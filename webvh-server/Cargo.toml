@@ -1,0 +1,16 @@
+[package]
+name = "affinidi-webvh-server"
+description = "WebVH Server, handles management and serving of WebVH Content"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# webvh-common = { version = "0.0.1", path = "./webvh-common"}
