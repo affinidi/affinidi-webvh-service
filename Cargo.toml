@@ -63,6 +63,13 @@ base64 = "0.22"
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 
+# Interactive prompts
+dialoguer = "0.11"
+
+# Static file embedding (for UI feature)
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

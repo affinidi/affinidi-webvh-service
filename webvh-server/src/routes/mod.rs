@@ -11,7 +11,7 @@ use axum::routing::{delete, get, post, put};
 use crate::server::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         // Health
         .route("/health", get(health::health))
         // Auth routes
@@ -43,5 +43,10 @@ pub fn router() -> Router<AppState> {
         .route("/stats/{mnemonic}", get(stats::get_did_stats))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route("/acl/{did}", delete(acl::delete_acl))
+        .route("/acl/{did}", delete(acl::delete_acl));
+
+    #[cfg(feature = "ui")]
+    let router = router.fallback(crate::frontend::static_handler);
+
+    router
 }

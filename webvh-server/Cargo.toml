@@ -12,6 +12,10 @@ repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 affinidi-tdk = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.7"
@@ -21,6 +25,7 @@ base64 = { workspace = true }
 bip39 = "2"
 chrono = { workspace = true }
 clap = { workspace = true }
+dialoguer = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
 hex = "0.4"
@@ -35,6 +40,8 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+rust-embed = { workspace = true, optional = true }
+mime_guess = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

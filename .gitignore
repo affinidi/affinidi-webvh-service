@@ -1,3 +1,8 @@
 **/.DS_Store
 **/.vscode
 /target
+
+# UI build artifacts
+webvh-ui/dist/
+webvh-ui/node_modules/
+webvh-ui/.expo/

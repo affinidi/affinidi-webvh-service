@@ -1,41 +1,213 @@
-# Affinidi WebVH Service
+# Affinidi WebVH Server
 
-## WebVH Controller/Server
+The WebVH Server hosts and manages
+[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It provides a
+REST API for DID lifecycle management (create, upload, delete),
+access control, statistics, and public DID resolution endpoints.
+An optional built-in management UI can be embedded directly into
+the binary.
 
 > **IMPORTANT:**
-> affinidi-webvh-service crates are provided "as is" without any warranties or guarantees,
-and by using this framework, users agree to assume all risks associated with its
-deployment and use including implementing security, and privacy measures in their
-applications. Affinidi assumes no liability for any issues arising from the use
-or modification of the project.
+> affinidi-webvh-service crates are provided "as is" without any
+> warranties or guarantees, and by using this framework, users
+> agree to assume all risks associated with its deployment and
+> use including implementing security, and privacy measures in
+> their applications. Affinidi assumes no liability for any
+> issues arising from the use or modification of the project.
 
 ## Requirements
 
-* Rust (1.88.0) 2024 Edition
+* Rust 1.91.0+ (2024 Edition)
+* Node.js 18+ (only if building with the management UI)
+
+## Configuration
+
+The server is configured via a TOML file. By default it looks
+for `config.toml` in the current directory. You can specify a
+different path with the `--config` flag or the
+`WEBVH_CONFIG_PATH` environment variable.
+
+### Example `config.toml`
+
+```toml
+# Server DID identity (required for auth endpoints to work)
+server_did = "did:web:webvh.example.com"
+public_url = "https://webvh.example.com"
+
+# 32-byte keys, base64url-no-pad encoded
+signing_key = "<ed25519-private-key>"
+key_agreement_key = "<x25519-private-key>"
+
+[server]
+host = "0.0.0.0"    # Bind address
+port = 3000          # Bind port
+
+[log]
+level = "info"       # trace, debug, info, warn, error
+format = "text"      # text or json
+
+[store]
+data_dir = "data/webvh-server"   # Persistent data directory
+
+[auth]
+jwt_signing_key = "<ed25519-private-key>"   # Required for auth
+access_token_expiry = 900                   # 15 minutes
+refresh_token_expiry = 86400                # 24 hours
+challenge_ttl = 300                         # 5 minutes
+session_cleanup_interval = 600              # 10 minutes
+```
+
+### Environment Variable Overrides
+
+Every config field can be overridden via environment variables:
+
+| Variable | Description |
+|---|---|
+| `WEBVH_CONFIG_PATH` | Path to config file |
+| `WEBVH_SERVER_DID` | Server DID identifier |
+| `WEBVH_PUBLIC_URL` | Public URL of the server |
+| `WEBVH_SIGNING_KEY` | Ed25519 signing key |
+| `WEBVH_KEY_AGREEMENT_KEY` | X25519 key agreement key |
+| `WEBVH_SERVER_HOST` | Bind host |
+| `WEBVH_SERVER_PORT` | Bind port |
+| `WEBVH_LOG_LEVEL` | Log level |
+| `WEBVH_LOG_FORMAT` | Log format (`text` / `json`) |
+| `WEBVH_STORE_DATA_DIR` | Data directory path |
+| `WEBVH_AUTH_JWT_SIGNING_KEY` | JWT signing key |
+| `WEBVH_AUTH_ACCESS_EXPIRY` | Access token expiry (sec) |
+| `WEBVH_AUTH_REFRESH_EXPIRY` | Refresh token expiry (sec) |
+| `WEBVH_AUTH_CHALLENGE_TTL` | Auth challenge TTL (sec) |
+| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Cleanup interval (sec) |
+
+All key values are base64url-no-pad encoded 32-byte keys.
+
+## Building
+
+### API-only (default)
+
+```bash
+cargo build -p affinidi-webvh-server --release
+```
+
+### With Management UI
+
+The `ui` feature flag embeds a web-based management interface
+directly into the server binary using `rust-embed`. When
+enabled, the server serves the UI as a fallback for any
+unmatched GET requests, alongside the API — no separate web
+server needed.
+
+First, build the UI:
+
+```bash
+cd webvh-ui
+npm install
+npm run build:web
+cd ..
+```
+
+Then build the server with the `ui` feature:
+
+```bash
+cargo build -p affinidi-webvh-server --release --features ui
+```
+
+The `webvh-ui/dist/` output is compiled into the binary at
+build time — the dist directory is not needed at runtime.
+
+## Running
+
+```bash
+# With default config.toml in current directory
+./target/release/affinidi-webvh-server
+
+# With a specific config file
+./target/release/affinidi-webvh-server --config /path/to/config.toml
+```
+
+If the server was built with `--features ui`, browse to
+`http://localhost:3000/` to access the management UI. The UI
+lets you:
+
+- View server health and DID counts
+- Authenticate with a Bearer token
+- Create, upload, and delete DIDs
+- Upload witness proofs
+- View DID resolution statistics
+- Manage access control entries (admin only)
+
+All API endpoints continue to work at their normal paths
+regardless of whether the UI is enabled.
+
+## API Endpoints
+
+### Public
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Health check |
+| `GET` | `/{mnemonic}/did.jsonl` | Resolve DID log |
+| `GET` | `/{mnemonic}/did-witness.json` | Resolve witness |
+| `GET` | `/.well-known/did.jsonl` | Root DID log |
+| `GET` | `/.well-known/did-witness.json` | Root witness |
+
+### Authentication
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/auth/challenge` | Request challenge |
+| `POST` | `/auth/` | Submit DIDComm auth |
+| `POST` | `/auth/refresh` | Refresh token |
+
+### DID Management (authenticated)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/dids` | List your DIDs |
+| `POST` | `/dids` | Request new DID URI |
+| `PUT` | `/dids/{mnemonic}` | Upload DID log |
+| `PUT` | `/dids/{mnemonic}/witness` | Upload witness |
+| `DELETE` | `/dids/{mnemonic}` | Delete a DID |
+
+### Statistics (authenticated)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/stats/{mnemonic}` | DID stats |
+
+### Access Control (admin only)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/acl` | List ACL entries |
+| `POST` | `/acl` | Create ACL entry |
+| `DELETE` | `/acl/{did}` | Remove ACL entry |
 
 ## Support & feedback
 
-If you face any issues or have suggestions, please don't hesitate to contact us
-'using [this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
+If you face any issues or have suggestions, please don't
+hesitate to contact us using
+[this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service codebase, you can also
-create an issue directly in GitHub.
+If you have a technical issue with the Affinidi WebVH Service
+codebase, you can also create an issue directly in GitHub.
 
-1. Ensure the bug was not already reported by searching on GitHub under
+1. Ensure the bug was not already reported by searching on
+   GitHub under
    [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
 
-2. If you're unable to find an open issue addressing the problem,
+2. If you're unable to find an open issue addressing the
+   problem,
    [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
-   Be sure to include a **title and clear description**, as much relevant
-information as possible,
-   and a **code sample** or an **executable test case** demonstrating the expected
-behaviour that is not occurring.
+   Be sure to include a **title and clear description**, as
+   much relevant information as possible, and a **code sample**
+   or an **executable test case** demonstrating the expected
+   behaviour that is not occurring.
 
 ## Contributing
 
-Want to contribute?
-
-Head over to our [CONTRIBUTING](https://github.com/affinidi/affinidi-webvh-service/blob/main/CONTRIBUTING.md)
+Want to contribute? Head over to our
+[CONTRIBUTING](https://github.com/affinidi/affinidi-webvh-service/blob/main/CONTRIBUTING.md)
 guidelines.

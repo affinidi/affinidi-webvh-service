@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub features: FeaturesConfig,
     pub server_did: Option<String>,
+    pub mediator_did: Option<String>,
     pub public_url: Option<String>,
     #[serde(default)]
     pub server: ServerConfig,
@@ -20,6 +23,14 @@ pub struct AppConfig {
     pub key_agreement_key: Option<String>,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct FeaturesConfig {
+    #[serde(default)]
+    pub didcomm: bool,
+    #[serde(default)]
+    pub rest_api: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -156,8 +167,17 @@ impl AppConfig {
         config.config_path = path.clone();
 
         // Apply env var overrides
+        if let Ok(v) = std::env::var("WEBVH_FEATURES_DIDCOMM") {
+            config.features.didcomm = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("WEBVH_FEATURES_REST_API") {
+            config.features.rest_api = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Ok(did) = std::env::var("WEBVH_SERVER_DID") {
             config.server_did = Some(did);
+        }
+        if let Ok(did) = std::env::var("WEBVH_MEDIATOR_DID") {
+            config.mediator_did = Some(did);
         }
         if let Ok(url) = std::env::var("WEBVH_PUBLIC_URL") {
             config.public_url = Some(url);
