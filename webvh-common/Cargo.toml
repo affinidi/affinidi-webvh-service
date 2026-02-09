@@ -1,6 +1,6 @@
 [package]
-name = "affinidi-webvh-server"
-description = "WebVH Server, handles management and serving of WebVH Content"
+name = "affinidi-webvh-common"
+description = "WebVH Common, Common methods and structs related to WebVH Content"
 version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
