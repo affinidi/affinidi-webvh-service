@@ -1,0 +1,15 @@
+[package]
+name = "affinidi-webvh-watcher"
+description = "WebVH Watcher, monitors WebVH DID changes"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]

@@ -16,6 +16,57 @@ rust-version = "1.91.0"
 
 [workspace.dependencies]
 
+# Affinidi Trust Development Kit
+affinidi-tdk = "0.4"
+
+# Async runtime
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "sync",
+  "signal",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Embedded key-value store
+fjall = "3"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random number generation
+rand = "0.9"
+
+# Cryptography
+ed25519-dalek = "2"
+multibase = "0.9"
+
+# JWT
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# Axum extras (typed headers for Bearer auth)
+axum-extra = { version = "0.12", features = ["typed-header"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 [profile.release]
 # Tell `rustc` to optimize for small code size.
 opt-level = "s"
