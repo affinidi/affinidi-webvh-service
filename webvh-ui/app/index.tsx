@@ -14,7 +14,7 @@ import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { HealthResponse } from "../lib/api";
 
 export default function Dashboard() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, logout } = useAuth();
   const api = useApi();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [didCount, setDidCount] = useState<number | null>(null);
@@ -84,6 +84,11 @@ export default function Dashboard() {
             <Text style={styles.buttonSecondaryText}>Access Control</Text>
           </Pressable>
         </Link>
+        {isAuthenticated && (
+          <Pressable style={styles.logoutButton} onPress={logout}>
+            <Text style={styles.logoutButtonText}>Logout</Text>
+          </Pressable>
+        )}
       </View>
     </View>
   );
@@ -189,5 +194,20 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     fontSize: 16,
     fontFamily: fonts.medium,
+  },
+  logoutButton: {
+    backgroundColor: "transparent",
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.error,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.xl,
+    alignItems: "center",
+    marginTop: spacing.md,
+  },
+  logoutButtonText: {
+    color: colors.error,
+    fontSize: 16,
+    fontFamily: fonts.semibold,
   },
 });

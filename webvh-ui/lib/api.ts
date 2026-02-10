@@ -105,6 +105,10 @@ async function request<T>(
   const res = await fetch(path, { ...options, headers });
 
   if (!res.ok) {
+    if (res.status === 401) {
+      clearToken();
+      window.dispatchEvent(new Event("webvh:unauthorized"));
+    }
     const text = await res.text().catch(() => res.statusText);
     throw new ApiError(res.status, text);
   }

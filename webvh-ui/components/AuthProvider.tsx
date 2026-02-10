@@ -21,6 +21,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const saved = getToken();
     if (saved) setTokenState(saved);
+
+    // Clear React state when the API client detects an expired/invalid token
+    const onUnauthorized = () => setTokenState(null);
+    window.addEventListener("webvh:unauthorized", onUnauthorized);
+    return () => window.removeEventListener("webvh:unauthorized", onUnauthorized);
   }, []);
 
   const login = useCallback((t: string) => {

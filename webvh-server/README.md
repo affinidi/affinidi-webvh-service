@@ -17,8 +17,8 @@ the binary.
 
 ## Requirements
 
-* Rust 1.91.0+ (2024 Edition)
-* Node.js 18+ (only if building with the management UI)
+- Rust 1.91.0+ (2024 Edition)
+- Node.js 18+ (only if building with the management UI)
 
 ## Configuration
 
@@ -61,23 +61,23 @@ session_cleanup_interval = 600              # 10 minutes
 
 Every config field can be overridden via environment variables:
 
-| Variable | Description |
-|---|---|
-| `WEBVH_CONFIG_PATH` | Path to config file |
-| `WEBVH_SERVER_DID` | Server DID identifier |
-| `WEBVH_PUBLIC_URL` | Public URL of the server |
-| `WEBVH_SIGNING_KEY` | Ed25519 signing key |
-| `WEBVH_KEY_AGREEMENT_KEY` | X25519 key agreement key |
-| `WEBVH_SERVER_HOST` | Bind host |
-| `WEBVH_SERVER_PORT` | Bind port |
-| `WEBVH_LOG_LEVEL` | Log level |
-| `WEBVH_LOG_FORMAT` | Log format (`text` / `json`) |
-| `WEBVH_STORE_DATA_DIR` | Data directory path |
-| `WEBVH_AUTH_JWT_SIGNING_KEY` | JWT signing key |
-| `WEBVH_AUTH_ACCESS_EXPIRY` | Access token expiry (sec) |
-| `WEBVH_AUTH_REFRESH_EXPIRY` | Refresh token expiry (sec) |
-| `WEBVH_AUTH_CHALLENGE_TTL` | Auth challenge TTL (sec) |
-| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Cleanup interval (sec) |
+| Variable                              | Description                  |
+| ------------------------------------- | ---------------------------- |
+| `WEBVH_CONFIG_PATH`                   | Path to config file          |
+| `WEBVH_SERVER_DID`                    | Server DID identifier        |
+| `WEBVH_PUBLIC_URL`                    | Public URL of the server     |
+| `WEBVH_SIGNING_KEY`                   | Ed25519 signing key          |
+| `WEBVH_KEY_AGREEMENT_KEY`             | X25519 key agreement key     |
+| `WEBVH_SERVER_HOST`                   | Bind host                    |
+| `WEBVH_SERVER_PORT`                   | Bind port                    |
+| `WEBVH_LOG_LEVEL`                     | Log level                    |
+| `WEBVH_LOG_FORMAT`                    | Log format (`text` / `json`) |
+| `WEBVH_STORE_DATA_DIR`                | Data directory path          |
+| `WEBVH_AUTH_JWT_SIGNING_KEY`          | JWT signing key              |
+| `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)    |
+| `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)   |
+| `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)     |
+| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Cleanup interval (sec)       |
 
 All key values are base64url-no-pad encoded 32-byte keys.
 
@@ -143,44 +143,44 @@ regardless of whether the UI is enabled.
 
 ### Public
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check |
-| `GET` | `/{mnemonic}/did.jsonl` | Resolve DID log |
-| `GET` | `/{mnemonic}/did-witness.json` | Resolve witness |
-| `GET` | `/.well-known/did.jsonl` | Root DID log |
-| `GET` | `/.well-known/did-witness.json` | Root witness |
+| Method | Path                            | Description     |
+| ------ | ------------------------------- | --------------- |
+| `GET`  | `/health`                       | Health check    |
+| `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
+| `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
+| `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
+| `GET`  | `/.well-known/did-witness.json` | Root witness    |
 
 ### Authentication
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/auth/challenge` | Request challenge |
-| `POST` | `/auth/` | Submit DIDComm auth |
-| `POST` | `/auth/refresh` | Refresh token |
+| Method | Path              | Description         |
+| ------ | ----------------- | ------------------- |
+| `POST` | `/auth/challenge` | Request challenge   |
+| `POST` | `/auth/`          | Submit DIDComm auth |
+| `POST` | `/auth/refresh`   | Refresh token       |
 
 ### DID Management (authenticated)
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/dids` | List your DIDs |
-| `POST` | `/dids` | Request new DID URI |
-| `PUT` | `/dids/{mnemonic}` | Upload DID log |
-| `PUT` | `/dids/{mnemonic}/witness` | Upload witness |
-| `DELETE` | `/dids/{mnemonic}` | Delete a DID |
+| Method   | Path                       | Description         |
+| -------- | -------------------------- | ------------------- |
+| `GET`    | `/dids`                    | List your DIDs      |
+| `POST`   | `/dids`                    | Request new DID URI |
+| `PUT`    | `/dids/{mnemonic}`         | Upload DID log      |
+| `PUT`    | `/dids/{mnemonic}/witness` | Upload witness      |
+| `DELETE` | `/dids/{mnemonic}`         | Delete a DID        |
 
 ### Statistics (authenticated)
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/stats/{mnemonic}` | DID stats |
+| Method | Path                | Description |
+| ------ | ------------------- | ----------- |
+| `GET`  | `/stats/{mnemonic}` | DID stats   |
 
 ### Access Control (admin only)
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/acl` | List ACL entries |
-| `POST` | `/acl` | Create ACL entry |
+| Method   | Path         | Description      |
+| -------- | ------------ | ---------------- |
+| `GET`    | `/acl`       | List ACL entries |
+| `POST`   | `/acl`       | Create ACL entry |
 | `DELETE` | `/acl/{did}` | Remove ACL entry |
 
 ## Support & feedback

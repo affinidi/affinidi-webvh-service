@@ -2,7 +2,6 @@ import { useState } from "react";
 import {
   View,
   Text,
-  TextInput,
   StyleSheet,
   Pressable,
 } from "react-native";
@@ -14,18 +13,11 @@ import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 
 export default function Login() {
-  const { isAuthenticated, login, logout } = useAuth();
+  const { isAuthenticated, logout } = useAuth();
+  const { login } = useAuth();
   const router = useRouter();
-  const [tokenInput, setTokenInput] = useState("");
   const [passkeyLoading, setPasskeyLoading] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
-
-  const handleLogin = () => {
-    const trimmed = tokenInput.trim();
-    if (!trimmed) return;
-    login(trimmed);
-    router.replace("/");
-  };
 
   const handlePasskeyLogin = async () => {
     setPasskeyLoading(true);
@@ -52,10 +44,10 @@ export default function Login() {
           <AffinidiLogo size={36} />
           <Text style={styles.title}>Authenticated</Text>
           <Text style={styles.hint}>
-            You are currently logged in with a Bearer token.
+            You are currently logged in.
           </Text>
           <Pressable style={styles.dangerButton} onPress={logout}>
-            <Text style={styles.buttonText}>Logout</Text>
+            <Text style={styles.dangerButtonText}>Logout</Text>
           </Pressable>
         </View>
       </View>
@@ -66,41 +58,17 @@ export default function Login() {
     <View style={styles.container}>
       <View style={styles.card}>
         <AffinidiLogo size={36} />
-        <Text style={styles.title}>Authenticate</Text>
+        <Text style={styles.title}>Login</Text>
         <Text style={styles.hint}>
-          Paste a Bearer token obtained via the DIDComm auth flow. The token
-          will be stored in your browser and used for API requests.
+          Use your registered passkey to authenticate with this server.
         </Text>
-        <TextInput
-          style={styles.input}
-          placeholder="eyJhbGciOi..."
-          placeholderTextColor={colors.textTertiary}
-          value={tokenInput}
-          onChangeText={setTokenInput}
-          multiline
-          autoCapitalize="none"
-          autoCorrect={false}
-        />
-        <Pressable
-          style={[styles.button, !tokenInput.trim() && styles.disabled]}
-          onPress={handleLogin}
-          disabled={!tokenInput.trim()}
-        >
-          <Text style={styles.buttonText}>Save Token</Text>
-        </Pressable>
-
-        <View style={styles.divider}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.dividerLine} />
-        </View>
 
         <Pressable
-          style={[styles.passkeyButton, passkeyLoading && styles.disabled]}
+          style={[styles.button, passkeyLoading && styles.disabled]}
           onPress={handlePasskeyLogin}
           disabled={passkeyLoading}
         >
-          <Text style={styles.passkeyButtonText}>
+          <Text style={styles.buttonText}>
             {passkeyLoading ? "Authenticating..." : "Login with Passkey"}
           </Text>
         </Pressable>
@@ -108,6 +76,25 @@ export default function Login() {
         {passkeyError && (
           <Text style={styles.errorText}>{passkeyError}</Text>
         )}
+
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>need access?</Text>
+          <View style={styles.dividerLine} />
+        </View>
+
+        <Text style={styles.cliHint}>
+          Ask a server admin to generate an enrollment link:
+        </Text>
+        <View style={styles.codeBlock}>
+          <Text style={styles.codeText} selectable>
+            webvh-server invite --did {"<"}your-did{">"} --role admin
+          </Text>
+        </View>
+        <Text style={styles.cliHint}>
+          Open the link in your browser to register a passkey, then return
+          here to log in.
+        </Text>
       </View>
     </View>
   );
@@ -144,18 +131,6 @@ const styles = StyleSheet.create({
     marginBottom: spacing.lg,
     lineHeight: 20,
   },
-  input: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    color: colors.textPrimary,
-    fontSize: 14,
-    fontFamily: fonts.mono,
-    minHeight: 80,
-    marginBottom: spacing.lg,
-  },
   button: {
     backgroundColor: colors.accent,
     borderRadius: radii.md,
@@ -174,6 +149,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginTop: spacing.lg,
   },
+  dangerButtonText: {
+    color: colors.error,
+    fontSize: 16,
+    fontFamily: fonts.semibold,
+  },
   buttonText: {
     color: colors.textOnAccent,
     fontSize: 16,
@@ -182,7 +162,8 @@ const styles = StyleSheet.create({
   divider: {
     flexDirection: "row",
     alignItems: "center",
-    marginVertical: spacing.lg,
+    marginTop: spacing.xxl,
+    marginBottom: spacing.lg,
   },
   dividerLine: {
     flex: 1,
@@ -195,24 +176,31 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     marginHorizontal: spacing.md,
   },
-  passkeyButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.accent,
-    paddingVertical: 14,
-    alignItems: "center",
-  },
-  passkeyButtonText: {
-    color: colors.accent,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-  },
   errorText: {
     color: colors.error,
     fontSize: 13,
     fontFamily: fonts.regular,
     marginTop: spacing.md,
     textAlign: "center",
+  },
+  cliHint: {
+    fontSize: 13,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    lineHeight: 19,
+    marginBottom: spacing.sm,
+  },
+  codeBlock: {
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  codeText: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.teal,
   },
 });
