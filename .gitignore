@@ -1,6 +1,8 @@
 **/.DS_Store
 **/.vscode
 /target
+**/config.toml
+**/data
 
 # UI build artifacts
 webvh-ui/dist/
