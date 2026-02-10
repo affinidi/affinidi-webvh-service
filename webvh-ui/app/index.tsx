@@ -9,6 +9,8 @@ import {
 import { Link } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
+import { AffinidiLogo } from "../components/AffinidiLogo";
+import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { HealthResponse } from "../lib/api";
 
 export default function Dashboard() {
@@ -35,46 +37,51 @@ export default function Dashboard() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>WebVH Server</Text>
+      <AffinidiLogo size={48} />
+
+      <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
 
       {error ? (
-        <View style={styles.card}>
+        <View style={[styles.card, styles.errorCard]}>
           <Text style={styles.errorText}>Server unreachable: {error}</Text>
         </View>
       ) : health ? (
-        <View style={styles.card}>
-          <Text style={styles.cardLabel}>Status</Text>
-          <Text style={styles.statusOk}>{health.status}</Text>
-          <Text style={styles.cardLabel}>Version</Text>
-          <Text style={styles.cardValue}>{health.version}</Text>
+        <View style={styles.statusRow}>
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Status</Text>
+            <Text style={styles.statusOk}>{health.status}</Text>
+          </View>
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Version</Text>
+            <Text style={styles.cardValue}>{health.version}</Text>
+          </View>
+          {isAuthenticated && didCount !== null && (
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Total DIDs</Text>
+              <Text style={styles.cardValueAccent}>{didCount}</Text>
+            </View>
+          )}
         </View>
       ) : (
-        <ActivityIndicator color="#7c7cff" size="large" />
-      )}
-
-      {isAuthenticated && didCount !== null && (
-        <View style={styles.card}>
-          <Text style={styles.cardLabel}>Total DIDs</Text>
-          <Text style={styles.cardValue}>{didCount}</Text>
-        </View>
+        <ActivityIndicator color={colors.accent} size="large" />
       )}
 
       <View style={styles.nav}>
         {!isAuthenticated && (
           <Link href="/login" asChild>
-            <Pressable style={styles.button}>
-              <Text style={styles.buttonText}>Login</Text>
+            <Pressable style={styles.buttonPrimary}>
+              <Text style={styles.buttonPrimaryText}>Login</Text>
             </Pressable>
           </Link>
         )}
         <Link href="/dids" asChild>
-          <Pressable style={styles.button}>
-            <Text style={styles.buttonText}>Manage DIDs</Text>
+          <Pressable style={styles.buttonSecondary}>
+            <Text style={styles.buttonSecondaryText}>Manage DIDs</Text>
           </Pressable>
         </Link>
         <Link href="/acl" asChild>
-          <Pressable style={styles.button}>
-            <Text style={styles.buttonText}>Access Control</Text>
+          <Pressable style={styles.buttonSecondary}>
+            <Text style={styles.buttonSecondaryText}>Access Control</Text>
           </Pressable>
         </Link>
       </View>
@@ -85,62 +92,102 @@ export default function Dashboard() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 24,
+    padding: spacing.xl,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#0f0f23",
+    backgroundColor: colors.bgPrimary,
   },
-  title: {
-    fontSize: 28,
-    fontWeight: "bold",
-    color: "#e0e0ff",
-    marginBottom: 24,
+  subtitle: {
+    fontSize: 14,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    marginTop: spacing.md,
+    marginBottom: spacing.xxl,
+    letterSpacing: 0.5,
+  },
+  statusRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.md,
+    justifyContent: "center",
+    marginBottom: spacing.lg,
+    width: "100%",
+    maxWidth: 500,
   },
   card: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 20,
-    marginBottom: 16,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    minWidth: 140,
+    flex: 1,
+  },
+  errorCard: {
+    backgroundColor: colors.errorBg,
+    borderColor: colors.error,
     width: "100%",
-    maxWidth: 400,
+    maxWidth: 500,
+    marginBottom: spacing.lg,
   },
   cardLabel: {
-    fontSize: 12,
-    color: "#888",
+    fontSize: 11,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
     textTransform: "uppercase",
-    marginBottom: 4,
+    letterSpacing: 1,
+    marginBottom: spacing.xs,
   },
   cardValue: {
     fontSize: 18,
-    color: "#e0e0ff",
-    marginBottom: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textPrimary,
+  },
+  cardValueAccent: {
+    fontSize: 24,
+    fontFamily: fonts.bold,
+    color: colors.accent,
   },
   statusOk: {
     fontSize: 18,
-    color: "#4caf50",
-    fontWeight: "bold",
-    marginBottom: 12,
+    fontFamily: fonts.bold,
+    color: colors.teal,
   },
   errorText: {
-    color: "#ef5350",
+    fontFamily: fonts.medium,
+    color: colors.error,
     fontSize: 14,
   },
   nav: {
-    marginTop: 16,
-    gap: 12,
+    marginTop: spacing.lg,
+    gap: spacing.md,
     width: "100%",
-    maxWidth: 400,
+    maxWidth: 500,
   },
-  button: {
-    backgroundColor: "#3d3d8e",
-    borderRadius: 8,
+  buttonPrimary: {
+    backgroundColor: colors.accent,
+    borderRadius: radii.md,
     paddingVertical: 14,
-    paddingHorizontal: 24,
+    paddingHorizontal: spacing.xl,
     alignItems: "center",
   },
-  buttonText: {
-    color: "#e0e0ff",
+  buttonPrimaryText: {
+    color: colors.textOnAccent,
     fontSize: 16,
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
+  },
+  buttonSecondary: {
+    backgroundColor: colors.bgTertiary,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.xl,
+    alignItems: "center",
+  },
+  buttonSecondaryText: {
+    color: colors.textPrimary,
+    fontSize: 16,
+    fontFamily: fonts.medium,
   },
 });

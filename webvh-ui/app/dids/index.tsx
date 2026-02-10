@@ -11,6 +11,7 @@ import {
 import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { DidRecord } from "../../lib/api";
 
 export default function DidList() {
@@ -56,11 +57,11 @@ export default function DidList() {
 
   if (!isAuthenticated) {
     return (
-      <View style={styles.container}>
+      <View style={styles.containerCenter}>
         <Text style={styles.hint}>Please log in to manage DIDs.</Text>
         <Link href="/login" asChild>
-          <Pressable style={styles.button}>
-            <Text style={styles.buttonText}>Login</Text>
+          <Pressable style={styles.buttonPrimary}>
+            <Text style={styles.buttonPrimaryText}>Login</Text>
           </Pressable>
         </Link>
       </View>
@@ -81,11 +82,11 @@ export default function DidList() {
       <View style={styles.header}>
         <Text style={styles.title}>Your DIDs</Text>
         <Pressable
-          style={[styles.button, creating && styles.disabled]}
+          style={[styles.buttonPrimary, creating && styles.disabled]}
           onPress={handleCreate}
           disabled={creating}
         >
-          <Text style={styles.buttonText}>
+          <Text style={styles.buttonPrimaryText}>
             {creating ? "Creating..." : "Request New DID"}
           </Text>
         </Pressable>
@@ -94,7 +95,11 @@ export default function DidList() {
       {error && <Text style={styles.errorText}>{error}</Text>}
 
       {loading ? (
-        <ActivityIndicator color="#7c7cff" size="large" style={{ marginTop: 32 }} />
+        <ActivityIndicator
+          color={colors.accent}
+          size="large"
+          style={{ marginTop: spacing.xxl }}
+        />
       ) : dids.length === 0 ? (
         <Text style={styles.hint}>
           No DIDs yet. Create one to get started.
@@ -103,7 +108,7 @@ export default function DidList() {
         <FlatList
           data={dids}
           keyExtractor={(item) => item.mnemonic}
-          contentContainerStyle={{ gap: 12 }}
+          contentContainerStyle={{ gap: spacing.md }}
           renderItem={({ item }) => (
             <Link href={`/dids/${item.mnemonic}`} asChild>
               <Pressable style={styles.card}>
@@ -128,65 +133,78 @@ export default function DidList() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 24,
-    backgroundColor: "#0f0f23",
+    padding: spacing.xl,
+    backgroundColor: colors.bgPrimary,
+  },
+  containerCenter: {
+    flex: 1,
+    padding: spacing.xl,
+    backgroundColor: colors.bgPrimary,
+    alignItems: "center",
+    justifyContent: "center",
   },
   header: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 20,
+    marginBottom: spacing.xl,
     flexWrap: "wrap",
-    gap: 12,
+    gap: spacing.md,
   },
   title: {
     fontSize: 22,
-    fontWeight: "bold",
-    color: "#e0e0ff",
+    fontFamily: fonts.bold,
+    color: colors.textPrimary,
   },
   card: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 16,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
   },
   mnemonic: {
     fontSize: 16,
+    fontFamily: fonts.mono,
     fontWeight: "600",
-    color: "#7c7cff",
-    fontFamily: "monospace",
-    marginBottom: 8,
+    color: colors.accent,
+    marginBottom: spacing.sm,
   },
   meta: {
     flexDirection: "row",
-    gap: 16,
+    gap: spacing.lg,
   },
   metaText: {
     fontSize: 13,
-    color: "#888",
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
   },
   hint: {
     fontSize: 14,
-    color: "#aaa",
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
     textAlign: "center",
-    marginTop: 32,
+    marginTop: spacing.xxl,
+    marginBottom: spacing.lg,
   },
   errorText: {
-    color: "#ef5350",
-    marginBottom: 12,
+    fontFamily: fonts.medium,
+    color: colors.error,
+    marginBottom: spacing.md,
   },
-  button: {
-    backgroundColor: "#3d3d8e",
-    borderRadius: 8,
+  buttonPrimary: {
+    backgroundColor: colors.accent,
+    borderRadius: radii.md,
     paddingVertical: 12,
-    paddingHorizontal: 20,
+    paddingHorizontal: spacing.xl,
     alignItems: "center",
   },
   disabled: {
     opacity: 0.5,
   },
-  buttonText: {
-    color: "#e0e0ff",
+  buttonPrimaryText: {
+    color: colors.textOnAccent,
     fontSize: 14,
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
   },
 });

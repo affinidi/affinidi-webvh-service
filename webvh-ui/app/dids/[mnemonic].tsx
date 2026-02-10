@@ -12,6 +12,7 @@ import {
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { DidStats } from "../../lib/api";
 
 export default function DidDetail() {
@@ -98,7 +99,7 @@ export default function DidDetail() {
 
   if (!isAuthenticated) {
     return (
-      <View style={styles.container}>
+      <View style={styles.containerCenter}>
         <Text style={styles.hint}>Please log in to view DID details.</Text>
       </View>
     );
@@ -140,7 +141,7 @@ export default function DidDetail() {
             </View>
           </View>
         ) : (
-          <ActivityIndicator color="#7c7cff" />
+          <ActivityIndicator color={colors.accent} />
         )}
       </View>
 
@@ -153,13 +154,16 @@ export default function DidDetail() {
         <TextInput
           style={styles.textarea}
           placeholder='{"versionId":"1",...}'
-          placeholderTextColor="#555"
+          placeholderTextColor={colors.textTertiary}
           value={didContent}
           onChangeText={setDidContent}
           multiline
         />
         <Pressable
-          style={[styles.button, (!didContent.trim() || uploading) && styles.disabled]}
+          style={[
+            styles.button,
+            (!didContent.trim() || uploading) && styles.disabled,
+          ]}
           onPress={handleUploadDid}
           disabled={!didContent.trim() || uploading}
         >
@@ -178,7 +182,7 @@ export default function DidDetail() {
         <TextInput
           style={styles.textarea}
           placeholder='{"witness":...}'
-          placeholderTextColor="#555"
+          placeholderTextColor={colors.textTertiary}
           value={witnessContent}
           onChangeText={setWitnessContent}
           multiline
@@ -198,14 +202,14 @@ export default function DidDetail() {
       </View>
 
       {/* Delete */}
-      <View style={styles.card}>
+      <View style={[styles.card, styles.dangerCard]}>
         <Text style={styles.sectionTitle}>Danger Zone</Text>
         <Pressable
           style={[styles.dangerButton, deleting && styles.disabled]}
           onPress={handleDelete}
           disabled={deleting}
         >
-          <Text style={styles.buttonText}>
+          <Text style={styles.dangerButtonText}>
             {deleting ? "Deleting..." : "Delete DID"}
           </Text>
         </Pressable>
@@ -217,77 +221,92 @@ export default function DidDetail() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#0f0f23",
+    backgroundColor: colors.bgPrimary,
+  },
+  containerCenter: {
+    flex: 1,
+    backgroundColor: colors.bgPrimary,
+    alignItems: "center",
+    justifyContent: "center",
   },
   content: {
-    padding: 24,
+    padding: spacing.xl,
     maxWidth: 600,
     alignSelf: "center",
     width: "100%",
   },
   title: {
     fontSize: 20,
+    fontFamily: fonts.mono,
     fontWeight: "bold",
-    color: "#7c7cff",
-    fontFamily: "monospace",
-    marginBottom: 20,
+    color: colors.accent,
+    marginBottom: spacing.xl,
   },
   card: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 20,
-    marginBottom: 16,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.xl,
+    marginBottom: spacing.lg,
+  },
+  dangerCard: {
+    borderColor: "rgba(255, 92, 92, 0.25)",
   },
   sectionTitle: {
     fontSize: 16,
-    fontWeight: "bold",
-    color: "#e0e0ff",
-    marginBottom: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textPrimary,
+    marginBottom: spacing.md,
   },
   statsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 16,
+    gap: spacing.lg,
   },
   statItem: {
     minWidth: 120,
   },
   statValue: {
     fontSize: 24,
-    fontWeight: "bold",
-    color: "#7c7cff",
+    fontFamily: fonts.bold,
+    color: colors.accent,
   },
   statSmall: {
     fontSize: 14,
-    color: "#e0e0ff",
+    fontFamily: fonts.regular,
+    color: colors.textPrimary,
   },
   statLabel: {
-    fontSize: 12,
-    color: "#888",
+    fontSize: 11,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
     textTransform: "uppercase",
+    letterSpacing: 1,
     marginTop: 2,
   },
   hint: {
     fontSize: 13,
-    color: "#aaa",
-    marginBottom: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    marginBottom: spacing.md,
     lineHeight: 18,
   },
   textarea: {
-    backgroundColor: "#0f0f23",
-    borderColor: "#333",
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
     borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    color: "#e0e0ff",
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    color: colors.textPrimary,
     fontSize: 13,
-    fontFamily: "monospace",
+    fontFamily: fonts.mono,
     minHeight: 100,
-    marginBottom: 12,
+    marginBottom: spacing.md,
   },
   button: {
-    backgroundColor: "#3d3d8e",
-    borderRadius: 8,
+    backgroundColor: colors.accent,
+    borderRadius: radii.md,
     paddingVertical: 12,
     alignItems: "center",
   },
@@ -295,18 +314,26 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   dangerButton: {
-    backgroundColor: "#8e3d3d",
-    borderRadius: 8,
+    backgroundColor: "transparent",
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.error,
     paddingVertical: 14,
     alignItems: "center",
   },
-  buttonText: {
-    color: "#e0e0ff",
+  dangerButtonText: {
+    color: colors.error,
     fontSize: 14,
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
+  },
+  buttonText: {
+    color: colors.textOnAccent,
+    fontSize: 14,
+    fontFamily: fonts.semibold,
   },
   errorText: {
-    color: "#ef5350",
+    fontFamily: fonts.medium,
+    color: colors.error,
     fontSize: 14,
   },
 });

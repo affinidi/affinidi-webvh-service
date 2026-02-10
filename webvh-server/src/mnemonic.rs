@@ -1,15 +1,13 @@
-use bip39::Language;
-use rand::Rng;
-
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
+use bip39::Language;
+use rand::random_range;
 
 /// Generate a random 2-word BIP-39 mnemonic (e.g., "apple-banana").
 fn random_mnemonic() -> String {
     let wordlist = Language::English.word_list();
-    let mut rng = rand::rng();
-    let w1 = wordlist[rng.random_range(0..wordlist.len())];
-    let w2 = wordlist[rng.random_range(0..wordlist.len())];
+    let w1 = wordlist[random_range(0..wordlist.len())];
+    let w2 = wordlist[random_range(0..wordlist.len())];
     format!("{w1}-{w2}")
 }
 

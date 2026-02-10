@@ -128,7 +128,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .default("data/webvh-server".to_string())
         .interact_text()?;
 
-    // 8. Key generation (only when DIDComm is enabled)
+    // 8. Key generation
     if enable_didcomm {
         let sk = generate_key();
         let kak = generate_key();
@@ -148,8 +148,46 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             jwt_signing_key: Some(jsk),
             ..Default::default()
         };
+    } else {
+        // REST API / passkey auth still needs a JWT signing key
+        let jwt_options = &[
+            "Generate a new random key",
+            "Paste an existing base64url key",
+            "Skip (no auth)",
+        ];
+        let jwt_idx = Select::new()
+            .with_prompt("JWT signing key (required for passkey & token auth)")
+            .items(jwt_options)
+            .default(0)
+            .interact()?;
 
-        // 9. Auth expiry settings
+        match jwt_idx {
+            0 => {
+                let jsk = generate_key();
+                eprintln!();
+                eprintln!("  Generated JWT signing key (back this up!):");
+                eprintln!("  -------------------------------------------");
+                eprintln!("  auth.jwt_signing_key: {jsk}");
+                eprintln!();
+                auth.jwt_signing_key = Some(jsk);
+            }
+            1 => {
+                let jsk: String = Input::new()
+                    .with_prompt("Base64url-no-pad encoded 32-byte key")
+                    .interact_text()?;
+                let trimmed = jsk.trim().to_string();
+                if !trimmed.is_empty() {
+                    auth.jwt_signing_key = Some(trimmed);
+                }
+            }
+            _ => {
+                eprintln!("  Skipping JWT key — auth endpoints will not work.");
+            }
+        }
+    }
+
+    // 9. Auth expiry settings
+    if auth.jwt_signing_key.is_some() {
         let customize_auth = Confirm::new()
             .with_prompt("Customize auth token expiry settings?")
             .default(false)
@@ -174,6 +212,11 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             auth.session_cleanup_interval = Input::new()
                 .with_prompt("Session cleanup interval (seconds)")
                 .default(auth.session_cleanup_interval)
+                .interact_text()?;
+
+            auth.passkey_enrollment_ttl = Input::new()
+                .with_prompt("Passkey enrollment TTL (seconds)")
+                .default(auth.passkey_enrollment_ttl)
                 .interact_text()?;
         }
     }

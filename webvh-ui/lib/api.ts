@@ -21,7 +21,7 @@ export interface AclEntry {
   did: string;
   role: "admin" | "owner";
   label: string | null;
-  createdAt: number;
+  created_at: number;
 }
 
 export interface AclListResponse {
@@ -33,6 +33,24 @@ export interface DidStats {
   total_updates: number;
   last_resolved_at: number | null;
   last_updated_at: number | null;
+}
+
+export interface TokenResponse {
+  session_id: string;
+  access_token: string;
+  access_expires_at: number;
+  refresh_token: string;
+  refresh_expires_at: number;
+}
+
+export interface EnrollStartResponse {
+  registration_id: string;
+  options: any;
+}
+
+export interface LoginStartResponse {
+  auth_id: string;
+  options: any;
 }
 
 export class ApiError extends Error {
@@ -137,4 +155,33 @@ export const api = {
 
   deleteAcl: (did: string) =>
     request<void>(`/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
+
+  // Passkey auth
+  passkeyEnrollStart: (token: string) =>
+    request<EnrollStartResponse>("/auth/passkey/enroll/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    }),
+
+  passkeyEnrollFinish: (registrationId: string, credential: any) =>
+    request<TokenResponse>("/auth/passkey/enroll/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ registration_id: registrationId, credential }),
+    }),
+
+  passkeyLoginStart: () =>
+    request<LoginStartResponse>("/auth/passkey/login/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+
+  passkeyLoginFinish: (authId: string, credential: any) =>
+    request<TokenResponse>("/auth/passkey/login/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auth_id: authId, credential }),
+    }),
 };

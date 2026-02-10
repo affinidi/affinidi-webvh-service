@@ -12,6 +12,7 @@ import {
 import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { AclEntry } from "../../lib/api";
 
 export default function AclManagement() {
@@ -61,7 +62,8 @@ export default function AclManagement() {
       setNewLabel("");
       refresh();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to create ACL entry";
+      const msg =
+        e instanceof Error ? e.message : "Failed to create ACL entry";
       Alert.alert("Error", msg);
     } finally {
       setCreating(false);
@@ -69,35 +71,33 @@ export default function AclManagement() {
   };
 
   const handleDelete = (did: string) => {
-    Alert.alert(
-      "Remove Access",
-      `Remove access for ${did}?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Remove",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              await api.deleteAcl(did);
-              refresh();
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : "Failed to delete";
-              Alert.alert("Error", msg);
-            }
-          },
+    Alert.alert("Remove Access", `Remove access for ${did}?`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Remove",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await api.deleteAcl(did);
+            refresh();
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "Failed to delete";
+            Alert.alert("Error", msg);
+          }
         },
-      ],
-    );
+      },
+    ]);
   };
 
   if (!isAuthenticated) {
     return (
-      <View style={styles.container}>
-        <Text style={styles.hint}>Please log in to manage access control.</Text>
+      <View style={styles.containerCenter}>
+        <Text style={styles.hint}>
+          Please log in to manage access control.
+        </Text>
         <Link href="/login" asChild>
-          <Pressable style={styles.button}>
-            <Text style={styles.buttonText}>Login</Text>
+          <Pressable style={styles.buttonPrimary}>
+            <Text style={styles.buttonPrimaryText}>Login</Text>
           </Pressable>
         </Link>
       </View>
@@ -121,7 +121,7 @@ export default function AclManagement() {
         <TextInput
           style={styles.input}
           placeholder="did:web:example.com"
-          placeholderTextColor="#555"
+          placeholderTextColor={colors.textTertiary}
           value={newDid}
           onChangeText={setNewDid}
           autoCapitalize="none"
@@ -164,16 +164,19 @@ export default function AclManagement() {
         <TextInput
           style={styles.input}
           placeholder="Label (optional)"
-          placeholderTextColor="#555"
+          placeholderTextColor={colors.textTertiary}
           value={newLabel}
           onChangeText={setNewLabel}
         />
         <Pressable
-          style={[styles.button, (!newDid.trim() || creating) && styles.disabled]}
+          style={[
+            styles.buttonPrimary,
+            (!newDid.trim() || creating) && styles.disabled,
+          ]}
           onPress={handleCreate}
           disabled={!newDid.trim() || creating}
         >
-          <Text style={styles.buttonText}>
+          <Text style={styles.buttonPrimaryText}>
             {creating ? "Adding..." : "Add Entry"}
           </Text>
         </Pressable>
@@ -182,14 +185,18 @@ export default function AclManagement() {
       {error && <Text style={styles.errorText}>{error}</Text>}
 
       {loading ? (
-        <ActivityIndicator color="#7c7cff" size="large" style={{ marginTop: 24 }} />
+        <ActivityIndicator
+          color={colors.accent}
+          size="large"
+          style={{ marginTop: spacing.xl }}
+        />
       ) : entries.length === 0 ? (
         <Text style={styles.hint}>No ACL entries configured.</Text>
       ) : (
         <FlatList
           data={entries}
           keyExtractor={(item) => item.did}
-          contentContainerStyle={{ gap: 10 }}
+          contentContainerStyle={{ gap: spacing.sm }}
           renderItem={({ item }) => (
             <View style={styles.entryCard}>
               <View style={styles.entryInfo}>
@@ -209,7 +216,7 @@ export default function AclManagement() {
                     <Text style={styles.entryLabel}>{item.label}</Text>
                   )}
                   <Text style={styles.entryDate}>
-                    {formatDate(item.createdAt)}
+                    {formatDate(item.created_at)}
                   </Text>
                 </View>
               </View>
@@ -230,93 +237,108 @@ export default function AclManagement() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 24,
-    backgroundColor: "#0f0f23",
+    padding: spacing.xl,
+    backgroundColor: colors.bgPrimary,
+  },
+  containerCenter: {
+    flex: 1,
+    padding: spacing.xl,
+    backgroundColor: colors.bgPrimary,
+    alignItems: "center",
+    justifyContent: "center",
   },
   title: {
     fontSize: 22,
-    fontWeight: "bold",
-    color: "#e0e0ff",
-    marginBottom: 20,
+    fontFamily: fonts.bold,
+    color: colors.textPrimary,
+    marginBottom: spacing.xl,
   },
   card: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 20,
-    marginBottom: 20,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.xl,
+    marginBottom: spacing.xl,
   },
   sectionTitle: {
     fontSize: 16,
-    fontWeight: "bold",
-    color: "#e0e0ff",
-    marginBottom: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textPrimary,
+    marginBottom: spacing.md,
   },
   input: {
-    backgroundColor: "#0f0f23",
-    borderColor: "#333",
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
     borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    color: "#e0e0ff",
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    color: colors.textPrimary,
+    fontFamily: fonts.regular,
     fontSize: 14,
-    marginBottom: 12,
+    marginBottom: spacing.md,
   },
   roleRow: {
     flexDirection: "row",
-    gap: 10,
-    marginBottom: 12,
+    gap: spacing.sm,
+    marginBottom: spacing.md,
   },
   roleButton: {
     flex: 1,
-    borderColor: "#333",
+    borderColor: colors.border,
     borderWidth: 1,
-    borderRadius: 8,
+    borderRadius: radii.sm,
     paddingVertical: 10,
     alignItems: "center",
   },
   roleActive: {
-    borderColor: "#7c7cff",
-    backgroundColor: "#2a2a5e",
+    borderColor: colors.accent,
+    backgroundColor: "rgba(59, 113, 255, 0.12)",
   },
   roleText: {
-    color: "#888",
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
   },
   roleTextActive: {
-    color: "#7c7cff",
+    color: colors.accent,
   },
-  button: {
-    backgroundColor: "#3d3d8e",
-    borderRadius: 8,
+  buttonPrimary: {
+    backgroundColor: colors.accent,
+    borderRadius: radii.md,
     paddingVertical: 12,
     alignItems: "center",
   },
   disabled: {
     opacity: 0.5,
   },
-  buttonText: {
-    color: "#e0e0ff",
+  buttonPrimaryText: {
+    color: colors.textOnAccent,
     fontSize: 14,
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
   },
   hint: {
     fontSize: 14,
-    color: "#aaa",
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
     textAlign: "center",
-    marginTop: 24,
+    marginTop: spacing.xl,
+    marginBottom: spacing.lg,
   },
   errorText: {
-    color: "#ef5350",
-    marginBottom: 12,
+    fontFamily: fonts.medium,
+    color: colors.error,
+    marginBottom: spacing.md,
   },
   entryCard: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 10,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border,
     padding: 14,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 12,
+    gap: spacing.md,
   },
   entryInfo: {
     flex: 1,
@@ -324,48 +346,50 @@ const styles = StyleSheet.create({
   },
   entryDid: {
     fontSize: 13,
-    color: "#e0e0ff",
-    fontFamily: "monospace",
-    marginBottom: 6,
+    fontFamily: fonts.mono,
+    color: colors.textPrimary,
+    marginBottom: spacing.xs,
   },
   entryMeta: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    gap: spacing.sm,
   },
   roleBadge: {
-    backgroundColor: "#2a4a2a",
+    backgroundColor: colors.tealMuted,
     borderRadius: 4,
     paddingHorizontal: 8,
     paddingVertical: 2,
   },
   adminBadge: {
-    backgroundColor: "#4a2a2a",
+    backgroundColor: "rgba(59, 113, 255, 0.15)",
   },
   roleBadgeText: {
     fontSize: 11,
-    color: "#e0e0ff",
-    fontWeight: "bold",
+    fontFamily: fonts.bold,
+    color: colors.textPrimary,
     textTransform: "uppercase",
   },
   entryLabel: {
     fontSize: 13,
-    color: "#aaa",
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
   },
   entryDate: {
     fontSize: 12,
-    color: "#666",
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
   },
   deleteButton: {
-    borderColor: "#8e3d3d",
+    borderColor: colors.error,
     borderWidth: 1,
-    borderRadius: 6,
+    borderRadius: radii.sm,
     paddingHorizontal: 12,
     paddingVertical: 6,
   },
   deleteText: {
-    color: "#ef5350",
+    color: colors.error,
     fontSize: 12,
-    fontWeight: "600",
+    fontFamily: fonts.semibold,
   },
 });

@@ -39,7 +39,10 @@ toml = "0.9"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
+webauthn-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { version = "2", optional = true }
 

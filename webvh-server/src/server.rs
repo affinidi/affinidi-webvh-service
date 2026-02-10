@@ -7,10 +7,13 @@ use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 
+use webauthn_rs::prelude::Webauthn;
+
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::error::AppError;
+use crate::passkey;
 use crate::routes;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::net::TcpListener;
@@ -28,6 +31,7 @@ pub struct AppState {
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub webauthn: Option<Arc<Webauthn>>,
 }
 
 pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
@@ -40,8 +44,25 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
     let dids_ks = store.keyspace("dids")?;
     let stats_ks = store.keyspace("stats")?;
 
-    // Initialize auth infrastructure
-    let (did_resolver, secrets_resolver, jwt_keys) = init_auth(&config).await;
+    // Initialize DIDComm auth infrastructure (requires server_did)
+    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config).await;
+
+    // Initialize JWT keys independently — needed by both DIDComm and passkey auth
+    let jwt_keys = init_jwt_keys(&config);
+
+    // Initialize passkey/WebAuthn if public_url is configured
+    let webauthn = config.public_url.as_ref().and_then(|url| {
+        match passkey::build_webauthn(url) {
+            Ok(w) => {
+                info!("passkey auth enabled (rp_origin={})", url);
+                Some(Arc::new(w))
+            }
+            Err(e) => {
+                warn!("passkey auth disabled: {e}");
+                None
+            }
+        }
+    });
 
     let auth_config = config.auth.clone();
 
@@ -54,6 +75,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         did_resolver,
         secrets_resolver,
         jwt_keys,
+        webauthn,
     };
 
     // Spawn session cleanup background task when auth is configured
@@ -76,22 +98,42 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Initialize DID resolver, secrets resolver, and JWT keys for authentication.
+/// Initialize JWT keys from config. Works independently of DIDComm setup,
+/// so passkey auth can issue tokens even without server_did.
+fn init_jwt_keys(config: &AppConfig) -> Option<Arc<JwtKeys>> {
+    match &config.auth.jwt_signing_key {
+        Some(b64) => match decode_jwt_key(b64) {
+            Ok(k) => {
+                debug!("JWT signing key loaded");
+                Some(Arc::new(k))
+            }
+            Err(e) => {
+                warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
+                None
+            }
+        },
+        None => {
+            warn!("auth.jwt_signing_key not configured — auth endpoints will not work");
+            None
+        }
+    }
+}
+
+/// Initialize DID resolver and secrets resolver for DIDComm authentication.
 ///
 /// Returns `None` values if the server DID is not configured (server still starts
-/// but auth endpoints will not work).
-async fn init_auth(
+/// but DIDComm auth endpoints will not work).
+async fn init_didcomm_auth(
     config: &AppConfig,
 ) -> (
     Option<DIDCacheClient>,
     Option<Arc<ThreadedSecretsResolver>>,
-    Option<Arc<JwtKeys>>,
 ) {
     let server_did = match &config.server_did {
         Some(did) => did.clone(),
         None => {
-            warn!("server_did not configured — auth endpoints will not work");
-            return (None, None, None);
+            warn!("server_did not configured — DIDComm auth endpoints will not work");
+            return (None, None);
         }
     };
 
@@ -99,8 +141,8 @@ async fn init_auth(
     let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("failed to create DID resolver: {e} — auth endpoints will not work");
-            return (None, None, None);
+            warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");
+            return (None, None);
         }
     };
 
@@ -144,27 +186,11 @@ async fn init_auth(
         }
     }
 
-    // 3. JWT signing key
-    let jwt_keys = match &config.auth.jwt_signing_key {
-        Some(b64) => match decode_jwt_key(b64) {
-            Ok(k) => k,
-            Err(e) => {
-                warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
-                return (Some(did_resolver), Some(Arc::new(secrets_resolver)), None);
-            }
-        },
-        None => {
-            warn!("auth.jwt_signing_key not configured — auth endpoints will not work");
-            return (Some(did_resolver), Some(Arc::new(secrets_resolver)), None);
-        }
-    };
-
-    info!("auth initialized for DID {server_did}");
+    info!("DIDComm auth initialized for DID {server_did}");
 
     (
         Some(did_resolver),
         Some(Arc::new(secrets_resolver)),
-        Some(Arc::new(jwt_keys)),
     )
 }
 

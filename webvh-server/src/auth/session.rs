@@ -1,3 +1,7 @@
+use uuid::Uuid;
+
+use crate::acl::Role;
+use crate::auth::jwt::JwtKeys;
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
 use serde::{Deserialize, Serialize};
@@ -140,4 +144,65 @@ pub async fn cleanup_expired_sessions(
     debug!(removed, "session cleanup complete");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared authenticated-session creation (used by DIDComm + passkey flows)
+// ---------------------------------------------------------------------------
+
+/// Response payload returned to clients after successful authentication.
+#[derive(Debug, Serialize)]
+pub struct TokenResponse {
+    pub session_id: String,
+    pub access_token: String,
+    pub access_expires_at: u64,
+    pub refresh_token: String,
+    pub refresh_expires_at: u64,
+}
+
+/// Create a new authenticated session, returning access + refresh tokens.
+///
+/// Reusable across DIDComm and passkey authentication flows.
+pub async fn create_authenticated_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    did: &str,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<TokenResponse, AppError> {
+    let session_id = Uuid::new_v4().to_string();
+
+    let claims = JwtKeys::new_claims(
+        did.to_string(),
+        session_id.clone(),
+        role.to_string(),
+        access_expiry,
+    );
+    let access_expires_at = claims.exp;
+    let access_token = jwt_keys.encode(&claims)?;
+
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+
+    let session = Session {
+        session_id: session_id.clone(),
+        did: did.to_string(),
+        challenge: String::new(),
+        state: SessionState::Authenticated,
+        created_at: now_epoch(),
+        refresh_token: Some(refresh_token.clone()),
+        refresh_expires_at: Some(refresh_expires_at),
+    };
+
+    store_session(sessions, &session).await?;
+    store_refresh_index(sessions, &refresh_token, &session_id).await?;
+
+    Ok(TokenResponse {
+        session_id,
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+    })
 }

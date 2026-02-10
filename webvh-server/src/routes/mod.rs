@@ -3,6 +3,7 @@ mod auth;
 mod did_manage;
 mod did_public;
 mod health;
+mod passkey;
 mod stats;
 
 use axum::Router;
@@ -41,6 +42,11 @@ pub fn router() -> Router<AppState> {
         )
         // Stats (authenticated)
         .route("/stats/{mnemonic}", get(stats::get_did_stats))
+        // Passkey auth routes
+        .route("/auth/passkey/enroll/start", post(passkey::enroll_start))
+        .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish))
+        .route("/auth/passkey/login/start", post(passkey::login_start))
+        .route("/auth/passkey/login/finish", post(passkey::login_finish))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route("/acl/{did}", delete(acl::delete_acl));
