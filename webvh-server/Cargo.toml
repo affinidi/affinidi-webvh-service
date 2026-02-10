@@ -17,6 +17,7 @@ default = []
 ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+affinidi-webvh-common = { path = "../webvh-common" }
 affinidi-tdk = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.7"
 axum = "0.8"

@@ -1,16 +1,7 @@
-use serde::{Deserialize, Serialize};
+pub use affinidi_webvh_common::DidStats;
 
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
-
-/// Statistics for a hosted DID.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DidStats {
-    pub total_resolves: u64,
-    pub total_updates: u64,
-    pub last_resolved_at: Option<u64>,
-    pub last_updated_at: Option<u64>,
-}
 
 fn stats_key(mnemonic: &str) -> String {
     format!("stats:{mnemonic}")

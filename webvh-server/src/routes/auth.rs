@@ -1,16 +1,19 @@
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use serde::Deserialize;
 
 use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::didcomm::UnpackOptions;
+use affinidi_webvh_common::{
+    AuthenticateData, AuthenticateResponse, ChallengeData, ChallengeResponse, RefreshData,
+    RefreshResponse,
+};
 
 use crate::acl::check_acl;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::{
-    Session, SessionState, get_session, get_session_by_refresh, now_epoch, store_refresh_index,
-    store_session, update_session,
+    Session, SessionState, finalize_challenge_session, get_session, get_session_by_refresh,
+    now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -23,18 +26,6 @@ pub struct ChallengeRequest {
     pub did: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChallengeResponse {
-    pub session_id: String,
-    pub data: ChallengeData,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChallengeData {
-    pub challenge: String,
-}
-
 pub async fn challenge(
     State(state): State<AppState>,
     Json(req): Json<ChallengeRequest>,
@@ -43,7 +34,7 @@ pub async fn challenge(
     let acl = state.acl_ks.clone();
     check_acl(&acl, &req.did).await?;
 
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = uuid::Uuid::new_v4().to_string();
 
     // Generate 32-byte random challenge as hex
     let mut challenge_bytes = [0u8; 32];
@@ -72,22 +63,6 @@ pub async fn challenge(
 }
 
 // ---------- POST /auth/ ----------
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthenticateResponse {
-    pub session_id: String,
-    pub data: AuthenticateData,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthenticateData {
-    pub access_token: String,
-    pub access_expires_at: u64,
-    pub refresh_token: String,
-    pub refresh_expires_at: u64,
-}
 
 pub async fn authenticate(
     State(state): State<AppState>,
@@ -162,75 +137,40 @@ pub async fn authenticate(
     }
 
     // Check challenge TTL
-    {
-        let config = state.config.read().await;
-        let challenge_ttl = config.auth.challenge_ttl;
-        drop(config);
-        if now_epoch().saturating_sub(session.created_at) > challenge_ttl {
-            warn!(session_id, "authentication rejected: challenge expired");
-            return Err(AppError::Authentication("challenge expired".into()));
-        }
+    if now_epoch().saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
+        warn!(session_id, "authentication rejected: challenge expired");
+        return Err(AppError::Authentication("challenge expired".into()));
     }
 
     // Look up ACL entry to get role for the token
     let acl = state.acl_ks.clone();
     let role = check_acl(&acl, &session.did).await?;
 
-    // Generate tokens
-    let config = state.config.read().await;
-    let access_expiry = config.auth.access_token_expiry;
-    let refresh_expiry = config.auth.refresh_token_expiry;
-    drop(config);
-
-    let claims = JwtKeys::new_claims(
-        session.did.clone(),
-        session.session_id.clone(),
-        role.to_string(),
-        access_expiry,
-    );
-    let access_expires_at = claims.exp;
-    let access_token = jwt_keys.encode(&claims)?;
-
-    let refresh_token = Uuid::new_v4().to_string();
-    let refresh_expires_at = now_epoch() + refresh_expiry;
-
-    // Update session to Authenticated
-    session.state = SessionState::Authenticated;
-    session.refresh_token = Some(refresh_token.clone());
-    session.refresh_expires_at = Some(refresh_expires_at);
-    update_session(&sessions, &session).await?;
-
-    // Store reverse refresh index
-    store_refresh_index(&sessions, &refresh_token, &session.session_id).await?;
+    // Generate tokens and finalize session
+    let token_resp = finalize_challenge_session(
+        &sessions,
+        jwt_keys,
+        &mut session,
+        &role,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
 
     info!(did = %session.did, session_id = %session.session_id, "authentication successful");
 
     Ok(Json(AuthenticateResponse {
-        session_id: session.session_id,
+        session_id: token_resp.session_id,
         data: AuthenticateData {
-            access_token,
-            access_expires_at,
-            refresh_token,
-            refresh_expires_at,
+            access_token: token_resp.access_token,
+            access_expires_at: token_resp.access_expires_at,
+            refresh_token: token_resp.refresh_token,
+            refresh_expires_at: token_resp.refresh_expires_at,
         },
     }))
 }
 
 // ---------- POST /auth/refresh ----------
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshResponse {
-    pub session_id: String,
-    pub data: RefreshData,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshData {
-    pub access_token: String,
-    pub access_expires_at: u64,
-}
 
 pub async fn refresh(
     State(state): State<AppState>,
@@ -298,15 +238,11 @@ pub async fn refresh(
     let role = check_acl(&acl, &session.did).await?;
 
     // Generate new access token
-    let config = state.config.read().await;
-    let access_expiry = config.auth.access_token_expiry;
-    drop(config);
-
     let claims = JwtKeys::new_claims(
         session.did.clone(),
         session.session_id.clone(),
         role.to_string(),
-        access_expiry,
+        state.config.auth.access_token_expiry,
     );
     let access_expires_at = claims.exp;
     let access_token = jwt_keys.encode(&claims)?;

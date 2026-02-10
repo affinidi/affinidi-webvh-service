@@ -17,7 +17,6 @@ use crate::passkey;
 use crate::routes;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
@@ -27,7 +26,7 @@ pub struct AppState {
     pub acl_ks: KeyspaceHandle,
     pub dids_ks: KeyspaceHandle,
     pub stats_ks: KeyspaceHandle,
-    pub config: Arc<RwLock<AppConfig>>,
+    pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
@@ -71,7 +70,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         acl_ks,
         dids_ks,
         stats_ks,
-        config: Arc::new(RwLock::new(config)),
+        config: Arc::new(config),
         did_resolver,
         secrets_resolver,
         jwt_keys,

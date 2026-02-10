@@ -6,16 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-affinidi-tdk = { workspace = true }
-affinidi-did-resolver-cache-sdk = { workspace = true }
-didwebvh-rs = { workspace = true }
-reqwest = { workspace = true }
+affinidi-webvh-common = { path = "../webvh-common" }
 tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
-url = { workspace = true }

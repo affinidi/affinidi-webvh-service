@@ -17,6 +17,11 @@ export interface CreateDidResponse {
   didUrl: string;
 }
 
+export interface CheckNameResponse {
+  available: boolean;
+  path: string;
+}
+
 export interface AclEntry {
   did: string;
   role: "admin" | "owner";
@@ -121,69 +126,84 @@ async function request<T>(
 }
 
 export const api = {
-  health: () => request<HealthResponse>("/health"),
+  health: () => request<HealthResponse>("/api/health"),
 
-  listDids: () => request<DidRecord[]>("/dids"),
+  listDids: () => request<DidRecord[]>("/api/dids"),
 
-  createDid: () =>
-    request<CreateDidResponse>("/dids", { method: "POST" }),
+  createDid: (path?: string) =>
+    request<CreateDidResponse>("/api/dids", {
+      method: "POST",
+      ...(path
+        ? {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path }),
+          }
+        : {}),
+    }),
+
+  checkName: (path: string) =>
+    request<CheckNameResponse>("/api/dids/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
 
   uploadDid: (mnemonic: string, body: string) =>
-    request<void>(`/dids/${mnemonic}`, {
+    request<void>(`/api/dids/${mnemonic}`, {
       method: "PUT",
       headers: { "Content-Type": "text/plain" },
       body,
     }),
 
   uploadWitness: (mnemonic: string, body: string) =>
-    request<void>(`/dids/${mnemonic}/witness`, {
+    request<void>(`/api/witness/${mnemonic}`, {
       method: "PUT",
       headers: { "Content-Type": "text/plain" },
       body,
     }),
 
   deleteDid: (mnemonic: string) =>
-    request<void>(`/dids/${mnemonic}`, { method: "DELETE" }),
+    request<void>(`/api/dids/${mnemonic}`, { method: "DELETE" }),
 
   getStats: (mnemonic: string) =>
-    request<DidStats>(`/stats/${mnemonic}`),
+    request<DidStats>(`/api/stats/${mnemonic}`),
 
-  listAcl: () => request<AclListResponse>("/acl"),
+  listAcl: () => request<AclListResponse>("/api/acl"),
 
   createAcl: (did: string, role: "admin" | "owner", label?: string) =>
-    request<AclEntry>("/acl", {
+    request<AclEntry>("/api/acl", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ did, role, label }),
     }),
 
   deleteAcl: (did: string) =>
-    request<void>(`/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
+    request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
 
   // Passkey auth
   passkeyEnrollStart: (token: string) =>
-    request<EnrollStartResponse>("/auth/passkey/enroll/start", {
+    request<EnrollStartResponse>("/api/auth/passkey/enroll/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token }),
     }),
 
   passkeyEnrollFinish: (registrationId: string, credential: any) =>
-    request<TokenResponse>("/auth/passkey/enroll/finish", {
+    request<TokenResponse>("/api/auth/passkey/enroll/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ registration_id: registrationId, credential }),
     }),
 
   passkeyLoginStart: () =>
-    request<LoginStartResponse>("/auth/passkey/login/start", {
+    request<LoginStartResponse>("/api/auth/passkey/login/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     }),
 
   passkeyLoginFinish: (authId: string, credential: any) =>
-    request<TokenResponse>("/auth/passkey/login/finish", {
+    request<TokenResponse>("/api/auth/passkey/login/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ auth_id: authId, credential }),

@@ -347,6 +347,18 @@ dependencies = [
 [[package]]
 name = "affinidi-webvh-common"
 version = "0.0.1"
+dependencies = [
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-tdk",
+ "didwebvh-rs",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "affinidi-webvh-server"
@@ -354,6 +366,7 @@ version = "0.0.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk",
+ "affinidi-webvh-common",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -6579,19 +6592,12 @@ dependencies = [
 name = "webvh-example"
 version = "0.1.0"
 dependencies = [
- "affinidi-did-resolver-cache-sdk",
- "affinidi-tdk",
+ "affinidi-webvh-common",
  "anyhow",
  "clap",
- "didwebvh-rs",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

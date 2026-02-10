@@ -16,7 +16,8 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { DidStats } from "../../lib/api";
 
 export default function DidDetail() {
-  const { mnemonic } = useLocalSearchParams<{ mnemonic: string }>();
+  const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
+  const mnemonic = Array.isArray(rawMnemonic) ? rawMnemonic.join("/") : rawMnemonic;
   const api = useApi();
   const { isAuthenticated } = useAuth();
   const router = useRouter();
@@ -73,28 +74,19 @@ export default function DidDetail() {
 
   const handleDelete = async () => {
     if (!mnemonic) return;
-    Alert.alert(
-      "Delete DID",
+    const confirmed = window.confirm(
       `Are you sure you want to delete "${mnemonic}"? This cannot be undone.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            setDeleting(true);
-            try {
-              await api.deleteDid(mnemonic);
-              router.replace("/dids");
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : "Delete failed";
-              Alert.alert("Error", msg);
-              setDeleting(false);
-            }
-          },
-        },
-      ],
     );
+    if (!confirmed) return;
+    setDeleting(true);
+    try {
+      await api.deleteDid(mnemonic);
+      router.replace("/dids");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Delete failed";
+      Alert.alert("Error", msg);
+      setDeleting(false);
+    }
   };
 
   if (!isAuthenticated) {

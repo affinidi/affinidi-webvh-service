@@ -160,6 +160,45 @@ pub struct TokenResponse {
     pub refresh_expires_at: u64,
 }
 
+/// Upgrade an existing `ChallengeSent` session to `Authenticated`, generating
+/// tokens and storing the refresh index. Used by DIDComm auth which preserves
+/// the original session_id from the challenge phase.
+pub async fn finalize_challenge_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    session: &mut Session,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<TokenResponse, AppError> {
+    let claims = JwtKeys::new_claims(
+        session.did.clone(),
+        session.session_id.clone(),
+        role.to_string(),
+        access_expiry,
+    );
+    let access_expires_at = claims.exp;
+    let access_token = jwt_keys.encode(&claims)?;
+
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+
+    session.state = SessionState::Authenticated;
+    session.refresh_token = Some(refresh_token.clone());
+    session.refresh_expires_at = Some(refresh_expires_at);
+    update_session(sessions, session).await?;
+
+    store_refresh_index(sessions, &refresh_token, &session.session_id).await?;
+
+    Ok(TokenResponse {
+        session_id: session.session_id.clone(),
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+    })
+}
+
 /// Create a new authenticated session, returning access + refresh tokens.
 ///
 /// Reusable across DIDComm and passkey authentication flows.

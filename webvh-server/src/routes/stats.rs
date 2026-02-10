@@ -12,12 +12,14 @@ pub async fn get_did_stats(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<Json<DidStats>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+
     // Verify the DID exists
     let key = format!("did:{mnemonic}");
     if !state.dids_ks.contains_key(key).await? {
         return Err(AppError::NotFound(format!("DID not found: {mnemonic}")));
     }
 
-    let stats = get_stats(&state.stats_ks, &mnemonic).await?;
+    let stats = get_stats(&state.stats_ks, mnemonic).await?;
     Ok(Json(stats))
 }

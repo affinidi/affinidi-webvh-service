@@ -13,3 +13,13 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+affinidi-tdk = { workspace = true }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+didwebvh-rs = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

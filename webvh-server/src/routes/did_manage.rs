@@ -3,13 +3,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+
 use crate::acl::Role;
 use crate::auth::AuthClaims;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
-use crate::mnemonic::generate_unique_mnemonic;
+use crate::mnemonic::{generate_unique_mnemonic, is_path_available, validate_custom_path};
 use crate::server::AppState;
 use crate::stats;
+use crate::store::KeyspaceHandle;
 use tracing::info;
 
 /// A record tracking a hosted DID.
@@ -38,20 +41,66 @@ fn owner_key(did: &str, mnemonic: &str) -> String {
     format!("owner:{did}:{mnemonic}")
 }
 
+/// Load a DID record and verify the caller is the owner (or admin).
+async fn get_authorized_record(
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    auth: &AuthClaims,
+) -> Result<DidRecord, AppError> {
+    let record: DidRecord = dids_ks
+        .get(did_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
+    if record.owner != auth.did && auth.role != Role::Admin {
+        return Err(AppError::Forbidden("not the owner of this DID".into()));
+    }
+    Ok(record)
+}
+
+// ---------- POST /dids/check ----------
+
+#[derive(Debug, Deserialize)]
+pub struct CheckNameRequest {
+    pub path: String,
+}
+
+pub async fn check_name(
+    _auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<CheckNameRequest>,
+) -> Result<Json<CheckNameResponse>, AppError> {
+    validate_custom_path(&req.path)?;
+    let available = is_path_available(&state.dids_ks, &req.path).await?;
+    Ok(Json(CheckNameResponse {
+        available,
+        path: req.path,
+    }))
+}
+
 // ---------- POST /dids ----------
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestUriResponse {
-    pub mnemonic: String,
-    pub did_url: String,
+#[derive(Debug, Deserialize, Default)]
+pub struct RequestUriRequest {
+    pub path: Option<String>,
 }
 
 pub async fn request_uri(
     auth: AuthClaims,
     State(state): State<AppState>,
+    body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
-    let mnemonic = generate_unique_mnemonic(&state.dids_ks).await?;
+    let mnemonic = match body.and_then(|b| b.0.path) {
+        Some(custom_path) => {
+            validate_custom_path(&custom_path)?;
+            if !is_path_available(&state.dids_ks, &custom_path).await? {
+                return Err(AppError::Conflict(format!(
+                    "path '{custom_path}' is already taken"
+                )));
+            }
+            custom_path
+        }
+        None => generate_unique_mnemonic(&state.dids_ks).await?,
+    };
 
     let now = now_epoch();
     let record = DidRecord {
@@ -75,12 +124,11 @@ pub async fn request_uri(
         .await?;
 
     // Build the public DID URL
-    let config = state.config.read().await;
-    let base_url = config
+    let base_url = state
+        .config
         .public_url
         .clone()
-        .unwrap_or_else(|| format!("http://{}:{}", config.server.host, config.server.port));
-    drop(config);
+        .unwrap_or_else(|| format!("http://{}:{}", state.config.server.host, state.config.server.port));
 
     let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
@@ -100,16 +148,8 @@ pub async fn upload_did(
     Path(mnemonic): Path<String>,
     body: String,
 ) -> Result<StatusCode, AppError> {
-    let mut record: DidRecord = state
-        .dids_ks
-        .get(did_key(&mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
-
-    // Only owner or admin can upload
-    if record.owner != auth.did && auth.role != Role::Admin {
-        return Err(AppError::Forbidden("not the owner of this DID".into()));
-    }
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     if body.is_empty() {
         return Err(AppError::Validation("did.jsonl content cannot be empty".into()));
@@ -142,16 +182,8 @@ pub async fn upload_witness(
     Path(mnemonic): Path<String>,
     body: String,
 ) -> Result<StatusCode, AppError> {
-    let record: DidRecord = state
-        .dids_ks
-        .get(did_key(&mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
-
-    // Only owner or admin can upload
-    if record.owner != auth.did && auth.role != Role::Admin {
-        return Err(AppError::Forbidden("not the owner of this DID".into()));
-    }
+    let mnemonic = mnemonic.trim_start_matches('/');
+    get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     if body.is_empty() {
         return Err(AppError::Validation(
@@ -177,16 +209,8 @@ pub async fn delete_did(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let record: DidRecord = state
-        .dids_ks
-        .get(did_key(&mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
-
-    // Only owner or admin can delete
-    if record.owner != auth.did && auth.role != Role::Admin {
-        return Err(AppError::Forbidden("not the owner of this DID".into()));
-    }
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     // Remove all associated data
     state.dids_ks.remove(did_key(&mnemonic)).await?;
@@ -206,15 +230,6 @@ pub async fn delete_did(
 }
 
 // ---------- GET /dids ----------
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DidListEntry {
-    pub mnemonic: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub version_count: u64,
-}
 
 pub async fn list_dids(
     auth: AuthClaims,

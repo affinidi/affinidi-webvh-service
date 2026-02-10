@@ -174,18 +174,13 @@ pub async fn enroll_finish(
     let role = check_acl(&state.acl_ks, &user.did).await?;
 
     // Issue session
-    let config = state.config.read().await;
-    let access_expiry = config.auth.access_token_expiry;
-    let refresh_expiry = config.auth.refresh_token_expiry;
-    drop(config);
-
     let token_resp = create_authenticated_session(
         &state.sessions_ks,
         jwt_keys,
         &user.did,
         &role,
-        access_expiry,
-        refresh_expiry,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
     )
     .await?;
 
@@ -275,18 +270,13 @@ pub async fn login_finish(
     let role = check_acl(&state.acl_ks, &user.did).await?;
 
     // Issue session
-    let config = state.config.read().await;
-    let access_expiry = config.auth.access_token_expiry;
-    let refresh_expiry = config.auth.refresh_token_expiry;
-    drop(config);
-
     let token_resp = create_authenticated_session(
         &state.sessions_ks,
         jwt_keys,
         &user.did,
         &role,
-        access_expiry,
-        refresh_expiry,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
     )
     .await?;
 
