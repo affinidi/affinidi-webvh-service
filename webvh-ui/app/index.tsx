@@ -35,6 +35,20 @@ export default function Dashboard() {
       .catch(() => {});
   }, [isAuthenticated, api]);
 
+  if (!isAuthenticated) {
+    return (
+      <View style={styles.container}>
+        <AffinidiLogo size={48} />
+        <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
+        <Link href="/login" asChild>
+          <Pressable style={styles.buttonPrimary}>
+            <Text style={styles.buttonPrimaryText}>Login</Text>
+          </Pressable>
+        </Link>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
       <AffinidiLogo size={48} />
@@ -55,7 +69,7 @@ export default function Dashboard() {
             <Text style={styles.cardLabel}>Version</Text>
             <Text style={styles.cardValue}>{health.version}</Text>
           </View>
-          {isAuthenticated && didCount !== null && (
+          {didCount !== null && (
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Total DIDs</Text>
               <Text style={styles.cardValueAccent}>{didCount}</Text>
@@ -67,13 +81,6 @@ export default function Dashboard() {
       )}
 
       <View style={styles.nav}>
-        {!isAuthenticated && (
-          <Link href="/login" asChild>
-            <Pressable style={styles.buttonPrimary}>
-              <Text style={styles.buttonPrimaryText}>Login</Text>
-            </Pressable>
-          </Link>
-        )}
         <Link href="/dids" asChild>
           <Pressable style={styles.buttonSecondary}>
             <Text style={styles.buttonSecondaryText}>Manage DIDs</Text>
@@ -84,11 +91,9 @@ export default function Dashboard() {
             <Text style={styles.buttonSecondaryText}>Access Control</Text>
           </Pressable>
         </Link>
-        {isAuthenticated && (
-          <Pressable style={styles.logoutButton} onPress={logout}>
-            <Text style={styles.logoutButtonText}>Logout</Text>
-          </Pressable>
-        )}
+        <Pressable style={styles.logoutButton} onPress={logout}>
+          <Text style={styles.logoutButtonText}>Logout</Text>
+        </Pressable>
       </View>
     </View>
   );
