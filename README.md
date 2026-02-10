@@ -6,6 +6,7 @@ WebVH DID requires supporting infrastructure for it to work to it's full potenti
 - WebVH Witness
 - WebVH Watcher
 - WebVH Common
+- WebVH Example
 
 > **IMPORTANT:**
 > affinidi-webvh-service crate is provided "as is" without any warranties or guarantees,
@@ -16,7 +17,53 @@ WebVH DID requires supporting infrastructure for it to work to it's full potenti
 
 ## Requirements
 
-- Rust (1.88.0) 2024 Edition
+- Rust (1.91.0) 2024 Edition
+
+## WebVH Example
+
+The `webvh-example` crate is a standalone CLI that demonstrates the full flow of
+programmatically creating a `did:webvh` DID and uploading it to a running
+webvh-server. It handles DIDComm v2 authentication, DID document construction,
+WebVH log entry creation, and upload — all in a single binary.
+
+### Building
+
+```sh
+cargo build -p webvh-example
+```
+
+### Usage
+
+1. Start the webvh-server with DIDComm authentication configured.
+
+2. Run the example, pointing it at the server:
+
+   ```sh
+   cargo run -p webvh-example -- --server-url http://localhost:8085
+   ```
+
+3. The example will generate a `did:key` identity and pause, printing the DID:
+
+   ```
+   Generated DID: did:key:z6Mk...
+   Ensure this DID is in the server ACL (e.g. via webvh-server invite).
+   Press Enter to continue...
+   ```
+
+   Add the printed DID to the server's ACL (for example, by running the
+   webvh-server `invite` command in another terminal), then press Enter.
+
+4. The example will authenticate, create the DID, upload it, and verify
+   resolution. On success it prints a summary:
+
+   ```
+   DID Created and Hosted Successfully!
+     Mnemonic:   apple-banana
+     SCID:       FHcGtSJ...
+     DID URL:    http://localhost:8085/apple-banana/did.jsonl
+     DID:        did:webvh:FHcGtSJ...:localhost%3A8085:apple-banana
+     Public Key: z6Mk...
+   ```
 
 ## Support & feedback
 

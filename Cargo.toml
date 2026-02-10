@@ -1,5 +1,5 @@
 [workspace]
-members = ["webvh-common", "webvh-server", "webvh-watcher", "webvh-witness"]
+members = ["webvh-common", "webvh-example", "webvh-server", "webvh-watcher", "webvh-witness"]
 resolver = "3"
 
 [workspace.package]
@@ -74,6 +74,18 @@ dialoguer = "0.12"
 # Static file embedding (for UI feature)
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
+
+# DID resolver
+affinidi-did-resolver-cache-sdk = "0.7"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Error handling (lightweight)
+anyhow = "1"
+
+# DID WebVH
+didwebvh-rs = "0.1"
 
 # Logging / tracing
 tracing = "0.1"
