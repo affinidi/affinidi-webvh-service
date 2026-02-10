@@ -1,6 +1,6 @@
 mod acl;
 mod auth;
-mod did_manage;
+pub(crate) mod did_manage;
 mod did_public;
 mod health;
 mod passkey;
@@ -25,11 +25,14 @@ pub fn router() -> Router<AppState> {
         .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
         .route(
             "/dids/{*mnemonic}",
-            put(did_manage::upload_did).delete(did_manage::delete_did),
+            get(did_manage::get_did)
+                .put(did_manage::upload_did)
+                .delete(did_manage::delete_did),
         )
         // Witness upload (separate prefix so the catch-all doesn't eat /witness)
         .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
         // Stats (authenticated)
+        .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
         // Passkey auth routes
         .route("/auth/passkey/enroll/start", post(passkey::enroll_start))

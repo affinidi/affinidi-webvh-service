@@ -67,6 +67,9 @@ pub struct AuthConfig {
     pub session_cleanup_interval: u64,
     #[serde(default = "default_passkey_enrollment_ttl")]
     pub passkey_enrollment_ttl: u64,
+    /// How long (in minutes) to keep empty DID records before auto-cleanup.
+    #[serde(default = "default_cleanup_ttl_minutes")]
+    pub cleanup_ttl_minutes: u64,
     /// Base64url-no-pad encoded 32-byte Ed25519 private key for JWT signing.
     pub jwt_signing_key: Option<String>,
 }
@@ -91,6 +94,10 @@ fn default_passkey_enrollment_ttl() -> u64 {
     86400
 }
 
+fn default_cleanup_ttl_minutes() -> u64 {
+    60
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -99,6 +106,7 @@ impl Default for AuthConfig {
             challenge_ttl: default_challenge_ttl(),
             session_cleanup_interval: default_session_cleanup_interval(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
+            cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
             jwt_signing_key: None,
         }
     }
@@ -241,6 +249,11 @@ impl AppConfig {
         if let Ok(ttl) = std::env::var("WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL") {
             config.auth.passkey_enrollment_ttl = ttl.parse().map_err(|e| {
                 AppError::Config(format!("invalid WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL: {e}"))
+            })?;
+        }
+        if let Ok(ttl) = std::env::var("WEBVH_CLEANUP_TTL_MINUTES") {
+            config.auth.cleanup_ttl_minutes = ttl.parse().map_err(|e| {
+                AppError::Config(format!("invalid WEBVH_CLEANUP_TTL_MINUTES: {e}"))
             })?;
         }
         if let Ok(key) = std::env::var("WEBVH_AUTH_JWT_SIGNING_KEY") {

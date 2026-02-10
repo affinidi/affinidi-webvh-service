@@ -144,3 +144,80 @@ impl KeyspaceHandle {
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+        };
+        let store = Store::open(&config).unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_roundtrip() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        ks.insert("key1", &"hello").await.unwrap();
+        let val: Option<String> = ks.get("key1").await.unwrap();
+        assert_eq!(val, Some("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_missing_returns_none() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        let val: Option<String> = ks.get("nonexistent").await.unwrap();
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_key() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        ks.insert("key1", &"hello").await.unwrap();
+        ks.remove("key1").await.unwrap();
+        let val: Option<String> = ks.get("key1").await.unwrap();
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn contains_key_true_false() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        assert!(!ks.contains_key("key1").await.unwrap());
+        ks.insert("key1", &"hello").await.unwrap();
+        assert!(ks.contains_key("key1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn insert_raw_and_get_raw_roundtrip() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        ks.insert_raw("raw1", b"raw-value".to_vec()).await.unwrap();
+        let val = ks.get_raw("raw1").await.unwrap();
+        assert_eq!(val, Some(b"raw-value".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn prefix_iter_raw_filters_correctly() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("test").unwrap();
+        ks.insert_raw("prefix:a", b"1".to_vec()).await.unwrap();
+        ks.insert_raw("prefix:b", b"2".to_vec()).await.unwrap();
+        ks.insert_raw("other:c", b"3".to_vec()).await.unwrap();
+        let results = ks.prefix_iter_raw("prefix:").await.unwrap();
+        assert_eq!(results.len(), 2);
+        let keys: Vec<String> = results
+            .iter()
+            .map(|(k, _)| String::from_utf8(k.clone()).unwrap())
+            .collect();
+        assert!(keys.contains(&"prefix:a".to_string()));
+        assert!(keys.contains(&"prefix:b".to_string()));
+    }
+}

@@ -9,7 +9,12 @@ import {
 import { ActivityIndicator, View } from "react-native";
 import { AuthProvider } from "../components/AuthProvider";
 import { ApiProvider } from "../components/ApiProvider";
+import { NavBar } from "../components/NavBar";
 import { colors } from "../lib/theme";
+
+function AppHeader() {
+  return <NavBar />;
+}
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({
@@ -39,30 +44,16 @@ export default function RootLayout() {
       <ApiProvider>
         <Stack
           screenOptions={{
-            headerStyle: { backgroundColor: colors.bgHeader },
-            headerTintColor: colors.textPrimary,
-            headerTitleStyle: {
-              fontWeight: "600",
-              fontFamily: "Figtree_600SemiBold",
-            },
+            header: () => <AppHeader />,
             contentStyle: { backgroundColor: colors.bgPrimary },
           }}
         >
-          <Stack.Screen name="index" options={{ title: "Dashboard" }} />
-          <Stack.Screen name="login" options={{ title: "Authenticate" }} />
-          <Stack.Screen name="dids/index" options={{ title: "DIDs" }} />
-          <Stack.Screen
-            name="dids/[mnemonic]"
-            options={{ title: "DID Detail" }}
-          />
-          <Stack.Screen
-            name="acl/index"
-            options={{ title: "Access Control" }}
-          />
-          <Stack.Screen
-            name="enroll"
-            options={{ title: "Enroll Passkey" }}
-          />
+          <Stack.Screen name="index" />
+          <Stack.Screen name="login" />
+          <Stack.Screen name="dids/index" />
+          <Stack.Screen name="dids/[mnemonic]" />
+          <Stack.Screen name="acl/index" />
+          <Stack.Screen name="enroll" />
         </Stack>
       </ApiProvider>
     </AuthProvider>

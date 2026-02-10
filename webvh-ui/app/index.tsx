@@ -11,13 +11,13 @@ import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { HealthResponse } from "../lib/api";
+import type { HealthResponse, ServerStats } from "../lib/api";
 
 export default function Dashboard() {
-  const { isAuthenticated, logout } = useAuth();
+  const { isAuthenticated } = useAuth();
   const api = useApi();
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [didCount, setDidCount] = useState<number | null>(null);
+  const [serverStats, setServerStats] = useState<ServerStats | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -30,8 +30,8 @@ export default function Dashboard() {
   useEffect(() => {
     if (!isAuthenticated) return;
     api
-      .listDids()
-      .then((dids) => setDidCount(dids.length))
+      .getServerStats()
+      .then(setServerStats)
       .catch(() => {});
   }, [isAuthenticated, api]);
 
@@ -69,32 +69,26 @@ export default function Dashboard() {
             <Text style={styles.cardLabel}>Version</Text>
             <Text style={styles.cardValue}>{health.version}</Text>
           </View>
-          {didCount !== null && (
-            <View style={styles.card}>
-              <Text style={styles.cardLabel}>Total DIDs</Text>
-              <Text style={styles.cardValueAccent}>{didCount}</Text>
-            </View>
+          {serverStats && (
+            <>
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Total DIDs</Text>
+                <Text style={styles.cardValueAccent}>{serverStats.totalDids}</Text>
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Total Resolves</Text>
+                <Text style={styles.cardValue}>{serverStats.totalResolves}</Text>
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Total Updates</Text>
+                <Text style={styles.cardValue}>{serverStats.totalUpdates}</Text>
+              </View>
+            </>
           )}
         </View>
       ) : (
         <ActivityIndicator color={colors.accent} size="large" />
       )}
-
-      <View style={styles.nav}>
-        <Link href="/dids" asChild>
-          <Pressable style={styles.buttonSecondary}>
-            <Text style={styles.buttonSecondaryText}>Manage DIDs</Text>
-          </Pressable>
-        </Link>
-        <Link href="/acl" asChild>
-          <Pressable style={styles.buttonSecondary}>
-            <Text style={styles.buttonSecondaryText}>Access Control</Text>
-          </Pressable>
-        </Link>
-        <Pressable style={styles.logoutButton} onPress={logout}>
-          <Text style={styles.logoutButtonText}>Logout</Text>
-        </Pressable>
-      </View>
     </View>
   );
 }
@@ -168,12 +162,6 @@ const styles = StyleSheet.create({
     color: colors.error,
     fontSize: 14,
   },
-  nav: {
-    marginTop: spacing.lg,
-    gap: spacing.md,
-    width: "100%",
-    maxWidth: 500,
-  },
   buttonPrimary: {
     backgroundColor: colors.accent,
     borderRadius: radii.md,
@@ -183,35 +171,6 @@ const styles = StyleSheet.create({
   },
   buttonPrimaryText: {
     color: colors.textOnAccent,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-  },
-  buttonSecondary: {
-    backgroundColor: colors.bgTertiary,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 14,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-  },
-  buttonSecondaryText: {
-    color: colors.textPrimary,
-    fontSize: 16,
-    fontFamily: fonts.medium,
-  },
-  logoutButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.error,
-    paddingVertical: 14,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-    marginTop: spacing.md,
-  },
-  logoutButtonText: {
-    color: colors.error,
     fontSize: 16,
     fontFamily: fonts.semibold,
   },

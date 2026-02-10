@@ -47,3 +47,24 @@ pub async fn delete_stats(
 ) -> Result<(), AppError> {
     stats_ks.remove(stats_key(mnemonic)).await
 }
+
+/// Aggregate stats across all DIDs.
+pub async fn aggregate_stats(stats_ks: &KeyspaceHandle) -> Result<DidStats, AppError> {
+    let raw = stats_ks.prefix_iter_raw("stats:").await?;
+    let mut agg = DidStats::default();
+    for (_key, value) in raw {
+        if let Ok(s) = serde_json::from_slice::<DidStats>(&value) {
+            agg.total_resolves += s.total_resolves;
+            agg.total_updates += s.total_updates;
+            agg.last_resolved_at = match (agg.last_resolved_at, s.last_resolved_at) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            agg.last_updated_at = match (agg.last_updated_at, s.last_updated_at) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    Ok(agg)
+}

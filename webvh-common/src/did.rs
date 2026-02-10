@@ -98,3 +98,53 @@ pub fn create_log_entry(
 
     Ok((scid, jsonl))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_host_with_port() {
+        let result = encode_host("http://localhost:8085").unwrap();
+        assert_eq!(result, "localhost%3A8085");
+    }
+
+    #[test]
+    fn encode_host_without_port() {
+        let result = encode_host("https://example.com").unwrap();
+        assert_eq!(result, "example.com");
+    }
+
+    #[test]
+    fn encode_host_invalid_url() {
+        assert!(encode_host("not-a-url").is_err());
+    }
+
+    #[test]
+    fn build_did_document_correct_did_id() {
+        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...");
+        let id = doc["id"].as_str().unwrap();
+        assert!(id.starts_with("did:webvh:{SCID}:example.com%3A8085:"));
+        assert!(id.ends_with(":mypath"));
+    }
+
+    #[test]
+    fn build_did_document_nested_path() {
+        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...");
+        let id = doc["id"].as_str().unwrap();
+        assert!(id.contains(":people:staff:glenn"));
+        assert!(!id.contains('/'));
+    }
+
+    #[test]
+    fn build_did_document_structure() {
+        let doc = build_did_document("example.com", "test", "z6MkPubKey");
+        assert!(doc["@context"].is_array());
+        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
+        assert!(doc["authentication"].is_array());
+        assert!(doc["verificationMethod"].is_array());
+        let vm = &doc["verificationMethod"][0];
+        assert_eq!(vm["type"], "Multikey");
+        assert_eq!(vm["publicKeyMultibase"], "z6MkPubKey");
+    }
+}

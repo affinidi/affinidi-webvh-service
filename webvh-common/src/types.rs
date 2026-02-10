@@ -90,6 +90,7 @@ pub struct DidListEntry {
     pub created_at: u64,
     pub updated_at: u64,
     pub version_count: u64,
+    pub did_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -103,6 +104,80 @@ pub struct DidStats {
 // ---------------------------------------------------------------------------
 // High-level create result
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn did_list_entry_serializes_camel_case() {
+        let entry = DidListEntry {
+            mnemonic: "test".to_string(),
+            created_at: 1000,
+            updated_at: 2000,
+            version_count: 1,
+            did_id: Some("did:webvh:abc:host:path".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"createdAt\""));
+        assert!(json.contains("\"updatedAt\""));
+        assert!(json.contains("\"versionCount\""));
+        assert!(json.contains("\"didId\""));
+        assert!(!json.contains("\"created_at\""));
+        assert!(!json.contains("\"updated_at\""));
+        assert!(!json.contains("\"version_count\""));
+        assert!(!json.contains("\"did_id\""));
+    }
+
+    #[test]
+    fn did_list_entry_did_id_none_serializes_as_null() {
+        let entry = DidListEntry {
+            mnemonic: "test".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 0,
+            did_id: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"didId\":null"));
+    }
+
+    #[test]
+    fn did_list_entry_roundtrip() {
+        let entry = DidListEntry {
+            mnemonic: "test".to_string(),
+            created_at: 1000,
+            updated_at: 2000,
+            version_count: 3,
+            did_id: Some("did:webvh:abc:host:path".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: DidListEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mnemonic, "test");
+        assert_eq!(back.version_count, 3);
+        assert_eq!(back.did_id, Some("did:webvh:abc:host:path".to_string()));
+    }
+
+    #[test]
+    fn did_stats_default_values() {
+        let stats = DidStats::default();
+        assert_eq!(stats.total_resolves, 0);
+        assert_eq!(stats.total_updates, 0);
+        assert_eq!(stats.last_resolved_at, None);
+        assert_eq!(stats.last_updated_at, None);
+    }
+
+    #[test]
+    fn request_uri_response_camel_case() {
+        let resp = RequestUriResponse {
+            mnemonic: "test".to_string(),
+            did_url: "http://example.com/test/did.jsonl".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"didUrl\""));
+        assert!(!json.contains("\"did_url\""));
+    }
+}
 
 /// Result of the high-level `create_did` operation.
 #[derive(Debug)]

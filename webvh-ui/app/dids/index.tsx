@@ -102,11 +102,6 @@ export default function DidList() {
     return (
       <View style={styles.containerCenter}>
         <Text style={styles.hint}>Please log in to manage DIDs.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
       </View>
     );
   }
@@ -208,6 +203,13 @@ export default function DidList() {
             <Link href={`/dids/${item.mnemonic}`} asChild>
               <Pressable style={styles.card}>
                 <Text style={styles.mnemonic}>{item.mnemonic}</Text>
+                {item.versionCount === 0 ? (
+                  <Text style={styles.statusPending}>Pending upload</Text>
+                ) : (
+                  <Text style={styles.statusActive}>
+                    {item.didId ?? "Uploaded"}
+                  </Text>
+                )}
                 <View style={styles.meta}>
                   <Text style={styles.metaText}>
                     Versions: {item.versionCount}
@@ -308,6 +310,18 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontWeight: "600",
     color: colors.accent,
+    marginBottom: spacing.sm,
+  },
+  statusPending: {
+    fontSize: 13,
+    fontFamily: fonts.medium,
+    color: colors.warning,
+    marginBottom: spacing.sm,
+  },
+  statusActive: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.success,
     marginBottom: spacing.sm,
   },
   meta: {

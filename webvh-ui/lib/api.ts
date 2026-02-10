@@ -10,6 +10,32 @@ export interface DidRecord {
   createdAt: number;
   updatedAt: number;
   versionCount: number;
+  didId: string | null;
+}
+
+export interface LogMetadata {
+  logEntryCount: number;
+  latestVersionId: string | null;
+  latestVersionTime: string | null;
+  method: string | null;
+  portable: boolean;
+  preRotation: boolean;
+  witnesses: boolean;
+  witnessCount: number;
+  witnessThreshold: number;
+  watchers: boolean;
+  watcherCount: number;
+  deactivated: boolean;
+  ttl: number | null;
+}
+
+export interface DidDetailResponse {
+  mnemonic: string;
+  createdAt: number;
+  updatedAt: number;
+  versionCount: number;
+  didId: string | null;
+  log: LogMetadata | null;
 }
 
 export interface CreateDidResponse {
@@ -38,6 +64,14 @@ export interface DidStats {
   total_updates: number;
   last_resolved_at: number | null;
   last_updated_at: number | null;
+}
+
+export interface ServerStats {
+  totalDids: number;
+  totalResolves: number;
+  totalUpdates: number;
+  lastResolvedAt: number | null;
+  lastUpdatedAt: number | null;
 }
 
 export interface TokenResponse {
@@ -130,6 +164,9 @@ export const api = {
 
   listDids: () => request<DidRecord[]>("/api/dids"),
 
+  getDid: (mnemonic: string) =>
+    request<DidDetailResponse>(`/api/dids/${mnemonic}`),
+
   createDid: (path?: string) =>
     request<CreateDidResponse>("/api/dids", {
       method: "POST",
@@ -167,6 +204,8 @@ export const api = {
 
   getStats: (mnemonic: string) =>
     request<DidStats>(`/api/stats/${mnemonic}`),
+
+  getServerStats: () => request<ServerStats>("/api/stats"),
 
   listAcl: () => request<AclListResponse>("/api/acl"),
 

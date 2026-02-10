@@ -10,10 +10,11 @@ import {
   Alert,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import type { DidStats } from "../../lib/api";
+import type { DidStats, DidDetailResponse } from "../../lib/api";
 
 export default function DidDetail() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
@@ -24,22 +25,35 @@ export default function DidDetail() {
 
   const [stats, setStats] = useState<DidStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
+  const [didDetail, setDidDetail] = useState<DidDetailResponse | null>(null);
+  const [copied, setCopied] = useState(false);
   const [didContent, setDidContent] = useState("");
   const [witnessContent, setWitnessContent] = useState("");
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  const loadStats = useCallback(() => {
+  const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
     api
       .getStats(mnemonic)
       .then(setStats)
       .catch((e) => setStatsError(e.message));
+    api
+      .getDid(mnemonic)
+      .then(setDidDetail)
+      .catch(() => {});
   }, [api, mnemonic, isAuthenticated]);
 
   useEffect(() => {
-    loadStats();
-  }, [loadStats]);
+    loadData();
+  }, [loadData]);
+
+  const handleCopyDidId = async () => {
+    if (!didDetail?.didId) return;
+    await Clipboard.setStringAsync(didDetail.didId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   const handleUploadDid = async () => {
     if (!mnemonic || !didContent.trim()) return;
@@ -48,7 +62,7 @@ export default function DidDetail() {
       await api.uploadDid(mnemonic, didContent);
       Alert.alert("Success", "DID log uploaded successfully");
       setDidContent("");
-      loadStats();
+      loadData();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
       Alert.alert("Error", msg);
@@ -102,109 +116,243 @@ export default function DidDetail() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Text style={styles.title}>{mnemonic}</Text>
+      <View style={styles.narrow}>
+        <Text style={styles.title}>{mnemonic}</Text>
 
-      {/* Stats */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Statistics</Text>
-        {statsError ? (
-          <Text style={styles.errorText}>{statsError}</Text>
-        ) : stats ? (
-          <View style={styles.statsGrid}>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>{stats.total_resolves}</Text>
-              <Text style={styles.statLabel}>Resolves</Text>
-            </View>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>{stats.total_updates}</Text>
-              <Text style={styles.statLabel}>Updates</Text>
-            </View>
-            <View style={styles.statItem}>
-              <Text style={styles.statSmall}>
-                {formatDate(stats.last_resolved_at)}
+        {/* DID ID directly under title */}
+        {didDetail && (
+          didDetail.didId ? (
+            <View style={styles.didIdRow}>
+              <Text style={styles.didIdText} numberOfLines={1}>
+                {didDetail.didId}
               </Text>
-              <Text style={styles.statLabel}>Last Resolved</Text>
+              <Pressable style={styles.copyButton} onPress={handleCopyDidId}>
+                <Text style={styles.copyButtonText}>
+                  {copied ? "Copied" : "Copy"}
+                </Text>
+              </Pressable>
             </View>
-            <View style={styles.statItem}>
-              <Text style={styles.statSmall}>
-                {formatDate(stats.last_updated_at)}
-              </Text>
-              <Text style={styles.statLabel}>Last Updated</Text>
+          ) : (
+            <Text style={styles.pendingText}>Pending upload</Text>
+          )
+        )}
+        {/* Stats */}
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Statistics</Text>
+          {statsError ? (
+            <Text style={styles.errorText}>{statsError}</Text>
+          ) : stats ? (
+            <View style={styles.statsGrid}>
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{stats.total_resolves}</Text>
+                <Text style={styles.statLabel}>Resolves</Text>
+              </View>
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{stats.total_updates}</Text>
+                <Text style={styles.statLabel}>Updates</Text>
+              </View>
+              <View style={styles.statItem}>
+                <Text style={styles.statSmall}>
+                  {formatDate(stats.last_resolved_at)}
+                </Text>
+                <Text style={styles.statLabel}>Last Resolved</Text>
+              </View>
+              <View style={styles.statItem}>
+                <Text style={styles.statSmall}>
+                  {formatDate(stats.last_updated_at)}
+                </Text>
+                <Text style={styles.statLabel}>Last Updated</Text>
+              </View>
+            </View>
+          ) : (
+            <ActivityIndicator color={colors.accent} />
+          )}
+        </View>
+
+        {/* DID Details — parsed from log entries */}
+        {didDetail?.log && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>DID Details</Text>
+            <View style={styles.detailsGrid}>
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Version</Text>
+                <Text style={styles.detailValue}>
+                  {didDetail.log.latestVersionId ?? "-"}
+                </Text>
+              </View>
+              {didDetail.log.latestVersionTime && (
+                <View style={styles.detailRow}>
+                  <Text style={styles.detailLabel}>Version Time</Text>
+                  <Text style={styles.detailValue}>
+                    {new Date(didDetail.log.latestVersionTime).toLocaleString()}
+                  </Text>
+                </View>
+              )}
+              {didDetail.log.method && (
+                <View style={styles.detailRow}>
+                  <Text style={styles.detailLabel}>Method</Text>
+                  <Text style={styles.detailValueMono}>
+                    {didDetail.log.method}
+                  </Text>
+                </View>
+              )}
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Log Entries</Text>
+                <Text style={styles.detailValue}>
+                  {didDetail.log.logEntryCount}
+                </Text>
+              </View>
+              {didDetail.log.ttl != null && (
+                <View style={styles.detailRow}>
+                  <Text style={styles.detailLabel}>TTL</Text>
+                  <Text style={styles.detailValue}>
+                    {didDetail.log.ttl}s
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            <Text style={[styles.sectionTitle, { marginTop: spacing.lg }]}>
+              Options
+            </Text>
+            <View style={styles.optionsGrid}>
+              <View style={styles.optionItem}>
+                <Text
+                  style={
+                    didDetail.log.portable
+                      ? styles.optionEnabled
+                      : styles.optionDisabled
+                  }
+                >
+                  {didDetail.log.portable ? "Yes" : "No"}
+                </Text>
+                <Text style={styles.statLabel}>Portable</Text>
+              </View>
+              <View style={styles.optionItem}>
+                <Text
+                  style={
+                    didDetail.log.preRotation
+                      ? styles.optionEnabled
+                      : styles.optionDisabled
+                  }
+                >
+                  {didDetail.log.preRotation ? "Yes" : "No"}
+                </Text>
+                <Text style={styles.statLabel}>Pre-rotation</Text>
+              </View>
+              <View style={styles.optionItem}>
+                <Text
+                  style={
+                    didDetail.log.witnesses
+                      ? styles.optionEnabled
+                      : styles.optionDisabled
+                  }
+                >
+                  {didDetail.log.witnesses
+                    ? `${didDetail.log.witnessThreshold}/${didDetail.log.witnessCount}`
+                    : "None"}
+                </Text>
+                <Text style={styles.statLabel}>Witnesses</Text>
+              </View>
+              <View style={styles.optionItem}>
+                <Text
+                  style={
+                    didDetail.log.watchers
+                      ? styles.optionEnabled
+                      : styles.optionDisabled
+                  }
+                >
+                  {didDetail.log.watchers
+                    ? String(didDetail.log.watcherCount)
+                    : "None"}
+                </Text>
+                <Text style={styles.statLabel}>Watchers</Text>
+              </View>
+              <View style={styles.optionItem}>
+                <Text
+                  style={
+                    didDetail.log.deactivated
+                      ? styles.optionDeactivated
+                      : styles.optionEnabled
+                  }
+                >
+                  {didDetail.log.deactivated ? "Yes" : "No"}
+                </Text>
+                <Text style={styles.statLabel}>Deactivated</Text>
+              </View>
             </View>
           </View>
-        ) : (
-          <ActivityIndicator color={colors.accent} />
         )}
-      </View>
 
-      {/* Upload DID log */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Upload DID Log</Text>
-        <Text style={styles.hint}>
-          Paste the JSONL content for the did.jsonl file.
-        </Text>
-        <TextInput
-          style={styles.textarea}
-          placeholder='{"versionId":"1",...}'
-          placeholderTextColor={colors.textTertiary}
-          value={didContent}
-          onChangeText={setDidContent}
-          multiline
-        />
-        <Pressable
-          style={[
-            styles.button,
-            (!didContent.trim() || uploading) && styles.disabled,
-          ]}
-          onPress={handleUploadDid}
-          disabled={!didContent.trim() || uploading}
-        >
-          <Text style={styles.buttonText}>
-            {uploading ? "Uploading..." : "Upload DID Log"}
+        {/* Upload DID log */}
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Upload DID Log</Text>
+          <Text style={styles.hint}>
+            Paste the JSONL content for the did.jsonl file.
           </Text>
-        </Pressable>
-      </View>
+          <TextInput
+            style={styles.textarea}
+            placeholder='{"versionId":"1",...}'
+            placeholderTextColor={colors.textTertiary}
+            value={didContent}
+            onChangeText={setDidContent}
+            multiline
+          />
+          <Pressable
+            style={[
+              styles.button,
+              (!didContent.trim() || uploading) && styles.disabled,
+            ]}
+            onPress={handleUploadDid}
+            disabled={!didContent.trim() || uploading}
+          >
+            <Text style={styles.buttonText}>
+              {uploading ? "Uploading..." : "Upload DID Log"}
+            </Text>
+          </Pressable>
+        </View>
 
-      {/* Upload witness */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Upload Witness Proof</Text>
-        <Text style={styles.hint}>
-          Paste the JSON content for the witness proof.
-        </Text>
-        <TextInput
-          style={styles.textarea}
-          placeholder='{"witness":...}'
-          placeholderTextColor={colors.textTertiary}
-          value={witnessContent}
-          onChangeText={setWitnessContent}
-          multiline
-        />
-        <Pressable
-          style={[
-            styles.button,
-            (!witnessContent.trim() || uploading) && styles.disabled,
-          ]}
-          onPress={handleUploadWitness}
-          disabled={!witnessContent.trim() || uploading}
-        >
-          <Text style={styles.buttonText}>
-            {uploading ? "Uploading..." : "Upload Witness"}
+        {/* Upload witness */}
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Upload Witness Proof</Text>
+          <Text style={styles.hint}>
+            Paste the JSON content for the witness proof.
           </Text>
-        </Pressable>
-      </View>
+          <TextInput
+            style={styles.textarea}
+            placeholder='{"witness":...}'
+            placeholderTextColor={colors.textTertiary}
+            value={witnessContent}
+            onChangeText={setWitnessContent}
+            multiline
+          />
+          <Pressable
+            style={[
+              styles.button,
+              (!witnessContent.trim() || uploading) && styles.disabled,
+            ]}
+            onPress={handleUploadWitness}
+            disabled={!witnessContent.trim() || uploading}
+          >
+            <Text style={styles.buttonText}>
+              {uploading ? "Uploading..." : "Upload Witness"}
+            </Text>
+          </Pressable>
+        </View>
 
-      {/* Delete */}
-      <View style={[styles.card, styles.dangerCard]}>
-        <Text style={styles.sectionTitle}>Danger Zone</Text>
-        <Pressable
-          style={[styles.dangerButton, deleting && styles.disabled]}
-          onPress={handleDelete}
-          disabled={deleting}
-        >
-          <Text style={styles.dangerButtonText}>
-            {deleting ? "Deleting..." : "Delete DID"}
-          </Text>
-        </Pressable>
+        {/* Delete */}
+        <View style={[styles.card, styles.dangerCard]}>
+          <Text style={styles.sectionTitle}>Danger Zone</Text>
+          <Pressable
+            style={[styles.dangerButton, deleting && styles.disabled]}
+            onPress={handleDelete}
+            disabled={deleting}
+          >
+            <Text style={styles.dangerButtonText}>
+              {deleting ? "Deleting..." : "Delete DID"}
+            </Text>
+          </Pressable>
+        </View>
       </View>
     </ScrollView>
   );
@@ -223,6 +371,8 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: spacing.xl,
+  },
+  narrow: {
     maxWidth: 600,
     alignSelf: "center",
     width: "100%",
@@ -232,7 +382,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontWeight: "bold",
     color: colors.accent,
-    marginBottom: spacing.xl,
+    marginBottom: spacing.sm,
   },
   card: {
     backgroundColor: colors.bgSecondary,
@@ -322,6 +472,82 @@ const styles = StyleSheet.create({
     color: colors.textOnAccent,
     fontSize: 14,
     fontFamily: fonts.semibold,
+  },
+  didIdRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    gap: spacing.sm,
+    marginBottom: spacing.xl,
+  },
+  didIdText: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.teal,
+  },
+  copyButton: {
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+  },
+  copyButtonText: {
+    fontSize: 13,
+    fontFamily: fonts.semibold,
+    color: colors.textSecondary,
+  },
+  pendingText: {
+    fontSize: 14,
+    fontFamily: fonts.medium,
+    color: colors.warning,
+    marginBottom: spacing.xl,
+  },
+  detailsGrid: {
+    gap: spacing.sm,
+  },
+  detailRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  detailLabel: {
+    fontSize: 13,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+  },
+  detailValue: {
+    fontSize: 13,
+    fontFamily: fonts.regular,
+    color: colors.textPrimary,
+  },
+  detailValueMono: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.textPrimary,
+  },
+  optionsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.lg,
+  },
+  optionItem: {
+    minWidth: 90,
+  },
+  optionEnabled: {
+    fontSize: 16,
+    fontFamily: fonts.bold,
+    color: colors.success,
+  },
+  optionDisabled: {
+    fontSize: 16,
+    fontFamily: fonts.bold,
+    color: colors.textTertiary,
+  },
+  optionDeactivated: {
+    fontSize: 16,
+    fontFamily: fonts.bold,
+    color: colors.error,
   },
   errorText: {
     fontFamily: fonts.medium,

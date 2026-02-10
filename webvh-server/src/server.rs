@@ -15,10 +15,11 @@ use crate::config::{AppConfig, AuthConfig};
 use crate::error::AppError;
 use crate::passkey;
 use crate::routes;
+use crate::routes::did_manage::cleanup_empty_dids;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{Level, debug, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -79,12 +80,30 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
 
     // Spawn session cleanup background task when auth is configured
     if state.jwt_keys.is_some() {
-        tokio::spawn(session_cleanup_loop(state.sessions_ks.clone(), auth_config));
+        tokio::spawn(session_cleanup_loop(
+            state.sessions_ks.clone(),
+            auth_config.clone(),
+        ));
     }
+
+    // Spawn DID cleanup background task (always active)
+    tokio::spawn(did_cleanup_loop(
+        state.dids_ks.clone(),
+        state.stats_ks.clone(),
+        auth_config,
+    ));
 
     let app = routes::router()
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(tower_http::LatencyUnit::Millis),
+                ),
+        );
 
     info!("server listening addr={addr}");
 
@@ -224,6 +243,23 @@ fn decode_jwt_key(b64: &str) -> Result<JwtKeys, AppError> {
     let keys = JwtKeys::from_ed25519_bytes(&key_bytes)?;
     debug!("JWT signing key decoded successfully");
     Ok(keys)
+}
+
+async fn did_cleanup_loop(
+    dids_ks: KeyspaceHandle,
+    stats_ks: KeyspaceHandle,
+    auth_config: AuthConfig,
+) {
+    let ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
+    let interval = Duration::from_secs(ttl_seconds.max(60));
+    loop {
+        tokio::time::sleep(interval).await;
+        match cleanup_empty_dids(&dids_ks, &stats_ks, ttl_seconds).await {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "cleaned up empty DID records"),
+            Err(e) => warn!("DID cleanup error: {e}"),
+        }
+    }
 }
 
 async fn session_cleanup_loop(sessions_ks: KeyspaceHandle, auth_config: AuthConfig) {
