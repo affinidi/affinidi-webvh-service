@@ -6,7 +6,6 @@ WebVH DID requires supporting infrastructure for it to work to it's full potenti
 - WebVH Witness
 - WebVH Watcher
 - WebVH Common
-- WebVH Example
 
 > **IMPORTANT:**
 > affinidi-webvh-service crate is provided "as is" without any warranties or guarantees,
@@ -19,17 +18,18 @@ WebVH DID requires supporting infrastructure for it to work to it's full potenti
 
 - Rust (1.91.0) 2024 Edition
 
-## WebVH Example
+## Example Client
 
-The `webvh-example` crate is a standalone CLI that demonstrates the full flow of
-programmatically creating a `did:webvh` DID and uploading it to a running
-webvh-server. It handles DIDComm v2 authentication, DID document construction,
-WebVH log entry creation, and upload — all in a single binary.
+The `webvh-server` crate includes an example CLI (`webvh-server/examples/client.rs`)
+that demonstrates the full flow of programmatically creating a `did:webvh` DID
+and uploading it to a running webvh-server. It handles DIDComm v2
+authentication, DID document construction, WebVH log entry creation, and
+upload.
 
 ### Building
 
 ```sh
-cargo build -p webvh-example
+cargo build -p affinidi-webvh-server --example client
 ```
 
 ### Usage
@@ -39,7 +39,7 @@ cargo build -p webvh-example
 2. Run the example, pointing it at the server:
 
    ```sh
-   cargo run -p webvh-example -- --server-url http://localhost:8085
+   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8085
    ```
 
 3. The example will generate a `did:key` identity and pause, printing the DID:
