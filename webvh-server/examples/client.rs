@@ -1,9 +1,8 @@
-use std::io::{self, Write};
-
 use affinidi_webvh_common::WebVHClient;
 use affinidi_webvh_common::did::generate_ed25519_identity;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::io::{self, Write};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -36,8 +35,7 @@ async fn main() -> Result<()> {
     // ------------------------------------------------------------------
     // Step 1: Generate a did:key identity
     // ------------------------------------------------------------------
-    let (my_did, my_secret) =
-        generate_ed25519_identity().context("failed to generate did:key")?;
+    let (my_did, my_secret) = generate_ed25519_identity().context("failed to generate did:key")?;
 
     println!("\n=== Step 1: Identity Generated ===");
     println!("  DID: {my_did}");

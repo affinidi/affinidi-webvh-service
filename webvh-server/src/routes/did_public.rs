@@ -60,29 +60,29 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     // Check for DID log: <mnemonic>/did.jsonl
-    if let Some(mnemonic) = path.strip_suffix("/did.jsonl") {
-        if !mnemonic.is_empty() {
-            return match serve_did_log_inner(&state, mnemonic).await {
-                Ok(resp) => resp,
-                Err(e) => e.into_response(),
-            };
-        }
+    if let Some(mnemonic) = path.strip_suffix("/did.jsonl")
+        && !mnemonic.is_empty()
+    {
+        return match serve_did_log_inner(&state, mnemonic).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        };
     }
 
     // Check for witness: <mnemonic>/did-witness.json
-    if let Some(mnemonic) = path.strip_suffix("/did-witness.json") {
-        if !mnemonic.is_empty() {
-            return match serve_witness_inner(&state, mnemonic).await {
-                Ok(resp) => resp,
-                Err(e) => e.into_response(),
-            };
-        }
+    if let Some(mnemonic) = path.strip_suffix("/did-witness.json")
+        && !mnemonic.is_empty()
+    {
+        return match serve_witness_inner(&state, mnemonic).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        };
     }
 
     // Fall through to SPA static handler or 404
     #[cfg(feature = "ui")]
     {
-        return crate::frontend::static_handler(uri).await;
+        crate::frontend::static_handler(uri).await
     }
 
     #[cfg(not(feature = "ui"))]

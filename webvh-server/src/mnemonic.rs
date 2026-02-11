@@ -109,12 +109,12 @@ pub fn validate_custom_path(path: &str) -> Result<(), AppError> {
     }
 
     // Only check the first segment against reserved names
-    if let Some(&first) = segments.first() {
-        if RESERVED_NAMES.contains(&first) {
-            return Err(AppError::Validation(format!(
-                "'{first}' is a reserved name and cannot be used as the first path segment",
-            )));
-        }
+    if let Some(&first) = segments.first()
+        && RESERVED_NAMES.contains(&first)
+    {
+        return Err(AppError::Validation(format!(
+            "'{first}' is a reserved name and cannot be used as the first path segment",
+        )));
     }
 
     Ok(())

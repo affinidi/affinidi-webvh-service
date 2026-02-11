@@ -1,10 +1,3 @@
-use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
-
-use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
-
 use crate::acl::Role;
 use crate::auth::AuthClaims;
 use crate::auth::session::now_epoch;
@@ -13,6 +6,11 @@ use crate::mnemonic::{generate_unique_mnemonic, is_path_available, validate_cust
 use crate::server::AppState;
 use crate::stats;
 use crate::store::KeyspaceHandle;
+use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// A record tracking a hosted DID.
@@ -127,11 +125,12 @@ pub async fn request_uri(
         .await?;
 
     // Build the public DID URL
-    let base_url = state
-        .config
-        .public_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{}:{}", state.config.server.host, state.config.server.port));
+    let base_url = state.config.public_url.clone().unwrap_or_else(|| {
+        format!(
+            "http://{}:{}",
+            state.config.server.host, state.config.server.port
+        )
+    });
 
     let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
@@ -256,13 +255,12 @@ fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
             }
         }
 
-        if let Some(watchers_val) = params.get("watchers") {
-            if let Some(arr) = watchers_val.as_array() {
-                if !arr.is_empty() {
-                    meta.watchers = true;
-                    meta.watcher_count = arr.len() as u32;
-                }
-            }
+        if let Some(watchers_val) = params.get("watchers")
+            && let Some(arr) = watchers_val.as_array()
+            && !arr.is_empty()
+        {
+            meta.watchers = true;
+            meta.watcher_count = arr.len() as u32;
         }
     }
 
@@ -321,7 +319,9 @@ pub async fn upload_did(
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     if body.is_empty() {
-        return Err(AppError::Validation("did.jsonl content cannot be empty".into()));
+        return Err(AppError::Validation(
+            "did.jsonl content cannot be empty".into(),
+        ));
     }
 
     // Extract DID ID from content
@@ -415,11 +415,7 @@ pub async fn list_dids(
     for (_key, value) in raw {
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if let Some(record) = state
-            .dids_ks
-            .get::<DidRecord>(did_key(&mnemonic))
-            .await?
-        {
+        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 created_at: record.created_at,

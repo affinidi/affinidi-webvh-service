@@ -12,11 +12,10 @@ mod setup;
 mod stats;
 mod store;
 
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use config::LogFormat;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -78,7 +77,8 @@ async fn run_invite(
     use crate::passkey::store::{Enrollment, store_enrollment};
 
     // Validate role
-    let _role = Role::from_str(&role).map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
+    let _role = Role::from_str(&role)
+        .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
 
     let config = AppConfig::load(config_path)?;
 
