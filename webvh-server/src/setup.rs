@@ -3,12 +3,16 @@ use std::path::PathBuf;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
+use serde::Deserialize;
+
+use uuid::Uuid;
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig,
 };
+use crate::passkey::store::{Enrollment, store_enrollment};
 use crate::store::Store;
 
 /// Generate a base64url-no-pad encoded 32-byte random key.
@@ -16,6 +20,29 @@ fn generate_key() -> String {
     let mut bytes = [0u8; 32];
     rand::fill(&mut bytes);
     BASE64.encode(bytes)
+}
+
+/// VTA secrets bundle format (base64url-encoded JSON).
+#[derive(Deserialize)]
+struct SecretsBundle {
+    did: String,
+    secrets: Vec<SecretEntry>,
+}
+
+#[derive(Deserialize)]
+struct SecretEntry {
+    key_id: String,
+    key_type: String,
+    private_key_multibase: String,
+}
+
+/// Decode a multibase-encoded 32-byte seed (Base58BTC, no multicodec prefix).
+fn decode_multibase_seed(multibase_str: &str) -> Result<[u8; 32], String> {
+    let (_base, bytes) =
+        multibase::decode(multibase_str).map_err(|e| format!("invalid multibase: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| "expected 32-byte seed".to_string())
 }
 
 pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
@@ -53,13 +80,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let selected = MultiSelect::new()
         .with_prompt("Which features do you want to enable? (Space to toggle, Enter to confirm)")
         .items(feature_items)
-        .defaults(&[true, false])
+        .defaults(&[true, true])
         .interact()?;
 
     let enable_didcomm = selected.contains(&0);
     let enable_rest_api = selected.contains(&1);
 
-    // 3. DIDComm-specific: Server DID and Mediator DID
+    // 3. DIDComm-specific: import VTA secrets bundle
     let mut server_did = None;
     let mut mediator_did = None;
     let mut signing_key = None;
@@ -67,13 +94,65 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let mut auth = AuthConfig::default();
 
     if enable_didcomm {
-        let did: String = Input::new()
-            .with_prompt("WebVH Server DID (e.g. did:web:example.com)")
-            .interact_text()?;
-        server_did = Some(did);
+        eprintln!();
+        eprintln!("  Paste the VTA secrets bundle export for the server DID.");
+        eprintln!("  (This is the base64url string from `vta export-did-secrets`)");
+        eprintln!();
+
+        let bundle: SecretsBundle = loop {
+            let input: String = Input::new()
+                .with_prompt("VTA secrets bundle (base64url)")
+                .interact_text()?;
+
+            let decoded = match BASE64.decode(input.trim()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("  Error: invalid base64url encoding: {e}");
+                    continue;
+                }
+            };
+
+            match serde_json::from_slice::<SecretsBundle>(&decoded) {
+                Ok(b) => break b,
+                Err(e) => {
+                    eprintln!("  Error: invalid bundle JSON: {e}");
+                    continue;
+                }
+            }
+        };
+
+        server_did = Some(bundle.did.clone());
+
+        // Extract Ed25519 signing key
+        let ed_entry = bundle
+            .secrets
+            .iter()
+            .find(|s| s.key_type == "ed25519")
+            .ok_or("bundle has no Ed25519 signing key".to_string())?;
+        let ed_seed = decode_multibase_seed(&ed_entry.private_key_multibase)?;
+        signing_key = Some(BASE64.encode(ed_seed));
+
+        // Extract X25519 key agreement key (optional)
+        match bundle.secrets.iter().find(|s| s.key_type == "x25519") {
+            Some(x_entry) => {
+                let x_seed = decode_multibase_seed(&x_entry.private_key_multibase)?;
+                key_agreement_key = Some(BASE64.encode(x_seed));
+            }
+            None => {
+                eprintln!("  Warning: bundle has no X25519 key agreement key; continuing without it.");
+            }
+        }
+
+        eprintln!();
+        eprintln!("  Imported server DID: {}", bundle.did);
+        eprintln!("  Signing key (Ed25519):     loaded from {}", ed_entry.key_id);
+        if let Some(x_entry) = bundle.secrets.iter().find(|s| s.key_type == "x25519") {
+            eprintln!("  Key agreement (X25519):    loaded from {}", x_entry.key_id);
+        }
+        eprintln!();
 
         let med_did: String = Input::new()
-            .with_prompt("Mediator DID (e.g. did:web:mediator.example.com)")
+            .with_prompt("Mediator DID (e.g. did:webvh:mediator.example.com)")
             .default(String::new())
             .interact_text()?;
         mediator_did = if med_did.is_empty() {
@@ -102,7 +181,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     let port: u16 = Input::new()
         .with_prompt("Listen port")
-        .default(3000)
+        .default(8101)
         .interact_text()?;
 
     // 6. Log level / format
@@ -128,22 +207,15 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .default("data/webvh-server".to_string())
         .interact_text()?;
 
-    // 8. Key generation
+    // 8. JWT signing key
     if enable_didcomm {
-        let sk = generate_key();
-        let kak = generate_key();
         let jsk = generate_key();
 
-        eprintln!();
-        eprintln!("  Generated cryptographic keys (back these up!):");
-        eprintln!("  -----------------------------------------------");
-        eprintln!("  signing_key:          {sk}");
-        eprintln!("  key_agreement_key:    {kak}");
+        eprintln!("  Generated JWT signing key (back this up!):");
+        eprintln!("  -------------------------------------------");
         eprintln!("  auth.jwt_signing_key: {jsk}");
         eprintln!();
 
-        signing_key = Some(sk);
-        key_agreement_key = Some(kak);
         auth = AuthConfig {
             jwt_signing_key: Some(jsk),
             ..Default::default()
@@ -283,6 +355,34 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
             store_acl_entry(&acl_ks, &entry).await?;
             eprintln!("  Admin ACL entry created for {admin_did}");
+
+            let create_invite = Confirm::new()
+                .with_prompt("Create a passkey enrollment invite for this admin?")
+                .default(true)
+                .interact()?;
+
+            if create_invite {
+                let sessions_ks = store.keyspace("sessions")?;
+                let token = Uuid::new_v4().to_string();
+                let now = now_epoch();
+                let enrollment = Enrollment {
+                    token: token.clone(),
+                    did: admin_did.clone(),
+                    role: "admin".to_string(),
+                    created_at: now,
+                    expires_at: now + config.auth.passkey_enrollment_ttl,
+                };
+                store_enrollment(&sessions_ks, &enrollment).await?;
+
+                eprintln!();
+                if let Some(ref url) = config.public_url {
+                    eprintln!("  Enrollment link: {url}/enroll?token={token}");
+                } else {
+                    eprintln!("  Enrollment token: {token}");
+                    eprintln!("  (Set public_url in config, then visit {{public_url}}/enroll?token={{token}})");
+                }
+                eprintln!("  Expires in: {} seconds", config.auth.passkey_enrollment_ttl);
+            }
         }
     }
 
