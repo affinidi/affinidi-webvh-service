@@ -12,7 +12,7 @@ use tracing::info;
 #[derive(Parser)]
 #[command(about = "Create a did:webvh DID and upload it to a webvh-server")]
 struct Cli {
-    /// Base URL of the webvh-server (e.g. http://localhost:8085)
+    /// Base URL of the webvh-server (e.g. http://localhost:8101)
     #[arg(long)]
     server_url: String,
 

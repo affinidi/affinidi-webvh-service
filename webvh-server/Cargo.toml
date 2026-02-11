@@ -31,6 +31,7 @@ ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
 hex = "0.4"
 jsonwebtoken = { workspace = true }
+multibase = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

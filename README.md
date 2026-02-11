@@ -39,7 +39,7 @@ cargo build -p affinidi-webvh-server --example client
 2. Run the example, pointing it at the server:
 
    ```sh
-   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8085
+   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8101
    ```
 
 3. The example will generate a `did:key` identity and pause, printing the DID:
@@ -60,7 +60,7 @@ cargo build -p affinidi-webvh-server --example client
    DID Created and Hosted Successfully!
      Mnemonic:   apple-banana
      SCID:       FHcGtSJ...
-     DID URL:    http://localhost:8085/apple-banana/did.jsonl
+     DID URL:    http://localhost:8101/apple-banana/did.jsonl
      DID:        did:webvh:FHcGtSJ...:localhost%3A8085:apple-banana
      Public Key: z6Mk...
    ```

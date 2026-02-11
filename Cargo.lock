@@ -380,6 +380,7 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "mime_guess",
+ "multibase",
  "rand 0.10.0",
  "rust-embed",
  "serde",
