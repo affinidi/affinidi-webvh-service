@@ -16,6 +16,10 @@ rust-version.workspace = true
 default = []
 ui = ["dep:rust-embed", "dep:mime_guess"]
 
+[[bin]]
+name = "webvh-server"
+path = "src/main.rs"
+
 [dependencies]
 affinidi-webvh-common = { path = "../webvh-common" }
 affinidi-tdk = { workspace = true }
