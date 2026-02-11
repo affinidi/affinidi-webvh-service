@@ -3,13 +3,28 @@ import { getToken, setToken as storeToken, clearToken } from "../lib/api";
 
 interface AuthState {
   token: string | null;
+  role: "admin" | "owner" | null;
   isAuthenticated: boolean;
   login: (token: string) => void;
   logout: () => void;
 }
 
+/** Decode the JWT payload (no verification) to extract the role claim. */
+function decodeJwtRole(token: string): "admin" | "owner" | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const json = JSON.parse(atob(payload));
+    if (json.role === "admin" || json.role === "owner") return json.role;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const AuthContext = createContext<AuthState>({
   token: null,
+  role: null,
   isAuthenticated: false,
   login: () => {},
   logout: () => {},
@@ -40,7 +55,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ token, isAuthenticated: !!token, login, logout }}
+      value={{ token, role: token ? decodeJwtRole(token) : null, isAuthenticated: !!token, login, logout }}
     >
       {children}
     </AuthContext.Provider>

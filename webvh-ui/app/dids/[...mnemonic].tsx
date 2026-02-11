@@ -117,7 +117,9 @@ export default function DidDetail() {
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       <View style={styles.narrow}>
-        <Text style={styles.title}>{mnemonic}</Text>
+        <Text style={styles.title}>
+          {mnemonic === ".well-known" ? "Root DID (.well-known)" : mnemonic}
+        </Text>
 
         {/* DID ID directly under title */}
         {didDetail && (

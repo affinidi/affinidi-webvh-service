@@ -19,11 +19,13 @@ type PathStatus = null | "checking" | "available" | "taken" | "error";
 
 export default function DidList() {
   const api = useApi();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, role } = useAuth();
   const [dids, setDids] = useState<DidRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+
+  const [creatingRoot, setCreatingRoot] = useState(false);
 
   // Inline create form state
   const [showForm, setShowForm] = useState(false);
@@ -106,6 +108,24 @@ export default function DidList() {
     );
   }
 
+  const handleCreateRootDid = async () => {
+    setCreatingRoot(true);
+    try {
+      await api.createDid(".well-known");
+      refresh();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to create root DID";
+      Alert.alert("Error", msg);
+    } finally {
+      setCreatingRoot(false);
+    }
+  };
+
+  const showRootDidButton =
+    role === "admin" &&
+    !dids.some((d) => d.mnemonic === ".well-known") &&
+    !loading;
+
   const formatDate = (ts: number) =>
     new Date(ts * 1000).toLocaleDateString(undefined, {
       year: "numeric",
@@ -119,14 +139,27 @@ export default function DidList() {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Your DIDs</Text>
-        {!showForm && (
-          <Pressable
-            style={styles.buttonPrimary}
-            onPress={() => setShowForm(true)}
-          >
-            <Text style={styles.buttonPrimaryText}>+ New DID</Text>
-          </Pressable>
-        )}
+        <View style={styles.headerActions}>
+          {showRootDidButton && (
+            <Pressable
+              style={[styles.buttonSecondary, creatingRoot && styles.disabled]}
+              onPress={handleCreateRootDid}
+              disabled={creatingRoot}
+            >
+              <Text style={styles.buttonSecondaryText}>
+                {creatingRoot ? "Creating..." : "Create Root DID"}
+              </Text>
+            </Pressable>
+          )}
+          {!showForm && (
+            <Pressable
+              style={styles.buttonPrimary}
+              onPress={() => setShowForm(true)}
+            >
+              <Text style={styles.buttonPrimaryText}>+ New DID</Text>
+            </Pressable>
+          )}
+        </View>
       </View>
 
       {showForm && (
@@ -246,6 +279,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: spacing.xl,
     flexWrap: "wrap",
+    gap: spacing.md,
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: spacing.md,
   },
   title: {

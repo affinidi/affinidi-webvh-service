@@ -90,6 +90,20 @@ pub async fn request_uri(
     body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
     let mnemonic = match body.and_then(|b| b.0.path) {
+        Some(custom_path) if custom_path == ".well-known" => {
+            // Root DID: admin-only, skip normal path validation
+            if auth.role != Role::Admin {
+                return Err(AppError::Forbidden(
+                    "only admins can create the root DID".into(),
+                ));
+            }
+            if !is_path_available(&state.dids_ks, &custom_path).await? {
+                return Err(AppError::Conflict(
+                    "root DID (.well-known) already exists".into(),
+                ));
+            }
+            custom_path
+        }
         Some(custom_path) => {
             validate_custom_path(&custom_path)?;
             if !is_path_available(&state.dids_ks, &custom_path).await? {
