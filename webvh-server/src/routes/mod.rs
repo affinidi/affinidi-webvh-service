@@ -7,11 +7,18 @@ mod passkey;
 mod stats;
 
 use axum::Router;
-use axum::routing::{delete, get, post, put};
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post, put};
 
 use crate::server::AppState;
 
-pub fn router() -> Router<AppState> {
+pub fn router(upload_body_limit: usize) -> Router<AppState> {
+    // Upload routes with a custom body-size limit
+    let upload_routes = Router::new()
+        .route("/dids/{*mnemonic}", put(did_manage::upload_did))
+        .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
+        .layer(DefaultBodyLimit::max(upload_body_limit));
+
     // API routes live under /api/ so they never collide with SPA client routes.
     let api = Router::new()
         // Health
@@ -25,12 +32,8 @@ pub fn router() -> Router<AppState> {
         .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
         .route(
             "/dids/{*mnemonic}",
-            get(did_manage::get_did)
-                .put(did_manage::upload_did)
-                .delete(did_manage::delete_did),
+            get(did_manage::get_did).delete(did_manage::delete_did),
         )
-        // Witness upload (separate prefix so the catch-all doesn't eat /witness)
-        .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
         // Stats (authenticated)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
@@ -41,7 +44,12 @@ pub fn router() -> Router<AppState> {
         .route("/auth/passkey/login/finish", post(passkey::login_finish))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route("/acl/{did}", delete(acl::delete_acl));
+        .route(
+            "/acl/{did}",
+            put(acl::update_acl).delete(acl::delete_acl),
+        )
+        // Merge upload routes (body-limited) into the API router
+        .merge(upload_routes);
 
     Router::new()
         .nest("/api", api)

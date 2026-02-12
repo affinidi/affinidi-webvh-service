@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -57,6 +59,10 @@ impl WebVHClient {
         debug!(session_id = %challenge_resp.session_id, "challenge received");
 
         // 4. Build DIDComm message
+        let created_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
         let msg = Message::build(
             uuid::Uuid::new_v4().to_string(),
             "https://affinidi.com/webvh/1.0/authenticate".to_string(),
@@ -66,6 +72,7 @@ impl WebVHClient {
             }),
         )
         .from(did.to_string())
+        .created_time(created_time)
         .finalize();
 
         // 5. Pack signed

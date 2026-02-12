@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub signing_key: Option<String>,
     /// Base64url-no-pad encoded 32-byte X25519 private key for server DID key agreement.
     pub key_agreement_key: Option<String>,
+    #[serde(default)]
+    pub limits: LimitsConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -83,7 +85,7 @@ fn default_refresh_token_expiry() -> u64 {
 }
 
 fn default_challenge_ttl() -> u64 {
-    300
+    30
 }
 
 fn default_session_cleanup_interval() -> u64 {
@@ -158,6 +160,41 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LimitsConfig {
+    /// Maximum body size (bytes) for did.jsonl / witness uploads. Default: 100KB.
+    #[serde(default = "default_upload_body_limit")]
+    pub upload_body_limit: usize,
+    /// Default per-account total DID document size (bytes). Default: 1MB.
+    #[serde(default = "default_max_total_size")]
+    pub default_max_total_size: u64,
+    /// Default per-account maximum number of DIDs. Default: 20.
+    #[serde(default = "default_max_did_count")]
+    pub default_max_did_count: u64,
+}
+
+fn default_upload_body_limit() -> usize {
+    102_400
+}
+
+fn default_max_total_size() -> u64 {
+    1_048_576
+}
+
+fn default_max_did_count() -> u64 {
+    20
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            upload_body_limit: default_upload_body_limit(),
+            default_max_total_size: default_max_total_size(),
+            default_max_did_count: default_max_did_count(),
         }
     }
 }
@@ -264,6 +301,23 @@ impl AppConfig {
         }
         if let Ok(key) = std::env::var("WEBVH_KEY_AGREEMENT_KEY") {
             config.key_agreement_key = Some(key);
+        }
+
+        // Limits env var overrides
+        if let Ok(v) = std::env::var("WEBVH_LIMITS_UPLOAD_BODY_LIMIT") {
+            config.limits.upload_body_limit = v.parse().map_err(|e| {
+                AppError::Config(format!("invalid WEBVH_LIMITS_UPLOAD_BODY_LIMIT: {e}"))
+            })?;
+        }
+        if let Ok(v) = std::env::var("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE") {
+            config.limits.default_max_total_size = v.parse().map_err(|e| {
+                AppError::Config(format!("invalid WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE: {e}"))
+            })?;
+        }
+        if let Ok(v) = std::env::var("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT") {
+            config.limits.default_max_did_count = v.parse().map_err(|e| {
+                AppError::Config(format!("invalid WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT: {e}"))
+            })?;
         }
 
         Ok(config)

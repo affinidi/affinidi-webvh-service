@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig,
+    AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, ServerConfig,
+    StoreConfig,
 };
 use crate::passkey::store::{Enrollment, store_enrollment};
 use crate::store::Store;
@@ -313,6 +314,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         auth,
         signing_key,
         key_agreement_key,
+        limits: LimitsConfig::default(),
         config_path: PathBuf::new(),
     };
 
@@ -351,6 +353,8 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                 role: Role::Admin,
                 label,
                 created_at: now_epoch(),
+                max_total_size: None,
+                max_did_count: None,
             };
 
             store_acl_entry(&acl_ks, &entry).await?;

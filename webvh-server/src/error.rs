@@ -36,6 +36,9 @@ pub enum AppError {
 
     #[error("validation error: {0}")]
     Validation(String),
+
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
 }
 
 impl IntoResponse for AppError {
@@ -52,6 +55,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
+            AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
         };
 
         if status.is_server_error() {

@@ -65,6 +65,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
     });
 
     let auth_config = config.auth.clone();
+    let upload_body_limit = config.limits.upload_body_limit;
 
     let state = AppState {
         sessions_ks,
@@ -93,7 +94,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         auth_config,
     ));
 
-    let app = routes::router()
+    let app = routes::router(upload_body_limit)
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()

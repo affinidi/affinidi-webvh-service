@@ -3,7 +3,7 @@ use axum::http::request::Parts;
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::acl::Role;
 use crate::auth::session::{SessionState, get_session};
@@ -62,6 +62,8 @@ impl FromRequestParts<AppState> for AuthClaims {
         }
 
         let role = Role::from_str(&claims.role)?;
+
+        debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");
 
         Ok(AuthClaims {
             did: claims.sub,

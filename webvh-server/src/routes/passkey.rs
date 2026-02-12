@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
@@ -50,19 +50,19 @@ pub async fn enroll_start(
 ) -> Result<Json<EnrollStartResponse>, AppError> {
     let webauthn = require_webauthn(&state)?;
 
-    // Look up and consume enrollment
-    let enrollment = store::get_enrollment(&state.sessions_ks, &req.token)
+    // Atomically retrieve and consume enrollment (prevents race conditions)
+    let enrollment = store::take_enrollment(&state.sessions_ks, &req.token)
         .await?
-        .ok_or_else(|| AppError::Authentication("enrollment not found or already used".into()))?;
+        .ok_or_else(|| {
+            warn!("passkey enrollment rejected: token not found or already used");
+            AppError::Authentication("enrollment not found or already used".into())
+        })?;
 
     // Check expiry
     if now_epoch() > enrollment.expires_at {
-        store::delete_enrollment(&state.sessions_ks, &req.token).await?;
+        warn!(did = %enrollment.did, "passkey enrollment rejected: link expired");
         return Err(AppError::Authentication("enrollment link has expired".into()));
     }
-
-    // Delete enrollment (one-time use)
-    store::delete_enrollment(&state.sessions_ks, &req.token).await?;
 
     // Ensure DID is in ACL — the enrollment itself is the admin's authorization,
     // so create the ACL entry if it doesn't already exist.
@@ -76,6 +76,8 @@ pub async fn enroll_start(
             role: role.clone(),
             label: Some("enrolled via passkey invite".into()),
             created_at: now_epoch(),
+            max_total_size: None,
+            max_did_count: None,
         };
         acl::store_acl_entry(&state.acl_ks, &entry).await?;
         info!(did = %enrollment.did, role = %role, "ACL entry created from enrollment");
@@ -141,16 +143,18 @@ pub async fn enroll_finish(
     let webauthn = require_webauthn(&state)?;
     let jwt_keys = require_jwt_keys(&state)?;
 
-    // Load and delete registration state
-    let reg_state = store::get_registration_state(&state.sessions_ks, &req.registration_id)
+    // Atomically load and delete registration state (prevents race conditions)
+    let reg_state = store::take_registration_state(&state.sessions_ks, &req.registration_id)
         .await?
         .ok_or_else(|| AppError::Authentication("registration state not found or expired".into()))?;
-    store::delete_registration_state(&state.sessions_ks, &req.registration_id).await?;
 
     // Complete registration ceremony
     let passkey = webauthn
         .finish_passkey_registration(&req.credential, &reg_state)
-        .map_err(|e| AppError::Authentication(format!("passkey registration failed: {e}")))?;
+        .map_err(|e| {
+            warn!(reg_id = %req.registration_id, error = %e, "passkey registration ceremony failed");
+            AppError::Authentication(format!("passkey registration failed: {e}"))
+        })?;
 
     // Load user UUID from registration-to-user mapping
     let user_uuid = store::get_registration_user(&state.sessions_ks, &req.registration_id)
@@ -220,6 +224,8 @@ pub async fn login_start(
     let auth_id = Uuid::new_v4().to_string();
     store::store_auth_state(&state.sessions_ks, &auth_id, &auth_state).await?;
 
+    info!(auth_id = %auth_id, passkey_count = all_passkeys.len(), "passkey login challenge issued");
+
     Ok(Json(LoginStartResponse {
         auth_id,
         options: rcr,
@@ -243,16 +249,18 @@ pub async fn login_finish(
     let webauthn = require_webauthn(&state)?;
     let jwt_keys = require_jwt_keys(&state)?;
 
-    // Load and delete auth state
-    let auth_state = store::get_auth_state(&state.sessions_ks, &req.auth_id)
+    // Atomically load and delete auth state (prevents race conditions)
+    let auth_state = store::take_auth_state(&state.sessions_ks, &req.auth_id)
         .await?
         .ok_or_else(|| AppError::Authentication("auth state not found or expired".into()))?;
-    store::delete_auth_state(&state.sessions_ks, &req.auth_id).await?;
 
     // Complete authentication ceremony
     let auth_result = webauthn
         .finish_passkey_authentication(&req.credential, &auth_state)
-        .map_err(|e| AppError::Authentication(format!("passkey authentication failed: {e}")))?;
+        .map_err(|e| {
+            warn!(auth_id = %req.auth_id, error = %e, "passkey authentication ceremony failed");
+            AppError::Authentication(format!("passkey authentication failed: {e}"))
+        })?;
 
     // Look up user by credential ID
     let cred_id_hex = hex::encode(auth_result.cred_id());

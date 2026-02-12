@@ -2,7 +2,10 @@ use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
+use tracing::debug;
+
 use crate::error::AppError;
+use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
 use crate::stats;
 
@@ -17,6 +20,8 @@ async fn serve_did_log_inner(state: &AppState, mnemonic: &str) -> Result<Respons
 
     // Increment resolve stats (best-effort, don't fail the request)
     let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
+
+    debug!(mnemonic = %mnemonic, size = content.len(), "DID log resolved");
 
     Ok((
         StatusCode::OK,
@@ -34,6 +39,8 @@ async fn serve_witness_inner(state: &AppState, mnemonic: &str) -> Result<Respons
         .get_raw(key)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("witness not found: {mnemonic}")))?;
+
+    debug!(mnemonic = %mnemonic, size = content.len(), "DID witness resolved");
 
     Ok((
         StatusCode::OK,
@@ -63,6 +70,9 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(mnemonic) = path.strip_suffix("/did.jsonl")
         && !mnemonic.is_empty()
     {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return e.into_response();
+        }
         return match serve_did_log_inner(&state, mnemonic).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
@@ -73,6 +83,9 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(mnemonic) = path.strip_suffix("/did-witness.json")
         && !mnemonic.is_empty()
     {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return e.into_response();
+        }
         return match serve_witness_inner(&state, mnemonic).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),

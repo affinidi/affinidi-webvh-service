@@ -1,8 +1,11 @@
-use crate::acl::Role;
+use crate::acl::{self, Role};
 use crate::auth::AuthClaims;
 use crate::auth::session::now_epoch;
+use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::mnemonic::{generate_unique_mnemonic, is_path_available, validate_custom_path};
+use crate::mnemonic::{
+    generate_unique_mnemonic, is_path_available, validate_custom_path, validate_mnemonic,
+};
 use crate::server::AppState;
 use crate::stats;
 use crate::store::KeyspaceHandle;
@@ -10,8 +13,9 @@ use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse}
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use didwebvh_rs::log_entry::LogEntry;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 /// A record tracking a hosted DID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +27,8 @@ pub struct DidRecord {
     pub version_count: u64,
     #[serde(default)]
     pub did_id: Option<String>,
+    #[serde(default)]
+    pub content_size: u64,
 }
 
 fn did_key(mnemonic: &str) -> String {
@@ -41,6 +47,81 @@ fn owner_key(did: &str, mnemonic: &str) -> String {
     format!("owner:{did}:{mnemonic}")
 }
 
+/// Check whether the owner has reached their DID count limit.
+/// Admins are exempt.
+async fn check_did_count_limit(
+    auth: &AuthClaims,
+    dids_ks: &KeyspaceHandle,
+    acl_ks: &KeyspaceHandle,
+    config: &AppConfig,
+) -> Result<(), AppError> {
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let acl_entry = acl::get_acl_entry(acl_ks, &auth.did).await?;
+    let max = acl_entry
+        .as_ref()
+        .map(|e| e.effective_max_did_count(config.limits.default_max_did_count))
+        .unwrap_or(config.limits.default_max_did_count);
+
+    let prefix = format!("owner:{}:", auth.did);
+    let owned = dids_ks.prefix_iter_raw(prefix).await?;
+    let count = owned.len() as u64;
+    if count >= max {
+        warn!(did = %auth.did, count, max, "DID count quota exceeded");
+        return Err(AppError::QuotaExceeded(format!(
+            "DID count limit reached ({max})"
+        )));
+    }
+    debug!(did = %auth.did, count, max, "DID count quota check passed");
+    Ok(())
+}
+
+/// Check whether storing `new_size` bytes would exceed the owner's total size quota.
+/// Admins are exempt. `exclude_mnemonic` is excluded from the sum (the upload replaces it).
+async fn check_total_size_limit(
+    auth: &AuthClaims,
+    dids_ks: &KeyspaceHandle,
+    acl_ks: &KeyspaceHandle,
+    config: &AppConfig,
+    exclude_mnemonic: &str,
+    new_size: u64,
+) -> Result<(), AppError> {
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let acl_entry = acl::get_acl_entry(acl_ks, &auth.did).await?;
+    let max = acl_entry
+        .as_ref()
+        .map(|e| e.effective_max_total_size(config.limits.default_max_total_size))
+        .unwrap_or(config.limits.default_max_total_size);
+
+    let prefix = format!("owner:{}:", auth.did);
+    let owned = dids_ks.prefix_iter_raw(prefix).await?;
+
+    let mut total: u64 = 0;
+    for (_key, value) in owned {
+        let mnemonic = String::from_utf8(value)
+            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+        if mnemonic == exclude_mnemonic {
+            continue;
+        }
+        if let Some(record) = dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            total = total.saturating_add(record.content_size);
+        }
+    }
+
+    let proposed = total.saturating_add(new_size);
+    if proposed > max {
+        warn!(did = %auth.did, current = total, new_size, max, "total size quota exceeded");
+        return Err(AppError::QuotaExceeded(format!(
+            "total DID document size would exceed limit ({max} bytes)"
+        )));
+    }
+    debug!(did = %auth.did, current = total, new_size, max, "total size quota check passed");
+    Ok(())
+}
+
 /// Load a DID record and verify the caller is the owner (or admin).
 async fn get_authorized_record(
     dids_ks: &KeyspaceHandle,
@@ -52,6 +133,13 @@ async fn get_authorized_record(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
     if record.owner != auth.did && auth.role != Role::Admin {
+        warn!(
+            caller = %auth.did,
+            role = %auth.role,
+            owner = %record.owner,
+            mnemonic = %mnemonic,
+            "access denied: not the owner of this DID"
+        );
         return Err(AppError::Forbidden("not the owner of this DID".into()));
     }
     Ok(record)
@@ -65,12 +153,13 @@ pub struct CheckNameRequest {
 }
 
 pub async fn check_name(
-    _auth: AuthClaims,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Json(req): Json<CheckNameRequest>,
 ) -> Result<Json<CheckNameResponse>, AppError> {
     validate_custom_path(&req.path)?;
     let available = is_path_available(&state.dids_ks, &req.path).await?;
+    info!(did = %auth.did, path = %req.path, available, "name availability checked");
     Ok(Json(CheckNameResponse {
         available,
         path: req.path,
@@ -89,6 +178,9 @@ pub async fn request_uri(
     State(state): State<AppState>,
     body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
+    // Enforce per-account DID count limit (admins exempt)
+    check_did_count_limit(&auth, &state.dids_ks, &state.acl_ks, &state.config).await?;
+
     let mnemonic = match body.and_then(|b| b.0.path) {
         Some(custom_path) if custom_path == ".well-known" => {
             // Root DID: admin-only, skip normal path validation
@@ -124,6 +216,7 @@ pub async fn request_uri(
         updated_at: now,
         version_count: 0,
         did_id: None,
+        content_size: 0,
     };
 
     // Store DID record
@@ -148,12 +241,35 @@ pub async fn request_uri(
 
     let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "URI requested");
+    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
 
     Ok((
         StatusCode::CREATED,
         Json(RequestUriResponse { mnemonic, did_url }),
     ))
+}
+
+// ---------- JSONL validation ----------
+
+/// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
+fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
+    if content.is_empty() {
+        return Err(AppError::Validation(
+            "did.jsonl content cannot be empty".into(),
+        ));
+    }
+
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        LogEntry::deserialize_string(line, None).map_err(|e| {
+            AppError::Validation(format!("invalid log entry at line {}: {e}", idx + 1))
+        })?;
+    }
+
+    Ok(())
 }
 
 // ---------- DID ID extraction helpers ----------
@@ -301,6 +417,7 @@ pub async fn get_did(
     Path(mnemonic): Path<String>,
 ) -> Result<Json<DidDetailResponse>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    validate_mnemonic(mnemonic)?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     // Parse stored JSONL content for log metadata
@@ -311,6 +428,8 @@ pub async fn get_did(
         }
         None => None,
     };
+
+    info!(did = %auth.did, mnemonic = %mnemonic, "DID details retrieved");
 
     Ok(Json(DidDetailResponse {
         mnemonic: record.mnemonic,
@@ -332,13 +451,23 @@ pub async fn upload_did(
     body: String,
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
-    if body.is_empty() {
-        return Err(AppError::Validation(
-            "did.jsonl content cannot be empty".into(),
-        ));
-    }
+    // Validate that every line is a well-formed did:webvh log entry
+    validate_did_jsonl(&body)?;
+
+    // Enforce per-account total size limit (admins exempt)
+    let new_size = body.len() as u64;
+    check_total_size_limit(
+        &auth,
+        &state.dids_ks,
+        &state.acl_ks,
+        &state.config,
+        mnemonic,
+        new_size,
+    )
+    .await?;
 
     // Extract DID ID from content
     let did_id = extract_did_id(&body);
@@ -353,12 +482,20 @@ pub async fn upload_did(
     record.updated_at = now_epoch();
     record.version_count += 1;
     record.did_id = did_id;
+    record.content_size = new_size;
     state.dids_ks.insert(did_key(&mnemonic), &record).await?;
 
     // Increment stats
     stats::increment_updates(&state.stats_ks, &mnemonic).await?;
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "did.jsonl uploaded");
+    info!(
+        did = %auth.did,
+        role = %auth.role,
+        mnemonic = %mnemonic,
+        size = new_size,
+        version = record.version_count,
+        "did.jsonl uploaded"
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -372,6 +509,7 @@ pub async fn upload_witness(
     body: String,
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    validate_mnemonic(mnemonic)?;
     get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     if body.is_empty() {
@@ -380,13 +518,15 @@ pub async fn upload_witness(
         ));
     }
 
+    let size = body.len();
+
     // Store witness content
     state
         .dids_ks
         .insert_raw(content_witness_key(&mnemonic), body.into_bytes())
         .await?;
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "did-witness.json uploaded");
+    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, size, "did-witness.json uploaded");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -399,6 +539,7 @@ pub async fn delete_did(
     Path(mnemonic): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    validate_mnemonic(mnemonic)?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     // Remove all associated data
@@ -413,7 +554,7 @@ pub async fn delete_did(
     // Remove stats
     stats::delete_stats(&state.stats_ks, &mnemonic).await?;
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted");
+    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -457,7 +598,7 @@ pub async fn list_dids(
         }
     }
 
-    info!(did = %auth.did, count = entries.len(), "DIDs listed");
+    info!(did = %auth.did, role = %auth.role, owner = %target_owner, count = entries.len(), "DIDs listed");
 
     Ok(Json(entries))
 }
@@ -610,5 +751,89 @@ mod tests {
         assert!(meta.portable);
         assert!(meta.deactivated);
         assert_eq!(meta.ttl, Some(300));
+    }
+
+    // ---- validate_did_jsonl tests ----
+
+    #[test]
+    fn validate_jsonl_empty_string_rejected() {
+        let result = validate_did_jsonl("");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty"), "expected 'empty' in: {err}");
+    }
+
+    #[test]
+    fn validate_jsonl_invalid_json_rejected() {
+        let result = validate_did_jsonl("this is not json");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid log entry at line 1"),
+            "expected line reference in: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonl_valid_json_but_not_log_entry() {
+        // Valid JSON but missing required did:webvh log entry fields
+        let result = validate_did_jsonl(r#"{"hello":"world"}"#);
+        assert!(result.is_err());
+    }
+
+    fn make_valid_jsonl() -> String {
+        use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
+
+        let secret =
+            affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+        let pk = secret.get_public_keymultibase().unwrap();
+        let host = encode_host("http://localhost:3000").unwrap();
+        let doc = build_did_document(&host, "test-validate", &pk);
+        let (_scid, jsonl) = create_log_entry(&doc, &secret).unwrap();
+        jsonl
+    }
+
+    #[test]
+    fn validate_jsonl_blank_lines_skipped() {
+        let entry = make_valid_jsonl();
+        let with_blanks = format!("\n{entry}\n\n");
+        assert!(validate_did_jsonl(&with_blanks).is_ok());
+    }
+
+    #[test]
+    fn validate_jsonl_valid_single_entry() {
+        let entry = make_valid_jsonl();
+        assert!(validate_did_jsonl(&entry).is_ok());
+    }
+
+    #[test]
+    fn validate_jsonl_second_line_invalid() {
+        let entry = make_valid_jsonl();
+        let content = format!("{entry}\nnot valid json");
+        let result = validate_did_jsonl(&content);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("line 2"),
+            "expected 'line 2' in error: {err}"
+        );
+    }
+
+    // ---- DidRecord serde backwards compat ----
+
+    #[test]
+    fn did_record_deserialize_without_content_size() {
+        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":100,"version_count":1}"#;
+        let record: DidRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.content_size, 0);
+        assert!(record.did_id.is_none());
+    }
+
+    #[test]
+    fn did_record_deserialize_with_content_size() {
+        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":200,"version_count":2,"did_id":"did:webvh:abc:host:path","content_size":5000}"#;
+        let record: DidRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.content_size, 5000);
+        assert_eq!(record.did_id.as_deref(), Some("did:webvh:abc:host:path"));
     }
 }

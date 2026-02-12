@@ -120,6 +120,17 @@ pub fn validate_custom_path(path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Validate a mnemonic extracted from a URL path parameter.
+///
+/// Accepts either `.well-known` (the root DID) or any path that passes
+/// [`validate_custom_path`].
+pub fn validate_mnemonic(mnemonic: &str) -> Result<(), AppError> {
+    if mnemonic == ".well-known" {
+        return Ok(());
+    }
+    validate_custom_path(mnemonic)
+}
+
 /// Check whether a path is available (not already taken) in the store.
 pub async fn is_path_available(dids_ks: &KeyspaceHandle, path: &str) -> Result<bool, AppError> {
     Ok(!dids_ks.contains_key(format!("did:{path}")).await?)

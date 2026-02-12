@@ -137,9 +137,30 @@ pub async fn authenticate(
     }
 
     // Check challenge TTL
-    if now_epoch().saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
+    let now = now_epoch();
+    if now.saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
         warn!(session_id, "authentication rejected: challenge expired");
         return Err(AppError::Authentication("challenge expired".into()));
+    }
+
+    // Validate DIDComm message created_time to prevent replay attacks
+    let created_time = msg
+        .created_time
+        .ok_or_else(|| AppError::Authentication("message missing created_time".into()))?;
+    let challenge_ttl = state.config.auth.challenge_ttl;
+    if created_time < session.created_at {
+        warn!(session_id, created_time, session_created = session.created_at,
+            "authentication rejected: message created_time before challenge");
+        return Err(AppError::Authentication(
+            "message created_time is before the challenge was issued".into(),
+        ));
+    }
+    if now.saturating_sub(created_time) > challenge_ttl {
+        warn!(session_id, created_time, now, challenge_ttl,
+            "authentication rejected: message created_time outside challenge TTL");
+        return Err(AppError::Authentication(
+            "message created_time is outside the challenge TTL window".into(),
+        ));
     }
 
     // Look up ACL entry to get role for the token
@@ -157,7 +178,7 @@ pub async fn authenticate(
     )
     .await?;
 
-    info!(did = %session.did, session_id = %session.session_id, "authentication successful");
+    info!(did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
 
     Ok(Json(AuthenticateResponse {
         session_id: token_resp.session_id,
@@ -223,6 +244,7 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
     if session.state != SessionState::Authenticated {
+        warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: session not authenticated");
         return Err(AppError::Authentication("session not authenticated".into()));
     }
 
@@ -230,6 +252,7 @@ pub async fn refresh(
     if let Some(expires_at) = session.refresh_expires_at
         && now_epoch() > expires_at
     {
+        warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: token expired");
         return Err(AppError::Authentication("refresh token expired".into()));
     }
 
@@ -247,7 +270,7 @@ pub async fn refresh(
     let access_expires_at = claims.exp;
     let access_token = jwt_keys.encode(&claims)?;
 
-    info!(did = %session.did, session_id = %session.session_id, "token refreshed");
+    info!(did = %session.did, role = %role, session_id = %session.session_id, "token refreshed");
 
     Ok(Json(RefreshResponse {
         session_id: session.session_id,

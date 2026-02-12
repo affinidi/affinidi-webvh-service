@@ -12,6 +12,9 @@ mod setup;
 mod stats;
 mod store;
 
+#[cfg(test)]
+mod tests;
+
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use config::LogFormat;

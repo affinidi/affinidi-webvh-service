@@ -74,15 +74,13 @@ pub async fn store_enrollment(
         .await
 }
 
-pub async fn get_enrollment(
+/// Atomically retrieve and delete an enrollment token.
+/// Returns the enrollment if it existed, or `None` if already consumed.
+pub async fn take_enrollment(
     ks: &KeyspaceHandle,
     token: &str,
 ) -> Result<Option<Enrollment>, AppError> {
-    ks.get(enrollment_key(token)).await
-}
-
-pub async fn delete_enrollment(ks: &KeyspaceHandle, token: &str) -> Result<(), AppError> {
-    ks.remove(enrollment_key(token)).await
+    ks.take(enrollment_key(token)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -97,15 +95,12 @@ pub async fn store_registration_state(
     ks.insert(registration_state_key(id), state).await
 }
 
-pub async fn get_registration_state(
+/// Atomically retrieve and delete a registration state.
+pub async fn take_registration_state(
     ks: &KeyspaceHandle,
     id: &str,
 ) -> Result<Option<PasskeyRegistration>, AppError> {
-    ks.get(registration_state_key(id)).await
-}
-
-pub async fn delete_registration_state(ks: &KeyspaceHandle, id: &str) -> Result<(), AppError> {
-    ks.remove(registration_state_key(id)).await
+    ks.take(registration_state_key(id)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -120,15 +115,12 @@ pub async fn store_auth_state(
     ks.insert(auth_state_key(id), state).await
 }
 
-pub async fn get_auth_state(
+/// Atomically retrieve and delete an auth state.
+pub async fn take_auth_state(
     ks: &KeyspaceHandle,
     id: &str,
 ) -> Result<Option<PasskeyAuthentication>, AppError> {
-    ks.get(auth_state_key(id)).await
-}
-
-pub async fn delete_auth_state(ks: &KeyspaceHandle, id: &str) -> Result<(), AppError> {
-    ks.remove(auth_state_key(id)).await
+    ks.take(auth_state_key(id)).await
 }
 
 // ---------------------------------------------------------------------------

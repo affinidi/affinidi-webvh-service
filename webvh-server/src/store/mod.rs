@@ -75,6 +75,27 @@ impl KeyspaceHandle {
         .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
     }
 
+    /// Atomically get and remove a key in a single blocking task.
+    /// Returns the deserialized value if the key existed, or `None`.
+    pub async fn take<V: DeserializeOwned + Send + 'static>(
+        &self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<Option<V>, AppError> {
+        let key = key.into();
+        let ks = self.keyspace.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<V>, AppError> {
+            match ks.get(&key)? {
+                Some(bytes) => {
+                    ks.remove(&key)?;
+                    Ok(Some(serde_json::from_slice(&bytes)?))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+    }
+
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
         let key = key.into();
         let ks = self.keyspace.clone();
