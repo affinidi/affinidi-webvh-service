@@ -201,22 +201,22 @@ webvh-server --config /path/to/config.toml backup
 
 ### Restoring from a backup
 
+Restore writes `config.toml` from the backup and imports all
+keyspace data into the store.
+
 ```bash
-# Restore data into the store configured by config.toml
+# Restore data and config.toml
 webvh-server restore --input /path/to/backup.json
 
-# Also restore the config.toml from the backup
-webvh-server restore --input /path/to/backup.json --restore-config
-
-# Restore config to a specific path
-webvh-server restore --input /path/to/backup.json --restore-config /path/to/config.toml
+# Write config.toml to a specific path
+webvh-server --config /path/to/config.toml restore --input /path/to/backup.json
 ```
 
 ### What's included
 
 The backup file is a single JSON document containing:
 
-- **config** — the raw TOML configuration used at backup time
+- **config** — the effective server configuration at backup time
 - **dids** — all DID documents and logs
 - **acl** — access control entries
 - **stats** — DID resolution statistics

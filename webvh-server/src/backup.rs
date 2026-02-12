@@ -117,11 +117,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     Ok(())
 }
 
-pub async fn run_restore(
-    config_path: Option<PathBuf>,
-    input: String,
-    restore_config: Option<Option<String>>,
-) -> Result<(), AppError> {
+pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<(), AppError> {
     let json = std::fs::read_to_string(&input)
         .map_err(|e| AppError::Config(format!("failed to read backup file {input}: {e}")))?;
 
@@ -139,32 +135,23 @@ pub async fn run_restore(
     let backup_config: AppConfig = serde_json::from_str(&backup.config)
         .map_err(|e| AppError::Config(format!("invalid config in backup: {e}")))?;
 
-    // Handle --restore-config: write the embedded config as TOML
-    if let Some(config_dest) = restore_config {
-        let dest = config_dest.unwrap_or_else(|| {
-            let input_path = PathBuf::from(&input);
-            input_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("config.toml")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let config_toml = toml::to_string_pretty(&backup_config)
-            .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
-        std::fs::write(&dest, &config_toml)
-            .map_err(|e| AppError::Config(format!("failed to write config to {dest}: {e}")))?;
-        eprintln!("  Config restored to: {dest}");
-    }
+    // Write config.toml from the backup
+    let config_file_path = config_path
+        .clone()
+        .or_else(|| std::env::var("WEBVH_CONFIG_PATH").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-    // Use --config if provided and exists, otherwise fall back to the backup's embedded config
-    let config = match AppConfig::load(config_path) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("  No config file found, using config from backup");
-            backup_config
-        }
-    };
+    let config_toml = toml::to_string_pretty(&backup_config)
+        .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
+    std::fs::write(&config_file_path, &config_toml).map_err(|e| {
+        AppError::Config(format!(
+            "failed to write config to {}: {e}",
+            config_file_path.display()
+        ))
+    })?;
+    eprintln!("  Config restored to: {}", config_file_path.display());
+
+    let config = AppConfig::load(config_path)?;
     let store = Store::open(&config.store)?;
 
     let dids_ks = store.keyspace("dids")?;

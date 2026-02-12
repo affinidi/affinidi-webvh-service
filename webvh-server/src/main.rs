@@ -57,9 +57,6 @@ enum Command {
         /// Input backup file path
         #[arg(short, long)]
         input: String,
-        /// Also restore the config from the backup (optionally specify output path)
-        #[arg(long)]
-        restore_config: Option<Option<String>>,
     },
 }
 
@@ -88,11 +85,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Restore {
-            input,
-            restore_config,
-        }) => {
-            if let Err(e) = backup::run_restore(cli.config, input, restore_config).await {
+        Some(Command::Restore { input }) => {
+            if let Err(e) = backup::run_restore(cli.config, input).await {
                 eprintln!("Restore error: {e}");
                 std::process::exit(1);
             }
