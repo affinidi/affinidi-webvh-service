@@ -8,7 +8,7 @@ use crate::stats;
 use crate::store::KeyspaceHandle;
 use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -291,6 +291,7 @@ pub struct DidDetailResponse {
     pub updated_at: u64,
     pub version_count: u64,
     pub did_id: Option<String>,
+    pub owner: String,
     pub log: Option<LogMetadata>,
 }
 
@@ -317,6 +318,7 @@ pub async fn get_did(
         updated_at: record.updated_at,
         version_count: record.version_count,
         did_id: record.did_id,
+        owner: record.owner,
         log,
     }))
 }
@@ -418,11 +420,24 @@ pub async fn delete_did(
 
 // ---------- GET /dids ----------
 
+#[derive(Debug, Deserialize)]
+pub struct ListDidsQuery {
+    pub owner: Option<String>,
+}
+
 pub async fn list_dids(
     auth: AuthClaims,
     State(state): State<AppState>,
+    Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let prefix = format!("owner:{}:", auth.did);
+    // Admins may filter by a specific owner; everyone else sees their own DIDs.
+    let target_owner = if auth.role == Role::Admin {
+        query.owner.as_deref().unwrap_or(&auth.did)
+    } else {
+        &auth.did
+    };
+
+    let prefix = format!("owner:{target_owner}:");
     let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
 
     let mut entries = Vec::with_capacity(raw.len());
@@ -430,12 +445,14 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            let did_stats = stats::get_stats(&state.stats_ks, &mnemonic).await?;
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 version_count: record.version_count,
                 did_id: record.did_id,
+                total_resolves: did_stats.total_resolves,
             });
         }
     }

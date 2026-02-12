@@ -11,6 +11,7 @@ export interface DidRecord {
   updatedAt: number;
   versionCount: number;
   didId: string | null;
+  totalResolves: number;
 }
 
 export interface LogMetadata {
@@ -35,6 +36,7 @@ export interface DidDetailResponse {
   updatedAt: number;
   versionCount: number;
   didId: string | null;
+  owner: string;
   log: LogMetadata | null;
 }
 
@@ -162,7 +164,10 @@ async function request<T>(
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
 
-  listDids: () => request<DidRecord[]>("/api/dids"),
+  listDids: (owner?: string) => {
+    const params = owner ? `?owner=${encodeURIComponent(owner)}` : "";
+    return request<DidRecord[]>(`/api/dids${params}`);
+  },
 
   getDid: (mnemonic: string) =>
     request<DidDetailResponse>(`/api/dids/${mnemonic}`),

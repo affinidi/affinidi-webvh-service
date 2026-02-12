@@ -9,7 +9,7 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
-import { Link } from "expo-router";
+import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -20,6 +20,8 @@ type PathStatus = null | "checking" | "available" | "taken" | "error";
 export default function DidList() {
   const api = useApi();
   const { isAuthenticated, role } = useAuth();
+  const router = useRouter();
+  const { owner } = useLocalSearchParams<{ owner?: string }>();
   const [dids, setDids] = useState<DidRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -39,14 +41,14 @@ export default function DidList() {
     }
     setLoading(true);
     api
-      .listDids()
+      .listDids(owner)
       .then((data) => {
         setDids(data);
         setError(null);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [api, isAuthenticated]);
+  }, [api, isAuthenticated, owner]);
 
   useEffect(() => {
     refresh();
@@ -104,6 +106,11 @@ export default function DidList() {
     return (
       <View style={styles.containerCenter}>
         <Text style={styles.hint}>Please log in to manage DIDs.</Text>
+        <Link href="/login" asChild>
+          <Pressable style={styles.buttonPrimary}>
+            <Text style={styles.buttonPrimaryText}>Login</Text>
+          </Pressable>
+        </Link>
       </View>
     );
   }
@@ -137,8 +144,22 @@ export default function DidList() {
 
   return (
     <View style={styles.container}>
+      {owner && (
+        <View style={styles.ownerBanner}>
+          <Text style={styles.ownerBannerText} numberOfLines={1}>
+            DIDs owned by {owner}
+          </Text>
+          <Pressable
+            style={styles.buttonSecondary}
+            onPress={() => router.replace("/dids")}
+          >
+            <Text style={styles.buttonSecondaryText}>Your DIDs</Text>
+          </Pressable>
+        </View>
+      )}
+
       <View style={styles.header}>
-        <Text style={styles.title}>Your DIDs</Text>
+        <Text style={styles.title}>{owner ? "Owner DIDs" : "Your DIDs"}</Text>
         <View style={styles.headerActions}>
           {showRootDidButton && (
             <Pressable
@@ -249,6 +270,10 @@ export default function DidList() {
                   </Text>
                   <Text style={styles.metaText}>
                     Updated: {formatDate(item.updatedAt)}
+                  </Text>
+                  <View style={{ flex: 1 }} />
+                  <Text style={styles.resolveCount}>
+                    {item.totalResolves} resolves
                   </Text>
                 </View>
               </Pressable>
@@ -365,11 +390,35 @@ const styles = StyleSheet.create({
   meta: {
     flexDirection: "row",
     gap: spacing.lg,
+    alignItems: "center",
   },
   metaText: {
     fontSize: 13,
     fontFamily: fonts.regular,
     color: colors.textTertiary,
+  },
+  resolveCount: {
+    fontSize: 13,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+  },
+  ownerBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+    gap: spacing.md,
+  },
+  ownerBannerText: {
+    flex: 1,
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.textSecondary,
   },
   hint: {
     fontSize: 14,

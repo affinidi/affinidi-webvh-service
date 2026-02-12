@@ -91,6 +91,7 @@ pub struct DidListEntry {
     pub updated_at: u64,
     pub version_count: u64,
     pub did_id: Option<String>,
+    pub total_resolves: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -117,16 +118,19 @@ mod tests {
             updated_at: 2000,
             version_count: 1,
             did_id: Some("did:webvh:abc:host:path".to_string()),
+            total_resolves: 42,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
         assert!(json.contains("\"updatedAt\""));
         assert!(json.contains("\"versionCount\""));
         assert!(json.contains("\"didId\""));
+        assert!(json.contains("\"totalResolves\""));
         assert!(!json.contains("\"created_at\""));
         assert!(!json.contains("\"updated_at\""));
         assert!(!json.contains("\"version_count\""));
         assert!(!json.contains("\"did_id\""));
+        assert!(!json.contains("\"total_resolves\""));
     }
 
     #[test]
@@ -137,6 +141,7 @@ mod tests {
             updated_at: 0,
             version_count: 0,
             did_id: None,
+            total_resolves: 0,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -150,12 +155,14 @@ mod tests {
             updated_at: 2000,
             version_count: 3,
             did_id: Some("did:webvh:abc:host:path".to_string()),
+            total_resolves: 99,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: DidListEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mnemonic, "test");
         assert_eq!(back.version_count, 3);
         assert_eq!(back.did_id, Some("did:webvh:abc:host:path".to_string()));
+        assert_eq!(back.total_resolves, 99);
     }
 
     #[test]

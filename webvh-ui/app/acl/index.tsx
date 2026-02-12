@@ -200,9 +200,11 @@ export default function AclManagement() {
           renderItem={({ item }) => (
             <View style={styles.entryCard}>
               <View style={styles.entryInfo}>
-                <Text style={styles.entryDid} numberOfLines={1}>
-                  {item.did}
-                </Text>
+                <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
+                  <Text style={styles.entryDid} numberOfLines={1}>
+                    {item.did}
+                  </Text>
+                </Link>
                 <View style={styles.entryMeta}>
                   <View
                     style={[

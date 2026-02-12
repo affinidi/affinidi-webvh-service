@@ -9,7 +9,7 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
@@ -107,6 +107,11 @@ export default function DidDetail() {
     return (
       <View style={styles.containerCenter}>
         <Text style={styles.hint}>Please log in to view DID details.</Text>
+        <Link href="/login" asChild>
+          <Pressable style={styles.button}>
+            <Text style={styles.buttonText}>Login</Text>
+          </Pressable>
+        </Link>
       </View>
     );
   }
@@ -138,6 +143,11 @@ export default function DidDetail() {
             <Text style={styles.pendingText}>Pending upload</Text>
           )
         )}
+        {/* Owner */}
+        {didDetail && (
+          <Text style={styles.ownerText}>Owner: {didDetail.owner}</Text>
+        )}
+
         {/* Stats */}
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Statistics</Text>
@@ -504,6 +514,12 @@ const styles = StyleSheet.create({
     fontFamily: fonts.medium,
     color: colors.warning,
     marginBottom: spacing.xl,
+  },
+  ownerText: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.textSecondary,
+    marginBottom: spacing.lg,
   },
   detailsGrid: {
     gap: spacing.sm,
