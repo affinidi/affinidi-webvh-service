@@ -475,7 +475,7 @@ pub async fn upload_did(
     // Store content
     state
         .dids_ks
-        .insert_raw(content_log_key(&mnemonic), body.into_bytes())
+        .insert_raw(content_log_key(mnemonic), body.into_bytes())
         .await?;
 
     // Update record
@@ -483,10 +483,10 @@ pub async fn upload_did(
     record.version_count += 1;
     record.did_id = did_id;
     record.content_size = new_size;
-    state.dids_ks.insert(did_key(&mnemonic), &record).await?;
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
 
     // Increment stats
-    stats::increment_updates(&state.stats_ks, &mnemonic).await?;
+    stats::increment_updates(&state.stats_ks, mnemonic).await?;
 
     info!(
         did = %auth.did,
@@ -523,7 +523,7 @@ pub async fn upload_witness(
     // Store witness content
     state
         .dids_ks
-        .insert_raw(content_witness_key(&mnemonic), body.into_bytes())
+        .insert_raw(content_witness_key(mnemonic), body.into_bytes())
         .await?;
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, size, "did-witness.json uploaded");
@@ -543,16 +543,16 @@ pub async fn delete_did(
     let record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
     // Remove all associated data
-    state.dids_ks.remove(did_key(&mnemonic)).await?;
-    state.dids_ks.remove(content_log_key(&mnemonic)).await?;
-    state.dids_ks.remove(content_witness_key(&mnemonic)).await?;
+    state.dids_ks.remove(did_key(mnemonic)).await?;
+    state.dids_ks.remove(content_log_key(mnemonic)).await?;
+    state.dids_ks.remove(content_witness_key(mnemonic)).await?;
     state
         .dids_ks
-        .remove(owner_key(&record.owner, &mnemonic))
+        .remove(owner_key(&record.owner, mnemonic))
         .await?;
 
     // Remove stats
-    stats::delete_stats(&state.stats_ks, &mnemonic).await?;
+    stats::delete_stats(&state.stats_ks, mnemonic).await?;
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
@@ -784,8 +784,7 @@ mod tests {
     fn make_valid_jsonl() -> String {
         use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
 
-        let secret =
-            affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+        let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
         let pk = secret.get_public_keymultibase().unwrap();
         let host = encode_host("http://localhost:3000").unwrap();
         let doc = build_did_document(&host, "test-validate", &pk);
@@ -813,10 +812,7 @@ mod tests {
         let result = validate_did_jsonl(&content);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("line 2"),
-            "expected 'line 2' in error: {err}"
-        );
+        assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
     }
 
     // ---- DidRecord serde backwards compat ----
