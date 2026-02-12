@@ -47,13 +47,8 @@ fn encode_pairs(pairs: Vec<RawKvPair>) -> Vec<KvEntry> {
 pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<(), AppError> {
     let config = AppConfig::load(config_path)?;
 
-    let config_toml =
-        std::fs::read_to_string(&config.config_path).map_err(|e| {
-            AppError::Config(format!(
-                "failed to read config file {}: {e}",
-                config.config_path.display()
-            ))
-        })?;
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
 
     let store = Store::open(&config.store)?;
 
@@ -83,7 +78,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
         version: BACKUP_VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-        config: config_toml,
+        config: config_json,
         keyspaces: BackupKeyspaces {
             dids,
             acl,
@@ -140,7 +135,11 @@ pub async fn run_restore(
         )));
     }
 
-    // Handle --restore-config
+    // Deserialize the embedded AppConfig from the backup
+    let backup_config: AppConfig = serde_json::from_str(&backup.config)
+        .map_err(|e| AppError::Config(format!("invalid config in backup: {e}")))?;
+
+    // Handle --restore-config: write the embedded config as TOML
     if let Some(config_dest) = restore_config {
         let dest = config_dest.unwrap_or_else(|| {
             let input_path = PathBuf::from(&input);
@@ -151,12 +150,21 @@ pub async fn run_restore(
                 .to_string_lossy()
                 .into_owned()
         });
-        std::fs::write(&dest, &backup.config)
+        let config_toml = toml::to_string_pretty(&backup_config)
+            .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
+        std::fs::write(&dest, &config_toml)
             .map_err(|e| AppError::Config(format!("failed to write config to {dest}: {e}")))?;
         eprintln!("  Config restored to: {dest}");
     }
 
-    let config = AppConfig::load(config_path)?;
+    // Use --config if provided and exists, otherwise fall back to the backup's embedded config
+    let config = match AppConfig::load(config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("  No config file found, using config from backup");
+            backup_config
+        }
+    };
     let store = Store::open(&config.store)?;
 
     let dids_ks = store.keyspace("dids")?;
