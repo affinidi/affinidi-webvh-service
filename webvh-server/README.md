@@ -177,6 +177,58 @@ lets you:
 All API endpoints continue to work at their normal paths
 regardless of whether the UI is enabled.
 
+## Backup & Restore
+
+The server includes built-in backup and restore commands for
+migrating data between instances, disaster recovery, or
+environment cloning.
+
+### Creating a backup
+
+```bash
+# Backup to default file (webvh-backup.json)
+webvh-server backup
+
+# Backup to a specific file
+webvh-server backup --output /path/to/backup.json
+
+# Backup to stdout (e.g. for piping)
+webvh-server backup --output -
+
+# With a specific config file
+webvh-server --config /path/to/config.toml backup
+```
+
+### Restoring from a backup
+
+```bash
+# Restore data into the store configured by config.toml
+webvh-server restore --input /path/to/backup.json
+
+# Also restore the config.toml from the backup
+webvh-server restore --input /path/to/backup.json --restore-config
+
+# Restore config to a specific path
+webvh-server restore --input /path/to/backup.json --restore-config /path/to/config.toml
+```
+
+### What's included
+
+The backup file is a single JSON document containing:
+
+- **config** — the raw TOML configuration used at backup time
+- **dids** — all DID documents and logs
+- **acl** — access control entries
+- **stats** — DID resolution statistics
+- **sessions** — durable passkey data only (`pk_user:`,
+  `pk_cred:`, `pk_did:`, `enroll:` prefixes)
+
+Ephemeral data (active sessions, refresh tokens, auth
+challenges, WebAuthn ceremony state) is excluded.
+
+All keys and values are base64url-no-pad encoded in the backup
+file.
+
 ## API Endpoints
 
 ### Public

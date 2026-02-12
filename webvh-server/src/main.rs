@@ -1,5 +1,6 @@
 mod acl;
 mod auth;
+mod backup;
 mod config;
 mod error;
 #[cfg(feature = "ui")]
@@ -45,6 +46,21 @@ enum Command {
         #[arg(long, default_value = "admin")]
         role: String,
     },
+    /// Export server data to a backup file
+    Backup {
+        /// Output file path (use "-" for stdout)
+        #[arg(short, long, default_value = "webvh-backup.json")]
+        output: String,
+    },
+    /// Restore server data from a backup file
+    Restore {
+        /// Input backup file path
+        #[arg(short, long)]
+        input: String,
+        /// Also restore the config from the backup (optionally specify output path)
+        #[arg(long)]
+        restore_config: Option<Option<String>>,
+    },
 }
 
 #[tokio::main]
@@ -63,6 +79,21 @@ async fn main() {
         Some(Command::Invite { did, role }) => {
             if let Err(e) = run_invite(cli.config, did, role).await {
                 eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Backup { output }) => {
+            if let Err(e) = backup::run_backup(cli.config, output).await {
+                eprintln!("Backup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Restore {
+            input,
+            restore_config,
+        }) => {
+            if let Err(e) = backup::run_restore(cli.config, input, restore_config).await {
+                eprintln!("Restore error: {e}");
                 std::process::exit(1);
             }
         }

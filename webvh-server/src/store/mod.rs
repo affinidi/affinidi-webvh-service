@@ -187,6 +187,11 @@ impl KeyspaceHandle {
             .map_err(AppError::Store)
     }
 
+    /// Iterate all key-value pairs in the keyspace.
+    pub async fn iter_all(&self) -> Result<Vec<RawKvPair>, AppError> {
+        self.prefix_iter_raw(b"").await
+    }
+
     /// Iterate all key-value pairs whose key starts with `prefix`.
     pub async fn prefix_iter_raw(
         &self,
