@@ -9,55 +9,37 @@ use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
 use crate::stats;
 
-/// Inner helper: serve the DID log for a given mnemonic.
-async fn serve_did_log_inner(state: &AppState, mnemonic: &str) -> Result<Response, AppError> {
-    let key = format!("content:{mnemonic}:log");
+/// Serve stored content for a mnemonic, optionally incrementing resolve stats.
+async fn serve_content(
+    state: &AppState,
+    mnemonic: &str,
+    key: &str,
+    content_type: &str,
+    track_stats: bool,
+) -> Result<Response, AppError> {
     let content = state
         .dids_ks
         .get_raw(key)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("DID log not found: {mnemonic}")))?;
+        .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
 
-    // Increment resolve stats (best-effort, don't fail the request)
-    let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
+    if track_stats {
+        let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
+    }
 
-    debug!(mnemonic = %mnemonic, size = content.len(), "DID log resolved");
+    debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((
-        StatusCode::OK,
-        [("content-type", "application/jsonl+json")],
-        content,
-    )
-        .into_response())
-}
-
-/// Inner helper: serve the witness for a given mnemonic.
-async fn serve_witness_inner(state: &AppState, mnemonic: &str) -> Result<Response, AppError> {
-    let key = format!("content:{mnemonic}:witness");
-    let content = state
-        .dids_ks
-        .get_raw(key)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("witness not found: {mnemonic}")))?;
-
-    debug!(mnemonic = %mnemonic, size = content.len(), "DID witness resolved");
-
-    Ok((
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        content,
-    )
-        .into_response())
+    Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
 }
 
 /// GET /.well-known/did.jsonl — serve the root DID log (mnemonic = ".well-known")
 pub async fn serve_root_did_log(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_did_log_inner(&state, ".well-known").await
+    serve_content(&state, ".well-known", "content:.well-known:log", "application/jsonl+json", true).await
 }
 
 /// GET /.well-known/did-witness.json — serve the root witness
 pub async fn serve_root_witness(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_witness_inner(&state, ".well-known").await
+    serve_content(&state, ".well-known", "content:.well-known:witness", "application/json", false).await
 }
 
 /// Combined fallback handler: serves DID documents for any path ending
@@ -73,7 +55,8 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
         if let Err(e) = validate_mnemonic(mnemonic) {
             return e.into_response();
         }
-        return match serve_did_log_inner(&state, mnemonic).await {
+        let key = format!("content:{mnemonic}:log");
+        return match serve_content(&state, mnemonic, &key, "application/jsonl+json", true).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
         };
@@ -86,7 +69,8 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
         if let Err(e) = validate_mnemonic(mnemonic) {
             return e.into_response();
         }
-        return match serve_witness_inner(&state, mnemonic).await {
+        let key = format!("content:{mnemonic}:witness");
+        return match serve_content(&state, mnemonic, &key, "application/json", false).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
         };

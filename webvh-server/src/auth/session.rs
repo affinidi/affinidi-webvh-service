@@ -52,13 +52,6 @@ pub async fn get_session(
     sessions.get(session_key(session_id)).await
 }
 
-/// Update an existing session (overwrites).
-pub async fn update_session(sessions: &KeyspaceHandle, session: &Session) -> Result<(), AppError> {
-    sessions
-        .insert(session_key(&session.session_id), session)
-        .await
-}
-
 /// Store a reverse index from refresh token to session_id.
 pub async fn store_refresh_index(
     sessions: &KeyspaceHandle,
@@ -160,6 +153,28 @@ pub struct TokenResponse {
     pub refresh_expires_at: u64,
 }
 
+/// Generate access + refresh tokens for an authenticated session.
+fn generate_tokens(
+    jwt_keys: &JwtKeys,
+    did: &str,
+    session_id: &str,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<(String, u64, String, u64), AppError> {
+    let claims = JwtKeys::new_claims(
+        did.to_string(),
+        session_id.to_string(),
+        role.to_string(),
+        access_expiry,
+    );
+    let access_expires_at = claims.exp;
+    let access_token = jwt_keys.encode(&claims)?;
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+    Ok((access_token, access_expires_at, refresh_token, refresh_expires_at))
+}
+
 /// Upgrade an existing `ChallengeSent` session to `Authenticated`, generating
 /// tokens and storing the refresh index. Used by DIDComm auth which preserves
 /// the original session_id from the challenge phase.
@@ -171,22 +186,13 @@ pub async fn finalize_challenge_session(
     access_expiry: u64,
     refresh_expiry: u64,
 ) -> Result<TokenResponse, AppError> {
-    let claims = JwtKeys::new_claims(
-        session.did.clone(),
-        session.session_id.clone(),
-        role.to_string(),
-        access_expiry,
-    );
-    let access_expires_at = claims.exp;
-    let access_token = jwt_keys.encode(&claims)?;
-
-    let refresh_token = Uuid::new_v4().to_string();
-    let refresh_expires_at = now_epoch() + refresh_expiry;
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at) =
+        generate_tokens(jwt_keys, &session.did, &session.session_id, role, access_expiry, refresh_expiry)?;
 
     session.state = SessionState::Authenticated;
     session.refresh_token = Some(refresh_token.clone());
     session.refresh_expires_at = Some(refresh_expires_at);
-    update_session(sessions, session).await?;
+    store_session(sessions, session).await?;
 
     store_refresh_index(sessions, &refresh_token, &session.session_id).await?;
 
@@ -212,17 +218,8 @@ pub async fn create_authenticated_session(
 ) -> Result<TokenResponse, AppError> {
     let session_id = Uuid::new_v4().to_string();
 
-    let claims = JwtKeys::new_claims(
-        did.to_string(),
-        session_id.clone(),
-        role.to_string(),
-        access_expiry,
-    );
-    let access_expires_at = claims.exp;
-    let access_token = jwt_keys.encode(&claims)?;
-
-    let refresh_token = Uuid::new_v4().to_string();
-    let refresh_expires_at = now_epoch() + refresh_expiry;
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at) =
+        generate_tokens(jwt_keys, did, &session_id, role, access_expiry, refresh_expiry)?;
 
     let session = Session {
         session_id: session_id.clone(),

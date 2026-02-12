@@ -218,33 +218,33 @@ impl AppConfig {
 
         config.config_path = path.clone();
 
-        // Apply env var overrides
-        if let Ok(v) = std::env::var("WEBVH_FEATURES_DIDCOMM") {
-            config.features.didcomm = v == "1" || v.eq_ignore_ascii_case("true");
-        }
-        if let Ok(v) = std::env::var("WEBVH_FEATURES_REST_API") {
-            config.features.rest_api = v == "1" || v.eq_ignore_ascii_case("true");
-        }
-        if let Ok(did) = std::env::var("WEBVH_SERVER_DID") {
-            config.server_did = Some(did);
-        }
-        if let Ok(did) = std::env::var("WEBVH_MEDIATOR_DID") {
-            config.mediator_did = Some(did);
-        }
-        if let Ok(url) = std::env::var("WEBVH_PUBLIC_URL") {
-            config.public_url = Some(url);
-        }
-        if let Ok(host) = std::env::var("WEBVH_SERVER_HOST") {
-            config.server.host = host;
-        }
-        if let Ok(port) = std::env::var("WEBVH_SERVER_PORT") {
-            config.server.port = port
-                .parse()
-                .map_err(|e| AppError::Config(format!("invalid WEBVH_SERVER_PORT: {e}")))?;
-        }
-        if let Ok(level) = std::env::var("WEBVH_LOG_LEVEL") {
-            config.log.level = level;
-        }
+        // Env var override macros
+        macro_rules! env_str { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = v; } }; }
+        macro_rules! env_opt { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = Some(v); } }; }
+        macro_rules! env_parse { ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = v.parse().map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
+            }
+        }; }
+        macro_rules! env_bool { ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) { $field = v == "1" || v.eq_ignore_ascii_case("true"); }
+        }; }
+
+        // Features
+        env_bool!("WEBVH_FEATURES_DIDCOMM", config.features.didcomm);
+        env_bool!("WEBVH_FEATURES_REST_API", config.features.rest_api);
+
+        // Server identity
+        env_opt!("WEBVH_SERVER_DID", config.server_did);
+        env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
+        env_opt!("WEBVH_PUBLIC_URL", config.public_url);
+
+        // Server
+        env_str!("WEBVH_SERVER_HOST", config.server.host);
+        env_parse!("WEBVH_SERVER_PORT", config.server.port);
+
+        // Logging
+        env_str!("WEBVH_LOG_LEVEL", config.log.level);
         if let Ok(format) = std::env::var("WEBVH_LOG_FORMAT") {
             config.log.format = match format.to_lowercase().as_str() {
                 "json" => LogFormat::Json,
@@ -256,69 +256,29 @@ impl AppConfig {
                 }
             };
         }
+
+        // Store
         if let Ok(data_dir) = std::env::var("WEBVH_STORE_DATA_DIR") {
             config.store.data_dir = PathBuf::from(data_dir);
         }
 
-        // Auth env var overrides
-        if let Ok(expiry) = std::env::var("WEBVH_AUTH_ACCESS_EXPIRY") {
-            config.auth.access_token_expiry = expiry
-                .parse()
-                .map_err(|e| AppError::Config(format!("invalid WEBVH_AUTH_ACCESS_EXPIRY: {e}")))?;
-        }
-        if let Ok(expiry) = std::env::var("WEBVH_AUTH_REFRESH_EXPIRY") {
-            config.auth.refresh_token_expiry = expiry.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_AUTH_REFRESH_EXPIRY: {e}"))
-            })?;
-        }
-        if let Ok(ttl) = std::env::var("WEBVH_AUTH_CHALLENGE_TTL") {
-            config.auth.challenge_ttl = ttl
-                .parse()
-                .map_err(|e| AppError::Config(format!("invalid WEBVH_AUTH_CHALLENGE_TTL: {e}")))?;
-        }
-        if let Ok(interval) = std::env::var("WEBVH_AUTH_SESSION_CLEANUP_INTERVAL") {
-            config.auth.session_cleanup_interval = interval.parse().map_err(|e| {
-                AppError::Config(format!(
-                    "invalid WEBVH_AUTH_SESSION_CLEANUP_INTERVAL: {e}"
-                ))
-            })?;
-        }
-        if let Ok(ttl) = std::env::var("WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL") {
-            config.auth.passkey_enrollment_ttl = ttl.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL: {e}"))
-            })?;
-        }
-        if let Ok(ttl) = std::env::var("WEBVH_CLEANUP_TTL_MINUTES") {
-            config.auth.cleanup_ttl_minutes = ttl.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_CLEANUP_TTL_MINUTES: {e}"))
-            })?;
-        }
-        if let Ok(key) = std::env::var("WEBVH_AUTH_JWT_SIGNING_KEY") {
-            config.auth.jwt_signing_key = Some(key);
-        }
-        if let Ok(key) = std::env::var("WEBVH_SIGNING_KEY") {
-            config.signing_key = Some(key);
-        }
-        if let Ok(key) = std::env::var("WEBVH_KEY_AGREEMENT_KEY") {
-            config.key_agreement_key = Some(key);
-        }
+        // Auth
+        env_parse!("WEBVH_AUTH_ACCESS_EXPIRY", config.auth.access_token_expiry);
+        env_parse!("WEBVH_AUTH_REFRESH_EXPIRY", config.auth.refresh_token_expiry);
+        env_parse!("WEBVH_AUTH_CHALLENGE_TTL", config.auth.challenge_ttl);
+        env_parse!("WEBVH_AUTH_SESSION_CLEANUP_INTERVAL", config.auth.session_cleanup_interval);
+        env_parse!("WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL", config.auth.passkey_enrollment_ttl);
+        env_parse!("WEBVH_CLEANUP_TTL_MINUTES", config.auth.cleanup_ttl_minutes);
+        env_opt!("WEBVH_AUTH_JWT_SIGNING_KEY", config.auth.jwt_signing_key);
 
-        // Limits env var overrides
-        if let Ok(v) = std::env::var("WEBVH_LIMITS_UPLOAD_BODY_LIMIT") {
-            config.limits.upload_body_limit = v.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_LIMITS_UPLOAD_BODY_LIMIT: {e}"))
-            })?;
-        }
-        if let Ok(v) = std::env::var("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE") {
-            config.limits.default_max_total_size = v.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE: {e}"))
-            })?;
-        }
-        if let Ok(v) = std::env::var("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT") {
-            config.limits.default_max_did_count = v.parse().map_err(|e| {
-                AppError::Config(format!("invalid WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT: {e}"))
-            })?;
-        }
+        // Keys
+        env_opt!("WEBVH_SIGNING_KEY", config.signing_key);
+        env_opt!("WEBVH_KEY_AGREEMENT_KEY", config.key_agreement_key);
+
+        // Limits
+        env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
+        env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
+        env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
 
         Ok(config)
     }

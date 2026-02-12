@@ -15,7 +15,13 @@ pub struct Store {
 
 #[derive(Clone)]
 pub struct KeyspaceHandle {
-    keyspace: fjall::Keyspace,
+    pub(crate) keyspace: fjall::Keyspace,
+}
+
+/// An atomic write batch that collects operations and commits them in a single
+/// `spawn_blocking` call via fjall's `WriteBatch`.
+pub struct WriteBatch {
+    inner: fjall::OwnedWriteBatch,
 }
 
 impl Store {
@@ -34,10 +40,54 @@ impl Store {
         Ok(KeyspaceHandle { keyspace })
     }
 
+    /// Create a new atomic write batch.
+    pub fn batch(&self) -> WriteBatch {
+        WriteBatch {
+            inner: self.db.batch(),
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn persist(&self) -> Result<(), AppError> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll))
+            .await
+            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
+        Ok(())
+    }
+}
+
+impl WriteBatch {
+    /// Add a serializable insert to the batch.
+    pub fn insert<V: Serialize>(
+        &mut self,
+        ks: &KeyspaceHandle,
+        key: impl Into<Vec<u8>>,
+        value: &V,
+    ) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(value)?;
+        self.inner.insert(&ks.keyspace, key.into(), bytes);
+        Ok(())
+    }
+
+    /// Add a raw-bytes insert to the batch.
+    pub fn insert_raw(
+        &mut self,
+        ks: &KeyspaceHandle,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) {
+        self.inner.insert(&ks.keyspace, key.into(), value.into());
+    }
+
+    /// Add a remove to the batch.
+    pub fn remove(&mut self, ks: &KeyspaceHandle, key: impl Into<Vec<u8>>) {
+        self.inner.remove(&ks.keyspace, key.into());
+    }
+
+    /// Commit all batched operations atomically in a single `spawn_blocking`.
+    pub async fn commit(self) -> Result<(), AppError> {
+        tokio::task::spawn_blocking(move || self.inner.commit())
             .await
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
         Ok(())

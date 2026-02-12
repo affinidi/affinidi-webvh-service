@@ -219,17 +219,15 @@ pub async fn request_uri(
         content_size: 0,
     };
 
-    // Store DID record
-    state.dids_ks.insert(did_key(&mnemonic), &record).await?;
-
-    // Store owner reverse index
-    state
-        .dids_ks
-        .insert_raw(
-            owner_key(&auth.did, &mnemonic),
-            mnemonic.as_bytes().to_vec(),
-        )
-        .await?;
+    // Store DID record + owner index atomically
+    let mut batch = state.store.batch();
+    batch.insert(&state.dids_ks, did_key(&mnemonic), &record)?;
+    batch.insert_raw(
+        &state.dids_ks,
+        owner_key(&auth.did, &mnemonic),
+        mnemonic.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
 
     // Build the public DID URL
     let base_url = state.config.public_url.clone().unwrap_or_else(|| {
@@ -472,18 +470,17 @@ pub async fn upload_did(
     // Extract DID ID from content
     let did_id = extract_did_id(&body);
 
-    // Store content
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.into_bytes())
-        .await?;
-
     // Update record
     record.updated_at = now_epoch();
     record.version_count += 1;
     record.did_id = did_id;
     record.content_size = new_size;
-    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+
+    // Store content + updated record atomically
+    let mut batch = state.store.batch();
+    batch.insert_raw(&state.dids_ks, content_log_key(mnemonic), body.into_bytes());
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.commit().await?;
 
     // Increment stats
     stats::increment_updates(&state.stats_ks, mnemonic).await?;
@@ -542,17 +539,14 @@ pub async fn delete_did(
     validate_mnemonic(mnemonic)?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, &auth).await?;
 
-    // Remove all associated data
-    state.dids_ks.remove(did_key(mnemonic)).await?;
-    state.dids_ks.remove(content_log_key(mnemonic)).await?;
-    state.dids_ks.remove(content_witness_key(mnemonic)).await?;
-    state
-        .dids_ks
-        .remove(owner_key(&record.owner, mnemonic))
-        .await?;
-
-    // Remove stats
-    stats::delete_stats(&state.stats_ks, mnemonic).await?;
+    // Remove all associated data atomically
+    let mut batch = state.store.batch();
+    batch.remove(&state.dids_ks, did_key(mnemonic));
+    batch.remove(&state.dids_ks, content_log_key(mnemonic));
+    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
+    batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
+    batch.remove(&state.stats_ks, format!("stats:{mnemonic}"));
+    batch.commit().await?;
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 

@@ -97,24 +97,20 @@ pub fn validate_custom_path(path: &str) -> Result<(), AppError> {
         ));
     }
 
-    let segments: Vec<&str> = path.split('/').collect();
-
-    for segment in &segments {
+    for (i, segment) in path.split('/').enumerate() {
         if segment.is_empty() {
             return Err(AppError::Validation(
                 "path must not contain empty segments (double slashes)".into(),
             ));
         }
         validate_segment(segment)?;
-    }
 
-    // Only check the first segment against reserved names
-    if let Some(&first) = segments.first()
-        && RESERVED_NAMES.contains(&first)
-    {
-        return Err(AppError::Validation(format!(
-            "'{first}' is a reserved name and cannot be used as the first path segment",
-        )));
+        // Only check the first segment against reserved names
+        if i == 0 && RESERVED_NAMES.contains(&segment) {
+            return Err(AppError::Validation(format!(
+                "'{segment}' is a reserved name and cannot be used as the first path segment",
+            )));
+        }
     }
 
     Ok(())

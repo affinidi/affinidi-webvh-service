@@ -31,8 +31,7 @@ pub async fn challenge(
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
     // ACL enforcement: DID must be in the ACL to request a challenge
-    let acl = state.acl_ks.clone();
-    check_acl(&acl, &req.did).await?;
+    check_acl(&state.acl_ks, &req.did).await?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -51,8 +50,7 @@ pub async fn challenge(
         refresh_expires_at: None,
     };
 
-    let sessions = state.sessions_ks.clone();
-    store_session(&sessions, &session).await?;
+    store_session(&state.sessions_ks, &session).await?;
 
     info!(did = %session.did, session_id = %session.session_id, "auth challenge issued");
 
@@ -68,24 +66,13 @@ pub async fn authenticate(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<AuthenticateResponse>, AppError> {
-    let did_resolver = state
-        .did_resolver
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
-    let secrets_resolver = state
-        .secrets_resolver
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
-    let jwt_keys = state
-        .jwt_keys
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+    let (did_resolver, secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
     // Unpack the DIDComm message
     let (msg, _metadata) = Message::unpack_string(
         &body,
         did_resolver,
-        secrets_resolver.as_ref(),
+        secrets_resolver,
         &UnpackOptions::default(),
     )
     .await
@@ -114,8 +101,7 @@ pub async fn authenticate(
         .ok_or_else(|| AppError::Authentication("message has no sender (from)".into()))?;
 
     // Look up session and validate
-    let sessions = state.sessions_ks.clone();
-    let mut session = get_session(&sessions, session_id)
+    let mut session = get_session(&state.sessions_ks, session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
@@ -164,12 +150,11 @@ pub async fn authenticate(
     }
 
     // Look up ACL entry to get role for the token
-    let acl = state.acl_ks.clone();
-    let role = check_acl(&acl, &session.did).await?;
+    let role = check_acl(&state.acl_ks, &session.did).await?;
 
     // Generate tokens and finalize session
     let token_resp = finalize_challenge_session(
-        &sessions,
+        &state.sessions_ks,
         jwt_keys,
         &mut session,
         &role,
@@ -197,24 +182,13 @@ pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<RefreshResponse>, AppError> {
-    let did_resolver = state
-        .did_resolver
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
-    let secrets_resolver = state
-        .secrets_resolver
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
-    let jwt_keys = state
-        .jwt_keys
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+    let (did_resolver, secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
     // Unpack the DIDComm message
     let (msg, _metadata) = Message::unpack_string(
         &body,
         did_resolver,
-        secrets_resolver.as_ref(),
+        secrets_resolver,
         &UnpackOptions::default(),
     )
     .await
@@ -234,12 +208,11 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
 
     // Look up session by refresh token
-    let sessions = state.sessions_ks.clone();
-    let session_id = get_session_by_refresh(&sessions, refresh_token)
+    let session_id = get_session_by_refresh(&state.sessions_ks, refresh_token)
         .await?
         .ok_or_else(|| AppError::Authentication("refresh token not found".into()))?;
 
-    let session = get_session(&sessions, &session_id)
+    let session = get_session(&state.sessions_ks, &session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
@@ -257,8 +230,7 @@ pub async fn refresh(
     }
 
     // Look up current ACL role (propagates changes at refresh time)
-    let acl = state.acl_ks.clone();
-    let role = check_acl(&acl, &session.did).await?;
+    let role = check_acl(&state.acl_ks, &session.did).await?;
 
     // Generate new access token
     let claims = JwtKeys::new_claims(

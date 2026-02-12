@@ -62,6 +62,10 @@ fn passkey_user_key(uuid: &Uuid) -> String {
     format!("pk_user:{uuid}")
 }
 
+fn passkey_did_key(did: &str) -> String {
+    format!("pk_did:{did}")
+}
+
 // ---------------------------------------------------------------------------
 // Enrollment CRUD
 // ---------------------------------------------------------------------------
@@ -167,7 +171,13 @@ pub async fn store_passkey_user(
     ks: &KeyspaceHandle,
     user: &PasskeyUser,
 ) -> Result<(), AppError> {
-    ks.insert(passkey_user_key(&user.user_uuid), user).await
+    ks.insert(passkey_user_key(&user.user_uuid), user).await?;
+    // Maintain DID → user UUID reverse index
+    ks.insert_raw(
+        passkey_did_key(&user.did),
+        user.user_uuid.to_string().into_bytes(),
+    )
+    .await
 }
 
 pub async fn get_passkey_user(
@@ -189,11 +199,24 @@ pub async fn get_passkey_user_by_cred(
     }
 }
 
-/// Find a PasskeyUser by DID, scanning all `pk_user:` entries.
+/// Find a PasskeyUser by DID, using the `pk_did:` reverse index.
+/// Falls back to a full scan for backward compatibility with existing data.
 pub async fn get_passkey_user_by_did(
     ks: &KeyspaceHandle,
     did: &str,
 ) -> Result<Option<PasskeyUser>, AppError> {
+    // Try the reverse index first
+    if let Some(bytes) = ks.get_raw(passkey_did_key(did)).await? {
+        let uuid_str = String::from_utf8(bytes)
+            .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
+        let uuid = Uuid::parse_str(&uuid_str)
+            .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
+        if let Some(user) = get_passkey_user(ks, &uuid).await? {
+            return Ok(Some(user));
+        }
+    }
+
+    // Fallback: linear scan for pre-index data
     let entries = ks.prefix_iter_raw("pk_user:").await?;
     for (_key, value) in entries {
         if let Ok(user) = serde_json::from_slice::<PasskeyUser>(&value)

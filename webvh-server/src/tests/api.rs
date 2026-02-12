@@ -59,6 +59,7 @@ async fn setup() -> TestEnv {
     };
 
     let state = AppState {
+        store,
         sessions_ks,
         acl_ks,
         dids_ks,

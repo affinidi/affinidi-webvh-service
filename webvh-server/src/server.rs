@@ -23,6 +23,7 @@ use tracing::{Level, debug, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub store: Store,
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub dids_ks: KeyspaceHandle,
@@ -32,6 +33,27 @@ pub struct AppState {
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
+}
+
+impl AppState {
+    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
+    pub fn require_didcomm_auth(
+        &self,
+    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
+        let did_resolver = self
+            .did_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
+        let secrets_resolver = self
+            .secrets_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
+        let jwt_keys = self
+            .jwt_keys
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
+    }
 }
 
 pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
@@ -68,6 +90,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
     let upload_body_limit = config.limits.upload_body_limit;
 
     let state = AppState {
+        store,
         sessions_ks,
         acl_ks,
         dids_ks,
@@ -170,7 +193,7 @@ async fn init_didcomm_auth(
 
     // Load and insert server signing key (Ed25519)
     if let Some(ref signing_key_b64) = config.signing_key {
-        match decode_ed25519_key(signing_key_b64) {
+        match decode_32byte_key(signing_key_b64, "signing_key") {
             Ok(private_bytes) => {
                 let kid = format!("{server_did}#key-0");
                 let secret =
@@ -187,7 +210,7 @@ async fn init_didcomm_auth(
 
     // Load and insert server key-agreement key (X25519)
     if let Some(ref ka_key_b64) = config.key_agreement_key {
-        match decode_x25519_key(ka_key_b64) {
+        match decode_32byte_key(ka_key_b64, "key_agreement_key") {
             Ok(private_bytes) => {
                 let kid = format!("{server_did}#key-1");
                 match affinidi_tdk::secrets_resolver::secrets::Secret::generate_x25519(
@@ -213,34 +236,19 @@ async fn init_didcomm_auth(
     )
 }
 
-/// Decode a base64url-no-pad 32-byte Ed25519 private key.
-fn decode_ed25519_key(b64: &str) -> Result<[u8; 32], AppError> {
+/// Decode a base64url-no-pad 32-byte key, returning a descriptive error on failure.
+fn decode_32byte_key(b64: &str, label: &str) -> Result<[u8; 32], AppError> {
     let bytes = BASE64
         .decode(b64)
-        .map_err(|e| AppError::Config(format!("invalid signing_key base64: {e}")))?;
+        .map_err(|e| AppError::Config(format!("invalid {label} base64: {e}")))?;
     bytes
         .try_into()
-        .map_err(|_| AppError::Config("signing_key must be exactly 32 bytes".into()))
-}
-
-/// Decode a base64url-no-pad 32-byte X25519 private key.
-fn decode_x25519_key(b64: &str) -> Result<[u8; 32], AppError> {
-    let bytes = BASE64
-        .decode(b64)
-        .map_err(|e| AppError::Config(format!("invalid key_agreement_key base64: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|_| AppError::Config("key_agreement_key must be exactly 32 bytes".into()))
+        .map_err(|_| AppError::Config(format!("{label} must be exactly 32 bytes")))
 }
 
 /// Decode a base64url-no-pad JWT signing key and construct `JwtKeys`.
 fn decode_jwt_key(b64: &str) -> Result<JwtKeys, AppError> {
-    let bytes = BASE64
-        .decode(b64)
-        .map_err(|e| AppError::Config(format!("invalid jwt_signing_key base64: {e}")))?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| AppError::Config("jwt_signing_key must be exactly 32 bytes".into()))?;
+    let key_bytes = decode_32byte_key(b64, "jwt_signing_key")?;
     let keys = JwtKeys::from_ed25519_bytes(&key_bytes)?;
     debug!("JWT signing key decoded successfully");
     Ok(keys)

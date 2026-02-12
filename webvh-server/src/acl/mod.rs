@@ -85,12 +85,9 @@ pub async fn delete_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<(), App
 /// List all ACL entries.
 pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, AppError> {
     let raw = acl.prefix_iter_raw("acl:").await?;
-    let mut entries = Vec::with_capacity(raw.len());
-    for (_key, value) in raw {
-        let entry: AclEntry = serde_json::from_slice(&value)?;
-        entries.push(entry);
-    }
-    Ok(entries)
+    raw.into_iter()
+        .map(|(_, v)| serde_json::from_slice(&v).map_err(AppError::from))
+        .collect()
 }
 
 /// Check whether a DID is in the ACL and return its role.

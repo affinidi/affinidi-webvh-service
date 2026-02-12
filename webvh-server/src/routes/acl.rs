@@ -47,8 +47,7 @@ pub async fn list_acl(
     auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<AclListResponse>, AppError> {
-    let acl = state.acl_ks.clone();
-    let all_entries = list_acl_entries(&acl).await?;
+    let all_entries = list_acl_entries(&state.acl_ks).await?;
     let entries: Vec<AclEntryResponse> =
         all_entries.into_iter().map(AclEntryResponse::from).collect();
     info!(caller = %auth.0.did, count = entries.len(), "ACL listed");
@@ -73,10 +72,8 @@ pub async fn create_acl(
     State(state): State<AppState>,
     Json(req): Json<CreateAclRequest>,
 ) -> Result<(StatusCode, Json<AclEntryResponse>), AppError> {
-    let acl = state.acl_ks.clone();
-
     // Check if entry already exists
-    if get_acl_entry(&acl, &req.did).await?.is_some() {
+    if get_acl_entry(&state.acl_ks, &req.did).await?.is_some() {
         warn!(caller = %auth.0.did, target_did = %req.did, "ACL create rejected: entry already exists");
         return Err(AppError::Conflict(format!(
             "ACL entry already exists for DID: {}",
@@ -93,7 +90,7 @@ pub async fn create_acl(
         max_did_count: req.max_did_count,
     };
 
-    store_acl_entry(&acl, &entry).await?;
+    store_acl_entry(&state.acl_ks, &entry).await?;
 
     info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
@@ -114,9 +111,7 @@ pub async fn update_acl(
     Path(did): Path<String>,
     Json(req): Json<UpdateAclRequest>,
 ) -> Result<Json<AclEntryResponse>, AppError> {
-    let acl = state.acl_ks.clone();
-
-    let mut entry = get_acl_entry(&acl, &did)
+    let mut entry = get_acl_entry(&state.acl_ks, &did)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found for DID: {did}")))?;
 
@@ -130,7 +125,7 @@ pub async fn update_acl(
         entry.max_did_count = req.max_did_count;
     }
 
-    store_acl_entry(&acl, &entry).await?;
+    store_acl_entry(&state.acl_ks, &entry).await?;
 
     info!(
         caller = %auth.0.did,
@@ -158,14 +153,12 @@ pub async fn delete_acl(
         ));
     }
 
-    let acl = state.acl_ks.clone();
-
     // Verify entry exists
-    get_acl_entry(&acl, &did)
+    get_acl_entry(&state.acl_ks, &did)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found for DID: {did}")))?;
 
-    delete_acl_entry(&acl, &did).await?;
+    delete_acl_entry(&state.acl_ks, &did).await?;
 
     info!(caller = %auth.0.did, did = %did, "ACL entry deleted");
     Ok(StatusCode::NO_CONTENT)
