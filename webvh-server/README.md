@@ -55,7 +55,37 @@ access_token_expiry = 900                   # 15 minutes
 refresh_token_expiry = 86400                # 24 hours
 challenge_ttl = 300                         # 5 minutes
 session_cleanup_interval = 600              # 10 minutes
+passkey_enrollment_ttl = 86400              # 24 hours
+cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
+
+[limits]
+upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
+default_max_total_size = 1048576            # Per-account total DID size (bytes), default 1MB
+default_max_did_count = 20                  # Per-account max number of DIDs
 ```
+
+#### Resource Limits
+
+The `[limits]` section controls per-account resource quotas:
+
+- **`upload_body_limit`** — Maximum request body size for
+  `did.jsonl` and witness uploads. Requests exceeding this are
+  rejected with `413 Payload Too Large`. Default: `102400`
+  (100 KB).
+
+- **`default_max_total_size`** — Default per-account total size
+  across all DID documents. When an upload would push an
+  account's combined DID content above this limit, the request
+  is rejected. Default: `1048576` (1 MB).
+
+- **`default_max_did_count`** — Default per-account maximum
+  number of DIDs. Once reached, new DID creation requests are
+  rejected. Default: `20`.
+
+Admins are exempt from all quota checks. Per-account overrides
+can be set via the ACL API by including `max_total_size` and/or
+`max_did_count` in the ACL entry — these take precedence over
+the global defaults.
 
 ### Environment Variable Overrides
 
@@ -77,7 +107,15 @@ Every config field can be overridden via environment variables:
 | `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)    |
 | `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)   |
 | `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)     |
-| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Cleanup interval (sec)       |
+| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Session cleanup interval (sec)       |
+| `WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL`   | Passkey enrollment TTL (sec)         |
+| `WEBVH_CLEANUP_TTL_MINUTES`          | Empty DID cleanup TTL (min)          |
+| `WEBVH_FEATURES_DIDCOMM`             | Enable DIDComm (`true` / `1`)        |
+| `WEBVH_FEATURES_REST_API`            | Enable REST API (`true` / `1`)       |
+| `WEBVH_MEDIATOR_DID`                 | Mediator DID identifier              |
+| `WEBVH_LIMITS_UPLOAD_BODY_LIMIT`     | Max upload body size (bytes)         |
+| `WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes)  |
+| `WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT` | Per-account max DID count            |
 
 All key values are base64url-no-pad encoded 32-byte keys.
 
