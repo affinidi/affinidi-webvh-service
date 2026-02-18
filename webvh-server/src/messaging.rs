@@ -10,6 +10,7 @@ use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::messaging::ATM;
 use affinidi_tdk::messaging::config::ATMConfig;
 use affinidi_tdk::messaging::profiles::ATMProfile;
+use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
 use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
 use affinidi_tdk::messaging::transports::websockets::WebSocketResponses;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
@@ -30,6 +31,7 @@ use crate::server::AppState;
 // ---------------------------------------------------------------------------
 
 const TRUST_PING_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping";
+const DISCOVER_FEATURES_QUERY_TYPE: &str = "https://didcomm.org/discover-features/2.0/queries";
 const MESSAGE_PICKUP_STATUS_TYPE: &str = "https://didcomm.org/messagepickup/3.0/status";
 const MSG_AUTHENTICATE: &str = "https://affinidi.com/webvh/1.0/authenticate";
 
@@ -92,9 +94,21 @@ pub async fn init_didcomm_connection(
         return None;
     }
 
-    // Build ATM with inbound message channel
+    // Register discoverable protocols
+    let features = DiscoverFeatures {
+        protocols: vec![
+            "https://didcomm.org/trust-ping/2.0".into(),
+            "https://didcomm.org/discover-features/2.0".into(),
+            "https://affinidi.com/webvh/1.0".into(),
+        ],
+        goal_codes: vec![],
+        headers: vec![],
+    };
+
+    // Build ATM with inbound message channel and discoverable features
     let atm_config = match ATMConfig::builder()
         .with_inbound_message_channel(100)
+        .with_discovery_features(features)
         .build()
     {
         Ok(c) => c,
@@ -211,6 +225,11 @@ async fn dispatch_message(
                 warn!("failed to handle trust-ping: {e}");
             }
         }
+        DISCOVER_FEATURES_QUERY_TYPE => {
+            if let Err(e) = handle_discover_features(atm, profile, server_did, msg).await {
+                warn!("failed to handle discover-features query: {e}");
+            }
+        }
         MESSAGE_PICKUP_STATUS_TYPE => {
             // Mediator status notifications — safe to ignore
         }
@@ -262,6 +281,51 @@ async fn handle_trust_ping(
         .await?;
 
     info!(to = sender_did, "sent trust-pong");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Discover Features
+// ---------------------------------------------------------------------------
+
+async fn handle_discover_features(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    server_did: &str,
+    query_msg: &Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender_did = query_msg
+        .from
+        .as_deref()
+        .ok_or("discover-features query has no 'from' DID")?;
+
+    info!(from = sender_did, "received discover-features query");
+
+    // Use ATM's discoverable state to calculate the disclosure
+    let state = atm.discover_features().get_discoverable_state();
+    let features = state.read().await;
+    let disclosure = features.generate_disclosure_message(
+        server_did,
+        sender_did,
+        query_msg,
+        None, // auto-calculate from registered state
+    )?;
+    drop(features);
+
+    let (packed, _) = atm
+        .pack_encrypted(
+            &disclosure,
+            sender_did,
+            Some(server_did),
+            Some(server_did),
+            None,
+        )
+        .await?;
+
+    atm.send_message(profile, &packed, &disclosure.id, false, false)
+        .await?;
+
+    info!(to = sender_did, "sent discover-features disclosure");
     Ok(())
 }
 

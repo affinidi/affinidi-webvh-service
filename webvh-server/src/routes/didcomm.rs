@@ -5,11 +5,13 @@
 //! `did/problem-report` messages; transport-level errors are returned as HTTP errors.
 
 use affinidi_tdk::didcomm::{Message, UnpackOptions};
+use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
+use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::auth::AuthClaims;
 use crate::auth::session::now_epoch;
@@ -20,6 +22,9 @@ use crate::server::AppState;
 // ---------------------------------------------------------------------------
 // Message type constants
 // ---------------------------------------------------------------------------
+
+const TRUST_PING_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping";
+const DISCOVER_FEATURES_QUERY_TYPE: &str = "https://didcomm.org/discover-features/2.0/queries";
 
 const MSG_DID_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/request";
 const MSG_DID_OFFER: &str = "https://affinidi.com/webvh/1.0/did/offer";
@@ -125,7 +130,7 @@ pub async fn handle(
         .ok_or_else(|| AppError::Internal("server_did not configured".into()))?;
 
     // Dispatch to sub-handler; convert business errors into problem-reports
-    let (response_type, response_body) = match dispatch(&auth, &state, &msg).await {
+    let (response_type, response_body) = match dispatch(&auth, &state, &msg, server_did).await {
         Ok(result) => result,
         Err(pe) => {
             warn!(
@@ -177,8 +182,11 @@ async fn dispatch(
     auth: &AuthClaims,
     state: &AppState,
     msg: &Message,
+    server_did: &str,
 ) -> Result<(String, Value), ProtocolError> {
     match msg.type_.as_str() {
+        TRUST_PING_TYPE => handle_trust_ping(msg, server_did),
+        DISCOVER_FEATURES_QUERY_TYPE => handle_discover_features(msg, server_did),
         MSG_DID_REQUEST => handle_did_request(auth, state, msg).await,
         MSG_DID_PUBLISH => handle_did_publish(auth, state, msg).await,
         MSG_WITNESS_PUBLISH => handle_witness_publish(auth, state, msg).await,
@@ -195,6 +203,64 @@ async fn dispatch(
 // ---------------------------------------------------------------------------
 // Sub-handlers
 // ---------------------------------------------------------------------------
+
+/// `trust-ping/2.0/ping` -> `trust-ping/2.0/ping-response`
+///
+/// Returns the pong message type and body directly; the caller packs it.
+fn handle_trust_ping(
+    ping: &Message,
+    server_did: &str,
+) -> Result<(String, Value), ProtocolError> {
+    let sender_did = ping
+        .from
+        .as_deref()
+        .ok_or_else(|| ProtocolError::new("e.p.trust-ping.no-from", "trust-ping has no 'from' DID"))?;
+
+    info!(from = sender_did, "received trust-ping");
+
+    let pong = TrustPing::default()
+        .generate_pong_message(ping, Some(server_did))
+        .map_err(|e| ProtocolError::new("e.p.trust-ping.error", e.to_string()))?;
+
+    Ok((pong.type_.clone(), pong.body.clone()))
+}
+
+/// `discover-features/2.0/queries` -> `discover-features/2.0/disclose`
+///
+/// Returns the disclosure message type and body; the caller packs it.
+fn handle_discover_features(
+    query_msg: &Message,
+    server_did: &str,
+) -> Result<(String, Value), ProtocolError> {
+    let sender_did = query_msg
+        .from
+        .as_deref()
+        .ok_or_else(|| {
+            ProtocolError::new(
+                "e.p.discover-features.no-from",
+                "discover-features query has no 'from' DID",
+            )
+        })?;
+
+    info!(from = sender_did, "received discover-features query");
+
+    // Build a DiscoverFeatures state with our supported protocols
+    let features = DiscoverFeatures {
+        protocols: vec![
+            "https://didcomm.org/trust-ping/2.0".into(),
+            "https://didcomm.org/discover-features/2.0".into(),
+            "https://affinidi.com/webvh/1.0".into(),
+        ],
+        goal_codes: vec![],
+        headers: vec![],
+    };
+
+    let disclosure = features
+        .generate_disclosure_message(server_did, sender_did, query_msg, None)
+        .map_err(|e| ProtocolError::new("e.p.discover-features.error", e.to_string()))?;
+
+    Ok((disclosure.type_.clone(), disclosure.body.clone()))
+}
 
 /// `did/request` -> `did/offer`
 async fn handle_did_request(
