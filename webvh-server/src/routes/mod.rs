@@ -1,5 +1,6 @@
 mod acl;
 mod auth;
+mod config;
 mod didcomm;
 pub(crate) mod did_manage;
 mod did_public;
@@ -49,6 +50,8 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/auth/passkey/login/finish", post(passkey::login_finish))
         // DIDComm protocol endpoint
         .route("/didcomm", post(didcomm::handle))
+        // Server config (admin only)
+        .route("/config", get(config::get_config))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route(

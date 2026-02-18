@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { href: "/", label: "Dashboard" },
   { href: "/dids", label: "DIDs" },
   { href: "/acl", label: "Access Control" },
+  { href: "/settings", label: "\u2699 Settings" },
 ] as const;
 
 export function NavBar() {

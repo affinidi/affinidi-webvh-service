@@ -109,6 +109,28 @@ export interface LoginStartResponse {
   options: any;
 }
 
+export interface ServerConfig {
+  serverDid: string | null;
+  publicUrl: string | null;
+  features: { didcomm: boolean; restApi: boolean };
+  server: { host: string; port: number };
+  log: { level: string; format: string };
+  store: { dataDir: string };
+  auth: {
+    accessTokenExpiry: number;
+    refreshTokenExpiry: number;
+    challengeTtl: number;
+    sessionCleanupInterval: number;
+    passkeyEnrollmentTtl: number;
+    cleanupTtlMinutes: number;
+  };
+  limits: {
+    uploadBodyLimit: number;
+    defaultMaxTotalSize: number;
+    defaultMaxDidCount: number;
+  };
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -247,6 +269,8 @@ export const api = {
 
   deleteAcl: (did: string) =>
     request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
+
+  getConfig: () => request<ServerConfig>("/api/config"),
 
   // Passkey auth
   passkeyEnrollStart: (token: string) =>
