@@ -2,6 +2,7 @@ mod acl;
 mod auth;
 mod backup;
 mod config;
+mod did_ops;
 mod error;
 #[cfg(feature = "ui")]
 mod frontend;

@@ -15,7 +15,7 @@ use crate::config::{AppConfig, AuthConfig};
 use crate::error::AppError;
 use crate::passkey;
 use crate::routes;
-use crate::routes::did_manage::cleanup_empty_dids;
+use crate::did_ops::cleanup_empty_dids;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::net::TcpListener;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
