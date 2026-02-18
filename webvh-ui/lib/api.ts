@@ -40,6 +40,13 @@ export interface DidDetailResponse {
   log: LogMetadata | null;
 }
 
+export interface LogEntryInfo {
+  versionId: string | null;
+  versionTime: string | null;
+  state: Record<string, any> | null;
+  parameters: Record<string, any> | null;
+}
+
 export interface CreateDidResponse {
   mnemonic: string;
   didUrl: string;
@@ -171,6 +178,9 @@ export const api = {
 
   getDid: (mnemonic: string) =>
     request<DidDetailResponse>(`/api/dids/${mnemonic}`),
+
+  getDidLog: (mnemonic: string) =>
+    request<LogEntryInfo[]>(`/api/log/${mnemonic}`),
 
   createDid: (path?: string) =>
     request<CreateDidResponse>("/api/dids", {

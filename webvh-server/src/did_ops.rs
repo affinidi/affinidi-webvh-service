@@ -39,6 +39,16 @@ pub struct DidRecord {
     pub content_size: u64,
 }
 
+/// A single parsed log entry with its DID document and parameters.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntryInfo {
+    pub version_id: Option<String>,
+    pub version_time: Option<String>,
+    pub state: Option<serde_json::Value>,
+    pub parameters: Option<serde_json::Value>,
+}
+
 /// Summary of WebVH log entry metadata parsed from the stored JSONL content.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -531,6 +541,49 @@ pub async fn get_did_info(
         stats: did_stats,
         did_url,
     })
+}
+
+/// Get parsed log entries for a DID.
+pub async fn get_did_log(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<Vec<LogEntryInfo>, AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    let content = String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+
+    let entries: Vec<LogEntryInfo> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            Some(LogEntryInfo {
+                version_id: value
+                    .get("versionId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                version_time: value
+                    .get("versionTime")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                state: value.get("state").cloned(),
+                parameters: value.get("parameters").cloned(),
+            })
+        })
+        .collect();
+
+    debug!(mnemonic = %mnemonic, count = entries.len(), "DID log entries retrieved");
+
+    Ok(entries)
 }
 
 /// List DIDs owned by the caller (or by a specific owner if the caller is admin).

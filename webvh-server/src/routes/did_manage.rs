@@ -1,5 +1,5 @@
 use crate::auth::AuthClaims;
-use crate::did_ops::{self, LogMetadata};
+use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::mnemonic::{is_path_available, validate_custom_path};
 use crate::server::AppState;
@@ -86,6 +86,18 @@ pub async fn get_did(
         owner: result.record.owner,
         log: result.log_metadata,
     }))
+}
+
+// ---------- GET /dids/{mnemonic}/log ----------
+
+pub async fn get_did_log(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<Json<Vec<LogEntryInfo>>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let entries = did_ops::get_did_log(&auth, &state, mnemonic).await?;
+    Ok(Json(entries))
 }
 
 // ---------- PUT /dids/{mnemonic} ----------

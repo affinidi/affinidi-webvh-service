@@ -14,7 +14,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import type { DidStats, DidDetailResponse } from "../../lib/api";
+import type { DidStats, DidDetailResponse, LogEntryInfo } from "../../lib/api";
 
 export default function DidDetail() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
@@ -29,6 +29,8 @@ export default function DidDetail() {
   const [copied, setCopied] = useState(false);
   const [didContent, setDidContent] = useState("");
   const [witnessContent, setWitnessContent] = useState("");
+  const [logEntries, setLogEntries] = useState<LogEntryInfo[]>([]);
+  const [selectedVersion, setSelectedVersion] = useState(-1);
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -41,6 +43,13 @@ export default function DidDetail() {
     api
       .getDid(mnemonic)
       .then(setDidDetail)
+      .catch(() => {});
+    api
+      .getDidLog(mnemonic)
+      .then((entries) => {
+        setLogEntries(entries);
+        setSelectedVersion(entries.length - 1);
+      })
       .catch(() => {});
   }, [api, mnemonic, isAuthenticated]);
 
@@ -293,6 +302,51 @@ export default function DidDetail() {
                 <Text style={styles.statLabel}>Deactivated</Text>
               </View>
             </View>
+          </View>
+        )}
+
+        {/* DID Document viewer */}
+        {logEntries.length > 0 && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>DID Document</Text>
+            <View style={styles.versionRow}>
+              <Text style={styles.detailLabel}>Version</Text>
+              <View style={styles.selectWrapper}>
+                <select
+                  value={selectedVersion}
+                  onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
+                  style={{
+                    backgroundColor: colors.bgPrimary,
+                    color: colors.textPrimary,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radii.sm,
+                    padding: "6px 10px",
+                    fontFamily: fonts.mono,
+                    fontSize: 13,
+                    width: "100%",
+                  }}
+                >
+                  {logEntries.map((entry, idx) => (
+                    <option key={idx} value={idx}>
+                      Version {idx + 1}
+                      {entry.versionId ? ` — ${entry.versionId}` : ""}
+                      {entry.versionTime ? ` (${entry.versionTime})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </View>
+            </View>
+            {logEntries[selectedVersion]?.state && (
+              <ScrollView
+                horizontal
+                style={styles.jsonScroll}
+                contentContainerStyle={styles.jsonScrollContent}
+              >
+                <Text style={styles.jsonText} selectable>
+                  {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
+                </Text>
+              </ScrollView>
+            )}
           </View>
         )}
 
@@ -571,5 +625,31 @@ const styles = StyleSheet.create({
     fontFamily: fonts.medium,
     color: colors.error,
     fontSize: 14,
+  },
+  versionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    marginBottom: spacing.md,
+  },
+  selectWrapper: {
+    flex: 1,
+  },
+  jsonScroll: {
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    maxHeight: 400,
+    padding: spacing.md,
+  },
+  jsonScrollContent: {
+    flexGrow: 1,
+  },
+  jsonText: {
+    fontFamily: fonts.mono,
+    fontSize: 12,
+    color: colors.textPrimary,
+    lineHeight: 18,
   },
 });
