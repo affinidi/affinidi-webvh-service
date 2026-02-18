@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::common::TDKSharedState;
 use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::messaging::ATM;
@@ -13,10 +14,11 @@ use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
 use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
 use affinidi_tdk::messaging::transports::websockets::WebSocketResponses;
-use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use affinidi_tdk::secrets_resolver::SecretsResolver;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::acl::check_acl;
 use crate::auth::AuthClaims;
@@ -57,13 +59,13 @@ const MSG_AUTH_RESPONSE: &str = "https://affinidi.com/webvh/1.0/authenticate-res
 
 /// Initialize the DIDComm connection to the mediator.
 ///
-/// Connects to the configured mediator over WebSocket and prepares the ATM
-/// and profile for inbound message handling.
+/// Resolves the server's DID document to determine the correct key IDs for
+/// secrets, creates keys from the configured private key material, and
+/// connects to the mediator via WebSocket.
 ///
 /// Returns `Some((Arc<ATM>, Arc<ATMProfile>))` on success.
 pub async fn init_didcomm_connection(
     config: &AppConfig,
-    secrets_resolver: &Arc<ThreadedSecretsResolver>,
     server_did: &str,
 ) -> Option<(Arc<ATM>, Arc<ATMProfile>)> {
     let mediator_did = match &config.mediator_did {
@@ -74,24 +76,57 @@ pub async fn init_didcomm_connection(
         }
     };
 
-    // Create TDK shared state and copy server secrets from the shared resolver
+    // Create TDK shared state
     let tdk = TDKSharedState::default().await;
 
-    let signing_id = format!("{server_did}#key-0");
-    let ka_id = format!("{server_did}#key-1");
+    // Resolve the server's DID document to discover the correct key IDs.
+    // The secrets MUST be inserted with KIDs matching the DID document;
+    // a mismatch causes the mediator to fail with "Unable unwrap cek".
+    let (signing_kid, ka_kid) = resolve_server_key_ids(server_did).await;
 
-    if let Some(secret) = secrets_resolver.get_secret(&signing_id).await {
-        tdk.secrets_resolver.insert(secret).await;
-    } else {
-        warn!("server signing secret not found — messaging disabled");
-        return None;
+    // Insert server signing key (Ed25519) with the DID-document key ID
+    match &config.signing_key {
+        Some(b64) => match crate::server::decode_32byte_key(b64, "signing_key") {
+            Ok(private_bytes) => {
+                let secret =
+                    Secret::generate_ed25519(Some(&signing_kid), Some(&private_bytes));
+                tdk.secrets_resolver.insert(secret).await;
+                debug!(kid = %signing_kid, "server signing secret loaded");
+            }
+            Err(e) => {
+                warn!("failed to decode signing_key: {e} — messaging disabled");
+                return None;
+            }
+        },
+        None => {
+            warn!("signing_key not configured — messaging disabled");
+            return None;
+        }
     }
 
-    if let Some(secret) = secrets_resolver.get_secret(&ka_id).await {
-        tdk.secrets_resolver.insert(secret).await;
-    } else {
-        warn!("server key-agreement secret not found — messaging disabled");
-        return None;
+    // Insert server key-agreement key (X25519) with the DID-document key ID
+    match &config.key_agreement_key {
+        Some(b64) => match crate::server::decode_32byte_key(b64, "key_agreement_key") {
+            Ok(private_bytes) => match Secret::generate_x25519(Some(&ka_kid), Some(&private_bytes))
+            {
+                Ok(secret) => {
+                    tdk.secrets_resolver.insert(secret).await;
+                    debug!(kid = %ka_kid, "server key-agreement secret loaded");
+                }
+                Err(e) => {
+                    warn!("failed to create X25519 secret: {e} — messaging disabled");
+                    return None;
+                }
+            },
+            Err(e) => {
+                warn!("failed to decode key_agreement_key: {e} — messaging disabled");
+                return None;
+            }
+        },
+        None => {
+            warn!("key_agreement_key not configured — messaging disabled");
+            return None;
+        }
     }
 
     // Register discoverable protocols
@@ -147,6 +182,78 @@ pub async fn init_didcomm_connection(
 
     info!("messaging initialized — connected to mediator");
     Some((atm, profile))
+}
+
+// ---------------------------------------------------------------------------
+// DID document key ID resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the server's DID document and extract the key IDs for signing
+/// (authentication) and key agreement.
+///
+/// The ATM SDK matches secrets to DID-document verification-method IDs during
+/// `pack_encrypted`.  If the secrets use hardcoded fragments like `#key-0` /
+/// `#key-1` but the DID document uses multibase-encoded fragments like
+/// `#z6Mk…` / `#z6LS…`, the mediator will fail with "Unable unwrap cek".
+///
+/// Falls back to `{server_did}#key-0` / `{server_did}#key-1` when the DID
+/// cannot be resolved (e.g. the server hosts its own DID and hasn't published
+/// it yet).
+async fn resolve_server_key_ids(server_did: &str) -> (String, String) {
+    let fallback_signing = format!("{server_did}#key-0");
+    let fallback_ka = format!("{server_did}#key-1");
+
+    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                "failed to create DID resolver for key-ID lookup: {e} — using fallback key IDs"
+            );
+            return (fallback_signing, fallback_ka);
+        }
+    };
+
+    match did_resolver.resolve(server_did).await {
+        Ok(response) => {
+            let doc = &response.doc;
+
+            // Key agreement (X25519) — used for DIDComm encryption
+            let ka_kid = match doc.key_agreement.first() {
+                Some(vr) => {
+                    let kid = vr.get_id().to_string();
+                    info!(kid = %kid, "DID doc keyAgreement key ID");
+                    kid
+                }
+                None => {
+                    warn!("server DID document has no keyAgreement — using fallback {fallback_ka}");
+                    fallback_ka
+                }
+            };
+
+            // Authentication (Ed25519) — used for DIDComm signing
+            let signing_kid = match doc.authentication.first() {
+                Some(vr) => {
+                    let kid = vr.get_id().to_string();
+                    info!(kid = %kid, "DID doc authentication key ID");
+                    kid
+                }
+                None => {
+                    warn!(
+                        "server DID document has no authentication — using fallback {fallback_signing}"
+                    );
+                    fallback_signing
+                }
+            };
+
+            (signing_kid, ka_kid)
+        }
+        Err(e) => {
+            warn!(
+                "failed to resolve server DID {server_did}: {e} — using fallback key IDs #key-0, #key-1"
+            );
+            (fallback_signing, fallback_ka)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

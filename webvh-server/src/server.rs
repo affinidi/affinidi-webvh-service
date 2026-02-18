@@ -113,6 +113,34 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         webauthn,
     };
 
+    // Log startup configuration
+    info!("--- enabled services ---");
+    info!(
+        "  REST API : {}",
+        if state.config.features.rest_api {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    info!(
+        "  DIDComm  : {}",
+        if state.config.features.didcomm {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(ref url) = state.config.public_url {
+        info!("  public URL   : {url}");
+    }
+    if let Some(ref did) = state.config.server_did {
+        info!("  server DID   : {did}");
+    }
+    if let Some(ref did) = state.config.mediator_did {
+        info!("  mediator DID : {did}");
+    }
+
     // Separate shutdown channels for ordered shutdown (DIDComm → REST → Storage)
     let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
     let (didcomm_shutdown_tx, didcomm_shutdown_rx) = watch::channel(false);
@@ -287,10 +315,10 @@ fn run_didcomm_thread(state: AppState, shutdown_rx: &mut watch::Receiver<bool>) 
         info!("DIDComm thread started");
 
         // Check preconditions
-        let (sr, server_did) = match (&state.secrets_resolver, &state.config.server_did) {
-            (Some(sr), Some(did)) => (sr, did.as_str()),
-            _ => {
-                info!("DIDComm not configured — thread idle");
+        let server_did = match &state.config.server_did {
+            Some(did) => did.as_str(),
+            None => {
+                info!("DIDComm not configured — server_did not set, thread idle");
                 let _ = shutdown_rx.changed().await;
                 info!("DIDComm thread shutting down (idle)");
                 return;
@@ -306,7 +334,7 @@ fn run_didcomm_thread(state: AppState, shutdown_rx: &mut watch::Receiver<bool>) 
 
         // Initialize ATM connection
         let (atm, profile) =
-            match messaging::init_didcomm_connection(&state.config, sr, server_did).await {
+            match messaging::init_didcomm_connection(&state.config, server_did).await {
                 Some(handles) => handles,
                 None => {
                     let _ = shutdown_rx.changed().await;
@@ -491,7 +519,7 @@ async fn init_didcomm_auth(
 }
 
 /// Decode a base64url-no-pad 32-byte key, returning a descriptive error on failure.
-fn decode_32byte_key(b64: &str, label: &str) -> Result<[u8; 32], AppError> {
+pub(crate) fn decode_32byte_key(b64: &str, label: &str) -> Result<[u8; 32], AppError> {
     let bytes = BASE64
         .decode(b64)
         .map_err(|e| AppError::Config(format!("invalid {label} base64: {e}")))?;
