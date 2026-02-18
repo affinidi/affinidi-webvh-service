@@ -6,6 +6,7 @@ mod did_ops;
 mod error;
 #[cfg(feature = "ui")]
 mod frontend;
+mod messaging;
 mod mnemonic;
 mod passkey;
 mod routes;
