@@ -73,15 +73,15 @@ export default function Dashboard() {
             <>
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Total DIDs</Text>
-                <Text style={styles.cardValueAccent}>{serverStats.totalDids}</Text>
+                <Text style={styles.cardValueAccent}>{serverStats.totalDids.toLocaleString()}</Text>
               </View>
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Total Resolves</Text>
-                <Text style={styles.cardValue}>{serverStats.totalResolves}</Text>
+                <Text style={styles.cardValue}>{serverStats.totalResolves.toLocaleString()}</Text>
               </View>
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Total Updates</Text>
-                <Text style={styles.cardValue}>{serverStats.totalUpdates}</Text>
+                <Text style={styles.cardValue}>{serverStats.totalUpdates.toLocaleString()}</Text>
               </View>
             </>
           )}

@@ -165,11 +165,11 @@ export default function DidDetail() {
           ) : stats ? (
             <View style={styles.statsGrid}>
               <View style={styles.statItem}>
-                <Text style={styles.statValue}>{stats.total_resolves}</Text>
+                <Text style={styles.statValue}>{stats.total_resolves.toLocaleString()}</Text>
                 <Text style={styles.statLabel}>Resolves</Text>
               </View>
               <View style={styles.statItem}>
-                <Text style={styles.statValue}>{stats.total_updates}</Text>
+                <Text style={styles.statValue}>{stats.total_updates.toLocaleString()}</Text>
                 <Text style={styles.statLabel}>Updates</Text>
               </View>
               <View style={styles.statItem}>
@@ -220,7 +220,7 @@ export default function DidDetail() {
               <View style={styles.detailRow}>
                 <Text style={styles.detailLabel}>Log Entries</Text>
                 <Text style={styles.detailValue}>
-                  {didDetail.log.logEntryCount}
+                  {didDetail.log.logEntryCount.toLocaleString()}
                 </Text>
               </View>
               {didDetail.log.ttl != null && (

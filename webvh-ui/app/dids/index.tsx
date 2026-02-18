@@ -266,14 +266,14 @@ export default function DidList() {
                 )}
                 <View style={styles.meta}>
                   <Text style={styles.metaText}>
-                    Versions: {item.versionCount}
+                    Versions: {item.versionCount.toLocaleString()}
                   </Text>
                   <Text style={styles.metaText}>
                     Updated: {formatDate(item.updatedAt)}
                   </Text>
                   <View style={{ flex: 1 }} />
                   <Text style={styles.resolveCount}>
-                    {item.totalResolves} resolves
+                    {item.totalResolves.toLocaleString()} resolves
                   </Text>
                 </View>
               </Pressable>
