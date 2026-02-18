@@ -305,51 +305,64 @@ export default function DidDetail() {
           </View>
         )}
 
-        {/* DID Document viewer */}
-        {logEntries.length > 0 && (
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>DID Document</Text>
-            <View style={styles.versionRow}>
-              <Text style={styles.detailLabel}>Version</Text>
-              <View style={styles.selectWrapper}>
-                <select
-                  value={selectedVersion}
-                  onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
-                  style={{
-                    backgroundColor: colors.bgPrimary,
-                    color: colors.textPrimary,
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: radii.sm,
-                    padding: "6px 10px",
-                    fontFamily: fonts.mono,
-                    fontSize: 13,
-                    width: "100%",
-                  }}
-                >
-                  {logEntries.map((entry, idx) => (
-                    <option key={idx} value={idx}>
-                      Version {idx + 1}
-                      {entry.versionId ? ` — ${entry.versionId}` : ""}
-                      {entry.versionTime ? ` (${entry.versionTime})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </View>
-            </View>
-            {logEntries[selectedVersion]?.state && (
-              <ScrollView
-                horizontal
-                style={styles.jsonScroll}
-                contentContainerStyle={styles.jsonScrollContent}
-              >
-                <Text style={styles.jsonText} selectable>
-                  {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
-                </Text>
-              </ScrollView>
-            )}
-          </View>
-        )}
+      </View>
 
+      {/* DID Document viewer — full width */}
+      {logEntries.length > 0 && (
+        <View style={styles.wideCard}>
+          <Text style={styles.sectionTitle}>DID Document</Text>
+          <View style={styles.versionRow}>
+            <Text style={styles.detailLabel}>Version</Text>
+            <View style={styles.selectWrapper}>
+              <select
+                value={selectedVersion}
+                onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
+                style={{
+                  backgroundColor: colors.bgPrimary,
+                  color: colors.textPrimary,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radii.sm,
+                  padding: "6px 10px",
+                  fontFamily: fonts.mono,
+                  fontSize: 13,
+                  width: "100%",
+                }}
+              >
+                {logEntries.map((entry, idx) => (
+                  <option key={idx} value={idx}>
+                    Version {idx + 1}
+                    {entry.versionId ? ` — ${entry.versionId}` : ""}
+                    {entry.versionTime ? ` (${entry.versionTime})` : ""}
+                  </option>
+                ))}
+              </select>
+            </View>
+          </View>
+          {logEntries[selectedVersion]?.state && (
+            <div style={{
+              backgroundColor: colors.bgPrimary,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radii.sm,
+              overflow: "auto",
+              maxHeight: 500,
+              padding: spacing.md,
+            }}>
+              <pre style={{
+                margin: 0,
+                fontFamily: fonts.mono,
+                fontSize: 12,
+                lineHeight: "18px",
+                color: colors.textPrimary,
+                whiteSpace: "pre",
+              }}>
+                {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
+              </pre>
+            </div>
+          )}
+        </View>
+      )}
+
+      <View style={styles.narrow}>
         {/* Upload DID log */}
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Upload DID Log</Text>
@@ -457,6 +470,17 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.xl,
     marginBottom: spacing.lg,
+  },
+  wideCard: {
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.xl,
+    marginBottom: spacing.lg,
+    width: "100%",
+    maxWidth: 1200,
+    alignSelf: "center",
   },
   dangerCard: {
     borderColor: "rgba(255, 92, 92, 0.25)",
@@ -634,22 +658,5 @@ const styles = StyleSheet.create({
   },
   selectWrapper: {
     flex: 1,
-  },
-  jsonScroll: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    maxHeight: 400,
-    padding: spacing.md,
-  },
-  jsonScrollContent: {
-    flexGrow: 1,
-  },
-  jsonText: {
-    fontFamily: fonts.mono,
-    fontSize: 12,
-    color: colors.textPrimary,
-    lineHeight: 18,
   },
 });
