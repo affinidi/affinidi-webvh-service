@@ -126,6 +126,7 @@ const styles = StyleSheet.create({
     padding: spacing.lg,
     minWidth: 140,
     flex: 1,
+    alignItems: "center",
   },
   errorCard: {
     backgroundColor: colors.errorBg,
