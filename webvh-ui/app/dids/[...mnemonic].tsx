@@ -131,7 +131,7 @@ export default function DidDetail() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <View style={styles.narrow}>
+      <View style={styles.wide}>
         <Text style={styles.title}>
           {mnemonic === ".well-known" ? "Root DID (.well-known)" : mnemonic}
         </Text>
@@ -190,9 +190,6 @@ export default function DidDetail() {
             <ActivityIndicator color={colors.accent} />
           )}
         </View>
-
-        {/* Usage chart */}
-        {mnemonic && <UsageChart mnemonic={mnemonic} />}
 
         {/* DID Details — parsed from log entries */}
         {didDetail?.log && (
@@ -309,64 +306,64 @@ export default function DidDetail() {
           </View>
         )}
 
-      </View>
+        {/* Usage chart */}
+        {mnemonic && <UsageChart mnemonic={mnemonic} />}
 
-      {/* DID Document viewer — full width */}
-      {logEntries.length > 0 && (
-        <View style={styles.wideCard}>
-          <Text style={styles.sectionTitle}>DID Document</Text>
-          <View style={styles.versionRow}>
-            <Text style={styles.detailLabel}>Version</Text>
-            <View style={styles.selectWrapper}>
-              <select
-                value={selectedVersion}
-                onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
-                style={{
-                  backgroundColor: colors.bgPrimary,
-                  color: colors.textPrimary,
-                  border: `1px solid ${colors.border}`,
-                  borderRadius: radii.sm,
-                  padding: "6px 10px",
-                  fontFamily: fonts.mono,
-                  fontSize: 13,
-                  width: "100%",
-                }}
-              >
-                {logEntries.map((entry, idx) => (
-                  <option key={idx} value={idx}>
-                    Version {idx + 1}
-                    {entry.versionId ? ` — ${entry.versionId}` : ""}
-                    {entry.versionTime ? ` (${entry.versionTime})` : ""}
-                  </option>
-                ))}
-              </select>
+        {/* DID Document viewer */}
+        {logEntries.length > 0 && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>DID Document</Text>
+            <View style={styles.versionRow}>
+              <Text style={styles.detailLabel}>Version</Text>
+              <View style={styles.selectWrapper}>
+                <select
+                  value={selectedVersion}
+                  onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
+                  style={{
+                    backgroundColor: colors.bgPrimary,
+                    color: colors.textPrimary,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radii.sm,
+                    padding: "6px 10px",
+                    fontFamily: fonts.mono,
+                    fontSize: 13,
+                    width: "100%",
+                  }}
+                >
+                  {logEntries.map((entry, idx) => (
+                    <option key={idx} value={idx}>
+                      Version {idx + 1}
+                      {entry.versionId ? ` — ${entry.versionId}` : ""}
+                      {entry.versionTime ? ` (${entry.versionTime})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </View>
             </View>
-          </View>
-          {logEntries[selectedVersion]?.state && (
-            <div style={{
-              backgroundColor: colors.bgPrimary,
-              border: `1px solid ${colors.border}`,
-              borderRadius: radii.sm,
-              overflow: "auto",
-              maxHeight: 500,
-              padding: spacing.md,
-            }}>
-              <pre style={{
-                margin: 0,
-                fontFamily: fonts.mono,
-                fontSize: 12,
-                lineHeight: "18px",
-                color: colors.textPrimary,
-                whiteSpace: "pre",
+            {logEntries[selectedVersion]?.state && (
+              <div style={{
+                backgroundColor: colors.bgPrimary,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radii.sm,
+                overflow: "auto",
+                maxHeight: 500,
+                padding: spacing.md,
               }}>
-                {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
-              </pre>
-            </div>
-          )}
-        </View>
-      )}
+                <pre style={{
+                  margin: 0,
+                  fontFamily: fonts.mono,
+                  fontSize: 12,
+                  lineHeight: "18px",
+                  color: colors.textPrimary,
+                  whiteSpace: "pre",
+                }}>
+                  {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
+                </pre>
+              </div>
+            )}
+          </View>
+        )}
 
-      <View style={styles.narrow}>
         {/* Upload DID log */}
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Upload DID Log</Text>
@@ -455,8 +452,8 @@ const styles = StyleSheet.create({
   content: {
     padding: spacing.xl,
   },
-  narrow: {
-    maxWidth: 600,
+  wide: {
+    maxWidth: 1200,
     alignSelf: "center",
     width: "100%",
   },
@@ -474,17 +471,6 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.xl,
     marginBottom: spacing.lg,
-  },
-  wideCard: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.xl,
-    marginBottom: spacing.lg,
-    width: "100%",
-    maxWidth: 1200,
-    alignSelf: "center",
   },
   dangerCard: {
     borderColor: "rgba(255, 92, 92, 0.25)",
