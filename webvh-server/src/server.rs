@@ -19,7 +19,7 @@ use crate::passkey;
 use crate::routes;
 use crate::stats;
 use crate::store::{KeyspaceHandle, Store};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
@@ -113,34 +113,32 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         webauthn,
     };
 
-    // Shutdown coordination
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Separate shutdown channels for ordered shutdown (DIDComm → REST → Storage)
+    let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
+    let (didcomm_shutdown_tx, didcomm_shutdown_rx) = watch::channel(false);
+    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
 
-    // Spawn signal handler on the main tokio runtime
-    tokio::spawn({
-        let shutdown_tx = shutdown_tx.clone();
-        async move {
-            shutdown_signal().await;
-            let _ = shutdown_tx.send(true);
-        }
-    });
+    // REST ready signal — DIDComm thread waits for this before starting
+    let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
-    // Spawn three named OS threads
-    let mut rest_shutdown_rx = shutdown_rx.clone();
+    // 1. Spawn REST thread first — HTTP must be available before DIDComm starts
+    let mut rest_shutdown = rest_shutdown_rx.clone();
     let rest_state = state.clone();
     let rest_handle = std::thread::Builder::new()
         .name("webvh-rest".into())
-        .spawn(move || run_rest_thread(std_listener, rest_state, upload_body_limit, &mut rest_shutdown_rx))
+        .spawn(move || {
+            run_rest_thread(
+                std_listener,
+                rest_state,
+                upload_body_limit,
+                &mut rest_shutdown,
+                rest_ready_tx,
+            )
+        })
         .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?;
 
-    let mut didcomm_shutdown_rx = shutdown_rx.clone();
-    let didcomm_state = state.clone();
-    let didcomm_handle = std::thread::Builder::new()
-        .name("webvh-didcomm".into())
-        .spawn(move || run_didcomm_thread(didcomm_state, &mut didcomm_shutdown_rx))
-        .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?;
-
-    let mut storage_shutdown_rx = shutdown_rx.clone();
+    // 2. Spawn storage thread (independent cleanup, can run alongside REST)
+    let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
         .spawn(move || {
@@ -151,33 +149,29 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                 storage_stats_ks,
                 storage_auth_config,
                 has_auth,
-                &mut storage_shutdown_rx,
+                &mut storage_shutdown,
             )
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // Join REST + DIDComm in parallel, then storage last
-    let (rest_result, didcomm_result) = tokio::join!(
-        tokio::task::spawn_blocking(move || rest_handle.join()),
-        tokio::task::spawn_blocking(move || didcomm_handle.join()),
-    );
+    // 3. Wait for REST to be serving before starting DIDComm
+    let _ = rest_ready_rx.await;
 
-    // If either thread panicked, trigger shutdown for the remaining threads
+    let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
+    let didcomm_state = state.clone();
+    let didcomm_handle = std::thread::Builder::new()
+        .name("webvh-didcomm".into())
+        .spawn(move || run_didcomm_thread(didcomm_state, &mut didcomm_shutdown))
+        .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?;
+
+    // Wait for shutdown signal
+    shutdown_signal().await;
+
+    // Ordered shutdown: DIDComm → REST → Storage
     let mut any_panic = false;
 
-    match rest_result {
-        Ok(Ok(())) => info!("REST thread stopped"),
-        Ok(Err(_panic)) => {
-            error!("REST thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join REST thread: {e}");
-            any_panic = true;
-        }
-    }
-
-    match didcomm_result {
+    let _ = didcomm_shutdown_tx.send(true);
+    match tokio::task::spawn_blocking(move || didcomm_handle.join()).await {
         Ok(Ok(())) => info!("DIDComm thread stopped"),
         Ok(Err(_panic)) => {
             error!("DIDComm thread panicked");
@@ -189,15 +183,28 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         }
     }
 
-    if any_panic {
-        let _ = shutdown_tx.send(true);
+    let _ = rest_shutdown_tx.send(true);
+    match tokio::task::spawn_blocking(move || rest_handle.join()).await {
+        Ok(Ok(())) => info!("REST thread stopped"),
+        Ok(Err(_panic)) => {
+            error!("REST thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join REST thread: {e}");
+            any_panic = true;
+        }
     }
 
-    // Join storage last — guarantees all writes flushed before database closes
-    match storage_handle.join() {
-        Ok(()) => info!("storage thread stopped"),
-        Err(_panic) => {
+    let _ = storage_shutdown_tx.send(true);
+    match tokio::task::spawn_blocking(move || storage_handle.join()).await {
+        Ok(Ok(())) => info!("storage thread stopped"),
+        Ok(Err(_panic)) => {
             error!("storage thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join storage thread: {e}");
             any_panic = true;
         }
     }
@@ -215,11 +222,16 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
 // ---------------------------------------------------------------------------
 
 /// REST thread: serves the Axum HTTP server.
+///
+/// Sends a signal on `ready_tx` once the router is built and `axum::serve` is
+/// about to start accepting connections. The main thread waits for this before
+/// spawning the DIDComm thread.
 fn run_rest_thread(
     std_listener: std::net::TcpListener,
     state: AppState,
     upload_body_limit: usize,
     shutdown_rx: &mut watch::Receiver<bool>,
+    ready_tx: oneshot::Sender<()>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -243,6 +255,9 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             );
+
+        // Signal that REST is ready to serve
+        let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
         axum::serve(listener, app)
