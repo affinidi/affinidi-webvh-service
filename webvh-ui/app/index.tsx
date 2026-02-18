@@ -10,6 +10,7 @@ import { Link } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
+import { UsageChart } from "../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { HealthResponse, ServerStats } from "../lib/api";
 
@@ -88,6 +89,12 @@ export default function Dashboard() {
         </View>
       ) : (
         <ActivityIndicator color={colors.accent} size="large" />
+      )}
+
+      {serverStats && (
+        <View style={{ width: "100%", maxWidth: 700 }}>
+          <UsageChart />
+        </View>
       )}
     </View>
   );

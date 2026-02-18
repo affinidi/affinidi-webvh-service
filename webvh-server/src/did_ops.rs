@@ -447,6 +447,7 @@ pub async fn publish_did(
     batch.commit().await?;
 
     stats::increment_updates(&state.stats_ks, mnemonic).await?;
+    let _ = stats::record_timeseries_update(&state.stats_ks, mnemonic).await;
 
     let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
 
@@ -648,6 +649,8 @@ pub async fn delete_did(
     batch.remove(&state.stats_ks, format!("stats:{mnemonic}"));
     batch.commit().await?;
 
+    let _ = stats::delete_timeseries(&state.stats_ks, mnemonic).await;
+
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(DeleteDidResult {
@@ -685,6 +688,7 @@ pub async fn cleanup_empty_dids(
                 .remove(owner_key(&record.owner, &record.mnemonic))
                 .await?;
             stats::delete_stats(stats_ks, &record.mnemonic).await?;
+            let _ = stats::delete_timeseries(stats_ks, &record.mnemonic).await;
             removed += 1;
         }
     }

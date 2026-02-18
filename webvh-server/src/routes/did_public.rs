@@ -25,6 +25,7 @@ async fn serve_content(
 
     if track_stats {
         let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
+        let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
     }
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");

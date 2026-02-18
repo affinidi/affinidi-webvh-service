@@ -39,6 +39,9 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         // Stats (authenticated)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
+        // Time-series (authenticated)
+        .route("/timeseries", get(stats::get_server_timeseries))
+        .route("/timeseries/{*mnemonic}", get(stats::get_did_timeseries))
         // Passkey auth routes
         .route("/auth/passkey/enroll/start", post(passkey::enroll_start))
         .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish))

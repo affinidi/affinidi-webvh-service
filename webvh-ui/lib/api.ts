@@ -83,6 +83,14 @@ export interface ServerStats {
   lastUpdatedAt: number | null;
 }
 
+export interface TimeSeriesPoint {
+  timestamp: number;
+  resolves: number;
+  updates: number;
+}
+
+export type TimeRange = "1h" | "24h" | "7d" | "30d";
+
 export interface TokenResponse {
   session_id: string;
   access_token: string;
@@ -221,6 +229,12 @@ export const api = {
     request<DidStats>(`/api/stats/${mnemonic}`),
 
   getServerStats: () => request<ServerStats>("/api/stats"),
+
+  getServerTimeseries: (range: TimeRange = "24h") =>
+    request<TimeSeriesPoint[]>(`/api/timeseries?range=${range}`),
+
+  getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
+    request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),
 
   listAcl: () => request<AclListResponse>("/api/acl"),
 

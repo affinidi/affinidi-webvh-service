@@ -16,6 +16,7 @@ use crate::error::AppError;
 use crate::passkey;
 use crate::routes;
 use crate::did_ops::cleanup_empty_dids;
+use crate::stats;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::net::TcpListener;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
@@ -267,6 +268,11 @@ async fn did_cleanup_loop(
             Ok(0) => {}
             Ok(n) => info!(count = n, "cleaned up empty DID records"),
             Err(e) => warn!("DID cleanup error: {e}"),
+        }
+        match stats::cleanup_old_timeseries(&stats_ks).await {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "cleaned up old time-series buckets"),
+            Err(e) => warn!("time-series cleanup error: {e}"),
         }
     }
 }

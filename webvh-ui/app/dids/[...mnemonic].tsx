@@ -13,6 +13,7 @@ import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { DidStats, DidDetailResponse, LogEntryInfo } from "../../lib/api";
 
@@ -189,6 +190,9 @@ export default function DidDetail() {
             <ActivityIndicator color={colors.accent} />
           )}
         </View>
+
+        {/* Usage chart */}
+        {mnemonic && <UsageChart mnemonic={mnemonic} />}
 
         {/* DID Details — parsed from log entries */}
         {didDetail?.log && (

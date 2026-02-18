@@ -1,6 +1,6 @@
 use axum::Json;
-use axum::extract::{Path, State};
-use serde::Serialize;
+use axum::extract::{Path, Query, State};
+use serde::{Deserialize, Serialize};
 
 use tracing::info;
 
@@ -8,7 +8,7 @@ use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
-use crate::stats::{DidStats, aggregate_stats, get_stats};
+use crate::stats::{self, DidStats, aggregate_stats, get_stats};
 
 /// GET /stats/{mnemonic}
 pub async fn get_did_stats(
@@ -58,4 +58,45 @@ pub async fn get_server_stats(
         last_resolved_at: agg.last_resolved_at,
         last_updated_at: agg.last_updated_at,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Time-series endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TimeseriesQuery {
+    #[serde(default)]
+    pub range: stats::TimeRange,
+}
+
+/// GET /timeseries — server-wide time-series data
+pub async fn get_server_timeseries(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<stats::TimeSeriesPoint>>, AppError> {
+    let points = stats::query_timeseries(&state.stats_ks, "_all", params.range).await?;
+    info!(did = %auth.did, points = points.len(), "server timeseries retrieved");
+    Ok(Json(points))
+}
+
+/// GET /timeseries/{*mnemonic} — per-DID time-series data
+pub async fn get_did_timeseries(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<stats::TimeSeriesPoint>>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    validate_mnemonic(mnemonic)?;
+
+    let key = format!("did:{mnemonic}");
+    if !state.dids_ks.contains_key(key).await? {
+        return Err(AppError::NotFound(format!("DID not found: {mnemonic}")));
+    }
+
+    let points = stats::query_timeseries(&state.stats_ks, mnemonic, params.range).await?;
+    info!(did = %auth.did, mnemonic = %mnemonic, points = points.len(), "DID timeseries retrieved");
+    Ok(Json(points))
 }
