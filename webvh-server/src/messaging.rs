@@ -26,6 +26,7 @@ use crate::auth::session::{create_authenticated_session, now_epoch};
 use crate::config::AppConfig;
 use crate::did_ops;
 use crate::error::AppError;
+use crate::secret_store::ServerSecrets;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +68,7 @@ const MSG_AUTH_RESPONSE: &str = "https://affinidi.com/webvh/1.0/authenticate-res
 pub async fn init_didcomm_connection(
     config: &AppConfig,
     server_did: &str,
+    secrets: &ServerSecrets,
 ) -> Option<(Arc<ATM>, Arc<ATMProfile>)> {
     let mediator_did = match &config.mediator_did {
         Some(m) => m.clone(),
@@ -84,47 +86,26 @@ pub async fn init_didcomm_connection(
     // a mismatch causes the mediator to fail with "Unable unwrap cek".
     let (signing_kid, ka_kid) = resolve_server_key_ids(server_did).await;
 
-    // Insert server signing key (Ed25519) with the DID-document key ID
-    match &config.signing_key {
-        Some(b64) => match crate::server::decode_32byte_key(b64, "signing_key") {
-            Ok(private_bytes) => {
-                let secret =
-                    Secret::generate_ed25519(Some(&signing_kid), Some(&private_bytes));
-                tdk.secrets_resolver.insert(secret).await;
-                debug!(kid = %signing_kid, "server signing secret loaded");
-            }
-            Err(e) => {
-                warn!("failed to decode signing_key: {e} — messaging disabled");
-                return None;
-            }
-        },
-        None => {
-            warn!("signing_key not configured — messaging disabled");
+    // Insert server signing key (Ed25519) from multibase with the DID-document key ID
+    match Secret::from_multibase(&secrets.signing_key, Some(&signing_kid)) {
+        Ok(secret) => {
+            tdk.secrets_resolver.insert(secret).await;
+            debug!(kid = %signing_kid, "server signing secret loaded");
+        }
+        Err(e) => {
+            warn!("failed to decode signing_key: {e} — messaging disabled");
             return None;
         }
     }
 
-    // Insert server key-agreement key (X25519) with the DID-document key ID
-    match &config.key_agreement_key {
-        Some(b64) => match crate::server::decode_32byte_key(b64, "key_agreement_key") {
-            Ok(private_bytes) => match Secret::generate_x25519(Some(&ka_kid), Some(&private_bytes))
-            {
-                Ok(secret) => {
-                    tdk.secrets_resolver.insert(secret).await;
-                    debug!(kid = %ka_kid, "server key-agreement secret loaded");
-                }
-                Err(e) => {
-                    warn!("failed to create X25519 secret: {e} — messaging disabled");
-                    return None;
-                }
-            },
-            Err(e) => {
-                warn!("failed to decode key_agreement_key: {e} — messaging disabled");
-                return None;
-            }
-        },
-        None => {
-            warn!("key_agreement_key not configured — messaging disabled");
+    // Insert server key-agreement key (X25519) from multibase with the DID-document key ID
+    match Secret::from_multibase(&secrets.key_agreement_key, Some(&ka_kid)) {
+        Ok(secret) => {
+            tdk.secrets_resolver.insert(secret).await;
+            debug!(kid = %ka_kid, "server key-agreement secret loaded");
+        }
+        Err(e) => {
+            warn!("failed to decode key_agreement_key: {e} — messaging disabled");
             return None;
         }
     }

@@ -17,10 +17,8 @@ pub struct AppConfig {
     pub store: StoreConfig,
     #[serde(default)]
     pub auth: AuthConfig,
-    /// Base64url-no-pad encoded 32-byte Ed25519 private key for server DID signing.
-    pub signing_key: Option<String>,
-    /// Base64url-no-pad encoded 32-byte X25519 private key for server DID key agreement.
-    pub key_agreement_key: Option<String>,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(skip)]
@@ -72,8 +70,6 @@ pub struct AuthConfig {
     /// How long (in minutes) to keep empty DID records before auto-cleanup.
     #[serde(default = "default_cleanup_ttl_minutes")]
     pub cleanup_ttl_minutes: u64,
-    /// Base64url-no-pad encoded 32-byte Ed25519 private key for JWT signing.
-    pub jwt_signing_key: Option<String>,
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -109,7 +105,6 @@ impl Default for AuthConfig {
             session_cleanup_interval: default_session_cleanup_interval(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
-            jwt_signing_key: None,
         }
     }
 }
@@ -199,6 +194,32 @@ impl Default for LimitsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretsConfig {
+    pub aws_secret_name: Option<String>,
+    pub aws_region: Option<String>,
+    pub gcp_project: Option<String>,
+    pub gcp_secret_name: Option<String>,
+    #[serde(default = "default_keyring_service")]
+    pub keyring_service: String,
+}
+
+fn default_keyring_service() -> String {
+    "webvh".to_string()
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            aws_secret_name: None,
+            aws_region: None,
+            gcp_project: None,
+            gcp_secret_name: None,
+            keyring_service: default_keyring_service(),
+        }
+    }
+}
+
 impl AppConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
@@ -269,11 +290,12 @@ impl AppConfig {
         env_parse!("WEBVH_AUTH_SESSION_CLEANUP_INTERVAL", config.auth.session_cleanup_interval);
         env_parse!("WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL", config.auth.passkey_enrollment_ttl);
         env_parse!("WEBVH_CLEANUP_TTL_MINUTES", config.auth.cleanup_ttl_minutes);
-        env_opt!("WEBVH_AUTH_JWT_SIGNING_KEY", config.auth.jwt_signing_key);
-
-        // Keys
-        env_opt!("WEBVH_SIGNING_KEY", config.signing_key);
-        env_opt!("WEBVH_KEY_AGREEMENT_KEY", config.key_agreement_key);
+        // Secrets
+        env_opt!("WEBVH_SECRETS_AWS_SECRET_NAME", config.secrets.aws_secret_name);
+        env_opt!("WEBVH_SECRETS_AWS_REGION", config.secrets.aws_region);
+        env_opt!("WEBVH_SECRETS_GCP_PROJECT", config.secrets.gcp_project);
+        env_opt!("WEBVH_SECRETS_GCP_SECRET_NAME", config.secrets.gcp_secret_name);
+        env_str!("WEBVH_SECRETS_KEYRING_SERVICE", config.secrets.keyring_service);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);

@@ -13,6 +13,9 @@ pub enum AppError {
     #[error("store error: {0}")]
     Store(#[from] fjall::Error),
 
+    #[error("secret store error: {0}")]
+    SecretStore(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -47,6 +50,7 @@ impl IntoResponse for AppError {
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::SecretStore(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,

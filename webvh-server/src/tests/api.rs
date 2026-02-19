@@ -11,7 +11,8 @@ use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::{Session, SessionState, now_epoch, store_session};
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, ServerConfig, StoreConfig,
+    AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, SecretsConfig, ServerConfig,
+    StoreConfig,
 };
 use crate::routes;
 use crate::server::AppState;
@@ -52,8 +53,7 @@ async fn setup() -> TestEnv {
         log: LogConfig::default(),
         store: store_config,
         auth: AuthConfig::default(),
-        signing_key: None,
-        key_agreement_key: None,
+        secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         config_path: PathBuf::new(),
     };

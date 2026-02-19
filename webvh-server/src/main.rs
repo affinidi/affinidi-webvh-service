@@ -10,6 +10,7 @@ mod messaging;
 mod mnemonic;
 mod passkey;
 mod routes;
+mod secret_store;
 mod server;
 mod setup;
 mod stats;
@@ -163,9 +164,33 @@ async fn run_server(config_path: Option<PathBuf>) {
 
     init_tracing(&config);
 
+    // Load secrets from the configured backend
+    let secret_store = match secret_store::create_secret_store(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let secrets = match secret_store.get().await {
+        Ok(Some(s)) => {
+            tracing::info!("secrets loaded from secret store");
+            s
+        }
+        Ok(None) => {
+            eprintln!("Error: no secrets found — run `webvh-server setup` first");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error loading secrets: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let store = store::Store::open(&config.store).expect("failed to open store");
 
-    if let Err(e) = server::run(config, store).await {
+    if let Err(e) = server::run(config, store, secrets).await {
         tracing::error!("server error: {e}");
         std::process::exit(1);
     }

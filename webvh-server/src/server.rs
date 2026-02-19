@@ -4,9 +4,6 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
-
 use webauthn_rs::prelude::Webauthn;
 
 use crate::auth::jwt::JwtKeys;
@@ -17,6 +14,7 @@ use crate::error::AppError;
 use crate::messaging;
 use crate::passkey;
 use crate::routes;
+use crate::secret_store::ServerSecrets;
 use crate::stats;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
@@ -58,7 +56,11 @@ impl AppState {
     }
 }
 
-pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
+pub async fn run(
+    config: AppConfig,
+    store: Store,
+    secrets: ServerSecrets,
+) -> Result<(), AppError> {
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -66,10 +68,10 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
     let stats_ks = store.keyspace("stats")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config).await;
+    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
 
     // Initialize JWT keys independently — needed by both DIDComm and passkey auth
-    let jwt_keys = init_jwt_keys(&config);
+    let jwt_keys = init_jwt_keys(&secrets);
 
     // Initialize passkey/WebAuthn if public_url is configured
     let webauthn = config.public_url.as_ref().and_then(|url| {
@@ -187,9 +189,10 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
 
     let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
     let didcomm_state = state.clone();
+    let didcomm_secrets = secrets;
     let didcomm_handle = std::thread::Builder::new()
         .name("webvh-didcomm".into())
-        .spawn(move || run_didcomm_thread(didcomm_state, &mut didcomm_shutdown))
+        .spawn(move || run_didcomm_thread(didcomm_state, didcomm_secrets, &mut didcomm_shutdown))
         .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?;
 
     // Wait for shutdown signal
@@ -305,7 +308,11 @@ fn run_rest_thread(
 // ---------------------------------------------------------------------------
 
 /// DIDComm thread: connects to the mediator and processes inbound messages.
-fn run_didcomm_thread(state: AppState, shutdown_rx: &mut watch::Receiver<bool>) {
+fn run_didcomm_thread(
+    state: AppState,
+    secrets: ServerSecrets,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -334,7 +341,7 @@ fn run_didcomm_thread(state: AppState, shutdown_rx: &mut watch::Receiver<bool>) 
 
         // Initialize ATM connection
         let (atm, profile) =
-            match messaging::init_didcomm_connection(&state.config, server_did).await {
+            match messaging::init_didcomm_connection(&state.config, server_did, &secrets).await {
                 Some(handles) => handles,
                 None => {
                     let _ = shutdown_rx.changed().await;
@@ -422,22 +429,22 @@ fn run_storage_thread(
 // Auth initialization
 // ---------------------------------------------------------------------------
 
-/// Initialize JWT keys from config. Works independently of DIDComm setup,
+/// Initialize JWT keys from secrets. Works independently of DIDComm setup,
 /// so passkey auth can issue tokens even without server_did.
-fn init_jwt_keys(config: &AppConfig) -> Option<Arc<JwtKeys>> {
-    match &config.auth.jwt_signing_key {
-        Some(b64) => match decode_jwt_key(b64) {
-            Ok(k) => {
+fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
+    match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
+        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
+            Ok(keys) => {
                 debug!("JWT signing key loaded");
-                Some(Arc::new(k))
+                Some(Arc::new(keys))
             }
             Err(e) => {
-                warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
+                warn!("failed to construct JWT keys: {e} — auth endpoints will not work");
                 None
             }
         },
-        None => {
-            warn!("auth.jwt_signing_key not configured — auth endpoints will not work");
+        Err(e) => {
+            warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
             None
         }
     }
@@ -445,14 +452,22 @@ fn init_jwt_keys(config: &AppConfig) -> Option<Arc<JwtKeys>> {
 
 /// Initialize DID resolver and secrets resolver for DIDComm authentication.
 ///
+/// Keys are stored as multibase-encoded private keys in `ServerSecrets`.
+/// `Secret::from_multibase()` reconstructs the full `Secret` object including
+/// the multicodec type prefix, then the key ID is overridden to match the
+/// server DID fragment.
+///
 /// Returns `None` values if the server DID is not configured (server still starts
 /// but DIDComm auth endpoints will not work).
 async fn init_didcomm_auth(
     config: &AppConfig,
+    secrets: &ServerSecrets,
 ) -> (
     Option<DIDCacheClient>,
     Option<Arc<ThreadedSecretsResolver>>,
 ) {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
     let server_did = match &config.server_did {
         Some(did) => did.clone(),
         None => {
@@ -473,41 +488,24 @@ async fn init_didcomm_auth(
     // 2. Secrets resolver with server's Ed25519 + X25519 secrets
     let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
 
-    // Load and insert server signing key (Ed25519)
-    if let Some(ref signing_key_b64) = config.signing_key {
-        match decode_32byte_key(signing_key_b64, "signing_key") {
-            Ok(private_bytes) => {
-                let kid = format!("{server_did}#key-0");
-                let secret =
-                    affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(
-                        Some(&kid),
-                        Some(&private_bytes),
-                    );
-                secrets_resolver.insert(secret).await;
-                debug!(kid = %kid, "server signing secret loaded");
-            }
-            Err(e) => warn!("failed to decode signing_key: {e}"),
+    // Load and insert server signing key (Ed25519) from multibase
+    let kid = format!("{server_did}#key-0");
+    match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
+        Ok(secret) => {
+            secrets_resolver.insert(secret).await;
+            debug!(kid = %kid, "server signing secret loaded");
         }
+        Err(e) => warn!("failed to decode signing_key: {e}"),
     }
 
-    // Load and insert server key-agreement key (X25519)
-    if let Some(ref ka_key_b64) = config.key_agreement_key {
-        match decode_32byte_key(ka_key_b64, "key_agreement_key") {
-            Ok(private_bytes) => {
-                let kid = format!("{server_did}#key-1");
-                match affinidi_tdk::secrets_resolver::secrets::Secret::generate_x25519(
-                    Some(&kid),
-                    Some(&private_bytes),
-                ) {
-                    Ok(secret) => {
-                        secrets_resolver.insert(secret).await;
-                        debug!(kid = %kid, "server key-agreement secret loaded");
-                    }
-                    Err(e) => warn!("failed to create X25519 secret: {e}"),
-                }
-            }
-            Err(e) => warn!("failed to decode key_agreement_key: {e}"),
+    // Load and insert server key-agreement key (X25519) from multibase
+    let kid = format!("{server_did}#key-1");
+    match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
+        Ok(secret) => {
+            secrets_resolver.insert(secret).await;
+            debug!(kid = %kid, "server key-agreement secret loaded");
         }
+        Err(e) => warn!("failed to decode key_agreement_key: {e}"),
     }
 
     info!("DIDComm auth initialized for DID {server_did}");
@@ -518,22 +516,22 @@ async fn init_didcomm_auth(
     )
 }
 
-/// Decode a base64url-no-pad 32-byte key, returning a descriptive error on failure.
-pub(crate) fn decode_32byte_key(b64: &str, label: &str) -> Result<[u8; 32], AppError> {
-    let bytes = BASE64
-        .decode(b64)
-        .map_err(|e| AppError::Config(format!("invalid {label} base64: {e}")))?;
+/// Decode a multibase-encoded Ed25519 private key to raw 32 bytes.
+///
+/// Used for JWT key initialization, which needs raw bytes rather than a
+/// `Secret` object.
+pub(crate) fn decode_multibase_ed25519_key(
+    multibase_key: &str,
+) -> Result<[u8; 32], AppError> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let secret = Secret::from_multibase(multibase_key, None)
+        .map_err(|e| AppError::Config(format!("invalid multibase key: {e}")))?;
+
+    let bytes = secret.get_private_bytes();
     bytes
         .try_into()
-        .map_err(|_| AppError::Config(format!("{label} must be exactly 32 bytes")))
-}
-
-/// Decode a base64url-no-pad JWT signing key and construct `JwtKeys`.
-fn decode_jwt_key(b64: &str) -> Result<JwtKeys, AppError> {
-    let key_bytes = decode_32byte_key(b64, "jwt_signing_key")?;
-    let keys = JwtKeys::from_ed25519_bytes(&key_bytes)?;
-    debug!("JWT signing key decoded successfully");
-    Ok(keys)
+        .map_err(|_| AppError::Config("key must be exactly 32 bytes".into()))
 }
 
 async fn shutdown_signal() {

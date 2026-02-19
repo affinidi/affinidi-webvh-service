@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
@@ -10,17 +11,27 @@ use uuid::Uuid;
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, ServerConfig,
-    StoreConfig,
+    AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig,
 };
 use crate::passkey::store::{Enrollment, store_enrollment};
+use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
-/// Generate a base64url-no-pad encoded 32-byte random key.
-fn generate_key() -> String {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    BASE64.encode(bytes)
+/// Generate a random Ed25519 key and return its multibase-encoded private key.
+fn generate_ed25519_multibase() -> String {
+    let secret = Secret::generate_ed25519(None, None);
+    secret
+        .get_private_keymultibase()
+        .expect("ed25519 multibase encoding")
+}
+
+/// Generate a random X25519 key and return its multibase-encoded private key.
+fn generate_x25519_multibase() -> String {
+    let secret = Secret::generate_x25519(None, None).expect("x25519 key generation");
+    secret
+        .get_private_keymultibase()
+        .expect("x25519 multibase encoding")
 }
 
 /// VTA secrets bundle format (base64url-encoded JSON).
@@ -35,15 +46,6 @@ struct SecretEntry {
     key_id: String,
     key_type: String,
     private_key_multibase: String,
-}
-
-/// Decode a multibase-encoded 32-byte seed (Base58BTC, no multicodec prefix).
-fn decode_multibase_seed(multibase_str: &str) -> Result<[u8; 32], String> {
-    let (_base, bytes) =
-        multibase::decode(multibase_str).map_err(|e| format!("invalid multibase: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| "expected 32-byte seed".to_string())
 }
 
 pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
@@ -92,7 +94,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let mut mediator_did = None;
     let mut signing_key = None;
     let mut key_agreement_key = None;
-    let mut auth = AuthConfig::default();
+    let auth = AuthConfig::default();
 
     if enable_didcomm {
         eprintln!();
@@ -124,20 +126,18 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
         server_did = Some(bundle.did.clone());
 
-        // Extract Ed25519 signing key
+        // Extract Ed25519 signing key — store multibase directly
         let ed_entry = bundle
             .secrets
             .iter()
             .find(|s| s.key_type == "ed25519")
             .ok_or("bundle has no Ed25519 signing key".to_string())?;
-        let ed_seed = decode_multibase_seed(&ed_entry.private_key_multibase)?;
-        signing_key = Some(BASE64.encode(ed_seed));
+        signing_key = Some(ed_entry.private_key_multibase.clone());
 
-        // Extract X25519 key agreement key (optional)
+        // Extract X25519 key agreement key (optional) — store multibase directly
         match bundle.secrets.iter().find(|s| s.key_type == "x25519") {
             Some(x_entry) => {
-                let x_seed = decode_multibase_seed(&x_entry.private_key_multibase)?;
-                key_agreement_key = Some(BASE64.encode(x_seed));
+                key_agreement_key = Some(x_entry.private_key_multibase.clone());
             }
             None => {
                 eprintln!("  Warning: bundle has no X25519 key agreement key; continuing without it.");
@@ -209,23 +209,16 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .interact_text()?;
 
     // 8. JWT signing key
+    let mut jwt_signing_key = None;
     if enable_didcomm {
-        let jsk = generate_key();
-
-        eprintln!("  Generated JWT signing key (back this up!):");
-        eprintln!("  -------------------------------------------");
-        eprintln!("  auth.jwt_signing_key: {jsk}");
-        eprintln!();
-
-        auth = AuthConfig {
-            jwt_signing_key: Some(jsk),
-            ..Default::default()
-        };
+        let jsk = generate_ed25519_multibase();
+        eprintln!("  Generated JWT signing key.");
+        jwt_signing_key = Some(jsk);
     } else {
         // REST API / passkey auth still needs a JWT signing key
         let jwt_options = &[
             "Generate a new random key",
-            "Paste an existing base64url key",
+            "Paste an existing multibase key",
             "Skip (no auth)",
         ];
         let jwt_idx = Select::new()
@@ -236,21 +229,19 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
         match jwt_idx {
             0 => {
-                let jsk = generate_key();
+                let jsk = generate_ed25519_multibase();
                 eprintln!();
-                eprintln!("  Generated JWT signing key (back this up!):");
-                eprintln!("  -------------------------------------------");
-                eprintln!("  auth.jwt_signing_key: {jsk}");
+                eprintln!("  Generated JWT signing key.");
                 eprintln!();
-                auth.jwt_signing_key = Some(jsk);
+                jwt_signing_key = Some(jsk);
             }
             1 => {
                 let jsk: String = Input::new()
-                    .with_prompt("Base64url-no-pad encoded 32-byte key")
+                    .with_prompt("Multibase-encoded Ed25519 private key")
                     .interact_text()?;
                 let trimmed = jsk.trim().to_string();
                 if !trimmed.is_empty() {
-                    auth.jwt_signing_key = Some(trimmed);
+                    jwt_signing_key = Some(trimmed);
                 }
             }
             _ => {
@@ -260,41 +251,17 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     }
 
     // 9. Auth expiry settings
-    if auth.jwt_signing_key.is_some() {
-        let customize_auth = Confirm::new()
-            .with_prompt("Customize auth token expiry settings?")
-            .default(false)
-            .interact()?;
+    let has_jwt_key = jwt_signing_key.is_some();
 
-        if customize_auth {
-            auth.access_token_expiry = Input::new()
-                .with_prompt("Access token expiry (seconds)")
-                .default(auth.access_token_expiry)
-                .interact_text()?;
+    // Fill in defaults for signing/key-agreement if not from bundle
+    let signing_key = signing_key.unwrap_or_else(generate_ed25519_multibase);
+    let key_agreement_key = key_agreement_key.unwrap_or_else(generate_x25519_multibase);
+    let jwt_signing_key = jwt_signing_key.unwrap_or_else(generate_ed25519_multibase);
 
-            auth.refresh_token_expiry = Input::new()
-                .with_prompt("Refresh token expiry (seconds)")
-                .default(auth.refresh_token_expiry)
-                .interact_text()?;
+    // 10. Secrets backend selection
+    let secrets_config = configure_secrets()?;
 
-            auth.challenge_ttl = Input::new()
-                .with_prompt("Challenge TTL (seconds)")
-                .default(auth.challenge_ttl)
-                .interact_text()?;
-
-            auth.session_cleanup_interval = Input::new()
-                .with_prompt("Session cleanup interval (seconds)")
-                .default(auth.session_cleanup_interval)
-                .interact_text()?;
-
-            auth.passkey_enrollment_ttl = Input::new()
-                .with_prompt("Passkey enrollment TTL (seconds)")
-                .default(auth.passkey_enrollment_ttl)
-                .interact_text()?;
-        }
-    }
-
-    // 10. Build and write config
+    // 11. Build and write config (no key material — secrets live in the secret store)
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: enable_didcomm,
@@ -312,8 +279,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             data_dir: PathBuf::from(&data_dir),
         },
         auth,
-        signing_key,
-        key_agreement_key,
+        secrets: secrets_config,
         limits: LimitsConfig::default(),
         config_path: PathBuf::new(),
     };
@@ -322,7 +288,18 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     std::fs::write(&output_path, &toml_str)?;
     eprintln!("  Configuration written to {}", output_path.display());
 
-    // 11. Optional admin bootstrap (only when DIDComm is enabled)
+    // 12. Store secrets in the chosen backend
+    let server_secrets = ServerSecrets {
+        signing_key,
+        key_agreement_key,
+        jwt_signing_key,
+    };
+
+    let secret_store = create_secret_store(&config)?;
+    secret_store.set(&server_secrets).await?;
+    eprintln!("  Secrets stored in secret store.");
+
+    // 13. Optional admin bootstrap (only when DIDComm is enabled)
     if enable_didcomm {
         let bootstrap = Confirm::new()
             .with_prompt("Bootstrap an initial admin ACL entry?")
@@ -390,10 +367,85 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         }
     }
 
+    if !has_jwt_key {
+        eprintln!();
+        eprintln!("  Note: No JWT signing key was configured. Auth endpoints will not work.");
+    }
+
     eprintln!();
     eprintln!("  Setup complete! Start the server with:");
     eprintln!("    webvh-server --config {}", output_path.display());
     eprintln!();
 
     Ok(())
+}
+
+/// Prompt for secrets backend selection and configuration.
+fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
+    let mut backends: Vec<&str> = Vec::new();
+
+    #[cfg(feature = "keyring")]
+    backends.push("OS Keyring (default)");
+
+    #[cfg(feature = "aws-secrets")]
+    backends.push("AWS Secrets Manager");
+
+    #[cfg(feature = "gcp-secrets")]
+    backends.push("GCP Secret Manager");
+
+    if backends.is_empty() {
+        return Err(
+            "no secret store backend available — compile with at least one of: keyring, aws-secrets, gcp-secrets".into(),
+        );
+    }
+
+    let mut secrets_config = SecretsConfig::default();
+
+    if backends.len() == 1 {
+        eprintln!("  Using {} for secrets storage.", backends[0]);
+    } else {
+        let idx = Select::new()
+            .with_prompt("Secrets storage backend")
+            .items(&backends)
+            .default(0)
+            .interact()?;
+
+        let chosen = backends[idx];
+
+        if chosen.starts_with("AWS") {
+            let name: String = Input::new()
+                .with_prompt("AWS secret name")
+                .default("webvh-server-secrets".to_string())
+                .interact_text()?;
+            secrets_config.aws_secret_name = Some(name);
+
+            let region: String = Input::new()
+                .with_prompt("AWS region (leave empty for default)")
+                .default(String::new())
+                .interact_text()?;
+            if !region.is_empty() {
+                secrets_config.aws_region = Some(region);
+            }
+        } else if chosen.starts_with("GCP") {
+            let project: String = Input::new()
+                .with_prompt("GCP project ID")
+                .interact_text()?;
+            secrets_config.gcp_project = Some(project);
+
+            let name: String = Input::new()
+                .with_prompt("GCP secret name")
+                .default("webvh-server-secrets".to_string())
+                .interact_text()?;
+            secrets_config.gcp_secret_name = Some(name);
+        } else {
+            // Keyring — optionally customize service name
+            let service: String = Input::new()
+                .with_prompt("Keyring service name")
+                .default("webvh".to_string())
+                .interact_text()?;
+            secrets_config.keyring_service = service;
+        }
+    }
+
+    Ok(secrets_config)
 }
