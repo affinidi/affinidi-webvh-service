@@ -246,7 +246,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let public_url = if public_url.is_empty() {
         None
     } else {
-        Some(public_url)
+        Some(public_url.trim_end_matches('/').to_string())
     };
 
     // 5. Host / Port

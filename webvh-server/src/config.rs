@@ -302,6 +302,12 @@ impl AppConfig {
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
 
+        // Normalize: strip trailing slashes from public_url
+        if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+
         Ok(config)
     }
 }
