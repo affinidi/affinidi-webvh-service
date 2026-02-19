@@ -474,52 +474,52 @@ fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
         );
     }
 
-    let mut secrets_config = SecretsConfig::default();
-
-    if backends.len() == 1 {
+    let chosen = if backends.len() == 1 {
         eprintln!("  Using {} for secrets storage.", backends[0]);
+        backends[0]
     } else {
         let idx = Select::new()
             .with_prompt("Secrets storage backend")
             .items(&backends)
             .default(0)
             .interact()?;
+        backends[idx]
+    };
 
-        let chosen = backends[idx];
+    let mut secrets_config = SecretsConfig::default();
 
-        if chosen.starts_with("AWS") {
-            let name: String = Input::new()
-                .with_prompt("AWS secret name")
-                .default("webvh-server-secrets".to_string())
-                .interact_text()?;
-            secrets_config.aws_secret_name = Some(name);
+    if chosen.starts_with("AWS") {
+        let name: String = Input::new()
+            .with_prompt("AWS secret name")
+            .default("webvh-server-secrets".to_string())
+            .interact_text()?;
+        secrets_config.aws_secret_name = Some(name);
 
-            let region: String = Input::new()
-                .with_prompt("AWS region (leave empty for default)")
-                .default(String::new())
-                .interact_text()?;
-            if !region.is_empty() {
-                secrets_config.aws_region = Some(region);
-            }
-        } else if chosen.starts_with("GCP") {
-            let project: String = Input::new()
-                .with_prompt("GCP project ID")
-                .interact_text()?;
-            secrets_config.gcp_project = Some(project);
-
-            let name: String = Input::new()
-                .with_prompt("GCP secret name")
-                .default("webvh-server-secrets".to_string())
-                .interact_text()?;
-            secrets_config.gcp_secret_name = Some(name);
-        } else {
-            // Keyring — optionally customize service name
-            let service: String = Input::new()
-                .with_prompt("Keyring service name")
-                .default("webvh".to_string())
-                .interact_text()?;
-            secrets_config.keyring_service = service;
+        let region: String = Input::new()
+            .with_prompt("AWS region (leave empty for default)")
+            .default(String::new())
+            .interact_text()?;
+        if !region.is_empty() {
+            secrets_config.aws_region = Some(region);
         }
+    } else if chosen.starts_with("GCP") {
+        let project: String = Input::new()
+            .with_prompt("GCP project ID")
+            .interact_text()?;
+        secrets_config.gcp_project = Some(project);
+
+        let name: String = Input::new()
+            .with_prompt("GCP secret name")
+            .default("webvh-server-secrets".to_string())
+            .interact_text()?;
+        secrets_config.gcp_secret_name = Some(name);
+    } else {
+        // Keyring — optionally customize service name
+        let service: String = Input::new()
+            .with_prompt("Keyring service name")
+            .default("webvh".to_string())
+            .interact_text()?;
+        secrets_config.keyring_service = service;
     }
 
     Ok(secrets_config)
