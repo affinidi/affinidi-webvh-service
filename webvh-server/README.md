@@ -15,10 +15,104 @@ the binary.
 > their applications. Affinidi assumes no liability for any
 > issues arising from the use or modification of the project.
 
-## Requirements
+## Getting Started
+
+This guide walks you through building the server, obtaining
+credentials from your Affinidi Trust Context (VTA), and running
+the interactive setup wizard.
+
+### Prerequisites
 
 - Rust 1.91.0+ (2024 Edition)
 - Node.js 18+ (only if building with the management UI)
+- A running [VTA](https://github.com/nicktho/vtc-vta-rs) instance
+  with admin access (optional — needed to import a DID secrets
+  bundle; you can also generate keys during setup)
+
+### 1. Clone and build
+
+```bash
+git clone https://github.com/affinidi/affinidi-webvh-service.git
+cd affinidi-webvh-service
+cargo build -p webvh-server --release
+```
+
+The binary is produced at `target/release/webvh-server`.
+
+Alternatively, you can install the server directly with Cargo:
+
+```bash
+cargo install -p webvh-server
+```
+
+### 2. Obtain server DID credentials (optional)
+
+The WebVH server needs its own DID identity for DIDComm
+authentication. The setup wizard can either import credentials
+from your VTA or generate fresh keys.
+
+**Option A — Import from VTA (recommended):** Export a DID
+secrets bundle from your VTA instance:
+
+```bash
+vta export-admin
+```
+
+This prints output like:
+
+```
+VTA DID: did:webvh:vta.example.com
+Mediator DID: did:webvh:mediator.example.com
+
+Admin DID: did:key:z6Mk...
+  Label: webvh-server
+
+  Credential:
+  eyJkaWQiOiJkaWQ6a2V5Ono2TWsu...
+```
+
+Copy the base64url credential string — the setup wizard will
+ask for it.
+
+**Option B — Manual entry:** If you don't have a VTA instance,
+the setup wizard can generate new Ed25519 and X25519 keys for
+you, or you can paste your own multibase-encoded private keys.
+
+### 3. Run the setup wizard
+
+```bash
+webvh-server setup
+```
+
+The wizard walks you through all required configuration:
+
+- **Configuration file path** — where to write `config.toml`
+- **Features** — enable DIDComm messaging and/or REST API
+- **Server DID identity** — import a VTA secrets bundle *or*
+  enter the server DID and keys manually (generate or paste)
+- **Mediator DID** — the DIDComm mediator to route messages
+  through
+- **Public URL** — the externally reachable URL of this server
+- **Host / port** — listen address (default: `0.0.0.0:8101`)
+- **Log level / format** — logging configuration
+- **Data directory** — persistent storage path
+- **Secrets backend** — where to store private key material
+  (OS keyring, AWS Secrets Manager, or GCP Secret Manager)
+- **Admin bootstrap** — optionally create an initial admin
+  ACL entry and passkey enrollment link
+
+The wizard writes `config.toml` (without any key material) and
+stores the server's private keys in the chosen secrets backend.
+
+### 4. Start the server
+
+```bash
+webvh-server --config config.toml
+```
+
+On startup the server loads secrets from the configured backend.
+If no secrets are found it exits with an error directing you to
+run `webvh-server setup` first.
 
 ## Configuration
 
@@ -30,17 +124,18 @@ different path with the `--config` flag or the
 ### Example `config.toml`
 
 ```toml
-# Server DID identity (required for auth endpoints to work)
-server_did = "did:web:webvh.example.com"
+# Server DID identity (required for DIDComm auth)
+server_did = "did:webvh:webvh.example.com"
+mediator_did = "did:webvh:mediator.example.com"
 public_url = "https://webvh.example.com"
 
-# 32-byte keys, base64url-no-pad encoded
-signing_key = "<ed25519-private-key>"
-key_agreement_key = "<x25519-private-key>"
+[features]
+didcomm = true
+rest_api = true
 
 [server]
 host = "0.0.0.0"    # Bind address
-port = 3000          # Bind port
+port = 8101          # Bind port
 
 [log]
 level = "info"       # trace, debug, info, warn, error
@@ -50,7 +145,6 @@ format = "text"      # text or json
 data_dir = "data/webvh-server"   # Persistent data directory
 
 [auth]
-jwt_signing_key = "<ed25519-private-key>"   # Required for auth
 access_token_expiry = 900                   # 15 minutes
 refresh_token_expiry = 86400                # 24 hours
 challenge_ttl = 300                         # 5 minutes
@@ -58,11 +152,23 @@ session_cleanup_interval = 600              # 10 minutes
 passkey_enrollment_ttl = 86400              # 24 hours
 cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
 
+[secrets]
+keyring_service = "webvh"                   # OS keyring service name (default backend)
+# aws_secret_name = "webvh-server-secrets"  # Use AWS Secrets Manager instead
+# aws_region = "us-east-1"
+# gcp_project = "my-project"               # Use GCP Secret Manager instead
+# gcp_secret_name = "webvh-server-secrets"
+
 [limits]
 upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
 default_max_total_size = 1048576            # Per-account total DID size (bytes), default 1MB
 default_max_did_count = 20                  # Per-account max number of DIDs
 ```
+
+Private keys (signing, key agreement, JWT signing) are **not**
+stored in the config file. They are managed by the secrets
+backend selected during `webvh-server setup`. See
+[Secrets Backends](#secrets-backends) below.
 
 #### Resource Limits
 
@@ -87,45 +193,85 @@ can be set via the ACL API by including `max_total_size` and/or
 `max_did_count` in the ACL entry — these take precedence over
 the global defaults.
 
+### Secrets Backends
+
+Private key material is stored outside the config file in a
+pluggable secrets backend. The backend is selected at compile
+time via feature flags and at runtime via config/env vars.
+
+| Backend              | Feature flag  | Config fields                                    |
+| -------------------- | ------------- | ------------------------------------------------ |
+| OS Keyring (default) | `keyring`     | `secrets.keyring_service`                        |
+| AWS Secrets Manager  | `aws-secrets` | `secrets.aws_secret_name`, `secrets.aws_region`  |
+| GCP Secret Manager   | `gcp-secrets` | `secrets.gcp_project`, `secrets.gcp_secret_name` |
+
+The server stores three keys as a JSON-serialized bundle in the
+backend:
+
+- **signing_key** — Ed25519 private key for server DID signing
+- **key_agreement_key** — X25519 private key for DIDComm
+  encryption
+- **jwt_signing_key** — Ed25519 private key for JWT token
+  signing
+
+Keys are stored in multibase format (Base58BTC with multicodec
+type prefix), which is self-describing and can be directly
+loaded as `Secret` objects.
+
+To compile with a non-default backend:
+
+```bash
+# AWS Secrets Manager
+cargo build -p affinidi-webvh-server --release --features aws-secrets
+
+# GCP Secret Manager
+cargo build -p affinidi-webvh-server --release --features gcp-secrets
+
+# Multiple backends
+cargo build -p affinidi-webvh-server --release --features "keyring,aws-secrets"
+```
+
 ### Environment Variable Overrides
 
 Every config field can be overridden via environment variables:
 
-| Variable                              | Description                  |
-| ------------------------------------- | ---------------------------- |
-| `WEBVH_CONFIG_PATH`                   | Path to config file          |
-| `WEBVH_SERVER_DID`                    | Server DID identifier        |
-| `WEBVH_PUBLIC_URL`                    | Public URL of the server     |
-| `WEBVH_SIGNING_KEY`                   | Ed25519 signing key          |
-| `WEBVH_KEY_AGREEMENT_KEY`             | X25519 key agreement key     |
-| `WEBVH_SERVER_HOST`                   | Bind host                    |
-| `WEBVH_SERVER_PORT`                   | Bind port                    |
-| `WEBVH_LOG_LEVEL`                     | Log level                    |
-| `WEBVH_LOG_FORMAT`                    | Log format (`text` / `json`) |
-| `WEBVH_STORE_DATA_DIR`                | Data directory path          |
-| `WEBVH_AUTH_JWT_SIGNING_KEY`          | JWT signing key              |
-| `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)    |
-| `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)   |
-| `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)     |
-| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Session cleanup interval (sec)       |
-| `WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL`   | Passkey enrollment TTL (sec)         |
-| `WEBVH_CLEANUP_TTL_MINUTES`          | Empty DID cleanup TTL (min)          |
-| `WEBVH_FEATURES_DIDCOMM`             | Enable DIDComm (`true` / `1`)        |
-| `WEBVH_FEATURES_REST_API`            | Enable REST API (`true` / `1`)       |
-| `WEBVH_MEDIATOR_DID`                 | Mediator DID identifier              |
-| `WEBVH_LIMITS_UPLOAD_BODY_LIMIT`     | Max upload body size (bytes)         |
-| `WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes)  |
-| `WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT` | Per-account max DID count            |
-
-All key values are base64url-no-pad encoded 32-byte keys.
+| Variable                              | Description                        |
+| ------------------------------------- | ---------------------------------- |
+| `WEBVH_CONFIG_PATH`                   | Path to config file                |
+| `WEBVH_SERVER_DID`                    | Server DID identifier              |
+| `WEBVH_PUBLIC_URL`                    | Public URL of the server           |
+| `WEBVH_MEDIATOR_DID`                  | Mediator DID identifier            |
+| `WEBVH_FEATURES_DIDCOMM`              | Enable DIDComm (`true` / `1`)      |
+| `WEBVH_FEATURES_REST_API`             | Enable REST API (`true` / `1`)     |
+| `WEBVH_SERVER_HOST`                   | Bind host                          |
+| `WEBVH_SERVER_PORT`                   | Bind port                          |
+| `WEBVH_LOG_LEVEL`                     | Log level                          |
+| `WEBVH_LOG_FORMAT`                    | Log format (`text` / `json`)       |
+| `WEBVH_STORE_DATA_DIR`                | Data directory path                |
+| `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)          |
+| `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)         |
+| `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)           |
+| `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Session cleanup interval (sec)     |
+| `WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL`   | Passkey enrollment TTL (sec)       |
+| `WEBVH_CLEANUP_TTL_MINUTES`           | Empty DID cleanup TTL (min)        |
+| `WEBVH_SECRETS_KEYRING_SERVICE`       | Keyring service name               |
+| `WEBVH_SECRETS_AWS_SECRET_NAME`       | AWS Secrets Manager secret name    |
+| `WEBVH_SECRETS_AWS_REGION`            | AWS region                         |
+| `WEBVH_SECRETS_GCP_PROJECT`           | GCP project ID                     |
+| `WEBVH_SECRETS_GCP_SECRET_NAME`       | GCP Secret Manager secret name     |
+| `WEBVH_LIMITS_UPLOAD_BODY_LIMIT`      | Max upload body size (bytes)       |
+| `WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes) |
+| `WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT`  | Per-account max DID count          |
 
 ## Building
 
-### API-only (default)
+### Default (with OS keyring)
 
 ```bash
 cargo build -p affinidi-webvh-server --release
 ```
+
+This builds with the `keyring` feature enabled by default.
 
 ### With Management UI
 
@@ -155,16 +301,20 @@ build time — the dist directory is not needed at runtime.
 
 ## Running
 
+Before starting the server for the first time, run the setup
+wizard to generate `config.toml` and store secrets (see
+[Getting Started](#getting-started)).
+
 ```bash
 # With default config.toml in current directory
-./target/release/affinidi-webvh-server
+./target/release/webvh-server
 
 # With a specific config file
-./target/release/affinidi-webvh-server --config /path/to/config.toml
+./target/release/webvh-server --config /path/to/config.toml
 ```
 
 If the server was built with `--features ui`, browse to
-`http://localhost:3000/` to access the management UI. The UI
+`http://localhost:8101/` to access the management UI. The UI
 lets you:
 
 - View server health and DID counts
