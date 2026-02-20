@@ -4,6 +4,7 @@ mod aws;
 mod gcp;
 #[cfg(feature = "keyring")]
 mod keyring;
+mod plaintext;
 
 #[cfg(feature = "aws-secrets")]
 pub use aws::AwsSecretStore;
@@ -52,6 +53,7 @@ pub trait SecretStore: Send + Sync {
 /// 1. AWS Secrets Manager (if `aws-secrets` compiled + `secrets.aws_secret_name` set)
 /// 2. GCP Secret Manager (if `gcp-secrets` compiled + `secrets.gcp_secret_name` set)
 /// 3. OS keyring (if `keyring` compiled — the default)
+/// 4. Plaintext in config file (fallback when no secure backend is available)
 #[allow(unused_variables)]
 pub fn create_secret_store(config: &AppConfig) -> Result<Box<dyn SecretStore>, AppError> {
     #[cfg(feature = "aws-secrets")]
@@ -81,8 +83,13 @@ pub fn create_secret_store(config: &AppConfig) -> Result<Box<dyn SecretStore>, A
         return Ok(Box::new(store));
     }
 
+    // Fallback: plaintext secrets stored in the config file
     #[allow(unreachable_code)]
-    Err(AppError::Config(
-        "no secret store backend available — compile with at least one of: keyring, aws-secrets, gcp-secrets".into(),
-    ))
+    {
+        let store = plaintext::PlaintextSecretStore::new(
+            config.secrets.plaintext.as_ref(),
+            config.config_path.clone(),
+        );
+        Ok(Box::new(store))
+    }
 }

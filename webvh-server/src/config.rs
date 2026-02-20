@@ -202,6 +202,21 @@ pub struct SecretsConfig {
     pub gcp_secret_name: Option<String>,
     #[serde(default = "default_keyring_service")]
     pub keyring_service: String,
+    /// Plaintext secrets stored directly in the config file.
+    /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
+    pub plaintext: Option<PlaintextSecrets>,
+}
+
+/// Plaintext secret key material stored directly in the configuration file.
+///
+/// **WARNING**: This is insecure and should only be used for testing/development.
+/// For production deployments, compile with a secure backend feature:
+/// `keyring`, `aws-secrets`, or `gcp-secrets`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlaintextSecrets {
+    pub signing_key: String,
+    pub key_agreement_key: String,
+    pub jwt_signing_key: String,
 }
 
 fn default_keyring_service() -> String {
@@ -216,6 +231,7 @@ impl Default for SecretsConfig {
             gcp_project: None,
             gcp_secret_name: None,
             keyring_service: default_keyring_service(),
+            plaintext: None,
         }
     }
 }

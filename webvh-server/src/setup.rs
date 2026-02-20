@@ -356,7 +356,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         auth,
         secrets: secrets_config,
         limits: LimitsConfig::default(),
-        config_path: PathBuf::new(),
+        config_path: output_path.clone(),
     };
 
     let toml_str = toml::to_string_pretty(&config)?;
@@ -457,6 +457,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
 /// Prompt for secrets backend selection and configuration.
 fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
+    #[allow(unused_mut)]
     let mut backends: Vec<&str> = Vec::new();
 
     #[cfg(feature = "keyring")]
@@ -469,9 +470,26 @@ fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
     backends.push("GCP Secret Manager");
 
     if backends.is_empty() {
-        return Err(
-            "no secret store backend available — compile with at least one of: keyring, aws-secrets, gcp-secrets".into(),
-        );
+        // No secure backend compiled — fall back to plaintext with a warning
+        eprintln!();
+        eprintln!("  *** WARNING: No secure secrets backend is available. ***");
+        eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
+        eprintln!("  This is INSECURE and should only be used for testing/development.");
+        eprintln!("  For production, recompile with: keyring, aws-secrets, or gcp-secrets.");
+        eprintln!();
+
+        let proceed = Confirm::new()
+            .with_prompt("Continue with plaintext secrets storage?")
+            .default(false)
+            .interact()?;
+
+        if !proceed {
+            return Err(
+                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, or gcp-secrets)".into(),
+            );
+        }
+
+        return Ok(SecretsConfig::default());
     }
 
     let chosen = if backends.len() == 1 {

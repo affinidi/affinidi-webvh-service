@@ -188,6 +188,16 @@ async fn run_server(config_path: Option<PathBuf>) {
         }
     };
 
+    if config.secrets.plaintext.is_some() {
+        tracing::warn!("============================================================");
+        tracing::warn!("  PLAINTEXT SECRETS MODE - INSECURE");
+        tracing::warn!("  Server secrets are stored as plaintext in the config file.");
+        tracing::warn!("  DO NOT use this in production.");
+        tracing::warn!("  For production, recompile with a secure backend:");
+        tracing::warn!("    keyring, aws-secrets, or gcp-secrets");
+        tracing::warn!("============================================================");
+    }
+
     let store = store::Store::open(&config.store).expect("failed to open store");
 
     if let Err(e) = server::run(config, store, secrets).await {
