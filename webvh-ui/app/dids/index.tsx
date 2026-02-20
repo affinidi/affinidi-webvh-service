@@ -10,6 +10,7 @@ import {
   Alert,
 } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
+import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -28,6 +29,7 @@ export default function DidList() {
   const [creating, setCreating] = useState(false);
 
   const [creatingRoot, setCreatingRoot] = useState(false);
+  const [copiedDid, setCopiedDid] = useState<string | null>(null);
 
   // Inline create form state
   const [showForm, setShowForm] = useState(false);
@@ -132,6 +134,12 @@ export default function DidList() {
     role === "admin" &&
     !dids.some((d) => d.mnemonic === ".well-known") &&
     !loading;
+
+  const handleCopyDid = async (didId: string) => {
+    await Clipboard.setStringAsync(didId);
+    setCopiedDid(didId);
+    setTimeout(() => setCopiedDid(null), 2000);
+  };
 
   const formatDate = (ts: number) =>
     new Date(ts * 1000).toLocaleDateString(undefined, {
@@ -260,9 +268,24 @@ export default function DidList() {
                 {item.versionCount === 0 ? (
                   <Text style={styles.statusPending}>Pending upload</Text>
                 ) : (
-                  <Text style={styles.statusActive}>
-                    {item.didId ?? "Uploaded"}
-                  </Text>
+                  <View style={styles.didIdRow}>
+                    <Text style={styles.statusActive} numberOfLines={1}>
+                      {item.didId ?? "Uploaded"}
+                    </Text>
+                    {item.didId && (
+                      <Pressable
+                        style={styles.copyButton}
+                        onPress={(e) => {
+                          e.preventDefault();
+                          handleCopyDid(item.didId!);
+                        }}
+                      >
+                        <Text style={styles.copyButtonText}>
+                          {copiedDid === item.didId ? "Copied!" : "Copy"}
+                        </Text>
+                      </Pressable>
+                    )}
+                  </View>
                 )}
                 <View style={styles.meta}>
                   <Text style={styles.metaText}>
@@ -381,11 +404,28 @@ const styles = StyleSheet.create({
     color: colors.warning,
     marginBottom: spacing.sm,
   },
+  didIdRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
   statusActive: {
     fontSize: 13,
     fontFamily: fonts.mono,
     color: colors.success,
-    marginBottom: spacing.sm,
+    flexShrink: 1,
+  },
+  copyButton: {
+    backgroundColor: colors.bgTertiary,
+    borderRadius: radii.sm,
+    paddingVertical: 2,
+    paddingHorizontal: spacing.sm,
+  },
+  copyButtonText: {
+    fontSize: 11,
+    fontFamily: fonts.medium,
+    color: colors.textSecondary,
   },
   meta: {
     flexDirection: "row",
