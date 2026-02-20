@@ -31,5 +31,8 @@
     "@types/react": "~19.1.0",
     "typescript": "~5.9.2"
   },
+  "overrides": {
+    "minimatch": ">=10.2.1"
+  },
   "private": true
 }
