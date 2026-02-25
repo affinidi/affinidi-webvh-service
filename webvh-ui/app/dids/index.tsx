@@ -7,13 +7,13 @@ import {
   Pressable,
   FlatList,
   ActivityIndicator,
-  Alert,
 } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
@@ -98,7 +98,7 @@ export default function DidList() {
       refresh();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to create DID";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
     } finally {
       setCreating(false);
     }
@@ -124,7 +124,7 @@ export default function DidList() {
       refresh();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to create root DID";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
     } finally {
       setCreatingRoot(false);
     }

@@ -7,7 +7,6 @@ import {
   Pressable,
   ScrollView,
   ActivityIndicator,
-  Alert,
 } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
@@ -15,6 +14,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { showAlert } from "../../lib/alert";
 import type { DidStats, DidDetailResponse, LogEntryInfo } from "../../lib/api";
 
 export default function DidDetail() {
@@ -70,12 +70,12 @@ export default function DidDetail() {
     setUploading(true);
     try {
       await api.uploadDid(mnemonic, didContent);
-      Alert.alert("Success", "DID log uploaded successfully");
+      showAlert("Success", "DID log uploaded successfully");
       setDidContent("");
       loadData();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
     } finally {
       setUploading(false);
     }
@@ -86,11 +86,11 @@ export default function DidDetail() {
     setUploading(true);
     try {
       await api.uploadWitness(mnemonic, witnessContent);
-      Alert.alert("Success", "Witness proof uploaded successfully");
+      showAlert("Success", "Witness proof uploaded successfully");
       setWitnessContent("");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
     } finally {
       setUploading(false);
     }
@@ -108,7 +108,7 @@ export default function DidDetail() {
       router.replace("/dids");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Delete failed";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
       setDeleting(false);
     }
   };

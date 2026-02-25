@@ -7,12 +7,12 @@ import {
   Pressable,
   FlatList,
   ActivityIndicator,
-  Alert,
 } from "react-native";
 import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { showAlert, showConfirm } from "../../lib/alert";
 import type { AclEntry } from "../../lib/api";
 
 export default function AclManagement() {
@@ -64,29 +64,22 @@ export default function AclManagement() {
     } catch (e: unknown) {
       const msg =
         e instanceof Error ? e.message : "Failed to create ACL entry";
-      Alert.alert("Error", msg);
+      showAlert("Error", msg);
     } finally {
       setCreating(false);
     }
   };
 
   const handleDelete = (did: string) => {
-    Alert.alert("Remove Access", `Remove access for ${did}?`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Remove",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            await api.deleteAcl(did);
-            refresh();
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : "Failed to delete";
-            Alert.alert("Error", msg);
-          }
-        },
-      },
-    ]);
+    showConfirm("Remove Access", `Remove access for ${did}?`, async () => {
+      try {
+        await api.deleteAcl(did);
+        refresh();
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Failed to delete";
+        showAlert("Error", msg);
+      }
+    });
   };
 
   if (!isAuthenticated) {
