@@ -434,39 +434,59 @@ async fn handle_authenticate(
         .ok_or("authenticate message has no 'from' DID")?;
     let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
 
-    // Check ACL and get role
-    let role = check_acl(&state.acl_ks, sender_base).await?;
+    // Check ACL and build response
+    let (response_type, response_body) = match check_acl(&state.acl_ks, sender_base).await {
+        Ok(role) => {
+            // Get JWT keys
+            let jwt_keys = state
+                .jwt_keys
+                .as_ref()
+                .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
 
-    // Get JWT keys
-    let jwt_keys = state
-        .jwt_keys
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+            // Create authenticated session with tokens
+            let tokens = create_authenticated_session(
+                &state.sessions_ks,
+                jwt_keys,
+                sender_base,
+                &role,
+                state.config.auth.access_token_expiry,
+                state.config.auth.refresh_token_expiry,
+            )
+            .await?;
 
-    // Create authenticated session with tokens
-    let tokens = create_authenticated_session(
-        &state.sessions_ks,
-        jwt_keys,
-        sender_base,
-        &role,
-        state.config.auth.access_token_expiry,
-        state.config.auth.refresh_token_expiry,
-    )
-    .await?;
+            info!(did = sender_base, role = %role, "mediator auth: session created");
 
-    info!(did = sender_base, role = %role, "mediator auth: session created");
+            (
+                MSG_AUTH_RESPONSE.to_string(),
+                json!({
+                    "session_id": tokens.session_id,
+                    "access_token": tokens.access_token,
+                    "access_expires_at": tokens.access_expires_at,
+                    "refresh_token": tokens.refresh_token,
+                    "refresh_expires_at": tokens.refresh_expires_at,
+                }),
+            )
+        }
+        Err(e) => {
+            let comment = e.to_string();
+            warn!(
+                code = "e.p.did.unauthorized",
+                comment = %comment,
+                did = sender_base,
+                "mediator auth: ACL denied"
+            );
+            (
+                MSG_PROBLEM_REPORT.to_string(),
+                json!({ "code": "e.p.did.unauthorized", "comment": comment }),
+            )
+        }
+    };
 
     // Build response message
     let response = Message::build(
         uuid::Uuid::new_v4().to_string(),
-        MSG_AUTH_RESPONSE.to_string(),
-        json!({
-            "session_id": tokens.session_id,
-            "access_token": tokens.access_token,
-            "access_expires_at": tokens.access_expires_at,
-            "refresh_token": tokens.refresh_token,
-            "refresh_expires_at": tokens.refresh_expires_at,
-        }),
+        response_type,
+        response_body,
     )
     .from(server_did.to_string())
     .to(sender_base.to_string())
@@ -507,16 +527,32 @@ async fn handle_webvh_message(
         .ok_or("webvh message has no 'from' DID")?;
     let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
 
-    // Check ACL and construct AuthClaims
-    let role = check_acl(&state.acl_ks, sender_base).await?;
-    let auth = AuthClaims {
-        did: sender_base.to_string(),
-        role,
-    };
-
-    // Dispatch to the appropriate did_ops function
-    let (response_type, response_body) = match dispatch_did_op(&auth, state, msg).await {
-        Ok(result) => result,
+    // Check ACL, then dispatch to the appropriate did_ops function
+    let (response_type, response_body) = match check_acl(&state.acl_ks, sender_base).await {
+        Ok(role) => {
+            let auth = AuthClaims {
+                did: sender_base.to_string(),
+                role,
+            };
+            match dispatch_did_op(&auth, state, msg).await {
+                Ok(result) => result,
+                Err(e) => {
+                    let comment = e.to_string();
+                    let code = map_app_error_code(&e);
+                    warn!(
+                        code = code,
+                        comment = %comment,
+                        msg_type = %msg.type_,
+                        did = sender_base,
+                        "DIDComm protocol error"
+                    );
+                    (
+                        MSG_PROBLEM_REPORT.to_string(),
+                        json!({ "code": code, "comment": comment }),
+                    )
+                }
+            }
+        }
         Err(e) => {
             let comment = e.to_string();
             let code = map_app_error_code(&e);
@@ -525,7 +561,7 @@ async fn handle_webvh_message(
                 comment = %comment,
                 msg_type = %msg.type_,
                 did = sender_base,
-                "DIDComm protocol error"
+                "mediator: ACL denied"
             );
             (
                 MSG_PROBLEM_REPORT.to_string(),
