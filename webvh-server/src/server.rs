@@ -87,11 +87,16 @@ pub async fn run(
         }
     });
 
-    // Bind TCP listener on the main thread for early port validation
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    let std_listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
-    std_listener.set_nonblocking(true).map_err(AppError::Io)?;
-    info!("server listening addr={addr}");
+    // Bind TCP listener on the main thread for early port validation (only if REST is enabled)
+    let std_listener = if config.features.rest_api {
+        let addr = format!("{}:{}", config.server.host, config.server.port);
+        let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
+        listener.set_nonblocking(true).map_err(AppError::Io)?;
+        info!("server listening addr={addr}");
+        Some(listener)
+    } else {
+        None
+    };
 
     // Gather storage thread inputs before moving config into Arc
     let storage_sessions_ks = sessions_ks.clone();
@@ -152,20 +157,28 @@ pub async fn run(
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
     // 1. Spawn REST thread first — HTTP must be available before DIDComm starts
-    let mut rest_shutdown = rest_shutdown_rx.clone();
-    let rest_state = state.clone();
-    let rest_handle = std::thread::Builder::new()
-        .name("webvh-rest".into())
-        .spawn(move || {
-            run_rest_thread(
-                std_listener,
-                rest_state,
-                upload_body_limit,
-                &mut rest_shutdown,
-                rest_ready_tx,
-            )
-        })
-        .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?;
+    let rest_handle = if let Some(listener) = std_listener {
+        let mut rest_shutdown = rest_shutdown_rx.clone();
+        let rest_state = state.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("webvh-rest".into())
+                .spawn(move || {
+                    run_rest_thread(
+                        listener,
+                        rest_state,
+                        upload_body_limit,
+                        &mut rest_shutdown,
+                        rest_ready_tx,
+                    )
+                })
+                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
+        )
+    } else {
+        // Signal ready immediately so DIDComm doesn't wait forever
+        let _ = rest_ready_tx.send(());
+        None
+    };
 
     // 2. Spawn storage thread (independent cleanup, can run alongside REST)
     let mut storage_shutdown = storage_shutdown_rx.clone();
@@ -184,16 +197,26 @@ pub async fn run(
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // 3. Wait for REST to be serving before starting DIDComm
+    // 3. Wait for REST to be serving (or immediate if REST disabled) before starting DIDComm
     let _ = rest_ready_rx.await;
 
-    let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
-    let didcomm_state = state.clone();
-    let didcomm_secrets = secrets;
-    let didcomm_handle = std::thread::Builder::new()
-        .name("webvh-didcomm".into())
-        .spawn(move || run_didcomm_thread(didcomm_state, didcomm_secrets, &mut didcomm_shutdown))
-        .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?;
+    let didcomm_handle = if state.config.features.didcomm {
+        let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
+        let didcomm_state = state.clone();
+        let didcomm_secrets = secrets;
+        Some(
+            std::thread::Builder::new()
+                .name("webvh-didcomm".into())
+                .spawn(move || {
+                    run_didcomm_thread(didcomm_state, didcomm_secrets, &mut didcomm_shutdown)
+                })
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to spawn DIDComm thread: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
 
     // Wait for shutdown signal
     shutdown_signal().await;
@@ -202,28 +225,32 @@ pub async fn run(
     let mut any_panic = false;
 
     let _ = didcomm_shutdown_tx.send(true);
-    match tokio::task::spawn_blocking(move || didcomm_handle.join()).await {
-        Ok(Ok(())) => info!("DIDComm thread stopped"),
-        Ok(Err(_panic)) => {
-            error!("DIDComm thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join DIDComm thread: {e}");
-            any_panic = true;
+    if let Some(handle) = didcomm_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => info!("DIDComm thread stopped"),
+            Ok(Err(_panic)) => {
+                error!("DIDComm thread panicked");
+                any_panic = true;
+            }
+            Err(e) => {
+                error!("failed to join DIDComm thread: {e}");
+                any_panic = true;
+            }
         }
     }
 
     let _ = rest_shutdown_tx.send(true);
-    match tokio::task::spawn_blocking(move || rest_handle.join()).await {
-        Ok(Ok(())) => info!("REST thread stopped"),
-        Ok(Err(_panic)) => {
-            error!("REST thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join REST thread: {e}");
-            any_panic = true;
+    if let Some(handle) = rest_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => info!("REST thread stopped"),
+            Ok(Err(_panic)) => {
+                error!("REST thread panicked");
+                any_panic = true;
+            }
+            Err(e) => {
+                error!("failed to join REST thread: {e}");
+                any_panic = true;
+            }
         }
     }
 
@@ -331,13 +358,6 @@ fn run_didcomm_thread(
                 return;
             }
         };
-
-        if !state.config.features.didcomm {
-            info!("DIDComm feature disabled — thread idle");
-            let _ = shutdown_rx.changed().await;
-            info!("DIDComm thread shutting down (idle)");
-            return;
-        }
 
         // Initialize ATM connection
         let (atm, profile) =

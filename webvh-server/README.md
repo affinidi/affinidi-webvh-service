@@ -381,6 +381,27 @@ lets you:
 All API endpoints continue to work at their normal paths
 regardless of whether the UI is enabled.
 
+## Access Control
+
+The `add-acl` command lets you create ACL entries directly from
+the command line, without needing a running server or
+authenticated API call. This is useful for bootstrapping the
+first admin account or granting access during initial setup.
+
+```bash
+# Add an admin
+webvh-server add-acl --did did:key:z6Mk... --role admin
+
+# Add an owner (default role)
+webvh-server add-acl --did did:key:z6Mk...
+
+# With a specific config file
+webvh-server --config /path/to/config.toml add-acl --did did:key:z6Mk... --role admin
+```
+
+The command will refuse to overwrite an existing entry — delete
+it via the API first if you need to change a role.
+
 ## Backup & Restore
 
 The server includes built-in backup and restore commands for

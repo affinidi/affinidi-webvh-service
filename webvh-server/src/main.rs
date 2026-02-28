@@ -49,6 +49,15 @@ enum Command {
         #[arg(long, default_value = "admin")]
         role: String,
     },
+    /// Add an access control entry
+    AddAcl {
+        /// DID to grant access to
+        #[arg(long)]
+        did: String,
+        /// Role: admin or owner
+        #[arg(long, default_value = "owner")]
+        role: String,
+    },
     /// Export server data to a backup file
     Backup {
         /// Output file path (use "-" for stdout)
@@ -78,6 +87,12 @@ async fn main() {
         }
         Some(Command::Invite { did, role }) => {
             if let Err(e) = run_invite(cli.config, did, role).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::AddAcl { did, role }) => {
+            if let Err(e) = run_add_acl(cli.config, did, role).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -142,6 +157,60 @@ async fn run_invite(
     eprintln!("  Expires: {} seconds", config.auth.passkey_enrollment_ttl);
     eprintln!();
     eprintln!("  URL: {url}");
+    eprintln!();
+
+    #[cfg(not(feature = "ui"))]
+    {
+        eprintln!("  WARNING: The server was compiled without the 'ui' feature.");
+        eprintln!("  The enrollment URL will not work unless the UI is enabled.");
+        eprintln!("  Rebuild with: cargo build --features ui");
+        eprintln!();
+    }
+
+    Ok(())
+}
+
+async fn run_add_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+    role: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+    use crate::auth::session::now_epoch;
+
+    let role_parsed = Role::from_str(&role)
+        .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    // Check if the entry already exists
+    if let Some(existing) = get_acl_entry(&acl_ks, &did).await? {
+        eprintln!();
+        eprintln!("  ACL entry already exists for this DID:");
+        eprintln!("  DID:  {}", existing.did);
+        eprintln!("  Role: {}", existing.role);
+        eprintln!();
+        return Err("ACL entry already exists — delete it first to change the role".into());
+    }
+
+    let entry = AclEntry {
+        did: did.clone(),
+        role: role_parsed.clone(),
+        label: None,
+        created_at: now_epoch(),
+        max_total_size: None,
+        max_did_count: None,
+    };
+
+    store_acl_entry(&acl_ks, &entry).await?;
+
+    eprintln!();
+    eprintln!("  ACL entry created!");
+    eprintln!();
+    eprintln!("  DID:  {did}");
+    eprintln!("  Role: {role_parsed}");
     eprintln!();
 
     Ok(())
