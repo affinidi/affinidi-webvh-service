@@ -93,6 +93,8 @@ pub struct DidListEntry {
     pub version_count: u64,
     pub did_id: Option<String>,
     pub total_resolves: u64,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -121,6 +123,7 @@ mod tests {
             version_count: 1,
             did_id: Some("did:webvh:abc:host:path".to_string()),
             total_resolves: 42,
+            disabled: false,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
@@ -145,6 +148,7 @@ mod tests {
             version_count: 0,
             did_id: None,
             total_resolves: 0,
+            disabled: false,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -160,6 +164,7 @@ mod tests {
             version_count: 3,
             did_id: Some("did:webvh:abc:host:path".to_string()),
             total_resolves: 99,
+            disabled: false,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: DidListEntry = serde_json::from_str(&json).unwrap();

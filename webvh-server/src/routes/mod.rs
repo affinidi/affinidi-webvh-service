@@ -37,6 +37,8 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
             get(did_manage::get_did).delete(did_manage::delete_did),
         )
         .route("/log/{*mnemonic}", get(did_manage::get_did_log))
+        .route("/disable/{*mnemonic}", put(did_manage::disable_did))
+        .route("/enable/{*mnemonic}", put(did_manage::enable_did))
         // Stats (authenticated)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))

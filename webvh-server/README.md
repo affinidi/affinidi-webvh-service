@@ -395,12 +395,26 @@ webvh-server add-acl --did did:key:z6Mk... --role admin
 # Add an owner (default role)
 webvh-server add-acl --did did:key:z6Mk...
 
+# Add an owner with per-account quota overrides
+webvh-server add-acl --did did:key:z6Mk... --max-total-size 2097152 --max-did-count 50
+
 # With a specific config file
 webvh-server --config /path/to/config.toml add-acl --did did:key:z6Mk... --role admin
 ```
 
 The command will refuse to overwrite an existing entry — delete
 it via the API first if you need to change a role.
+
+### Listing ACL entries
+
+The `list-acl` command prints all ACL entries in the store:
+
+```bash
+webvh-server list-acl
+
+# With a specific config file
+webvh-server --config /path/to/config.toml list-acl
+```
 
 ## Backup & Restore
 
@@ -482,6 +496,8 @@ file.
 | `POST`   | `/dids`                    | Request new DID URI |
 | `PUT`    | `/dids/{mnemonic}`         | Upload DID log      |
 | `PUT`    | `/dids/{mnemonic}/witness` | Upload witness      |
+| `PUT`    | `/disable/{mnemonic}`      | Disable a DID       |
+| `PUT`    | `/enable/{mnemonic}`       | Enable a DID        |
 | `DELETE` | `/dids/{mnemonic}`         | Delete a DID        |
 
 ### Statistics (authenticated)

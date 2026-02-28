@@ -57,7 +57,15 @@ enum Command {
         /// Role: admin or owner
         #[arg(long, default_value = "owner")]
         role: String,
+        /// Per-account max total DID document size in bytes (overrides global default)
+        #[arg(long)]
+        max_total_size: Option<u64>,
+        /// Per-account max number of DIDs (overrides global default)
+        #[arg(long)]
+        max_did_count: Option<u64>,
     },
+    /// List all access control entries
+    ListAcl,
     /// Export server data to a backup file
     Backup {
         /// Output file path (use "-" for stdout)
@@ -91,8 +99,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::AddAcl { did, role }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role).await {
+        Some(Command::AddAcl {
+            did,
+            role,
+            max_total_size,
+            max_did_count,
+        }) => {
+            if let Err(e) = run_add_acl(cli.config, did, role, max_total_size, max_did_count).await
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ListAcl) => {
+            if let Err(e) = run_list_acl(cli.config).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -174,6 +194,8 @@ async fn run_add_acl(
     config_path: Option<PathBuf>,
     did: String,
     role: String,
+    max_total_size: Option<u64>,
+    max_did_count: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
     use crate::auth::session::now_epoch;
@@ -200,8 +222,8 @@ async fn run_add_acl(
         role: role_parsed.clone(),
         label: None,
         created_at: now_epoch(),
-        max_total_size: None,
-        max_did_count: None,
+        max_total_size,
+        max_did_count,
     };
 
     store_acl_entry(&acl_ks, &entry).await?;
@@ -211,6 +233,60 @@ async fn run_add_acl(
     eprintln!();
     eprintln!("  DID:  {did}");
     eprintln!("  Role: {role_parsed}");
+    if let Some(size) = max_total_size {
+        eprintln!("  Max total size: {size} bytes");
+    }
+    if let Some(count) = max_did_count {
+        eprintln!("  Max DID count:  {count}");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_list_acl(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::acl::{list_acl_entries};
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    let entries = list_acl_entries(&acl_ks).await?;
+
+    if entries.is_empty() {
+        eprintln!();
+        eprintln!("  No ACL entries found.");
+        eprintln!();
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {:<50} {:<8} {:<15} {:<15} {}",
+        "DID", "ROLE", "MAX SIZE", "MAX DIDS", "LABEL"
+    );
+    eprintln!("  {}", "-".repeat(100));
+
+    for entry in &entries {
+        let max_size = entry
+            .max_total_size
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".into());
+        let max_dids = entry
+            .max_did_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        let label = entry.label.as_deref().unwrap_or("-");
+        eprintln!(
+            "  {:<50} {:<8} {:<15} {:<15} {}",
+            entry.did, entry.role, max_size, max_dids, label
+        );
+    }
+
+    eprintln!();
+    eprintln!("  {} entries total", entries.len());
     eprintln!();
 
     Ok(())

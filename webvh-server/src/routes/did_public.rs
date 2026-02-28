@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 
 use tracing::debug;
 
+use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
@@ -17,6 +18,17 @@ async fn serve_content(
     content_type: &str,
     track_stats: bool,
 ) -> Result<Response, AppError> {
+    // Check if the DID is disabled — return 404 to avoid leaking state.
+    if let Some(record) = state
+        .dids_ks
+        .get::<DidRecord>(did_ops::did_key(mnemonic))
+        .await?
+    {
+        if record.disabled {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
+    }
+
     let content = state
         .dids_ks
         .get_raw(key)

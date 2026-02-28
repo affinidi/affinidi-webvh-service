@@ -37,6 +37,8 @@ pub struct DidRecord {
     pub did_id: Option<String>,
     #[serde(default)]
     pub content_size: u64,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// A single parsed log entry with its DID document and parameters.
@@ -192,6 +194,31 @@ pub async fn get_authorized_record(
         return Err(AppError::Forbidden("not the owner of this DID".into()));
     }
     Ok(record)
+}
+
+// ---------------------------------------------------------------------------
+// Disable / enable
+// ---------------------------------------------------------------------------
+
+/// Toggle the `disabled` flag on a DID record.
+pub async fn set_did_disabled(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    disabled: bool,
+) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic)?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    record.disabled = disabled;
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+    info!(
+        did = %auth.did,
+        role = %auth.role,
+        mnemonic = %mnemonic,
+        disabled,
+        "DID disabled state updated"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +402,7 @@ pub async fn create_did(
         version_count: 0,
         did_id: None,
         content_size: 0,
+        disabled: false,
     };
 
     let mut batch = state.store.batch();
@@ -622,6 +650,7 @@ pub async fn list_dids(
                 version_count: record.version_count,
                 did_id: record.did_id,
                 total_resolves: did_stats.total_resolves,
+                disabled: record.disabled,
             });
         }
     }
@@ -653,6 +682,7 @@ async fn list_all_dids(
             version_count: record.version_count,
             did_id: record.did_id,
             total_resolves: did_stats.total_resolves,
+            disabled: record.disabled,
         });
     }
 

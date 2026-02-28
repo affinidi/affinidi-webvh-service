@@ -66,6 +66,7 @@ pub struct DidDetailResponse {
     pub version_count: u64,
     pub did_id: Option<String>,
     pub owner: String,
+    pub disabled: bool,
     pub log: Option<LogMetadata>,
 }
 
@@ -84,6 +85,7 @@ pub async fn get_did(
         version_count: result.record.version_count,
         did_id: result.record.did_id,
         owner: result.record.owner,
+        disabled: result.record.disabled,
         log: result.log_metadata,
     }))
 }
@@ -135,6 +137,30 @@ pub async fn delete_did(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::delete_did(&auth, &state, mnemonic).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /dids/{mnemonic}/disable ----------
+
+pub async fn disable_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    did_ops::set_did_disabled(&auth, &state, mnemonic, true).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /dids/{mnemonic}/enable ----------
+
+pub async fn enable_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    did_ops::set_did_disabled(&auth, &state, mnemonic, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
