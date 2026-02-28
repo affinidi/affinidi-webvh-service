@@ -17,7 +17,7 @@ rust-version = "1.91.0"
 [workspace.dependencies]
 
 # Affinidi Trust Development Kit
-affinidi-tdk = "0.4"
+affinidi-tdk = "0.5"
 
 # Async runtime
 tokio = { version = "1", features = [
@@ -78,7 +78,7 @@ rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 
 # DID resolver
-affinidi-did-resolver-cache-sdk = "0.7"
+affinidi-did-resolver-cache-sdk = "0.8"
 
 # HTTP client
 reqwest = { version = "0.13", features = ["json"] }
