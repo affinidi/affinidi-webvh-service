@@ -20,7 +20,7 @@ type PathStatus = null | "checking" | "available" | "taken" | "error";
 
 export default function DidList() {
   const api = useApi();
-  const { isAuthenticated, role } = useAuth();
+  const { isAuthenticated, role, did: myDid } = useAuth();
   const router = useRouter();
   const { owner } = useLocalSearchParams<{ owner?: string }>();
   const [dids, setDids] = useState<DidRecord[]>([]);
@@ -167,7 +167,9 @@ export default function DidList() {
       )}
 
       <View style={styles.header}>
-        <Text style={styles.title}>{owner ? "Owner DIDs" : "Your DIDs"}</Text>
+        <Text style={styles.title}>
+          {owner ? "Owner DIDs" : role === "admin" ? "All DIDs" : "Your DIDs"}
+        </Text>
         <View style={styles.headerActions}>
           {showRootDidButton && (
             <Pressable
@@ -261,47 +263,68 @@ export default function DidList() {
           data={dids}
           keyExtractor={(item) => item.mnemonic}
           contentContainerStyle={{ gap: spacing.md }}
-          renderItem={({ item }) => (
-            <Link href={`/dids/${item.mnemonic}`} asChild>
-              <Pressable style={styles.card}>
-                <Text style={styles.mnemonic}>{item.mnemonic}</Text>
-                {item.versionCount === 0 ? (
-                  <Text style={styles.statusPending}>Pending upload</Text>
-                ) : (
-                  <View style={styles.didIdRow}>
-                    <Text style={styles.statusActive} numberOfLines={1}>
-                      {item.didId ?? "Uploaded"}
-                    </Text>
-                    {item.didId && (
-                      <Pressable
-                        style={styles.copyButton}
-                        onPress={(e) => {
-                          e.preventDefault();
-                          handleCopyDid(item.didId!);
-                        }}
-                      >
-                        <Text style={styles.copyButtonText}>
-                          {copiedDid === item.didId ? "Copied!" : "Copy"}
-                        </Text>
-                      </Pressable>
+          renderItem={({ item }) => {
+            const isOwn = item.owner === myDid;
+            const showOwnerInfo = role === "admin" && !owner;
+            return (
+              <Link href={`/dids/${item.mnemonic}`} asChild>
+                <Pressable
+                  style={[
+                    styles.card,
+                    showOwnerInfo && (isOwn ? styles.cardOwn : styles.cardOther),
+                  ]}
+                >
+                  <View style={styles.mnemonicRow}>
+                    <Text style={styles.mnemonic}>{item.mnemonic}</Text>
+                    {showOwnerInfo && isOwn && (
+                      <View style={styles.youBadge}>
+                        <Text style={styles.youBadgeText}>You</Text>
+                      </View>
                     )}
                   </View>
-                )}
-                <View style={styles.meta}>
-                  <Text style={styles.metaText}>
-                    Versions: {item.versionCount.toLocaleString()}
-                  </Text>
-                  <Text style={styles.metaText}>
-                    Updated: {formatDate(item.updatedAt)}
-                  </Text>
-                  <View style={{ flex: 1 }} />
-                  <Text style={styles.resolveCount}>
-                    {item.totalResolves.toLocaleString()} resolves
-                  </Text>
-                </View>
-              </Pressable>
-            </Link>
-          )}
+                  {item.versionCount === 0 ? (
+                    <Text style={styles.statusPending}>Pending upload</Text>
+                  ) : (
+                    <View style={styles.didIdRow}>
+                      <Text style={styles.statusActive} numberOfLines={1}>
+                        {item.didId ?? "Uploaded"}
+                      </Text>
+                      {item.didId && (
+                        <Pressable
+                          style={styles.copyButton}
+                          onPress={(e) => {
+                            e.preventDefault();
+                            handleCopyDid(item.didId!);
+                          }}
+                        >
+                          <Text style={styles.copyButtonText}>
+                            {copiedDid === item.didId ? "Copied!" : "Copy"}
+                          </Text>
+                        </Pressable>
+                      )}
+                    </View>
+                  )}
+                  {showOwnerInfo && !isOwn && (
+                    <Text style={styles.ownerText} numberOfLines={1}>
+                      Owner: {item.owner}
+                    </Text>
+                  )}
+                  <View style={styles.meta}>
+                    <Text style={styles.metaText}>
+                      Versions: {item.versionCount.toLocaleString()}
+                    </Text>
+                    <Text style={styles.metaText}>
+                      Updated: {formatDate(item.updatedAt)}
+                    </Text>
+                    <View style={{ flex: 1 }} />
+                    <Text style={styles.resolveCount}>
+                      {item.totalResolves.toLocaleString()} resolves
+                    </Text>
+                  </View>
+                </Pressable>
+              </Link>
+            );
+          }}
         />
       )}
     </View>
@@ -391,12 +414,42 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.lg,
   },
+  cardOwn: {
+    borderLeftWidth: 4,
+    borderLeftColor: colors.teal,
+  },
+  cardOther: {
+    borderLeftWidth: 4,
+    borderLeftColor: colors.textTertiary,
+  },
+  mnemonicRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  youBadge: {
+    backgroundColor: colors.tealMuted,
+    borderRadius: radii.sm,
+    paddingVertical: 2,
+    paddingHorizontal: spacing.sm,
+  },
+  youBadgeText: {
+    fontSize: 11,
+    fontFamily: fonts.semibold,
+    color: colors.teal,
+  },
+  ownerText: {
+    fontSize: 12,
+    fontFamily: fonts.mono,
+    color: colors.textTertiary,
+    marginBottom: spacing.sm,
+  },
   mnemonic: {
     fontSize: 16,
     fontFamily: fonts.mono,
     fontWeight: "600",
     color: colors.accent,
-    marginBottom: spacing.sm,
   },
   statusPending: {
     fontSize: 13,

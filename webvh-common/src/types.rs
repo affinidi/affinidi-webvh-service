@@ -87,6 +87,7 @@ pub struct RequestUriResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DidListEntry {
     pub mnemonic: String,
+    pub owner: String,
     pub created_at: u64,
     pub updated_at: u64,
     pub version_count: u64,
@@ -114,6 +115,7 @@ mod tests {
     fn did_list_entry_serializes_camel_case() {
         let entry = DidListEntry {
             mnemonic: "test".to_string(),
+            owner: "did:example:owner".to_string(),
             created_at: 1000,
             updated_at: 2000,
             version_count: 1,
@@ -137,6 +139,7 @@ mod tests {
     fn did_list_entry_did_id_none_serializes_as_null() {
         let entry = DidListEntry {
             mnemonic: "test".to_string(),
+            owner: "did:example:owner".to_string(),
             created_at: 0,
             updated_at: 0,
             version_count: 0,
@@ -151,6 +154,7 @@ mod tests {
     fn did_list_entry_roundtrip() {
         let entry = DidListEntry {
             mnemonic: "test".to_string(),
+            owner: "did:example:owner".to_string(),
             created_at: 1000,
             updated_at: 2000,
             version_count: 3,

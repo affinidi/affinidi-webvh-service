@@ -588,11 +588,17 @@ pub async fn get_did_log(
 }
 
 /// List DIDs owned by the caller (or by a specific owner if the caller is admin).
+/// When the caller is admin and no `requested_owner` is provided, returns *all* DIDs.
 pub async fn list_dids(
     auth: &AuthClaims,
     state: &AppState,
     requested_owner: Option<&str>,
 ) -> Result<Vec<DidListEntry>, AppError> {
+    // Admin with no owner filter → return all DIDs across all owners.
+    if auth.role == Role::Admin && requested_owner.is_none() {
+        return list_all_dids(auth, state).await;
+    }
+
     let target_owner = if auth.role == Role::Admin {
         requested_owner.unwrap_or(&auth.did)
     } else {
@@ -610,6 +616,7 @@ pub async fn list_dids(
             let did_stats = stats::get_stats(&state.stats_ks, &mnemonic).await?;
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
+                owner: record.owner,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 version_count: record.version_count,
@@ -620,6 +627,36 @@ pub async fn list_dids(
     }
 
     info!(did = %auth.did, role = %auth.role, owner = %target_owner, count = entries.len(), "DIDs listed");
+
+    Ok(entries)
+}
+
+/// List all DIDs in the store (admin only). Iterates the `did:` prefix.
+async fn list_all_dids(
+    auth: &AuthClaims,
+    state: &AppState,
+) -> Result<Vec<DidListEntry>, AppError> {
+    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+
+    let mut entries = Vec::with_capacity(raw.len());
+    for (_key, value) in raw {
+        let record: DidRecord = match serde_json::from_slice(&value) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let did_stats = stats::get_stats(&state.stats_ks, &record.mnemonic).await?;
+        entries.push(DidListEntry {
+            mnemonic: record.mnemonic,
+            owner: record.owner,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            version_count: record.version_count,
+            did_id: record.did_id,
+            total_resolves: did_stats.total_resolves,
+        });
+    }
+
+    info!(did = %auth.did, role = %auth.role, count = entries.len(), "all DIDs listed (admin)");
 
     Ok(entries)
 }

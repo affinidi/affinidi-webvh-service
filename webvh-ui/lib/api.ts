@@ -7,6 +7,7 @@ export interface HealthResponse {
 
 export interface DidRecord {
   mnemonic: string;
+  owner: string;
   createdAt: number;
   updatedAt: number;
   versionCount: number;
