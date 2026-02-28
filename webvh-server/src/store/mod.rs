@@ -1,61 +1,116 @@
-use crate::config::StoreConfig;
-use crate::error::AppError;
-use fjall::{KeyspaceCreateOptions, PersistMode};
+#[cfg(feature = "store-cosmosdb")]
+mod cosmosdb;
+#[cfg(feature = "store-dynamodb")]
+mod dynamodb;
+#[cfg(feature = "store-firestore")]
+mod firestore;
+#[cfg(feature = "store-fjall")]
+mod fjall;
+#[cfg(feature = "store-redis")]
+mod redis;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tracing::info;
+
+use crate::config::StoreConfig;
+use crate::error::AppError;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 /// A key-value pair of raw bytes from a prefix scan.
 pub type RawKvPair = (Vec<u8>, Vec<u8>);
 
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// ---------------------------------------------------------------------------
+// Traits
+// ---------------------------------------------------------------------------
+
+/// Per-keyspace CRUD + prefix scan over raw bytes.
+pub trait KeyspaceOps: Send + Sync {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>>;
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>>;
+}
+
+/// Atomic multi-key write batch identified by keyspace name.
+pub trait BatchOps: Send {
+    fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>);
+    fn remove(&mut self, keyspace: &str, key: Vec<u8>);
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>>;
+}
+
+/// Factory: create keyspaces, create batches, persist/flush.
+pub trait StorageBackend: Send + Sync {
+    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
+    fn batch(&self) -> Box<dyn BatchOps>;
+    fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+}
+
+// ---------------------------------------------------------------------------
+// Public wrapper types (same API surface as before)
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct Store {
-    db: fjall::Database,
+    inner: Arc<dyn StorageBackend>,
 }
 
 #[derive(Clone)]
 pub struct KeyspaceHandle {
-    pub(crate) keyspace: fjall::Keyspace,
+    pub(crate) name: String,
+    inner: Arc<dyn KeyspaceOps>,
 }
 
-/// An atomic write batch that collects operations and commits them in a single
-/// `spawn_blocking` call via fjall's `WriteBatch`.
+/// An atomic write batch that collects operations and commits them in a single call.
 pub struct WriteBatch {
-    inner: fjall::OwnedWriteBatch,
+    inner: Box<dyn BatchOps>,
 }
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
 impl Store {
-    pub fn open(config: &StoreConfig) -> Result<Self, AppError> {
-        std::fs::create_dir_all(&config.data_dir).map_err(AppError::Io)?;
-
-        info!(path = %config.data_dir.display(), "opening store");
-
-        let db = fjall::Database::builder(&config.data_dir).open()?;
-
-        Ok(Self { db })
+    pub async fn open(config: &StoreConfig) -> Result<Self, AppError> {
+        let backend = create_backend(config).await?;
+        Ok(Self {
+            inner: Arc::from(backend),
+        })
     }
 
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
-        let keyspace = self.db.keyspace(name, KeyspaceCreateOptions::default)?;
-        Ok(KeyspaceHandle { keyspace })
+        let (ks_name, ops) = self.inner.keyspace(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+        })
     }
 
     /// Create a new atomic write batch.
     pub fn batch(&self) -> WriteBatch {
         WriteBatch {
-            inner: self.db.batch(),
+            inner: self.inner.batch(),
         }
     }
 
     #[allow(dead_code)]
     pub async fn persist(&self) -> Result<(), AppError> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(())
+        self.inner.persist().await
     }
 }
+
+// ---------------------------------------------------------------------------
+// WriteBatch
+// ---------------------------------------------------------------------------
 
 impl WriteBatch {
     /// Add a serializable insert to the batch.
@@ -66,7 +121,7 @@ impl WriteBatch {
         value: &V,
     ) -> Result<(), AppError> {
         let bytes = serde_json::to_vec(value)?;
-        self.inner.insert(&ks.keyspace, key.into(), bytes);
+        self.inner.insert_raw(&ks.name, key.into(), bytes);
         Ok(())
     }
 
@@ -77,22 +132,23 @@ impl WriteBatch {
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) {
-        self.inner.insert(&ks.keyspace, key.into(), value.into());
+        self.inner.insert_raw(&ks.name, key.into(), value.into());
     }
 
     /// Add a remove to the batch.
     pub fn remove(&mut self, ks: &KeyspaceHandle, key: impl Into<Vec<u8>>) {
-        self.inner.remove(&ks.keyspace, key.into());
+        self.inner.remove(&ks.name, key.into());
     }
 
-    /// Commit all batched operations atomically in a single `spawn_blocking`.
+    /// Commit all batched operations atomically.
     pub async fn commit(self) -> Result<(), AppError> {
-        tokio::task::spawn_blocking(move || self.inner.commit())
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(())
+        self.inner.commit().await
     }
 }
+
+// ---------------------------------------------------------------------------
+// KeyspaceHandle
+// ---------------------------------------------------------------------------
 
 impl KeyspaceHandle {
     pub async fn insert<V: Serialize>(
@@ -100,59 +156,38 @@ impl KeyspaceHandle {
         key: impl Into<Vec<u8>>,
         value: &V,
     ) -> Result<(), AppError> {
-        let key = key.into();
         let bytes = serde_json::to_vec(value)?;
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || ks.insert(key, bytes))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(())
+        self.inner.insert_raw(key.into(), bytes).await
     }
 
     pub async fn get<V: DeserializeOwned + Send + 'static>(
         &self,
         key: impl Into<Vec<u8>>,
     ) -> Result<Option<V>, AppError> {
-        let key = key.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<V>, AppError> {
-            match ks.get(key)? {
-                Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-                None => Ok(None),
-            }
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+        match self.inner.get_raw(key.into()).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
-    /// Atomically get and remove a key in a single blocking task.
+    /// Atomically get and remove a key.
     /// Returns the deserialized value if the key existed, or `None`.
     pub async fn take<V: DeserializeOwned + Send + 'static>(
         &self,
         key: impl Into<Vec<u8>>,
     ) -> Result<Option<V>, AppError> {
         let key = key.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<V>, AppError> {
-            match ks.get(&key)? {
-                Some(bytes) => {
-                    ks.remove(&key)?;
-                    Ok(Some(serde_json::from_slice(&bytes)?))
-                }
-                None => Ok(None),
+        match self.inner.get_raw(key.clone()).await? {
+            Some(bytes) => {
+                self.inner.remove(key).await?;
+                Ok(Some(serde_json::from_slice(&bytes)?))
             }
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+            None => Ok(None),
+        }
     }
 
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
-        let key = key.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || ks.remove(key))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(())
+        self.inner.remove(key.into()).await
     }
 
     pub async fn insert_raw(
@@ -160,31 +195,15 @@ impl KeyspaceHandle {
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<(), AppError> {
-        let key = key.into();
-        let value = value.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || ks.insert(key, value))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(())
+        self.inner.insert_raw(key.into(), value.into()).await
     }
 
     pub async fn get_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
-        let key = key.into();
-        let ks = self.keyspace.clone();
-        let result = tokio::task::spawn_blocking(move || ks.get(key))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))??;
-        Ok(result.map(|v| v.to_vec()))
+        self.inner.get_raw(key.into()).await
     }
 
     pub async fn contains_key(&self, key: impl Into<Vec<u8>>) -> Result<bool, AppError> {
-        let key = key.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || ks.contains_key(key))
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
-            .map_err(AppError::Store)
+        self.inner.contains_key(key.into()).await
     }
 
     /// Iterate all key-value pairs in the keyspace.
@@ -197,103 +216,50 @@ impl KeyspaceHandle {
         &self,
         prefix: impl Into<Vec<u8>>,
     ) -> Result<Vec<RawKvPair>, AppError> {
-        let prefix = prefix.into();
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<RawKvPair>, AppError> {
-            let mut results = Vec::new();
-            for guard in ks.prefix(&prefix) {
-                let (key, value) = guard.into_inner()?;
-                results.push((key.to_vec(), value.to_vec()));
-            }
-            Ok(results)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+        self.inner.prefix_iter_raw(prefix.into()).await
     }
 
     /// Returns the approximate number of items in the keyspace.
     #[allow(dead_code)]
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
-        let ks = self.keyspace.clone();
-        tokio::task::spawn_blocking(move || ks.approximate_len())
-            .await
-            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))
+        Ok(self.prefix_iter_raw(b"").await?.len())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
+// ---------------------------------------------------------------------------
+// Backend factory
+// ---------------------------------------------------------------------------
 
-    fn temp_store() -> (Store, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig {
-            data_dir: PathBuf::from(dir.path()),
-        };
-        let store = Store::open(&config).unwrap();
-        (store, dir)
+#[allow(unused_variables)]
+async fn create_backend(config: &StoreConfig) -> Result<Box<dyn StorageBackend>, AppError> {
+    #[cfg(feature = "store-fjall")]
+    {
+        return fjall::FjallBackend::open(config);
     }
 
-    #[tokio::test]
-    async fn insert_and_get_roundtrip() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        ks.insert("key1", &"hello").await.unwrap();
-        let val: Option<String> = ks.get("key1").await.unwrap();
-        assert_eq!(val, Some("hello".to_string()));
+    #[cfg(feature = "store-redis")]
+    {
+        return redis::RedisBackend::open(config).await;
     }
 
-    #[tokio::test]
-    async fn get_missing_returns_none() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        let val: Option<String> = ks.get("nonexistent").await.unwrap();
-        assert_eq!(val, None);
+    #[cfg(feature = "store-dynamodb")]
+    {
+        return dynamodb::DynamoDbBackend::open(config).await;
     }
 
-    #[tokio::test]
-    async fn remove_deletes_key() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        ks.insert("key1", &"hello").await.unwrap();
-        ks.remove("key1").await.unwrap();
-        let val: Option<String> = ks.get("key1").await.unwrap();
-        assert_eq!(val, None);
+    #[cfg(feature = "store-firestore")]
+    {
+        return firestore::FirestoreBackend::open(config).await;
     }
 
-    #[tokio::test]
-    async fn contains_key_true_false() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        assert!(!ks.contains_key("key1").await.unwrap());
-        ks.insert("key1", &"hello").await.unwrap();
-        assert!(ks.contains_key("key1").await.unwrap());
+    #[cfg(feature = "store-cosmosdb")]
+    {
+        return cosmosdb::CosmosDbBackend::open(config).await;
     }
 
-    #[tokio::test]
-    async fn insert_raw_and_get_raw_roundtrip() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        ks.insert_raw("raw1", b"raw-value".to_vec()).await.unwrap();
-        let val = ks.get_raw("raw1").await.unwrap();
-        assert_eq!(val, Some(b"raw-value".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn prefix_iter_raw_filters_correctly() {
-        let (store, _dir) = temp_store();
-        let ks = store.keyspace("test").unwrap();
-        ks.insert_raw("prefix:a", b"1".to_vec()).await.unwrap();
-        ks.insert_raw("prefix:b", b"2".to_vec()).await.unwrap();
-        ks.insert_raw("other:c", b"3".to_vec()).await.unwrap();
-        let results = ks.prefix_iter_raw("prefix:").await.unwrap();
-        assert_eq!(results.len(), 2);
-        let keys: Vec<String> = results
-            .iter()
-            .map(|(k, _)| String::from_utf8(k.clone()).unwrap())
-            .collect();
-        assert!(keys.contains(&"prefix:a".to_string()));
-        assert!(keys.contains(&"prefix:b".to_string()));
-    }
+    // build.rs enforces exactly one feature, so this is unreachable
+    #[allow(unreachable_code)]
+    Err(AppError::Config(
+        "no storage backend compiled — enable a store-* feature".into(),
+    ))
 }

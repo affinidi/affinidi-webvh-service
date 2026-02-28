@@ -33,8 +33,9 @@ async fn setup() -> TestEnv {
     let dir = tempfile::tempdir().unwrap();
     let store_config = StoreConfig {
         data_dir: PathBuf::from(dir.path()),
+        ..StoreConfig::default()
     };
-    let store = Store::open(&store_config).unwrap();
+    let store = Store::open(&store_config).await.unwrap();
     let sessions_ks = store.keyspace("sessions").unwrap();
     let acl_ks = store.keyspace("acl").unwrap();
     let dids_ks = store.keyspace("dids").unwrap();

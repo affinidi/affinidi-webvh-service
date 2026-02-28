@@ -50,7 +50,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
 
-    let store = Store::open(&config.store)?;
+    let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace("dids")?;
     let acl_ks = store.keyspace("acl")?;
@@ -152,7 +152,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     eprintln!("  Config restored to: {}", config_file_path.display());
 
     let config = AppConfig::load(config_path)?;
-    let store = Store::open(&config.store)?;
+    let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace("dids")?;
     let acl_ks = store.keyspace("acl")?;

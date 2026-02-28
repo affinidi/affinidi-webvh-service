@@ -142,7 +142,14 @@ level = "info"       # trace, debug, info, warn, error
 format = "text"      # text or json
 
 [store]
-data_dir = "data/webvh-server"   # Persistent data directory
+data_dir = "data/webvh-server"   # Persistent data directory (fjall)
+# redis_url = "redis://localhost:6379"           # Redis backend
+# dynamodb_table_prefix = "webvh"                # DynamoDB backend
+# dynamodb_region = "us-east-1"
+# firestore_project = "my-gcp-project"           # Firestore backend
+# firestore_database = "(default)"
+# cosmosdb_connection_string = "AccountEndpoint=...;AccountKey=..."  # Cosmos DB
+# cosmosdb_database = "webvh"
 
 [auth]
 access_token_expiry = 900                   # 15 minutes
@@ -231,6 +238,46 @@ cargo build -p affinidi-webvh-server --release --features gcp-secrets
 cargo build -p affinidi-webvh-server --release --features "keyring,aws-secrets"
 ```
 
+### Storage Backends
+
+The storage layer is pluggable — exactly one backend must be
+selected at compile time via feature flags. The default backend
+is **fjall**, an embedded key-value store that requires no
+external services.
+
+| Backend                   | Feature flag     | Config fields                                                  |
+| ------------------------- | ---------------- | -------------------------------------------------------------- |
+| Fjall (default, embedded) | `store-fjall`    | `store.data_dir`                                               |
+| Redis                     | `store-redis`    | `store.redis_url`                                              |
+| AWS DynamoDB              | `store-dynamodb` | `store.dynamodb_table_prefix`, `store.dynamodb_region`         |
+| GCP Firestore             | `store-firestore`| `store.firestore_project`, `store.firestore_database`          |
+| Azure Cosmos DB           | `store-cosmosdb` | `store.cosmosdb_connection_string`, `store.cosmosdb_database`  |
+
+To build with a non-default storage backend:
+
+```bash
+# Redis
+cargo build -p affinidi-webvh-server --release \
+  --no-default-features --features "keyring,store-redis"
+
+# DynamoDB
+cargo build -p affinidi-webvh-server --release \
+  --no-default-features --features "keyring,store-dynamodb"
+
+# Firestore
+cargo build -p affinidi-webvh-server --release \
+  --no-default-features --features "keyring,store-firestore"
+
+# Cosmos DB
+cargo build -p affinidi-webvh-server --release \
+  --no-default-features --features "keyring,store-cosmosdb"
+```
+
+> **Note:** Enabling more than one `store-*` feature or zero
+> `store-*` features will produce a compile error. Fjall provides
+> full ACID transactions; cloud backends provide best-effort
+> batched writes.
+
 ### Environment Variable Overrides
 
 Every config field can be overridden via environment variables:
@@ -247,7 +294,14 @@ Every config field can be overridden via environment variables:
 | `WEBVH_SERVER_PORT`                   | Bind port                          |
 | `WEBVH_LOG_LEVEL`                     | Log level                          |
 | `WEBVH_LOG_FORMAT`                    | Log format (`text` / `json`)       |
-| `WEBVH_STORE_DATA_DIR`                | Data directory path                |
+| `WEBVH_STORE_DATA_DIR`                | Data directory path (fjall)        |
+| `WEBVH_STORE_REDIS_URL`               | Redis connection URL               |
+| `WEBVH_STORE_DYNAMODB_TABLE_PREFIX`   | DynamoDB table name prefix         |
+| `WEBVH_STORE_DYNAMODB_REGION`         | AWS region for DynamoDB            |
+| `WEBVH_STORE_FIRESTORE_PROJECT`       | GCP project ID for Firestore       |
+| `WEBVH_STORE_FIRESTORE_DATABASE`      | Firestore database name            |
+| `WEBVH_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB connection string     |
+| `WEBVH_STORE_COSMOSDB_DATABASE`       | Cosmos DB database name            |
 | `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)          |
 | `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)         |
 | `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)           |

@@ -53,6 +53,20 @@ pub struct LogConfig {
 pub struct StoreConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Redis connection URL (e.g. `redis://localhost:6379`). Used by `store-redis` backend.
+    pub redis_url: Option<String>,
+    /// DynamoDB table name prefix (default: `"webvh"`). Used by `store-dynamodb` backend.
+    pub dynamodb_table_prefix: Option<String>,
+    /// AWS region for DynamoDB. Used by `store-dynamodb` backend.
+    pub dynamodb_region: Option<String>,
+    /// GCP project ID for Firestore. Used by `store-firestore` backend.
+    pub firestore_project: Option<String>,
+    /// Firestore database name (default: `"(default)"`). Used by `store-firestore` backend.
+    pub firestore_database: Option<String>,
+    /// Azure Cosmos DB connection string. Used by `store-cosmosdb` backend.
+    pub cosmosdb_connection_string: Option<String>,
+    /// Cosmos DB database name (default: `"webvh"`). Used by `store-cosmosdb` backend.
+    pub cosmosdb_database: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -155,6 +169,13 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            redis_url: None,
+            dynamodb_table_prefix: None,
+            dynamodb_region: None,
+            firestore_project: None,
+            firestore_database: None,
+            cosmosdb_connection_string: None,
+            cosmosdb_database: None,
         }
     }
 }
@@ -298,6 +319,13 @@ impl AppConfig {
         if let Ok(data_dir) = std::env::var("WEBVH_STORE_DATA_DIR") {
             config.store.data_dir = PathBuf::from(data_dir);
         }
+        env_opt!("WEBVH_STORE_REDIS_URL", config.store.redis_url);
+        env_opt!("WEBVH_STORE_DYNAMODB_TABLE_PREFIX", config.store.dynamodb_table_prefix);
+        env_opt!("WEBVH_STORE_DYNAMODB_REGION", config.store.dynamodb_region);
+        env_opt!("WEBVH_STORE_FIRESTORE_PROJECT", config.store.firestore_project);
+        env_opt!("WEBVH_STORE_FIRESTORE_DATABASE", config.store.firestore_database);
+        env_opt!("WEBVH_STORE_COSMOSDB_CONNECTION_STRING", config.store.cosmosdb_connection_string);
+        env_opt!("WEBVH_STORE_COSMOSDB_DATABASE", config.store.cosmosdb_database);
 
         // Auth
         env_parse!("WEBVH_AUTH_ACCESS_EXPIRY", config.auth.access_token_expiry);

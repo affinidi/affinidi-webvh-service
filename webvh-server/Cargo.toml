@@ -14,11 +14,16 @@ rust-version.workspace = true
 build = "build.rs"
 
 [features]
-default = ["keyring"]
+default = ["keyring", "store-fjall"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["dep:keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 gcp-secrets = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth", "dep:bytes"]
+store-fjall = ["dep:fjall"]
+store-redis = ["dep:redis"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
+store-firestore = ["dep:firestore", "dep:futures"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
 
 [[bin]]
 name = "webvh-server"
@@ -37,7 +42,7 @@ clap = { workspace = true }
 dialoguer = { workspace = true }
 didwebvh-rs = { workspace = true }
 ed25519-dalek = { workspace = true }
-fjall = { workspace = true }
+fjall = { workspace = true, optional = true }
 hex = "0.4"
 jsonwebtoken = { workspace = true }
 multibase = { workspace = true }
@@ -62,6 +67,12 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
+redis = { version = "0.29", features = ["tokio-comp", "aio"], optional = true }
+aws-sdk-dynamodb = { version = "1", optional = true }
+firestore = { version = "0.47", optional = true }
+futures = { version = "0.3", optional = true }
+azure_data_cosmos = { version = "0.31", features = ["key_auth"], optional = true }
+azure_core = { version = "0.32", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

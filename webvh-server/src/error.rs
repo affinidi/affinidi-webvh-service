@@ -11,7 +11,7 @@ pub enum AppError {
     Io(#[from] std::io::Error),
 
     #[error("store error: {0}")]
-    Store(#[from] fjall::Error),
+    Store(String),
 
     #[error("secret store error: {0}")]
     SecretStore(String),

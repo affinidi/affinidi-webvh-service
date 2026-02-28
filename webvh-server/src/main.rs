@@ -118,7 +118,7 @@ async fn run_invite(
         .as_ref()
         .ok_or("public_url must be set in config to generate enrollment links")?;
 
-    let st = store::Store::open(&config.store)?;
+    let st = store::Store::open(&config.store).await?;
     let sessions_ks = st.keyspace("sessions")?;
 
     let token = uuid::Uuid::new_v4().to_string();
@@ -198,7 +198,9 @@ async fn run_server(config_path: Option<PathBuf>) {
         tracing::warn!("============================================================");
     }
 
-    let store = store::Store::open(&config.store).expect("failed to open store");
+    let store = store::Store::open(&config.store)
+        .await
+        .expect("failed to open store");
 
     if let Err(e) = server::run(config, store, secrets).await {
         tracing::error!("server error: {e}");

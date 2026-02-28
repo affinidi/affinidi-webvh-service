@@ -352,6 +352,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         },
         store: StoreConfig {
             data_dir: PathBuf::from(&data_dir),
+            ..StoreConfig::default()
         },
         auth,
         secrets: secrets_config,
@@ -397,7 +398,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                 Some(admin_label)
             };
 
-            let store = Store::open(&config.store)?;
+            let store = Store::open(&config.store).await?;
             let acl_ks = store.keyspace("acl")?;
 
             let entry = AclEntry {
