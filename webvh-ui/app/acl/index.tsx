@@ -19,7 +19,7 @@ import {
   parseOptionalInt,
 } from "../../lib/format";
 import { showAlert, showConfirm } from "../../lib/alert";
-import type { AclEntry } from "../../lib/api";
+import type { AclEntry, DidRecord } from "../../lib/api";
 
 interface EditState {
   did: string;
@@ -239,15 +239,56 @@ export default function AclManagement() {
 
   const handleDelete = useCallback(
     (did: string) => {
-      showConfirm("Remove Access", `Remove access for ${did}?`, async () => {
+      const doDelete = async (deleteDids: boolean, dids: DidRecord[]) => {
         try {
+          if (deleteDids && dids.length > 0) {
+            for (const d of dids) {
+              await api.deleteDid(d.mnemonic);
+            }
+          }
           await api.deleteAcl(did);
           refresh();
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Failed to delete";
           showAlert("Error", msg);
         }
-      });
+      };
+
+      // Fetch DIDs owned by this account, then prompt accordingly
+      api
+        .listDids(did)
+        .then((dids) => {
+          if (dids.length === 0) {
+            showConfirm(
+              "Remove Access",
+              `Remove access for ${did}?`,
+              () => doDelete(false, []),
+            );
+          } else {
+            showConfirm(
+              "Delete DIDs",
+              `This account owns ${dids.length} DID(s). Delete them too?`,
+              () => doDelete(true, dids),
+              () => {
+                // User declined deleting DIDs — confirm removing access only
+                showConfirm(
+                  "Remove Access Only",
+                  `Remove access for ${did}? (${dids.length} DID(s) will be kept)`,
+                  () => doDelete(false, []),
+                );
+              },
+            );
+          }
+        })
+        .catch((e) => {
+          // Can't fetch DIDs — fall back to simple confirmation
+          const msg = e instanceof Error ? e.message : "";
+          showConfirm(
+            "Remove Access",
+            `Remove access for ${did}?${msg ? `\n(Could not check owned DIDs: ${msg})` : ""}`,
+            () => doDelete(false, []),
+          );
+        });
     },
     [api, refresh],
   );

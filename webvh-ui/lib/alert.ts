@@ -9,19 +9,22 @@ export function showAlert(title: string, message: string) {
   }
 }
 
-/** Show a confirmation dialog; calls `onConfirm` if user accepts. */
+/** Show a confirmation dialog; calls `onConfirm` if user accepts, `onCancel` if declined. */
 export function showConfirm(
   title: string,
   message: string,
   onConfirm: () => void,
+  onCancel?: () => void,
 ) {
   if (Platform.OS === "web") {
     if (window.confirm(message)) {
       onConfirm();
+    } else {
+      onCancel?.();
     }
   } else {
     Alert.alert(title, message, [
-      { text: "Cancel", style: "cancel" },
+      { text: "Cancel", style: "cancel", onPress: onCancel },
       { text: "OK", style: "destructive", onPress: onConfirm },
     ]);
   }
