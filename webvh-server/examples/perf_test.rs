@@ -110,6 +110,9 @@ struct Snapshot {
     peak_inbound_bps: u64,
     outbound_bps: u64,
     peak_outbound_bps: u64,
+    active_workers: u64,
+    peak_workers: u64,
+    max_workers: usize,
 }
 
 impl Default for Snapshot {
@@ -139,6 +142,9 @@ impl Default for Snapshot {
             peak_inbound_bps: 0,
             outbound_bps: 0,
             peak_outbound_bps: 0,
+            active_workers: 0,
+            peak_workers: 0,
+            max_workers: 0,
         }
     }
 }
@@ -154,6 +160,7 @@ struct SharedMetrics {
     errors: AtomicU64,
     bytes_inbound: AtomicU64,
     bytes_outbound: AtomicU64,
+    active_workers: AtomicU64,
     latencies: Mutex<Vec<f64>>,
 }
 
@@ -165,6 +172,7 @@ impl SharedMetrics {
             errors: AtomicU64::new(0),
             bytes_inbound: AtomicU64::new(0),
             bytes_outbound: AtomicU64::new(0),
+            active_workers: AtomicU64::new(0),
             latencies: Mutex::new(Vec::with_capacity(4096)),
         }
     }
@@ -206,10 +214,12 @@ struct Aggregator {
     peak_inbound_bps: u64,
     outbound_bps: u64,
     peak_outbound_bps: u64,
+    peak_workers: u64,
+    max_workers: usize,
 }
 
 impl Aggregator {
-    fn new(did_count: usize, server_url: String) -> Self {
+    fn new(did_count: usize, server_url: String, max_workers: usize) -> Self {
         Self {
             total: 0,
             success: 0,
@@ -240,11 +250,16 @@ impl Aggregator {
             peak_inbound_bps: 0,
             outbound_bps: 0,
             peak_outbound_bps: 0,
+            peak_workers: 0,
+            max_workers,
         }
     }
 
     /// Absorb a batch of metrics from the shared atomic counters.
-    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes_in: u64, raw_bytes_out: u64, latencies: &[f64]) {
+    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes_in: u64, raw_bytes_out: u64, active_workers: u64, latencies: &[f64]) {
+        if active_workers > self.peak_workers {
+            self.peak_workers = active_workers;
+        }
         self.total = raw_total - self.baseline_total;
         self.success = raw_success - self.baseline_success;
         self.errors = raw_errors - self.baseline_errors;
@@ -301,7 +316,7 @@ impl Aggregator {
         self.sec_latencies.clear();
     }
 
-    fn snapshot(&self, target_rate: u64) -> Snapshot {
+    fn snapshot(&self, target_rate: u64, active_workers: u64) -> Snapshot {
         let mut sorted: Vec<f64> = self.latency_buf.iter().copied().collect();
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -343,6 +358,9 @@ impl Aggregator {
             peak_inbound_bps: self.peak_inbound_bps,
             outbound_bps: self.outbound_bps,
             peak_outbound_bps: self.peak_outbound_bps,
+            active_workers,
+            peak_workers: self.peak_workers,
+            max_workers: self.max_workers,
         }
     }
 
@@ -422,6 +440,7 @@ async fn dispatcher(
             let m = metrics.clone();
 
             tokio::spawn(async move {
+                m.active_workers.fetch_add(1, Ordering::Relaxed);
                 let start = Instant::now();
                 let result = c.get(&url).send().await;
                 let latency = start.elapsed();
@@ -445,6 +464,7 @@ async fn dispatcher(
                 m.bytes_inbound.fetch_add(resp_bytes, Ordering::Relaxed);
                 m.bytes_outbound.fetch_add(req_bytes, Ordering::Relaxed);
                 m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
+                m.active_workers.fetch_sub(1, Ordering::Relaxed);
 
                 drop(permit);
             });
@@ -460,9 +480,10 @@ async fn run_aggregator(
     target_rate: Arc<AtomicU64>,
     did_count: usize,
     server_url: String,
+    max_workers: usize,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut agg = Aggregator::new(did_count, server_url);
+    let mut agg = Aggregator::new(did_count, server_url, max_workers);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut sub_tick: u8 = 0;
 
@@ -478,6 +499,7 @@ async fn run_aggregator(
         let errors = metrics.errors.load(Ordering::Relaxed);
         let bytes_in = metrics.bytes_inbound.load(Ordering::Relaxed);
         let bytes_out = metrics.bytes_outbound.load(Ordering::Relaxed);
+        let active = metrics.active_workers.load(Ordering::Relaxed);
 
         let rate = target_rate.load(Ordering::Relaxed);
 
@@ -510,12 +532,13 @@ async fn run_aggregator(
                 agg.sec_start_errors = 0;
                 agg.sec_start_bytes_in = 0;
                 agg.sec_start_bytes_out = 0;
+                agg.peak_workers = 0;
                 sub_tick = 0;
             }
 
             let _ = snap_tx.send(agg.warmup_snapshot(rate, secs_left));
         } else {
-            agg.update(total, success, errors, bytes_in, bytes_out, &batch);
+            agg.update(total, success, errors, bytes_in, bytes_out, active, &batch);
 
             // Push sparkline data once per second
             sub_tick += 1;
@@ -524,7 +547,7 @@ async fn run_aggregator(
                 sub_tick = 0;
             }
 
-            let _ = snap_tx.send(agg.snapshot(rate));
+            let _ = snap_tx.send(agg.snapshot(rate, active));
         }
 
         if shutdown.load(Ordering::Relaxed) {
@@ -734,6 +757,24 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Span::styled(
                 format!("{:>8.1}ms", snap.p99_latency_ms),
                 Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Workers", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("   Active:   "),
+            Span::styled(
+                format!("{:>4} / {}", snap.active_workers, snap.max_workers),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("   Peak:     "),
+            Span::styled(
+                format!("{:>4} / {}", snap.peak_workers, snap.max_workers),
+                Style::default().fg(Color::Cyan),
             ),
         ]),
         Line::from(""),
@@ -1071,7 +1112,7 @@ async fn main() -> Result<()> {
     let a_url = server_url.clone();
     let a_metrics = metrics.clone();
     tokio::spawn(async move {
-        run_aggregator(a_metrics, snap_tx, a_rate, a_did_count, a_url, a_shutdown).await;
+        run_aggregator(a_metrics, snap_tx, a_rate, a_did_count, a_url, d_workers, a_shutdown).await;
     });
 
     // ----- TUI event loop -----
