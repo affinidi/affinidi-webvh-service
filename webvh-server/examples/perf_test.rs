@@ -82,6 +82,9 @@ const LATENCY_BUFFER: usize = 10_000;
 const Y_AXIS_WIDTH: u16 = 5;
 const WARMUP_SECS: f64 = 3.0;
 const WARMUP_TICKS: u8 = 30; // 3s × 10 ticks/s
+/// Per-tick (10ms) exponential smoothing factor for rate changes.
+/// With 0.02, effective rate reaches ~87% in 1s, ~98% in 2s, ~99.8% in 3s.
+const RATE_SMOOTHING: f64 = 0.02;
 
 /// A point-in-time snapshot of all metrics, safe to clone to the TUI thread.
 #[derive(Clone)]
@@ -414,15 +417,18 @@ async fn dispatcher(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     let mut deficit = 0.0f64;
+    let mut effective_rate = 0.0f64;
     let dispatch_start = Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
         interval.tick().await;
-        let rate = target_rate.load(Ordering::Relaxed) as f64;
-        // Linear ramp-up: scale effective rate from 0 to target over WARMUP_SECS
+        let target = target_rate.load(Ordering::Relaxed) as f64;
+        // Smooth rate changes: exponentially converge toward target (~3s to settle)
+        effective_rate += (target - effective_rate) * RATE_SMOOTHING;
+        // Startup ramp: linearly scale 0→1 over WARMUP_SECS
         let elapsed = dispatch_start.elapsed().as_secs_f64();
         let ramp = (elapsed / WARMUP_SECS).min(1.0);
-        deficit += rate * ramp * 0.01; // 10ms tick
+        deficit += effective_rate * ramp * 0.01; // 10ms tick
         let to_spawn = deficit.floor() as u64;
         deficit -= to_spawn as f64;
 
@@ -782,19 +788,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Span::styled("  Network", Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::raw("   In:  "),
-            Span::styled(
-                format!("{:>10}", fmt_bytes_rate(snap.inbound_bps)),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::raw("  Peak: "),
-            Span::styled(
-                format!("{:>10}", fmt_bytes_rate(snap.peak_inbound_bps)),
-                Style::default().fg(Color::Magenta),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("   Out: "),
+            Span::raw("   ↑ Out: "),
             Span::styled(
                 format!("{:>10}", fmt_bytes_rate(snap.outbound_bps)),
                 Style::default().fg(Color::Magenta),
@@ -802,6 +796,18 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Span::raw("  Peak: "),
             Span::styled(
                 format!("{:>10}", fmt_bytes_rate(snap.peak_outbound_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("   ↓ In:  "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.inbound_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  Peak: "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.peak_inbound_bps)),
                 Style::default().fg(Color::Magenta),
             ),
         ]),
