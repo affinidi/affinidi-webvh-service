@@ -63,6 +63,8 @@ export interface AclEntry {
   role: "admin" | "owner";
   label: string | null;
   created_at: number;
+  max_total_size: number | null;
+  max_did_count: number | null;
 }
 
 export interface AclListResponse {
@@ -261,11 +263,37 @@ export const api = {
 
   listAcl: () => request<AclListResponse>("/api/acl"),
 
-  createAcl: (did: string, role: "admin" | "owner", label?: string) =>
+  createAcl: (
+    did: string,
+    role: "admin" | "owner",
+    label?: string,
+    maxTotalSize?: number,
+    maxDidCount?: number,
+  ) =>
     request<AclEntry>("/api/acl", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, role, label }),
+      body: JSON.stringify({
+        did,
+        role,
+        label,
+        max_total_size: maxTotalSize,
+        max_did_count: maxDidCount,
+      }),
+    }),
+
+  updateAcl: (
+    did: string,
+    updates: {
+      label?: string | null;
+      max_total_size?: number | null;
+      max_did_count?: number | null;
+    },
+  ) =>
+    request<AclEntry>(`/api/acl/${encodeURIComponent(did)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
     }),
 
   deleteAcl: (did: string) =>

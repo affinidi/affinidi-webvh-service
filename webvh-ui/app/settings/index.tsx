@@ -11,13 +11,8 @@ import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { formatBytes } from "../../lib/format";
 import type { ServerConfig } from "../../lib/api";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
