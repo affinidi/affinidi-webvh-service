@@ -1,20 +1,24 @@
 //! WebVH DID Resolution Performance Test
 //!
-//! A rich TUI benchmarking tool that authenticates with a WebVH server via
-//! DIDComm, discovers active DIDs, and runs configurable-rate HTTP resolution
-//! tests against the public endpoints.
+//! A rich TUI benchmarking tool for load-testing WebVH DID resolution.
+//!
+//! Supports two modes:
+//! - **Server mode** (default): authenticates with a WebVH server via DIDComm,
+//!   discovers active DIDs, and benchmarks resolution.
+//! - **File mode** (`--did-file`): reads `did:webvh:...` identifiers from a
+//!   file and derives resolution URLs directly. No authentication needed —
+//!   works against any hosted WebVH DID.
 //!
 //! # Usage
 //!
 //! ```bash
-//! # Generate a fresh identity (print DID, add to ACL, then run)
+//! # Server mode: authenticate and discover DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
 //!   --server-url http://localhost:8101 --rate 100
 //!
-//! # Use an existing identity via 32-byte hex seed
+//! # File mode: test against any hosted DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
-//!   --server-url http://localhost:8101 --rate 100 \
-//!   --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+//!   --did-file my-dids.txt --rate 100
 //! ```
 
 use std::collections::VecDeque;
@@ -75,6 +79,14 @@ struct Args {
     /// Request timeout in seconds
     #[arg(long, short = 't', default_value = "5")]
     timeout: u64,
+
+    /// File containing `did:webvh:...` identifiers (one per line). When
+    /// provided, skips authentication and DID listing — resolution URLs
+    /// are derived directly from the DIDs. Useful for testing against any
+    /// hosted WebVH server without needing ACL access. Lines starting
+    /// with '#' and blank lines are ignored.
+    #[arg(long, short = 'f')]
+    did_file: Option<String>,
 
     /// WebVH server DID (reserved for future DIDComm-via-mediator testing)
     #[arg(long)]
@@ -425,8 +437,7 @@ fn pick_random_index(len: usize) -> usize {
 async fn dispatcher(
     target_rate: Arc<AtomicU64>,
     client: reqwest::Client,
-    mnemonics: Arc<Vec<String>>,
-    server_url: String,
+    urls: Arc<Vec<String>>,
     metrics: Arc<SharedMetrics>,
     shutdown: Arc<AtomicBool>,
     max_concurrent: usize,
@@ -455,9 +466,8 @@ async fn dispatcher(
                 Err(_) => continue,
             };
 
-            let idx = pick_random_index(mnemonics.len());
-            let mnemonic = mnemonics[idx].clone();
-            let url = format!("{}/{}/did.jsonl", server_url, mnemonic);
+            let idx = pick_random_index(urls.len());
+            let url = urls[idx].clone();
             let req_bytes = url.len() as u64;
             let c = client.clone();
             let m = metrics.clone();
@@ -1020,6 +1030,48 @@ fn decode_hex_seed(hex_str: &str) -> Result<[u8; 32]> {
     Ok(seed)
 }
 
+/// Convert a `did:webvh:SCID:HOST:PATH` identifier to a resolution URL.
+///
+/// The host component may contain `%3A` for ports (e.g. `localhost%3A8085`).
+/// Path segments after the host are joined with `/` to form the mnemonic.
+/// The resulting URL uses HTTPS by default.
+///
+/// # Examples
+/// - `did:webvh:Qm...:example.com:my-did` → `https://example.com/my-did/did.jsonl`
+/// - `did:webvh:Qm...:localhost%3A8085:my-did` → `https://localhost:8085/my-did/did.jsonl`
+fn did_webvh_to_url(did: &str) -> Result<String> {
+    let parts: Vec<&str> = did.split(':').collect();
+    if parts.len() < 5 || parts[0] != "did" || parts[1] != "webvh" {
+        bail!("invalid did:webvh identifier: {did}");
+    }
+    // parts[2] = SCID, parts[3] = host (with %3A for port), parts[4..] = path segments
+    let host = parts[3].replace("%3A", ":");
+    let path = parts[4..].join("/");
+    Ok(format!("https://{host}/{path}/did.jsonl"))
+}
+
+/// Load DID identifiers from a file and convert them to resolution URLs.
+///
+/// Blank lines and lines starting with '#' are skipped.
+fn load_did_file(path: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read DID file: {path}"))?;
+    let mut urls = Vec::new();
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let url = did_webvh_to_url(trimmed)
+            .with_context(|| format!("line {}: {trimmed}", line_num + 1))?;
+        urls.push(url);
+    }
+    if urls.is_empty() {
+        bail!("DID file {path} contains no valid entries");
+    }
+    Ok(urls)
+}
+
 // =========================================================================
 // Main
 // =========================================================================
@@ -1029,131 +1081,151 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let server_url = args.server_url.trim_end_matches('/').to_string();
 
-    // ----- Generate or load identity -----
-    let (my_did, my_secret) = if let Some(ref seed_hex) = args.seed {
-        let seed = decode_hex_seed(seed_hex)?;
-        let secret = Secret::generate_ed25519(None, Some(&seed));
-        let pk = secret
-            .get_public_keymultibase()
-            .map_err(|e| anyhow::anyhow!("failed to get public key: {e}"))?;
-        let did = format!("did:key:{pk}");
-        (did, secret)
-    } else {
-        generate_ed25519_identity().context("failed to generate identity")?
-    };
-
-    eprintln!();
-    eprintln!("  Identity:  {my_did}");
-    eprintln!("  Server:    {server_url}");
-    eprintln!();
-
-    if args.seed.is_none() {
-        eprintln!("  (Generated fresh identity. Ensure this DID is in the server ACL:)");
-        eprintln!("    webvh-server add-acl --did {my_did}");
+    // ----- Build resolution URLs -----
+    // Two modes: file mode (--did-file) or server mode (authenticate + list).
+    let (urls, display_label) = if let Some(ref did_file) = args.did_file {
+        if args.create_dids > 0 {
+            bail!("--did-file and --create-dids cannot be used together");
+        }
         eprintln!();
-        eprint!("  Press Enter to continue after adding to ACL...");
-        io::stderr().flush()?;
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
-    }
+        eprintln!("  Loading DIDs from: {did_file}");
+        let urls = load_did_file(did_file)?;
+        eprintln!("  Loaded {} DIDs", urls.len());
+        eprintln!();
+        (urls, format!("File: {did_file}"))
+    } else {
+        // ----- Server mode: authenticate, optionally create, then list -----
+        let (my_did, my_secret) = if let Some(ref seed_hex) = args.seed {
+            let seed = decode_hex_seed(seed_hex)?;
+            let secret = Secret::generate_ed25519(None, Some(&seed));
+            let pk = secret
+                .get_public_keymultibase()
+                .map_err(|e| anyhow::anyhow!("failed to get public key: {e}"))?;
+            let did = format!("did:key:{pk}");
+            (did, secret)
+        } else {
+            generate_ed25519_identity().context("failed to generate identity")?
+        };
 
-    // ----- Authenticate via DIDComm -----
-    eprintln!("  Authenticating via DIDComm...");
-    let mut client = WebVHClient::new(&server_url);
-    client
-        .authenticate(&my_did, &my_secret)
-        .await
-        .context("DIDComm authentication failed")?;
-    eprintln!("  Authenticated!");
+        eprintln!();
+        eprintln!("  Identity:  {my_did}");
+        eprintln!("  Server:    {server_url}");
+        eprintln!();
 
-    // ----- Create random DIDs if requested -----
-    let (client, _my_secret) = if args.create_dids > 0 {
-        let parallel = args.create_parallel.max(1);
-        eprintln!(
-            "  Creating {} random DIDs ({} parallel)...",
-            args.create_dids, parallel
-        );
-
-        let client = Arc::new(client);
-        let my_secret = Arc::new(my_secret);
-        let sem = Arc::new(tokio::sync::Semaphore::new(parallel));
-        let counter = Arc::new(AtomicU64::new(0));
-        let total = args.create_dids;
-
-        let mut handles = Vec::with_capacity(total);
-        for _ in 0..total {
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let c = client.clone();
-            let s = my_secret.clone();
-            let ctr = counter.clone();
-            handles.push(tokio::spawn(async move {
-                let result = c.create_did(&s, None).await;
-                drop(permit);
-                let i = ctr.fetch_add(1, Ordering::Relaxed) + 1;
-                match result {
-                    Ok(r) => {
-                        eprintln!("    [{i}/{total}] {} -> {}", r.mnemonic, r.did);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("    [{i}/{total}] FAILED: {e}");
-                        Err(e)
-                    }
-                }
-            }));
+        if args.seed.is_none() {
+            eprintln!("  (Generated fresh identity. Ensure this DID is in the server ACL:)");
+            eprintln!("    webvh-server add-acl --did {my_did}");
+            eprintln!();
+            eprint!("  Press Enter to continue after adding to ACL...");
+            io::stderr().flush()?;
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
         }
 
-        let mut failures = 0u64;
-        for h in handles {
-            if h.await.unwrap().is_err() {
-                failures += 1;
+        // Authenticate via DIDComm
+        eprintln!("  Authenticating via DIDComm...");
+        let mut client = WebVHClient::new(&server_url);
+        client
+            .authenticate(&my_did, &my_secret)
+            .await
+            .context("DIDComm authentication failed")?;
+        eprintln!("  Authenticated!");
+
+        // Create random DIDs if requested
+        let (client, _my_secret) = if args.create_dids > 0 {
+            let parallel = args.create_parallel.max(1);
+            eprintln!(
+                "  Creating {} random DIDs ({} parallel)...",
+                args.create_dids, parallel
+            );
+
+            let client = Arc::new(client);
+            let my_secret = Arc::new(my_secret);
+            let sem = Arc::new(tokio::sync::Semaphore::new(parallel));
+            let counter = Arc::new(AtomicU64::new(0));
+            let total = args.create_dids;
+
+            let mut handles = Vec::with_capacity(total);
+            for _ in 0..total {
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let c = client.clone();
+                let s = my_secret.clone();
+                let ctr = counter.clone();
+                handles.push(tokio::spawn(async move {
+                    let result = c.create_did(&s, None).await;
+                    drop(permit);
+                    let i = ctr.fetch_add(1, Ordering::Relaxed) + 1;
+                    match result {
+                        Ok(r) => {
+                            eprintln!("    [{i}/{total}] {} -> {}", r.mnemonic, r.did);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            eprintln!("    [{i}/{total}] FAILED: {e}");
+                            Err(e)
+                        }
+                    }
+                }));
             }
-        }
-        if failures > 0 {
-            bail!("failed to create {failures}/{total} DIDs");
+
+            let mut failures = 0u64;
+            for h in handles {
+                if h.await.unwrap().is_err() {
+                    failures += 1;
+                }
+            }
+            if failures > 0 {
+                bail!("failed to create {failures}/{total} DIDs");
+            }
+
+            eprintln!("  Created {} DIDs.", total);
+            eprintln!();
+
+            let client = Arc::into_inner(client).expect("client Arc still shared");
+            let my_secret = Arc::into_inner(my_secret).expect("secret Arc still shared");
+            (client, my_secret)
+        } else {
+            (client, my_secret)
+        };
+
+        // Fetch active DIDs
+        eprintln!("  Fetching DID list...");
+        let all_dids = client
+            .list_dids()
+            .await
+            .context("failed to list DIDs")?;
+
+        let active_mnemonics: Vec<String> = all_dids
+            .iter()
+            .filter(|d| d.version_count > 0 && !d.disabled)
+            .map(|d| d.mnemonic.clone())
+            .collect();
+
+        eprintln!(
+            "  Found {} active DIDs (of {} total)",
+            active_mnemonics.len(),
+            all_dids.len()
+        );
+
+        if active_mnemonics.is_empty() {
+            eprintln!();
+            eprintln!("  No active (published & enabled) DIDs found.");
+            eprintln!("  Create and publish DIDs first, e.g.:");
+            eprintln!(
+                "    cargo run -p affinidi-webvh-server --example client -- --server-url {server_url}"
+            );
+            bail!("no active DIDs to test against");
         }
 
-        eprintln!("  Created {} DIDs.", total);
-        eprintln!();
+        // Convert mnemonics to full resolution URLs
+        let urls: Vec<String> = active_mnemonics
+            .iter()
+            .map(|m| format!("{server_url}/{m}/did.jsonl"))
+            .collect();
 
-        let client = Arc::into_inner(client).expect("client Arc still shared");
-        let my_secret = Arc::into_inner(my_secret).expect("secret Arc still shared");
-        (client, my_secret)
-    } else {
-        (client, my_secret)
+        (urls, server_url.clone())
     };
 
-    // ----- Fetch active DIDs -----
-    eprintln!("  Fetching DID list...");
-    let all_dids = client
-        .list_dids()
-        .await
-        .context("failed to list DIDs")?;
-
-    // Filter to published and enabled DIDs only
-    let active_mnemonics: Vec<String> = all_dids
-        .iter()
-        .filter(|d| d.version_count > 0 && !d.disabled)
-        .map(|d| d.mnemonic.clone())
-        .collect();
-
-    eprintln!(
-        "  Found {} active DIDs (of {} total)",
-        active_mnemonics.len(),
-        all_dids.len()
-    );
-
-    if active_mnemonics.is_empty() {
-        eprintln!();
-        eprintln!("  No active (published & enabled) DIDs found.");
-        eprintln!("  Create and publish DIDs first, e.g.:");
-        eprintln!(
-            "    cargo run -p affinidi-webvh-server --example client -- --server-url {server_url}"
-        );
-        bail!("no active DIDs to test against");
-    }
-
-    eprintln!();
     eprintln!(
         "  Starting performance test: {} req/s target, {} max concurrent",
         args.rate, args.workers
@@ -1161,9 +1233,10 @@ async fn main() -> Result<()> {
     eprintln!();
 
     // ----- Shared state -----
+    let did_count = urls.len();
     let target_rate = Arc::new(AtomicU64::new(args.rate));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mnemonics = Arc::new(active_mnemonics);
+    let urls = Arc::new(urls);
     let metrics = Arc::new(SharedMetrics::new());
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
@@ -1177,23 +1250,21 @@ async fn main() -> Result<()> {
     // Dispatcher
     let d_rate = target_rate.clone();
     let d_shutdown = shutdown.clone();
-    let d_mnemonics = mnemonics.clone();
-    let d_url = server_url.clone();
+    let d_urls = urls.clone();
     let d_metrics = metrics.clone();
     let d_workers = args.workers;
     let d_client = http_client.clone();
     tokio::spawn(async move {
-        dispatcher(d_rate, d_client, d_mnemonics, d_url, d_metrics, d_shutdown, d_workers).await;
+        dispatcher(d_rate, d_client, d_urls, d_metrics, d_shutdown, d_workers).await;
     });
 
     // Aggregator
     let a_rate = target_rate.clone();
     let a_shutdown = shutdown.clone();
-    let a_did_count = mnemonics.len();
-    let a_url = server_url.clone();
     let a_metrics = metrics.clone();
+    let a_label = display_label.clone();
     tokio::spawn(async move {
-        run_aggregator(a_metrics, snap_tx, a_rate, a_did_count, a_url, d_workers, a_shutdown).await;
+        run_aggregator(a_metrics, snap_tx, a_rate, did_count, a_label, d_workers, a_shutdown).await;
     });
 
     // ----- TUI event loop -----
@@ -1214,7 +1285,7 @@ async fn main() -> Result<()> {
     }
 
     // Print final stats
-    let snap = snap_rx_final(&server_url, mnemonics.len(), target_rate.load(Ordering::Relaxed));
+    let snap = snap_rx_final(&display_label, did_count, target_rate.load(Ordering::Relaxed));
     eprintln!();
     eprintln!("  Performance test complete.");
     eprintln!("  Total: {} | Success: {} | Errors: {}", snap.total, snap.success, snap.errors);

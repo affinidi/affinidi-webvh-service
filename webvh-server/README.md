@@ -488,8 +488,11 @@ cargo build --example perf_test -p affinidi-webvh-server
 cargo run --example perf_test -p affinidi-webvh-server -- [OPTIONS]
 ```
 
-The tool requires at least one DID to exist on the server, or
-you can use `--create-dids` to auto-create test DIDs on startup.
+The tool supports two modes: **server mode** (default) authenticates
+with a WebVH server and discovers DIDs automatically, while
+**file mode** (`--did-file`) reads `did:webvh:...` identifiers from
+a file and works against any hosted WebVH DID without needing
+ACL access.
 
 ### Options
 
@@ -502,6 +505,7 @@ you can use `--create-dids` to auto-create test DIDs on startup.
 | `--create-dids` | | `0` | Number of random DIDs to create on startup |
 | `--create-parallel` | | `4` | Parallel concurrency for DID creation |
 | `--seed` | | random | Ed25519 seed as 64 hex characters |
+| `--did-file` | `-f` | | File of `did:webvh:...` identifiers (skips auth) |
 | `--mediator-did` | | | Mediator DID (reserved for future use) |
 | `--webvh-did` | | | Server DID (reserved for future use) |
 
@@ -523,7 +527,31 @@ cargo run --example perf_test -p affinidi-webvh-server -- \
 # Create DIDs faster with more parallelism
 cargo run --example perf_test -p affinidi-webvh-server -- \
   --create-dids 50 --create-parallel 8 --rate 100
+
+# File mode: test against any hosted DIDs without ACL access
+cargo run --example perf_test -p affinidi-webvh-server -- \
+  --did-file my-dids.txt --rate 200
 ```
+
+#### File mode
+
+When `--did-file` / `-f` is provided, the tool reads `did:webvh:...`
+identifiers from the file (one per line) and derives HTTPS resolution
+URLs directly. No authentication or server connection is needed —
+this works against any hosted WebVH DID.
+
+The file format is simple:
+
+```text
+# Production DIDs
+did:webvh:Qm...:example.com:my-did
+did:webvh:Qm...:example.com:another-did
+
+# Staging
+did:webvh:Qm...:staging.example.com%3A8085:test-did
+```
+
+Blank lines and lines starting with `#` are ignored.
 
 ### Keyboard Controls
 
@@ -567,8 +595,9 @@ The tool includes a 3-second warmup period on startup:
 
 - Timed-out requests count as errors but are excluded from
   latency statistics to avoid skewing percentiles
-- The tool authenticates with the server using DIDComm
-  challenge-response before starting the benchmark
+- In server mode, the tool authenticates with the server using
+  DIDComm challenge-response before starting the benchmark
+- In file mode (`--did-file`), no authentication is needed
 - Network traffic shows actual bytes transferred (response
   bodies are fully consumed)
 
