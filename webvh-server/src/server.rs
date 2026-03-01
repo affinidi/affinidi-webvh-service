@@ -18,6 +18,7 @@ use crate::secret_store::ServerSecrets;
 use crate::stats;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
+use axum::routing::get;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
@@ -312,7 +313,9 @@ fn run_rest_thread(
                             .level(Level::INFO)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
-            );
+            )
+            // Health route mounted after the TraceLayer so it bypasses tracing
+            .route("/api/health", get(routes::health::health));
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());

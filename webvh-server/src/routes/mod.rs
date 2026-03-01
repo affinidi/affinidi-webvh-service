@@ -4,7 +4,7 @@ mod config;
 mod didcomm;
 pub(crate) mod did_manage;
 mod did_public;
-mod health;
+pub(crate) mod health;
 mod passkey;
 mod stats;
 
@@ -23,8 +23,6 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
 
     // API routes live under /api/ so they never collide with SPA client routes.
     let api = Router::new()
-        // Health
-        .route("/health", get(health::health))
         // Auth routes
         .route("/auth/challenge", post(auth::challenge))
         .route("/auth/", post(auth::authenticate))
