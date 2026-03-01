@@ -64,6 +64,10 @@ struct Args {
     #[arg(long, default_value = "0")]
     create_dids: usize,
 
+    /// Number of DIDs to create in parallel (used with --create-dids)
+    #[arg(long, default_value = "4")]
+    create_parallel: usize,
+
     /// Mediator DID (reserved for future DIDComm-via-mediator testing)
     #[arg(long)]
     mediator_did: Option<String>,
@@ -1057,18 +1061,61 @@ async fn main() -> Result<()> {
     eprintln!("  Authenticated!");
 
     // ----- Create random DIDs if requested -----
-    if args.create_dids > 0 {
-        eprintln!("  Creating {} random DIDs...", args.create_dids);
-        for i in 1..=args.create_dids {
-            let result = client
-                .create_did(&my_secret, None)
-                .await
-                .with_context(|| format!("failed to create DID {i}/{}", args.create_dids))?;
-            eprintln!("    [{i}/{}] {} -> {}", args.create_dids, result.mnemonic, result.did);
+    let (client, _my_secret) = if args.create_dids > 0 {
+        let parallel = args.create_parallel.max(1);
+        eprintln!(
+            "  Creating {} random DIDs ({} parallel)...",
+            args.create_dids, parallel
+        );
+
+        let client = Arc::new(client);
+        let my_secret = Arc::new(my_secret);
+        let sem = Arc::new(tokio::sync::Semaphore::new(parallel));
+        let counter = Arc::new(AtomicU64::new(0));
+        let total = args.create_dids;
+
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let c = client.clone();
+            let s = my_secret.clone();
+            let ctr = counter.clone();
+            handles.push(tokio::spawn(async move {
+                let result = c.create_did(&s, None).await;
+                drop(permit);
+                let i = ctr.fetch_add(1, Ordering::Relaxed) + 1;
+                match result {
+                    Ok(r) => {
+                        eprintln!("    [{i}/{total}] {} -> {}", r.mnemonic, r.did);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("    [{i}/{total}] FAILED: {e}");
+                        Err(e)
+                    }
+                }
+            }));
         }
-        eprintln!("  Created {} DIDs.", args.create_dids);
+
+        let mut failures = 0u64;
+        for h in handles {
+            if h.await.unwrap().is_err() {
+                failures += 1;
+            }
+        }
+        if failures > 0 {
+            bail!("failed to create {failures}/{total} DIDs");
+        }
+
+        eprintln!("  Created {} DIDs.", total);
         eprintln!();
-    }
+
+        let client = Arc::into_inner(client).expect("client Arc still shared");
+        let my_secret = Arc::into_inner(my_secret).expect("secret Arc still shared");
+        (client, my_secret)
+    } else {
+        (client, my_secret)
+    };
 
     // ----- Fetch active DIDs -----
     eprintln!("  Fetching DID list...");
