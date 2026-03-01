@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write as _};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use affinidi_webvh_common::did::generate_ed25519_identity;
 use affinidi_webvh_common::{Secret, WebVHClient};
@@ -79,6 +79,9 @@ struct Args {
 
 const HISTORY_LEN: usize = 120;
 const LATENCY_BUFFER: usize = 10_000;
+const Y_AXIS_WIDTH: u16 = 5;
+const WARMUP_SECS: f64 = 3.0;
+const WARMUP_TICKS: u8 = 30; // 3s × 10 ticks/s
 
 /// A point-in-time snapshot of all metrics, safe to clone to the TUI thread.
 #[derive(Clone)]
@@ -101,6 +104,10 @@ struct Snapshot {
     target_rate: u64,
     did_count: usize,
     server_url: String,
+    warming_up: bool,
+    warmup_secs_left: u8,
+    current_bps: u64,
+    peak_bps: u64,
 }
 
 impl Default for Snapshot {
@@ -124,6 +131,35 @@ impl Default for Snapshot {
             target_rate: 0,
             did_count: 0,
             server_url: String::new(),
+            warming_up: false,
+            warmup_secs_left: 0,
+            current_bps: 0,
+            peak_bps: 0,
+        }
+    }
+}
+
+/// Lock-free metrics shared between worker tasks and the aggregator.
+///
+/// Counts are updated atomically by each worker; latencies are pushed
+/// into a `Mutex<Vec>` that the aggregator swaps out every 100 ms.
+/// This avoids per-request channel overhead and scales to any TPS.
+struct SharedMetrics {
+    total: AtomicU64,
+    success: AtomicU64,
+    errors: AtomicU64,
+    bytes_received: AtomicU64,
+    latencies: Mutex<Vec<f64>>,
+}
+
+impl SharedMetrics {
+    fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            success: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            latencies: Mutex::new(Vec::with_capacity(4096)),
         }
     }
 }
@@ -133,9 +169,9 @@ struct Aggregator {
     total: u64,
     success: u64,
     errors: u64,
-    // Current-second accumulators
-    sec_total: u64,
-    sec_errors: u64,
+    // Cumulative values at the start of the current second (for deltas)
+    sec_start_total: u64,
+    sec_start_errors: u64,
     sec_latencies: Vec<f64>,
     // Sparkline history (per-second samples)
     throughput_hist: VecDeque<u64>,
@@ -148,6 +184,17 @@ struct Aggregator {
     start: Instant,
     did_count: usize,
     server_url: String,
+    // Warmup
+    warmup_remaining: u8,
+    baseline_total: u64,
+    baseline_success: u64,
+    baseline_errors: u64,
+    baseline_bytes: u64,
+    // Network bandwidth tracking
+    total_bytes: u64,
+    sec_start_bytes: u64,
+    current_bps: u64,
+    peak_bps: u64,
 }
 
 impl Aggregator {
@@ -156,8 +203,8 @@ impl Aggregator {
             total: 0,
             success: 0,
             errors: 0,
-            sec_total: 0,
-            sec_errors: 0,
+            sec_start_total: 0,
+            sec_start_errors: 0,
             sec_latencies: Vec::with_capacity(1024),
             throughput_hist: VecDeque::with_capacity(HISTORY_LEN),
             latency_hist: VecDeque::with_capacity(HISTORY_LEN),
@@ -168,38 +215,46 @@ impl Aggregator {
             start: Instant::now(),
             did_count,
             server_url,
+            warmup_remaining: WARMUP_TICKS,
+            baseline_total: 0,
+            baseline_success: 0,
+            baseline_errors: 0,
+            baseline_bytes: 0,
+            total_bytes: 0,
+            sec_start_bytes: 0,
+            current_bps: 0,
+            peak_bps: 0,
         }
     }
 
-    fn record(&mut self, ok: bool, latency: Duration) {
-        let ms = latency.as_secs_f64() * 1000.0;
-        self.total += 1;
-        self.sec_total += 1;
-        self.sec_latencies.push(ms);
+    /// Absorb a batch of metrics from the shared atomic counters.
+    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes: u64, latencies: &[f64]) {
+        self.total = raw_total - self.baseline_total;
+        self.success = raw_success - self.baseline_success;
+        self.errors = raw_errors - self.baseline_errors;
+        self.total_bytes = raw_bytes - self.baseline_bytes;
 
-        if ok {
-            self.success += 1;
-        } else {
-            self.errors += 1;
-            self.sec_errors += 1;
+        for &ms in latencies {
+            if ms < self.min_lat {
+                self.min_lat = ms;
+            }
+            if ms > self.max_lat {
+                self.max_lat = ms;
+            }
+            self.latency_buf.push_back(ms);
+            if self.latency_buf.len() > LATENCY_BUFFER {
+                self.latency_buf.pop_front();
+            }
         }
-
-        if ms < self.min_lat {
-            self.min_lat = ms;
-        }
-        if ms > self.max_lat {
-            self.max_lat = ms;
-        }
-
-        self.latency_buf.push_back(ms);
-        if self.latency_buf.len() > LATENCY_BUFFER {
-            self.latency_buf.pop_front();
-        }
+        self.sec_latencies.extend_from_slice(latencies);
     }
 
     fn tick_second(&mut self) {
-        push_bounded(&mut self.throughput_hist, self.sec_total, HISTORY_LEN);
-        push_bounded(&mut self.error_hist, self.sec_errors, HISTORY_LEN);
+        let sec_total = self.total - self.sec_start_total;
+        let sec_errors = self.errors - self.sec_start_errors;
+
+        push_bounded(&mut self.throughput_hist, sec_total, HISTORY_LEN);
+        push_bounded(&mut self.error_hist, sec_errors, HISTORY_LEN);
 
         let avg_ms = if self.sec_latencies.is_empty() {
             0
@@ -208,8 +263,16 @@ impl Aggregator {
         };
         push_bounded(&mut self.latency_hist, avg_ms, HISTORY_LEN);
 
-        self.sec_total = 0;
-        self.sec_errors = 0;
+        // Network bandwidth
+        let sec_bytes = self.total_bytes - self.sec_start_bytes;
+        self.current_bps = sec_bytes;
+        if sec_bytes > self.peak_bps {
+            self.peak_bps = sec_bytes;
+        }
+        self.sec_start_bytes = self.total_bytes;
+
+        self.sec_start_total = self.total;
+        self.sec_start_errors = self.errors;
         self.sec_latencies.clear();
     }
 
@@ -249,6 +312,21 @@ impl Aggregator {
             target_rate,
             did_count: self.did_count,
             server_url: self.server_url.clone(),
+            warming_up: false,
+            warmup_secs_left: 0,
+            current_bps: self.current_bps,
+            peak_bps: self.peak_bps,
+        }
+    }
+
+    fn warmup_snapshot(&self, target_rate: u64, secs_left: u8) -> Snapshot {
+        Snapshot {
+            warming_up: true,
+            warmup_secs_left: secs_left,
+            target_rate,
+            did_count: self.did_count,
+            server_url: self.server_url.clone(),
+            ..Snapshot::default()
         }
     }
 }
@@ -284,18 +362,22 @@ async fn dispatcher(
     client: reqwest::Client,
     mnemonics: Arc<Vec<String>>,
     server_url: String,
-    event_tx: mpsc::UnboundedSender<(bool, Duration)>,
+    metrics: Arc<SharedMetrics>,
     shutdown: Arc<AtomicBool>,
     max_concurrent: usize,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     let mut deficit = 0.0f64;
+    let dispatch_start = Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
         interval.tick().await;
         let rate = target_rate.load(Ordering::Relaxed) as f64;
-        deficit += rate * 0.01; // 10ms tick
+        // Linear ramp-up: scale effective rate from 0 to target over WARMUP_SECS
+        let elapsed = dispatch_start.elapsed().as_secs_f64();
+        let ramp = (elapsed / WARMUP_SECS).min(1.0);
+        deficit += rate * ramp * 0.01; // 10ms tick
         let to_spawn = deficit.floor() as u64;
         deficit -= to_spawn as f64;
 
@@ -309,23 +391,42 @@ async fn dispatcher(
             let mnemonic = mnemonics[idx].clone();
             let url = format!("{}/{}/did.jsonl", server_url, mnemonic);
             let c = client.clone();
-            let tx = event_tx.clone();
+            let m = metrics.clone();
 
             tokio::spawn(async move {
                 let start = Instant::now();
                 let result = c.get(&url).send().await;
                 let latency = start.elapsed();
-                let ok = result.map(|r| r.status().is_success()).unwrap_or(false);
-                let _ = tx.send((ok, latency));
+
+                let (ok, resp_bytes) = match result {
+                    Ok(resp) => {
+                        let ok = resp.status().is_success();
+                        let bytes = resp.bytes().await.map(|b| b.len() as u64).unwrap_or(0);
+                        (ok, bytes)
+                    }
+                    Err(_) => (false, 0),
+                };
+
+                // Lock-free for counts, brief lock for latency
+                m.total.fetch_add(1, Ordering::Relaxed);
+                if ok {
+                    m.success.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    m.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                m.bytes_received.fetch_add(resp_bytes, Ordering::Relaxed);
+                m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
+
                 drop(permit);
             });
         }
     }
 }
 
-/// Consumes metric events, updates the aggregator, and publishes snapshots.
+/// Reads shared metrics every 100 ms and publishes snapshots to the TUI.
+/// Sparkline history is pushed once per second (every 10th tick).
 async fn run_aggregator(
-    mut event_rx: mpsc::UnboundedReceiver<(bool, Duration)>,
+    metrics: Arc<SharedMetrics>,
     snap_tx: watch::Sender<Snapshot>,
     target_rate: Arc<AtomicU64>,
     did_count: usize,
@@ -333,21 +434,68 @@ async fn run_aggregator(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut agg = Aggregator::new(did_count, server_url);
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut sub_tick: u8 = 0;
 
     loop {
-        tokio::select! {
-            Some((ok, lat)) = event_rx.recv() => {
-                agg.record(ok, lat);
+        tick.tick().await;
+
+        // Swap out the latency vec (brief lock, O(1) pointer swap)
+        let batch = std::mem::take(&mut *metrics.latencies.lock().unwrap());
+
+        // Read cumulative counters
+        let total = metrics.total.load(Ordering::Relaxed);
+        let success = metrics.success.load(Ordering::Relaxed);
+        let errors = metrics.errors.load(Ordering::Relaxed);
+        let bytes = metrics.bytes_received.load(Ordering::Relaxed);
+
+        let rate = target_rate.load(Ordering::Relaxed);
+
+        if agg.warmup_remaining > 0 {
+            // During warmup: decrement counter, discard latencies, publish warmup snapshot
+            agg.warmup_remaining -= 1;
+            let secs_left = (agg.warmup_remaining + 9) / 10; // ceiling division to whole seconds
+
+            if agg.warmup_remaining == 0 {
+                // Warmup just ended — capture baselines and reset aggregator state
+                agg.baseline_total = total;
+                agg.baseline_success = success;
+                agg.baseline_errors = errors;
+                agg.baseline_bytes = bytes;
+                agg.start = Instant::now();
+                agg.latency_buf.clear();
+                agg.throughput_hist.clear();
+                agg.latency_hist.clear();
+                agg.error_hist.clear();
+                agg.sec_latencies.clear();
+                agg.min_lat = f64::MAX;
+                agg.max_lat = 0.0;
+                agg.total = 0;
+                agg.success = 0;
+                agg.errors = 0;
+                agg.total_bytes = 0;
+                agg.sec_start_total = 0;
+                agg.sec_start_errors = 0;
+                agg.sec_start_bytes = 0;
+                sub_tick = 0;
             }
-            _ = tick.tick() => {
-                let rate = target_rate.load(Ordering::Relaxed);
+
+            let _ = snap_tx.send(agg.warmup_snapshot(rate, secs_left));
+        } else {
+            agg.update(total, success, errors, bytes, &batch);
+
+            // Push sparkline data once per second
+            sub_tick += 1;
+            if sub_tick >= 10 {
                 agg.tick_second();
-                let _ = snap_tx.send(agg.snapshot(rate));
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
+                sub_tick = 0;
             }
+
+            let _ = snap_tx.send(agg.snapshot(rate));
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
+            break;
         }
     }
 }
@@ -389,35 +537,48 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             .areas(bottom_row);
 
     // ---- Throughput sparkline ----
+    // Split each sparkline area into a y-axis label column and the sparkline.
+    // ratatui Sparkline renders from the start of the slice, so we pass only
+    // the tail matching the inner width to get immediate scrolling.
+    let [tp_y, tp_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(throughput_area);
+    let tp_tail = sparkline_tail(&snap.throughput_history, tp_spark.width);
+    let tp_max = tp_tail.iter().copied().max().unwrap_or(0);
+    render_y_axis(frame, tp_y, &fmt_compact(tp_max));
     frame.render_widget(
         Sparkline::default()
-            .data(&snap.throughput_history)
+            .data(tp_tail)
             .style(Style::default().fg(Color::Green))
-            .block(
-                Block::bordered()
-                    .title(format!(" Throughput ({} req/s) ", snap.current_rps))
-                    .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-        throughput_area,
+            .block(sparkline_block(
+                format!(" Throughput ({} req/s) ", snap.current_rps),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                tp_tail.len(),
+            )),
+        tp_spark,
     );
 
     // ---- Latency sparkline ----
+    let [lat_y, lat_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(latency_area);
+    let lat_tail = sparkline_tail(&snap.latency_history, lat_spark.width);
+    let lat_max = lat_tail.iter().copied().max().unwrap_or(0);
+    render_y_axis(frame, lat_y, &fmt_compact(lat_max));
     frame.render_widget(
         Sparkline::default()
-            .data(&snap.latency_history)
+            .data(lat_tail)
             .style(Style::default().fg(Color::Yellow))
-            .block(
-                Block::bordered()
-                    .title(format!(" Latency ({:.1}ms avg) ", snap.avg_latency_ms))
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-        latency_area,
+            .block(sparkline_block(
+                format!(" Latency ({:.1}ms avg) ", snap.avg_latency_ms),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                lat_tail.len(),
+            )),
+        lat_spark,
     );
 
     // ---- Error sparkline ----
@@ -426,21 +587,28 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
     } else {
         0.0
     };
+    let [err_y, err_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(error_area);
+    let err_tail = sparkline_tail(&snap.error_history, err_spark.width);
+    let err_max = err_tail.iter().copied().max().unwrap_or(0);
+    render_y_axis(frame, err_y, &fmt_compact(err_max));
     frame.render_widget(
         Sparkline::default()
-            .data(&snap.error_history)
+            .data(err_tail)
             .style(Style::default().fg(Color::Red))
-            .block(
-                Block::bordered()
-                    .title(format!(
-                        " Errors ({:.1}% | {}/s) ",
-                        error_pct,
-                        snap.error_history.last().unwrap_or(&0)
-                    ))
-                    .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-        error_area,
+            .block(sparkline_block(
+                format!(
+                    " Errors ({:.1}% | {}/s) ",
+                    error_pct,
+                    snap.error_history.last().unwrap_or(&0)
+                ),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                err_tail.len(),
+            )),
+        err_spark,
     );
 
     // ---- Summary panel ----
@@ -535,6 +703,24 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
                 Style::default().fg(Color::Yellow),
             ),
         ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Network", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("   Current:  "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.current_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("   Peak:     "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.peak_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
     ];
 
     frame.render_widget(
@@ -556,11 +742,102 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
         .block(Block::bordered().border_style(Style::default().fg(Color::DarkGray))),
         footer,
     );
+
+    // ---- Warmup popup overlay ----
+    if snap.warming_up {
+        let popup_area = centered_rect(40, 7, area);
+        frame.render_widget(Clear, popup_area);
+        let popup_text = vec![
+            Line::from(""),
+            Line::styled(
+                "  Starting test...",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("  Warming up ({}s remaining)", snap.warmup_secs_left),
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::from(""),
+        ];
+        frame.render_widget(
+            Paragraph::new(popup_text).block(
+                Block::bordered()
+                    .title(" Initializing ")
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup_area,
+        );
+    }
 }
 
 // =========================================================================
 // Helpers
 // =========================================================================
+
+/// Return the tail of `data` that fits inside a bordered sparkline area.
+/// The inner width is `area_width - 2` (one char border each side).
+fn sparkline_tail(data: &[u64], area_width: u16) -> &[u64] {
+    let inner = area_width.saturating_sub(2) as usize;
+    let start = data.len().saturating_sub(inner);
+    &data[start..]
+}
+
+/// Build a bordered block with a coloured top title and a time-axis on the
+/// bottom border showing how far back the visible data extends.
+fn sparkline_block(title: String, title_style: Style, visible_secs: usize) -> Block<'static> {
+    let axis = Style::default().fg(Color::DarkGray);
+    let mut block = Block::bordered()
+        .title(title)
+        .title_style(title_style)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if visible_secs > 0 {
+        block = block
+            .title_bottom(Line::styled(format!(" {} ", format_age(visible_secs)), axis).left_aligned())
+            .title_bottom(Line::styled(" now ", axis).right_aligned());
+    }
+    block
+}
+
+/// Render y-axis labels (max at top, 0 at bottom) in a narrow column next
+/// to a bordered sparkline. Labels are right-aligned and positioned to line
+/// up with the first and last inner rows of the adjacent bordered block.
+fn render_y_axis(frame: &mut Frame, area: Rect, max_label: &str) {
+    if area.height < 3 {
+        return;
+    }
+    let style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = vec![Line::from(""); area.height as usize];
+    // Max value at the first inner row of the sparkline (row 1)
+    lines[1] = Line::styled(max_label, style).right_aligned();
+    // Zero at the last inner row (row height-2), if distinct from the max row
+    let zero_row = area.height as usize - 2;
+    if zero_row > 1 {
+        lines[zero_row] = Line::styled("0", style).right_aligned();
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Format a value compactly for y-axis labels (e.g. "150", "12k", "3M").
+fn fmt_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format a number of seconds as a relative age label, e.g. "-2m00s" or "-45s".
+fn format_age(seconds: usize) -> String {
+    if seconds >= 60 {
+        format!("-{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("-{}s", seconds)
+    }
+}
 
 fn format_duration(d: Duration) -> String {
     let total_secs = d.as_secs();
@@ -572,6 +849,30 @@ fn format_duration(d: Duration) -> String {
     } else {
         format!("{m}m {s:02}s")
     }
+}
+
+/// Format bytes/sec as a human-readable rate string.
+fn fmt_bytes_rate(bps: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bps as f64;
+    if b >= GB {
+        format!("{:.1} GB/s", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB/s", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB/s", b / KB)
+    } else {
+        format!("{} B/s", bps)
+    }
+}
+
+/// Return a centered `Rect` of the given width and height within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
 fn fmt_num(n: u64) -> String {
@@ -699,8 +1000,8 @@ async fn main() -> Result<()> {
     let target_rate = Arc::new(AtomicU64::new(args.rate));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mnemonics = Arc::new(active_mnemonics);
+    let metrics = Arc::new(SharedMetrics::new());
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<(bool, Duration)>();
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
 
     // ----- Spawn background tasks -----
@@ -713,11 +1014,11 @@ async fn main() -> Result<()> {
     let d_shutdown = shutdown.clone();
     let d_mnemonics = mnemonics.clone();
     let d_url = server_url.clone();
-    let d_tx = event_tx.clone();
+    let d_metrics = metrics.clone();
     let d_workers = args.workers;
     let d_client = http_client.clone();
     tokio::spawn(async move {
-        dispatcher(d_rate, d_client, d_mnemonics, d_url, d_tx, d_shutdown, d_workers).await;
+        dispatcher(d_rate, d_client, d_mnemonics, d_url, d_metrics, d_shutdown, d_workers).await;
     });
 
     // Aggregator
@@ -725,12 +1026,10 @@ async fn main() -> Result<()> {
     let a_shutdown = shutdown.clone();
     let a_did_count = mnemonics.len();
     let a_url = server_url.clone();
+    let a_metrics = metrics.clone();
     tokio::spawn(async move {
-        run_aggregator(event_rx, snap_tx, a_rate, a_did_count, a_url, a_shutdown).await;
+        run_aggregator(a_metrics, snap_tx, a_rate, a_did_count, a_url, a_shutdown).await;
     });
-
-    // Drop the extra event_tx so the aggregator can detect shutdown
-    drop(event_tx);
 
     // ----- TUI event loop -----
     // Install panic hook to restore terminal on crash
