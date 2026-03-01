@@ -266,9 +266,7 @@ export const api = {
   createAcl: (
     did: string,
     role: "admin" | "owner",
-    label?: string,
-    maxTotalSize?: number,
-    maxDidCount?: number,
+    opts?: { label?: string; maxTotalSize?: number; maxDidCount?: number },
   ) =>
     request<AclEntry>("/api/acl", {
       method: "POST",
@@ -276,9 +274,9 @@ export const api = {
       body: JSON.stringify({
         did,
         role,
-        label,
-        max_total_size: maxTotalSize,
-        max_did_count: maxDidCount,
+        label: opts?.label,
+        max_total_size: opts?.maxTotalSize,
+        max_did_count: opts?.maxDidCount,
       }),
     }),
 
@@ -286,14 +284,18 @@ export const api = {
     did: string,
     updates: {
       label?: string | null;
-      max_total_size?: number | null;
-      max_did_count?: number | null;
+      maxTotalSize?: number | null;
+      maxDidCount?: number | null;
     },
   ) =>
     request<AclEntry>(`/api/acl/${encodeURIComponent(did)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
+      body: JSON.stringify({
+        label: updates.label,
+        max_total_size: updates.maxTotalSize,
+        max_did_count: updates.maxDidCount,
+      }),
     }),
 
   deleteAcl: (did: string) =>

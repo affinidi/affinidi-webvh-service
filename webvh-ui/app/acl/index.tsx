@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, memo } from "react";
 import {
   View,
   Text,
@@ -12,9 +12,167 @@ import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { formatBytes } from "../../lib/format";
+import {
+  formatBytes,
+  parseMbToBytes,
+  bytesToMb,
+  parseOptionalInt,
+} from "../../lib/format";
 import { showAlert, showConfirm } from "../../lib/alert";
 import type { AclEntry } from "../../lib/api";
+
+interface EditState {
+  did: string;
+  label: string;
+  maxTotalSize: string;
+  maxDidCount: string;
+}
+
+const formatDate = (ts: number) =>
+  new Date(ts * 1000).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+
+const keyExtractor = (item: AclEntry) => item.did;
+const listContentStyle = { gap: spacing.sm };
+
+const AclEntryRow = memo(function AclEntryRow({
+  item,
+  editing,
+  saving,
+  onStartEdit,
+  onCancelEdit,
+  onSave,
+  onDelete,
+  onChangeLabel,
+  onChangeMaxTotalSize,
+  onChangeMaxDidCount,
+}: {
+  item: AclEntry;
+  editing: EditState | null;
+  saving: boolean;
+  onStartEdit: (entry: AclEntry) => void;
+  onCancelEdit: () => void;
+  onSave: (did: string) => void;
+  onDelete: (did: string) => void;
+  onChangeLabel: (v: string) => void;
+  onChangeMaxTotalSize: (v: string) => void;
+  onChangeMaxDidCount: (v: string) => void;
+}) {
+  const isEditing = editing?.did === item.did;
+
+  return (
+    <View style={styles.entryCard}>
+      <View style={styles.entryInfo}>
+        <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
+          <Text style={styles.entryDid} numberOfLines={1}>
+            {item.did}
+          </Text>
+        </Link>
+        <View style={styles.entryMeta}>
+          <View
+            style={[
+              styles.roleBadge,
+              item.role === "admin" && styles.adminBadge,
+            ]}
+          >
+            <Text style={styles.roleBadgeText}>{item.role}</Text>
+          </View>
+          {!isEditing && item.label && (
+            <Text style={styles.entryLabel}>{item.label}</Text>
+          )}
+          <Text style={styles.entryDate}>
+            {formatDate(item.created_at)}
+          </Text>
+        </View>
+
+        {isEditing ? (
+          <View style={styles.editFields}>
+            <TextInput
+              style={styles.editInput}
+              placeholder="Label"
+              placeholderTextColor={colors.textTertiary}
+              value={editing.label}
+              onChangeText={onChangeLabel}
+            />
+            <View style={styles.editRow}>
+              <View style={styles.editFieldHalf}>
+                <Text style={styles.editFieldLabel}>Max size (MB)</Text>
+                <TextInput
+                  style={styles.editInput}
+                  placeholder="Default"
+                  placeholderTextColor={colors.textTertiary}
+                  value={editing.maxTotalSize}
+                  onChangeText={onChangeMaxTotalSize}
+                  keyboardType="numeric"
+                />
+              </View>
+              <View style={styles.editFieldHalf}>
+                <Text style={styles.editFieldLabel}>Max DIDs</Text>
+                <TextInput
+                  style={styles.editInput}
+                  placeholder="Default"
+                  placeholderTextColor={colors.textTertiary}
+                  value={editing.maxDidCount}
+                  onChangeText={onChangeMaxDidCount}
+                  keyboardType="numeric"
+                />
+              </View>
+            </View>
+            <View style={styles.editActions}>
+              <Pressable
+                style={[styles.saveButton, saving && styles.disabled]}
+                onPress={() => onSave(item.did)}
+                disabled={saving}
+              >
+                <Text style={styles.saveText}>
+                  {saving ? "Saving..." : "Save"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.cancelButton} onPress={onCancelEdit}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : (
+          <View style={styles.quotaRow}>
+            <Text style={styles.quotaText}>
+              Max Size:{" "}
+              {item.max_total_size != null
+                ? formatBytes(item.max_total_size)
+                : "Default"}
+            </Text>
+            <Text style={styles.quotaText}>
+              Max DIDs:{" "}
+              {item.max_did_count != null
+                ? item.max_did_count.toLocaleString()
+                : "Default"}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {!isEditing && (
+        <View style={styles.entryActions}>
+          <Pressable
+            style={styles.editButton}
+            onPress={() => onStartEdit(item)}
+          >
+            <Text style={styles.editText}>Edit</Text>
+          </Pressable>
+          <Pressable
+            style={styles.deleteButton}
+            onPress={() => onDelete(item.did)}
+          >
+            <Text style={styles.deleteText}>Remove</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+});
 
 export default function AclManagement() {
   const api = useApi();
@@ -33,10 +191,7 @@ export default function AclManagement() {
   const [creating, setCreating] = useState(false);
 
   // Inline edit state
-  const [editingDid, setEditingDid] = useState<string | null>(null);
-  const [editLabel, setEditLabel] = useState("");
-  const [editMaxTotalSize, setEditMaxTotalSize] = useState("");
-  const [editMaxDidCount, setEditMaxDidCount] = useState("");
+  const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
 
   const refresh = useCallback(() => {
@@ -63,19 +218,11 @@ export default function AclManagement() {
     if (!newDid.trim()) return;
     setCreating(true);
     try {
-      const maxSize = newMaxTotalSize.trim()
-        ? Math.round(parseFloat(newMaxTotalSize) * 1024 * 1024)
-        : undefined;
-      const maxDids = newMaxDidCount.trim()
-        ? parseInt(newMaxDidCount, 10)
-        : undefined;
-      await api.createAcl(
-        newDid.trim(),
-        newRole,
-        newLabel.trim() || undefined,
-        maxSize,
-        maxDids,
-      );
+      await api.createAcl(newDid.trim(), newRole, {
+        label: newLabel.trim() || undefined,
+        maxTotalSize: parseMbToBytes(newMaxTotalSize) ?? undefined,
+        maxDidCount: parseOptionalInt(newMaxDidCount) ?? undefined,
+      });
       setNewDid("");
       setNewLabel("");
       setNewMaxTotalSize("");
@@ -90,59 +237,72 @@ export default function AclManagement() {
     }
   };
 
-  const handleDelete = (did: string) => {
-    showConfirm("Remove Access", `Remove access for ${did}?`, async () => {
+  const handleDelete = useCallback(
+    (did: string) => {
+      showConfirm("Remove Access", `Remove access for ${did}?`, async () => {
+        try {
+          await api.deleteAcl(did);
+          refresh();
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Failed to delete";
+          showAlert("Error", msg);
+        }
+      });
+    },
+    [api, refresh],
+  );
+
+  const startEditing = useCallback((entry: AclEntry) => {
+    setEditing({
+      did: entry.did,
+      label: entry.label ?? "",
+      maxTotalSize:
+        entry.max_total_size != null ? bytesToMb(entry.max_total_size) : "",
+      maxDidCount:
+        entry.max_did_count != null ? entry.max_did_count.toString() : "",
+    });
+  }, []);
+
+  const cancelEditing = useCallback(() => {
+    setEditing(null);
+  }, []);
+
+  const onChangeLabel = useCallback(
+    (v: string) => setEditing((prev) => (prev ? { ...prev, label: v } : prev)),
+    [],
+  );
+  const onChangeMaxTotalSize = useCallback(
+    (v: string) =>
+      setEditing((prev) => (prev ? { ...prev, maxTotalSize: v } : prev)),
+    [],
+  );
+  const onChangeMaxDidCount = useCallback(
+    (v: string) =>
+      setEditing((prev) => (prev ? { ...prev, maxDidCount: v } : prev)),
+    [],
+  );
+
+  const handleSave = useCallback(
+    async (did: string) => {
+      if (!editing) return;
+      setSaving(true);
       try {
-        await api.deleteAcl(did);
+        await api.updateAcl(did, {
+          label: editing.label.trim() || null,
+          maxTotalSize: parseMbToBytes(editing.maxTotalSize),
+          maxDidCount: parseOptionalInt(editing.maxDidCount),
+        });
+        setEditing(null);
         refresh();
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Failed to delete";
+        const msg = e instanceof Error ? e.message : "Failed to update";
         showAlert("Error", msg);
+      } finally {
+        setSaving(false);
       }
-    });
-  };
-
-  const startEditing = (entry: AclEntry) => {
-    setEditingDid(entry.did);
-    setEditLabel(entry.label ?? "");
-    setEditMaxTotalSize(
-      entry.max_total_size != null
-        ? (entry.max_total_size / (1024 * 1024)).toString()
-        : "",
-    );
-    setEditMaxDidCount(
-      entry.max_did_count != null ? entry.max_did_count.toString() : "",
-    );
-  };
-
-  const cancelEditing = () => {
-    setEditingDid(null);
-  };
-
-  const handleSave = async (did: string) => {
-    setSaving(true);
-    try {
-      const label = editLabel.trim() || null;
-      const maxSize = editMaxTotalSize.trim()
-        ? Math.round(parseFloat(editMaxTotalSize) * 1024 * 1024)
-        : null;
-      const maxDids = editMaxDidCount.trim()
-        ? parseInt(editMaxDidCount, 10)
-        : null;
-      await api.updateAcl(did, {
-        label,
-        max_total_size: maxSize,
-        max_did_count: maxDids,
-      });
-      setEditingDid(null);
-      refresh();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to update";
-      showAlert("Error", msg);
-    } finally {
-      setSaving(false);
-    }
-  };
+    },
+    [api, editing, refresh],
+  );
 
   if (!isAuthenticated) {
     return (
@@ -159,126 +319,20 @@ export default function AclManagement() {
     );
   }
 
-  const formatDate = (ts: number) =>
-    new Date(ts * 1000).toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-
-  const renderEntry = ({ item }: { item: AclEntry }) => {
-    const isEditing = editingDid === item.did;
-
-    return (
-      <View style={styles.entryCard}>
-        <View style={styles.entryInfo}>
-          <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
-            <Text style={styles.entryDid} numberOfLines={1}>
-              {item.did}
-            </Text>
-          </Link>
-          <View style={styles.entryMeta}>
-            <View
-              style={[
-                styles.roleBadge,
-                item.role === "admin" && styles.adminBadge,
-              ]}
-            >
-              <Text style={styles.roleBadgeText}>{item.role}</Text>
-            </View>
-            {!isEditing && item.label && (
-              <Text style={styles.entryLabel}>{item.label}</Text>
-            )}
-            <Text style={styles.entryDate}>
-              {formatDate(item.created_at)}
-            </Text>
-          </View>
-
-          {isEditing ? (
-            <View style={styles.editFields}>
-              <TextInput
-                style={styles.editInput}
-                placeholder="Label"
-                placeholderTextColor={colors.textTertiary}
-                value={editLabel}
-                onChangeText={setEditLabel}
-              />
-              <View style={styles.editRow}>
-                <View style={styles.editFieldHalf}>
-                  <Text style={styles.editFieldLabel}>Max size (MB)</Text>
-                  <TextInput
-                    style={styles.editInput}
-                    placeholder="Default"
-                    placeholderTextColor={colors.textTertiary}
-                    value={editMaxTotalSize}
-                    onChangeText={setEditMaxTotalSize}
-                    keyboardType="numeric"
-                  />
-                </View>
-                <View style={styles.editFieldHalf}>
-                  <Text style={styles.editFieldLabel}>Max DIDs</Text>
-                  <TextInput
-                    style={styles.editInput}
-                    placeholder="Default"
-                    placeholderTextColor={colors.textTertiary}
-                    value={editMaxDidCount}
-                    onChangeText={setEditMaxDidCount}
-                    keyboardType="numeric"
-                  />
-                </View>
-              </View>
-              <View style={styles.editActions}>
-                <Pressable
-                  style={[styles.saveButton, saving && styles.disabled]}
-                  onPress={() => handleSave(item.did)}
-                  disabled={saving}
-                >
-                  <Text style={styles.saveText}>
-                    {saving ? "Saving..." : "Save"}
-                  </Text>
-                </Pressable>
-                <Pressable style={styles.cancelButton} onPress={cancelEditing}>
-                  <Text style={styles.cancelText}>Cancel</Text>
-                </Pressable>
-              </View>
-            </View>
-          ) : (
-            <View style={styles.quotaRow}>
-              <Text style={styles.quotaText}>
-                Max Size:{" "}
-                {item.max_total_size != null
-                  ? formatBytes(item.max_total_size)
-                  : "Default"}
-              </Text>
-              <Text style={styles.quotaText}>
-                Max DIDs:{" "}
-                {item.max_did_count != null
-                  ? item.max_did_count.toLocaleString()
-                  : "Default"}
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {!isEditing && (
-          <View style={styles.entryActions}>
-            <Pressable
-              style={styles.editButton}
-              onPress={() => startEditing(item)}
-            >
-              <Text style={styles.editText}>Edit</Text>
-            </Pressable>
-            <Pressable
-              style={styles.deleteButton}
-              onPress={() => handleDelete(item.did)}
-            >
-              <Text style={styles.deleteText}>Remove</Text>
-            </Pressable>
-          </View>
-        )}
-      </View>
-    );
-  };
+  const renderEntry = ({ item }: { item: AclEntry }) => (
+    <AclEntryRow
+      item={item}
+      editing={editing}
+      saving={saving}
+      onStartEdit={startEditing}
+      onCancelEdit={cancelEditing}
+      onSave={handleSave}
+      onDelete={handleDelete}
+      onChangeLabel={onChangeLabel}
+      onChangeMaxTotalSize={onChangeMaxTotalSize}
+      onChangeMaxDidCount={onChangeMaxDidCount}
+    />
+  );
 
   return (
     <View style={styles.container}>
@@ -389,8 +443,8 @@ export default function AclManagement() {
       ) : (
         <FlatList
           data={entries}
-          keyExtractor={(item) => item.did}
-          contentContainerStyle={{ gap: spacing.sm }}
+          keyExtractor={keyExtractor}
+          contentContainerStyle={listContentStyle}
           renderItem={renderEntry}
         />
       )}
