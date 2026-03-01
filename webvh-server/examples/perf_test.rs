@@ -59,6 +59,11 @@ struct Args {
     #[arg(long)]
     seed: Option<String>,
 
+    /// Number of random WebVH DIDs to create on startup for testing.
+    /// Each DID gets a server-generated random mnemonic.
+    #[arg(long, default_value = "0")]
+    create_dids: usize,
+
     /// Mediator DID (reserved for future DIDComm-via-mediator testing)
     #[arg(long)]
     mediator_did: Option<String>,
@@ -638,6 +643,20 @@ async fn main() -> Result<()> {
         .await
         .context("DIDComm authentication failed")?;
     eprintln!("  Authenticated!");
+
+    // ----- Create random DIDs if requested -----
+    if args.create_dids > 0 {
+        eprintln!("  Creating {} random DIDs...", args.create_dids);
+        for i in 1..=args.create_dids {
+            let result = client
+                .create_did(&my_secret, None)
+                .await
+                .with_context(|| format!("failed to create DID {i}/{}", args.create_dids))?;
+            eprintln!("    [{i}/{}] {} -> {}", args.create_dids, result.mnemonic, result.did);
+        }
+        eprintln!("  Created {} DIDs.", args.create_dids);
+        eprintln!();
+    }
 
     // ----- Fetch active DIDs -----
     eprintln!("  Fetching DID list...");
