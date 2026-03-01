@@ -103,6 +103,7 @@ struct Snapshot {
     throughput_history: Vec<u64>,
     latency_history: Vec<u64>,
     error_history: Vec<u64>,
+    worker_history: Vec<u64>,
     elapsed: Duration,
     target_rate: u64,
     did_count: usize,
@@ -135,6 +136,7 @@ impl Default for Snapshot {
             throughput_history: vec![],
             latency_history: vec![],
             error_history: vec![],
+            worker_history: vec![],
             elapsed: Duration::ZERO,
             target_rate: 0,
             did_count: 0,
@@ -194,6 +196,8 @@ struct Aggregator {
     throughput_hist: VecDeque<u64>,
     latency_hist: VecDeque<u64>,
     error_hist: VecDeque<u64>,
+    worker_hist: VecDeque<u64>,
+    last_active_workers: u64,
     // Circular buffer for percentile calculation
     latency_buf: VecDeque<f64>,
     min_lat: f64,
@@ -233,6 +237,8 @@ impl Aggregator {
             throughput_hist: VecDeque::with_capacity(HISTORY_LEN),
             latency_hist: VecDeque::with_capacity(HISTORY_LEN),
             error_hist: VecDeque::with_capacity(HISTORY_LEN),
+            worker_hist: VecDeque::with_capacity(HISTORY_LEN),
+            last_active_workers: 0,
             latency_buf: VecDeque::with_capacity(LATENCY_BUFFER),
             min_lat: f64::MAX,
             max_lat: 0.0,
@@ -263,6 +269,7 @@ impl Aggregator {
         if active_workers > self.peak_workers {
             self.peak_workers = active_workers;
         }
+        self.last_active_workers = active_workers;
         self.total = raw_total - self.baseline_total;
         self.success = raw_success - self.baseline_success;
         self.errors = raw_errors - self.baseline_errors;
@@ -290,6 +297,7 @@ impl Aggregator {
 
         push_bounded(&mut self.throughput_hist, sec_total, HISTORY_LEN);
         push_bounded(&mut self.error_hist, sec_errors, HISTORY_LEN);
+        push_bounded(&mut self.worker_hist, self.last_active_workers, HISTORY_LEN);
 
         let avg_ms = if self.sec_latencies.is_empty() {
             0
@@ -351,6 +359,7 @@ impl Aggregator {
             throughput_history: self.throughput_hist.iter().copied().collect(),
             latency_history: self.latency_hist.iter().copied().collect(),
             error_history: self.error_hist.iter().copied().collect(),
+            worker_history: self.worker_hist.iter().copied().collect(),
             elapsed: self.start.elapsed(),
             target_rate,
             did_count: self.did_count,
@@ -526,6 +535,7 @@ async fn run_aggregator(
                 agg.throughput_hist.clear();
                 agg.latency_hist.clear();
                 agg.error_hist.clear();
+                agg.worker_hist.clear();
                 agg.sec_latencies.clear();
                 agg.min_lat = f64::MAX;
                 agg.max_lat = 0.0;
@@ -594,9 +604,13 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .areas(top_row);
 
-    let [error_area, summary_area] =
+    let [left_bottom, summary_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .areas(bottom_row);
+
+    let [worker_area, error_area] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(left_bottom);
 
     // ---- Throughput sparkline ----
     // Split each sparkline area into a y-axis label column and the sparkline.
@@ -641,6 +655,31 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
                 lat_tail.len(),
             )),
         lat_spark,
+    );
+
+    // ---- Workers sparkline ----
+    let [wk_y, wk_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(worker_area);
+    let wk_tail = sparkline_tail(&snap.worker_history, wk_spark.width);
+    let wk_max = wk_tail.iter().copied().max().unwrap_or(0).max(snap.max_workers as u64);
+    render_y_axis(frame, wk_y, &fmt_compact(wk_max));
+    frame.render_widget(
+        Sparkline::default()
+            .data(wk_tail)
+            .max(wk_max)
+            .style(Style::default().fg(Color::Cyan))
+            .block(sparkline_block(
+                format!(
+                    " Workers ({}/{} | peak {}) ",
+                    snap.active_workers, snap.max_workers, snap.peak_workers
+                ),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                wk_tail.len(),
+            )),
+        wk_spark,
     );
 
     // ---- Error sparkline ----
@@ -763,24 +802,6 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Span::styled(
                 format!("{:>8.1}ms", snap.p99_latency_ms),
                 Style::default().fg(Color::Yellow),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Workers", Style::default().add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::raw("   Active:   "),
-            Span::styled(
-                format!("{:>4} / {}", snap.active_workers, snap.max_workers),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("   Peak:     "),
-            Span::styled(
-                format!("{:>4} / {}", snap.peak_workers, snap.max_workers),
-                Style::default().fg(Color::Cyan),
             ),
         ]),
         Line::from(""),
