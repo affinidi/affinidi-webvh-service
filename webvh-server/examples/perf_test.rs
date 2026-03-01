@@ -72,6 +72,10 @@ struct Args {
     #[arg(long)]
     mediator_did: Option<String>,
 
+    /// Request timeout in seconds
+    #[arg(long, short = 't', default_value = "5")]
+    timeout: u64,
+
     /// WebVH server DID (reserved for future DIDComm-via-mediator testing)
     #[arg(long)]
     webvh_did: Option<String>,
@@ -1165,6 +1169,7 @@ async fn main() -> Result<()> {
     // ----- Spawn background tasks -----
     let http_client = reqwest::Client::builder()
         .pool_max_idle_per_host(args.workers)
+        .timeout(Duration::from_secs(args.timeout))
         .build()?;
 
     // Dispatcher
