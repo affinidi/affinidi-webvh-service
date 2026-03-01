@@ -3,7 +3,7 @@
 /target
 **/config.toml
 **/data
-**/.list
+**/*.list
 
 # UI build artifacts
 webvh-ui/dist/
