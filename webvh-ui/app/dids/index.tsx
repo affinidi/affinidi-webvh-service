@@ -269,10 +269,10 @@ export default function DidList() {
             return (
               <Link href={`/dids/${item.mnemonic}`} asChild>
                 <Pressable
-                  style={[
+                  style={StyleSheet.flatten([
                     styles.card,
                     showOwnerInfo && (isOwn ? styles.cardOwn : styles.cardOther),
-                  ]}
+                  ])}
                 >
                   <View style={styles.mnemonicRow}>
                     <Text style={styles.mnemonic}>{item.mnemonic}</Text>

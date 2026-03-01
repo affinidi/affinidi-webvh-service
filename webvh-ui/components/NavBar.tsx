@@ -36,7 +36,7 @@ export function NavBar() {
               <Link key={item.href} href={item.href as any} asChild>
                 <Pressable style={styles.linkButton}>
                   <Text
-                    style={[styles.linkText, active && styles.linkTextActive]}
+                    style={StyleSheet.flatten([styles.linkText, active && styles.linkTextActive])}
                   >
                     {item.label}
                   </Text>
