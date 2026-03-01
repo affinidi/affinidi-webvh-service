@@ -106,8 +106,10 @@ struct Snapshot {
     server_url: String,
     warming_up: bool,
     warmup_secs_left: u8,
-    current_bps: u64,
-    peak_bps: u64,
+    inbound_bps: u64,
+    peak_inbound_bps: u64,
+    outbound_bps: u64,
+    peak_outbound_bps: u64,
 }
 
 impl Default for Snapshot {
@@ -133,8 +135,10 @@ impl Default for Snapshot {
             server_url: String::new(),
             warming_up: false,
             warmup_secs_left: 0,
-            current_bps: 0,
-            peak_bps: 0,
+            inbound_bps: 0,
+            peak_inbound_bps: 0,
+            outbound_bps: 0,
+            peak_outbound_bps: 0,
         }
     }
 }
@@ -148,7 +152,8 @@ struct SharedMetrics {
     total: AtomicU64,
     success: AtomicU64,
     errors: AtomicU64,
-    bytes_received: AtomicU64,
+    bytes_inbound: AtomicU64,
+    bytes_outbound: AtomicU64,
     latencies: Mutex<Vec<f64>>,
 }
 
@@ -158,7 +163,8 @@ impl SharedMetrics {
             total: AtomicU64::new(0),
             success: AtomicU64::new(0),
             errors: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
+            bytes_inbound: AtomicU64::new(0),
+            bytes_outbound: AtomicU64::new(0),
             latencies: Mutex::new(Vec::with_capacity(4096)),
         }
     }
@@ -189,12 +195,17 @@ struct Aggregator {
     baseline_total: u64,
     baseline_success: u64,
     baseline_errors: u64,
-    baseline_bytes: u64,
+    baseline_bytes_in: u64,
+    baseline_bytes_out: u64,
     // Network bandwidth tracking
-    total_bytes: u64,
-    sec_start_bytes: u64,
-    current_bps: u64,
-    peak_bps: u64,
+    total_bytes_in: u64,
+    total_bytes_out: u64,
+    sec_start_bytes_in: u64,
+    sec_start_bytes_out: u64,
+    inbound_bps: u64,
+    peak_inbound_bps: u64,
+    outbound_bps: u64,
+    peak_outbound_bps: u64,
 }
 
 impl Aggregator {
@@ -219,20 +230,26 @@ impl Aggregator {
             baseline_total: 0,
             baseline_success: 0,
             baseline_errors: 0,
-            baseline_bytes: 0,
-            total_bytes: 0,
-            sec_start_bytes: 0,
-            current_bps: 0,
-            peak_bps: 0,
+            baseline_bytes_in: 0,
+            baseline_bytes_out: 0,
+            total_bytes_in: 0,
+            total_bytes_out: 0,
+            sec_start_bytes_in: 0,
+            sec_start_bytes_out: 0,
+            inbound_bps: 0,
+            peak_inbound_bps: 0,
+            outbound_bps: 0,
+            peak_outbound_bps: 0,
         }
     }
 
     /// Absorb a batch of metrics from the shared atomic counters.
-    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes: u64, latencies: &[f64]) {
+    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes_in: u64, raw_bytes_out: u64, latencies: &[f64]) {
         self.total = raw_total - self.baseline_total;
         self.success = raw_success - self.baseline_success;
         self.errors = raw_errors - self.baseline_errors;
-        self.total_bytes = raw_bytes - self.baseline_bytes;
+        self.total_bytes_in = raw_bytes_in - self.baseline_bytes_in;
+        self.total_bytes_out = raw_bytes_out - self.baseline_bytes_out;
 
         for &ms in latencies {
             if ms < self.min_lat {
@@ -263,13 +280,21 @@ impl Aggregator {
         };
         push_bounded(&mut self.latency_hist, avg_ms, HISTORY_LEN);
 
-        // Network bandwidth
-        let sec_bytes = self.total_bytes - self.sec_start_bytes;
-        self.current_bps = sec_bytes;
-        if sec_bytes > self.peak_bps {
-            self.peak_bps = sec_bytes;
+        // Network bandwidth — inbound
+        let sec_in = self.total_bytes_in - self.sec_start_bytes_in;
+        self.inbound_bps = sec_in;
+        if sec_in > self.peak_inbound_bps {
+            self.peak_inbound_bps = sec_in;
         }
-        self.sec_start_bytes = self.total_bytes;
+        self.sec_start_bytes_in = self.total_bytes_in;
+
+        // Network bandwidth — outbound
+        let sec_out = self.total_bytes_out - self.sec_start_bytes_out;
+        self.outbound_bps = sec_out;
+        if sec_out > self.peak_outbound_bps {
+            self.peak_outbound_bps = sec_out;
+        }
+        self.sec_start_bytes_out = self.total_bytes_out;
 
         self.sec_start_total = self.total;
         self.sec_start_errors = self.errors;
@@ -314,8 +339,10 @@ impl Aggregator {
             server_url: self.server_url.clone(),
             warming_up: false,
             warmup_secs_left: 0,
-            current_bps: self.current_bps,
-            peak_bps: self.peak_bps,
+            inbound_bps: self.inbound_bps,
+            peak_inbound_bps: self.peak_inbound_bps,
+            outbound_bps: self.outbound_bps,
+            peak_outbound_bps: self.peak_outbound_bps,
         }
     }
 
@@ -390,6 +417,7 @@ async fn dispatcher(
             let idx = pick_random_index(mnemonics.len());
             let mnemonic = mnemonics[idx].clone();
             let url = format!("{}/{}/did.jsonl", server_url, mnemonic);
+            let req_bytes = url.len() as u64;
             let c = client.clone();
             let m = metrics.clone();
 
@@ -414,7 +442,8 @@ async fn dispatcher(
                 } else {
                     m.errors.fetch_add(1, Ordering::Relaxed);
                 }
-                m.bytes_received.fetch_add(resp_bytes, Ordering::Relaxed);
+                m.bytes_inbound.fetch_add(resp_bytes, Ordering::Relaxed);
+                m.bytes_outbound.fetch_add(req_bytes, Ordering::Relaxed);
                 m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
 
                 drop(permit);
@@ -447,7 +476,8 @@ async fn run_aggregator(
         let total = metrics.total.load(Ordering::Relaxed);
         let success = metrics.success.load(Ordering::Relaxed);
         let errors = metrics.errors.load(Ordering::Relaxed);
-        let bytes = metrics.bytes_received.load(Ordering::Relaxed);
+        let bytes_in = metrics.bytes_inbound.load(Ordering::Relaxed);
+        let bytes_out = metrics.bytes_outbound.load(Ordering::Relaxed);
 
         let rate = target_rate.load(Ordering::Relaxed);
 
@@ -461,7 +491,8 @@ async fn run_aggregator(
                 agg.baseline_total = total;
                 agg.baseline_success = success;
                 agg.baseline_errors = errors;
-                agg.baseline_bytes = bytes;
+                agg.baseline_bytes_in = bytes_in;
+                agg.baseline_bytes_out = bytes_out;
                 agg.start = Instant::now();
                 agg.latency_buf.clear();
                 agg.throughput_hist.clear();
@@ -473,16 +504,18 @@ async fn run_aggregator(
                 agg.total = 0;
                 agg.success = 0;
                 agg.errors = 0;
-                agg.total_bytes = 0;
+                agg.total_bytes_in = 0;
+                agg.total_bytes_out = 0;
                 agg.sec_start_total = 0;
                 agg.sec_start_errors = 0;
-                agg.sec_start_bytes = 0;
+                agg.sec_start_bytes_in = 0;
+                agg.sec_start_bytes_out = 0;
                 sub_tick = 0;
             }
 
             let _ = snap_tx.send(agg.warmup_snapshot(rate, secs_left));
         } else {
-            agg.update(total, success, errors, bytes, &batch);
+            agg.update(total, success, errors, bytes_in, bytes_out, &batch);
 
             // Push sparkline data once per second
             sub_tick += 1;
@@ -708,16 +741,26 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Span::styled("  Network", Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::raw("   Current:  "),
+            Span::raw("   In:  "),
             Span::styled(
-                format!("{:>10}", fmt_bytes_rate(snap.current_bps)),
+                format!("{:>10}", fmt_bytes_rate(snap.inbound_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  Peak: "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.peak_inbound_bps)),
                 Style::default().fg(Color::Magenta),
             ),
         ]),
         Line::from(vec![
-            Span::raw("   Peak:     "),
+            Span::raw("   Out: "),
             Span::styled(
-                format!("{:>10}", fmt_bytes_rate(snap.peak_bps)),
+                format!("{:>10}", fmt_bytes_rate(snap.outbound_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  Peak: "),
+            Span::styled(
+                format!("{:>10}", fmt_bytes_rate(snap.peak_outbound_bps)),
                 Style::default().fg(Color::Magenta),
             ),
         ]),
