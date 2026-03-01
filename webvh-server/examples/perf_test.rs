@@ -468,13 +468,13 @@ async fn dispatcher(
                 let result = c.get(&url).send().await;
                 let latency = start.elapsed();
 
-                let (ok, resp_bytes) = match result {
+                let (ok, resp_bytes, timed_out) = match result {
                     Ok(resp) => {
                         let ok = resp.status().is_success();
                         let bytes = resp.bytes().await.map(|b| b.len() as u64).unwrap_or(0);
-                        (ok, bytes)
+                        (ok, bytes, false)
                     }
-                    Err(_) => (false, 0),
+                    Err(e) => (false, 0, e.is_timeout()),
                 };
 
                 // Lock-free for counts, brief lock for latency
@@ -486,7 +486,9 @@ async fn dispatcher(
                 }
                 m.bytes_inbound.fetch_add(resp_bytes, Ordering::Relaxed);
                 m.bytes_outbound.fetch_add(req_bytes, Ordering::Relaxed);
-                m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
+                if !timed_out {
+                    m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
+                }
                 m.active_workers.fetch_sub(1, Ordering::Relaxed);
 
                 drop(permit);

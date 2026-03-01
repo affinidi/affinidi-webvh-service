@@ -468,6 +468,110 @@ challenges, WebAuthn ceremony state) is excluded.
 All keys and values are base64url-no-pad encoded in the backup
 file.
 
+## Performance Testing
+
+The `perf_test` example is an interactive TUI benchmarking tool
+for load-testing a running WebVH server. It sends concurrent DID
+resolution requests and displays real-time metrics including
+throughput, latency percentiles, network bandwidth, active
+workers, and error rates.
+
+### Building
+
+```bash
+cargo build --example perf_test -p affinidi-webvh-server
+```
+
+### Usage
+
+```bash
+cargo run --example perf_test -p affinidi-webvh-server -- [OPTIONS]
+```
+
+The tool requires at least one DID to exist on the server, or
+you can use `--create-dids` to auto-create test DIDs on startup.
+
+### Options
+
+| Flag | Short | Default | Description |
+| ---- | ----- | ------- | ----------- |
+| `--server-url` | `-s` | `http://localhost:8101` | WebVH server URL |
+| `--rate` | `-r` | `10` | Target requests per second (adjustable at runtime) |
+| `--workers` | `-w` | `64` | Maximum concurrent in-flight requests |
+| `--timeout` | `-t` | `5` | Request timeout in seconds |
+| `--create-dids` | | `0` | Number of random DIDs to create on startup |
+| `--create-parallel` | | `4` | Parallel concurrency for DID creation |
+| `--seed` | | random | Ed25519 seed as 64 hex characters |
+| `--mediator-did` | | | Mediator DID (reserved for future use) |
+| `--webvh-did` | | | Server DID (reserved for future use) |
+
+### Examples
+
+```bash
+# Basic: 50 req/s against local server
+cargo run --example perf_test -p affinidi-webvh-server -- \
+  --rate 50
+
+# Create 10 test DIDs on startup, then benchmark at 200 req/s
+cargo run --example perf_test -p affinidi-webvh-server -- \
+  --create-dids 10 --rate 200
+
+# Remote server with higher concurrency and longer timeout
+cargo run --example perf_test -p affinidi-webvh-server -- \
+  -s https://webvh.example.com -r 500 -w 128 -t 10
+
+# Create DIDs faster with more parallelism
+cargo run --example perf_test -p affinidi-webvh-server -- \
+  --create-dids 50 --create-parallel 8 --rate 100
+```
+
+### Keyboard Controls
+
+| Key | Action |
+| --- | ------ |
+| `q` / `Esc` | Quit |
+| `+` / `=` / `Up` | Increase target rate by 10 req/s |
+| `-` / `Down` | Decrease target rate by 10 req/s |
+| `]` | Double target rate |
+| `[` | Halve target rate |
+
+Rate changes are smoothed over a few seconds to avoid shocking
+the server with sudden load spikes.
+
+### Dashboard
+
+The TUI displays four quadrants plus a summary panel:
+
+- **Throughput** (top-left) — sparkline of requests per second
+  over the last 120 seconds
+- **Latency** (top-right) — sparkline of p99 latency over the
+  last 120 seconds
+- **Workers** (bottom-left top) — sparkline of active concurrent
+  workers showing current, max, and peak utilization
+- **Errors** (bottom-left bottom) — sparkline of errors per
+  second
+- **Summary** (right panel) — current totals, latency
+  percentiles (p50/p95/p99/max), network bandwidth (outbound
+  and inbound with peak values), and test duration
+
+### Warmup
+
+The tool includes a 3-second warmup period on startup:
+
+- Request rate ramps linearly from 0 to the target rate
+- A popup overlay shows the warmup countdown
+- All metrics collected during warmup are discarded so that
+  graphs and statistics start clean
+
+### Notes
+
+- Timed-out requests count as errors but are excluded from
+  latency statistics to avoid skewing percentiles
+- The tool authenticates with the server using DIDComm
+  challenge-response before starting the benchmark
+- Network traffic shows actual bytes transferred (response
+  bodies are fully consumed)
+
 ## API Endpoints
 
 ### Public
