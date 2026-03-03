@@ -38,6 +38,30 @@ pub fn encode_host(server_url: &str) -> Result<String> {
     })
 }
 
+/// Construct a `did:web` identifier from a server URL and mnemonic.
+///
+/// Follows the did:web method spec:
+/// - `did:web:example.com` for the root DID (mnemonic = `.well-known`)
+/// - `did:web:host:path` for path-based DIDs
+/// - Ports are percent-encoded (`:` → `%3A`)
+/// - Path separators (`/`) become `:`
+///
+/// # Examples
+/// ```
+/// # use affinidi_webvh_common::did::build_did_web_id;
+/// assert_eq!(build_did_web_id("https://example.com", "my-did").unwrap(), "did:web:example.com:my-did");
+/// assert_eq!(build_did_web_id("https://example.com", ".well-known").unwrap(), "did:web:example.com");
+/// ```
+pub fn build_did_web_id(server_url: &str, mnemonic: &str) -> Result<String> {
+    let host = encode_host(server_url)?;
+    if mnemonic == ".well-known" {
+        Ok(format!("did:web:{host}"))
+    } else {
+        let path = mnemonic.replace('/', ":");
+        Ok(format!("did:web:{host}:{path}"))
+    }
+}
+
 /// Build a standard DID document with `{SCID}` placeholders.
 ///
 /// The returned JSON value uses the did:webvh identifier format with a
@@ -118,6 +142,43 @@ mod tests {
     #[test]
     fn encode_host_invalid_url() {
         assert!(encode_host("not-a-url").is_err());
+    }
+
+    #[test]
+    fn build_did_web_id_simple() {
+        assert_eq!(
+            build_did_web_id("https://example.com", "my-did").unwrap(),
+            "did:web:example.com:my-did"
+        );
+    }
+
+    #[test]
+    fn build_did_web_id_with_port() {
+        assert_eq!(
+            build_did_web_id("http://localhost:8530", "my-did").unwrap(),
+            "did:web:localhost%3A8530:my-did"
+        );
+    }
+
+    #[test]
+    fn build_did_web_id_nested_path() {
+        assert_eq!(
+            build_did_web_id("https://example.com", "people/staff").unwrap(),
+            "did:web:example.com:people:staff"
+        );
+    }
+
+    #[test]
+    fn build_did_web_id_well_known() {
+        assert_eq!(
+            build_did_web_id("https://example.com", ".well-known").unwrap(),
+            "did:web:example.com"
+        );
+    }
+
+    #[test]
+    fn build_did_web_id_invalid_url() {
+        assert!(build_did_web_id("not-a-url", "test").is_err());
     }
 
     #[test]

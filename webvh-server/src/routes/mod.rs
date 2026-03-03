@@ -65,6 +65,10 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
             get(did_public::serve_root_did_log),
         )
         .route(
+            "/.well-known/did.json",
+            get(did_public::serve_root_did_web),
+        )
+        .route(
             "/.well-known/did-witness.json",
             get(did_public::serve_root_witness),
         )

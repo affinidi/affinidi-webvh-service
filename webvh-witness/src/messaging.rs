@@ -7,6 +7,7 @@ use affinidi_tdk::messaging::ATM;
 use affinidi_tdk::messaging::config::ATMConfig;
 use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
+use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
 use affinidi_tdk::messaging::transports::websockets::WebSocketResponses;
 use affinidi_tdk::secrets_resolver::SecretsResolver;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -21,7 +22,11 @@ use crate::error::AppError;
 use crate::secret_store::ServerSecrets;
 use crate::server::AppState;
 
-// DIDComm message types
+// Standard DIDComm protocol message types
+const TRUST_PING_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping";
+const DISCOVER_FEATURES_QUERY_TYPE: &str = "https://didcomm.org/discover-features/2.0/queries";
+
+// WebVH witness message types
 const MSG_AUTHENTICATE: &str = "https://affinidi.com/webvh/1.0/authenticate";
 const MSG_AUTHENTICATE_RESPONSE: &str = "https://affinidi.com/webvh/1.0/authenticate-response";
 const MSG_WITNESS_PROOF_REQUEST: &str = "https://affinidi.com/webvh/1.0/witness/proof-request";
@@ -244,6 +249,23 @@ async fn dispatch_message(
 
     debug!(type_ = %msg.type_, from = %sender_did, "received DIDComm message");
 
+    // Standard DIDComm protocols — handled separately (different response pattern)
+    match msg.type_.as_str() {
+        TRUST_PING_TYPE => {
+            if let Err(e) = handle_trust_ping(atm, profile, server_did, msg).await {
+                warn!("failed to handle trust-ping: {e}");
+            }
+            return;
+        }
+        DISCOVER_FEATURES_QUERY_TYPE => {
+            if let Err(e) = handle_discover_features(atm, profile, server_did, msg).await {
+                warn!("failed to handle discover-features query: {e}");
+            }
+            return;
+        }
+        _ => {}
+    }
+
     let result: Result<(String, Value), AppError> = match msg.type_.as_str() {
         MSG_AUTHENTICATE => handle_authenticate(state, server_did, msg).await,
         MSG_WITNESS_PROOF_REQUEST => handle_proof_request(state, msg).await,
@@ -307,6 +329,84 @@ async fn dispatch_message(
         Err(e) => warn!(error = %e, "failed to pack DIDComm response"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Trust ping
+// ---------------------------------------------------------------------------
+
+async fn handle_trust_ping(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    server_did: &str,
+    ping: &Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender_did = ping
+        .from
+        .as_deref()
+        .ok_or("trust-ping has no 'from' DID — cannot send pong")?;
+
+    info!(from = sender_did, "received trust-ping");
+
+    let pong = TrustPing::default().generate_pong_message(ping, Some(server_did))?;
+
+    let (packed, _) = atm
+        .pack_encrypted(&pong, sender_did, Some(server_did), Some(server_did), None)
+        .await?;
+
+    atm.send_message(profile, &packed, &pong.id, false, false)
+        .await?;
+
+    info!(to = sender_did, "sent trust-pong");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Discover Features
+// ---------------------------------------------------------------------------
+
+async fn handle_discover_features(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    server_did: &str,
+    query_msg: &Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender_did = query_msg
+        .from
+        .as_deref()
+        .ok_or("discover-features query has no 'from' DID")?;
+
+    info!(from = sender_did, "received discover-features query");
+
+    let state = atm.discover_features().get_discoverable_state();
+    let features = state.read().await;
+    let disclosure = features.generate_disclosure_message(
+        server_did,
+        sender_did,
+        query_msg,
+        None,
+    )?;
+    drop(features);
+
+    let (packed, _) = atm
+        .pack_encrypted(
+            &disclosure,
+            sender_did,
+            Some(server_did),
+            Some(server_did),
+            None,
+        )
+        .await?;
+
+    atm.send_message(profile, &packed, &disclosure.id, false, false)
+        .await?;
+
+    info!(to = sender_did, "sent discover-features disclosure");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
 
 async fn handle_authenticate(
     state: &AppState,

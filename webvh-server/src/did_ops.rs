@@ -346,6 +346,44 @@ pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
 }
 
 // ---------------------------------------------------------------------------
+// did:web document extraction
+// ---------------------------------------------------------------------------
+
+/// Extract a did:web document from JSONL content by rewriting the did:webvh identity.
+///
+/// Returns `Some(json_bytes)` if the last log entry's `state.alsoKnownAs` contains
+/// the expected `did:web` identifier. The returned document has all occurrences of
+/// the original `did:webvh:...` id replaced with the `did:web:...` id.
+///
+/// Returns `None` if there is no state, no `alsoKnownAs`, or the expected `did:web`
+/// is not declared.
+pub fn extract_did_web_document(jsonl_content: &str, expected_did_web: &str) -> Option<Vec<u8>> {
+    let last_line = jsonl_content.lines().last()?;
+    let entry: serde_json::Value = serde_json::from_str(last_line).ok()?;
+    let state = entry.get("state")?;
+
+    // Get the original did:webvh identifier
+    let webvh_id = state.get("id")?.as_str()?;
+    if !webvh_id.starts_with("did:webvh:") {
+        return None;
+    }
+
+    // Check that alsoKnownAs contains the expected did:web
+    let also_known_as = state.get("alsoKnownAs")?.as_array()?;
+    let found = also_known_as
+        .iter()
+        .any(|v| v.as_str() == Some(expected_did_web));
+    if !found {
+        return None;
+    }
+
+    // Rewrite: serialize the state and replace all occurrences of the webvh id
+    let state_json = serde_json::to_string(state).ok()?;
+    let rewritten = state_json.replace(webvh_id, expected_did_web);
+    Some(rewritten.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // URL helper
 // ---------------------------------------------------------------------------
 
@@ -950,6 +988,63 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
+    }
+
+    // ---- extract_did_web_document tests ----
+
+    #[test]
+    fn did_web_document_rewrites_ids() {
+        let jsonl = r#"{"state":{"@context":["https://www.w3.org/ns/did/v1"],"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:example.com:my-did"],"authentication":["did:webvh:SCID123:example.com:my-did#key-0"],"verificationMethod":[{"id":"did:webvh:SCID123:example.com:my-did#key-0","type":"Multikey","controller":"did:webvh:SCID123:example.com:my-did","publicKeyMultibase":"z6MkPub"}]}}"#;
+        let result = extract_did_web_document(jsonl, "did:web:example.com:my-did").unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(doc["id"], "did:web:example.com:my-did");
+        assert_eq!(doc["authentication"][0], "did:web:example.com:my-did#key-0");
+        assert_eq!(
+            doc["verificationMethod"][0]["id"],
+            "did:web:example.com:my-did#key-0"
+        );
+        assert_eq!(
+            doc["verificationMethod"][0]["controller"],
+            "did:web:example.com:my-did"
+        );
+        // alsoKnownAs should still be present (unchanged)
+        assert!(doc["alsoKnownAs"].is_array());
+    }
+
+    #[test]
+    fn did_web_document_none_without_also_known_as() {
+        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did"}}"#;
+        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
+    }
+
+    #[test]
+    fn did_web_document_none_when_did_web_not_in_list() {
+        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:other.com:my-did"]}}"#;
+        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
+    }
+
+    #[test]
+    fn did_web_document_none_without_state() {
+        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"}}"#;
+        assert!(extract_did_web_document(jsonl, "did:web:example.com:test").is_none());
+    }
+
+    #[test]
+    fn did_web_document_none_for_empty_content() {
+        assert!(extract_did_web_document("", "did:web:example.com:test").is_none());
+    }
+
+    #[test]
+    fn did_web_document_uses_last_line() {
+        let jsonl = r#"{"state":{"id":"did:webvh:OLD:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}
+{"state":{"id":"did:webvh:NEW:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}"#;
+        let result = extract_did_web_document(jsonl, "did:web:example.com:test").unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(doc["id"], "did:web:example.com:test");
+        // Verify the OLD id is not present (it was in a different line)
+        let text = String::from_utf8(result.clone()).unwrap();
+        assert!(!text.contains("did:webvh:OLD"));
+        assert!(!text.contains("did:webvh:NEW"));
     }
 
     // ---- DidRecord serde backwards compat ----

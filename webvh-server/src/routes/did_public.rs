@@ -1,3 +1,4 @@
+use affinidi_webvh_common::did::build_did_web_id;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -45,6 +46,68 @@ async fn serve_content(
     Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
 }
 
+/// Derive the base URL from config (same fallback as `base_url()` in did_ops).
+fn base_url(state: &AppState) -> String {
+    state.config.public_url.clone().unwrap_or_else(|| {
+        format!(
+            "http://{}:{}",
+            state.config.server.host, state.config.server.port
+        )
+    })
+}
+
+/// Serve a did:web document (`did.json`) for the given mnemonic.
+///
+/// Loads the JSONL log, constructs the expected `did:web` identifier,
+/// checks `alsoKnownAs`, and returns the rewritten DID document with
+/// `application/did+json` content type.
+async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, AppError> {
+    // Check if the DID is disabled
+    if let Some(record) = state
+        .dids_ks
+        .get::<DidRecord>(did_ops::did_key(mnemonic))
+        .await?
+    {
+        if record.disabled {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
+    }
+
+    let content_bytes = state
+        .dids_ks
+        .get_raw(did_ops::content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+
+    let jsonl = String::from_utf8(content_bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+
+    let server_url = base_url(state);
+    let expected_did_web = build_did_web_id(&server_url, mnemonic)
+        .map_err(|e| AppError::Internal(format!("failed to build did:web id: {e}")))?;
+
+    let doc_bytes = did_ops::extract_did_web_document(&jsonl, &expected_did_web)
+        .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
+
+    // Track stats (same counters as did:webvh resolves)
+    let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
+    let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
+
+    debug!(mnemonic = %mnemonic, size = doc_bytes.len(), "did:web document resolved");
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/did+json")],
+        doc_bytes,
+    )
+        .into_response())
+}
+
+/// GET /.well-known/did.json — serve the root did:web document (mnemonic = ".well-known")
+pub async fn serve_root_did_web(State(state): State<AppState>) -> Result<Response, AppError> {
+    serve_did_web(&state, ".well-known").await
+}
+
 /// GET /.well-known/did.jsonl — serve the root DID log (mnemonic = ".well-known")
 pub async fn serve_root_did_log(State(state): State<AppState>) -> Result<Response, AppError> {
     serve_content(&state, ".well-known", "content:.well-known:log", "application/jsonl+json", true).await
@@ -84,6 +147,19 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
         }
         let key = format!("content:{mnemonic}:witness");
         return match serve_content(&state, mnemonic, &key, "application/json", false).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        };
+    }
+
+    // Check for did:web document: <mnemonic>/did.json
+    if let Some(mnemonic) = path.strip_suffix("/did.json")
+        && !mnemonic.is_empty()
+    {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return e.into_response();
+        }
+        return match serve_did_web(&state, mnemonic).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
         };
