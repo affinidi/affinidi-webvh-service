@@ -34,7 +34,7 @@ pub struct AppConfig {
 fn default_server() -> ServerConfig {
     ServerConfig {
         host: "0.0.0.0".to_string(),
-        port: 8100,
+        port: 8532,
     }
 }
 

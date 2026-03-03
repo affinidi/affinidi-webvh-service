@@ -29,7 +29,7 @@ pub async fn run_setup() -> Result<(), AppError> {
     // 2. Public URL (required for passkeys)
     let public_url: String = Input::new()
         .with_prompt("Public URL (for passkey auth, e.g. https://control.example.com)")
-        .default("http://localhost:8100".into())
+        .default("http://localhost:8532".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let public_url = if public_url.is_empty() {
@@ -47,7 +47,7 @@ pub async fn run_setup() -> Result<(), AppError> {
 
     let port: u16 = Input::new()
         .with_prompt("Listen port")
-        .default(8100)
+        .default(8532)
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 

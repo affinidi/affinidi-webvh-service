@@ -94,7 +94,7 @@ The wizard walks you through all required configuration:
 - **Mediator DID** — the DIDComm mediator to route messages
   through
 - **Public URL** — the externally reachable URL of this server
-- **Host / port** — listen address (default: `0.0.0.0:8101`)
+- **Host / port** — listen address (default: `0.0.0.0:8530`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
@@ -136,7 +136,7 @@ rest_api = true
 
 [server]
 host = "0.0.0.0"    # Bind address
-port = 8101          # Bind port
+port = 8530          # Bind port
 
 [log]
 level = "info"       # trace, debug, info, warn, error
@@ -166,7 +166,7 @@ default_max_did_count = 20                  # Per-account max number of DIDs
 
 # Optional: push DID updates to watcher instances
 # [[watchers]]
-# url = "http://watcher1.example.com:8103"
+# url = "http://watcher1.example.com:8533"
 # token = "shared-secret-token"
 ```
 
@@ -208,11 +208,11 @@ block the primary operation.
 
 ```toml
 [[watchers]]
-url = "http://watcher1.example.com:8103"
+url = "http://watcher1.example.com:8533"
 token = "shared-secret-token"
 
 [[watchers]]
-url = "http://watcher2.example.com:8103"
+url = "http://watcher2.example.com:8533"
 ```
 
 ### Secrets Backends
@@ -471,7 +471,7 @@ ACL access.
 
 | Flag | Short | Default | Description |
 | ---- | ----- | ------- | ----------- |
-| `--server-url` | `-s` | `http://localhost:8101` | WebVH server URL |
+| `--server-url` | `-s` | `http://localhost:8530` | WebVH server URL |
 | `--rate` | `-r` | `10` | Target requests per second (adjustable at runtime) |
 | `--workers` | `-w` | `64` | Maximum concurrent in-flight requests |
 | `--timeout` | `-t` | `5` | Request timeout in seconds |

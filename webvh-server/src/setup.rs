@@ -254,7 +254,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     let port: u16 = Input::new()
         .with_prompt("Listen port")
-        .default(8101)
+        .default(8530)
         .interact_text()?;
 
     // 6. Log level / format

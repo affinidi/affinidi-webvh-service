@@ -17,11 +17,11 @@ pub struct AppConfig {
     pub features: FeaturesConfig,
     pub server_did: Option<String>,
     pub mediator_did: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_server")]
     pub server: ServerConfig,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default)]
+    #[serde(default = "default_store")]
     pub store: StoreConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -41,6 +41,20 @@ pub struct VtaConfig {
     pub did: Option<String>,
     /// VTA context ID for witness keys
     pub context_id: Option<String>,
+}
+
+fn default_server() -> ServerConfig {
+    ServerConfig {
+        host: "0.0.0.0".to_string(),
+        port: 8531,
+    }
+}
+
+fn default_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: std::path::PathBuf::from("data/webvh-witness"),
+        ..StoreConfig::default()
+    }
 }
 
 impl AppConfig {

@@ -113,7 +113,7 @@ fn default_host() -> String {
 }
 
 fn default_port() -> u16 {
-    8101
+    8530
 }
 
 fn default_log_level() -> String {

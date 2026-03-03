@@ -21,20 +21,20 @@ Standalone mode:                          Daemon mode:
 
 ┌──────────────┐                         ┌───────────────────────┐
 │ webvh-control│ (UI + proxy + registry) │    webvh-daemon       │
-│   :8100      │──────┐                  │       :8100           │
+│   :8532      │──────┐                  │       :8534           │
 └──────────────┘      │                  │ ┌───────────────────┐ │
                       ├─► webvh-server   │ │ /          server │ │
-┌──────────────┐      │     :8101        │ │ /witness   witness│ │
+┌──────────────┐      │     :8530        │ │ /witness   witness│ │
 │ webvh-server │◄─────┘                  │ │ /watcher   watcher│ │
-│   :8101      │      ├─► webvh-witness  │ │ /control   control│ │
-└──────────────┘      │     :8102        │ └───────────────────┘ │
+│   :8530      │      ├─► webvh-witness  │ │ /control   control│ │
+└──────────────┘      │     :8531        │ └───────────────────┘ │
 ┌──────────────┐      │                  │   (shared listener,   │
 │webvh-witness │◄─────┘                  │    separate stores)   │
-│   :8102      │      ├─► webvh-watcher  └───────────────────────┘
-└──────────────┘      │     :8103
+│   :8531      │      ├─► webvh-watcher  └───────────────────────┘
+└──────────────┘      │     :8533
 ┌──────────────┐      │
 │webvh-watcher │◄─────┘
-│   :8103      │ (read-only DID mirror)
+│   :8533      │ (read-only DID mirror)
 └──────────────┘
 ```
 
@@ -107,7 +107,7 @@ cargo build -p affinidi-webvh-server --example client
 2. Run the example, pointing it at the server:
 
    ```sh
-   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8101
+   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8530
    ```
 
 3. The example will generate a `did:key` identity and pause, printing the DID:
@@ -128,7 +128,7 @@ cargo build -p affinidi-webvh-server --example client
    DID Created and Hosted Successfully!
      Mnemonic:   apple-banana
      SCID:       FHcGtSJ...
-     DID URL:    http://localhost:8101/apple-banana/did.jsonl
+     DID URL:    http://localhost:8530/apple-banana/did.jsonl
      DID:        did:webvh:FHcGtSJ...:localhost%3A8085:apple-banana
      Public Key: z6Mk...
    ```

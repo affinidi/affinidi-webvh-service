@@ -39,7 +39,7 @@ The wizard walks you through configuration:
 - **Features** — enable DIDComm messaging and/or REST API
 - **Server DID identity** — import a VTA secrets bundle or
   generate keys
-- **Host / port** — listen address (default: `0.0.0.0:8102`)
+- **Host / port** — listen address (default: `0.0.0.0:8531`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
@@ -70,7 +70,7 @@ rest_api = true
 
 [server]
 host = "0.0.0.0"
-port = 8102
+port = 8531
 
 [log]
 level = "info"

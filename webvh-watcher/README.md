@@ -38,7 +38,7 @@ Create a `config.toml`:
 ```toml
 [server]
 host = "0.0.0.0"
-port = 8103
+port = 8533
 
 [log]
 level = "info"
@@ -52,7 +52,7 @@ push_tokens = ["my-shared-secret-token"]
 
 # Optional: source servers to pull from for reconciliation
 # [[sync.sources]]
-# url = "http://server1:8101"
+# url = "http://server1:8530"
 # token = "pull-token"
 ```
 
@@ -63,7 +63,7 @@ to its `config.toml`:
 
 ```toml
 [[watchers]]
-url = "http://watcher1.example.com:8103"
+url = "http://watcher1.example.com:8533"
 token = "my-shared-secret-token"
 ```
 

@@ -14,7 +14,7 @@
 //! ```bash
 //! # Server mode: authenticate and discover DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
-//!   --server-url http://localhost:8101 --rate 100
+//!   --server-url http://localhost:8530 --rate 100
 //!
 //! # File mode: test against any hosted DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
@@ -48,7 +48,7 @@ use affinidi_webvh_common::{Secret, WebVHClient};
 )]
 struct Args {
     /// WebVH server URL
-    #[arg(long, short = 's', default_value = "http://localhost:8101")]
+    #[arg(long, short = 's', default_value = "http://localhost:8530")]
     server_url: String,
 
     /// Target requests per second (adjustable at runtime with +/-)

@@ -45,7 +45,7 @@ The wizard configures:
 - **Configuration file path** — where to write `config.toml`
 - **Server DID identity** — for DIDComm authentication
 - **Public URL** — for passkey (WebAuthn) RP origin
-- **Host / port** — listen address (default: `0.0.0.0:8100`)
+- **Host / port** — listen address (default: `0.0.0.0:8532`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
@@ -58,7 +58,7 @@ webvh-control --config config.toml
 ```
 
 If built with `--features ui`, browse to
-`http://localhost:8100/` to access the management UI.
+`http://localhost:8532/` to access the management UI.
 
 ## Configuration
 
@@ -79,7 +79,7 @@ rest_api = true
 
 [server]
 host = "0.0.0.0"
-port = 8100
+port = 8532
 
 [log]
 level = "info"
@@ -100,12 +100,12 @@ keyring_service = "webvh-control"
 # [[registry.instances]]
 # label = "Primary Server"
 # service_type = "server"
-# url = "http://localhost:8101"
+# url = "http://localhost:8530"
 #
 # [[registry.instances]]
 # label = "Witness"
 # service_type = "witness"
-# url = "http://localhost:8102"
+# url = "http://localhost:8531"
 
 [registry]
 health_check_interval = 60    # seconds
@@ -122,17 +122,17 @@ Static instances can be defined in `config.toml`:
 [[registry.instances]]
 label = "Primary Server"
 service_type = "server"         # server, witness, or watcher
-url = "http://localhost:8101"
+url = "http://localhost:8530"
 
 [[registry.instances]]
 label = "Witness Node"
 service_type = "witness"
-url = "http://localhost:8102"
+url = "http://localhost:8531"
 
 [[registry.instances]]
 label = "EU Watcher"
 service_type = "watcher"
-url = "http://watcher-eu:8103"
+url = "http://watcher-eu:8533"
 ```
 
 Instances can also be managed dynamically via the registry API.

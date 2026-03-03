@@ -55,7 +55,7 @@ public_url = "https://example.com"
 
 [server]
 host = "0.0.0.0"
-port = 8100
+port = 8534
 
 [log]
 level = "info"
@@ -103,7 +103,7 @@ logs which services are active:
   server (/)
   witness (/witness)
   control (/control)
-daemon listening on 0.0.0.0:8100
+daemon listening on 0.0.0.0:8534
 ```
 
 ## Configuration

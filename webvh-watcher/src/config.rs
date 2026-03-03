@@ -44,7 +44,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig {
                 host: "0.0.0.0".into(),
-                port: 8103,
+                port: 8533,
             },
             log: LogConfig::default(),
             store: StoreConfig {
