@@ -68,6 +68,7 @@ pub struct LogMetadata {
     pub witness_threshold: u32,
     pub watchers: bool,
     pub watcher_count: u32,
+    pub watcher_urls: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,10 @@ pub fn content_witness_key(mnemonic: &str) -> String {
 
 pub fn owner_key(did: &str, mnemonic: &str) -> String {
     format!("owner:{did}:{mnemonic}")
+}
+
+pub fn watcher_sync_key(mnemonic: &str) -> String {
+    format!("watcher_sync:{mnemonic}")
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +335,10 @@ pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
         {
             meta.watchers = true;
             meta.watcher_count = arr.len() as u32;
+            meta.watcher_urls = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
         }
     }
 
@@ -713,6 +722,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, content_log_key(mnemonic));
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
+    batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
     batch.remove(&state.stats_ks, format!("stats:{mnemonic}"));
     batch.commit().await?;
 

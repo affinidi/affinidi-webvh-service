@@ -470,6 +470,7 @@ async fn handle_delete(
     watcher_push::notify_watchers_delete(
         &state.config,
         &state.http_client,
+        &state.dids_ks,
         mnemonic.to_string(),
     );
 

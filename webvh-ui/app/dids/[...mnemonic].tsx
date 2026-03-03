@@ -15,7 +15,7 @@ import { useAuth } from "../../components/AuthProvider";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
-import type { DidStats, DidDetailResponse, LogEntryInfo } from "../../lib/api";
+import type { DidStats, DidDetailResponse, LogEntryInfo, WatcherSyncStatus } from "../../lib/api";
 
 export default function DidDetail() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
@@ -303,6 +303,42 @@ export default function DidDetail() {
                 <Text style={styles.statLabel}>Deactivated</Text>
               </View>
             </View>
+          </View>
+        )}
+
+        {/* Watcher Sync */}
+        {didDetail?.watcherSync && didDetail.watcherSync.length > 0 && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Watcher Sync</Text>
+            {didDetail.watcherSync.map((ws: WatcherSyncStatus, idx: number) => {
+              const synced =
+                ws.ok &&
+                ws.lastSyncedVersionId != null &&
+                ws.lastSyncedVersionId === didDetail.log?.latestVersionId;
+              return (
+                <View key={idx} style={styles.watcherRow}>
+                  <View
+                    style={[
+                      styles.watcherDot,
+                      { backgroundColor: synced ? colors.success : colors.error },
+                    ]}
+                  />
+                  <View style={styles.watcherInfo}>
+                    <Text style={styles.watcherUrl} numberOfLines={1}>
+                      {ws.watcherUrl}
+                    </Text>
+                    {ws.lastSyncedVersionId && (
+                      <Text style={styles.watcherMeta}>
+                        Synced: {ws.lastSyncedVersionId}
+                      </Text>
+                    )}
+                    {ws.lastError && (
+                      <Text style={styles.watcherError}>{ws.lastError}</Text>
+                    )}
+                  </View>
+                </View>
+              );
+            })}
           </View>
         )}
 
@@ -648,5 +684,37 @@ const styles = StyleSheet.create({
   },
   selectWrapper: {
     flex: 1,
+  },
+  watcherRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  watcherDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginTop: 4,
+  },
+  watcherInfo: {
+    flex: 1,
+  },
+  watcherUrl: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.textPrimary,
+  },
+  watcherMeta: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
+  watcherError: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    marginTop: 2,
   },
 });

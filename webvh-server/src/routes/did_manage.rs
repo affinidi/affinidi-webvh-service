@@ -3,7 +3,7 @@ use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::mnemonic::{is_path_available, validate_custom_path};
 use crate::server::AppState;
-use crate::watcher_push;
+use crate::watcher_push::{self, WatcherSyncStatus};
 use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -69,6 +69,7 @@ pub struct DidDetailResponse {
     pub owner: String,
     pub disabled: bool,
     pub log: Option<LogMetadata>,
+    pub watcher_sync: Option<Vec<WatcherSyncStatus>>,
 }
 
 pub async fn get_did(
@@ -79,6 +80,11 @@ pub async fn get_did(
     let mnemonic = mnemonic.trim_start_matches('/');
     let result = did_ops::get_did_info(&auth, &state, mnemonic).await?;
 
+    let watcher_sync: Option<Vec<WatcherSyncStatus>> = state
+        .dids_ks
+        .get(did_ops::watcher_sync_key(mnemonic))
+        .await?;
+
     Ok(Json(DidDetailResponse {
         mnemonic: result.record.mnemonic,
         created_at: result.record.created_at,
@@ -88,6 +94,7 @@ pub async fn get_did(
         owner: result.record.owner,
         disabled: result.record.disabled,
         log: result.log_metadata,
+        watcher_sync,
     }))
 }
 
@@ -153,6 +160,7 @@ pub async fn delete_did(
     watcher_push::notify_watchers_delete(
         &state.config,
         &state.http_client,
+        &state.dids_ks,
         mnemonic.to_string(),
     );
     Ok(StatusCode::NO_CONTENT)

@@ -31,6 +31,14 @@ export interface LogMetadata {
   ttl: number | null;
 }
 
+export interface WatcherSyncStatus {
+  watcherUrl: string;
+  lastSyncedVersionId: string | null;
+  lastSyncedAt: number | null;
+  lastError: string | null;
+  ok: boolean;
+}
+
 export interface DidDetailResponse {
   mnemonic: string;
   createdAt: number;
@@ -39,6 +47,7 @@ export interface DidDetailResponse {
   didId: string | null;
   owner: string;
   log: LogMetadata | null;
+  watcherSync: WatcherSyncStatus[] | null;
 }
 
 export interface LogEntryInfo {
