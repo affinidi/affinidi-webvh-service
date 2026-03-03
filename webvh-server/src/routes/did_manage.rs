@@ -202,6 +202,57 @@ pub async fn enable_did(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---------- POST /rollback/{mnemonic} ----------
+
+pub async fn rollback_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<Json<DidDetailResponse>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let result = did_ops::rollback_did(&auth, &state, mnemonic).await?;
+
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+
+    let watcher_sync: Option<Vec<WatcherSyncStatus>> = state
+        .dids_ks
+        .get(did_ops::watcher_sync_key(mnemonic))
+        .await?;
+
+    Ok(Json(DidDetailResponse {
+        mnemonic: result.record.mnemonic,
+        created_at: result.record.created_at,
+        updated_at: result.record.updated_at,
+        version_count: result.record.version_count,
+        did_id: result.record.did_id,
+        owner: result.record.owner,
+        disabled: result.record.disabled,
+        log: result.log_metadata,
+        watcher_sync,
+    }))
+}
+
+// ---------- GET /raw/{mnemonic} ----------
+
+pub async fn get_raw_log(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<(StatusCode, [(axum::http::HeaderName, &'static str); 1], String), AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        content,
+    ))
+}
+
 // ---------- GET /dids ----------
 
 #[derive(Debug, Deserialize)]

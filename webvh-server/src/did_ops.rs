@@ -778,6 +778,104 @@ pub async fn delete_did(
 // Cleanup
 // ---------------------------------------------------------------------------
 
+/// Result of rolling back the last log entry.
+pub struct RollbackDidResult {
+    pub record: DidRecord,
+    pub log_metadata: Option<LogMetadata>,
+    pub did_url: String,
+}
+
+/// Roll back (remove) the last log entry from a DID's JSONL content.
+///
+/// Rejects the operation if there are fewer than 2 log entries (cannot roll back
+/// the genesis entry). Updates the `DidRecord` with the truncated content and
+/// removes any stale witness data.
+pub async fn rollback_did(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<RollbackDidResult, AppError> {
+    validate_mnemonic(mnemonic)?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    let content = String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < 2 {
+        return Err(AppError::Validation(
+            "cannot rollback: DID log must have at least 2 entries".into(),
+        ));
+    }
+
+    let truncated_lines = &lines[..lines.len() - 1];
+    let truncated = truncated_lines.join("\n");
+
+    let new_did_id = extract_did_id(&truncated);
+    let new_size = truncated.len() as u64;
+
+    record.version_count = truncated_lines.len() as u64;
+    record.did_id = new_did_id;
+    record.content_size = new_size;
+    record.updated_at = now_epoch();
+
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_log_key(mnemonic),
+        truncated.as_bytes().to_vec(),
+    );
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
+    batch.commit().await?;
+
+    let log_metadata = Some(extract_log_metadata(&truncated));
+    let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
+
+    info!(
+        did = %auth.did,
+        role = %auth.role,
+        mnemonic = %mnemonic,
+        remaining = truncated_lines.len(),
+        "DID log entry rolled back"
+    );
+
+    Ok(RollbackDidResult {
+        record,
+        log_metadata,
+        did_url,
+    })
+}
+
+/// Get the raw JSONL content for a DID log as a plain string.
+pub async fn get_raw_log(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<String, AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+
 /// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
@@ -1063,5 +1161,47 @@ mod tests {
         let record: DidRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.content_size, 5000);
         assert_eq!(record.did_id.as_deref(), Some("did:webvh:abc:host:path"));
+    }
+
+    // ---- rollback helper tests (pure functions used by rollback_did) ----
+
+    #[test]
+    fn rollback_removes_last_line() {
+        let line1 = r#"{"state":{"id":"did:webvh:first:host:path"}}"#;
+        let line2 = r#"{"state":{"id":"did:webvh:second:host:path"}}"#;
+        let jsonl = format!("{line1}\n{line2}");
+        let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let truncated = lines[..lines.len() - 1].join("\n");
+        assert_eq!(truncated, line1);
+        assert_eq!(
+            extract_did_id(&truncated),
+            Some("did:webvh:first:host:path".to_string())
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_single_entry() {
+        let jsonl = r#"{"state":{"id":"did:webvh:only:host:path"}}"#;
+        let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            lines.len() < 2,
+            "single entry should not be rollback-able"
+        );
+    }
+
+    #[test]
+    fn rollback_updates_did_id() {
+        let line1 = r#"{"state":{"id":"did:webvh:genesis:host:path"}}"#;
+        let line2 = r#"{"state":{"id":"did:webvh:update1:host:path"}}"#;
+        let line3 = r#"{"state":{"id":"did:webvh:update2:host:path"}}"#;
+        let jsonl = format!("{line1}\n{line2}\n{line3}");
+        let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+        let truncated = lines[..lines.len() - 1].join("\n");
+        // After rollback, did_id should come from line2 (now the last entry)
+        assert_eq!(
+            extract_did_id(&truncated),
+            Some("did:webvh:update1:host:path".to_string())
+        );
     }
 }

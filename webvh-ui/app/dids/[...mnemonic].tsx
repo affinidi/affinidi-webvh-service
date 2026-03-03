@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -14,8 +14,208 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { showAlert } from "../../lib/alert";
+import { showAlert, showConfirm } from "../../lib/alert";
 import type { DidStats, DidDetailResponse, LogEntryInfo, WatcherSyncStatus } from "../../lib/api";
+
+// ---------------------------------------------------------------------------
+// ChipInput — inline component for tag-style multi-value inputs
+// ---------------------------------------------------------------------------
+
+function ChipInput({
+  values,
+  onChange,
+  suggestions,
+  placeholder,
+  readOnly,
+}: {
+  values: string[];
+  onChange: (v: string[]) => void;
+  suggestions?: string[];
+  placeholder?: string;
+  readOnly?: boolean;
+}) {
+  const [input, setInput] = useState("");
+  const [showDropdown, setShowDropdown] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  const filtered = (suggestions ?? []).filter(
+    (s) =>
+      !values.includes(s) &&
+      s.toLowerCase().includes(input.toLowerCase()),
+  );
+
+  const addValue = (v: string) => {
+    const trimmed = v.trim();
+    if (trimmed && !values.includes(trimmed)) {
+      onChange([...values, trimmed]);
+    }
+    setInput("");
+    setShowDropdown(false);
+  };
+
+  const removeValue = (v: string) => {
+    onChange(values.filter((x) => x !== v));
+  };
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setShowDropdown(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  return (
+    <div ref={wrapperRef} style={{ position: "relative" }}>
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 6,
+          alignItems: "center",
+          minHeight: 36,
+        }}
+      >
+        {values.map((v) => (
+          <span
+            key={v}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              backgroundColor: colors.bgTertiary,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radii.full,
+              padding: "3px 10px",
+              fontSize: 12,
+              fontFamily: fonts.mono,
+              color: colors.textPrimary,
+            }}
+          >
+            <span
+              style={{
+                maxWidth: 280,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {v}
+            </span>
+            {!readOnly && (
+              <button
+                onClick={() => removeValue(v)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: colors.textTertiary,
+                  cursor: "pointer",
+                  fontSize: 14,
+                  padding: 0,
+                  lineHeight: 1,
+                }}
+              >
+                x
+              </button>
+            )}
+          </span>
+        ))}
+        {!readOnly && (
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => {
+              setInput(e.target.value);
+              setShowDropdown(true);
+            }}
+            onFocus={() => setShowDropdown(true)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addValue(input);
+              }
+            }}
+            placeholder={values.length === 0 ? placeholder : ""}
+            style={{
+              flex: 1,
+              minWidth: 120,
+              background: "none",
+              border: "none",
+              outline: "none",
+              color: colors.textPrimary,
+              fontFamily: fonts.mono,
+              fontSize: 12,
+              padding: "4px 0",
+            }}
+          />
+        )}
+        {readOnly && values.length === 0 && (
+          <span
+            style={{
+              color: colors.textTertiary,
+              fontSize: 12,
+              fontFamily: fonts.regular,
+            }}
+          >
+            None
+          </span>
+        )}
+      </div>
+      {showDropdown && filtered.length > 0 && !readOnly && (
+        <div
+          style={{
+            position: "absolute",
+            top: "100%",
+            left: 0,
+            right: 0,
+            zIndex: 10,
+            backgroundColor: colors.bgSecondary,
+            border: `1px solid ${colors.border}`,
+            borderRadius: radii.sm,
+            maxHeight: 160,
+            overflowY: "auto",
+            marginTop: 4,
+          }}
+        >
+          {filtered.map((s) => (
+            <div
+              key={s}
+              onClick={() => addValue(s)}
+              style={{
+                padding: "6px 10px",
+                fontSize: 12,
+                fontFamily: fonts.mono,
+                color: colors.textPrimary,
+                cursor: "pointer",
+                borderBottom: `1px solid ${colors.border}`,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+              onMouseEnter={(e) => {
+                (e.target as HTMLDivElement).style.backgroundColor =
+                  colors.bgTertiary;
+              }}
+              onMouseLeave={(e) => {
+                (e.target as HTMLDivElement).style.backgroundColor =
+                  "transparent";
+              }}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 
 export default function DidDetail() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
@@ -34,6 +234,17 @@ export default function DidDetail() {
   const [selectedVersion, setSelectedVersion] = useState(-1);
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
+  const [loadingRaw, setLoadingRaw] = useState(false);
+  const [editingDoc, setEditingDoc] = useState(false);
+  const [docEditValue, setDocEditValue] = useState("");
+  const [editingParams, setEditingParams] = useState(false);
+  const [paramWatchers, setParamWatchers] = useState<string[]>([]);
+  const [paramWitnesses, setParamWitnesses] = useState<string[]>([]);
+  const [paramAlsoKnownAs, setParamAlsoKnownAs] = useState<string[]>([]);
+  const [paramPortable, setParamPortable] = useState(false);
+  const [paramTtl, setParamTtl] = useState<string>("");
+  const [knownWatcherUrls, setKnownWatcherUrls] = useState<string[]>([]);
 
   const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
@@ -52,17 +263,66 @@ export default function DidDetail() {
         setSelectedVersion(entries.length - 1);
       })
       .catch(() => {});
+    api
+      .getServices()
+      .then((s) => setKnownWatcherUrls(s.watcherUrls))
+      .catch(() => {});
   }, [api, mnemonic, isAuthenticated]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
+  // Sync parameter editor state when detail or log entries change
+  useEffect(() => {
+    if (!logEntries.length) return;
+    const latest = logEntries[logEntries.length - 1];
+    const params = latest?.parameters;
+    const state = latest?.state;
+
+    if (params) {
+      setParamPortable(params.portable ?? false);
+      setParamTtl(params.ttl != null ? String(params.ttl) : "");
+
+      const watchers: string[] = Array.isArray(params.watchers)
+        ? params.watchers.filter((w: unknown) => typeof w === "string")
+        : [];
+      setParamWatchers(watchers);
+
+      const witnesses: string[] =
+        params.witness?.witnesses
+          ?.map((w: any) => w.id)
+          .filter((id: unknown) => typeof id === "string") ?? [];
+      setParamWitnesses(witnesses);
+    }
+
+    if (state) {
+      const aka: string[] = Array.isArray(state.alsoKnownAs)
+        ? state.alsoKnownAs.filter((a: unknown) => typeof a === "string")
+        : [];
+      setParamAlsoKnownAs(aka);
+    }
+  }, [logEntries]);
+
   const handleCopyDidId = async () => {
     if (!didDetail?.didId) return;
     await Clipboard.setStringAsync(didDetail.didId);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleLoadCurrentJsonl = async () => {
+    if (!mnemonic) return;
+    setLoadingRaw(true);
+    try {
+      const raw = await api.getRawLog(mnemonic);
+      setDidContent(raw);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to load raw log";
+      showAlert("Error", msg);
+    } finally {
+      setLoadingRaw(false);
+    }
   };
 
   const handleUploadDid = async () => {
@@ -96,20 +356,68 @@ export default function DidDetail() {
     }
   };
 
+  const handleRollback = () => {
+    if (!mnemonic) return;
+    showConfirm(
+      "Rollback Last Entry",
+      "Are you sure you want to remove the last log entry? This cannot be undone.",
+      async () => {
+        setRollingBack(true);
+        try {
+          const updated = await api.rollbackDid(mnemonic);
+          setDidDetail(updated);
+          loadData();
+          showAlert("Success", "Last log entry has been rolled back");
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Rollback failed";
+          showAlert("Error", msg);
+        } finally {
+          setRollingBack(false);
+        }
+      },
+    );
+  };
+
   const handleDelete = async () => {
     if (!mnemonic) return;
-    const confirmed = window.confirm(
+    showConfirm(
+      "Delete DID",
       `Are you sure you want to delete "${mnemonic}"? This cannot be undone.`,
+      async () => {
+        setDeleting(true);
+        try {
+          await api.deleteDid(mnemonic);
+          router.replace("/dids");
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Delete failed";
+          showAlert("Error", msg);
+          setDeleting(false);
+        }
+      },
     );
-    if (!confirmed) return;
-    setDeleting(true);
+  };
+
+  const handleToggleDocEdit = () => {
+    if (!editingDoc && logEntries[selectedVersion]?.state) {
+      setDocEditValue(
+        JSON.stringify(logEntries[selectedVersion].state, null, 2),
+      );
+    }
+    setEditingDoc(!editingDoc);
+  };
+
+  const handleCopyDocToUpload = async () => {
+    if (!mnemonic) return;
+    setLoadingRaw(true);
     try {
-      await api.deleteDid(mnemonic);
-      router.replace("/dids");
+      const raw = await api.getRawLog(mnemonic);
+      setDidContent(raw);
+      setEditingDoc(false);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Delete failed";
+      const msg = e instanceof Error ? e.message : "Failed to load raw log";
       showAlert("Error", msg);
-      setDeleting(false);
+    } finally {
+      setLoadingRaw(false);
     }
   };
 
@@ -128,6 +436,8 @@ export default function DidDetail() {
 
   const formatDate = (ts: number | null) =>
     ts ? new Date(ts * 1000).toLocaleString() : "Never";
+
+  const logEntryCount = didDetail?.log?.logEntryCount ?? 0;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
@@ -345,16 +655,47 @@ export default function DidDetail() {
         {/* Usage chart */}
         {mnemonic && <UsageChart mnemonic={mnemonic} />}
 
-        {/* DID Document viewer */}
+        {/* DID Document viewer / editor */}
         {logEntries.length > 0 && (
           <View style={styles.card}>
-            <Text style={styles.sectionTitle}>DID Document</Text>
+            <View style={styles.sectionTitleRow}>
+              <Text style={styles.sectionTitle}>DID Document</Text>
+              <View style={styles.sectionActions}>
+                <Pressable
+                  style={styles.smallButton}
+                  onPress={handleToggleDocEdit}
+                >
+                  <Text style={styles.smallButtonText}>
+                    {editingDoc ? "Cancel" : "Edit"}
+                  </Text>
+                </Pressable>
+                {editingDoc && (
+                  <Pressable
+                    style={[styles.smallButton, loadingRaw && styles.disabled]}
+                    onPress={handleCopyDocToUpload}
+                    disabled={loadingRaw}
+                  >
+                    <Text style={styles.smallButtonText}>
+                      {loadingRaw ? "Loading..." : "Copy to Upload"}
+                    </Text>
+                  </Pressable>
+                )}
+              </View>
+            </View>
             <View style={styles.versionRow}>
               <Text style={styles.detailLabel}>Version</Text>
               <View style={styles.selectWrapper}>
                 <select
                   value={selectedVersion}
-                  onChange={(e: any) => setSelectedVersion(Number(e.target.value))}
+                  onChange={(e: any) => {
+                    const v = Number(e.target.value);
+                    setSelectedVersion(v);
+                    if (editingDoc && logEntries[v]?.state) {
+                      setDocEditValue(
+                        JSON.stringify(logEntries[v].state, null, 2),
+                      );
+                    }
+                  }}
                   style={{
                     backgroundColor: colors.bgPrimary,
                     color: colors.textPrimary,
@@ -376,27 +717,123 @@ export default function DidDetail() {
                 </select>
               </View>
             </View>
-            {logEntries[selectedVersion]?.state && (
-              <div style={{
-                backgroundColor: colors.bgPrimary,
-                border: `1px solid ${colors.border}`,
-                borderRadius: radii.sm,
-                overflow: "auto",
-                maxHeight: 500,
-                padding: spacing.md,
-              }}>
-                <pre style={{
-                  margin: 0,
-                  fontFamily: fonts.mono,
-                  fontSize: 12,
-                  lineHeight: "18px",
-                  color: colors.textPrimary,
-                  whiteSpace: "pre",
+            {editingDoc ? (
+              <TextInput
+                style={[styles.textarea, { minHeight: 300 }]}
+                value={docEditValue}
+                onChangeText={setDocEditValue}
+                multiline
+              />
+            ) : (
+              logEntries[selectedVersion]?.state && (
+                <div style={{
+                  backgroundColor: colors.bgPrimary,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radii.sm,
+                  overflow: "auto",
+                  maxHeight: 500,
+                  padding: spacing.md,
                 }}>
-                  {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
-                </pre>
-              </div>
+                  <pre style={{
+                    margin: 0,
+                    fontFamily: fonts.mono,
+                    fontSize: 12,
+                    lineHeight: "18px",
+                    color: colors.textPrimary,
+                    whiteSpace: "pre",
+                  }}>
+                    {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
+                  </pre>
+                </div>
+              )
             )}
+          </View>
+        )}
+
+        {/* Parameters editor */}
+        {logEntries.length > 0 && (
+          <View style={styles.card}>
+            <View style={styles.sectionTitleRow}>
+              <Text style={styles.sectionTitle}>Parameters</Text>
+              <Pressable
+                style={styles.smallButton}
+                onPress={() => setEditingParams(!editingParams)}
+              >
+                <Text style={styles.smallButtonText}>
+                  {editingParams ? "Done" : "Edit Parameters"}
+                </Text>
+              </Pressable>
+            </View>
+            {!editingParams && (
+              <Text style={styles.hint}>
+                View and configure parameters for the next log entry.
+                Editing is informational — use these values when constructing signed JSONL.
+              </Text>
+            )}
+
+            <View style={styles.paramField}>
+              <Text style={styles.paramLabel}>Watchers</Text>
+              <ChipInput
+                values={paramWatchers}
+                onChange={setParamWatchers}
+                suggestions={knownWatcherUrls}
+                placeholder="Add watcher URL..."
+                readOnly={!editingParams}
+              />
+            </View>
+
+            <View style={styles.paramField}>
+              <Text style={styles.paramLabel}>Witnesses</Text>
+              <ChipInput
+                values={paramWitnesses}
+                onChange={setParamWitnesses}
+                placeholder="Add witness DID..."
+                readOnly={!editingParams}
+              />
+            </View>
+
+            <View style={styles.paramField}>
+              <Text style={styles.paramLabel}>Also Known As</Text>
+              <ChipInput
+                values={paramAlsoKnownAs}
+                onChange={setParamAlsoKnownAs}
+                placeholder="Add alternate identifier..."
+                readOnly={!editingParams}
+              />
+            </View>
+
+            <View style={[styles.paramField, { flexDirection: "row", alignItems: "center", gap: spacing.lg }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}>
+                <Text style={styles.paramLabel}>Portable</Text>
+                <input
+                  type="checkbox"
+                  checked={paramPortable}
+                  onChange={(e) => setParamPortable(e.target.checked)}
+                  disabled={!editingParams}
+                  style={{ accentColor: colors.accent }}
+                />
+              </View>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}>
+                <Text style={styles.paramLabel}>TTL</Text>
+                <input
+                  type="number"
+                  value={paramTtl}
+                  onChange={(e) => setParamTtl(e.target.value)}
+                  disabled={!editingParams}
+                  placeholder="seconds"
+                  style={{
+                    width: 100,
+                    backgroundColor: colors.bgPrimary,
+                    color: colors.textPrimary,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radii.sm,
+                    padding: "4px 8px",
+                    fontFamily: fonts.mono,
+                    fontSize: 12,
+                  }}
+                />
+              </View>
+            </View>
           </View>
         )}
 
@@ -406,6 +843,17 @@ export default function DidDetail() {
           <Text style={styles.hint}>
             Paste the JSONL content for the did.jsonl file.
           </Text>
+          {didDetail && didDetail.versionCount > 0 && (
+            <Pressable
+              style={[styles.outlineButton, loadingRaw && styles.disabled]}
+              onPress={handleLoadCurrentJsonl}
+              disabled={loadingRaw}
+            >
+              <Text style={styles.outlineButtonText}>
+                {loadingRaw ? "Loading..." : "Load Current JSONL"}
+              </Text>
+            </Pressable>
+          )}
           <TextInput
             style={styles.textarea}
             placeholder='{"versionId":"1",...}'
@@ -456,9 +904,30 @@ export default function DidDetail() {
           </Pressable>
         </View>
 
-        {/* Delete */}
+        {/* Danger Zone */}
         <View style={[styles.card, styles.dangerCard]}>
           <Text style={styles.sectionTitle}>Danger Zone</Text>
+
+          {/* Rollback */}
+          <Pressable
+            style={[
+              styles.warningButton,
+              (logEntryCount < 2 || rollingBack) && styles.disabled,
+            ]}
+            onPress={handleRollback}
+            disabled={logEntryCount < 2 || rollingBack}
+          >
+            <Text style={styles.warningButtonText}>
+              {rollingBack ? "Rolling back..." : "Rollback Last Entry"}
+            </Text>
+          </Pressable>
+          {logEntryCount < 2 && logEntryCount > 0 && (
+            <Text style={[styles.hint, { marginTop: spacing.xs, marginBottom: spacing.md }]}>
+              Cannot rollback — only one log entry exists.
+            </Text>
+          )}
+
+          {/* Delete */}
           <Pressable
             style={[styles.dangerButton, deleting && styles.disabled]}
             onPress={handleDelete}
@@ -517,6 +986,16 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     marginBottom: spacing.md,
   },
+  sectionTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: spacing.md,
+  },
+  sectionActions: {
+    flexDirection: "row",
+    gap: spacing.sm,
+  },
   statsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -570,6 +1049,45 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  smallButton: {
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 4,
+    paddingHorizontal: spacing.md,
+  },
+  smallButtonText: {
+    fontSize: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textSecondary,
+  },
+  outlineButton: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.accent,
+    paddingVertical: 10,
+    alignItems: "center",
+    marginBottom: spacing.md,
+  },
+  outlineButtonText: {
+    color: colors.accent,
+    fontSize: 13,
+    fontFamily: fonts.semibold,
+  },
+  warningButton: {
+    backgroundColor: "transparent",
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.warning,
+    paddingVertical: 14,
+    alignItems: "center",
+    marginBottom: spacing.md,
+  },
+  warningButtonText: {
+    color: colors.warning,
+    fontSize: 14,
+    fontFamily: fonts.semibold,
   },
   dangerButton: {
     backgroundColor: "transparent",
@@ -716,5 +1234,16 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     color: colors.textTertiary,
     marginTop: 2,
+  },
+  paramField: {
+    marginBottom: spacing.md,
+  },
+  paramLabel: {
+    fontSize: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    marginBottom: spacing.xs,
   },
 });

@@ -27,8 +27,13 @@ export interface LogMetadata {
   witnessThreshold: number;
   watchers: boolean;
   watcherCount: number;
+  watcherUrls: string[];
   deactivated: boolean;
   ttl: number | null;
+}
+
+export interface ServicesResponse {
+  watcherUrls: string[];
 }
 
 export interface WatcherSyncStatus {
@@ -258,6 +263,29 @@ export const api = {
 
   deleteDid: (mnemonic: string) =>
     request<void>(`/api/dids/${mnemonic}`, { method: "DELETE" }),
+
+  rollbackDid: (mnemonic: string) =>
+    request<DidDetailResponse>(`/api/rollback/${mnemonic}`, { method: "POST" }),
+
+  getRawLog: async (mnemonic: string): Promise<string> => {
+    const token = getToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    const res = await fetch(`/api/raw/${mnemonic}`, { headers });
+    if (!res.ok) {
+      if (res.status === 401) {
+        clearToken();
+        window.dispatchEvent(new Event("webvh:unauthorized"));
+      }
+      const text = await res.text().catch(() => res.statusText);
+      throw new ApiError(res.status, text);
+    }
+    return res.text();
+  },
+
+  getServices: () => request<ServicesResponse>("/api/services"),
 
   getStats: (mnemonic: string) =>
     request<DidStats>(`/api/stats/${mnemonic}`),

@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use tracing::info;
 
-use crate::auth::AdminAuth;
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::error::AppError;
 use crate::server::AppState;
 
@@ -65,6 +65,31 @@ pub struct LimitsResponse {
     pub upload_body_limit: usize,
     pub default_max_total_size: u64,
     pub default_max_did_count: u64,
+}
+
+// ---------- GET /services ----------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicesResponse {
+    pub watcher_urls: Vec<String>,
+}
+
+/// GET /services — return available service URLs (any authenticated user)
+pub async fn get_services(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+) -> Result<Json<ServicesResponse>, AppError> {
+    let watcher_urls: Vec<String> = state
+        .config
+        .watchers
+        .iter()
+        .map(|w| w.url.clone())
+        .collect();
+
+    info!(caller = %auth.did, "services info retrieved");
+
+    Ok(Json(ServicesResponse { watcher_urls }))
 }
 
 /// GET /config — return safe server configuration (admin only)
