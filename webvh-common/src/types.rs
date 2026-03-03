@@ -195,6 +195,70 @@ mod tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Witness types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessResponse {
+    pub witness_id: String,
+    pub did: String,
+    pub label: Option<String>,
+    pub created_at: u64,
+    pub proofs_signed: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WitnessListResponse {
+    pub witnesses: Vec<WitnessResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignProofRequest {
+    pub version_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignProofResponse {
+    pub version_id: String,
+    pub proof: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateWitnessRequest {
+    pub label: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Watcher sync types
+// ---------------------------------------------------------------------------
+
+/// Pushed from webvh-server to webvh-watcher when a DID is published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncDidRequest {
+    pub mnemonic: String,
+    pub did_id: Option<String>,
+    pub log_content: String,
+    pub witness_content: Option<String>,
+    pub source_url: String,
+    pub updated_at: u64,
+    pub disabled: bool,
+}
+
+/// Pushed from webvh-server to webvh-watcher when a DID is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncDeleteRequest {
+    pub mnemonic: String,
+    pub source_url: String,
+}
+
+// ---------------------------------------------------------------------------
+// High-level create result
+// ---------------------------------------------------------------------------
+
 /// Result of the high-level `create_did` operation.
 #[derive(Debug)]
 pub struct CreateDidResult {

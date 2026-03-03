@@ -5,7 +5,6 @@ mod didcomm;
 pub(crate) mod did_manage;
 mod did_public;
 pub(crate) mod health;
-mod passkey;
 mod stats;
 
 use axum::Router;
@@ -21,7 +20,7 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
         .layer(DefaultBodyLimit::max(upload_body_limit));
 
-    // API routes live under /api/ so they never collide with SPA client routes.
+    // API routes live under /api/ so they never collide with DID serving paths.
     let api = Router::new()
         // Auth routes
         .route("/auth/challenge", post(auth::challenge))
@@ -43,11 +42,6 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         // Time-series (authenticated)
         .route("/timeseries", get(stats::get_server_timeseries))
         .route("/timeseries/{*mnemonic}", get(stats::get_did_timeseries))
-        // Passkey auth routes
-        .route("/auth/passkey/enroll/start", post(passkey::enroll_start))
-        .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish))
-        .route("/auth/passkey/login/start", post(passkey::login_start))
-        .route("/auth/passkey/login/finish", post(passkey::login_finish))
         // DIDComm protocol endpoint
         .route("/didcomm", post(didcomm::handle))
         // Server config (admin only)
@@ -63,6 +57,8 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
 
     Router::new()
         .nest("/api", api)
+        // Health route (no auth required)
+        .route("/api/health", get(health::health))
         // .well-known routes (specific routes take priority over fallback)
         .route(
             "/.well-known/did.jsonl",
@@ -72,6 +68,6 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
             "/.well-known/did-witness.json",
             get(did_public::serve_root_witness),
         )
-        // Combined fallback: DID serving + SPA
+        // Combined fallback: DID serving (no SPA - UI moved to webvh-control)
         .fallback(did_public::serve_public)
 }

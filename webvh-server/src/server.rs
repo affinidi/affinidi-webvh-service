@@ -4,21 +4,18 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 
-use webauthn_rs::prelude::Webauthn;
-
+use affinidi_webvh_common::server::auth::extractor::AuthState;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::did_ops::cleanup_empty_dids;
 use crate::error::AppError;
 use crate::messaging;
-use crate::passkey;
 use crate::routes;
 use crate::secret_store::ServerSecrets;
 use crate::stats;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
-use axum::routing::get;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
@@ -33,7 +30,7 @@ pub struct AppState {
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
-    pub webauthn: Option<Arc<Webauthn>>,
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -57,6 +54,16 @@ impl AppState {
     }
 }
 
+impl AuthState for AppState {
+    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
+        self.jwt_keys.as_ref()
+    }
+
+    fn sessions_ks(&self) -> &KeyspaceHandle {
+        &self.sessions_ks
+    }
+}
+
 pub async fn run(
     config: AppConfig,
     store: Store,
@@ -73,20 +80,6 @@ pub async fn run(
 
     // Initialize JWT keys independently — needed by both DIDComm and passkey auth
     let jwt_keys = init_jwt_keys(&secrets);
-
-    // Initialize passkey/WebAuthn if public_url is configured
-    let webauthn = config.public_url.as_ref().and_then(|url| {
-        match passkey::build_webauthn(url) {
-            Ok(w) => {
-                info!("passkey auth enabled (rp_origin={})", url);
-                Some(Arc::new(w))
-            }
-            Err(e) => {
-                warn!("passkey auth disabled: {e}");
-                None
-            }
-        }
-    });
 
     // Bind TCP listener on the main thread for early port validation (only if REST is enabled)
     let std_listener = if config.features.rest_api {
@@ -118,7 +111,7 @@ pub async fn run(
         did_resolver,
         secrets_resolver,
         jwt_keys,
-        webauthn,
+        http_client: reqwest::Client::new(),
     };
 
     // Log startup configuration
@@ -139,9 +132,6 @@ pub async fn run(
             "disabled"
         }
     );
-    if let Some(ref url) = state.config.public_url {
-        info!("  public URL   : {url}");
-    }
     if let Some(ref did) = state.config.server_did {
         info!("  server DID   : {did}");
     }
@@ -313,9 +303,7 @@ fn run_rest_thread(
                             .level(Level::INFO)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
-            )
-            // Health route mounted after the TraceLayer so it bypasses tracing
-            .route("/api/health", get(routes::health::health));
+            );
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());

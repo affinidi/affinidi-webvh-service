@@ -89,14 +89,6 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
         };
     }
 
-    // Fall through to SPA static handler or 404
-    #[cfg(feature = "ui")]
-    {
-        crate::frontend::static_handler(uri).await
-    }
-
-    #[cfg(not(feature = "ui"))]
-    {
-        StatusCode::NOT_FOUND.into_response()
-    }
+    // No matching DID path — return 404
+    StatusCode::NOT_FOUND.into_response()
 }

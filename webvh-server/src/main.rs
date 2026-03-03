@@ -1,27 +1,6 @@
-mod acl;
-mod auth;
-mod backup;
-mod config;
-mod did_ops;
-mod error;
-#[cfg(feature = "ui")]
-mod frontend;
-mod messaging;
-mod mnemonic;
-mod passkey;
-mod routes;
-mod secret_store;
-mod server;
-mod setup;
-mod stats;
-mod store;
-
-#[cfg(test)]
-mod tests;
-
 use clap::{Parser, Subcommand};
-use config::AppConfig;
-use config::LogFormat;
+use affinidi_webvh_server::config::{AppConfig, LogFormat};
+use affinidi_webvh_server::{backup, secret_store, server, setup, store};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -40,15 +19,6 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
-    /// Generate a one-time passkey enrollment link
-    Invite {
-        /// DID to associate with this enrollment
-        #[arg(long)]
-        did: String,
-        /// Role: admin or owner
-        #[arg(long, default_value = "admin")]
-        role: String,
-    },
     /// Add an access control entry
     AddAcl {
         /// DID to grant access to
@@ -93,12 +63,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Invite { did, role }) => {
-            if let Err(e) = run_invite(cli.config, did, role).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
         Some(Command::AddAcl {
             did,
             role,
@@ -133,63 +97,6 @@ async fn main() {
     }
 }
 
-async fn run_invite(
-    config_path: Option<PathBuf>,
-    did: String,
-    role: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::acl::Role;
-    use crate::auth::session::now_epoch;
-    use crate::passkey::store::{Enrollment, store_enrollment};
-
-    // Validate role
-    let _role = Role::from_str(&role)
-        .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
-
-    let config = AppConfig::load(config_path)?;
-
-    let public_url = config
-        .public_url
-        .as_ref()
-        .ok_or("public_url must be set in config to generate enrollment links")?;
-
-    let st = store::Store::open(&config.store).await?;
-    let sessions_ks = st.keyspace("sessions")?;
-
-    let token = uuid::Uuid::new_v4().to_string();
-    let now = now_epoch();
-    let enrollment = Enrollment {
-        token: token.clone(),
-        did: did.clone(),
-        role: role.clone(),
-        created_at: now,
-        expires_at: now + config.auth.passkey_enrollment_ttl,
-    };
-
-    store_enrollment(&sessions_ks, &enrollment).await?;
-
-    let url = format!("{public_url}/enroll?token={token}");
-    eprintln!();
-    eprintln!("  Enrollment link created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    eprintln!("  Expires: {} seconds", config.auth.passkey_enrollment_ttl);
-    eprintln!();
-    eprintln!("  URL: {url}");
-    eprintln!();
-
-    #[cfg(not(feature = "ui"))]
-    {
-        eprintln!("  WARNING: The server was compiled without the 'ui' feature.");
-        eprintln!("  The enrollment URL will not work unless the UI is enabled.");
-        eprintln!("  Rebuild with: cargo build --features ui");
-        eprintln!();
-    }
-
-    Ok(())
-}
-
 async fn run_add_acl(
     config_path: Option<PathBuf>,
     did: String,
@@ -197,8 +104,8 @@ async fn run_add_acl(
     max_total_size: Option<u64>,
     max_did_count: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-    use crate::auth::session::now_epoch;
+    use affinidi_webvh_server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+    use affinidi_webvh_server::auth::session::now_epoch;
 
     let role_parsed = Role::from_str(&role)
         .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
@@ -247,7 +154,7 @@ async fn run_add_acl(
 async fn run_list_acl(
     config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::acl::{list_acl_entries};
+    use affinidi_webvh_server::acl::list_acl_entries;
 
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;

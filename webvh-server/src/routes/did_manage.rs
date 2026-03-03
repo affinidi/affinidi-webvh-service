@@ -3,6 +3,7 @@ use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::mnemonic::{is_path_available, validate_custom_path};
 use crate::server::AppState;
+use crate::watcher_push;
 use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -112,6 +113,12 @@ pub async fn upload_did(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::publish_did(&auth, &state, mnemonic, &body).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -125,6 +132,12 @@ pub async fn upload_witness(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::upload_witness(&auth, &state, mnemonic, &body).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -137,6 +150,11 @@ pub async fn delete_did(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::delete_did(&auth, &state, mnemonic).await?;
+    watcher_push::notify_watchers_delete(
+        &state.config,
+        &state.http_client,
+        mnemonic.to_string(),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -149,6 +167,12 @@ pub async fn disable_did(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::set_did_disabled(&auth, &state, mnemonic, true).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -161,6 +185,12 @@ pub async fn enable_did(
 ) -> Result<StatusCode, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     did_ops::set_did_disabled(&auth, &state, mnemonic, false).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

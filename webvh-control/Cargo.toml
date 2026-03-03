@@ -1,0 +1,89 @@
+[package]
+name = "affinidi-webvh-control"
+description = "WebVH Control Plane — Unified management UI and service registry"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[features]
+default = ["keyring", "store-fjall", "ui"]
+ui = ["dep:rust-embed", "dep:mime_guess"]
+keyring = ["dep:keyring"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
+gcp-secrets = [
+  "dep:google-cloud-secretmanager-v1",
+  "dep:google-cloud-auth",
+  "dep:bytes",
+]
+store-fjall = ["dep:fjall"]
+store-redis = ["dep:redis"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
+store-firestore = ["dep:firestore", "dep:futures"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+passkey = ["affinidi-webvh-common/passkey"]
+
+[lib]
+name = "affinidi_webvh_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webvh-control"
+path = "src/main.rs"
+
+[dependencies]
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall", "passkey"] }
+affinidi-tdk = { workspace = true }
+affinidi-did-resolver-cache-sdk = "0.8"
+axum = "0.8"
+axum-extra = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+ed25519-dalek = { workspace = true }
+fjall = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true }
+multibase = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rust-embed = { workspace = true, optional = true }
+webauthn-rs = { workspace = true }
+mime_guess = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = "1.0"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+keyring = { version = "3", optional = true }
+aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-config = { version = "1", features = [
+  "behavior-version-latest",
+], optional = true }
+google-cloud-secretmanager-v1 = { version = "1", optional = true }
+google-cloud-auth = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
+aws-sdk-dynamodb = { version = "1", optional = true }
+firestore = { version = "0.47", optional = true }
+futures = { version = "0.3", optional = true }
+azure_data_cosmos = { version = "0.31", features = [
+  "key_auth",
+], optional = true }
+azure_core = { version = "0.32", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+anyhow.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

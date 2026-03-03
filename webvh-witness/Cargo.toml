@@ -11,6 +11,50 @@ keywords.workspace = true
 repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+build = "build.rs"
+
+[features]
+default = ["keyring", "store-fjall"]
+keyring = ["affinidi-webvh-common/keyring"]
+aws-secrets = ["affinidi-webvh-common/aws-secrets"]
+gcp-secrets = ["affinidi-webvh-common/gcp-secrets"]
+store-fjall = ["affinidi-webvh-common/store-fjall"]
+store-redis = ["affinidi-webvh-common/store-redis"]
+store-dynamodb = ["affinidi-webvh-common/store-dynamodb"]
+store-firestore = ["affinidi-webvh-common/store-firestore"]
+store-cosmosdb = ["affinidi-webvh-common/store-cosmosdb"]
+
+[lib]
+name = "affinidi_webvh_witness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webvh-witness"
+path = "src/main.rs"
 
 [dependencies]
-# webvh-common = { version = "0.0.1", path = "./webvh-common"}
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core"] }
+affinidi-tdk = { workspace = true }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+affinidi-data-integrity = "0.3"
+didwebvh-rs = { workspace = true }
+axum = "0.8"
+axum-extra = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = "0.4"
+jsonwebtoken = { workspace = true }
+multibase = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = "1.0"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

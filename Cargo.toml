@@ -1,5 +1,5 @@
 [workspace]
-members = ["webvh-common", "webvh-server", "webvh-watcher", "webvh-witness"]
+members = ["webvh-common", "webvh-control", "webvh-daemon", "webvh-server", "webvh-watcher", "webvh-witness"]
 resolver = "3"
 
 [workspace.package]

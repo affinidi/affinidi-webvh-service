@@ -1,6 +1,6 @@
 [package]
 name = "affinidi-webvh-watcher"
-description = "WebVH Watcher, monitors WebVH DID changes"
+description = "WebVH Watcher, read-only DID mirror service"
 version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
@@ -11,5 +11,35 @@ keywords.workspace = true
 repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+build = "build.rs"
+
+[features]
+default = ["store-fjall"]
+store-fjall = ["affinidi-webvh-common/store-fjall"]
+store-redis = ["affinidi-webvh-common/store-redis"]
+store-dynamodb = ["affinidi-webvh-common/store-dynamodb"]
+store-firestore = ["affinidi-webvh-common/store-firestore"]
+store-cosmosdb = ["affinidi-webvh-common/store-cosmosdb"]
+
+[lib]
+name = "affinidi_webvh_watcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webvh-watcher"
+path = "src/main.rs"
 
 [dependencies]
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core"] }
+axum = "0.8"
+axum-extra = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = "1.0"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

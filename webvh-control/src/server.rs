@@ -1,0 +1,530 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use affinidi_webvh_common::server::auth::extractor::AuthState;
+use affinidi_webvh_common::server::passkey::PasskeyState;
+use webauthn_rs::prelude::Webauthn;
+
+use crate::auth::jwt::JwtKeys;
+use crate::auth::session::cleanup_expired_sessions;
+use crate::config::{AppConfig, AuthConfig};
+use crate::error::AppError;
+use crate::registry::{self, ServiceStatus};
+use crate::routes;
+use crate::secret_store::ServerSecrets;
+use crate::store::{KeyspaceHandle, Store};
+use tokio::sync::{oneshot, watch};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{Level, debug, error, info, warn};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Store,
+    pub sessions_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub registry_ks: KeyspaceHandle,
+    pub config: Arc<AppConfig>,
+    pub did_resolver: Option<DIDCacheClient>,
+    pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub webauthn: Option<Arc<Webauthn>>,
+    pub http_client: reqwest::Client,
+}
+
+impl AppState {
+    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
+    pub fn require_didcomm_auth(
+        &self,
+    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
+        let did_resolver = self
+            .did_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
+        let secrets_resolver = self
+            .secrets_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
+        let jwt_keys = self
+            .jwt_keys
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
+    }
+}
+
+impl AuthState for AppState {
+    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
+        self.jwt_keys.as_ref()
+    }
+
+    fn sessions_ks(&self) -> &KeyspaceHandle {
+        &self.sessions_ks
+    }
+}
+
+impl PasskeyState for AppState {
+    fn webauthn(&self) -> Option<&Arc<Webauthn>> {
+        self.webauthn.as_ref()
+    }
+
+    fn acl_ks(&self) -> &KeyspaceHandle {
+        &self.acl_ks
+    }
+
+    fn access_token_expiry(&self) -> u64 {
+        self.config.auth.access_token_expiry
+    }
+
+    fn refresh_token_expiry(&self) -> u64 {
+        self.config.auth.refresh_token_expiry
+    }
+}
+
+pub async fn run(
+    config: AppConfig,
+    store: Store,
+    secrets: ServerSecrets,
+) -> Result<(), AppError> {
+    // Open keyspace handles
+    let sessions_ks = store.keyspace("sessions")?;
+    let acl_ks = store.keyspace("acl")?;
+    let registry_ks = store.keyspace("registry")?;
+
+    // Initialize DIDComm auth infrastructure (requires server_did)
+    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
+
+    // Initialize JWT keys
+    let jwt_keys = init_jwt_keys(&secrets);
+
+    // Initialize WebAuthn for passkeys
+    let webauthn = config
+        .public_url
+        .as_ref()
+        .and_then(|url| {
+            match affinidi_webvh_common::server::passkey::build_webauthn(url) {
+                Ok(w) => {
+                    info!("WebAuthn (passkey) auth enabled");
+                    Some(Arc::new(w))
+                }
+                Err(e) => {
+                    warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
+                    None
+                }
+            }
+        });
+
+    // Bind TCP listener on the main thread
+    let std_listener = if config.features.rest_api {
+        let addr = format!("{}:{}", config.server.host, config.server.port);
+        let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
+        listener.set_nonblocking(true).map_err(AppError::Io)?;
+        info!("control plane listening addr={addr}");
+        Some(listener)
+    } else {
+        None
+    };
+
+    // Gather storage thread inputs before moving config into Arc
+    let storage_sessions_ks = sessions_ks.clone();
+    let storage_registry_ks = registry_ks.clone();
+    let storage_auth_config = config.auth.clone();
+    let storage_registry_config = config.registry.clone();
+    let has_auth = jwt_keys.is_some();
+
+    let state = AppState {
+        store: store.clone(),
+        sessions_ks,
+        acl_ks,
+        registry_ks,
+        config: Arc::new(config),
+        did_resolver,
+        secrets_resolver,
+        jwt_keys,
+        webauthn,
+        http_client: reqwest::Client::new(),
+    };
+
+    // Seed registry from static config
+    seed_registry(&state).await;
+
+    // Log startup configuration
+    info!("--- enabled services ---");
+    info!(
+        "  REST API : {}",
+        if state.config.features.rest_api {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(ref url) = state.config.public_url {
+        info!("  public URL   : {url}");
+    }
+
+    // Shutdown channels
+    let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
+    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
+    let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
+
+    // 1. Spawn REST thread
+    let rest_handle = if let Some(listener) = std_listener {
+        let mut rest_shutdown = rest_shutdown_rx.clone();
+        let rest_state = state.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("control-rest".into())
+                .spawn(move || {
+                    run_rest_thread(listener, rest_state, &mut rest_shutdown, rest_ready_tx)
+                })
+                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
+        )
+    } else {
+        let _ = rest_ready_tx.send(());
+        None
+    };
+
+    // 2. Spawn storage thread (cleanup + health checks)
+    let mut storage_shutdown = storage_shutdown_rx.clone();
+    let storage_http = state.http_client.clone();
+    let storage_handle = std::thread::Builder::new()
+        .name("control-storage".into())
+        .spawn(move || {
+            run_storage_thread(
+                store,
+                storage_sessions_ks,
+                storage_registry_ks,
+                storage_auth_config,
+                storage_registry_config,
+                has_auth,
+                storage_http,
+                &mut storage_shutdown,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+
+    // Wait for REST to be ready
+    let _ = rest_ready_rx.await;
+
+    // Wait for shutdown signal
+    shutdown_signal().await;
+
+    // Ordered shutdown: REST → Storage
+    let mut any_panic = false;
+
+    let _ = rest_shutdown_tx.send(true);
+    if let Some(handle) = rest_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => info!("REST thread stopped"),
+            Ok(Err(_)) => {
+                error!("REST thread panicked");
+                any_panic = true;
+            }
+            Err(e) => {
+                error!("failed to join REST thread: {e}");
+                any_panic = true;
+            }
+        }
+    }
+
+    let _ = storage_shutdown_tx.send(true);
+    match tokio::task::spawn_blocking(move || storage_handle.join()).await {
+        Ok(Ok(())) => info!("storage thread stopped"),
+        Ok(Err(_)) => {
+            error!("storage thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join storage thread: {e}");
+            any_panic = true;
+        }
+    }
+
+    if any_panic {
+        return Err(AppError::Internal("one or more threads panicked".into()));
+    }
+
+    info!("control plane shut down");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registry seeding
+// ---------------------------------------------------------------------------
+
+/// Seed the registry with statically configured instances.
+async fn seed_registry(state: &AppState) {
+    for instance_config in &state.config.registry.instances {
+        let service_type = match instance_config.service_type.as_str() {
+            "server" => registry::ServiceType::Server,
+            "witness" => registry::ServiceType::Witness,
+            "watcher" => registry::ServiceType::Watcher,
+            other => {
+                warn!(service_type = %other, "unknown service type in registry config, skipping");
+                continue;
+            }
+        };
+
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let instance = registry::ServiceInstance {
+            instance_id,
+            service_type,
+            label: instance_config.label.clone(),
+            url: instance_config.url.clone(),
+            status: ServiceStatus::Active,
+            last_health_check: None,
+            registered_at: crate::auth::session::now_epoch(),
+            metadata: serde_json::Value::Null,
+        };
+
+        if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
+            warn!(url = %instance_config.url, error = %e, "failed to seed registry instance");
+        } else {
+            info!(
+                url = %instance_config.url,
+                service_type = %instance_config.service_type,
+                "seeded registry instance"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST thread
+// ---------------------------------------------------------------------------
+
+fn run_rest_thread(
+    std_listener: std::net::TcpListener,
+    state: AppState,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    ready_tx: oneshot::Sender<()>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build REST runtime");
+
+    rt.block_on(async {
+        info!("REST thread started");
+
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("failed to convert std TcpListener to tokio TcpListener");
+
+        let app = routes::router()
+            .with_state(state)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                    .on_response(
+                        DefaultOnResponse::new()
+                            .level(Level::INFO)
+                            .latency_unit(tower_http::LatencyUnit::Millis),
+                    ),
+            );
+
+        let _ = ready_tx.send(());
+
+        let mut rx = shutdown_rx.clone();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.changed().await;
+            })
+            .await
+            .expect("axum serve failed");
+
+        info!("REST thread shutting down");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Storage thread
+// ---------------------------------------------------------------------------
+
+fn run_storage_thread(
+    store: Store,
+    sessions_ks: KeyspaceHandle,
+    registry_ks: KeyspaceHandle,
+    auth_config: AuthConfig,
+    registry_config: crate::config::RegistryConfig,
+    has_auth: bool,
+    http: reqwest::Client,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build storage runtime");
+
+    rt.block_on(async {
+        info!("storage thread started");
+
+        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
+        let health_interval = Duration::from_secs(registry_config.health_check_interval.max(10));
+
+        let mut session_timer = tokio::time::interval(session_interval);
+        let mut health_timer = tokio::time::interval(health_interval);
+
+        // Skip first tick (immediate)
+        session_timer.tick().await;
+        health_timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = session_timer.tick(), if has_auth => {
+                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
+                        warn!("session cleanup error: {e}");
+                    }
+                }
+                _ = health_timer.tick() => {
+                    if let Err(e) = run_health_checks(&registry_ks, &http).await {
+                        warn!("health check error: {e}");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("storage thread shutting down");
+                    break;
+                }
+            }
+        }
+
+        if let Err(e) = store.persist().await {
+            error!("failed to persist store on shutdown: {e}");
+        } else {
+            info!("store persisted");
+        }
+    });
+}
+
+/// Run health checks against all registered instances.
+async fn run_health_checks(
+    registry_ks: &KeyspaceHandle,
+    http: &reqwest::Client,
+) -> Result<(), AppError> {
+    let instances = registry::list_instances(registry_ks).await?;
+    let now = crate::auth::session::now_epoch();
+
+    for instance in &instances {
+        let status = registry::health_check(http, instance).await;
+        if status != instance.status {
+            info!(
+                instance_id = %instance.instance_id,
+                url = %instance.url,
+                old_status = ?instance.status,
+                new_status = ?status,
+                "instance status changed"
+            );
+        }
+        registry::update_instance_status(registry_ks, &instance.instance_id, status, now).await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Auth initialization
+// ---------------------------------------------------------------------------
+
+fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
+    match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
+        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
+            Ok(keys) => {
+                debug!("JWT signing key loaded");
+                Some(Arc::new(keys))
+            }
+            Err(e) => {
+                warn!("failed to construct JWT keys: {e} — auth endpoints will not work");
+                None
+            }
+        },
+        Err(e) => {
+            warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
+            None
+        }
+    }
+}
+
+async fn init_didcomm_auth(
+    config: &AppConfig,
+    secrets: &ServerSecrets,
+) -> (
+    Option<DIDCacheClient>,
+    Option<Arc<ThreadedSecretsResolver>>,
+) {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let server_did = match &config.server_did {
+        Some(did) => did.clone(),
+        None => {
+            warn!("server_did not configured — DIDComm auth endpoints will not work");
+            return (None, None);
+        }
+    };
+
+    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");
+            return (None, None);
+        }
+    };
+
+    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+
+    let kid = format!("{server_did}#key-0");
+    match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
+        Ok(secret) => {
+            secrets_resolver.insert(secret).await;
+            debug!(kid = %kid, "server signing secret loaded");
+        }
+        Err(e) => warn!("failed to decode signing_key: {e}"),
+    }
+
+    let kid = format!("{server_did}#key-1");
+    match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
+        Ok(secret) => {
+            secrets_resolver.insert(secret).await;
+            debug!(kid = %kid, "server key-agreement secret loaded");
+        }
+        Err(e) => warn!("failed to decode key_agreement_key: {e}"),
+    }
+
+    info!("DIDComm auth initialized for DID {server_did}");
+
+    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
+}
+
+pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let secret = Secret::from_multibase(multibase_key, None)
+        .map_err(|e| AppError::Config(format!("invalid multibase key: {e}")))?;
+
+    let bytes = secret.get_private_bytes();
+    bytes
+        .try_into()
+        .map_err(|_| AppError::Config("key must be exactly 32 bytes".into()))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => info!("received SIGINT"),
+        () = terminate => info!("received SIGTERM"),
+    }
+}

@@ -15,7 +15,6 @@ build = "build.rs"
 
 [features]
 default = ["keyring", "store-fjall"]
-ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["dep:keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 gcp-secrets = [
@@ -29,12 +28,16 @@ store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
 store-firestore = ["dep:firestore", "dep:futures"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
 
+[lib]
+name = "affinidi_webvh_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "webvh-server"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common" }
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall"] }
 affinidi-tdk = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8"
 axum = "0.8"
@@ -55,16 +58,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 toml = "1.0"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
-webauthn-rs = { workspace = true }
-webauthn-rs-proto = { workspace = true }
-rust-embed = { workspace = true, optional = true }
-mime_guess = { version = "2", optional = true }
 keyring = { version = "3", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [

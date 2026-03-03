@@ -6,15 +6,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde::Deserialize;
 
-use uuid::Uuid;
-
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
     ServerConfig, StoreConfig,
 };
-use crate::passkey::store::{Enrollment, store_enrollment};
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
@@ -297,7 +294,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             "Skip (no auth)",
         ];
         let jwt_idx = Select::new()
-            .with_prompt("JWT signing key (required for passkey & token auth)")
+            .with_prompt("JWT signing key (required for token auth)")
             .items(jwt_options)
             .default(0)
             .interact()?;
@@ -357,6 +354,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         auth,
         secrets: secrets_config,
         limits: LimitsConfig::default(),
+        watchers: Vec::new(),
         config_path: output_path.clone(),
     };
 
@@ -412,34 +410,6 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
             store_acl_entry(&acl_ks, &entry).await?;
             eprintln!("  Admin ACL entry created for {admin_did}");
-
-            let create_invite = Confirm::new()
-                .with_prompt("Create a passkey enrollment invite for this admin?")
-                .default(true)
-                .interact()?;
-
-            if create_invite {
-                let sessions_ks = store.keyspace("sessions")?;
-                let token = Uuid::new_v4().to_string();
-                let now = now_epoch();
-                let enrollment = Enrollment {
-                    token: token.clone(),
-                    did: admin_did.clone(),
-                    role: "admin".to_string(),
-                    created_at: now,
-                    expires_at: now + config.auth.passkey_enrollment_ttl,
-                };
-                store_enrollment(&sessions_ks, &enrollment).await?;
-
-                eprintln!();
-                if let Some(ref url) = config.public_url {
-                    eprintln!("  Enrollment link: {url}/enroll?token={token}");
-                } else {
-                    eprintln!("  Enrollment token: {token}");
-                    eprintln!("  (Set public_url in config, then visit {{public_url}}/enroll?token={{token}})");
-                }
-                eprintln!("  Expires in: {} seconds", config.auth.passkey_enrollment_ttl);
-            }
         }
     }
 

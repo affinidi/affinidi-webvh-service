@@ -4,8 +4,10 @@ The WebVH Server hosts and manages
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It provides a
 REST API for DID lifecycle management (create, upload, delete),
 access control, statistics, and public DID resolution endpoints.
-An optional built-in management UI can be embedded directly into
-the binary.
+
+When a DID is published, the server can optionally push the content
+to registered [watcher](../webvh-watcher/) instances for read-only
+replication.
 
 > **IMPORTANT:**
 > affinidi-webvh-service crates are provided "as is" without any
@@ -24,7 +26,6 @@ the interactive setup wizard.
 ### Prerequisites
 
 - Rust 1.91.0+ (2024 Edition)
-- Node.js 18+ (only if building with the management UI)
 - A running [VTA](https://github.com/nicktho/vtc-vta-rs) instance
   with admin access (optional — needed to import a DID secrets
   bundle; you can also generate keys during setup)
@@ -34,7 +35,7 @@ the interactive setup wizard.
 ```bash
 git clone https://github.com/affinidi/affinidi-webvh-service.git
 cd affinidi-webvh-service
-cargo build -p webvh-server --release
+cargo build -p affinidi-webvh-server --release
 ```
 
 The binary is produced at `target/release/webvh-server`.
@@ -42,7 +43,7 @@ The binary is produced at `target/release/webvh-server`.
 Alternatively, you can install the server directly with Cargo:
 
 ```bash
-cargo install -p webvh-server
+cargo install affinidi-webvh-server
 ```
 
 ### 2. Obtain server DID credentials (optional)
@@ -99,7 +100,7 @@ The wizard walks you through all required configuration:
 - **Secrets backend** — where to store private key material
   (OS keyring, AWS Secrets Manager, or GCP Secret Manager)
 - **Admin bootstrap** — optionally create an initial admin
-  ACL entry and passkey enrollment link
+  ACL entry
 
 The wizard writes `config.toml` (without any key material) and
 stores the server's private keys in the chosen secrets backend.
@@ -143,20 +144,12 @@ format = "text"      # text or json
 
 [store]
 data_dir = "data/webvh-server"   # Persistent data directory (fjall)
-# redis_url = "redis://localhost:6379"           # Redis backend
-# dynamodb_table_prefix = "webvh"                # DynamoDB backend
-# dynamodb_region = "us-east-1"
-# firestore_project = "my-gcp-project"           # Firestore backend
-# firestore_database = "(default)"
-# cosmosdb_connection_string = "AccountEndpoint=...;AccountKey=..."  # Cosmos DB
-# cosmosdb_database = "webvh"
 
 [auth]
 access_token_expiry = 900                   # 15 minutes
 refresh_token_expiry = 86400                # 24 hours
 challenge_ttl = 300                         # 5 minutes
 session_cleanup_interval = 600              # 10 minutes
-passkey_enrollment_ttl = 86400              # 24 hours
 cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
 
 [secrets]
@@ -170,6 +163,11 @@ keyring_service = "webvh"                   # OS keyring service name (default b
 upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
 default_max_total_size = 1048576            # Per-account total DID size (bytes), default 1MB
 default_max_did_count = 20                  # Per-account max number of DIDs
+
+# Optional: push DID updates to watcher instances
+# [[watchers]]
+# url = "http://watcher1.example.com:8103"
+# token = "shared-secret-token"
 ```
 
 Private keys (signing, key agreement, JWT signing) are **not**
@@ -199,6 +197,23 @@ Admins are exempt from all quota checks. Per-account overrides
 can be set via the ACL API by including `max_total_size` and/or
 `max_did_count` in the ACL entry — these take precedence over
 the global defaults.
+
+#### Watcher Push
+
+The optional `[[watchers]]` section configures DID replication
+to [watcher](../webvh-watcher/) instances. When a DID is
+published, updated, or deleted, the server pushes the change to
+each registered watcher. Push failures are logged but do not
+block the primary operation.
+
+```toml
+[[watchers]]
+url = "http://watcher1.example.com:8103"
+token = "shared-secret-token"
+
+[[watchers]]
+url = "http://watcher2.example.com:8103"
+```
 
 ### Secrets Backends
 
@@ -248,39 +263,21 @@ external services.
 | Backend                   | Feature flag     | Config fields                                                  |
 | ------------------------- | ---------------- | -------------------------------------------------------------- |
 | Fjall (default, embedded) | `store-fjall`    | `store.data_dir`                                               |
-| Redis                     | `store-redis`    | `store.redis_url`                                              |
-| AWS DynamoDB              | `store-dynamodb` | `store.dynamodb_table_prefix`, `store.dynamodb_region`         |
-| GCP Firestore             | `store-firestore`| `store.firestore_project`, `store.firestore_database`          |
-| Azure Cosmos DB           | `store-cosmosdb` | `store.cosmosdb_connection_string`, `store.cosmosdb_database`  |
 
 To build with a non-default storage backend:
 
 ```bash
-# Redis
 cargo build -p affinidi-webvh-server --release \
-  --no-default-features --features "keyring,store-redis"
-
-# DynamoDB
-cargo build -p affinidi-webvh-server --release \
-  --no-default-features --features "keyring,store-dynamodb"
-
-# Firestore
-cargo build -p affinidi-webvh-server --release \
-  --no-default-features --features "keyring,store-firestore"
-
-# Cosmos DB
-cargo build -p affinidi-webvh-server --release \
-  --no-default-features --features "keyring,store-cosmosdb"
+  --no-default-features --features "keyring,store-fjall"
 ```
 
 > **Note:** Enabling more than one `store-*` feature or zero
-> `store-*` features will produce a compile error. Fjall provides
-> full ACID transactions; cloud backends provide best-effort
-> batched writes.
+> `store-*` features will produce a compile error.
 
 ### Environment Variable Overrides
 
-Every config field can be overridden via environment variables:
+Every config field can be overridden via environment variables
+with the `WEBVH_` prefix:
 
 | Variable                              | Description                        |
 | ------------------------------------- | ---------------------------------- |
@@ -288,26 +285,18 @@ Every config field can be overridden via environment variables:
 | `WEBVH_SERVER_DID`                    | Server DID identifier              |
 | `WEBVH_PUBLIC_URL`                    | Public URL of the server           |
 | `WEBVH_MEDIATOR_DID`                  | Mediator DID identifier            |
-| `WEBVH_FEATURES_DIDCOMM`              | Enable DIDComm (`true` / `1`)      |
-| `WEBVH_FEATURES_REST_API`             | Enable REST API (`true` / `1`)     |
+| `WEBVH_FEATURES_DIDCOMM`             | Enable DIDComm (`true` / `1`)      |
+| `WEBVH_FEATURES_REST_API`            | Enable REST API (`true` / `1`)     |
 | `WEBVH_SERVER_HOST`                   | Bind host                          |
 | `WEBVH_SERVER_PORT`                   | Bind port                          |
 | `WEBVH_LOG_LEVEL`                     | Log level                          |
 | `WEBVH_LOG_FORMAT`                    | Log format (`text` / `json`)       |
-| `WEBVH_STORE_DATA_DIR`                | Data directory path (fjall)        |
-| `WEBVH_STORE_REDIS_URL`               | Redis connection URL               |
-| `WEBVH_STORE_DYNAMODB_TABLE_PREFIX`   | DynamoDB table name prefix         |
-| `WEBVH_STORE_DYNAMODB_REGION`         | AWS region for DynamoDB            |
-| `WEBVH_STORE_FIRESTORE_PROJECT`       | GCP project ID for Firestore       |
-| `WEBVH_STORE_FIRESTORE_DATABASE`      | Firestore database name            |
-| `WEBVH_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB connection string     |
-| `WEBVH_STORE_COSMOSDB_DATABASE`       | Cosmos DB database name            |
+| `WEBVH_STORE_DATA_DIR`               | Data directory path (fjall)        |
 | `WEBVH_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)          |
 | `WEBVH_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)         |
 | `WEBVH_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)           |
 | `WEBVH_AUTH_SESSION_CLEANUP_INTERVAL` | Session cleanup interval (sec)     |
-| `WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL`   | Passkey enrollment TTL (sec)       |
-| `WEBVH_CLEANUP_TTL_MINUTES`           | Empty DID cleanup TTL (min)        |
+| `WEBVH_CLEANUP_TTL_MINUTES`          | Empty DID cleanup TTL (min)        |
 | `WEBVH_SECRETS_KEYRING_SERVICE`       | Keyring service name               |
 | `WEBVH_SECRETS_AWS_SECRET_NAME`       | AWS Secrets Manager secret name    |
 | `WEBVH_SECRETS_AWS_REGION`            | AWS region                         |
@@ -325,68 +314,25 @@ Every config field can be overridden via environment variables:
 cargo build -p affinidi-webvh-server --release
 ```
 
-This builds with the `keyring` feature enabled by default.
+This builds with the `keyring` and `store-fjall` features
+enabled by default.
 
-### With Management UI
+## CLI Commands
 
-The `ui` feature flag embeds a web-based management interface
-directly into the server binary using `rust-embed`. When
-enabled, the server serves the UI as a fallback for any
-unmatched GET requests, alongside the API — no separate web
-server needed.
-
-First, build the UI:
-
-```bash
-cd webvh-ui
-npm install
-npm run build:web
-cd ..
+```
+webvh-server                      # Run server (default)
+webvh-server setup                # Interactive config wizard
+webvh-server add-acl              # Add ACL entry
+webvh-server list-acl             # List ACL entries
+webvh-server backup               # Export data to backup file
+webvh-server restore              # Restore data from backup file
 ```
 
-Then build the server with the `ui` feature:
+### Access Control
 
-```bash
-cargo build -p affinidi-webvh-server --release --features ui
-```
-
-The `webvh-ui/dist/` output is compiled into the binary at
-build time — the dist directory is not needed at runtime.
-
-## Running
-
-Before starting the server for the first time, run the setup
-wizard to generate `config.toml` and store secrets (see
-[Getting Started](#getting-started)).
-
-```bash
-# With default config.toml in current directory
-./target/release/webvh-server
-
-# With a specific config file
-./target/release/webvh-server --config /path/to/config.toml
-```
-
-If the server was built with `--features ui`, browse to
-`http://localhost:8101/` to access the management UI. The UI
-lets you:
-
-- View server health and DID counts
-- Authenticate with a Bearer token
-- Create, upload, and delete DIDs
-- Upload witness proofs
-- View DID resolution statistics
-- Manage access control entries (admin only)
-
-All API endpoints continue to work at their normal paths
-regardless of whether the UI is enabled.
-
-## Access Control
-
-The `add-acl` command lets you create ACL entries directly from
-the command line, without needing a running server or
-authenticated API call. This is useful for bootstrapping the
-first admin account or granting access during initial setup.
+The `add-acl` command creates ACL entries directly from the
+command line, without needing a running server or authenticated
+API call. Useful for bootstrapping the first admin account.
 
 ```bash
 # Add an admin
@@ -407,22 +353,11 @@ it via the API first if you need to change a role.
 
 ### Listing ACL entries
 
-The `list-acl` command prints all ACL entries in the store:
-
 ```bash
 webvh-server list-acl
-
-# With a specific config file
-webvh-server --config /path/to/config.toml list-acl
 ```
 
-## Backup & Restore
-
-The server includes built-in backup and restore commands for
-migrating data between instances, disaster recovery, or
-environment cloning.
-
-### Creating a backup
+### Backup & Restore
 
 ```bash
 # Backup to default file (webvh-backup.json)
@@ -431,27 +366,9 @@ webvh-server backup
 # Backup to a specific file
 webvh-server backup --output /path/to/backup.json
 
-# Backup to stdout (e.g. for piping)
-webvh-server backup --output -
-
-# With a specific config file
-webvh-server --config /path/to/config.toml backup
-```
-
-### Restoring from a backup
-
-Restore writes `config.toml` from the backup and imports all
-keyspace data into the store.
-
-```bash
 # Restore data and config.toml
 webvh-server restore --input /path/to/backup.json
-
-# Write config.toml to a specific path
-webvh-server --config /path/to/config.toml restore --input /path/to/backup.json
 ```
-
-### What's included
 
 The backup file is a single JSON document containing:
 
@@ -459,14 +376,70 @@ The backup file is a single JSON document containing:
 - **dids** — all DID documents and logs
 - **acl** — access control entries
 - **stats** — DID resolution statistics
-- **sessions** — durable passkey data only (`pk_user:`,
-  `pk_cred:`, `pk_did:`, `enroll:` prefixes)
 
 Ephemeral data (active sessions, refresh tokens, auth
-challenges, WebAuthn ceremony state) is excluded.
+challenges) is excluded. All keys and values are base64url
+encoded.
 
-All keys and values are base64url-no-pad encoded in the backup
-file.
+## API Endpoints
+
+All API endpoints are under the `/api` prefix.
+
+### Public
+
+| Method | Path                            | Description     |
+| ------ | ------------------------------- | --------------- |
+| `GET`  | `/api/health`                   | Health check    |
+| `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
+| `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
+| `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
+| `GET`  | `/.well-known/did-witness.json` | Root witness    |
+
+### Authentication
+
+| Method | Path                  | Description         |
+| ------ | --------------------- | ------------------- |
+| `POST` | `/api/auth/challenge` | Request challenge   |
+| `POST` | `/api/auth/`          | Submit DIDComm auth |
+| `POST` | `/api/auth/refresh`   | Refresh token       |
+
+### DID Management (authenticated)
+
+| Method   | Path                           | Description         |
+| -------- | ------------------------------ | ------------------- |
+| `GET`    | `/api/dids`                    | List your DIDs      |
+| `POST`   | `/api/dids`                    | Request new DID URI |
+| `POST`   | `/api/dids/check`              | Check name available|
+| `GET`    | `/api/dids/{mnemonic}`         | Get DID details     |
+| `PUT`    | `/api/dids/{mnemonic}`         | Upload DID log      |
+| `PUT`    | `/api/witness/{mnemonic}`      | Upload witness      |
+| `PUT`    | `/api/disable/{mnemonic}`      | Disable a DID       |
+| `PUT`    | `/api/enable/{mnemonic}`       | Enable a DID        |
+| `DELETE` | `/api/dids/{mnemonic}`         | Delete a DID        |
+
+### Statistics (authenticated)
+
+| Method | Path                           | Description         |
+| ------ | ------------------------------ | ------------------- |
+| `GET`  | `/api/stats`                   | Server-wide stats   |
+| `GET`  | `/api/stats/{mnemonic}`        | Per-DID stats       |
+| `GET`  | `/api/timeseries`              | Server time-series  |
+| `GET`  | `/api/timeseries/{mnemonic}`   | Per-DID time-series |
+
+### Configuration (admin only)
+
+| Method | Path          | Description    |
+| ------ | ------------- | -------------- |
+| `GET`  | `/api/config` | Server config  |
+
+### Access Control (admin only)
+
+| Method   | Path             | Description      |
+| -------- | ---------------- | ---------------- |
+| `GET`    | `/api/acl`       | List ACL entries |
+| `POST`   | `/api/acl`       | Create ACL entry |
+| `PUT`    | `/api/acl/{did}` | Update ACL entry |
+| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
 
 ## Performance Testing
 
@@ -506,52 +479,6 @@ ACL access.
 | `--create-parallel` | | `4` | Parallel concurrency for DID creation |
 | `--seed` | | random | Ed25519 seed as 64 hex characters |
 | `--did-file` | `-f` | | File of `did:webvh:...` identifiers (skips auth) |
-| `--mediator-did` | | | Mediator DID (reserved for future use) |
-| `--webvh-did` | | | Server DID (reserved for future use) |
-
-### Examples
-
-```bash
-# Basic: 50 req/s against local server
-cargo run --example perf_test -p affinidi-webvh-server -- \
-  --rate 50
-
-# Create 10 test DIDs on startup, then benchmark at 200 req/s
-cargo run --example perf_test -p affinidi-webvh-server -- \
-  --create-dids 10 --rate 200
-
-# Remote server with higher concurrency and longer timeout
-cargo run --example perf_test -p affinidi-webvh-server -- \
-  -s https://webvh.example.com -r 500 -w 128 -t 10
-
-# Create DIDs faster with more parallelism
-cargo run --example perf_test -p affinidi-webvh-server -- \
-  --create-dids 50 --create-parallel 8 --rate 100
-
-# File mode: test against any hosted DIDs without ACL access
-cargo run --example perf_test -p affinidi-webvh-server -- \
-  --did-file my-dids.txt --rate 200
-```
-
-#### File mode
-
-When `--did-file` / `-f` is provided, the tool reads `did:webvh:...`
-identifiers from the file (one per line) and derives HTTPS resolution
-URLs directly. No authentication or server connection is needed —
-this works against any hosted WebVH DID.
-
-The file format is simple:
-
-```text
-# Production DIDs
-did:webvh:Qm...:example.com:my-did
-did:webvh:Qm...:example.com:another-did
-
-# Staging
-did:webvh:Qm...:staging.example.com%3A8085:test-did
-```
-
-Blank lines and lines starting with `#` are ignored.
 
 ### Keyboard Controls
 
@@ -563,89 +490,15 @@ Blank lines and lines starting with `#` are ignored.
 | `]` | Double target rate |
 | `[` | Halve target rate |
 
-Rate changes are smoothed over a few seconds to avoid shocking
-the server with sudden load spikes.
+## Library Usage
 
-### Dashboard
+The webvh-server crate can be used as a library (e.g., by the
+[webvh-daemon](../webvh-daemon/)). It exposes:
 
-The TUI displays four quadrants plus a summary panel:
-
-- **Throughput** (top-left) — sparkline of requests per second
-  over the last 120 seconds
-- **Latency** (top-right) — sparkline of p99 latency over the
-  last 120 seconds
-- **Workers** (bottom-left top) — sparkline of active concurrent
-  workers showing current, max, and peak utilization
-- **Errors** (bottom-left bottom) — sparkline of errors per
-  second
-- **Summary** (right panel) — current totals, latency
-  percentiles (p50/p95/p99/max), network bandwidth (outbound
-  and inbound with peak values), and test duration
-
-### Warmup
-
-The tool includes a 3-second warmup period on startup:
-
-- Request rate ramps linearly from 0 to the target rate
-- A popup overlay shows the warmup countdown
-- All metrics collected during warmup are discarded so that
-  graphs and statistics start clean
-
-### Notes
-
-- Timed-out requests count as errors but are excluded from
-  latency statistics to avoid skewing percentiles
-- In server mode, the tool authenticates with the server using
-  DIDComm challenge-response before starting the benchmark
-- In file mode (`--did-file`), no authentication is needed
-- Network traffic shows actual bytes transferred (response
-  bodies are fully consumed)
-
-## API Endpoints
-
-### Public
-
-| Method | Path                            | Description     |
-| ------ | ------------------------------- | --------------- |
-| `GET`  | `/health`                       | Health check    |
-| `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
-| `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
-| `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
-| `GET`  | `/.well-known/did-witness.json` | Root witness    |
-
-### Authentication
-
-| Method | Path              | Description         |
-| ------ | ----------------- | ------------------- |
-| `POST` | `/auth/challenge` | Request challenge   |
-| `POST` | `/auth/`          | Submit DIDComm auth |
-| `POST` | `/auth/refresh`   | Refresh token       |
-
-### DID Management (authenticated)
-
-| Method   | Path                       | Description         |
-| -------- | -------------------------- | ------------------- |
-| `GET`    | `/dids`                    | List your DIDs      |
-| `POST`   | `/dids`                    | Request new DID URI |
-| `PUT`    | `/dids/{mnemonic}`         | Upload DID log      |
-| `PUT`    | `/dids/{mnemonic}/witness` | Upload witness      |
-| `PUT`    | `/disable/{mnemonic}`      | Disable a DID       |
-| `PUT`    | `/enable/{mnemonic}`       | Enable a DID        |
-| `DELETE` | `/dids/{mnemonic}`         | Delete a DID        |
-
-### Statistics (authenticated)
-
-| Method | Path                | Description |
-| ------ | ------------------- | ----------- |
-| `GET`  | `/stats/{mnemonic}` | DID stats   |
-
-### Access Control (admin only)
-
-| Method   | Path         | Description      |
-| -------- | ------------ | ---------------- |
-| `GET`    | `/acl`       | List ACL entries |
-| `POST`   | `/acl`       | Create ACL entry |
-| `DELETE` | `/acl/{did}` | Remove ACL entry |
+- `affinidi_webvh_server::config::AppConfig` — configuration
+- `affinidi_webvh_server::server::AppState` — application state
+- `affinidi_webvh_server::routes::router()` — Axum router
+- `affinidi_webvh_server::server::run()` — standalone entry point
 
 ## Support & feedback
 

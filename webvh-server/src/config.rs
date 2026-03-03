@@ -2,6 +2,13 @@ use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// Re-export shared config types so existing code can still use `crate::config::*`
+pub use affinidi_webvh_common::server::config::{
+    AuthConfig, FeaturesConfig, LogConfig, LogFormat, PlaintextSecrets, SecretsConfig,
+    ServerConfig, StoreConfig,
+};
+// PlaintextSecrets is used by setup.rs
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -21,163 +28,16 @@ pub struct AppConfig {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub watchers: Vec<WatcherEndpoint>,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct FeaturesConfig {
-    #[serde(default)]
-    pub didcomm: bool,
-    #[serde(default)]
-    pub rest_api: bool,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServerConfig {
-    #[serde(default = "default_host")]
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct LogConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    #[serde(default)]
-    pub format: LogFormat,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StoreConfig {
-    #[serde(default = "default_data_dir")]
-    pub data_dir: PathBuf,
-    /// Redis connection URL (e.g. `redis://localhost:6379`). Used by `store-redis` backend.
-    pub redis_url: Option<String>,
-    /// DynamoDB table name prefix (default: `"webvh"`). Used by `store-dynamodb` backend.
-    pub dynamodb_table_prefix: Option<String>,
-    /// AWS region for DynamoDB. Used by `store-dynamodb` backend.
-    pub dynamodb_region: Option<String>,
-    /// GCP project ID for Firestore. Used by `store-firestore` backend.
-    pub firestore_project: Option<String>,
-    /// Firestore database name (default: `"(default)"`). Used by `store-firestore` backend.
-    pub firestore_database: Option<String>,
-    /// Azure Cosmos DB connection string. Used by `store-cosmosdb` backend.
-    pub cosmosdb_connection_string: Option<String>,
-    /// Cosmos DB database name (default: `"webvh"`). Used by `store-cosmosdb` backend.
-    pub cosmosdb_database: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AuthConfig {
-    #[serde(default = "default_access_token_expiry")]
-    pub access_token_expiry: u64,
-    #[serde(default = "default_refresh_token_expiry")]
-    pub refresh_token_expiry: u64,
-    #[serde(default = "default_challenge_ttl")]
-    pub challenge_ttl: u64,
-    #[serde(default = "default_session_cleanup_interval")]
-    pub session_cleanup_interval: u64,
-    #[serde(default = "default_passkey_enrollment_ttl")]
-    pub passkey_enrollment_ttl: u64,
-    /// How long (in minutes) to keep empty DID records before auto-cleanup.
-    #[serde(default = "default_cleanup_ttl_minutes")]
-    pub cleanup_ttl_minutes: u64,
-}
-
-fn default_access_token_expiry() -> u64 {
-    900
-}
-
-fn default_refresh_token_expiry() -> u64 {
-    86400
-}
-
-fn default_challenge_ttl() -> u64 {
-    30
-}
-
-fn default_session_cleanup_interval() -> u64 {
-    600
-}
-
-fn default_passkey_enrollment_ttl() -> u64 {
-    86400
-}
-
-fn default_cleanup_ttl_minutes() -> u64 {
-    60
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            access_token_expiry: default_access_token_expiry(),
-            refresh_token_expiry: default_refresh_token_expiry(),
-            challenge_ttl: default_challenge_ttl(),
-            session_cleanup_interval: default_session_cleanup_interval(),
-            passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
-            cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogFormat {
-    #[default]
-    Text,
-    Json,
-}
-
-fn default_host() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_port() -> u16 {
-    8101
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_data_dir() -> PathBuf {
-    PathBuf::from("data/webvh-server")
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            host: default_host(),
-            port: default_port(),
-        }
-    }
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            format: LogFormat::default(),
-        }
-    }
-}
-
-impl Default for StoreConfig {
-    fn default() -> Self {
-        Self {
-            data_dir: default_data_dir(),
-            redis_url: None,
-            dynamodb_table_prefix: None,
-            dynamodb_region: None,
-            firestore_project: None,
-            firestore_database: None,
-            cosmosdb_connection_string: None,
-            cosmosdb_database: None,
-        }
-    }
+pub struct WatcherEndpoint {
+    pub url: String,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -215,48 +75,6 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SecretsConfig {
-    pub aws_secret_name: Option<String>,
-    pub aws_region: Option<String>,
-    pub gcp_project: Option<String>,
-    pub gcp_secret_name: Option<String>,
-    #[serde(default = "default_keyring_service")]
-    pub keyring_service: String,
-    /// Plaintext secrets stored directly in the config file.
-    /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
-    pub plaintext: Option<PlaintextSecrets>,
-}
-
-/// Plaintext secret key material stored directly in the configuration file.
-///
-/// **WARNING**: This is insecure and should only be used for testing/development.
-/// For production deployments, compile with a secure backend feature:
-/// `keyring`, `aws-secrets`, or `gcp-secrets`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PlaintextSecrets {
-    pub signing_key: String,
-    pub key_agreement_key: String,
-    pub jwt_signing_key: String,
-}
-
-fn default_keyring_service() -> String {
-    "webvh".to_string()
-}
-
-impl Default for SecretsConfig {
-    fn default() -> Self {
-        Self {
-            aws_secret_name: None,
-            aws_region: None,
-            gcp_project: None,
-            gcp_secret_name: None,
-            keyring_service: default_keyring_service(),
-            plaintext: None,
-        }
-    }
-}
-
 impl AppConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
@@ -276,70 +94,28 @@ impl AppConfig {
 
         config.config_path = path.clone();
 
-        // Env var override macros
-        macro_rules! env_str { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = v; } }; }
+        // Apply shared env overrides for common config fields
+        affinidi_webvh_common::server::config::apply_env_overrides(
+            "WEBVH",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            &mut config.auth,
+            &mut config.secrets,
+        )?;
+
+        // Server identity (webvh-server specific env vars)
         macro_rules! env_opt { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = Some(v); } }; }
         macro_rules! env_parse { ($var:expr, $field:expr) => {
             if let Ok(v) = std::env::var($var) {
                 $field = v.parse().map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
             }
         }; }
-        macro_rules! env_bool { ($var:expr, $field:expr) => {
-            if let Ok(v) = std::env::var($var) { $field = v == "1" || v.eq_ignore_ascii_case("true"); }
-        }; }
 
-        // Features
-        env_bool!("WEBVH_FEATURES_DIDCOMM", config.features.didcomm);
-        env_bool!("WEBVH_FEATURES_REST_API", config.features.rest_api);
-
-        // Server identity
         env_opt!("WEBVH_SERVER_DID", config.server_did);
         env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
         env_opt!("WEBVH_PUBLIC_URL", config.public_url);
-
-        // Server
-        env_str!("WEBVH_SERVER_HOST", config.server.host);
-        env_parse!("WEBVH_SERVER_PORT", config.server.port);
-
-        // Logging
-        env_str!("WEBVH_LOG_LEVEL", config.log.level);
-        if let Ok(format) = std::env::var("WEBVH_LOG_FORMAT") {
-            config.log.format = match format.to_lowercase().as_str() {
-                "json" => LogFormat::Json,
-                "text" => LogFormat::Text,
-                other => {
-                    return Err(AppError::Config(format!(
-                        "invalid WEBVH_LOG_FORMAT '{other}', expected 'text' or 'json'"
-                    )));
-                }
-            };
-        }
-
-        // Store
-        if let Ok(data_dir) = std::env::var("WEBVH_STORE_DATA_DIR") {
-            config.store.data_dir = PathBuf::from(data_dir);
-        }
-        env_opt!("WEBVH_STORE_REDIS_URL", config.store.redis_url);
-        env_opt!("WEBVH_STORE_DYNAMODB_TABLE_PREFIX", config.store.dynamodb_table_prefix);
-        env_opt!("WEBVH_STORE_DYNAMODB_REGION", config.store.dynamodb_region);
-        env_opt!("WEBVH_STORE_FIRESTORE_PROJECT", config.store.firestore_project);
-        env_opt!("WEBVH_STORE_FIRESTORE_DATABASE", config.store.firestore_database);
-        env_opt!("WEBVH_STORE_COSMOSDB_CONNECTION_STRING", config.store.cosmosdb_connection_string);
-        env_opt!("WEBVH_STORE_COSMOSDB_DATABASE", config.store.cosmosdb_database);
-
-        // Auth
-        env_parse!("WEBVH_AUTH_ACCESS_EXPIRY", config.auth.access_token_expiry);
-        env_parse!("WEBVH_AUTH_REFRESH_EXPIRY", config.auth.refresh_token_expiry);
-        env_parse!("WEBVH_AUTH_CHALLENGE_TTL", config.auth.challenge_ttl);
-        env_parse!("WEBVH_AUTH_SESSION_CLEANUP_INTERVAL", config.auth.session_cleanup_interval);
-        env_parse!("WEBVH_AUTH_PASSKEY_ENROLLMENT_TTL", config.auth.passkey_enrollment_ttl);
-        env_parse!("WEBVH_CLEANUP_TTL_MINUTES", config.auth.cleanup_ttl_minutes);
-        // Secrets
-        env_opt!("WEBVH_SECRETS_AWS_SECRET_NAME", config.secrets.aws_secret_name);
-        env_opt!("WEBVH_SECRETS_AWS_REGION", config.secrets.aws_region);
-        env_opt!("WEBVH_SECRETS_GCP_PROJECT", config.secrets.gcp_project);
-        env_opt!("WEBVH_SECRETS_GCP_SECRET_NAME", config.secrets.gcp_secret_name);
-        env_str!("WEBVH_SECRETS_KEYRING_SERVICE", config.secrets.keyring_service);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);

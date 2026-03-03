@@ -18,6 +18,7 @@ use crate::auth::session::now_epoch;
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
+use crate::watcher_push;
 
 // ---------------------------------------------------------------------------
 // Message type constants
@@ -308,6 +309,13 @@ async fn handle_did_publish(
         .await
         .map_err(map_app_error)?;
 
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+
     Ok((
         MSG_DID_CONFIRM.to_string(),
         json!({
@@ -350,6 +358,13 @@ async fn handle_witness_publish(
     let result = did_ops::upload_witness(auth, state, mnemonic, &witness_str)
         .await
         .map_err(map_app_error)?;
+
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
 
     Ok((
         MSG_WITNESS_CONFIRM.to_string(),
@@ -451,6 +466,12 @@ async fn handle_delete(
     let result = did_ops::delete_did(auth, state, mnemonic)
         .await
         .map_err(map_app_error)?;
+
+    watcher_push::notify_watchers_delete(
+        &state.config,
+        &state.http_client,
+        mnemonic.to_string(),
+    );
 
     Ok((
         MSG_DELETE_CONFIRM.to_string(),
