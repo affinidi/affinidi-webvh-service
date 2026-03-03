@@ -86,6 +86,6 @@ tempfile = "3"
 anyhow.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 reqwest = { workspace = true }
