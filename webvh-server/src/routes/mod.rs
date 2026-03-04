@@ -62,8 +62,6 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
 
     Router::new()
         .nest("/api", api)
-        // Health route (no auth required)
-        .route("/api/health", get(health::health))
         // .well-known routes (specific routes take priority over fallback)
         .route(
             "/.well-known/did.jsonl",

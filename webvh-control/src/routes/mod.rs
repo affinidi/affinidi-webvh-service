@@ -53,9 +53,7 @@ pub fn router() -> Router<AppState> {
         .route(
             "/witness/{instance_id}/{*path}",
             any(proxy::proxy_to_service),
-        )
-        // Health
-        .route("/health", get(health::health));
+        );
 
     let router = Router::new().nest("/api", api);
 

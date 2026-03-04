@@ -130,19 +130,18 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // Daemon-level health
-    combined = combined.route("/health", get(daemon_health));
-
-    // Apply tracing layer
-    let app = combined.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_response(
-                DefaultOnResponse::new()
-                    .level(Level::INFO)
-                    .latency_unit(tower_http::LatencyUnit::Millis),
-            ),
-    );
+    // Apply tracing layer, then add health route *after* so it's not traced
+    let app = combined
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(tower_http::LatencyUnit::Millis),
+                ),
+        )
+        .route("/health", get(daemon_health));
 
     // Log startup summary
     info!("--- daemon services ---");

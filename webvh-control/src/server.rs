@@ -4,6 +4,7 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
+use axum::routing::get;
 use affinidi_webvh_common::server::passkey::PasskeyState;
 use webauthn_rs::prelude::Webauthn;
 
@@ -330,7 +331,8 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers));
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+            .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());
 
