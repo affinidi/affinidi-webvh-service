@@ -39,7 +39,7 @@ impl WebVHError {
 }
 
 /// Server error response shape: `{"error": "..."}`.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub(crate) struct ServerErrorBody {
     pub error: String,
 }

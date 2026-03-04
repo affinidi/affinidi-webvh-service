@@ -1,2 +1,2 @@
 // Re-export from webvh-common shared server infrastructure
-pub use affinidi_webvh_common::server::error::AppError;
+pub use affinidi_webvh_common::server::error::{AppError, QuotaKind, ValidationKind};

@@ -98,10 +98,15 @@ pub struct DidListEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct DidStats {
+    #[serde(alias = "total_resolves")]
     pub total_resolves: u64,
+    #[serde(alias = "total_updates")]
     pub total_updates: u64,
+    #[serde(alias = "last_resolved_at")]
     pub last_resolved_at: Option<u64>,
+    #[serde(alias = "last_updated_at")]
     pub last_updated_at: Option<u64>,
 }
 
@@ -181,6 +186,22 @@ mod tests {
         assert_eq!(stats.total_updates, 0);
         assert_eq!(stats.last_resolved_at, None);
         assert_eq!(stats.last_updated_at, None);
+    }
+
+    #[test]
+    fn did_stats_serializes_camel_case() {
+        let stats = DidStats {
+            total_resolves: 10,
+            total_updates: 5,
+            last_resolved_at: Some(1000),
+            last_updated_at: Some(2000),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("\"totalResolves\""));
+        assert!(json.contains("\"totalUpdates\""));
+        assert!(json.contains("\"lastResolvedAt\""));
+        assert!(json.contains("\"lastUpdatedAt\""));
+        assert!(!json.contains("\"total_resolves\""));
     }
 
     #[test]

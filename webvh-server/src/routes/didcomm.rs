@@ -61,29 +61,23 @@ impl ProtocolError {
 
 /// Convert an [`AppError`] into a [`ProtocolError`] with an appropriate DIDComm error code.
 fn map_app_error(err: AppError) -> ProtocolError {
+    use crate::error::{QuotaKind, ValidationKind};
+
     let comment = err.to_string();
     let code = match &err {
         AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
-        AppError::QuotaExceeded(msg) => {
-            if msg.contains("size") {
-                "e.p.did.size-exceeded"
-            } else {
-                "e.p.did.quota-exceeded"
-            }
-        }
+        AppError::QuotaExceeded(_) => match err.quota_kind() {
+            QuotaKind::Size => "e.p.did.size-exceeded",
+            QuotaKind::Count => "e.p.did.quota-exceeded",
+        },
         AppError::Conflict(_) => "e.p.did.path-unavailable",
         AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
-        AppError::Validation(msg) => {
-            if msg.contains("log entry") || msg.contains("jsonl") || msg.contains("JSONL") {
-                "e.p.did.invalid-log"
-            } else if msg.contains("path") {
-                "e.p.did.path-invalid"
-            } else if msg.contains("witness") {
-                "e.p.did.witness-invalid"
-            } else {
-                "e.p.did.validation-error"
-            }
-        }
+        AppError::Validation(_) => match err.validation_kind() {
+            ValidationKind::InvalidLog => "e.p.did.invalid-log",
+            ValidationKind::InvalidPath => "e.p.did.path-invalid",
+            ValidationKind::InvalidWitness => "e.p.did.witness-invalid",
+            ValidationKind::Other => "e.p.did.validation-error",
+        },
         _ => "e.p.did.internal-error",
     };
     ProtocolError::new(code, comment)

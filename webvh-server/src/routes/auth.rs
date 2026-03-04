@@ -12,12 +12,24 @@ use affinidi_webvh_common::{
 use crate::acl::check_acl;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::{
-    Session, SessionState, finalize_challenge_session, get_session, get_session_by_refresh,
-    now_epoch, store_session,
+    Session, SessionState, delete_session, finalize_challenge_session, get_session,
+    get_session_by_refresh, now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
 use tracing::{info, warn};
+
+/// Constant-time comparison to prevent timing side-channels on challenge values.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 // ---------- POST /auth/challenge ----------
 
@@ -111,7 +123,7 @@ pub async fn authenticate(
             "session already authenticated (replay)".into(),
         ));
     }
-    if session.challenge != challenge {
+    if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
         warn!(session_id, "authentication rejected: challenge mismatch");
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
@@ -228,6 +240,9 @@ pub async fn refresh(
         warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: token expired");
         return Err(AppError::Authentication("refresh token expired".into()));
     }
+
+    // Invalidate the old session to prevent refresh token reuse
+    delete_session(&state.sessions_ks, &session.session_id).await?;
 
     // Look up current ACL role (propagates changes at refresh time)
     let role = check_acl(&state.acl_ks, &session.did).await?;

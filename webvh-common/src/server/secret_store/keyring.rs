@@ -62,7 +62,12 @@ impl super::SecretStore for KeyringSecretStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let service = self.service.clone();
         let user = self.user.clone();
-        let json_str = serde_json::to_string(secrets).expect("ServerSecrets serialization");
+        let json_str = match serde_json::to_string(secrets) {
+            Ok(s) => s,
+            Err(e) => return Box::pin(async move {
+                Err(AppError::Internal(format!("secrets serialization: {e}")))
+            }),
+        };
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let entry = keyring::Entry::new(&service, &user).map_err(|e| {

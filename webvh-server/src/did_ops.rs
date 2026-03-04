@@ -384,19 +384,6 @@ pub fn extract_did_web_document(jsonl_content: &str, expected_did_web: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// URL helper
-// ---------------------------------------------------------------------------
-
-fn base_url(config: &AppConfig) -> String {
-    config.public_url.clone().unwrap_or_else(|| {
-        format!(
-            "http://{}:{}",
-            config.server.host, config.server.port
-        )
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Core operations
 // ---------------------------------------------------------------------------
 
@@ -461,7 +448,7 @@ pub async fn create_did(
     );
     batch.commit().await?;
 
-    let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
+    let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
 
@@ -524,7 +511,7 @@ pub async fn publish_did(
     stats::increment_updates(&state.stats_ks, mnemonic).await?;
     let _ = stats::record_timeseries_update(&state.stats_ks, mnemonic).await;
 
-    let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
+    let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(
         did = %auth.did,
@@ -574,7 +561,7 @@ pub async fn upload_witness(
         )
         .await?;
 
-    let witness_url = format!("{}/{mnemonic}/did-witness.json", base_url(&state.config));
+    let witness_url = format!("{}/{mnemonic}/did-witness.json", state.config.public_base_url());
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, size, "did-witness.json uploaded");
 
@@ -607,7 +594,7 @@ pub async fn get_did_info(
     };
 
     let did_stats = stats::get_stats(&state.stats_ks, mnemonic).await?;
-    let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
+    let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID info retrieved");
 
@@ -836,7 +823,7 @@ pub async fn rollback_did(
     batch.commit().await?;
 
     let log_metadata = Some(extract_log_metadata(&truncated));
-    let did_url = format!("{}/{mnemonic}/did.jsonl", base_url(&state.config));
+    let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(
         did = %auth.did,

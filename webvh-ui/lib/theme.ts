@@ -57,3 +57,45 @@ export const fonts = {
   bold: "Figtree_700Bold",
   mono: "monospace",
 } as const;
+
+// ---------------------------------------------------------------------------
+// Shared component styles
+// ---------------------------------------------------------------------------
+
+import { ViewStyle, TextStyle } from "react-native";
+
+/** Standard card container. */
+export const card: ViewStyle = {
+  backgroundColor: colors.bgSecondary,
+  borderRadius: radii.lg,
+  borderWidth: 1,
+  borderColor: colors.border,
+  padding: spacing.xl,
+};
+
+/** Primary action button. */
+export const primaryButton: ViewStyle = {
+  backgroundColor: colors.accent,
+  borderRadius: radii.sm,
+  paddingVertical: 14,
+  paddingHorizontal: spacing.xl,
+  alignItems: "center",
+};
+
+/** Destructive / danger action button (outline style). */
+export const dangerButton: ViewStyle = {
+  backgroundColor: "transparent",
+  borderRadius: radii.sm,
+  borderWidth: 1,
+  borderColor: colors.error,
+  paddingVertical: 14,
+  paddingHorizontal: spacing.xl,
+  alignItems: "center",
+};
+
+/** Muted hint text below inputs or sections. */
+export const hintText: TextStyle = {
+  fontFamily: fonts.regular,
+  fontSize: 13,
+  color: colors.textSecondary,
+};

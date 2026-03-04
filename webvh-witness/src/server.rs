@@ -300,7 +300,7 @@ fn run_didcomm_thread(
         };
 
         let (atm, profile) =
-            match messaging::init_didcomm_connection(&state.config, server_did, &secrets).await {
+            match messaging::init_didcomm_connection(&state.config, server_did, &secrets, state.did_resolver.as_ref()).await {
                 Some(handles) => handles,
                 None => {
                     let _ = shutdown_rx.changed().await;

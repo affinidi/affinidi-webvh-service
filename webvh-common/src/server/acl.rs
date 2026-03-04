@@ -30,7 +30,7 @@ impl Role {
         match s {
             "admin" => Ok(Role::Admin),
             "owner" => Ok(Role::Owner),
-            _ => Err(AppError::Internal(format!("unknown role: {s}"))),
+            _ => Err(AppError::Validation(format!("unknown role: {s}"))),
         }
     }
 }

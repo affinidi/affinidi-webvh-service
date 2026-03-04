@@ -46,15 +46,6 @@ async fn serve_content(
     Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
 }
 
-/// Derive the base URL from config (same fallback as `base_url()` in did_ops).
-fn base_url(state: &AppState) -> String {
-    state.config.public_url.clone().unwrap_or_else(|| {
-        format!(
-            "http://{}:{}",
-            state.config.server.host, state.config.server.port
-        )
-    })
-}
 
 /// Serve a did:web document (`did.json`) for the given mnemonic.
 ///
@@ -82,7 +73,7 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
     let jsonl = String::from_utf8(content_bytes)
         .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
-    let server_url = base_url(state);
+    let server_url = state.config.public_base_url();
     let expected_did_web = build_did_web_id(&server_url, mnemonic)
         .map_err(|e| AppError::Internal(format!("failed to build did:web id: {e}")))?;
 

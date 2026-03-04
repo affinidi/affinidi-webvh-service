@@ -32,11 +32,6 @@ pub struct WatcherSyncStatus {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn source_url(config: &AppConfig) -> String {
-    config.public_url.clone().unwrap_or_else(|| {
-        format!("http://{}:{}", config.server.host, config.server.port)
-    })
-}
 
 /// Normalize a URL for comparison by trimming trailing slashes.
 fn normalize_url(url: &str) -> String {
@@ -85,7 +80,10 @@ pub fn notify_watchers_did(
         {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(_) => {
+                    warn!(mnemonic = %mnemonic, "watcher push: invalid UTF-8 in log content");
+                    return;
+                }
             },
             Ok(None) => return,
             Err(e) => {
@@ -115,7 +113,7 @@ pub fn notify_watchers_did(
             did_id: record.did_id,
             log_content,
             witness_content,
-            source_url: source_url(&config),
+            source_url: config.public_base_url(),
             updated_at: record.updated_at,
             disabled: record.disabled,
         };
@@ -218,7 +216,7 @@ pub fn notify_watchers_delete(
 
         let payload = SyncDeleteRequest {
             mnemonic: mnemonic.clone(),
-            source_url: source_url(&config),
+            source_url: config.public_base_url(),
         };
 
         for watcher in &config.watchers {

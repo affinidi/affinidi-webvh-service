@@ -76,6 +76,13 @@ impl Default for LimitsConfig {
 }
 
 impl AppConfig {
+    /// Return the public-facing base URL for this server.
+    pub fn public_base_url(&self) -> String {
+        self.public_url.clone().unwrap_or_else(|| {
+            format!("http://{}:{}", self.server.host, self.server.port)
+        })
+    }
+
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
             .or_else(|| std::env::var("WEBVH_CONFIG_PATH").ok().map(PathBuf::from))

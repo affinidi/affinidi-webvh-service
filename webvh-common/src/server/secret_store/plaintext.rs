@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::server::config::PlaintextSecrets;
 use crate::server::error::AppError;
+use tracing::warn;
 
 use super::{BoxFuture, SecretStore, ServerSecrets};
 
@@ -17,6 +18,7 @@ pub struct PlaintextSecretStore {
 
 impl PlaintextSecretStore {
     pub fn new(plaintext: Option<&PlaintextSecrets>, config_path: PathBuf) -> Self {
+        warn!("plaintext secret store is insecure — use keyring, aws-secrets, or gcp-secrets in production");
         Self {
             secrets: plaintext.map(|p| ServerSecrets {
                 signing_key: p.signing_key.clone(),

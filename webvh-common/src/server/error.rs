@@ -44,6 +44,65 @@ pub enum AppError {
     QuotaExceeded(String),
 }
 
+/// Semantic tags for finer-grained error classification without string matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationKind {
+    InvalidLog,
+    InvalidPath,
+    InvalidWitness,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaKind {
+    Size,
+    Count,
+}
+
+impl AppError {
+    /// Create a tagged validation error.
+    pub fn validation(kind: ValidationKind, msg: impl Into<String>) -> Self {
+        let mut s = msg.into();
+        // Embed a machine-readable tag prefix for structured matching
+        let tag = match kind {
+            ValidationKind::InvalidLog => "[log]",
+            ValidationKind::InvalidPath => "[path]",
+            ValidationKind::InvalidWitness => "[witness]",
+            ValidationKind::Other => "",
+        };
+        if !tag.is_empty() {
+            s = format!("{tag} {s}");
+        }
+        AppError::Validation(s)
+    }
+
+    /// Classify a Validation error's kind by its tag prefix.
+    pub fn validation_kind(&self) -> ValidationKind {
+        match self {
+            AppError::Validation(msg) => {
+                if msg.starts_with("[log]") {
+                    ValidationKind::InvalidLog
+                } else if msg.starts_with("[path]") {
+                    ValidationKind::InvalidPath
+                } else if msg.starts_with("[witness]") {
+                    ValidationKind::InvalidWitness
+                } else {
+                    ValidationKind::Other
+                }
+            }
+            _ => ValidationKind::Other,
+        }
+    }
+
+    /// Classify a QuotaExceeded error's kind by its content.
+    pub fn quota_kind(&self) -> QuotaKind {
+        match self {
+            AppError::QuotaExceeded(msg) if msg.contains("size") => QuotaKind::Size,
+            _ => QuotaKind::Count,
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {

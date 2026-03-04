@@ -20,6 +20,34 @@ use super::config::StoreConfig;
 use super::error::AppError;
 
 // ---------------------------------------------------------------------------
+// Key prefix constants — used across keyspaces to namespace stored data.
+//
+// session:<id>         — auth session record
+// refresh:<token>      — reverse index: refresh token → session_id
+// did:<mnemonic>       — DID record (DidRecord)
+// content:<m>:log      — raw JSONL did-log content
+// content:<m>:witness  — raw witness JSON content
+// owner:<did>:<m>      — reverse index: owner DID → mnemonic
+// watcher_sync:<m>     — per-DID watcher sync status
+// passkey:<handle>     — WebAuthn credential record
+// acl:<did>            — ACL entry
+// stats:<mnemonic>     — per-DID resolve/update counters
+// ts:<mnemonic>:<epoch> — time-series bucket
+// ---------------------------------------------------------------------------
+pub mod key_prefix {
+    pub const SESSION: &str = "session:";
+    pub const REFRESH: &str = "refresh:";
+    pub const DID: &str = "did:";
+    pub const CONTENT: &str = "content:";
+    pub const OWNER: &str = "owner:";
+    pub const WATCHER_SYNC: &str = "watcher_sync:";
+    pub const PASSKEY: &str = "passkey:";
+    pub const ACL: &str = "acl:";
+    pub const STATS: &str = "stats:";
+    pub const TIMESERIES: &str = "ts:";
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 

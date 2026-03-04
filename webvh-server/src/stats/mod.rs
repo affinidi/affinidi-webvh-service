@@ -195,12 +195,12 @@ pub async fn query_timeseries(
     let mut buckets: Vec<(u64, BucketData)> = Vec::new();
     for (key, value) in &raw {
         let key_str = std::str::from_utf8(key).unwrap_or_default();
-        if let Ok(epoch) = key_str[prefix_len..].parse::<u64>() {
-            if epoch >= cutoff {
-                if let Ok(data) = serde_json::from_slice::<BucketData>(value) {
-                    buckets.push((epoch, data));
-                }
-            }
+        if let Some(epoch_str) = key_str.get(prefix_len..)
+            && let Ok(epoch) = epoch_str.parse::<u64>()
+            && epoch >= cutoff
+            && let Ok(data) = serde_json::from_slice::<BucketData>(value)
+        {
+            buckets.push((epoch, data));
         }
     }
 

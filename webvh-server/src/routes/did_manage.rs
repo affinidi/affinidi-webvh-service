@@ -11,6 +11,11 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+/// Strip leading slash from path-extracted mnemonics.
+fn clean_mnemonic(m: &str) -> &str {
+    m.trim_start_matches('/')
+}
+
 // ---------- POST /dids/check ----------
 
 #[derive(Debug, Deserialize)]
@@ -72,12 +77,32 @@ pub struct DidDetailResponse {
     pub watcher_sync: Option<Vec<WatcherSyncStatus>>,
 }
 
+impl DidDetailResponse {
+    fn from_record(
+        record: did_ops::DidRecord,
+        log: Option<LogMetadata>,
+        watcher_sync: Option<Vec<WatcherSyncStatus>>,
+    ) -> Self {
+        Self {
+            mnemonic: record.mnemonic,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            version_count: record.version_count,
+            did_id: record.did_id,
+            owner: record.owner,
+            disabled: record.disabled,
+            log,
+            watcher_sync,
+        }
+    }
+}
+
 pub async fn get_did(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<Json<DidDetailResponse>, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     let result = did_ops::get_did_info(&auth, &state, mnemonic).await?;
 
     let watcher_sync: Option<Vec<WatcherSyncStatus>> = state
@@ -85,17 +110,11 @@ pub async fn get_did(
         .get(did_ops::watcher_sync_key(mnemonic))
         .await?;
 
-    Ok(Json(DidDetailResponse {
-        mnemonic: result.record.mnemonic,
-        created_at: result.record.created_at,
-        updated_at: result.record.updated_at,
-        version_count: result.record.version_count,
-        did_id: result.record.did_id,
-        owner: result.record.owner,
-        disabled: result.record.disabled,
-        log: result.log_metadata,
+    Ok(Json(DidDetailResponse::from_record(
+        result.record,
+        result.log_metadata,
         watcher_sync,
-    }))
+    )))
 }
 
 // ---------- GET /dids/{mnemonic}/log ----------
@@ -105,7 +124,7 @@ pub async fn get_did_log(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<Json<Vec<LogEntryInfo>>, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     let entries = did_ops::get_did_log(&auth, &state, mnemonic).await?;
     Ok(Json(entries))
 }
@@ -118,7 +137,7 @@ pub async fn upload_did(
     Path(mnemonic): Path<String>,
     body: String,
 ) -> Result<StatusCode, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     did_ops::publish_did(&auth, &state, mnemonic, &body).await?;
     watcher_push::notify_watchers_did(
         &state.config,
@@ -137,7 +156,7 @@ pub async fn upload_witness(
     Path(mnemonic): Path<String>,
     body: String,
 ) -> Result<StatusCode, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     did_ops::upload_witness(&auth, &state, mnemonic, &body).await?;
     watcher_push::notify_watchers_did(
         &state.config,
@@ -155,7 +174,7 @@ pub async fn delete_did(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     did_ops::delete_did(&auth, &state, mnemonic).await?;
     watcher_push::notify_watchers_delete(
         &state.config,
@@ -173,7 +192,7 @@ pub async fn disable_did(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     did_ops::set_did_disabled(&auth, &state, mnemonic, true).await?;
     watcher_push::notify_watchers_did(
         &state.config,
@@ -191,7 +210,7 @@ pub async fn enable_did(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     did_ops::set_did_disabled(&auth, &state, mnemonic, false).await?;
     watcher_push::notify_watchers_did(
         &state.config,
@@ -209,7 +228,7 @@ pub async fn rollback_did(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<Json<DidDetailResponse>, AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     let result = did_ops::rollback_did(&auth, &state, mnemonic).await?;
 
     watcher_push::notify_watchers_did(
@@ -224,17 +243,11 @@ pub async fn rollback_did(
         .get(did_ops::watcher_sync_key(mnemonic))
         .await?;
 
-    Ok(Json(DidDetailResponse {
-        mnemonic: result.record.mnemonic,
-        created_at: result.record.created_at,
-        updated_at: result.record.updated_at,
-        version_count: result.record.version_count,
-        did_id: result.record.did_id,
-        owner: result.record.owner,
-        disabled: result.record.disabled,
-        log: result.log_metadata,
+    Ok(Json(DidDetailResponse::from_record(
+        result.record,
+        result.log_metadata,
         watcher_sync,
-    }))
+    )))
 }
 
 // ---------- GET /raw/{mnemonic} ----------
@@ -244,7 +257,7 @@ pub async fn get_raw_log(
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<(StatusCode, [(axum::http::HeaderName, &'static str); 1], String), AppError> {
-    let mnemonic = mnemonic.trim_start_matches('/');
+    let mnemonic = clean_mnemonic(&mnemonic);
     let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
     Ok((
         StatusCode::OK,

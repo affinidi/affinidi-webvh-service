@@ -86,10 +86,10 @@ export interface AclListResponse {
 }
 
 export interface DidStats {
-  total_resolves: number;
-  total_updates: number;
-  last_resolved_at: number | null;
-  last_updated_at: number | null;
+  totalResolves: number;
+  totalUpdates: number;
+  lastResolvedAt: number | null;
+  lastUpdatedAt: number | null;
 }
 
 export interface ServerStats {
@@ -215,6 +215,33 @@ async function request<T>(
   return res.json() as Promise<T>;
 }
 
+async function requestText(
+  path: string,
+  options: RequestInit = {},
+): Promise<string> {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    ...(options.headers as Record<string, string>),
+  };
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(path, { ...options, headers });
+
+  if (!res.ok) {
+    if (res.status === 401) {
+      clearToken();
+      window.dispatchEvent(new Event("webvh:unauthorized"));
+    }
+    const text = await res.text().catch(() => res.statusText);
+    throw new ApiError(res.status, text);
+  }
+
+  return res.text();
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
 
@@ -267,23 +294,7 @@ export const api = {
   rollbackDid: (mnemonic: string) =>
     request<DidDetailResponse>(`/api/rollback/${mnemonic}`, { method: "POST" }),
 
-  getRawLog: async (mnemonic: string): Promise<string> => {
-    const token = getToken();
-    const headers: Record<string, string> = {};
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-    const res = await fetch(`/api/raw/${mnemonic}`, { headers });
-    if (!res.ok) {
-      if (res.status === 401) {
-        clearToken();
-        window.dispatchEvent(new Event("webvh:unauthorized"));
-      }
-      const text = await res.text().catch(() => res.statusText);
-      throw new ApiError(res.status, text);
-    }
-    return res.text();
-  },
+  getRawLog: (mnemonic: string) => requestText(`/api/raw/${mnemonic}`),
 
   getServices: () => request<ServicesResponse>("/api/services"),
 

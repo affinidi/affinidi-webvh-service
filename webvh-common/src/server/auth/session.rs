@@ -6,7 +6,7 @@ use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Session lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,7 +87,6 @@ pub fn now_epoch() -> u64 {
 }
 
 /// Delete a single session and its refresh index.
-#[allow(dead_code)]
 pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Result<(), AppError> {
     let session: Option<Session> = sessions.get(session_key(session_id)).await?;
     if let Some(session) = session {
@@ -115,7 +114,10 @@ pub async fn cleanup_expired_sessions(
     for (key, value) in entries {
         let session: Session = match serde_json::from_slice(&value) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("skipping malformed session record: {e}");
+                continue;
+            }
         };
 
         let expired = match session.state {

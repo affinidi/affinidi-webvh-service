@@ -36,16 +36,30 @@ const MSG_WITNESS_LIST: &str = "https://affinidi.com/webvh/1.0/witness/list";
 const MSG_WITNESS_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/witness/problem-report";
 
 /// Resolve the actual key IDs from the server's DID document.
-async fn resolve_server_key_ids(server_did: &str) -> (String, String) {
+///
+/// Reuses an existing `DIDCacheClient` when available, falling back to creating
+/// a temporary resolver if `None` is passed.
+async fn resolve_server_key_ids(
+    server_did: &str,
+    existing_resolver: Option<&DIDCacheClient>,
+) -> (String, String) {
     let fallback_signing = format!("{server_did}#key-0");
     let fallback_ka = format!("{server_did}#key-1");
 
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("failed to resolve DID for key IDs: {e} — using fallback");
-            return (fallback_signing, fallback_ka);
-        }
+    // Use the provided resolver, or create a one-shot instance.
+    let owned;
+    let did_resolver = match existing_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to resolve DID for key IDs: {e} — using fallback");
+                return (fallback_signing, fallback_ka);
+            }
+        },
     };
 
     match did_resolver.resolve(server_did).await {
@@ -90,6 +104,7 @@ pub async fn init_didcomm_connection(
     config: &AppConfig,
     server_did: &str,
     secrets: &ServerSecrets,
+    did_resolver: Option<&DIDCacheClient>,
 ) -> Option<(Arc<ATM>, Arc<ATMProfile>)> {
     let mediator_did = match &config.mediator_did {
         Some(did) => did.clone(),
@@ -100,7 +115,7 @@ pub async fn init_didcomm_connection(
     };
 
     // Resolve actual key IDs from the DID document
-    let (signing_kid, ka_kid) = resolve_server_key_ids(server_did).await;
+    let (signing_kid, ka_kid) = resolve_server_key_ids(server_did, did_resolver).await;
 
     // Create TDK shared state
     let tdk = TDKSharedState::default().await;

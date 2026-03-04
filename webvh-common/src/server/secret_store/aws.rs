@@ -93,8 +93,10 @@ impl super::SecretStore for AwsSecretStore {
         &self,
         secrets: &ServerSecrets,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let json_str = serde_json::to_string(secrets).expect("ServerSecrets serialization");
+        let json_str = serde_json::to_string(secrets)
+            .map_err(|e| AppError::Internal(format!("secrets serialization: {e}")));
         Box::pin(async move {
+            let json_str = json_str?;
             let client = self.client().await?;
 
             // Try to update the existing secret first
