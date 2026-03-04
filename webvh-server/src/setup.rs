@@ -451,10 +451,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                         eprintln!("  DID:  {}", result.did_id);
                         eprintln!("  SCID: {}", result.scid);
 
-                        // Update server_did in config
-                        config.server_did = Some(result.did_id);
-                        let toml_str = toml::to_string_pretty(&config)?;
-                        std::fs::write(&output_path, &toml_str)?;
+                        // Update server_did in config (targeted update to preserve secrets)
+                        config.server_did = Some(result.did_id.clone());
+                        update_server_did_in_config(&output_path, &result.did_id)?;
                         eprintln!("  server_did updated in {}", output_path.display());
                     }
                     Err(e) => {
@@ -486,10 +485,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                     eprintln!("  DID:  {}", result.did_id);
                     eprintln!("  SCID: {}", result.scid);
 
-                    // Update server_did in config
-                    config.server_did = Some(result.did_id);
-                    let toml_str = toml::to_string_pretty(&config)?;
-                    std::fs::write(&output_path, &toml_str)?;
+                    // Update server_did in config (targeted update to preserve secrets)
+                    config.server_did = Some(result.did_id.clone());
+                    update_server_did_in_config(&output_path, &result.did_id)?;
                     eprintln!("  server_did updated in {}", output_path.display());
                 }
                 Err(e) => {
@@ -550,6 +548,26 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("    webvh-server --config {}", output_path.display());
     eprintln!();
 
+    Ok(())
+}
+
+/// Update `server_did` in the config file without clobbering other sections
+/// (e.g. `[secrets.plaintext]` written by the plaintext secret store).
+fn update_server_did_in_config(
+    config_path: &PathBuf,
+    server_did: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = std::fs::read_to_string(config_path)?;
+    let mut doc: toml::Value = toml::from_str(&contents)?;
+
+    if let Some(table) = doc.as_table_mut() {
+        table.insert(
+            "server_did".to_string(),
+            toml::Value::String(server_did.to_string()),
+        );
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
     Ok(())
 }
 
