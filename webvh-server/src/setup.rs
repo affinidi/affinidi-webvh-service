@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
+use crate::bootstrap;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
     ServerConfig, StoreConfig,
@@ -334,7 +335,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let secrets_config = configure_secrets()?;
 
     // 11. Build and write config (no key material — secrets live in the secret store)
-    let config = AppConfig {
+    let mut config = AppConfig {
         features: FeaturesConfig {
             didcomm: enable_didcomm,
             rest_api: enable_rest_api,
@@ -375,14 +376,138 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     secret_store.set(&server_secrets).await?;
     eprintln!("  Secrets stored in secret store.");
 
-    // 13. Optional admin bootstrap (only when DIDComm is enabled)
-    if enable_didcomm {
-        let bootstrap = Confirm::new()
+    // 13. Root DID bootstrap
+    if config.public_url.is_some() {
+        eprintln!();
+        let bootstrap_options = &[
+            "Import an existing DID log entry",
+            "Generate a new root DID",
+            "Skip (use `bootstrap-did` later)",
+        ];
+        let bootstrap_idx = Select::new()
+            .with_prompt("Root DID (.well-known) setup")
+            .items(bootstrap_options)
+            .default(1)
+            .interact()?;
+
+        if bootstrap_idx == 0 {
+            // --- Import existing log entry ---
+            eprintln!();
+            eprintln!("  Paste the DID log entry (JSONL format).");
+            eprintln!("  For multiple log entries, paste one per line.");
+            eprintln!("  Enter a blank line when done.");
+            eprintln!();
+
+            let mut lines = Vec::new();
+            loop {
+                let prompt = if lines.is_empty() {
+                    "Log entry"
+                } else {
+                    "Next line (blank to finish)"
+                };
+                let line: String = Input::new()
+                    .with_prompt(prompt)
+                    .allow_empty(true)
+                    .interact_text()?;
+                if line.trim().is_empty() {
+                    break;
+                }
+                lines.push(line);
+            }
+
+            if lines.is_empty() {
+                eprintln!("  No log entry provided, skipping bootstrap.");
+            } else {
+                let jsonl = lines.join("\n");
+
+                // Optionally import witness data
+                let witness_content = if Confirm::new()
+                    .with_prompt("Do you also have a did-witness.json to import?")
+                    .default(false)
+                    .interact()?
+                {
+                    let witness: String = Input::new()
+                        .with_prompt("Paste did-witness.json content")
+                        .interact_text()?;
+                    Some(witness)
+                } else {
+                    None
+                };
+
+                let store = Store::open(&config.store).await?;
+                let dids_ks = store.keyspace("dids")?;
+
+                match bootstrap::import_root_did(
+                    &store,
+                    &dids_ks,
+                    &jsonl,
+                    witness_content.as_deref(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        eprintln!();
+                        eprintln!("  Root DID imported!");
+                        eprintln!("  DID:  {}", result.did_id);
+                        eprintln!("  SCID: {}", result.scid);
+
+                        // Update server_did in config
+                        config.server_did = Some(result.did_id);
+                        let toml_str = toml::to_string_pretty(&config)?;
+                        std::fs::write(&output_path, &toml_str)?;
+                        eprintln!("  server_did updated in {}", output_path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: failed to import root DID: {e}");
+                        eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                    }
+                }
+            }
+        } else if bootstrap_idx == 1 {
+            // --- Generate new root DID ---
+            let signing_secret =
+                Secret::from_multibase(&server_secrets.signing_key, None)
+                    .map_err(|e| format!("invalid signing_key: {e}"))?;
+
+            let store = Store::open(&config.store).await?;
+            let dids_ks = store.keyspace("dids")?;
+
+            match bootstrap::bootstrap_root_did(
+                &store,
+                &dids_ks,
+                &signing_secret,
+                config.public_url.as_deref().unwrap(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    eprintln!();
+                    eprintln!("  Root DID bootstrapped!");
+                    eprintln!("  DID:  {}", result.did_id);
+                    eprintln!("  SCID: {}", result.scid);
+
+                    // Update server_did in config
+                    config.server_did = Some(result.did_id);
+                    let toml_str = toml::to_string_pretty(&config)?;
+                    std::fs::write(&output_path, &toml_str)?;
+                    eprintln!("  server_did updated in {}", output_path.display());
+                }
+                Err(e) => {
+                    eprintln!("  Warning: failed to bootstrap root DID: {e}");
+                    eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                }
+            }
+        }
+    }
+
+    // 14. Optional admin ACL bootstrap
+    if enable_didcomm || config.server_did.is_some() {
+        let add_admin = Confirm::new()
             .with_prompt("Bootstrap an initial admin ACL entry?")
             .default(true)
             .interact()?;
 
-        if bootstrap {
+        if add_admin {
             let admin_did: String = Input::new()
                 .with_prompt("Admin DID")
                 .interact_text()?;
