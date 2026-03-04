@@ -1,52 +1,195 @@
-//! Control plane registration — announces this server to the control plane.
+//! Control plane registration — announces this server to the control plane
+//! using DIDComm challenge-response authentication and reports preloaded DIDs
+//! for synchronisation.
 
-use serde_json::json;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use affinidi_webvh_common::{
+    ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest,
+};
 use tracing::{info, warn};
 
-/// Register this server instance with the control plane.
+use crate::did_ops::{DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl};
+use crate::store::{KeyspaceHandle, Store};
+
+/// Register this server instance with the control plane via DIDComm auth.
 ///
-/// Posts a service registration request using a shared bearer token.
-/// Failures are logged as warnings — registration is never fatal.
+/// 1. Authenticates with the control plane using DIDComm challenge-response
+/// 2. Collects preloaded (system-owned) DIDs from the store
+/// 3. Sends registration request with DID sync data
+/// 4. Applies any DID updates received from the control plane
+///
+/// All failures are logged as warnings — registration is never fatal.
 pub async fn register_with_control(
-    http_client: &reqwest::Client,
     control_url: &str,
-    control_token: &str,
+    server_did: &str,
+    signing_secret: &Secret,
     public_url: &str,
     label: Option<&str>,
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
 ) {
-    let url = format!("{control_url}/api/control/register-service");
-    let body = json!({
-        "serviceType": "server",
-        "url": public_url,
-        "label": label,
-    });
+    // 1. Authenticate with control plane via DIDComm
+    let mut client = ControlClient::new(control_url);
+    if let Err(e) = client.authenticate(server_did, signing_secret).await {
+        warn!(
+            control_url = %control_url,
+            error = %e,
+            "failed to authenticate with control plane"
+        );
+        return;
+    }
 
-    match http_client
-        .post(&url)
-        .bearer_auth(control_token)
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            info!(control_url = %control_url, "registered with control plane");
-        }
+    // 2. Collect preloaded DIDs (system-owned)
+    let preloaded_dids = collect_preloaded_dids(dids_ks).await;
+
+    // 3. Register service with DID sync
+    let req = RegisterServiceRequest {
+        service_type: "server".to_string(),
+        url: public_url.to_string(),
+        label: label.map(String::from),
+        preloaded_dids,
+    };
+
+    match client.register_service(&req).await {
         Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(
+            info!(
                 control_url = %control_url,
-                status = %status,
-                body = %body,
-                "control plane registration failed"
+                instance_id = %resp.instance_id,
+                did_updates = resp.did_updates.len(),
+                "registered with control plane"
             );
+
+            // 4. Apply any DID updates from the control plane
+            if !resp.did_updates.is_empty() {
+                apply_did_updates(dids_ks, store, &resp.did_updates).await;
+            }
         }
         Err(e) => {
             warn!(
                 control_url = %control_url,
                 error = %e,
-                "failed to connect to control plane for registration"
+                "control plane registration failed"
             );
         }
     }
+}
+
+/// Collect all system-owned (preloaded) DIDs from the store.
+async fn collect_preloaded_dids(dids_ks: &KeyspaceHandle) -> Vec<DidSyncEntry> {
+    let entries = match dids_ks.prefix_iter_raw("owner:system:").await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!("failed to iterate system DIDs: {e}");
+            return Vec::new();
+        }
+    };
+
+    let prefix = b"owner:system:";
+    let mut result = Vec::new();
+    for (key, _value) in &entries {
+        // Key format: "owner:system:{mnemonic}"
+        let mnemonic = if key.starts_with(prefix) {
+            match std::str::from_utf8(&key[prefix.len()..]) {
+                Ok(m) => m.to_string(),
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+
+        // Look up the DidRecord to get metadata
+        match dids_ks.get::<DidRecord>(did_key(&mnemonic)).await {
+            Ok(Some(record)) => {
+                result.push(DidSyncEntry {
+                    mnemonic,
+                    did_id: record.did_id,
+                    version_count: record.version_count,
+                    updated_at: record.updated_at,
+                });
+            }
+            Ok(None) => {
+                // Orphaned owner key, skip
+                continue;
+            }
+            Err(e) => {
+                warn!(mnemonic = %mnemonic, error = %e, "failed to read DID record");
+                continue;
+            }
+        }
+    }
+
+    result
+}
+
+/// Apply DID updates received from the control plane.
+///
+/// Each update is validated and stored atomically. Failures are logged
+/// as warnings and do not affect other updates.
+async fn apply_did_updates(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+    updates: &[DidSyncUpdate],
+) {
+    for update in updates {
+        if let Err(e) = apply_single_update(dids_ks, store, update).await {
+            warn!(
+                mnemonic = %update.mnemonic,
+                error = %e,
+                "failed to apply DID sync update"
+            );
+        }
+    }
+}
+
+/// Apply a single DID sync update atomically.
+async fn apply_single_update(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+    update: &DidSyncUpdate,
+) -> Result<(), crate::error::AppError> {
+    use crate::auth::session::now_epoch;
+
+    // Validate the JSONL content
+    validate_did_jsonl(&update.log_content)?;
+
+    let now = now_epoch();
+    let record = DidRecord {
+        owner: "system".to_string(),
+        mnemonic: update.mnemonic.clone(),
+        created_at: now,
+        updated_at: now,
+        version_count: update.version_count,
+        did_id: Some(update.did_id.clone()),
+        content_size: update.log_content.len() as u64,
+        disabled: false,
+    };
+
+    let mut batch = store.batch();
+    batch.insert(dids_ks, did_key(&update.mnemonic), &record)?;
+    batch.insert_raw(
+        dids_ks,
+        content_log_key(&update.mnemonic),
+        update.log_content.as_bytes().to_vec(),
+    );
+    batch.insert_raw(
+        dids_ks,
+        owner_key("system", &update.mnemonic),
+        update.mnemonic.as_bytes().to_vec(),
+    );
+    if let Some(ref witness) = update.witness_content {
+        batch.insert_raw(
+            dids_ks,
+            content_witness_key(&update.mnemonic),
+            witness.as_bytes().to_vec(),
+        );
+    }
+    batch.commit().await?;
+
+    info!(
+        mnemonic = %update.mnemonic,
+        did = %update.did_id,
+        "applied DID sync update from control plane"
+    );
+
+    Ok(())
 }

@@ -48,6 +48,18 @@ enum Command {
         #[arg(short, long)]
         input: String,
     },
+    /// Load a DID at an arbitrary path (e.g., "services/control")
+    LoadDid {
+        /// Path to store the DID at (e.g., "services/control")
+        #[arg(long)]
+        path: String,
+        /// Path to the did.jsonl file
+        #[arg(long)]
+        did_log: PathBuf,
+        /// Optional did-witness.json file
+        #[arg(long)]
+        did_witness: Option<PathBuf>,
+    },
     /// Bootstrap the root DID (.well-known) for this server
     BootstrapDid {
         /// Path to an existing did.jsonl file to import
@@ -105,6 +117,16 @@ async fn main() {
         Some(Command::Restore { input }) => {
             if let Err(e) = backup::run_restore(cli.config, input).await {
                 eprintln!("Restore error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::LoadDid {
+            path,
+            did_log,
+            did_witness,
+        }) => {
+            if let Err(e) = run_load_did(cli.config, path, did_log, did_witness).await {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -222,6 +244,49 @@ async fn run_list_acl(
 
     eprintln!();
     eprintln!("  {} entries total", entries.len());
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_load_did(
+    config_path: Option<PathBuf>,
+    path: String,
+    did_log: PathBuf,
+    did_witness: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    let jsonl = std::fs::read_to_string(&did_log)
+        .map_err(|e| format!("failed to read {}: {e}", did_log.display()))?;
+
+    let witness_content = match &did_witness {
+        Some(wp) => Some(
+            std::fs::read_to_string(wp)
+                .map_err(|e| format!("failed to read {}: {e}", wp.display()))?,
+        ),
+        None => None,
+    };
+
+    let result = bootstrap::import_did_at_path(
+        &store,
+        &dids_ks,
+        &path,
+        &jsonl,
+        witness_content.as_deref(),
+    )
+    .await?;
+
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("  DID loaded at path '{path}'!");
+    eprintln!();
+    eprintln!("  DID:  {}", result.did_id);
+    eprintln!("  SCID: {}", result.scid);
+    eprintln!("  Path: {path}/did.jsonl");
     eprintln!();
 
     Ok(())

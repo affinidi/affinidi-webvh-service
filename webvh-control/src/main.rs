@@ -32,6 +32,21 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Bootstrap all WebVH services via a VTA
+    Bootstrap {
+        /// Admin credential bundle (base64url string)
+        #[arg(long)]
+        admin_bundle: String,
+        /// WebVH server public URL (where DIDs will be published)
+        #[arg(long)]
+        server_url: String,
+        /// VTA URL override (if not in the credential bundle)
+        #[arg(long)]
+        vta_url: Option<String>,
+        /// Output directory for bundles and DID logs
+        #[arg(long, default_value = "./bootstrap-output")]
+        output_dir: PathBuf,
+    },
     /// Create a passkey enrollment invite
     Invite {
         /// DID to invite
@@ -68,6 +83,24 @@ async fn main() {
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
                 eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Bootstrap {
+            admin_bundle,
+            server_url,
+            vta_url,
+            output_dir,
+        }) => {
+            if let Err(e) = affinidi_webvh_control::vta_bootstrap::run_bootstrap(
+                &admin_bundle,
+                &server_url,
+                vta_url.as_deref(),
+                &output_dir,
+            )
+            .await
+            {
+                eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
             }
         }

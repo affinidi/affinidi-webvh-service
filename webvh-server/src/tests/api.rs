@@ -58,7 +58,7 @@ async fn setup() -> TestEnv {
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
         control_url: None,
-        control_token: None,
+        control_did: None,
         config_path: PathBuf::new(),
     };
 

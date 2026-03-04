@@ -32,8 +32,8 @@ pub struct AppConfig {
     pub watchers: Vec<WatcherEndpoint>,
     /// URL of the control plane for service registration.
     pub control_url: Option<String>,
-    /// Bearer token for authenticating with the control plane.
-    pub control_token: Option<String>,
+    /// DID of the control plane service (for DIDComm authentication).
+    pub control_did: Option<String>,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -128,7 +128,7 @@ impl AppConfig {
         env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
         env_opt!("WEBVH_PUBLIC_URL", config.public_url);
         env_opt!("WEBVH_CONTROL_URL", config.control_url);
-        env_opt!("WEBVH_CONTROL_TOKEN", config.control_token);
+        env_opt!("WEBVH_CONTROL_DID", config.control_did);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);

@@ -1,11 +1,9 @@
 //! Service registry API routes.
 
+use affinidi_webvh_common::{DidSyncEntry, DidSyncUpdate, RegisterServiceResponse};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum_extra::TypedHeader;
-use axum_extra::headers::Authorization;
-use axum_extra::headers::authorization::Bearer;
 use serde::Deserialize;
 use tracing::info;
 
@@ -110,31 +108,31 @@ pub async fn health_check(
 
 // ---------- POST /api/control/register-service ----------
 
-/// Token-authenticated service self-registration endpoint.
+/// Request body for `POST /api/control/register-service`.
+/// Extends `RegisterRequest` with DID sync data.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterServiceWithSyncRequest {
+    pub service_type: ServiceType,
+    pub label: Option<String>,
+    pub url: String,
+    #[serde(default)]
+    pub preloaded_dids: Vec<DidSyncEntry>,
+}
+
+/// DIDComm-authenticated service self-registration endpoint.
 ///
 /// Backend services (webvh-server, webvh-witness, etc.) call this on startup
-/// to announce themselves to the control plane. Authentication uses a shared
-/// bearer token configured via `registry.registration_token`.
+/// to announce themselves to the control plane. Authentication uses DIDComm
+/// challenge-response (the calling service must have an ACL entry).
 ///
 /// Idempotent: if an instance with the same URL and service type already
 /// exists, its status is set to Active and the existing record is returned.
 pub async fn register_service(
+    auth: AdminAuth,
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
-    Json(req): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<ServiceInstance>), AppError> {
-    // Validate registration token
-    let expected = state
-        .config
-        .registry
-        .registration_token
-        .as_deref()
-        .ok_or_else(|| AppError::Forbidden("service registration not enabled".into()))?;
-
-    if auth.token() != expected {
-        return Err(AppError::Unauthorized("invalid registration token".into()));
-    }
-
+    Json(req): Json<RegisterServiceWithSyncRequest>,
+) -> Result<(StatusCode, Json<RegisterServiceResponse>), AppError> {
     // Dedup check: look for existing instance with same URL + service_type
     let existing = registry::list_instances(&state.registry_ks).await?;
     if let Some(instance) = existing
@@ -151,20 +149,26 @@ pub async fn register_service(
         )
         .await?;
 
-        let updated = registry::get_instance(&state.registry_ks, &instance.instance_id)
-            .await?
-            .unwrap_or(instance);
-
         info!(
-            instance_id = %updated.instance_id,
-            url = %updated.url,
+            instance_id = %instance.instance_id,
+            url = %instance.url,
+            did = %auth.0.did,
             "service re-registered (existing instance reactivated)"
         );
 
-        return Ok((StatusCode::OK, Json(updated)));
+        let did_updates = compute_did_sync_updates(&state, &req.preloaded_dids).await;
+
+        return Ok((
+            StatusCode::OK,
+            Json(RegisterServiceResponse {
+                instance_id: instance.instance_id,
+                did_updates,
+            }),
+        ));
     }
 
-    // Create new instance
+    // Create new instance — store registering DID in metadata
+    let metadata = serde_json::json!({ "did": auth.0.did });
     let instance = ServiceInstance {
         instance_id: uuid::Uuid::new_v4().to_string(),
         service_type: req.service_type,
@@ -173,7 +177,7 @@ pub async fn register_service(
         status: ServiceStatus::Active,
         last_health_check: None,
         registered_at: crate::auth::session::now_epoch(),
-        metadata: serde_json::Value::Null,
+        metadata,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -181,8 +185,29 @@ pub async fn register_service(
         instance_id = %instance.instance_id,
         url = %instance.url,
         service_type = %instance.service_type,
-        "service registered via token auth"
+        did = %auth.0.did,
+        "service registered via DIDComm auth"
     );
 
-    Ok((StatusCode::CREATED, Json(instance)))
+    let did_updates = compute_did_sync_updates(&state, &req.preloaded_dids).await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterServiceResponse {
+            instance_id: instance.instance_id,
+            did_updates,
+        }),
+    ))
+}
+
+/// Compute DID sync updates for the registering service.
+///
+/// Phase 1 stub: returns empty — sync infrastructure is in place but the
+/// control plane doesn't yet store/resolve DID content. This will be filled
+/// in when the control plane gains DID content awareness.
+async fn compute_did_sync_updates(
+    _state: &AppState,
+    _reported_dids: &[DidSyncEntry],
+) -> Vec<DidSyncUpdate> {
+    Vec::new()
 }

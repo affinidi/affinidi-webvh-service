@@ -189,7 +189,7 @@ impl DaemonConfig {
             limits: self.limits.clone(),
             watchers: self.watchers.clone(),
             control_url: None,
-            control_token: None,
+            control_did: None,
             config_path: self.config_path.clone(),
         }
     }

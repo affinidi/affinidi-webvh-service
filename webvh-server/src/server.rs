@@ -125,19 +125,29 @@ pub async fn run(
             .expect("failed to build HTTP client"),
     };
 
-    // Register with control plane if configured
-    if let (Some(control_url), Some(control_token)) =
-        (&state.config.control_url, &state.config.control_token)
-    {
-        let public_url = state.config.public_url.as_deref().unwrap_or_default();
-        control_register::register_with_control(
-            &state.http_client,
-            control_url,
-            control_token,
-            public_url,
-            None,
-        )
-        .await;
+    // Register with control plane if configured (DIDComm auth)
+    if let Some(control_url) = &state.config.control_url {
+        if let Some(ref server_did) = state.config.server_did {
+            use affinidi_tdk::secrets_resolver::secrets::Secret;
+            match Secret::from_multibase(&secrets.signing_key, None) {
+                Ok(signing_secret) => {
+                    let public_url = state.config.public_url.as_deref().unwrap_or_default();
+                    control_register::register_with_control(
+                        control_url,
+                        server_did,
+                        &signing_secret,
+                        public_url,
+                        None,
+                        &state.dids_ks,
+                        &state.store,
+                    )
+                    .await;
+                }
+                Err(e) => warn!("cannot register with control: {e}"),
+            }
+        } else {
+            warn!("control_url set but server_did missing — skipping registration");
+        }
     }
 
     // Log startup configuration

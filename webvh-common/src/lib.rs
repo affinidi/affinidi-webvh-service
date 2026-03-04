@@ -1,4 +1,5 @@
 mod client;
+mod control_client;
 pub mod did;
 mod error;
 mod types;
@@ -9,6 +10,9 @@ mod witness_client;
 pub mod server;
 
 pub use client::WebVHClient;
+pub use control_client::{
+    ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest, RegisterServiceResponse,
+};
 pub use error::{Result, WebVHError};
 pub use types::*;
 pub use watcher_client::WatcherClient;
