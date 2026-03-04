@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
+use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
 use tracing::debug;
 
 use crate::error::AppError;
@@ -56,6 +57,9 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(mnemonic) = path.strip_suffix("/did.jsonl")
         && !mnemonic.is_empty()
     {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return e.into_response();
+        }
         let key = format!("content:{mnemonic}:log");
         return match serve_content(&state, mnemonic, &key, "application/jsonl+json").await {
             Ok(resp) => resp,
@@ -67,6 +71,9 @@ pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(mnemonic) = path.strip_suffix("/did-witness.json")
         && !mnemonic.is_empty()
     {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return e.into_response();
+        }
         let key = format!("content:{mnemonic}:witness");
         return match serve_content(&state, mnemonic, &key, "application/json").await {
             Ok(resp) => resp,

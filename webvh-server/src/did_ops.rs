@@ -551,6 +551,11 @@ pub async fn upload_witness(
         ));
     }
 
+    // Validate that witness content is well-formed JSON
+    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
+        AppError::Validation(format!("did-witness.json must be valid JSON: {e}"))
+    })?;
+
     let size = witness_content.len();
 
     state

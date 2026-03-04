@@ -5,6 +5,7 @@ use axum::extract::State;
 use tracing::{info, warn};
 
 use affinidi_webvh_common::{ChallengeRequest, ChallengeResponse, ChallengeData};
+use affinidi_webvh_common::server::auth::constant_time_eq;
 
 use crate::auth::session::{self, SessionState, Session, now_epoch};
 use crate::error::AppError;
@@ -15,7 +16,8 @@ pub async fn challenge(
     State(state): State<AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
-    let challenge = uuid::Uuid::new_v4().to_string();
+    let challenge_bytes = rand::random::<[u8; 32]>();
+    let challenge = challenge_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let session = Session {
@@ -86,7 +88,8 @@ pub async fn authenticate(
     if session.state != SessionState::ChallengeSent {
         return Err(AppError::Authentication("session already authenticated".into()));
     }
-    if session.challenge != challenge {
+    if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
+        warn!(session_id, "authentication rejected: challenge mismatch");
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
 
@@ -161,6 +164,12 @@ pub async fn refresh(
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
+    // Verify session is in Authenticated state
+    if session.state != SessionState::Authenticated {
+        warn!(session_id = %session.session_id, "refresh rejected: session not authenticated");
+        return Err(AppError::Authentication("session not authenticated".into()));
+    }
+
     // Check refresh token hasn't expired
     if let Some(expires_at) = session.refresh_expires_at {
         if now_epoch() > expires_at {
@@ -168,6 +177,9 @@ pub async fn refresh(
             return Err(AppError::Authentication("refresh token expired".into()));
         }
     }
+
+    // Invalidate the old session to prevent refresh token reuse
+    session::delete_session(&state.sessions_ks, &session.session_id).await?;
 
     let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
 

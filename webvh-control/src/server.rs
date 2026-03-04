@@ -321,7 +321,8 @@ fn run_rest_thread(
                             .level(Level::INFO)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
-            );
+            )
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers));
 
         let _ = ready_tx.send(());
 

@@ -255,6 +255,7 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
             .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());

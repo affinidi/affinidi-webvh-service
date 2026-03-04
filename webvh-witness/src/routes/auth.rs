@@ -2,10 +2,13 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
+use affinidi_webvh_common::server::auth::constant_time_eq;
+use tracing::warn;
+
 use crate::acl::check_acl;
 use crate::auth::session::{
-    Session, SessionState, create_authenticated_session, finalize_challenge_session, get_session,
-    get_session_by_refresh, now_epoch, store_session,
+    Session, SessionState, create_authenticated_session, delete_session,
+    finalize_challenge_session, get_session, get_session_by_refresh, now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -118,8 +121,9 @@ pub async fn authenticate(
         return Err(AppError::Authentication("invalid session state".into()));
     }
 
-    // Validate challenge
-    if session.challenge != challenge {
+    // Validate challenge (constant-time to prevent timing side-channels)
+    if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
+        warn!(session_id, "authentication rejected: challenge mismatch");
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
 
@@ -131,13 +135,35 @@ pub async fn authenticate(
     let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
 
     if sender_base != session.did {
+        warn!(session_id, sender = %sender_base, expected = %session.did, "authentication rejected: DID mismatch");
         return Err(AppError::Authentication("DID mismatch".into()));
     }
 
-    // Check challenge TTL
+    // Check challenge TTL (saturating_sub to prevent underflow on clock skew)
     let now = now_epoch();
-    if now - session.created_at > state.config.auth.challenge_ttl {
+    let challenge_ttl = state.config.auth.challenge_ttl;
+    if now.saturating_sub(session.created_at) > challenge_ttl {
+        warn!(session_id, "authentication rejected: challenge expired");
         return Err(AppError::Authentication("challenge expired".into()));
+    }
+
+    // Validate DIDComm message created_time to prevent replay attacks
+    let created_time = msg
+        .created_time
+        .ok_or_else(|| AppError::Authentication("message missing created_time".into()))?;
+    if created_time < session.created_at {
+        warn!(session_id, created_time, session_created = session.created_at,
+            "authentication rejected: message created_time before challenge");
+        return Err(AppError::Authentication(
+            "message created_time is before the challenge was issued".into(),
+        ));
+    }
+    if now.saturating_sub(created_time) > challenge_ttl {
+        warn!(session_id, created_time, now, challenge_ttl,
+            "authentication rejected: message created_time outside challenge TTL");
+        return Err(AppError::Authentication(
+            "message created_time is outside the challenge TTL window".into(),
+        ));
     }
 
     // Re-check ACL for current role
@@ -217,6 +243,9 @@ pub async fn refresh(
 
     // Re-check ACL
     let role = check_acl(&state.acl_ks, &session.did).await?;
+
+    // Invalidate the old session to prevent refresh token reuse
+    delete_session(&state.sessions_ks, &session.session_id).await?;
 
     let token_response = create_authenticated_session(
         &state.sessions_ks,

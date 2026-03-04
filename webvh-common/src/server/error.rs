@@ -123,9 +123,12 @@ impl IntoResponse for AppError {
 
         if status.is_server_error() {
             warn!(status = %status.as_u16(), error = %self, "server error");
-        } else {
-            debug!(status = %status.as_u16(), error = %self, "client error");
+            // Do not leak internal details to clients for 5xx errors
+            let body = serde_json::json!({ "error": "internal server error" });
+            return (status, axum::Json(body)).into_response();
         }
+
+        debug!(status = %status.as_u16(), error = %self, "client error");
 
         let body = serde_json::json!({ "error": self.to_string() });
         (status, axum::Json(body)).into_response()

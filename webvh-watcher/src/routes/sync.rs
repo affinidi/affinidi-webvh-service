@@ -3,9 +3,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::extract::FromRequestParts;
-use tracing::info;
+use tracing::{info, warn};
 
 use affinidi_webvh_common::{SyncDidRequest, SyncDeleteRequest};
+use affinidi_webvh_common::server::auth::constant_time_eq;
+use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::watcher_ops::{self, WatcherRecord};
@@ -28,7 +30,9 @@ impl FromRequestParts<AppState> for SyncAuth {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AppError::Authentication("missing sync token".into()))?;
 
-        if state.config.sync.push_tokens.iter().any(|t| t == token) {
+        if state.config.sync.push_tokens.iter().any(|t| {
+            constant_time_eq(t.as_bytes(), token.as_bytes())
+        }) {
             Ok(SyncAuth)
         } else {
             Err(AppError::Authentication("invalid sync token".into()))
@@ -45,6 +49,22 @@ pub async fn receive_did(
     _auth: SyncAuth,
     Json(req): Json<SyncDidRequest>,
 ) -> Result<StatusCode, AppError> {
+    // Validate mnemonic format to prevent store key injection
+    validate_mnemonic(&req.mnemonic)?;
+
+    // Validate log content is well-formed JSONL
+    if req.log_content.is_empty() {
+        return Err(AppError::Validation("log_content cannot be empty".into()));
+    }
+    for line in req.log_content.lines() {
+        if !line.is_empty() {
+            serde_json::from_str::<serde_json::Value>(line).map_err(|e| {
+                warn!(mnemonic = %req.mnemonic, error = %e, "invalid JSONL in sync push");
+                AppError::Validation(format!("invalid JSONL line: {e}"))
+            })?;
+        }
+    }
+
     let record = WatcherRecord {
         mnemonic: req.mnemonic.clone(),
         did_id: req.did_id,
@@ -84,6 +104,9 @@ pub async fn receive_delete(
     _auth: SyncAuth,
     Json(req): Json<SyncDeleteRequest>,
 ) -> Result<StatusCode, AppError> {
+    // Validate mnemonic format
+    validate_mnemonic(&req.mnemonic)?;
+
     watcher_ops::delete_record(&state.dids_ks, &req.mnemonic).await?;
 
     info!(mnemonic = %req.mnemonic, source = %req.source_url, "DID deleted via sync");

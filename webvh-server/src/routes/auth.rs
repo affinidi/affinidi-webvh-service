@@ -9,6 +9,8 @@ use affinidi_webvh_common::{
     RefreshResponse,
 };
 
+use affinidi_webvh_common::server::auth::constant_time_eq;
+
 use crate::acl::check_acl;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::{
@@ -18,18 +20,6 @@ use crate::auth::session::{
 use crate::error::AppError;
 use crate::server::AppState;
 use tracing::{info, warn};
-
-/// Constant-time comparison to prevent timing side-channels on challenge values.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
 
 // ---------- POST /auth/challenge ----------
 

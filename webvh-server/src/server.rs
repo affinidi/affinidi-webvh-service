@@ -111,7 +111,12 @@ pub async fn run(
         did_resolver,
         secrets_resolver,
         jwt_keys,
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build HTTP client"),
     };
 
     // Log startup configuration
@@ -303,7 +308,8 @@ fn run_rest_thread(
                             .level(Level::INFO)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
-            );
+            )
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers));
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());

@@ -197,8 +197,15 @@ impl KeyspaceHandle {
         }
     }
 
-    /// Atomically get and remove a key.
+    /// Get and remove a key.
     /// Returns the deserialized value if the key existed, or `None`.
+    ///
+    /// **Note:** This is not truly atomic — the get and remove are two
+    /// separate operations. Under concurrent access, two callers could
+    /// both read the value before either removes it (TOCTOU race).
+    /// For single-threaded runtimes this is safe; for multi-worker or
+    /// distributed deployments, consider backend-specific atomic
+    /// delete-and-return operations.
     pub async fn take<V: DeserializeOwned + Send + 'static>(
         &self,
         key: impl Into<Vec<u8>>,

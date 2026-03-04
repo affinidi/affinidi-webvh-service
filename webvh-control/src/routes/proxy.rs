@@ -5,14 +5,18 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use tracing::debug;
 
+use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::registry;
 use crate::server::AppState;
 
 /// ANY /api/server/{instance_id}/{*path}
 /// ANY /api/witness/{instance_id}/{*path}
+///
+/// Requires authentication to prevent SSRF via the proxy.
 pub async fn proxy_to_service(
     State(state): State<AppState>,
+    _auth: AuthClaims,
     Path((instance_id, path)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Result<Response, AppError> {

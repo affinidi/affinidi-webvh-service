@@ -136,6 +136,21 @@ pub async fn cleanup_expired_sessions(
         }
     }
 
+    // Clean up expired enrollment tokens (have an `expires_at` field).
+    let enrollments = sessions.prefix_iter_raw("enroll:").await?;
+    for (key, value) in enrollments {
+        #[derive(serde::Deserialize)]
+        struct EnrollmentExpiry {
+            expires_at: u64,
+        }
+        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value) {
+            if now > e.expires_at {
+                sessions.remove(key).await?;
+                removed += 1;
+            }
+        }
+    }
+
     debug!(removed, "session cleanup complete");
 
     Ok(())

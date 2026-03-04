@@ -226,6 +226,7 @@ async fn expired_token_returns_401() {
         session_id: "sess-expired".into(),
         role: "owner".into(),
         exp: now_epoch().saturating_sub(10),
+        iat: now_epoch().saturating_sub(20),
     };
     let token = env.jwt_keys.encode(&claims).unwrap();
 

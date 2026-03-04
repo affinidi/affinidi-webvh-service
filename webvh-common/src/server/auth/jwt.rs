@@ -12,6 +12,9 @@ pub struct Claims {
     pub session_id: String,
     pub role: String,
     pub exp: u64,
+    /// Issued-at timestamp (RFC 7519 §4.1.6).
+    #[serde(default)]
+    pub iat: u64,
 }
 
 /// Holds the JWT encoding and decoding keys derived from an Ed25519 seed.
@@ -76,18 +79,18 @@ impl JwtKeys {
         role: String,
         expiry_secs: u64,
     ) -> Claims {
-        let exp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-            + expiry_secs;
+            .as_secs();
 
         Claims {
             aud: "WebVH".to_string(),
             sub,
             session_id,
             role,
-            exp,
+            exp: now + expiry_secs,
+            iat: now,
         }
     }
 }

@@ -283,8 +283,14 @@ async fn dispatch_message(
 
     let result: Result<(String, Value), AppError> = match msg.type_.as_str() {
         MSG_AUTHENTICATE => handle_authenticate(state, server_did, msg).await,
-        MSG_WITNESS_PROOF_REQUEST => handle_proof_request(state, msg).await,
-        MSG_WITNESS_LIST_REQUEST => handle_list_request(state).await,
+        MSG_WITNESS_PROOF_REQUEST => match check_acl(&state.acl_ks, sender_base).await {
+            Ok(_) => handle_proof_request(state, msg).await,
+            Err(e) => Err(e),
+        },
+        MSG_WITNESS_LIST_REQUEST => match check_acl(&state.acl_ks, sender_base).await {
+            Ok(_) => handle_list_request(state).await,
+            Err(e) => Err(e),
+        },
         other => {
             warn!(type_ = %other, "unknown DIDComm message type");
             Ok((
