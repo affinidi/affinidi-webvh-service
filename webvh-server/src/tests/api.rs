@@ -56,6 +56,9 @@ async fn setup() -> TestEnv {
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        watchers: Vec::new(),
+        control_url: None,
+        control_token: None,
         config_path: PathBuf::new(),
     };
 

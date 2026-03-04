@@ -1,7 +1,9 @@
 pub mod acl;
 pub mod auth;
 pub mod backup;
+pub mod bootstrap;
 pub mod config;
+pub mod control_register;
 pub mod did_ops;
 pub mod error;
 pub mod messaging;

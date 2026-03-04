@@ -51,6 +51,9 @@ pub struct RegistryConfig {
     pub instances: Vec<InstanceConfig>,
     #[serde(default = "default_health_check_interval")]
     pub health_check_interval: u64,
+    /// Shared token that backend services present to register themselves.
+    /// If `None`, the `register-service` endpoint is disabled.
+    pub registration_token: Option<String>,
 }
 
 impl Default for RegistryConfig {
@@ -58,6 +61,7 @@ impl Default for RegistryConfig {
         Self {
             instances: Vec::new(),
             health_check_interval: default_health_check_interval(),
+            registration_token: None,
         }
     }
 }
@@ -127,6 +131,10 @@ impl AppConfig {
         env_parse!(
             "CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL",
             config.registry.health_check_interval
+        );
+        env_opt!(
+            "CONTROL_REGISTRATION_TOKEN",
+            config.registry.registration_token
         );
 
         // Normalize: strip trailing slashes from public_url

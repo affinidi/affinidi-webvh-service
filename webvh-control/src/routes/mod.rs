@@ -20,6 +20,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/registry/{instance_id}/health",
             post(registry::health_check),
+        )
+        .route(
+            "/register-service",
+            post(registry::register_service),
         );
 
     let api = Router::new()

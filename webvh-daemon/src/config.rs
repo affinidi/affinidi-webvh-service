@@ -188,6 +188,8 @@ impl DaemonConfig {
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
             watchers: self.watchers.clone(),
+            control_url: None,
+            control_token: None,
             config_path: self.config_path.clone(),
         }
     }

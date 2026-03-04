@@ -355,6 +355,8 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         secrets: secrets_config,
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
+        control_url: None,
+        control_token: None,
         config_path: output_path.clone(),
     };
 

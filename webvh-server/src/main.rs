@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_server::config::{AppConfig, LogFormat};
-use affinidi_webvh_server::{backup, secret_store, server, setup, store};
+use affinidi_webvh_server::{backup, bootstrap, secret_store, server, setup, store};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -48,6 +48,15 @@ enum Command {
         #[arg(short, long)]
         input: String,
     },
+    /// Bootstrap the root DID (.well-known) for this server
+    BootstrapDid {
+        /// Witness service URL for requesting a proof
+        #[arg(long)]
+        witness_url: Option<String>,
+        /// Witness ID to use when requesting a proof
+        #[arg(long)]
+        witness_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +99,15 @@ async fn main() {
         Some(Command::Restore { input }) => {
             if let Err(e) = backup::run_restore(cli.config, input).await {
                 eprintln!("Restore error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::BootstrapDid {
+            witness_url,
+            witness_id,
+        }) => {
+            if let Err(e) = run_bootstrap_did(cli.config, witness_url, witness_id).await {
+                eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
             }
         }
@@ -195,6 +213,109 @@ async fn run_list_acl(
     eprintln!();
     eprintln!("  {} entries total", entries.len());
     eprintln!();
+
+    Ok(())
+}
+
+async fn run_bootstrap_did(
+    config_path: Option<PathBuf>,
+    witness_url: Option<String>,
+    witness_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let config = AppConfig::load(config_path)?;
+
+    let public_url = config
+        .public_url
+        .as_deref()
+        .ok_or("public_url must be set in config for bootstrap")?;
+
+    // Load secrets
+    let secret_store = secret_store::create_secret_store(&config)?;
+    let secrets = secret_store
+        .get()
+        .await?
+        .ok_or("no secrets found — run `webvh-server setup` first")?;
+
+    let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
+        .map_err(|e| format!("invalid signing_key: {e}"))?;
+
+    let store = store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    // Check if root DID already exists
+    if bootstrap::root_did_exists(&dids_ks).await? {
+        eprintln!();
+        eprintln!("  Root DID (.well-known) already exists.");
+        eprintln!("  No action taken.");
+        eprintln!();
+        return Ok(());
+    }
+
+    let result = bootstrap::bootstrap_root_did(&store, &dids_ks, &signing_secret, public_url).await?;
+
+    // Optional: request witness proof
+    if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
+        use affinidi_webvh_common::WitnessClient;
+
+        eprintln!("  Requesting witness proof...");
+        eprintln!("  NOTE: the server must be running (on another process) for the");
+        eprintln!("  witness to resolve the DID during authentication.");
+        eprintln!();
+
+        let mut witness_client = WitnessClient::new(&w_url);
+        if let Err(e) = witness_client
+            .authenticate(&result.did_id, &signing_secret)
+            .await
+        {
+            eprintln!("  Warning: witness authentication failed: {e}");
+            eprintln!("  The DID was created but has no witness proof.");
+        } else {
+            // Extract versionId from the JSONL
+            let version_id = result
+                .jsonl
+                .lines()
+                .last()
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .and_then(|v| v.get("versionId").and_then(|id| id.as_str()).map(String::from));
+
+            if let Some(vid) = version_id {
+                match witness_client.request_proof(&w_id, &vid).await {
+                    Ok(proof) => {
+                        let proof_json = serde_json::to_string(&proof)?;
+                        dids_ks
+                            .insert_raw(
+                                affinidi_webvh_server::did_ops::content_witness_key(".well-known"),
+                                proof_json.into_bytes(),
+                            )
+                            .await?;
+                        eprintln!("  Witness proof stored.");
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: witness proof request failed: {e}");
+                    }
+                }
+            } else {
+                eprintln!("  Warning: could not extract versionId for witness proof.");
+            }
+        }
+    }
+
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("  Root DID bootstrapped!");
+    eprintln!();
+    eprintln!("  DID:   {}", result.did_id);
+    eprintln!("  SCID:  {}", result.scid);
+    eprintln!("  JSONL: {public_url}/.well-known/did.jsonl");
+    eprintln!();
+    if config.server_did.is_none() {
+        eprintln!("  Hint: set server_did in your config.toml:");
+        eprintln!("    server_did = \"{}\"", result.did_id);
+        eprintln!();
+    }
 
     Ok(())
 }

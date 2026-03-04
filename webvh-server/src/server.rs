@@ -7,7 +7,9 @@ use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
+use crate::bootstrap;
 use crate::config::{AppConfig, AuthConfig};
+use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
 use crate::error::AppError;
 use crate::messaging;
@@ -75,6 +77,9 @@ pub async fn run(
     let dids_ks = store.keyspace("dids")?;
     let stats_ks = store.keyspace("stats")?;
 
+    // Auto-bootstrap the root DID if public_url is set and no .well-known exists yet
+    let config = auto_bootstrap_root_did(config, &store, &dids_ks, &secrets).await;
+
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
 
@@ -118,6 +123,21 @@ pub async fn run(
             .build()
             .expect("failed to build HTTP client"),
     };
+
+    // Register with control plane if configured
+    if let (Some(control_url), Some(control_token)) =
+        (&state.config.control_url, &state.config.control_token)
+    {
+        let public_url = state.config.public_url.as_deref().unwrap_or_default();
+        control_register::register_with_control(
+            &state.http_client,
+            control_url,
+            control_token,
+            public_url,
+            None,
+        )
+        .await;
+    }
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -531,6 +551,62 @@ async fn init_didcomm_auth(
         Some(did_resolver),
         Some(Arc::new(secrets_resolver)),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Auto-bootstrap
+// ---------------------------------------------------------------------------
+
+/// Attempt to bootstrap the root DID on startup if conditions are met:
+/// - `public_url` is configured
+/// - `.well-known` doesn't already exist
+///
+/// All failures are logged as warnings — server starts regardless.
+/// Takes `config` by value and returns it (possibly with `server_did` set).
+async fn auto_bootstrap_root_did(
+    mut config: AppConfig,
+    store: &Store,
+    dids_ks: &KeyspaceHandle,
+    secrets: &ServerSecrets,
+) -> AppConfig {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let public_url = match &config.public_url {
+        Some(url) => url.clone(),
+        None => return config,
+    };
+
+    match bootstrap::root_did_exists(dids_ks).await {
+        Ok(true) => return config,
+        Ok(false) => {}
+        Err(e) => {
+            warn!("auto-bootstrap: failed to check root DID: {e}");
+            return config;
+        }
+    }
+
+    let signing_secret = match Secret::from_multibase(&secrets.signing_key, None) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("auto-bootstrap: failed to decode signing key: {e}");
+            return config;
+        }
+    };
+
+    match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, &public_url).await {
+        Ok(result) => {
+            info!(did = %result.did_id, "auto-bootstrapped root DID");
+            if config.server_did.is_none() {
+                info!("setting server_did to bootstrapped DID");
+                config.server_did = Some(result.did_id);
+            }
+        }
+        Err(e) => {
+            warn!("auto-bootstrap: failed to create root DID: {e}");
+        }
+    }
+
+    config
 }
 
 /// Decode a multibase-encoded Ed25519 private key to raw 32 bytes.

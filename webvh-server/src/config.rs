@@ -30,6 +30,10 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub watchers: Vec<WatcherEndpoint>,
+    /// URL of the control plane for service registration.
+    pub control_url: Option<String>,
+    /// Bearer token for authenticating with the control plane.
+    pub control_token: Option<String>,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -123,14 +127,20 @@ impl AppConfig {
         env_opt!("WEBVH_SERVER_DID", config.server_did);
         env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
         env_opt!("WEBVH_PUBLIC_URL", config.public_url);
+        env_opt!("WEBVH_CONTROL_URL", config.control_url);
+        env_opt!("WEBVH_CONTROL_TOKEN", config.control_token);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
 
-        // Normalize: strip trailing slashes from public_url
+        // Normalize: strip trailing slashes from URLs
         if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+        if let Some(ref mut url) = config.control_url {
             let trimmed = url.trim_end_matches('/').to_string();
             *url = trimmed;
         }
