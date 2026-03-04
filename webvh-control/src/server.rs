@@ -80,6 +80,14 @@ impl PasskeyState for AppState {
     fn refresh_token_expiry(&self) -> u64 {
         self.config.auth.refresh_token_expiry
     }
+
+    fn public_url(&self) -> Option<&str> {
+        self.config.public_url.as_deref()
+    }
+
+    fn enrollment_ttl(&self) -> u64 {
+        self.config.auth.passkey_enrollment_ttl
+    }
 }
 
 pub async fn run(

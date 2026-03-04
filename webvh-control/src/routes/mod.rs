@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish::<AppState>))
         .route("/auth/passkey/login/start", post(passkey::login_start::<AppState>))
         .route("/auth/passkey/login/finish", post(passkey::login_finish::<AppState>))
+        .route("/auth/passkey/invite", post(passkey::create_invite::<AppState>))
         // ACL
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route(
