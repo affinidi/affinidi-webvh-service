@@ -47,6 +47,32 @@ pub trait SecretStore: Send + Sync {
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>>;
 }
 
+/// Returns `true` when the plaintext fallback backend will actually be used.
+///
+/// This mirrors the selection logic in [`create_secret_store`] so that callers
+/// can emit warnings only when plaintext is the *active* backend — not merely
+/// because a `[secrets.plaintext]` section exists in the config file.
+#[allow(unused_variables)]
+pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
+    #[cfg(feature = "aws-secrets")]
+    if secrets.aws_secret_name.is_some() {
+        return false;
+    }
+
+    #[cfg(feature = "gcp-secrets")]
+    if secrets.gcp_secret_name.is_some() {
+        return false;
+    }
+
+    #[cfg(feature = "keyring")]
+    {
+        return false;
+    }
+
+    #[allow(unreachable_code)]
+    true
+}
+
 /// Create a secret store backend based on compiled features and configuration.
 ///
 /// Priority:

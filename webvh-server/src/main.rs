@@ -240,7 +240,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         }
     };
 
-    if config.secrets.plaintext.is_some() {
+    if secret_store::is_plaintext_backend(&config.secrets) {
         tracing::warn!("============================================================");
         tracing::warn!("  PLAINTEXT SECRETS MODE - INSECURE");
         tracing::warn!("  Server secrets are stored as plaintext in the config file.");
