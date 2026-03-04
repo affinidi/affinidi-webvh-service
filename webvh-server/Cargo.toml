@@ -15,18 +15,19 @@ build = "build.rs"
 
 [features]
 default = ["keyring", "store-fjall"]
-keyring = ["dep:keyring"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
+keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
   "dep:bytes",
+  "affinidi-webvh-common/gcp-secrets",
 ]
 store-fjall = ["dep:fjall"]
-store-redis = ["dep:redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
-store-firestore = ["dep:firestore", "dep:futures"]
-store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+store-redis = ["dep:redis", "affinidi-webvh-common/store-redis"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "affinidi-webvh-common/store-dynamodb"]
+store-firestore = ["dep:firestore", "dep:futures", "affinidi-webvh-common/store-firestore"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "affinidi-webvh-common/store-cosmosdb"]
 
 [lib]
 name = "affinidi_webvh_server"

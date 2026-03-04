@@ -49,11 +49,12 @@ pub trait SecretStore: Send + Sync {
 
 /// Returns `true` when the plaintext fallback backend will actually be used.
 ///
-/// This mirrors the selection logic in [`create_secret_store`] so that callers
-/// can emit warnings only when plaintext is the *active* backend — not merely
-/// because a `[secrets.plaintext]` section exists in the config file.
+/// This mirrors the priority logic in [`create_secret_store`]: AWS → GCP →
+/// keyring → plaintext. Returns `true` only when no higher-priority backend
+/// is both compiled in and configured.
 #[allow(unused_variables)]
 pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
+    // If any secure backend is compiled in AND would be selected, not plaintext.
     #[cfg(feature = "aws-secrets")]
     if secrets.aws_secret_name.is_some() {
         return false;
@@ -64,11 +65,14 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
         return false;
     }
 
+    // Keyring is only used when compiled in AND no cloud backend was selected above.
+    // But it is unconditionally preferred over plaintext when compiled in.
     #[cfg(feature = "keyring")]
     {
         return false;
     }
 
+    // No secure backend compiled in — plaintext fallback will be used.
     #[allow(unreachable_code)]
     true
 }
