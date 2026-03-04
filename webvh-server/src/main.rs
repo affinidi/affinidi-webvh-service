@@ -50,10 +50,16 @@ enum Command {
     },
     /// Bootstrap the root DID (.well-known) for this server
     BootstrapDid {
-        /// Witness service URL for requesting a proof
+        /// Path to an existing did.jsonl file to import
+        #[arg(long)]
+        did_log: Option<PathBuf>,
+        /// Path to an existing did-witness.json file to import (requires --did-log)
+        #[arg(long)]
+        did_witness: Option<PathBuf>,
+        /// Witness service URL for requesting a proof (auto-bootstrap only)
         #[arg(long)]
         witness_url: Option<String>,
-        /// Witness ID to use when requesting a proof
+        /// Witness ID to use when requesting a proof (auto-bootstrap only)
         #[arg(long)]
         witness_id: Option<String>,
     },
@@ -103,10 +109,14 @@ async fn main() {
             }
         }
         Some(Command::BootstrapDid {
+            did_log,
+            did_witness,
             witness_url,
             witness_id,
         }) => {
-            if let Err(e) = run_bootstrap_did(cli.config, witness_url, witness_id).await {
+            if let Err(e) =
+                run_bootstrap_did(cli.config, did_log, did_witness, witness_url, witness_id).await
+            {
                 eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
             }
@@ -219,10 +229,16 @@ async fn run_list_acl(
 
 async fn run_bootstrap_did(
     config_path: Option<PathBuf>,
+    did_log: Option<PathBuf>,
+    did_witness: Option<PathBuf>,
     witness_url: Option<String>,
     witness_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    if did_witness.is_some() && did_log.is_none() {
+        return Err("--did-witness requires --did-log".into());
+    }
 
     let config = AppConfig::load(config_path)?;
 
@@ -230,16 +246,6 @@ async fn run_bootstrap_did(
         .public_url
         .as_deref()
         .ok_or("public_url must be set in config for bootstrap")?;
-
-    // Load secrets
-    let secret_store = secret_store::create_secret_store(&config)?;
-    let secrets = secret_store
-        .get()
-        .await?
-        .ok_or("no secrets found — run `webvh-server setup` first")?;
-
-    let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
-        .map_err(|e| format!("invalid signing_key: {e}"))?;
 
     let store = store::Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
@@ -253,54 +259,100 @@ async fn run_bootstrap_did(
         return Ok(());
     }
 
-    let result = bootstrap::bootstrap_root_did(&store, &dids_ks, &signing_secret, public_url).await?;
+    let result = if let Some(log_path) = did_log {
+        // Import from existing files
+        let jsonl = std::fs::read_to_string(&log_path)
+            .map_err(|e| format!("failed to read {}: {e}", log_path.display()))?;
 
-    // Optional: request witness proof
-    if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
-        use affinidi_webvh_common::WitnessClient;
+        let witness_content = match &did_witness {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
 
-        eprintln!("  Requesting witness proof...");
-        eprintln!("  NOTE: the server must be running (on another process) for the");
-        eprintln!("  witness to resolve the DID during authentication.");
-        eprintln!();
+        let result = bootstrap::import_root_did(
+            &store,
+            &dids_ks,
+            &jsonl,
+            witness_content.as_deref(),
+        )
+        .await?;
 
-        let mut witness_client = WitnessClient::new(&w_url);
-        if let Err(e) = witness_client
-            .authenticate(&result.did_id, &signing_secret)
-            .await
-        {
-            eprintln!("  Warning: witness authentication failed: {e}");
-            eprintln!("  The DID was created but has no witness proof.");
-        } else {
-            // Extract versionId from the JSONL
-            let version_id = result
-                .jsonl
-                .lines()
-                .last()
-                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .and_then(|v| v.get("versionId").and_then(|id| id.as_str()).map(String::from));
+        if did_witness.is_some() {
+            eprintln!("  Witness data imported.");
+        }
 
-            if let Some(vid) = version_id {
-                match witness_client.request_proof(&w_id, &vid).await {
-                    Ok(proof) => {
-                        let proof_json = serde_json::to_string(&proof)?;
-                        dids_ks
-                            .insert_raw(
-                                affinidi_webvh_server::did_ops::content_witness_key(".well-known"),
-                                proof_json.into_bytes(),
-                            )
-                            .await?;
-                        eprintln!("  Witness proof stored.");
-                    }
-                    Err(e) => {
-                        eprintln!("  Warning: witness proof request failed: {e}");
-                    }
-                }
+        result
+    } else {
+        // Auto-bootstrap: generate a new root DID
+        let secret_store = secret_store::create_secret_store(&config)?;
+        let secrets = secret_store
+            .get()
+            .await?
+            .ok_or("no secrets found — run `webvh-server setup` first")?;
+
+        let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
+            .map_err(|e| format!("invalid signing_key: {e}"))?;
+
+        let result =
+            bootstrap::bootstrap_root_did(&store, &dids_ks, &signing_secret, public_url).await?;
+
+        // Optional: request witness proof
+        if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
+            use affinidi_webvh_common::WitnessClient;
+
+            eprintln!("  Requesting witness proof...");
+            eprintln!("  NOTE: the server must be running (on another process) for the");
+            eprintln!("  witness to resolve the DID during authentication.");
+            eprintln!();
+
+            let mut witness_client = WitnessClient::new(&w_url);
+            if let Err(e) = witness_client
+                .authenticate(&result.did_id, &signing_secret)
+                .await
+            {
+                eprintln!("  Warning: witness authentication failed: {e}");
+                eprintln!("  The DID was created but has no witness proof.");
             } else {
-                eprintln!("  Warning: could not extract versionId for witness proof.");
+                let version_id = result
+                    .jsonl
+                    .lines()
+                    .last()
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|v| {
+                        v.get("versionId")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    });
+
+                if let Some(vid) = version_id {
+                    match witness_client.request_proof(&w_id, &vid).await {
+                        Ok(proof) => {
+                            let proof_json = serde_json::to_string(&proof)?;
+                            dids_ks
+                                .insert_raw(
+                                    affinidi_webvh_server::did_ops::content_witness_key(
+                                        ".well-known",
+                                    ),
+                                    proof_json.into_bytes(),
+                                )
+                                .await?;
+                            eprintln!("  Witness proof stored.");
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: witness proof request failed: {e}");
+                        }
+                    }
+                } else {
+                    eprintln!("  Warning: could not extract versionId for witness proof.");
+                }
             }
         }
-    }
+
+        result
+    };
 
     store.persist().await?;
 

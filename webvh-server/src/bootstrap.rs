@@ -8,7 +8,10 @@ use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_ho
 use tracing::info;
 
 use crate::auth::session::now_epoch;
-use crate::did_ops::{DidRecord, content_log_key, did_key, extract_did_id, owner_key};
+use crate::did_ops::{
+    DidRecord, content_log_key, content_witness_key, did_key, extract_did_id, owner_key,
+    validate_did_jsonl,
+};
 use crate::error::AppError;
 use crate::store::{KeyspaceHandle, Store};
 
@@ -91,6 +94,89 @@ pub async fn bootstrap_root_did(
         scid,
         did_id,
         jsonl,
+        mnemonic,
+    })
+}
+
+/// Import an existing `.well-known` root DID from provided JSONL content.
+///
+/// Validates the JSONL, extracts the DID id and SCID, and stores everything
+/// atomically. Optionally stores witness content alongside the log.
+pub async fn import_root_did(
+    store: &Store,
+    dids_ks: &KeyspaceHandle,
+    jsonl: &str,
+    witness_content: Option<&str>,
+) -> Result<BootstrapResult, AppError> {
+    // Guard: must not already exist
+    if root_did_exists(dids_ks).await? {
+        return Err(AppError::Conflict(
+            "root DID (.well-known) already exists".into(),
+        ));
+    }
+
+    // Validate the JSONL content
+    validate_did_jsonl(jsonl)?;
+
+    let did_id = extract_did_id(jsonl)
+        .ok_or_else(|| AppError::Validation("could not extract DID id from did.jsonl".into()))?;
+
+    // Extract SCID from the DID id (did:webvh:<scid>:host:...)
+    let scid = did_id
+        .strip_prefix("did:webvh:")
+        .and_then(|rest| rest.split(':').next())
+        .ok_or_else(|| AppError::Validation("could not extract SCID from DID id".into()))?
+        .to_string();
+
+    // Validate witness content is valid JSON if provided
+    if let Some(witness) = witness_content {
+        serde_json::from_str::<serde_json::Value>(witness).map_err(|e| {
+            AppError::Validation(format!("did-witness.json must be valid JSON: {e}"))
+        })?;
+    }
+
+    let mnemonic = ".well-known".to_string();
+    let now = now_epoch();
+    let version_count = jsonl.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+
+    let record = DidRecord {
+        owner: "system".to_string(),
+        mnemonic: mnemonic.clone(),
+        created_at: now,
+        updated_at: now,
+        version_count,
+        did_id: Some(did_id.clone()),
+        content_size: jsonl.len() as u64,
+        disabled: false,
+    };
+
+    let mut batch = store.batch();
+    batch.insert(dids_ks, did_key(&mnemonic), &record)?;
+    batch.insert_raw(
+        dids_ks,
+        content_log_key(&mnemonic),
+        jsonl.as_bytes().to_vec(),
+    );
+    batch.insert_raw(
+        dids_ks,
+        owner_key("system", &mnemonic),
+        mnemonic.as_bytes().to_vec(),
+    );
+    if let Some(witness) = witness_content {
+        batch.insert_raw(
+            dids_ks,
+            content_witness_key(&mnemonic),
+            witness.as_bytes().to_vec(),
+        );
+    }
+    batch.commit().await?;
+
+    info!(did = %did_id, scid = %scid, "root DID imported from files");
+
+    Ok(BootstrapResult {
+        scid,
+        did_id,
+        jsonl: jsonl.to_string(),
         mnemonic,
     })
 }
