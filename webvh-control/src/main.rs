@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_control::config::AppConfig;
-use affinidi_webvh_control::{server, setup, store, secret_store};
+use affinidi_webvh_control::{health, server, setup, store, secret_store};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,6 +18,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
     /// Add an ACL entry
     AddAcl {
         /// DID to add to the ACL
@@ -56,6 +58,12 @@ async fn main() {
         Some(Command::Setup) => {
             if let Err(e) = setup::run_setup().await {
                 eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Health) => {
+            if let Err(e) = health::run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
                 std::process::exit(1);
             }
         }

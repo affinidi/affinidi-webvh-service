@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_witness::config::AppConfig;
-use affinidi_webvh_witness::{secret_store, server, setup, store, witness_ops};
+use affinidi_webvh_witness::{health, secret_store, server, setup, store, witness_ops};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,6 +18,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
     /// Add an access control entry
     AddAcl {
         /// DID to grant access to
@@ -55,6 +57,12 @@ async fn main() {
         Some(Command::Setup) => {
             if let Err(e) = setup::run_wizard(cli.config).await {
                 eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Health) => {
+            if let Err(e) = health::run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
                 std::process::exit(1);
             }
         }

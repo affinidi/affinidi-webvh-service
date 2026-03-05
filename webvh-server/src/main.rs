@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_server::config::{AppConfig, LogFormat};
-use affinidi_webvh_server::{backup, bootstrap, secret_store, server, setup, store};
+use affinidi_webvh_server::{backup, bootstrap, health, secret_store, server, setup, store};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -19,6 +19,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
     /// Add an access control entry
     AddAcl {
         /// DID to grant access to
@@ -87,6 +89,12 @@ async fn main() {
         Some(Command::Setup) => {
             if let Err(e) = setup::run_wizard(cli.config).await {
                 eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Health) => {
+            if let Err(e) = health::run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
                 std::process::exit(1);
             }
         }

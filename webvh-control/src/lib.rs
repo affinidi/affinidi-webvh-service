@@ -2,6 +2,7 @@ pub mod acl;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod health;
 #[cfg(feature = "ui")]
 pub mod frontend;
 pub mod messaging;

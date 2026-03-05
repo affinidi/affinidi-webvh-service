@@ -28,6 +28,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
 }
 
 #[tokio::main]
@@ -41,6 +43,12 @@ async fn main() {
             eprintln!("  Setup wizard not yet implemented for the daemon.");
             eprintln!("  Configure each service individually, then create a combined config.toml.");
             std::process::exit(1);
+        }
+        Some(Command::Health) => {
+            if let Err(e) = run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
+                std::process::exit(1);
+            }
         }
         None => run_daemon(cli.config).await,
     }
@@ -429,6 +437,131 @@ async fn init_didcomm_auth(
     }
 
     (Some(did_resolver), Some(Arc::new(secrets_resolver)))
+}
+
+// ---------------------------------------------------------------------------
+// CLI health check
+// ---------------------------------------------------------------------------
+
+async fn run_health(
+    config_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::health;
+
+    health::header("webvh-daemon", env!("CARGO_PKG_VERSION"));
+
+    // ── Configuration ──────────────────────────────────────────────
+    let config = match DaemonConfig::load(config_path) {
+        Ok(c) => {
+            health::section("Configuration");
+            health::check_config_loaded(&c.config_path);
+            health::check_value("server_did", &c.server_did);
+            health::check_value("public_url", &c.public_url);
+            health::check_value("did_hosting_url", &c.did_hosting_url);
+            health::check_value("mediator_did", &c.mediator_did);
+            Some(c)
+        }
+        Err(e) => {
+            health::section("Configuration");
+            health::fail(&format!("Config load failed: {e}"));
+            None
+        }
+    };
+
+    // ── Compile Features ───────────────────────────────────────────
+    health::section("Compile Features");
+    health::print_feature("store-fjall", cfg!(feature = "store-fjall"));
+    health::print_feature("keyring", cfg!(feature = "keyring"));
+    health::print_feature("ui", cfg!(feature = "ui"));
+    health::print_feature("passkey", cfg!(feature = "passkey"));
+
+    let config = match config {
+        Some(c) => c,
+        None => {
+            eprintln!();
+            return Ok(());
+        }
+    };
+
+    // ── Enabled Services ───────────────────────────────────────────
+    health::section("Enabled Services");
+    health::print_feature("server", config.enable.server);
+    health::print_feature("witness", config.enable.witness);
+    health::print_feature("watcher", config.enable.watcher);
+    health::print_feature("control", config.enable.control);
+
+    // ── Secrets ────────────────────────────────────────────────────
+    health::section("Secrets");
+    health::check_secrets(&config.secrets, &config.config_path).await;
+
+    // ── Per-service Stores ─────────────────────────────────────────
+    if config.enable.server {
+        health::section("Store (server)");
+        let store = health::check_store(&config.server_store).await;
+
+        // Root DID check via server store
+        if let Some(ref store) = store {
+            if let Ok(dids_ks) = store.keyspace("dids") {
+                health::section("Root DID (.well-known)");
+                match affinidi_webvh_server::bootstrap::root_did_exists(&dids_ks).await {
+                    Ok(true) => {
+                        health::pass("Root DID exists");
+                        match dids_ks
+                            .get::<affinidi_webvh_server::did_ops::DidRecord>(
+                                affinidi_webvh_server::did_ops::did_key(".well-known"),
+                            )
+                            .await
+                        {
+                            Ok(Some(record)) => {
+                                if let Some(ref did_id) = record.did_id {
+                                    health::info_msg(&format!("DID: {did_id}"));
+                                }
+                                health::info_msg(&format!(
+                                    "Version count: {}",
+                                    record.version_count
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                health::warn_msg(&format!("Could not read DID record: {e}"))
+                            }
+                        }
+                    }
+                    Ok(false) => health::skip("Root DID not yet bootstrapped"),
+                    Err(e) => health::fail(&format!("Root DID check failed: {e}")),
+                }
+            }
+        }
+    }
+
+    if config.enable.witness {
+        health::section("Store (witness)");
+        health::check_store(&config.witness_store).await;
+    }
+
+    if config.enable.watcher {
+        health::section("Store (watcher)");
+        health::check_store(&config.watcher_store).await;
+    }
+
+    if config.enable.control {
+        health::section("Store (control)");
+        health::check_store(&config.control_store).await;
+    }
+
+    // ── DID Resolution ─────────────────────────────────────────────
+    if let Some(ref did) = config.server_did {
+        health::section("DID Resolution");
+        health::check_did_resolution("Server DID resolves", did).await;
+    }
+
+    if let Some(ref did) = config.mediator_did {
+        health::section("Mediator DID Resolution");
+        health::check_did_resolution("Mediator DID resolves", did).await;
+    }
+
+    eprintln!();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
