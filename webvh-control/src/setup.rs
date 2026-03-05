@@ -15,10 +15,24 @@ use dialoguer::{Confirm, Input, Select};
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// Secrets bundle format (base64url-encoded JSON from PNM provision / bootstrap).
+/// Secrets bundle format (base64url-encoded JSON from bootstrap output).
 #[derive(Deserialize)]
 struct SecretsBundle {
     did: String,
+    secrets: Vec<SecretEntry>,
+}
+
+/// PNM ContextProvisionBundle format (direct output of `pnm contexts provision`).
+#[derive(Deserialize)]
+struct ContextProvisionBundle {
+    did: Option<ProvisionedDid>,
+    #[allow(dead_code)]
+    context_id: String,
+}
+
+#[derive(Deserialize)]
+struct ProvisionedDid {
+    id: String,
     secrets: Vec<SecretEntry>,
 }
 
@@ -27,6 +41,28 @@ struct SecretEntry {
     key_id: String,
     key_type: String,
     private_key_multibase: String,
+}
+
+/// Try to decode as SecretsBundle first, then fall back to ContextProvisionBundle.
+fn decode_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
+    // Try SecretsBundle format (from bootstrap output)
+    if let Ok(bundle) = serde_json::from_slice::<SecretsBundle>(bytes) {
+        return Ok(bundle);
+    }
+
+    // Try ContextProvisionBundle format (direct PNM provision output)
+    match serde_json::from_slice::<ContextProvisionBundle>(bytes) {
+        Ok(provision) => {
+            let did_info = provision
+                .did
+                .ok_or("provision bundle has no DID material — re-provision with --did-url")?;
+            Ok(SecretsBundle {
+                did: did_info.id,
+                secrets: did_info.secrets,
+            })
+        }
+        Err(e) => Err(format!("unrecognized bundle format: {e}")),
+    }
 }
 
 pub async fn run_setup() -> Result<(), AppError> {
@@ -130,11 +166,11 @@ pub async fn run_setup() -> Result<(), AppError> {
 
         let bundle: SecretsBundle = loop {
             let input: String = Input::new()
-                .with_prompt("Secrets bundle (base64url)")
+                .with_prompt("Bundle (base64url)")
                 .interact_text()
                 .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-            let decoded = match BASE64.decode(input.trim()) {
+            let raw = match BASE64.decode(input.trim()) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("  Error: invalid base64url encoding: {e}");
@@ -142,10 +178,10 @@ pub async fn run_setup() -> Result<(), AppError> {
                 }
             };
 
-            match serde_json::from_slice::<SecretsBundle>(&decoded) {
+            match decode_bundle(&raw) {
                 Ok(b) => break b,
                 Err(e) => {
-                    eprintln!("  Error: invalid bundle JSON: {e}");
+                    eprintln!("  Error: {e}");
                     continue;
                 }
             }
