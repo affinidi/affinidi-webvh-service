@@ -11,4 +11,3 @@ pub mod secret_store;
 pub mod server;
 pub mod setup;
 pub mod store;
-pub mod vta_bootstrap;

@@ -32,29 +32,6 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
-    /// Import a PNM provision bundle to bootstrap the control plane.
-    ///
-    /// Use the PNM CLI to provision a VTA context with a DID first:
-    ///
-    ///   pnm contexts provision --name webvh-control \
-    ///     --did-url https://did.example.com/services/control
-    ///
-    /// Then pass the output bundle here:
-    ///
-    ///   webvh-control bootstrap \
-    ///     --control-bundle <base64url from provision> \
-    ///     --output-dir ./bootstrap-output
-    ///
-    /// For webvh-server, use `webvh-server setup` to import its own bundle.
-    #[command(verbatim_doc_comment)]
-    Bootstrap {
-        /// PNM provision bundle for webvh-control (base64url string from `pnm contexts provision`)
-        #[arg(long)]
-        control_bundle: String,
-        /// Output directory for secrets bundles and DID log files
-        #[arg(long, default_value = "./bootstrap-output")]
-        output_dir: PathBuf,
-    },
     /// Create a passkey enrollment invite
     Invite {
         /// DID to invite
@@ -93,23 +70,6 @@ async fn main() {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
-        }
-        Some(Command::Bootstrap {
-            control_bundle,
-            output_dir,
-        }) => {
-            use affinidi_webvh_control::vta_bootstrap::{ServiceBundle, run_bootstrap, print_next_steps};
-
-            let bundles = vec![
-                ServiceBundle { label: "webvh-control", encoded: &control_bundle },
-            ];
-
-            if let Err(e) = run_bootstrap(&bundles, &output_dir) {
-                eprintln!("Bootstrap error: {e}");
-                std::process::exit(1);
-            }
-
-            print_next_steps(&output_dir);
         }
         Some(Command::Invite { did, role, ttl_hours }) => {
             if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
