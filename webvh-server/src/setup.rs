@@ -32,6 +32,16 @@ fn generate_x25519_multibase() -> String {
         .expect("x25519 multibase encoding")
 }
 
+/// Decoded bundle — unified result from either format.
+struct DecodedBundle {
+    did: String,
+    secrets: Vec<SecretEntry>,
+    /// DIDComm mediator DID (from vta_did in provision bundle).
+    mediator_did: Option<String>,
+    /// Root DID log entry (JSONL, from provision bundle).
+    log_entry: Option<String>,
+}
+
 /// Secrets bundle format (base64url-encoded JSON from bootstrap output).
 #[derive(Deserialize)]
 struct SecretsBundle {
@@ -43,13 +53,15 @@ struct SecretsBundle {
 #[derive(Deserialize)]
 struct ContextProvisionBundle {
     did: Option<ProvisionedDid>,
-    #[allow(dead_code)]
-    context_id: String,
+    #[serde(default)]
+    vta_did: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ProvisionedDid {
     id: String,
+    #[serde(default)]
+    log_entry: Option<String>,
     secrets: Vec<SecretEntry>,
 }
 
@@ -61,10 +73,15 @@ struct SecretEntry {
 }
 
 /// Try to decode as SecretsBundle first, then fall back to ContextProvisionBundle.
-fn decode_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
+fn decode_bundle(bytes: &[u8]) -> Result<DecodedBundle, String> {
     // Try SecretsBundle format (from bootstrap output)
     if let Ok(bundle) = serde_json::from_slice::<SecretsBundle>(bytes) {
-        return Ok(bundle);
+        return Ok(DecodedBundle {
+            did: bundle.did,
+            secrets: bundle.secrets,
+            mediator_did: None,
+            log_entry: None,
+        });
     }
 
     // Try ContextProvisionBundle format (direct PNM provision output)
@@ -73,9 +90,11 @@ fn decode_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
             let did_info = provision
                 .did
                 .ok_or("provision bundle has no DID material — re-provision with --did-url")?;
-            Ok(SecretsBundle {
+            Ok(DecodedBundle {
                 did: did_info.id,
                 secrets: did_info.secrets,
+                mediator_did: provision.vta_did,
+                log_entry: did_info.log_entry,
             })
         }
         Err(e) => Err(format!("unrecognized bundle format: {e}")),
@@ -128,6 +147,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let mut mediator_did = None;
     let mut signing_key = None;
     let mut key_agreement_key = None;
+    let mut imported_log_entry = None;
     let auth = AuthConfig::default();
 
     let identity_options = &[
@@ -145,11 +165,10 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         // --- Bundle import ---
         eprintln!();
         eprintln!("  Paste the secrets bundle for the server.");
-        eprintln!("  This is the base64url string from `webvh-server bootstrap`");
-        eprintln!("  or from `pnm contexts provision`.");
+        eprintln!("  This is the base64url string from `pnm contexts provision`.");
         eprintln!();
 
-        let bundle: SecretsBundle = loop {
+        let bundle: DecodedBundle = loop {
             let input: String = Input::new()
                 .with_prompt("Bundle (base64url)")
                 .interact_text()?;
@@ -189,6 +208,18 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                 "  Key agreement (X25519):    loaded from {}",
                 x_entry.key_id
             );
+        }
+
+        // Auto-set mediator DID from VTA DID
+        if let Some(ref vta_did) = bundle.mediator_did {
+            mediator_did = Some(vta_did.clone());
+            eprintln!("  Mediator DID:              {vta_did}");
+        }
+
+        // Capture log entry for root DID bootstrap
+        if bundle.log_entry.is_some() {
+            imported_log_entry = bundle.log_entry;
+            eprintln!("  DID log entry:             included");
         }
 
         eprintln!();
@@ -250,8 +281,8 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         eprintln!();
     }
 
-    // DIDComm-specific: mediator DID
-    if enable_didcomm {
+    // DIDComm-specific: mediator DID (only ask if not already set from bundle)
+    if enable_didcomm && mediator_did.is_none() {
         let med_did: String = Input::new()
             .with_prompt("Mediator DID (e.g. did:webvh:mediator.example.com)")
             .default(String::new())
@@ -405,121 +436,144 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     // 13. Root DID bootstrap
     if config.public_url.is_some() {
-        eprintln!();
-        let bootstrap_options = &[
-            "Import an existing DID log entry",
-            "Generate a new root DID",
-            "Skip (use `bootstrap-did` later)",
-        ];
-        let bootstrap_idx = Select::new()
-            .with_prompt("Root DID (.well-known) setup")
-            .items(bootstrap_options)
-            .default(1)
-            .interact()?;
-
-        if bootstrap_idx == 0 {
-            // --- Import existing log entry ---
+        if let Some(ref log_entry) = imported_log_entry {
+            // --- Auto-import from provision bundle ---
             eprintln!();
-            eprintln!("  Paste the DID log entry (JSONL format).");
-            eprintln!("  For multiple log entries, paste one per line.");
-            eprintln!("  Enter a blank line when done.");
-            eprintln!();
-
-            let mut lines = Vec::new();
-            loop {
-                let prompt = if lines.is_empty() {
-                    "Log entry"
-                } else {
-                    "Next line (blank to finish)"
-                };
-                let line: String = Input::new()
-                    .with_prompt(prompt)
-                    .allow_empty(true)
-                    .interact_text()?;
-                if line.trim().is_empty() {
-                    break;
-                }
-                lines.push(line);
-            }
-
-            if lines.is_empty() {
-                eprintln!("  No log entry provided, skipping bootstrap.");
-            } else {
-                let jsonl = lines.join("\n");
-
-                // Optionally import witness data
-                let witness_content = if Confirm::new()
-                    .with_prompt("Do you also have a did-witness.json to import?")
-                    .default(false)
-                    .interact()?
-                {
-                    let witness: String = Input::new()
-                        .with_prompt("Paste did-witness.json content")
-                        .interact_text()?;
-                    Some(witness)
-                } else {
-                    None
-                };
-
-                let store = Store::open(&config.store).await?;
-                let dids_ks = store.keyspace("dids")?;
-
-                match bootstrap::import_root_did(
-                    &store,
-                    &dids_ks,
-                    &jsonl,
-                    witness_content.as_deref(),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        eprintln!();
-                        eprintln!("  Root DID imported!");
-                        eprintln!("  DID:  {}", result.did_id);
-                        eprintln!("  SCID: {}", result.scid);
-
-                        // Update server_did in config (targeted update to preserve secrets)
-                        config.server_did = Some(result.did_id.clone());
-                        update_server_did_in_config(&output_path, &result.did_id)?;
-                        eprintln!("  server_did updated in {}", output_path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("  Warning: failed to import root DID: {e}");
-                        eprintln!("  You can retry later with `webvh-server bootstrap-did`");
-                    }
-                }
-            }
-        } else if bootstrap_idx == 1 {
-            // --- Generate new root DID ---
-            let signing_secret =
-                Secret::from_multibase(&server_secrets.signing_key, None)
-                    .map_err(|e| format!("invalid signing_key: {e}"))?;
+            eprintln!("  Importing root DID from provision bundle...");
 
             let store = Store::open(&config.store).await?;
             let dids_ks = store.keyspace("dids")?;
 
-            match bootstrap::bootstrap_root_did(
-                &store,
-                &dids_ks,
-                &signing_secret,
-                config.public_url.as_deref().unwrap(),
-            )
-            .await
-            {
+            match bootstrap::import_root_did(&store, &dids_ks, log_entry, None).await {
                 Ok(result) => {
-                    eprintln!();
-                    eprintln!("  Root DID bootstrapped!");
+                    eprintln!("  Root DID imported!");
                     eprintln!("  DID:  {}", result.did_id);
                     eprintln!("  SCID: {}", result.scid);
 
-                    // Update server_did in config (targeted update to preserve secrets)
                     config.server_did = Some(result.did_id.clone());
                     update_server_did_in_config(&output_path, &result.did_id)?;
                     eprintln!("  server_did updated in {}", output_path.display());
                 }
                 Err(e) => {
-                    eprintln!("  Warning: failed to bootstrap root DID: {e}");
+                    eprintln!("  Warning: failed to import root DID: {e}");
                     eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                }
+            }
+        } else {
+            eprintln!();
+            let bootstrap_options = &[
+                "Import an existing DID log entry",
+                "Generate a new root DID",
+                "Skip (use `bootstrap-did` later)",
+            ];
+            let bootstrap_idx = Select::new()
+                .with_prompt("Root DID (.well-known) setup")
+                .items(bootstrap_options)
+                .default(1)
+                .interact()?;
+
+            if bootstrap_idx == 0 {
+                // --- Import existing log entry ---
+                eprintln!();
+                eprintln!("  Paste the DID log entry (JSONL format).");
+                eprintln!("  For multiple log entries, paste one per line.");
+                eprintln!("  Enter a blank line when done.");
+                eprintln!();
+
+                let mut lines = Vec::new();
+                loop {
+                    let prompt = if lines.is_empty() {
+                        "Log entry"
+                    } else {
+                        "Next line (blank to finish)"
+                    };
+                    let line: String = Input::new()
+                        .with_prompt(prompt)
+                        .allow_empty(true)
+                        .interact_text()?;
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    lines.push(line);
+                }
+
+                if lines.is_empty() {
+                    eprintln!("  No log entry provided, skipping bootstrap.");
+                } else {
+                    let jsonl = lines.join("\n");
+
+                    // Optionally import witness data
+                    let witness_content = if Confirm::new()
+                        .with_prompt("Do you also have a did-witness.json to import?")
+                        .default(false)
+                        .interact()?
+                    {
+                        let witness: String = Input::new()
+                            .with_prompt("Paste did-witness.json content")
+                            .interact_text()?;
+                        Some(witness)
+                    } else {
+                        None
+                    };
+
+                    let store = Store::open(&config.store).await?;
+                    let dids_ks = store.keyspace("dids")?;
+
+                    match bootstrap::import_root_did(
+                        &store,
+                        &dids_ks,
+                        &jsonl,
+                        witness_content.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            eprintln!();
+                            eprintln!("  Root DID imported!");
+                            eprintln!("  DID:  {}", result.did_id);
+                            eprintln!("  SCID: {}", result.scid);
+
+                            config.server_did = Some(result.did_id.clone());
+                            update_server_did_in_config(&output_path, &result.did_id)?;
+                            eprintln!("  server_did updated in {}", output_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: failed to import root DID: {e}");
+                            eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                        }
+                    }
+                }
+            } else if bootstrap_idx == 1 {
+                // --- Generate new root DID ---
+                let signing_secret =
+                    Secret::from_multibase(&server_secrets.signing_key, None)
+                        .map_err(|e| format!("invalid signing_key: {e}"))?;
+
+                let store = Store::open(&config.store).await?;
+                let dids_ks = store.keyspace("dids")?;
+
+                match bootstrap::bootstrap_root_did(
+                    &store,
+                    &dids_ks,
+                    &signing_secret,
+                    config.public_url.as_deref().unwrap(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        eprintln!();
+                        eprintln!("  Root DID bootstrapped!");
+                        eprintln!("  DID:  {}", result.did_id);
+                        eprintln!("  SCID: {}", result.scid);
+
+                        config.server_did = Some(result.did_id.clone());
+                        update_server_did_in_config(&output_path, &result.did_id)?;
+                        eprintln!("  server_did updated in {}", output_path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: failed to bootstrap root DID: {e}");
+                        eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                    }
                 }
             }
         }

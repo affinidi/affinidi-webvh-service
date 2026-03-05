@@ -16,12 +16,13 @@ build = "build.rs"
 [features]
 default = ["keyring", "store-fjall", "ui"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
-keyring = ["dep:keyring"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
+keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
   "dep:bytes",
+  "affinidi-webvh-common/gcp-secrets",
 ]
 store-fjall = ["dep:fjall"]
 store-redis = ["dep:redis"]
