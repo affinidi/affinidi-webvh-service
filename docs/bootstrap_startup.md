@@ -4,7 +4,7 @@ This document explains how to set up a complete WebVH environment with DIDComm-b
 
 ## Prerequisites
 
-- A running VTA (Verifiable Trust Agent) with admin credentials
+- PNM CLI installed and configured with access to a VTA (Verifiable Trust Agent)
 - Compiled WebVH binaries: `webvh-server`, `webvh-control`
 - A public URL where the server will serve DIDs (e.g., `https://did.example.com`)
 
@@ -23,23 +23,24 @@ Each service has its own DID, created during bootstrap. The server authenticates
 ```mermaid
 sequenceDiagram
     participant Admin
+    participant PNM as PNM CLI
     participant VTA
     participant Server as webvh-server
     participant Control as webvh-control
 
     rect rgb(230, 240, 255)
-        Note over Admin,VTA: Phase 0 — VTA Bootstrap (automated)
-        Admin->>Admin: webvh-control bootstrap<br/>--admin-bundle eyJ...<br/>--server-url https://did.example.com
-        Admin->>VTA: DIDComm auth (pack_encrypted)
-        VTA->>Admin: {access_token}
-        Admin->>VTA: POST /contexts (webvh-server, webvh-control, webvh-witness)
-        VTA->>Admin: contexts created
-        loop For each context
-            Admin->>VTA: POST /webvh/dids (serverless mode, url=server_url)
-            VTA->>Admin: {did, signing_key_id, ka_key_id, log_entry}
-            Admin->>VTA: GET /keys/{signing_key_id}/secret
-            Admin->>VTA: GET /keys/{ka_key_id}/secret
+        Note over Admin,VTA: Phase 0a — Provision VTA Contexts (PNM CLI)
+        loop For each service (webvh-server, webvh-control, webvh-witness)
+            Admin->>PNM: pnm contexts provision<br/>--name <service> --did-url <url>
+            PNM->>VTA: Create context + DID
+            VTA->>PNM: context_id, DID material, secrets
+            PNM->>Admin: ContextProvisionBundle (base64url)
         end
+    end
+
+    rect rgb(235, 245, 255)
+        Note over Admin: Phase 0b — Import Provision Bundles
+        Admin->>Admin: webvh-control bootstrap<br/>--server-bundle eyJ...<br/>--control-bundle eyJ...
         Note over Admin: Writes to output dir:<br/>*.bundle (secrets)<br/>*.did.jsonl (DID log)
     end
 
@@ -80,25 +81,55 @@ sequenceDiagram
 
 ## Step-by-Step Setup
 
-### Phase 0: Bootstrap with VTA
+### Phase 0a: Provision VTA Contexts with PNM
 
-Run the bootstrap command to create DIDs for all services:
+Each WebVH service gets its own VTA context for secret/config isolation. Use the PNM CLI to provision a context with a DID for each service:
+
+```bash
+# Provision the webvh-server context
+# The --did-url should point to where the server's DID will be published
+pnm contexts provision \
+  --name webvh-server \
+  --did-url https://did.example.com/.well-known
+
+# Provision the webvh-control context
+pnm contexts provision \
+  --name webvh-control \
+  --did-url https://did.example.com/services/control
+
+# (Optional) Provision the webvh-witness context
+pnm contexts provision \
+  --name webvh-witness \
+  --did-url https://did.example.com/services/witness
+```
+
+Each command outputs a base64url-encoded **ContextProvisionBundle** containing:
+- VTA context credentials (admin DID + credential)
+- DID material (DID document, log entry)
+- Private keys (signing + key-agreement)
+
+Save the output string from each command — you'll pass them to the bootstrap step.
+
+### Phase 0b: Import Provision Bundles
+
+Pass the PNM provision bundles to the bootstrap command to extract secrets and DID logs:
 
 ```bash
 webvh-control bootstrap \
-  --admin-bundle eyJ... \
-  --server-url https://did.example.com \
+  --server-bundle <base64url output from webvh-server provision> \
+  --control-bundle <base64url output from webvh-control provision> \
+  --witness-bundle <base64url output from webvh-witness provision> \
   --output-dir ./bootstrap-output
 ```
 
 This creates:
 ```
 bootstrap-output/
-  webvh-server.bundle       # secrets bundle (base64url)
-  webvh-server.did.jsonl    # DID log entry
+  webvh-server.bundle       # secrets bundle (base64url, for setup wizard)
+  webvh-server.did.jsonl    # DID log entry (for load-did)
   webvh-control.bundle
   webvh-control.did.jsonl
-  webvh-witness.bundle
+  webvh-witness.bundle      # (if --witness-bundle was provided)
   webvh-witness.did.jsonl
 ```
 
