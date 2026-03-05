@@ -1,5 +1,12 @@
 [workspace]
-members = ["webvh-common", "webvh-control", "webvh-daemon", "webvh-server", "webvh-watcher", "webvh-witness"]
+members = [
+  "webvh-common",
+  "webvh-control",
+  "webvh-daemon",
+  "webvh-server",
+  "webvh-watcher",
+  "webvh-witness",
+]
 resolver = "3"
 
 [workspace.package]
@@ -87,7 +94,7 @@ reqwest = { version = "0.13", features = ["json"] }
 anyhow = "1"
 
 # DID WebVH
-didwebvh-rs = "0.1"
+didwebvh-rs = "0.2"
 
 # Logging / tracing
 tracing = "0.1"

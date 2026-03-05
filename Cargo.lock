@@ -113,6 +113,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "affinidi-data-integrity"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "425cf94b0553c648af66e42ffea6ec0ee77db28f7b8314913015a4587278e53e"
+dependencies = [
+ "affinidi-crypto",
+ "affinidi-did-common",
+ "affinidi-rdf-encoding",
+ "affinidi-secrets-resolver",
+ "chrono",
+ "ed25519-dalek",
+ "multibase",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "affinidi-did-authentication"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,7 +185,7 @@ dependencies = [
  "did-resolver-cheqd",
  "did-scid",
  "did-web",
- "didwebvh-rs",
+ "didwebvh-rs 0.1.17",
  "futures-util",
  "highway",
  "moka",
@@ -279,6 +300,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "affinidi-rdf-encoding"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1147c1bc8043cf59fa4d50d005556260992628334c1cd7c09b2c077afa22eb2e"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "affinidi-secrets-resolver"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -311,7 +345,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fcd8c4da675925401aaee70b8e91a02491540658ea22b24d644c58eee96ab122"
 dependencies = [
  "affinidi-crypto",
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.3.6",
  "affinidi-did-authentication",
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
@@ -335,7 +369,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8853d410d0ff1b725501cec204ba517328491e560995fb7a88e1052b3aac37f3"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.3.6",
  "affinidi-did-authentication",
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
@@ -370,7 +404,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "didwebvh-rs",
+ "didwebvh-rs 0.2.0",
  "ed25519-dalek",
  "firestore",
  "fjall",
@@ -493,7 +527,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dialoguer",
- "didwebvh-rs",
+ "didwebvh-rs 0.2.0",
  "ed25519-dalek",
  "firestore",
  "fjall",
@@ -545,7 +579,7 @@ dependencies = [
 name = "affinidi-webvh-witness"
 version = "0.0.1"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.3.6",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk",
  "affinidi-webvh-common",
@@ -555,7 +589,7 @@ dependencies = [
  "chrono",
  "clap",
  "dialoguer",
- "didwebvh-rs",
+ "didwebvh-rs 0.2.0",
  "ed25519-dalek",
  "hex",
  "jsonwebtoken",
@@ -2535,7 +2569,7 @@ checksum = "cb3c376084e769f09a6ad4026ac67a8458e24f12e890468cb902312152bde6b8"
 dependencies = [
  "affinidi-did-common",
  "did-resolver-cheqd",
- "didwebvh-rs",
+ "didwebvh-rs 0.1.17",
  "regex",
  "serde_json",
  "ssi-dids-core",
@@ -2562,7 +2596,33 @@ version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e3c7bfb62a5ce22d7b8719bbbafa804ec2d27028ff39545b4a763853a1074af"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.3.6",
+ "affinidi-secrets-resolver",
+ "ahash 0.8.12",
+ "base58",
+ "chrono",
+ "getrandom 0.4.1",
+ "multihash",
+ "regex",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "serde_with",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "didwebvh-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c98823fcf00c4781d1733b6f0bc37c637a4b2ea020868c09ba98d95a560ddbb"
+dependencies = [
+ "affinidi-data-integrity 0.4.0",
  "affinidi-secrets-resolver",
  "ahash 0.8.12",
  "base58",
@@ -7495,9 +7555,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.49.0"
+version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a2903cd7736441aac9df9d7688bd0ce48edccaadf181c3b90be801e81d3d86"
+checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "bytes",
  "libc",
