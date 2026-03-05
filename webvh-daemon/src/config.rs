@@ -23,6 +23,7 @@ pub struct DaemonConfig {
     pub server_did: Option<String>,
     pub mediator_did: Option<String>,
     pub public_url: Option<String>,
+    pub did_hosting_url: Option<String>,
 
     // Per-service store locations (separate to avoid keyspace collisions)
     #[serde(default = "default_server_store")]
@@ -153,6 +154,7 @@ impl DaemonConfig {
         env_opt!("DAEMON_SERVER_DID", config.server_did);
         env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
         env_opt!("DAEMON_PUBLIC_URL", config.public_url);
+        env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
 
         if let Ok(v) = std::env::var("DAEMON_SERVER_HOST") {
             config.server.host = v;
@@ -168,6 +170,9 @@ impl DaemonConfig {
 
         // Normalize
         if let Some(ref mut url) = config.public_url {
+            *url = url.trim_end_matches('/').to_string();
+        }
+        if let Some(ref mut url) = config.did_hosting_url {
             *url = url.trim_end_matches('/').to_string();
         }
 
@@ -228,6 +233,7 @@ impl DaemonConfig {
             server_did: self.server_did.clone(),
             mediator_did: self.mediator_did.clone(),
             public_url: self.public_url.clone(),
+            did_hosting_url: self.did_hosting_url.clone(),
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.control_store.clone(),

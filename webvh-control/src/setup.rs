@@ -91,6 +91,18 @@ pub async fn run_setup() -> Result<(), AppError> {
         Some(public_url)
     };
 
+    // 2b. DID hosting URL
+    let did_hosting_url: String = Input::new()
+        .with_prompt("DID hosting URL (where DIDs are publicly served, e.g. https://did.example.com)")
+        .default(String::new())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let did_hosting_url = if did_hosting_url.is_empty() {
+        None
+    } else {
+        Some(did_hosting_url)
+    };
+
     // 3. Host & Port
     let host: String = Input::new()
         .with_prompt("Listen host")
@@ -231,6 +243,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         server_did,
         mediator_did: None,
         public_url,
+        did_hosting_url,
         server: ServerConfig { host, port },
         log: LogConfig {
             level: log_level,

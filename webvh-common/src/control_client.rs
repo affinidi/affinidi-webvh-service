@@ -52,6 +52,7 @@ pub struct RegisterServiceRequest {
 pub struct RegisterServiceResponse {
     pub instance_id: String,
     pub did_updates: Vec<DidSyncUpdate>,
+    pub did_hosting_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

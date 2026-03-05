@@ -163,6 +163,7 @@ pub async fn register_service(
             Json(RegisterServiceResponse {
                 instance_id: instance.instance_id,
                 did_updates,
+                did_hosting_url: state.config.did_hosting_url.clone(),
             }),
         ));
     }
@@ -196,6 +197,7 @@ pub async fn register_service(
         Json(RegisterServiceResponse {
             instance_id: instance.instance_id,
             did_updates,
+            did_hosting_url: state.config.did_hosting_url.clone(),
         }),
     ))
 }

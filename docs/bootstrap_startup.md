@@ -201,6 +201,7 @@ For development or simple deployments, use `webvh-daemon` which runs all service
 # daemon-config.toml
 server_did = "did:webvh:..."
 public_url = "https://did.example.com"
+did_hosting_url = "https://did.example.com"
 
 [server]
 host = "0.0.0.0"
@@ -260,3 +261,4 @@ webvh-control list-acl
 |----------|-------------|
 | `CONTROL_SERVER_DID` | Control plane's DID |
 | `CONTROL_PUBLIC_URL` | Public-facing URL |
+| `CONTROL_DID_HOSTING_URL` | DID hosting URL (where DIDs are publicly served) |

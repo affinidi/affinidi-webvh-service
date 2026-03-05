@@ -52,6 +52,9 @@ pub async fn register_with_control(
 
     match client.register_service(&req).await {
         Ok(resp) => {
+            if let Some(ref hosting_url) = resp.did_hosting_url {
+                info!(did_hosting_url = %hosting_url, "control plane provided DID hosting URL");
+            }
             info!(
                 control_url = %control_url,
                 instance_id = %resp.instance_id,
