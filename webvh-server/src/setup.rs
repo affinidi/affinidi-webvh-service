@@ -438,6 +438,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                     eprintln!("  Root DID imported!");
                     eprintln!("  DID:  {}", result.did_id);
                     eprintln!("  SCID: {}", result.scid);
+                    eprintln!();
+                    eprintln!("  DID Log Entry:");
+                    eprintln!("  ---");
+                    for line in result.jsonl.lines() {
+                        eprintln!("  {line}");
+                    }
+                    eprintln!("  ---");
 
                     config.server_did = Some(result.did_id.clone());
                     update_server_did_in_config(&output_path, &result.did_id)?;
@@ -521,6 +528,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                             eprintln!("  Root DID imported!");
                             eprintln!("  DID:  {}", result.did_id);
                             eprintln!("  SCID: {}", result.scid);
+                            eprintln!();
+                            eprintln!("  DID Log Entry:");
+                            eprintln!("  ---");
+                            for line in result.jsonl.lines() {
+                                eprintln!("  {line}");
+                            }
+                            eprintln!("  ---");
 
                             config.server_did = Some(result.did_id.clone());
                             update_server_did_in_config(&output_path, &result.did_id)?;
@@ -554,6 +568,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                         eprintln!("  Root DID bootstrapped!");
                         eprintln!("  DID:  {}", result.did_id);
                         eprintln!("  SCID: {}", result.scid);
+                        eprintln!();
+                        eprintln!("  DID Log Entry:");
+                        eprintln!("  ---");
+                        for line in result.jsonl.lines() {
+                            eprintln!("  {line}");
+                        }
+                        eprintln!("  ---");
 
                         config.server_did = Some(result.did_id.clone());
                         update_server_did_in_config(&output_path, &result.did_id)?;
