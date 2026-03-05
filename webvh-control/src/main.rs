@@ -32,19 +32,9 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
-    /// Bootstrap all WebVH services via a VTA.
-    ///
-    /// Creates contexts and DIDs for webvh-server, webvh-control, and
-    /// webvh-witness, then exports secrets bundles and DID log files.
-    ///
-    /// To obtain the admin bundle:
-    ///   1. Run `vta setup` (prints the credential during initial setup), or
-    ///   2. Run `vta export-admin` (re-exports existing admin credentials).
-    ///
-    /// You can also use the PNM CLI to set up and authenticate:
-    ///   pnm setup --url <VTA_URL> --credential <credential>
+    /// Bootstrap all WebVH services via a VTA
     Bootstrap {
-        /// Admin credential bundle (base64url string from `vta export-admin`)
+        /// Admin credential bundle (base64url string)
         #[arg(long)]
         admin_bundle: String,
         /// WebVH server public URL (where DIDs will be published)
