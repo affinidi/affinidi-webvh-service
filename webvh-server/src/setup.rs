@@ -32,7 +32,7 @@ fn generate_x25519_multibase() -> String {
         .expect("x25519 multibase encoding")
 }
 
-/// VTA secrets bundle format (base64url-encoded JSON).
+/// Secrets bundle format (base64url-encoded JSON from PNM provision / bootstrap).
 #[derive(Deserialize)]
 struct SecretsBundle {
     did: String,
@@ -87,144 +87,135 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let enable_didcomm = selected.contains(&0);
     let enable_rest_api = selected.contains(&1);
 
-    // 3. DIDComm-specific: server identity and keys
+    // 3. Server identity — import PNM provision bundle or configure manually
     let mut server_did = None;
     let mut mediator_did = None;
     let mut signing_key = None;
     let mut key_agreement_key = None;
     let auth = AuthConfig::default();
 
-    if enable_didcomm {
-        let identity_options = &[
-            "Import a VTA secrets bundle (recommended)",
-            "Enter each parameter manually",
-        ];
-        let identity_idx = Select::new()
-            .with_prompt("How do you want to configure the server DID identity?")
-            .items(identity_options)
-            .default(0)
-            .interact()?;
+    let identity_options = &[
+        "Import a secrets bundle (from PNM provision or bootstrap)",
+        "Enter each parameter manually",
+        "Skip (generate new keys, no DID)",
+    ];
+    let identity_idx = Select::new()
+        .with_prompt("Server identity")
+        .items(identity_options)
+        .default(0)
+        .interact()?;
 
-        if identity_idx == 0 {
-            // --- VTA bundle import ---
-            eprintln!();
-            eprintln!("  Paste the VTA secrets bundle export for the server DID.");
-            eprintln!("  (This is the base64url string from `vta export-admin`)");
-            eprintln!();
+    if identity_idx == 0 {
+        // --- Bundle import ---
+        eprintln!();
+        eprintln!("  Paste the secrets bundle for the server.");
+        eprintln!("  This is the base64url string from `webvh-server bootstrap`");
+        eprintln!("  or from `pnm contexts provision`.");
+        eprintln!();
 
-            let bundle: SecretsBundle = loop {
-                let input: String = Input::new()
-                    .with_prompt("VTA secrets bundle (base64url)")
-                    .interact_text()?;
+        let bundle: SecretsBundle = loop {
+            let input: String = Input::new()
+                .with_prompt("Secrets bundle (base64url)")
+                .interact_text()?;
 
-                let decoded = match BASE64.decode(input.trim()) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("  Error: invalid base64url encoding: {e}");
-                        continue;
-                    }
-                };
-
-                match serde_json::from_slice::<SecretsBundle>(&decoded) {
-                    Ok(b) => break b,
-                    Err(e) => {
-                        eprintln!("  Error: invalid bundle JSON: {e}");
-                        continue;
-                    }
+            let decoded = match BASE64.decode(input.trim()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("  Error: invalid base64url encoding: {e}");
+                    continue;
                 }
             };
 
-            server_did = Some(bundle.did.clone());
-
-            // Extract Ed25519 signing key — store multibase directly
-            let ed_entry = bundle
-                .secrets
-                .iter()
-                .find(|s| s.key_type == "ed25519")
-                .ok_or("bundle has no Ed25519 signing key".to_string())?;
-            signing_key = Some(ed_entry.private_key_multibase.clone());
-
-            // Extract X25519 key agreement key (optional) — store multibase directly
-            match bundle.secrets.iter().find(|s| s.key_type == "x25519") {
-                Some(x_entry) => {
-                    key_agreement_key = Some(x_entry.private_key_multibase.clone());
-                }
-                None => {
-                    eprintln!(
-                        "  Warning: bundle has no X25519 key agreement key; generating one."
-                    );
+            match serde_json::from_slice::<SecretsBundle>(&decoded) {
+                Ok(b) => break b,
+                Err(e) => {
+                    eprintln!("  Error: invalid bundle JSON: {e}");
+                    continue;
                 }
             }
+        };
 
-            eprintln!();
-            eprintln!("  Imported server DID: {}", bundle.did);
+        server_did = Some(bundle.did.clone());
+
+        // Extract Ed25519 signing key
+        if let Some(ed_entry) = bundle.secrets.iter().find(|s| s.key_type == "ed25519") {
+            signing_key = Some(ed_entry.private_key_multibase.clone());
             eprintln!(
                 "  Signing key (Ed25519):     loaded from {}",
                 ed_entry.key_id
             );
-            if let Some(x_entry) = bundle.secrets.iter().find(|s| s.key_type == "x25519") {
-                eprintln!(
-                    "  Key agreement (X25519):    loaded from {}",
-                    x_entry.key_id
-                );
-            }
-            eprintln!();
-        } else {
-            // --- Manual entry ---
-            eprintln!();
-
-            let did: String = Input::new()
-                .with_prompt("Server DID (e.g. did:webvh:webvh.example.com)")
-                .interact_text()?;
-            server_did = Some(did);
-
-            // Signing key
-            let sk_options = &[
-                "Generate a new Ed25519 signing key",
-                "Paste an existing multibase-encoded key",
-            ];
-            let sk_idx = Select::new()
-                .with_prompt("Ed25519 signing key")
-                .items(sk_options)
-                .default(0)
-                .interact()?;
-
-            if sk_idx == 0 {
-                let key = generate_ed25519_multibase();
-                eprintln!("  Generated Ed25519 signing key.");
-                signing_key = Some(key);
-            } else {
-                let key: String = Input::new()
-                    .with_prompt("Multibase-encoded Ed25519 private key")
-                    .interact_text()?;
-                signing_key = Some(key.trim().to_string());
-            }
-
-            // Key agreement key
-            let ka_options = &[
-                "Generate a new X25519 key agreement key",
-                "Paste an existing multibase-encoded key",
-            ];
-            let ka_idx = Select::new()
-                .with_prompt("X25519 key agreement key")
-                .items(ka_options)
-                .default(0)
-                .interact()?;
-
-            if ka_idx == 0 {
-                let key = generate_x25519_multibase();
-                eprintln!("  Generated X25519 key agreement key.");
-                key_agreement_key = Some(key);
-            } else {
-                let key: String = Input::new()
-                    .with_prompt("Multibase-encoded X25519 private key")
-                    .interact_text()?;
-                key_agreement_key = Some(key.trim().to_string());
-            }
-
-            eprintln!();
         }
 
+        // Extract X25519 key agreement key
+        if let Some(x_entry) = bundle.secrets.iter().find(|s| s.key_type == "x25519") {
+            key_agreement_key = Some(x_entry.private_key_multibase.clone());
+            eprintln!(
+                "  Key agreement (X25519):    loaded from {}",
+                x_entry.key_id
+            );
+        }
+
+        eprintln!();
+        eprintln!("  Imported server DID: {}", bundle.did);
+        eprintln!();
+    } else if identity_idx == 1 {
+        // --- Manual entry ---
+        eprintln!();
+
+        let did: String = Input::new()
+            .with_prompt("Server DID (e.g. did:webvh:webvh.example.com)")
+            .interact_text()?;
+        server_did = Some(did);
+
+        // Signing key
+        let sk_options = &[
+            "Generate a new Ed25519 signing key",
+            "Paste an existing multibase-encoded key",
+        ];
+        let sk_idx = Select::new()
+            .with_prompt("Ed25519 signing key")
+            .items(sk_options)
+            .default(0)
+            .interact()?;
+
+        if sk_idx == 0 {
+            let key = generate_ed25519_multibase();
+            eprintln!("  Generated Ed25519 signing key.");
+            signing_key = Some(key);
+        } else {
+            let key: String = Input::new()
+                .with_prompt("Multibase-encoded Ed25519 private key")
+                .interact_text()?;
+            signing_key = Some(key.trim().to_string());
+        }
+
+        // Key agreement key
+        let ka_options = &[
+            "Generate a new X25519 key agreement key",
+            "Paste an existing multibase-encoded key",
+        ];
+        let ka_idx = Select::new()
+            .with_prompt("X25519 key agreement key")
+            .items(ka_options)
+            .default(0)
+            .interact()?;
+
+        if ka_idx == 0 {
+            let key = generate_x25519_multibase();
+            eprintln!("  Generated X25519 key agreement key.");
+            key_agreement_key = Some(key);
+        } else {
+            let key: String = Input::new()
+                .with_prompt("Multibase-encoded X25519 private key")
+                .interact_text()?;
+            key_agreement_key = Some(key.trim().to_string());
+        }
+
+        eprintln!();
+    }
+
+    // DIDComm-specific: mediator DID
+    if enable_didcomm {
         let med_did: String = Input::new()
             .with_prompt("Mediator DID (e.g. did:webvh:mediator.example.com)")
             .default(String::new())

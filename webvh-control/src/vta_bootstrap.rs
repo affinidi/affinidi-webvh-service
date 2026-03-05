@@ -147,14 +147,10 @@ pub fn print_next_steps(output_dir: &Path) {
     eprintln!("  Bootstrap complete!");
     eprintln!();
     eprintln!("  Next steps:");
-    eprintln!("    1. Import secrets into each service's setup:");
-    eprintln!("       webvh-server setup    (paste {dir}/webvh-server.bundle when prompted)");
+    eprintln!("    1. Import the secrets bundle into the control plane setup:");
     eprintln!("       webvh-control setup   (paste {dir}/webvh-control.bundle when prompted)");
     eprintln!();
-    eprintln!("    2. Load DIDs onto the webvh-server:");
-    eprintln!(
-        "       webvh-server load-did --path .well-known --did-log {dir}/webvh-server.did.jsonl"
-    );
+    eprintln!("    2. Load the control plane DID onto the webvh-server:");
     eprintln!(
         "       webvh-server load-did --path services/control --did-log {dir}/webvh-control.did.jsonl"
     );

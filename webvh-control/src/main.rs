@@ -32,31 +32,25 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
-    /// Import PNM provision bundles to bootstrap all WebVH services.
+    /// Import a PNM provision bundle to bootstrap the control plane.
     ///
-    /// Each service needs its own VTA context for secret/config isolation.
-    /// Use the PNM CLI to provision contexts with DIDs before running this:
+    /// Use the PNM CLI to provision a VTA context with a DID first:
     ///
-    ///   pnm contexts provision --name webvh-server --did-url https://did.example.com/.well-known
-    ///   pnm contexts provision --name webvh-control --did-url https://did.example.com/services/control
+    ///   pnm contexts provision --name webvh-control \
+    ///     --did-url https://did.example.com/services/control
     ///
-    /// Then pass the output bundles here:
+    /// Then pass the output bundle here:
     ///
     ///   webvh-control bootstrap \
-    ///     --server-bundle <base64url from webvh-server provision> \
-    ///     --control-bundle <base64url from webvh-control provision> \
+    ///     --control-bundle <base64url from provision> \
     ///     --output-dir ./bootstrap-output
+    ///
+    /// For webvh-server, use `webvh-server setup` to import its own bundle.
     #[command(verbatim_doc_comment)]
     Bootstrap {
-        /// PNM provision bundle for webvh-server (base64url string from `pnm contexts provision`)
-        #[arg(long)]
-        server_bundle: String,
         /// PNM provision bundle for webvh-control (base64url string from `pnm contexts provision`)
         #[arg(long)]
         control_bundle: String,
-        /// PNM provision bundle for webvh-witness (optional, base64url string)
-        #[arg(long)]
-        witness_bundle: Option<String>,
         /// Output directory for secrets bundles and DID log files
         #[arg(long, default_value = "./bootstrap-output")]
         output_dir: PathBuf,
@@ -101,20 +95,14 @@ async fn main() {
             }
         }
         Some(Command::Bootstrap {
-            server_bundle,
             control_bundle,
-            witness_bundle,
             output_dir,
         }) => {
             use affinidi_webvh_control::vta_bootstrap::{ServiceBundle, run_bootstrap, print_next_steps};
 
-            let mut bundles = vec![
-                ServiceBundle { label: "webvh-server", encoded: &server_bundle },
+            let bundles = vec![
                 ServiceBundle { label: "webvh-control", encoded: &control_bundle },
             ];
-            if let Some(ref wb) = witness_bundle {
-                bundles.push(ServiceBundle { label: "webvh-witness", encoded: wb });
-            }
 
             if let Err(e) = run_bootstrap(&bundles, &output_dir) {
                 eprintln!("Bootstrap error: {e}");

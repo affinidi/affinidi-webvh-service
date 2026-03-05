@@ -40,13 +40,14 @@ sequenceDiagram
 
     rect rgb(235, 245, 255)
         Note over Admin: Phase 0b — Import Provision Bundles
-        Admin->>Admin: webvh-control bootstrap<br/>--server-bundle eyJ...<br/>--control-bundle eyJ...
-        Note over Admin: Writes to output dir:<br/>*.bundle (secrets)<br/>*.did.jsonl (DID log)
+        Admin->>Admin: webvh-control bootstrap<br/>--control-bundle eyJ...
+        Note over Admin: Writes control plane<br/>*.bundle + *.did.jsonl
     end
 
     rect rgb(240, 248, 255)
         Note over Admin: Phase 1 — Configure Services
-        Admin->>Admin: Import secrets bundles into service configs
+        Admin->>Admin: webvh-server setup (import server provision bundle)
+        Admin->>Admin: webvh-control setup (import control secrets bundle)
         Admin->>Server: webvh-server load-did --path .well-known<br/>--did-log webvh-server.did.jsonl
         Admin->>Server: webvh-server load-did --path services/control<br/>--did-log webvh-control.did.jsonl
         Admin->>Control: webvh-control add-acl<br/>--did did:webvh:SERVER_SCID:... --role admin
@@ -108,40 +109,35 @@ Each command outputs a base64url-encoded **ContextProvisionBundle** containing:
 - DID material (DID document, log entry)
 - Private keys (signing + key-agreement)
 
-Save the output string from each command — you'll pass them to the bootstrap step.
+Save the output string from each command — you'll pass them to the setup wizards.
 
-### Phase 0b: Import Provision Bundles
+### Phase 0b: Import Control Plane Provision Bundle
 
-Pass the PNM provision bundles to the bootstrap command to extract secrets and DID logs:
+Extract the control plane's secrets and DID log from its provision bundle:
 
 ```bash
 webvh-control bootstrap \
-  --server-bundle <base64url output from webvh-server provision> \
   --control-bundle <base64url output from webvh-control provision> \
-  --witness-bundle <base64url output from webvh-witness provision> \
   --output-dir ./bootstrap-output
 ```
 
 This creates:
 ```
 bootstrap-output/
-  webvh-server.bundle       # secrets bundle (base64url, for setup wizard)
-  webvh-server.did.jsonl    # DID log entry (for load-did)
-  webvh-control.bundle
-  webvh-control.did.jsonl
-  webvh-witness.bundle      # (if --witness-bundle was provided)
-  webvh-witness.did.jsonl
+  webvh-control.bundle      # secrets bundle (base64url, for setup wizard)
+  webvh-control.did.jsonl   # DID log entry (for load-did)
 ```
 
 ### Phase 1: Configure Services
 
-#### 1a. Import secrets
+#### 1a. Import secrets via setup wizards
 
-Run the setup wizard for each service and paste the corresponding bundle when prompted:
+Run the setup wizard for each service. Each wizard prompts to import a secrets bundle
+(from PNM provision or from the bootstrap step):
 
 ```bash
-webvh-server setup     # paste webvh-server.bundle content
-webvh-control setup    # paste webvh-control.bundle content
+webvh-server setup     # import the webvh-server provision bundle when prompted
+webvh-control setup    # paste bootstrap-output/webvh-control.bundle when prompted
 ```
 
 #### 1b. Preload DIDs onto the server
