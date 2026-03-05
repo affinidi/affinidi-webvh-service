@@ -294,18 +294,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         };
     }
 
-    // 4. Public URL
-    let public_url: String = Input::new()
-        .with_prompt("Public URL (e.g. https://example.com)")
-        .default(String::new())
-        .interact_text()?;
-    let public_url = if public_url.is_empty() {
-        None
-    } else {
-        Some(public_url.trim_end_matches('/').to_string())
-    };
-
-    // 5. Host / Port
+    // 4. Host / Port
     let host: String = Input::new()
         .with_prompt("Listen host")
         .default("0.0.0.0".to_string())
@@ -400,7 +389,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         },
         server_did,
         mediator_did,
-        public_url,
+        public_url: None,
         server: ServerConfig { host, port },
         log: LogConfig {
             level: log_level,
