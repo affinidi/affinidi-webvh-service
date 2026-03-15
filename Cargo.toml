@@ -24,7 +24,7 @@ rust-version = "1.91.0"
 [workspace.dependencies]
 
 # Affinidi Trust Development Kit
-affinidi-tdk = "0.5"
+affinidi-tdk = "0.6"
 
 # Async runtime
 tokio = { version = "1", features = [
@@ -94,7 +94,7 @@ reqwest = { version = "0.13", features = ["json"] }
 anyhow = "1"
 
 # DID WebVH
-didwebvh-rs = "0.2"
+didwebvh-rs = "0.3"
 
 # Logging / tracing
 tracing = "0.1"

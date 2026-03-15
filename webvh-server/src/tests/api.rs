@@ -167,14 +167,14 @@ async fn create_did(app: &axum::Router, token: &str) -> String {
 }
 
 /// Generate valid did:webvh JSONL content for upload tests.
-fn valid_jsonl() -> String {
+async fn valid_jsonl() -> String {
     use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
 
     let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
     let pk = secret.get_public_keymultibase().unwrap();
     let host = encode_host("http://localhost:8530").unwrap();
     let doc = build_did_document(&host, "test", &pk);
-    let (_scid, jsonl) = create_log_entry(&doc, &secret).unwrap();
+    let (_scid, jsonl) = create_log_entry(&doc, &secret).await.unwrap();
     jsonl
 }
 
@@ -424,7 +424,7 @@ async fn owner_cannot_upload_to_others_did() {
     seed_acl(&env, did_b, Role::Owner).await;
     let token_b = token_for(&env, did_b, Role::Owner).await;
 
-    let content = valid_jsonl();
+    let content = valid_jsonl().await;
     let resp = router
         .clone()
         .oneshot(
@@ -692,7 +692,7 @@ async fn did_count_limit_enforced() {
 async fn total_size_limit_enforced() {
     let env = setup().await;
     let did = "did:key:quotaSize";
-    let content = valid_jsonl();
+    let content = valid_jsonl().await;
     let content_len = content.len() as u64;
     // Set total size limit just below 2x the content size
     let limit = content_len * 2 - 1;
@@ -765,7 +765,7 @@ async fn admin_bypasses_did_count_limit() {
 async fn admin_bypasses_total_size_limit() {
     let env = setup().await;
     let did = "did:key:adminSizeBypass";
-    let content = valid_jsonl();
+    let content = valid_jsonl().await;
     // Set a tiny limit — admin should bypass
     seed_acl_with_limits(&env, did, Role::Admin, None, Some(1)).await;
     let token = token_for(&env, did, Role::Admin).await;
@@ -798,7 +798,7 @@ async fn upload_valid_jsonl_accepted() {
     let router = app(&env);
 
     let mnemonic = create_did(&router, &token).await;
-    let content = valid_jsonl();
+    let content = valid_jsonl().await;
 
     let resp = router
         .clone()
@@ -884,7 +884,7 @@ async fn public_did_resolve_after_upload() {
     let router = app(&env);
 
     let mnemonic = create_did(&router, &token).await;
-    let content = valid_jsonl();
+    let content = valid_jsonl().await;
 
     // Upload content
     let resp = router

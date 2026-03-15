@@ -55,6 +55,7 @@ pub async fn bootstrap_root_did(
     let doc = build_did_document(&host, ".well-known", &public_key);
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)
+        .await
         .map_err(|e| AppError::Internal(format!("failed to create log entry: {e}")))?;
 
     let did_id = extract_did_id(&jsonl)

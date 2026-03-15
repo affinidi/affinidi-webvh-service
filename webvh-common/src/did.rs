@@ -93,7 +93,7 @@ pub fn build_did_document(
 /// Returns `(scid, jsonl)` where:
 /// - `scid` is the self-certifying identifier derived from the log entry
 /// - `jsonl` is the serialized log entry ready for upload to the server
-pub fn create_log_entry(
+pub async fn create_log_entry(
     did_document: &serde_json::Value,
     secret: &Secret,
 ) -> Result<(String, String)> {
@@ -101,20 +101,28 @@ pub fn create_log_entry(
         .get_public_keymultibase()
         .map_err(|e| WebVHError::DIDComm(format!("failed to get public key multibase: {e}")))?;
 
+    // didwebvh-rs 0.3 requires the signing key's verification_method to
+    // contain '#' followed by the multibase public key.
+    let mut signing_key = secret.clone();
+    if !signing_key.id.contains('#') {
+        signing_key.id = format!("did:key:{public_key_multibase}#{public_key_multibase}");
+    }
+
     let mut state = DIDWebVHState::default();
     let params = Parameters {
-        update_keys: Some(Arc::new(vec![public_key_multibase])),
+        update_keys: Some(Arc::new(vec![public_key_multibase.into()])),
         ..Default::default()
     };
 
     state
-        .create_log_entry(None, did_document, &params, secret)
+        .create_log_entry(None, did_document, &params, &signing_key)
+        .await
         .map_err(|e| WebVHError::DIDComm(format!("failed to create WebVH log entry: {e}")))?;
 
-    let scid = state.scid.clone();
+    let scid = state.scid().to_string();
 
     let jsonl: String = state
-        .log_entries
+        .log_entries()
         .iter()
         .map(|e| serde_json::to_string(&e.log_entry).unwrap())
         .collect::<Vec<_>>()

@@ -1046,33 +1046,33 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn make_valid_jsonl() -> String {
+    async fn make_valid_jsonl() -> String {
         use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
 
         let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
         let pk = secret.get_public_keymultibase().unwrap();
         let host = encode_host("http://localhost:3000").unwrap();
         let doc = build_did_document(&host, "test-validate", &pk);
-        let (_scid, jsonl) = create_log_entry(&doc, &secret).unwrap();
+        let (_scid, jsonl) = create_log_entry(&doc, &secret).await.unwrap();
         jsonl
     }
 
-    #[test]
-    fn validate_jsonl_blank_lines_skipped() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_blank_lines_skipped() {
+        let entry = make_valid_jsonl().await;
         let with_blanks = format!("\n{entry}\n\n");
         assert!(validate_did_jsonl(&with_blanks).is_ok());
     }
 
-    #[test]
-    fn validate_jsonl_valid_single_entry() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_valid_single_entry() {
+        let entry = make_valid_jsonl().await;
         assert!(validate_did_jsonl(&entry).is_ok());
     }
 
-    #[test]
-    fn validate_jsonl_second_line_invalid() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_second_line_invalid() {
+        let entry = make_valid_jsonl().await;
         let content = format!("{entry}\nnot valid json");
         let result = validate_did_jsonl(&content);
         assert!(result.is_err());
