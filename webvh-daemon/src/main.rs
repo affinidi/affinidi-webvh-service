@@ -218,6 +218,7 @@ async fn build_server(
         secrets_resolver,
         jwt_keys,
         http_client: reqwest::Client::new(),
+        stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
     };
 
     let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);
@@ -329,6 +330,7 @@ async fn build_control(
         http_client: reqwest::Client::new(),
         atm: None,
         atm_profile: None,
+        server_stats: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     let router = affinidi_webvh_control::routes::router().with_state(state);

@@ -8,7 +8,7 @@ use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
-use crate::stats::{self, DidStats, aggregate_stats, get_stats};
+use crate::stats::{self, DidStats, get_stats};
 
 /// GET /stats/{mnemonic}
 pub async fn get_did_stats(
@@ -40,24 +40,37 @@ pub struct ServerStatsResponse {
     pub last_updated_at: Option<u64>,
 }
 
-/// GET /stats — aggregate stats across all DIDs
+/// GET /stats — instant aggregate from in-memory collector (no storage scan).
 pub async fn get_server_stats(
     auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatsResponse>, AppError> {
-    let dids = state.dids_ks.prefix_iter_raw("did:").await?;
-    let total_dids = dids.len() as u64;
-    let agg = aggregate_stats(&state.stats_ks).await?;
+    let resp = if let Some(ref collector) = state.stats_collector {
+        // Fast path: read from in-memory aggregate
+        let agg = collector.get_aggregate();
+        ServerStatsResponse {
+            total_dids: agg.total_dids,
+            total_resolves: agg.total_resolves,
+            total_updates: agg.total_updates,
+            last_resolved_at: agg.last_resolved_at,
+            last_updated_at: agg.last_updated_at,
+        }
+    } else {
+        // Fallback: scan storage (no collector configured)
+        let dids = state.dids_ks.prefix_iter_raw("did:").await?;
+        let total_dids = dids.len() as u64;
+        let agg = stats::load_aggregate(&state.stats_ks).await?;
+        ServerStatsResponse {
+            total_dids,
+            total_resolves: agg.total_resolves,
+            total_updates: agg.total_updates,
+            last_resolved_at: agg.last_resolved_at,
+            last_updated_at: agg.last_updated_at,
+        }
+    };
 
-    info!(did = %auth.did, total_dids, "server stats retrieved");
-
-    Ok(Json(ServerStatsResponse {
-        total_dids,
-        total_resolves: agg.total_resolves,
-        total_updates: agg.total_updates,
-        last_resolved_at: agg.last_resolved_at,
-        last_updated_at: agg.last_updated_at,
-    }))
+    info!(did = %auth.did, total_dids = resp.total_dids, "server stats retrieved");
+    Ok(Json(resp))
 }
 
 // ---------------------------------------------------------------------------

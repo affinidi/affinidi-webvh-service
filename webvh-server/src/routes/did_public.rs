@@ -9,7 +9,6 @@ use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
-use crate::stats;
 
 /// Serve stored content for a mnemonic, optionally incrementing resolve stats.
 async fn serve_content(
@@ -37,8 +36,9 @@ async fn serve_content(
         .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
 
     if track_stats {
-        let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
-        let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
+        if let Some(ref collector) = state.stats_collector {
+            collector.record_resolve(mnemonic);
+        }
     }
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
@@ -81,8 +81,9 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
 
     // Track stats (same counters as did:webvh resolves)
-    let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
-    let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
+    if let Some(ref collector) = state.stats_collector {
+        collector.record_resolve(mnemonic);
+    }
 
     debug!(mnemonic = %mnemonic, size = doc_bytes.len(), "did:web document resolved");
 

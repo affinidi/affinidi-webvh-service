@@ -5,6 +5,7 @@ pub mod didcomm_profile;
 pub mod error;
 pub mod health;
 pub mod mnemonic;
+pub mod stats_collector;
 #[cfg(feature = "passkey")]
 pub mod passkey;
 pub mod secret_store;

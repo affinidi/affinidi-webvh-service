@@ -5,6 +5,7 @@ pub mod health;
 mod passkey;
 mod proxy;
 mod registry;
+mod stats_sync;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -65,6 +66,8 @@ pub fn router() -> Router<AppState> {
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Stats (DID count from control plane)
         .route("/stats", get(did_manage::get_server_stats))
+        // Stats sync (server → control plane, no auth — servers self-identify by DID)
+        .route("/control/stats", post(stats_sync::receive_stats))
         // Control plane
         .nest("/control", control)
         // Proxy to backend services (moved to /proxy/ prefix to avoid

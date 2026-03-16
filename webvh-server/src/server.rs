@@ -40,6 +40,7 @@ pub struct AppState {
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub http_client: reqwest::Client,
+    pub stats_collector: Option<Arc<stats::StatsCollector>>,
 }
 
 impl AppState {
@@ -112,6 +113,33 @@ pub async fn run(
     let has_auth = jwt_keys.is_some();
 
     let upload_body_limit = config.limits.upload_body_limit;
+    let stats_config = config.stats.clone();
+
+    // Initialize in-memory stats collector and seed from storage
+    let stats_collector = {
+        let collector = stats::StatsCollector::new();
+        // Load existing aggregate from storage to seed the collector
+        match stats::load_aggregate(&storage_stats_ks).await {
+            Ok(agg) => {
+                let total_dids = storage_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
+                collector.seed_aggregate(&stats::StatsAggregate {
+                    total_dids,
+                    total_resolves: agg.total_resolves,
+                    total_updates: agg.total_updates,
+                    last_resolved_at: agg.last_resolved_at,
+                    last_updated_at: agg.last_updated_at,
+                });
+                info!(
+                    total_dids,
+                    total_resolves = agg.total_resolves,
+                    total_updates = agg.total_updates,
+                    "stats collector seeded from storage"
+                );
+            }
+            Err(e) => warn!("failed to seed stats collector: {e}"),
+        }
+        Arc::new(collector)
+    };
 
     let state = AppState {
         store: store.clone(),
@@ -129,6 +157,7 @@ pub async fn run(
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client"),
+        stats_collector: Some(stats_collector.clone()),
     };
 
     // Register with control plane if configured (DIDComm auth)
@@ -212,8 +241,13 @@ pub async fn run(
         None
     };
 
-    // 2. Spawn storage thread (independent cleanup, can run alongside REST)
+    // 2. Spawn storage thread (independent cleanup, flush, sync)
     let mut storage_shutdown = storage_shutdown_rx.clone();
+    let storage_collector = stats_collector.clone();
+    let storage_http = state.http_client.clone();
+    let storage_control_url = state.config.control_url.clone();
+    let storage_server_did = state.config.server_did.clone();
+    let storage_stats_config = stats_config;
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
         .spawn(move || {
@@ -224,6 +258,11 @@ pub async fn run(
                 storage_stats_ks,
                 storage_auth_config,
                 has_auth,
+                storage_collector,
+                storage_stats_config,
+                storage_http,
+                storage_control_url,
+                storage_server_did,
                 &mut storage_shutdown,
             )
         })
@@ -418,6 +457,11 @@ fn run_storage_thread(
     stats_ks: KeyspaceHandle,
     auth_config: AuthConfig,
     has_auth: bool,
+    collector: Arc<stats::StatsCollector>,
+    stats_config: crate::config::StatsConfig,
+    http: reqwest::Client,
+    control_url: Option<String>,
+    server_did: Option<String>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -426,18 +470,29 @@ fn run_storage_thread(
         .expect("failed to build storage runtime");
 
     rt.block_on(async {
-        info!("storage thread started");
+        info!(
+            flush_interval = stats_config.flush_interval_secs,
+            sync_interval = stats_config.sync_interval_secs,
+            "storage thread started"
+        );
 
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let did_ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
+        let flush_interval = Duration::from_secs(stats_config.flush_interval_secs.max(1));
+        let sync_enabled = stats_config.sync_interval_secs > 0 && control_url.is_some();
+        let sync_interval = Duration::from_secs(stats_config.sync_interval_secs.max(1));
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut did_timer = tokio::time::interval(did_interval);
+        let mut flush_timer = tokio::time::interval(flush_interval);
+        let mut sync_timer = tokio::time::interval(sync_interval);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
         session_timer.tick().await;
         did_timer.tick().await;
+        flush_timer.tick().await;
+        sync_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -458,11 +513,30 @@ fn run_storage_thread(
                         Err(e) => warn!("time-series cleanup error: {e}"),
                     }
                 }
+                _ = flush_timer.tick() => {
+                    if let Err(e) = stats::flush_to_storage(&collector, &stats_ks, &store).await {
+                        warn!("stats flush error: {e}");
+                    }
+                    // Update total DID count in collector after flush
+                    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+                        collector.set_total_dids(dids.len() as u64);
+                    }
+                }
+                _ = sync_timer.tick(), if sync_enabled => {
+                    if let (Some(url), Some(did)) = (&control_url, &server_did) {
+                        stats::sync_to_control(&http, url, did, &collector).await;
+                    }
+                }
                 _ = shutdown_rx.changed() => {
                     info!("storage thread shutting down");
                     break;
                 }
             }
+        }
+
+        // Final flush before shutdown
+        if let Err(e) = stats::flush_to_storage(&collector, &stats_ks, &store).await {
+            warn!("final stats flush error: {e}");
         }
 
         // Persist store before closing

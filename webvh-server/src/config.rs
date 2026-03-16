@@ -28,6 +28,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
     pub watchers: Vec<WatcherEndpoint>,
     /// URL of the control plane for service registration.
     pub control_url: Option<String>,
@@ -76,6 +78,35 @@ impl Default for LimitsConfig {
             upload_body_limit: default_upload_body_limit(),
             default_max_total_size: default_max_total_size(),
             default_max_did_count: default_max_did_count(),
+        }
+    }
+}
+
+/// Stats collection and sync configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StatsConfig {
+    /// How often (seconds) to flush in-memory counters to storage. Default: 5.
+    #[serde(default = "default_stats_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// How often (seconds) to push aggregate stats to the control plane. Default: 1.
+    /// Set to 0 to disable sync.
+    #[serde(default = "default_stats_sync_interval")]
+    pub sync_interval_secs: u64,
+}
+
+fn default_stats_flush_interval() -> u64 {
+    5
+}
+
+fn default_stats_sync_interval() -> u64 {
+    1
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: default_stats_flush_interval(),
+            sync_interval_secs: default_stats_sync_interval(),
         }
     }
 }
@@ -140,6 +171,10 @@ impl AppConfig {
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
+
+        // Stats
+        env_parse!("WEBVH_STATS_FLUSH_INTERVAL_SECS", config.stats.flush_interval_secs);
+        env_parse!("WEBVH_STATS_SYNC_INTERVAL_SECS", config.stats.sync_interval_secs);
 
         // Normalize: strip trailing slashes from URLs
         if let Some(ref mut url) = config.public_url {

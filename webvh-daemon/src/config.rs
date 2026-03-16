@@ -196,6 +196,7 @@ impl DaemonConfig {
             control_url: None,
             control_did: None,
             vta: self.vta.clone(),
+            stats: affinidi_webvh_server::config::StatsConfig::default(),
             config_path: self.config_path.clone(),
         }
     }

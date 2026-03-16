@@ -111,6 +111,30 @@ pub struct DidStats {
 }
 
 // ---------------------------------------------------------------------------
+// Stats sync (server → control plane)
+// ---------------------------------------------------------------------------
+
+/// Payload sent by webvh-server to the control plane to report aggregate stats.
+///
+/// Pushed periodically (configurable via `stats.sync_interval_secs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsSyncPayload {
+    /// DID of the reporting server.
+    pub server_did: String,
+    /// Total number of hosted DIDs.
+    pub total_dids: u64,
+    /// Total resolve operations since server start (loaded from storage + in-flight).
+    pub total_resolves: u64,
+    /// Total update/publish operations.
+    pub total_updates: u64,
+    /// Epoch timestamp of the most recent resolve.
+    pub last_resolved_at: Option<u64>,
+    /// Epoch timestamp of the most recent update.
+    pub last_updated_at: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // High-level create result
 // ---------------------------------------------------------------------------
 

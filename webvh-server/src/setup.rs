@@ -237,6 +237,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             did: Some(conn_info.vta_did),
             context_id: Some(conn_info.context_id),
         },
+        stats: crate::config::StatsConfig::default(),
         config_path: output_path.clone(),
     };
 

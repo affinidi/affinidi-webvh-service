@@ -293,8 +293,9 @@ pub async fn publish_did(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.commit().await?;
 
-    stats::increment_updates(&state.stats_ks, mnemonic).await?;
-    let _ = stats::record_timeseries_update(&state.stats_ks, mnemonic).await;
+    if let Some(ref collector) = state.stats_collector {
+        collector.record_update(mnemonic);
+    }
 
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 

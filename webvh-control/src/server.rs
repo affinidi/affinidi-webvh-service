@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
@@ -45,6 +46,8 @@ pub struct AppState {
     pub atm: Option<Arc<ATM>>,
     /// ATM profile for the control plane's outbound mediator connection.
     pub atm_profile: Option<Arc<ATMProfile>>,
+    /// Per-server stats received via HTTP sync. Key: server DID.
+    pub server_stats: Arc<RwLock<HashMap<String, affinidi_webvh_common::StatsSyncPayload>>>,
 }
 
 impl AppState {
@@ -170,6 +173,7 @@ pub async fn run(
         http_client: reqwest::Client::new(),
         atm: None,
         atm_profile: None,
+        server_stats: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Seed registry from static config

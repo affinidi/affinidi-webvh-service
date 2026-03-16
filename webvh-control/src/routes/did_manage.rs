@@ -237,36 +237,49 @@ pub struct ServerStatsResponse {
     pub last_updated_at: Option<u64>,
 }
 
+/// GET /api/stats — aggregates stats from all connected server instances.
+///
+/// If no servers have synced stats yet, falls back to counting local DID records.
 pub async fn get_server_stats(
     _auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatsResponse>, AppError> {
-    use affinidi_webvh_common::did_ops::DidRecord;
-
-    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
     let mut total_dids = 0u64;
+    let mut total_resolves = 0u64;
     let mut total_updates = 0u64;
+    let mut last_resolved_at: Option<u64> = None;
     let mut last_updated_at: Option<u64> = None;
+    let mut has_server_stats = false;
 
-    for (_key, value) in raw {
-        let record: DidRecord = match serde_json::from_slice(&value) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        total_dids += 1;
-        if record.version_count > 1 {
-            total_updates += record.version_count - 1;
+    // Aggregate across all server instances that have synced stats
+    if let Ok(map) = state.server_stats.read() {
+        for payload in map.values() {
+            has_server_stats = true;
+            total_dids += payload.total_dids;
+            total_resolves += payload.total_resolves;
+            total_updates += payload.total_updates;
+            last_resolved_at = match (last_resolved_at, payload.last_resolved_at) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            last_updated_at = match (last_updated_at, payload.last_updated_at) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
         }
-        if record.updated_at > 0 {
-            last_updated_at = Some(last_updated_at.map_or(record.updated_at, |prev: u64| prev.max(record.updated_at)));
-        }
+    }
+
+    // Fallback: if no servers have synced, count local DID records
+    if !has_server_stats {
+        let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+        total_dids = raw.len() as u64;
     }
 
     Ok(Json(ServerStatsResponse {
         total_dids,
-        total_resolves: 0,
+        total_resolves,
         total_updates,
-        last_resolved_at: None,
+        last_resolved_at,
         last_updated_at,
     }))
 }

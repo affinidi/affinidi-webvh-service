@@ -1,15 +1,24 @@
+//! Stats collection and storage.
+//!
+//! Hot-path operations (`record_resolve`, `record_update`) accumulate in the
+//! in-memory `StatsCollector`. A periodic flush task drains the collector and
+//! writes deltas to the storage backend via `WriteBatch`, which works
+//! identically across all backends (fjall, redis, dynamodb, firestore, cosmosdb).
+
 pub use affinidi_webvh_common::DidStats;
+pub use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
 
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
-use crate::store::KeyspaceHandle;
+use crate::store::{KeyspaceHandle, Store};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 fn stats_key(mnemonic: &str) -> String {
     format!("stats:{mnemonic}")
 }
 
-/// Get stats for a mnemonic. Returns default stats if none exist yet.
+/// Get stats for a mnemonic from storage. Returns default stats if none exist yet.
 pub async fn get_stats(
     stats_ks: &KeyspaceHandle,
     mnemonic: &str,
@@ -20,28 +29,6 @@ pub async fn get_stats(
         .unwrap_or_default())
 }
 
-/// Increment the resolve counter and update last_resolved_at.
-pub async fn increment_resolves(
-    stats_ks: &KeyspaceHandle,
-    mnemonic: &str,
-) -> Result<(), AppError> {
-    let mut stats = get_stats(stats_ks, mnemonic).await?;
-    stats.total_resolves += 1;
-    stats.last_resolved_at = Some(crate::auth::session::now_epoch());
-    stats_ks.insert(stats_key(mnemonic), &stats).await
-}
-
-/// Increment the update counter and update last_updated_at.
-pub async fn increment_updates(
-    stats_ks: &KeyspaceHandle,
-    mnemonic: &str,
-) -> Result<(), AppError> {
-    let mut stats = get_stats(stats_ks, mnemonic).await?;
-    stats.total_updates += 1;
-    stats.last_updated_at = Some(crate::auth::session::now_epoch());
-    stats_ks.insert(stats_key(mnemonic), &stats).await
-}
-
 /// Delete stats for a mnemonic.
 pub async fn delete_stats(
     stats_ks: &KeyspaceHandle,
@@ -50,8 +37,9 @@ pub async fn delete_stats(
     stats_ks.remove(stats_key(mnemonic)).await
 }
 
-/// Aggregate stats across all DIDs.
-pub async fn aggregate_stats(stats_ks: &KeyspaceHandle) -> Result<DidStats, AppError> {
+/// Load the aggregate from storage (full scan). Used once at startup to seed
+/// the in-memory collector.
+pub async fn load_aggregate(stats_ks: &KeyspaceHandle) -> Result<DidStats, AppError> {
     let raw = stats_ks.prefix_iter_raw("stats:").await?;
     let mut agg = DidStats::default();
     for (_key, value) in raw {
@@ -71,13 +59,71 @@ pub async fn aggregate_stats(stats_ks: &KeyspaceHandle) -> Result<DidStats, AppE
     Ok(agg)
 }
 
+/// Flush accumulated deltas from the collector to the storage backend.
+///
+/// Uses `WriteBatch` for atomicity where the backend supports it.
+/// For each dirty mnemonic, reads the current stored value, merges the delta,
+/// and writes back. This is a read-modify-write but only contends with other
+/// flush cycles (not with the hot path).
+pub async fn flush_to_storage(
+    collector: &StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
+    // --- Flush per-DID counter deltas ---
+    let deltas = collector.drain_deltas();
+    if !deltas.is_empty() {
+        let mut batch = store.batch();
+        for d in &deltas {
+            let mut stats: DidStats = stats_ks
+                .get(stats_key(&d.mnemonic))
+                .await?
+                .unwrap_or_default();
+            stats.total_resolves += d.resolve_delta;
+            stats.total_updates += d.update_delta;
+            if let Some(t) = d.last_resolved_at {
+                stats.last_resolved_at = Some(
+                    stats.last_resolved_at.map_or(t, |prev| prev.max(t)),
+                );
+            }
+            if let Some(t) = d.last_updated_at {
+                stats.last_updated_at = Some(
+                    stats.last_updated_at.map_or(t, |prev| prev.max(t)),
+                );
+            }
+            batch.insert(stats_ks, stats_key(&d.mnemonic), &stats)?;
+        }
+        batch.commit().await?;
+        debug!(count = deltas.len(), "flushed stats deltas to storage");
+    }
+
+    // --- Flush time-series bucket deltas ---
+    let ts_deltas = collector.drain_ts_deltas();
+    if !ts_deltas.is_empty() {
+        let mut batch = store.batch();
+        for b in &ts_deltas {
+            let key = ts_key(&b.mnemonic, b.epoch);
+            let mut bucket: BucketData = stats_ks
+                .get(key.as_str())
+                .await?
+                .unwrap_or_default();
+            bucket.r += b.resolve_delta;
+            bucket.u += b.update_delta;
+            batch.insert(stats_ks, key, &bucket)?;
+        }
+        batch.commit().await?;
+        debug!(count = ts_deltas.len(), "flushed time-series deltas to storage");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Time-series tracking (5-minute buckets, 30-day retention)
 // ---------------------------------------------------------------------------
 
 const BUCKET_SECONDS: u64 = 300; // 5 minutes
 const RETENTION_SECONDS: u64 = 30 * 24 * 3600; // 30 days
-const GLOBAL_MNEMONIC: &str = "_all";
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct BucketData {
@@ -120,40 +166,6 @@ fn ts_key(mnemonic: &str, epoch: u64) -> String {
 
 fn ts_prefix(mnemonic: &str) -> String {
     format!("ts:{mnemonic}:")
-}
-
-async fn increment_bucket(
-    stats_ks: &KeyspaceHandle,
-    mnemonic: &str,
-    resolve: bool,
-) -> Result<(), AppError> {
-    let epoch = bucket_epoch(now_epoch());
-    let key = ts_key(mnemonic, epoch);
-    let mut bucket: BucketData = stats_ks.get(key.as_str()).await?.unwrap_or_default();
-    if resolve {
-        bucket.r += 1;
-    } else {
-        bucket.u += 1;
-    }
-    stats_ks.insert(key, &bucket).await
-}
-
-/// Record a resolve event in time-series buckets (per-DID + global).
-pub async fn record_timeseries_resolve(
-    stats_ks: &KeyspaceHandle,
-    mnemonic: &str,
-) -> Result<(), AppError> {
-    increment_bucket(stats_ks, mnemonic, true).await?;
-    increment_bucket(stats_ks, GLOBAL_MNEMONIC, true).await
-}
-
-/// Record an update event in time-series buckets (per-DID + global).
-pub async fn record_timeseries_update(
-    stats_ks: &KeyspaceHandle,
-    mnemonic: &str,
-) -> Result<(), AppError> {
-    increment_bucket(stats_ks, mnemonic, false).await?;
-    increment_bucket(stats_ks, GLOBAL_MNEMONIC, false).await
 }
 
 impl TimeRange {
@@ -262,4 +274,27 @@ pub async fn delete_timeseries(
         stats_ks.remove(key.clone()).await?;
     }
     Ok(())
+}
+
+/// Push aggregate stats to the control plane via HTTP.
+pub async fn sync_to_control(
+    http: &reqwest::Client,
+    control_url: &str,
+    server_did: &str,
+    collector: &StatsCollector,
+) {
+    let agg = collector.get_aggregate();
+    let payload = affinidi_webvh_common::StatsSyncPayload {
+        server_did: server_did.to_string(),
+        total_dids: agg.total_dids,
+        total_resolves: agg.total_resolves,
+        total_updates: agg.total_updates,
+        last_resolved_at: agg.last_resolved_at,
+        last_updated_at: agg.last_updated_at,
+    };
+
+    let url = format!("{control_url}/api/control/stats");
+    if let Err(e) = http.post(&url).json(&payload).send().await {
+        warn!(error = %e, url = %url, "failed to sync stats to control plane");
+    }
 }
