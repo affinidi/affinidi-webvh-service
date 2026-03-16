@@ -5,7 +5,7 @@ use std::path::PathBuf;
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use affinidi_webvh_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, LogFormat, PlaintextSecrets, SecretsConfig,
-    ServerConfig, StoreConfig,
+    ServerConfig, StoreConfig, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub vta: VtaConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
     #[serde(skip)]
@@ -126,6 +128,11 @@ impl AppConfig {
         env_opt!("CONTROL_MEDIATOR_DID", config.mediator_did);
         env_opt!("CONTROL_PUBLIC_URL", config.public_url);
         env_opt!("CONTROL_DID_HOSTING_URL", config.did_hosting_url);
+
+        // VTA config
+        env_opt!("CONTROL_VTA_URL", config.vta.url);
+        env_opt!("CONTROL_VTA_DID", config.vta.did);
+        env_opt!("CONTROL_VTA_CONTEXT_ID", config.vta.context_id);
         env_parse!(
             "CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL",
             config.registry.health_check_interval

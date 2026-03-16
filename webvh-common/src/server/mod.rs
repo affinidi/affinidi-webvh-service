@@ -8,6 +8,7 @@ pub mod mnemonic;
 pub mod passkey;
 pub mod secret_store;
 pub mod store;
+pub mod vta_setup;
 
 /// Axum middleware that sets security response headers on every response.
 pub async fn security_headers(

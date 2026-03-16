@@ -4,66 +4,14 @@ use crate::acl::{AclEntry, Role};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, RegistryConfig, SecretsConfig,
-    ServerConfig, StoreConfig,
+    ServerConfig, StoreConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use affinidi_webvh_common::server::vta_setup;
 use dialoguer::{Confirm, Input, Select};
-use serde::Deserialize;
 use std::path::PathBuf;
-
-/// Secrets bundle format (base64url-encoded JSON from bootstrap output).
-#[derive(Deserialize)]
-struct SecretsBundle {
-    did: String,
-    secrets: Vec<SecretEntry>,
-}
-
-/// PNM ContextProvisionBundle format (direct output of `pnm contexts provision`).
-#[derive(Deserialize)]
-struct ContextProvisionBundle {
-    did: Option<ProvisionedDid>,
-    #[allow(dead_code)]
-    context_id: String,
-}
-
-#[derive(Deserialize)]
-struct ProvisionedDid {
-    id: String,
-    secrets: Vec<SecretEntry>,
-}
-
-#[derive(Deserialize)]
-struct SecretEntry {
-    key_id: String,
-    key_type: String,
-    private_key_multibase: String,
-}
-
-/// Try to decode as SecretsBundle first, then fall back to ContextProvisionBundle.
-fn decode_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
-    // Try SecretsBundle format (from bootstrap output)
-    if let Ok(bundle) = serde_json::from_slice::<SecretsBundle>(bytes) {
-        return Ok(bundle);
-    }
-
-    // Try ContextProvisionBundle format (direct PNM provision output)
-    match serde_json::from_slice::<ContextProvisionBundle>(bytes) {
-        Ok(provision) => {
-            let did_info = provision
-                .did
-                .ok_or("provision bundle has no DID material — re-provision with --did-url")?;
-            Ok(SecretsBundle {
-                did: did_info.id,
-                secrets: did_info.secrets,
-            })
-        }
-        Err(e) => Err(format!("unrecognized bundle format: {e}")),
-    }
-}
 
 pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
@@ -82,12 +30,87 @@ pub async fn run_setup() -> Result<(), AppError> {
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let output_path = PathBuf::from(output_path);
 
-    // 2. Public URL (required for passkeys)
+    // 2. VTA credential — authenticate with control's VTA context
+    eprintln!();
+    eprintln!("  The control plane needs a VTA credential to create its DID identity.");
+    eprintln!("  This is the base64url string issued by the VTA operator for the");
+    eprintln!("  control plane's context.");
+    eprintln!();
+
+    let credential_b64: String = Input::new()
+        .with_prompt("VTA credential (base64url)")
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+    let (client, conn_info) = vta_setup::connect_vta(credential_b64.trim())
+        .await
+        .map_err(|e| AppError::Config(format!("VTA authentication failed: {e}")))?;
+
+    eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
+    eprintln!("  VTA context: {}", conn_info.context_id);
+
+    // 3. DID hosting URL (where webvh-server serves DIDs)
+    eprintln!();
+    eprintln!("  The DID hosting URL is where your webvh-server serves DID documents.");
+    eprintln!("  The control plane's DID will be published at <url>/<path>/did.jsonl.");
+    eprintln!();
+    let did_hosting_url: String = Input::new()
+        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
+
+    // 4. DID path
+    let did_path: String = Input::new()
+        .with_prompt("DID path on the server")
+        .default("services/control".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+    // 5. Create control DID via VTA
+    eprintln!();
+    eprintln!("  Creating control plane DID via VTA...");
+
+    let did_result = vta_setup::create_did(
+        &client,
+        &conn_info.context_id,
+        &did_hosting_url,
+        &did_path,
+        Some("webvh-control"),
+    )
+    .await
+    .map_err(|e| AppError::Config(format!("failed to create DID: {e}")))?;
+
+    eprintln!("  Control DID created: {}", did_result.did);
+    eprintln!("  SCID: {}", did_result.scid);
+
+    // 6. Write log entry to file
+    if let Some(ref log_entry) = did_result.log_entry {
+        let log_file = PathBuf::from("control-did.jsonl");
+        let default_log_path = log_file.display().to_string();
+        let log_path: String = Input::new()
+            .with_prompt("DID log entry output file")
+            .default(default_log_path)
+            .interact_text()
+            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+        vta_setup::write_log_entry_file(log_entry, &PathBuf::from(&log_path))?;
+        eprintln!("  DID log entry written to {log_path}");
+
+        // Dump raw log entry
+        eprintln!();
+        eprintln!("  DID Log Entry:");
+        eprintln!("  ---");
+        for line in log_entry.lines() {
+            eprintln!("  {line}");
+        }
+        eprintln!("  ---");
+    }
+
+    // 7. Public URL (for WebAuthn/passkey)
     eprintln!();
     eprintln!("  The public URL is used for WebAuthn/passkey authentication.");
     eprintln!("  It must match the URL users will access in their browser.");
-    eprintln!("  For local development, use http://localhost:<port>.");
-    eprintln!("  For production, use the externally reachable HTTPS URL.");
     eprintln!();
     let public_url: String = Input::new()
         .with_prompt("Public URL")
@@ -100,27 +123,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         Some(public_url)
     };
 
-    // 2b. DID hosting URL
-    eprintln!();
-    eprintln!("  The DID hosting URL is where your webvh-server serves DID documents.");
-    eprintln!("  The control plane displays this to users so they know where their");
-    eprintln!("  DIDs are publicly accessible. Leave empty if not yet known.");
-    eprintln!();
-    let did_hosting_url: String = Input::new()
-        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
-        .default(String::new())
-        .interact_text()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let did_hosting_url = if did_hosting_url.is_empty() {
-        None
-    } else {
-        Some(did_hosting_url)
-    };
-
-    // 3. Host & Port
-    eprintln!();
-    eprintln!("  Network binding for the control plane HTTP server.");
-    eprintln!("  Use 0.0.0.0 to listen on all interfaces, or 127.0.0.1 for localhost only.");
+    // 8. Host & Port
     eprintln!();
     let host: String = Input::new()
         .with_prompt("Listen host")
@@ -134,7 +137,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    // 4. Log level & format
+    // 9. Log level & format
     eprintln!();
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -157,11 +160,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         _ => LogFormat::Text,
     };
 
-    // 5. Data directory
-    eprintln!();
-    eprintln!("  The data directory stores the embedded database (fjall key-value store).");
-    eprintln!("  This includes ACL entries, sessions, and registry state.");
-    eprintln!("  The directory will be created automatically if it does not exist.");
+    // 10. Data directory
     eprintln!();
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
@@ -169,120 +168,32 @@ pub async fn run_setup() -> Result<(), AppError> {
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    // 6. JWT signing key
-    let jwt_signing_key = generate_ed25519_multibase();
-    eprintln!("  Generated JWT signing key.");
-
-    // 7. Secrets backend
-    eprintln!();
-    eprintln!("  The control plane needs to store cryptographic keys (signing, key agreement,");
-    eprintln!("  JWT). Choose a backend for secure storage of these secrets.");
+    // 11. Secrets backend
     eprintln!();
     let secrets_config = configure_secrets()?;
 
-    // 8. Identity — import PNM provision bundle or generate new keys
-    eprintln!();
-    eprintln!("  The control plane needs a DID identity for authentication and DIDComm.");
-    eprintln!();
-    eprintln!("  - Import a PNM bundle: If you provisioned a DID using the PNM CLI,");
-    eprintln!("    paste the base64url bundle here. This is the recommended approach");
-    eprintln!("    for production deployments.");
-    eprintln!("  - Generate new keys: Creates fresh Ed25519/X25519 keys without an");
-    eprintln!("    associated DID. Useful for local development or if you plan to");
-    eprintln!("    assign a DID later by editing server_did in the config file.");
-    eprintln!();
+    // 12. JWT signing key (always generated)
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!("  Generated JWT signing key.");
 
-    let mut server_did = None;
-    let mut signing_key = None;
-    let mut key_agreement_key = None;
+    // 13. Store secrets
+    let server_secrets = ServerSecrets {
+        signing_key: did_result.signing_key,
+        key_agreement_key: did_result.key_agreement_key,
+        jwt_signing_key,
+        vta_credential: Some(credential_b64.trim().to_string()),
+    };
 
-    let identity_options = &[
-        "Import a PNM provision bundle (recommended)",
-        "Generate new keys (no DID)",
-    ];
-    let identity_idx = Select::new()
-        .with_prompt("Server identity")
-        .items(identity_options)
-        .default(0)
-        .interact()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-    if identity_idx == 0 {
-        // --- PNM provision bundle import ---
-        eprintln!();
-        eprintln!("  Paste the secrets bundle for the control plane.");
-        eprintln!("  This is the base64url string from `webvh-control bootstrap`");
-        eprintln!("  or directly from `pnm contexts provision`.");
-        eprintln!();
-
-        let bundle: SecretsBundle = loop {
-            let input: String = Input::new()
-                .with_prompt("Bundle (base64url)")
-                .interact_text()
-                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-            let raw = match BASE64.decode(input.trim()) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("  Error: invalid base64url encoding: {e}");
-                    continue;
-                }
-            };
-
-            match decode_bundle(&raw) {
-                Ok(b) => break b,
-                Err(e) => {
-                    eprintln!("  Error: {e}");
-                    continue;
-                }
-            }
-        };
-
-        server_did = Some(bundle.did.clone());
-
-        // Extract Ed25519 signing key
-        if let Some(ed_entry) = bundle.secrets.iter().find(|s| s.key_type == "ed25519") {
-            signing_key = Some(ed_entry.private_key_multibase.clone());
-            eprintln!(
-                "  Signing key (Ed25519):     loaded from {}",
-                ed_entry.key_id
-            );
-        }
-
-        // Extract X25519 key agreement key
-        if let Some(x_entry) = bundle.secrets.iter().find(|s| s.key_type == "x25519") {
-            key_agreement_key = Some(x_entry.private_key_multibase.clone());
-            eprintln!(
-                "  Key agreement (X25519):    loaded from {}",
-                x_entry.key_id
-            );
-        }
-
-        eprintln!();
-        eprintln!("  Imported server DID: {}", bundle.did);
-        eprintln!();
-    }
-
-    // Fill in defaults for keys not from bundle
-    let signing_key = signing_key.unwrap_or_else(|| {
-        eprintln!("  Generated Ed25519 signing key.");
-        generate_ed25519_multibase()
-    });
-    let key_agreement_key = key_agreement_key.unwrap_or_else(|| {
-        eprintln!("  Generated X25519 key agreement key.");
-        generate_x25519_multibase()
-    });
-
-    // 9. Build and write config
+    // 14. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: false,
             rest_api: true,
         },
-        server_did,
+        server_did: Some(did_result.did.clone()),
         mediator_did: None,
         public_url,
-        did_hosting_url,
+        did_hosting_url: Some(did_hosting_url),
         server: ServerConfig { host, port },
         log: LogConfig {
             level: log_level,
@@ -294,6 +205,11 @@ pub async fn run_setup() -> Result<(), AppError> {
         },
         auth: AuthConfig::default(),
         secrets: secrets_config,
+        vta: VtaConfig {
+            url: Some(conn_info.vta_url),
+            did: Some(conn_info.vta_did),
+            context_id: Some(conn_info.context_id),
+        },
         registry: RegistryConfig::default(),
         config_path: output_path.clone(),
     };
@@ -303,44 +219,39 @@ pub async fn run_setup() -> Result<(), AppError> {
     std::fs::write(&output_path, &toml_str)?;
     eprintln!("  Configuration written to {}", output_path.display());
 
-    // 10. Store secrets
-    let server_secrets = ServerSecrets {
-        signing_key,
-        key_agreement_key,
-        jwt_signing_key,
-    };
-
     let secret_store = create_secret_store(&config)?;
     secret_store.set(&server_secrets).await?;
     eprintln!("  Secrets stored.");
 
-    // 11. Optional admin ACL bootstrap
+    // 15. Admin ACL bootstrap
     eprintln!();
-    eprintln!("  The Access Control List (ACL) determines who can manage the control plane.");
-    eprintln!("  An admin can register/deregister service instances, manage users, and");
-    eprintln!("  perform all privileged operations.");
+    eprintln!("  The control plane needs at least one admin in the ACL.");
     eprintln!();
-    eprintln!("  You need at least one admin DID in the ACL to authenticate and use the");
-    eprintln!("  control plane. This is typically the DID of the operator or the server");
-    eprintln!("  itself (the server_did configured above).");
-    eprintln!();
-    eprintln!("  You can also add admin entries later using:");
-    eprintln!("    webvh-control add-acl --did <DID> --role admin");
-    eprintln!();
-    let add_admin = Confirm::new()
-        .with_prompt("Add an admin DID to the ACL now?")
-        .default(config.server_did.is_some())
+    let admin_options = &[
+        "Enter an existing DID",
+        "Generate a new did:key identity",
+        "Skip (add later with webvh-control add-acl)",
+    ];
+    let admin_idx = Select::new()
+        .with_prompt("Admin ACL entry")
+        .items(admin_options)
+        .default(0)
         .interact()
-        .unwrap_or(false);
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    if add_admin {
-        eprintln!();
-        eprintln!("  Enter the DID to grant admin access to (e.g. did:key:z6Mk... or did:webvh:...).");
-        eprintln!();
-        let admin_did: String = Input::new()
-            .with_prompt("Admin DID")
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    if admin_idx <= 1 {
+        let admin_did = if admin_idx == 0 {
+            let did: String = Input::new()
+                .with_prompt("Admin DID")
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+            did
+        } else {
+            let (did, sk) = vta_setup::generate_admin_did_key();
+            eprintln!("  Generated admin did:key: {did}");
+            eprintln!("  Private key (save this!): {sk}");
+            did
+        };
 
         let store = Store::open(&config.store).await?;
         let acl_ks = store.keyspace("acl")?;
@@ -360,31 +271,26 @@ pub async fn run_setup() -> Result<(), AppError> {
         eprintln!("  Admin ACL entry added for {admin_did}");
     }
 
+    // 16. Summary
     eprintln!();
-    if config.server_did.is_some() {
-        eprintln!("  Setup complete! Start the control plane with:");
-        eprintln!("    webvh-control --config {}", output_path.display());
-    } else {
-        eprintln!("  Setup complete!");
-        eprintln!("  To finish, import a PNM provision bundle and set server_did in the config.");
-        eprintln!("  Then start with: webvh-control --config {}", output_path.display());
-    }
+    eprintln!("  Setup complete!");
+    eprintln!();
+    eprintln!("  Control DID: {}", did_result.did);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!("    1. Set up webvh-server (if not already done)");
+    eprintln!(
+        "    2. Import this DID on the server:"
+    );
+    eprintln!(
+        "       webvh-server bootstrap-did --path {} --did-log control-did.jsonl",
+        did_path
+    );
+    eprintln!("    3. Start the control plane:");
+    eprintln!("       webvh-control --config {}", output_path.display());
     eprintln!();
 
     Ok(())
-}
-
-fn generate_ed25519_multibase() -> String {
-    affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None)
-        .get_private_keymultibase()
-        .expect("ed25519 multibase encoding")
-}
-
-fn generate_x25519_multibase() -> String {
-    affinidi_tdk::secrets_resolver::secrets::Secret::generate_x25519(None, None)
-        .expect("failed to generate X25519 key")
-        .get_private_keymultibase()
-        .expect("x25519 multibase encoding")
 }
 
 /// Prompt for secrets backend selection and configuration.
@@ -402,7 +308,6 @@ fn configure_secrets() -> Result<SecretsConfig, AppError> {
     backends.push("GCP Secret Manager");
 
     if backends.is_empty() {
-        // No secure backend compiled — fall back to plaintext with a warning
         eprintln!();
         eprintln!("  *** WARNING: No secure secrets backend is available. ***");
         eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
@@ -470,7 +375,6 @@ fn configure_secrets() -> Result<SecretsConfig, AppError> {
             .map_err(|e| AppError::Config(format!("input error: {e}")))?;
         secrets_config.gcp_secret_name = Some(name);
     } else {
-        // Keyring — optionally customize service name
         let service: String = Input::new()
             .with_prompt("Keyring service name")
             .default("webvh".to_string())

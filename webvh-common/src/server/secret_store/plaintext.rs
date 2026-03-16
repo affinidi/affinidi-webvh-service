@@ -24,6 +24,7 @@ impl PlaintextSecretStore {
                 signing_key: p.signing_key.clone(),
                 key_agreement_key: p.key_agreement_key.clone(),
                 jwt_signing_key: p.jwt_signing_key.clone(),
+                vta_credential: None,
             }),
             config_path,
         }
@@ -107,6 +108,7 @@ mod tests {
             signing_key: "z6Mktest_signing".into(),
             key_agreement_key: "z6LStest_agreement".into(),
             jwt_signing_key: "z6Mktest_jwt".into(),
+            vta_credential: None,
         }
     }
 

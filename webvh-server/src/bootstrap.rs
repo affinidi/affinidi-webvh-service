@@ -1,4 +1,4 @@
-//! Server DID bootstrap — creates the `.well-known` root DID log entry.
+//! Server DID bootstrap — creates DID log entries for hosted DIDs.
 //!
 //! Shared logic used by both the `bootstrap-did` CLI subcommand and the
 //! auto-bootstrap path on server startup.
@@ -30,19 +30,32 @@ pub async fn root_did_exists(dids_ks: &KeyspaceHandle) -> Result<bool, AppError>
 
 /// Create the `.well-known` root DID log entry and store it atomically.
 ///
-/// The signing secret's public key is embedded in the DID document. The
-/// resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
+/// Convenience wrapper around [`bootstrap_did`] for the root DID path.
 pub async fn bootstrap_root_did(
     store: &Store,
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
     public_url: &str,
 ) -> Result<BootstrapResult, AppError> {
+    bootstrap_did(store, dids_ks, signing_secret, public_url, ".well-known").await
+}
+
+/// Create a DID log entry at the given path and store it atomically.
+///
+/// The signing secret's public key is embedded in the DID document. The
+/// resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
+pub async fn bootstrap_did(
+    store: &Store,
+    dids_ks: &KeyspaceHandle,
+    signing_secret: &Secret,
+    public_url: &str,
+    mnemonic: &str,
+) -> Result<BootstrapResult, AppError> {
     // Guard: must not already exist
-    if root_did_exists(dids_ks).await? {
-        return Err(AppError::Conflict(
-            "root DID (.well-known) already exists".into(),
-        ));
+    if dids_ks.contains_key(did_key(mnemonic)).await? {
+        return Err(AppError::Conflict(format!(
+            "DID at path '{mnemonic}' already exists"
+        )));
     }
 
     let host = encode_host(public_url)
@@ -52,7 +65,7 @@ pub async fn bootstrap_root_did(
         .get_public_keymultibase()
         .map_err(|e| AppError::Internal(format!("failed to get public key multibase: {e}")))?;
 
-    let doc = build_did_document(&host, ".well-known", &public_key);
+    let doc = build_did_document(&host, mnemonic, &public_key);
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)
         .await
@@ -61,7 +74,7 @@ pub async fn bootstrap_root_did(
     let did_id = extract_did_id(&jsonl)
         .ok_or_else(|| AppError::Internal("failed to extract DID id from log entry".into()))?;
 
-    let mnemonic = ".well-known".to_string();
+    let mnemonic = mnemonic.to_string();
     let now = now_epoch();
 
     let record = DidRecord {
@@ -89,7 +102,7 @@ pub async fn bootstrap_root_did(
     );
     batch.commit().await?;
 
-    info!(did = %did_id, scid = %scid, "root DID bootstrapped");
+    info!(did = %did_id, scid = %scid, path = %mnemonic, "DID bootstrapped");
 
     Ok(BootstrapResult {
         scid,

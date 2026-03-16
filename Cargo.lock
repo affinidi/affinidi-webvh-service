@@ -428,6 +428,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "vta-sdk",
  "webauthn-rs",
  "webauthn-rs-proto",
 ]
@@ -477,6 +478,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vta-sdk",
  "webauthn-rs",
 ]
 
@@ -553,6 +555,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vta-sdk",
 ]
 
 [[package]]
@@ -603,6 +606,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vta-sdk",
 ]
 
 [[package]]
@@ -8158,6 +8162,23 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vta-sdk"
+version = "0.1.0"
+dependencies = [
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-tdk",
+ "base64 0.22.1",
+ "chrono",
+ "multibase",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "vtparse"

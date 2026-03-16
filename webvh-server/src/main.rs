@@ -62,8 +62,12 @@ enum Command {
         #[arg(long)]
         did_witness: Option<PathBuf>,
     },
-    /// Bootstrap the root DID (.well-known) for this server
+    /// Bootstrap a DID for this server (defaults to root .well-known)
     BootstrapDid {
+        /// DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth")
+        /// Defaults to ".well-known" (the root DID for this server)
+        #[arg(long, default_value = ".well-known")]
+        path: String,
         /// Path to an existing did.jsonl file to import
         #[arg(long)]
         did_log: Option<PathBuf>,
@@ -139,13 +143,15 @@ async fn main() {
             }
         }
         Some(Command::BootstrapDid {
+            path,
             did_log,
             did_witness,
             witness_url,
             witness_id,
         }) => {
             if let Err(e) =
-                run_bootstrap_did(cli.config, did_log, did_witness, witness_url, witness_id).await
+                run_bootstrap_did(cli.config, path, did_log, did_witness, witness_url, witness_id)
+                    .await
             {
                 eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
@@ -302,6 +308,7 @@ async fn run_load_did(
 
 async fn run_bootstrap_did(
     config_path: Option<PathBuf>,
+    mnemonic: String,
     did_log: Option<PathBuf>,
     did_witness: Option<PathBuf>,
     witness_url: Option<String>,
@@ -323,10 +330,11 @@ async fn run_bootstrap_did(
     let store = store::Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
-    // Check if root DID already exists
-    if bootstrap::root_did_exists(&dids_ks).await? {
+    // Check if DID already exists at this path
+    let did_key = affinidi_webvh_server::did_ops::did_key(&mnemonic);
+    if dids_ks.contains_key(did_key).await? {
         eprintln!();
-        eprintln!("  Root DID (.well-known) already exists.");
+        eprintln!("  DID at path '{mnemonic}' already exists.");
         eprintln!("  No action taken.");
         eprintln!();
         return Ok(());
@@ -345,9 +353,10 @@ async fn run_bootstrap_did(
             None => None,
         };
 
-        let result = bootstrap::import_root_did(
+        let result = bootstrap::import_did_at_path(
             &store,
             &dids_ks,
+            &mnemonic,
             &jsonl,
             witness_content.as_deref(),
         )
@@ -359,7 +368,7 @@ async fn run_bootstrap_did(
 
         result
     } else {
-        // Auto-bootstrap: generate a new root DID
+        // Auto-bootstrap: generate a new DID
         let secret_store = secret_store::create_secret_store(&config)?;
         let secrets = secret_store
             .get()
@@ -370,7 +379,8 @@ async fn run_bootstrap_did(
             .map_err(|e| format!("invalid signing_key: {e}"))?;
 
         let result =
-            bootstrap::bootstrap_root_did(&store, &dids_ks, &signing_secret, public_url).await?;
+            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, public_url, &mnemonic)
+                .await?;
 
         // Optional: request witness proof
         if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
@@ -406,9 +416,7 @@ async fn run_bootstrap_did(
                             let proof_json = serde_json::to_string(&proof)?;
                             dids_ks
                                 .insert_raw(
-                                    affinidi_webvh_server::did_ops::content_witness_key(
-                                        ".well-known",
-                                    ),
+                                    affinidi_webvh_server::did_ops::content_witness_key(&mnemonic),
                                     proof_json.into_bytes(),
                                 )
                                 .await?;
@@ -429,14 +437,25 @@ async fn run_bootstrap_did(
 
     store.persist().await?;
 
+    let is_root = mnemonic == ".well-known";
+    let url_path = if is_root {
+        ".well-known/did.jsonl".to_string()
+    } else {
+        format!("{mnemonic}/did.jsonl")
+    };
+
     eprintln!();
-    eprintln!("  Root DID bootstrapped!");
+    if is_root {
+        eprintln!("  Root DID bootstrapped!");
+    } else {
+        eprintln!("  DID bootstrapped at path '{mnemonic}'!");
+    }
     eprintln!();
     eprintln!("  DID:   {}", result.did_id);
     eprintln!("  SCID:  {}", result.scid);
-    eprintln!("  JSONL: {public_url}/.well-known/did.jsonl");
+    eprintln!("  JSONL: {public_url}/{url_path}");
     eprintln!();
-    if config.server_did.is_none() {
+    if is_root && config.server_did.is_none() {
         eprintln!("  Hint: set server_did in your config.toml:");
         eprintln!("    server_did = \"{}\"", result.did_id);
         eprintln!();

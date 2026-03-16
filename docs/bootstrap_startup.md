@@ -4,192 +4,175 @@ This document explains how to set up a complete WebVH environment with DIDComm-b
 
 ## Prerequisites
 
-- PNM CLI installed and configured with access to a VTA (Verifiable Trust Agent)
-- Compiled WebVH binaries: `webvh-server`, `webvh-control`
+- VTA (Verifiable Trust Agent) credentials for each service's context
+  - Each service gets its own isolated VTA context
+  - Credentials are base64url-encoded strings issued by the VTA operator
+- Compiled WebVH binaries: `webvh-server`, `webvh-control`, `webvh-witness`
 - A public URL where the server will serve DIDs (e.g., `https://did.example.com`)
 
 ## Architecture Overview
 
 Services authenticate with each other using DIDComm challenge-response:
 
-- **webvh-server** — hosts DID documents at public URLs
-- **webvh-control** — manages service registration, ACLs, and DID sync
-- **webvh-witness** — provides witness proofs for DID log entries
+- **webvh-control** — manages service registration, ACLs, and DID sync (set up first)
+- **webvh-server** — hosts DID documents at public URLs (set up second)
+- **webvh-witness** — provides witness proofs for DID log entries (optional, set up last)
 
-Each service has its own DID, created during bootstrap. The server authenticates with the control plane using its DID, replacing the previous bearer-token approach.
+Each service connects to its own VTA context during setup, creates its own DID, retrieves keys, and stores them locally. No external PNM CLI is needed.
 
 ## Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     participant Admin
-    participant PNM as PNM CLI
     participant VTA
-    participant Server as webvh-server
     participant Control as webvh-control
+    participant Server as webvh-server
+    participant Witness as webvh-witness
 
     rect rgb(230, 240, 255)
-        Note over Admin,VTA: Phase 0a — Provision VTA Contexts (PNM CLI)
-        loop For each service (webvh-server, webvh-control, webvh-witness)
-            Admin->>PNM: pnm contexts provision<br/>--name <service> --did-url <url>
-            PNM->>VTA: Create context + DID
-            VTA->>PNM: context_id, DID material, secrets
-            PNM->>Admin: ContextProvisionBundle (base64url)
-        end
+        Note over Admin,VTA: Phase 1 — Control Plane Setup (first)
+        Admin->>Control: webvh-control setup
+        Control->>VTA: Authenticate with VTA credential
+        VTA->>Control: Session established
+        Control->>VTA: Create control DID
+        VTA->>Control: DID + signing key + KA key
+        Control->>Admin: Writes control-did.jsonl<br/>Outputs control DID string
     end
 
     rect rgb(235, 245, 255)
-        Note over Admin: Phase 0b — Import Provision Bundles
-        Admin->>Admin: webvh-control bootstrap<br/>--control-bundle eyJ...
-        Note over Admin: Writes control plane<br/>*.bundle + *.did.jsonl
+        Note over Admin,Server: Phase 2 — Server Setup
+        Admin->>Server: webvh-server setup
+        Server->>VTA: Authenticate with VTA credential
+        VTA->>Server: Session established
+        Server->>VTA: Create server root DID
+        VTA->>Server: DID + signing key + KA key + log entry
+        Note over Server: Auto-imports root DID at .well-known
+        Admin->>Admin: Enter control_url + control_did from Phase 1
     end
 
     rect rgb(240, 248, 255)
-        Note over Admin: Phase 1 — Configure Services
-        Admin->>Admin: webvh-server setup (import server provision bundle)
-        Admin->>Admin: webvh-control setup (import control secrets bundle)
-        Admin->>Server: webvh-server load-did --path .well-known<br/>--did-log webvh-server.did.jsonl
-        Admin->>Server: webvh-server load-did --path services/control<br/>--did-log webvh-control.did.jsonl
-        Admin->>Control: webvh-control add-acl<br/>--did did:webvh:SERVER_SCID:... --role admin
+        Note over Admin,Server: Phase 2b — Bootstrap Control DID on Server
+        Admin->>Server: webvh-server bootstrap-did<br/>--path services/control<br/>--did-log control-did.jsonl
+        Admin->>Control: webvh-control add-acl<br/>--did <server-did> --role admin
     end
 
     rect rgb(245, 255, 245)
-        Note over Server,Control: Phase 2 — Start Services
-        Admin->>Server: Start webvh-server
-        Note over Server: Serves /.well-known/did.jsonl (own DID)<br/>Serves /services/control/did.jsonl (control DID)
-        Admin->>Control: Start webvh-control
-        Note over Control: Configured with own server_did
+        Note over Admin,Witness: Phase 3 — Witness Setup (optional)
+        Admin->>Witness: webvh-witness setup
+        Witness->>VTA: Authenticate with VTA credential
+        VTA->>Witness: Session established
+        Witness->>VTA: Create witness DID
+        VTA->>Witness: DID + signing key + KA key + log entry
+        Witness->>Admin: Writes witness-did.jsonl
+        Admin->>Server: webvh-server bootstrap-did<br/>--path services/witness<br/>--did-log witness-did.jsonl
     end
 
     rect rgb(255, 248, 240)
-        Note over Server,Control: Phase 3 — DIDComm Registration
-        Server->>Control: POST /api/auth/challenge {did: server_did}
-        Control->>Server: {session_id, challenge}
-        Note over Server: Sign DIDComm message with server's Ed25519 key
-        Server->>Control: POST /api/auth/ (packed DIDComm message)
-        Note over Control: Resolve server DID from server's public URL<br/>Verify signature, check ACL → issue JWT
-        Control->>Server: {access_token, refresh_token}
-    end
-
-    rect rgb(255, 245, 250)
-        Note over Server,Control: Phase 4 — Service Registration + DID Sync
-        Server->>Control: POST /api/control/register-service<br/>Bearer JWT<br/>{serviceType, url, preloadedDids: [{mnemonic, didId, versionCount}]}
-        Note over Control: Register instance in registry<br/>Check preloaded DIDs against known DIDs
-        Control->>Server: {instanceId, didUpdates: [...]}
-        Note over Server: Apply any DID updates to local store
+        Note over Server,Control: Phase 4 — Start Services
+        Admin->>Server: Start webvh-server
+        Admin->>Control: Start webvh-control
+        Admin->>Witness: Start webvh-witness
+        Server->>Control: DIDComm challenge-response auth
+        Control->>Server: JWT access token
+        Server->>Control: Register service + report preloaded DIDs
     end
 ```
 
 ## Step-by-Step Setup
 
-### Phase 0a: Provision VTA Contexts with PNM
-
-Each WebVH service gets its own VTA context for secret/config isolation. Use the PNM CLI to provision a context with a DID for each service:
+### Phase 1: Control Plane (set up first — other services need its DID)
 
 ```bash
-# Provision the webvh-server context
-# The --did-url should point to where the server's DID will be published
-pnm contexts provision \
-  --name webvh-server \
-  --did-url https://did.example.com/.well-known
-
-# Provision the webvh-control context
-pnm contexts provision \
-  --name webvh-control \
-  --did-url https://did.example.com/services/control
-
-# (Optional) Provision the webvh-witness context
-pnm contexts provision \
-  --name webvh-witness \
-  --did-url https://did.example.com/services/witness
+webvh-control setup
 ```
 
-Each command outputs a base64url-encoded **ContextProvisionBundle** containing:
-- VTA context credentials (admin DID + credential)
-- DID material (DID document, log entry)
-- Private keys (signing + key-agreement)
+The wizard prompts for:
+1. **VTA credential** — base64url string for the control plane's VTA context
+2. **DID hosting URL** — where webvh-server will serve DIDs (e.g., `https://did.example.com`)
+3. **DID path** — path on the server (default: `services/control`)
+4. **Public URL** — control plane's own URL for WebAuthn (e.g., `http://localhost:8532`)
+5. Host, port, log level, data directory, secrets backend
+6. **Admin ACL** — enter an existing DID or generate a new `did:key`
 
-Save the output string from each command — you'll pass them to the setup wizards.
+Output:
+- `config.toml` — control plane configuration
+- `control-did.jsonl` — DID log entry to import on the server
+- Control DID string (displayed on screen)
 
-### Phase 0b: Import Control Plane Provision Bundle
+**Save the control DID** — you'll need it when setting up the server.
 
-Extract the control plane's secrets and DID log from its provision bundle:
+### Phase 2: Server (set up second — hosts all DIDs)
 
 ```bash
-webvh-control bootstrap \
-  --control-bundle <base64url output from webvh-control provision> \
-  --output-dir ./bootstrap-output
+webvh-server setup
 ```
 
-This creates:
-```
-bootstrap-output/
-  webvh-control.bundle      # secrets bundle (base64url, for setup wizard)
-  webvh-control.did.jsonl   # DID log entry (for load-did)
-```
+The wizard prompts for:
+1. **VTA credential** — base64url string for the server's VTA context
+2. **Public URL** — where DIDs are served (e.g., `https://did.example.com`)
+3. Features (DIDComm, REST API)
+4. **Control plane URL** — e.g., `http://localhost:8532` (from Phase 1)
+5. **Control plane DID** — paste the DID from Phase 1
+6. Host, port, log level, data directory, secrets backend
+7. **Admin ACL** — enter an existing DID or generate a new `did:key`
 
-### Phase 1: Configure Services
+The wizard automatically creates the root DID and imports it at `.well-known`.
 
-#### 1a. Import secrets via setup wizards
+### Phase 2b: Bootstrap Control DID on Server
 
-Run the setup wizard for each service. Each wizard prompts to import a secrets bundle
-(from PNM provision or from the bootstrap step):
+Import the control plane's DID log entry onto the server:
 
 ```bash
-webvh-server setup     # import the webvh-server provision bundle when prompted
-webvh-control setup    # paste bootstrap-output/webvh-control.bundle when prompted
-```
-
-#### 1b. Preload DIDs onto the server
-
-The server needs to host the DID documents for all services:
-
-```bash
-# Server's own DID at /.well-known/did.jsonl
-webvh-server load-did \
-  --path .well-known \
-  --did-log bootstrap-output/webvh-server.did.jsonl
-
-# Control plane's DID at /services/control/did.jsonl
-webvh-server load-did \
+webvh-server bootstrap-did \
   --path services/control \
-  --did-log bootstrap-output/webvh-control.did.jsonl
+  --did-log control-did.jsonl
 ```
 
-#### 1c. Grant server access to control plane
+Grant the server admin access to the control plane:
 
 ```bash
 webvh-control add-acl --did <server-DID> --role admin
 ```
 
-Replace `<server-DID>` with the DID printed during the `load-did` step.
+Replace `<server-DID>` with the DID printed during server setup.
 
-#### 1d. Configure control plane URL
-
-Add to the server's `config.toml`:
-
-```toml
-control_url = "http://localhost:8532"
-```
-
-Or set the environment variable:
+### Phase 3: Witness (optional — set up after server)
 
 ```bash
-export WEBVH_CONTROL_URL=http://localhost:8532
+webvh-witness setup
 ```
 
-### Phase 2: Start Services
+The wizard prompts for:
+1. **VTA credential** — base64url string for the witness's VTA context
+2. **DID hosting URL** — the server's public URL
+3. **DID path** — path on the server (default: `services/witness`)
+4. Features, host, port, log level, data directory, secrets backend
+5. **Admin ACL**
+
+Import the witness DID on the server:
+
+```bash
+webvh-server bootstrap-did \
+  --path services/witness \
+  --did-log witness-did.jsonl
+```
+
+### Phase 4: Start Services
 
 ```bash
 # Terminal 1
-webvh-server
+webvh-server --config config.toml
 
 # Terminal 2
-webvh-control
+webvh-control --config config.toml
+
+# Terminal 3 (if witness is configured)
+webvh-witness --config config.toml
 ```
 
 On startup, the server will:
-1. Authenticate with the control plane via DIDComm
+1. Authenticate with the control plane via DIDComm challenge-response
 2. Register itself, reporting all preloaded DIDs
 3. Apply any DID updates received from the control plane
 
@@ -255,6 +238,9 @@ webvh-control list-acl
 | `WEBVH_PUBLIC_URL` | Public-facing URL |
 | `WEBVH_CONTROL_URL` | Control plane URL |
 | `WEBVH_CONTROL_DID` | Control plane's DID |
+| `WEBVH_VTA_URL` | VTA REST URL |
+| `WEBVH_VTA_DID` | VTA DID for DIDComm |
+| `WEBVH_VTA_CONTEXT_ID` | VTA context ID |
 
 ### webvh-control
 | Variable | Description |
@@ -262,3 +248,14 @@ webvh-control list-acl
 | `CONTROL_SERVER_DID` | Control plane's DID |
 | `CONTROL_PUBLIC_URL` | Public-facing URL |
 | `CONTROL_DID_HOSTING_URL` | DID hosting URL (where DIDs are publicly served) |
+| `CONTROL_VTA_URL` | VTA REST URL |
+| `CONTROL_VTA_DID` | VTA DID for DIDComm |
+| `CONTROL_VTA_CONTEXT_ID` | VTA context ID |
+
+### webvh-witness
+| Variable | Description |
+|----------|-------------|
+| `WITNESS_SERVER_DID` | Witness's DID |
+| `WITNESS_VTA_URL` | VTA REST URL |
+| `WITNESS_VTA_DID` | VTA DID for DIDComm |
+| `WITNESS_VTA_CONTEXT_ID` | VTA context ID |

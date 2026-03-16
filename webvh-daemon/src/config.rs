@@ -195,6 +195,7 @@ impl DaemonConfig {
             watchers: self.watchers.clone(),
             control_url: None,
             control_did: None,
+            vta: self.vta.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -239,6 +240,7 @@ impl DaemonConfig {
             store: self.control_store.clone(),
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
             registry: self.registry.clone(),
             config_path: self.config_path.clone(),
         }

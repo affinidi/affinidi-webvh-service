@@ -5,6 +5,7 @@ use std::path::PathBuf;
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use affinidi_webvh_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
+    VtaConfig,
 };
 
 // Re-export PlaintextSecrets for setup.rs
@@ -31,16 +32,6 @@ pub struct AppConfig {
     pub vta: VtaConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct VtaConfig {
-    /// VTA REST URL for remote key management
-    pub url: Option<String>,
-    /// VTA DID for DIDComm communication
-    pub did: Option<String>,
-    /// VTA context ID for witness keys
-    pub context_id: Option<String>,
 }
 
 fn default_server() -> ServerConfig {

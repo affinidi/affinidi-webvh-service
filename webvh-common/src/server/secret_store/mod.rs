@@ -40,6 +40,9 @@ pub struct ServerSecrets {
     pub key_agreement_key: String,
     /// Ed25519 private key for JWT token signing (multibase-encoded).
     pub jwt_signing_key: String,
+    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
+    #[serde(default)]
+    pub vta_credential: Option<String>,
 }
 
 pub trait SecretStore: Send + Sync {

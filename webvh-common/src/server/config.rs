@@ -170,6 +170,19 @@ pub struct SecretsConfig {
     pub plaintext: Option<PlaintextSecrets>,
 }
 
+/// VTA (Verifiable Trust Architecture) connection configuration.
+///
+/// Used by services that integrate with a VTA for key management and DID operations.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct VtaConfig {
+    /// VTA REST URL for remote key management
+    pub url: Option<String>,
+    /// VTA DID for DIDComm communication
+    pub did: Option<String>,
+    /// VTA context ID for this service's keys
+    pub context_id: Option<String>,
+}
+
 /// Plaintext secret key material stored directly in the configuration file.
 ///
 /// **WARNING**: This is insecure and should only be used for testing/development.

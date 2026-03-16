@@ -5,9 +5,8 @@ use std::path::PathBuf;
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use affinidi_webvh_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, LogFormat, PlaintextSecrets, SecretsConfig,
-    ServerConfig, StoreConfig,
+    ServerConfig, StoreConfig, VtaConfig,
 };
-// PlaintextSecrets is used by setup.rs
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -34,6 +33,8 @@ pub struct AppConfig {
     pub control_url: Option<String>,
     /// DID of the control plane service (for DIDComm authentication).
     pub control_did: Option<String>,
+    #[serde(default)]
+    pub vta: VtaConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -129,6 +130,11 @@ impl AppConfig {
         env_opt!("WEBVH_PUBLIC_URL", config.public_url);
         env_opt!("WEBVH_CONTROL_URL", config.control_url);
         env_opt!("WEBVH_CONTROL_DID", config.control_did);
+
+        // VTA config
+        env_opt!("WEBVH_VTA_URL", config.vta.url);
+        env_opt!("WEBVH_VTA_DID", config.vta.did);
+        env_opt!("WEBVH_VTA_CONTEXT_ID", config.vta.context_id);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
