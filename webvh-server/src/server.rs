@@ -2,10 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+};
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use axum::routing::get;
 
 use affinidi_webvh_common::server::auth::extractor::AuthState;
+use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use tokio_util::sync::CancellationToken;
+
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::bootstrap;
@@ -177,10 +183,9 @@ pub async fn run(
 
     // Separate shutdown channels for ordered shutdown (DIDComm → REST → Storage)
     let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
-    let (didcomm_shutdown_tx, didcomm_shutdown_rx) = watch::channel(false);
     let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
 
-    // REST ready signal — DIDComm thread waits for this before starting
+    // REST ready signal — DIDComm waits for this before starting
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
     // 1. Spawn REST thread first — HTTP must be available before DIDComm starts
@@ -224,23 +229,19 @@ pub async fn run(
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // 3. Wait for REST to be serving (or immediate if REST disabled) before starting DIDComm
+    // 3. Wait for REST to be serving before starting DIDComm
     let _ = rest_ready_rx.await;
 
-    let didcomm_handle = if state.config.features.didcomm {
-        let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
-        let didcomm_state = state.clone();
-        let didcomm_secrets = secrets;
-        Some(
-            std::thread::Builder::new()
-                .name("webvh-didcomm".into())
-                .spawn(move || {
-                    run_didcomm_thread(didcomm_state, didcomm_secrets, &mut didcomm_shutdown)
-                })
-                .map_err(|e| {
-                    AppError::Internal(format!("failed to spawn DIDComm thread: {e}"))
-                })?,
-        )
+    let didcomm_shutdown = CancellationToken::new();
+    let didcomm_service = if state.config.features.didcomm {
+        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => Some(svc),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("failed to start DIDComm service: {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -251,19 +252,10 @@ pub async fn run(
     // Ordered shutdown: DIDComm → REST → Storage
     let mut any_panic = false;
 
-    let _ = didcomm_shutdown_tx.send(true);
-    if let Some(handle) = didcomm_handle {
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => info!("DIDComm thread stopped"),
-            Ok(Err(_panic)) => {
-                error!("DIDComm thread panicked");
-                any_panic = true;
-            }
-            Err(e) => {
-                error!("failed to join DIDComm thread: {e}");
-                any_panic = true;
-            }
-        }
+    didcomm_shutdown.cancel();
+    if let Some(svc) = didcomm_service {
+        svc.shutdown().await;
+        info!("DIDComm service stopped");
     }
 
     let _ = rest_shutdown_tx.send(true);
@@ -303,14 +295,70 @@ pub async fn run(
 }
 
 // ---------------------------------------------------------------------------
+// DIDComm service startup
+// ---------------------------------------------------------------------------
+
+async fn start_didcomm_service(
+    state: &AppState,
+    secrets: &ServerSecrets,
+    shutdown: CancellationToken,
+) -> Result<Option<DIDCommService>, AppError> {
+    let server_did = match &state.config.server_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("DIDComm not configured — server_did not set");
+            return Ok(None);
+        }
+    };
+
+    let mediator_did = match &state.config.mediator_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("mediator_did not configured — DIDComm messaging disabled");
+            return Ok(None);
+        }
+    };
+
+    let profile = build_tdk_profile(
+        "server",
+        server_did,
+        Some(mediator_did),
+        secrets,
+        state.did_resolver.as_ref(),
+    )
+    .await?;
+
+    let listener = ListenerConfig {
+        id: "server".into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        ..Default::default()
+    };
+
+    let router = messaging::build_server_router(state.clone())
+        .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    let svc = DIDCommService::start(
+        DIDCommServiceConfig {
+            listeners: vec![listener],
+        },
+        router,
+        shutdown,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+
+    info!("DIDComm service started for {server_did}");
+    Ok(Some(svc))
+}
+
+// ---------------------------------------------------------------------------
 // REST thread
 // ---------------------------------------------------------------------------
 
-/// REST thread: serves the Axum HTTP server.
-///
-/// Sends a signal on `ready_tx` once the router is built and `axum::serve` is
-/// about to start accepting connections. The main thread waits for this before
-/// spawning the DIDComm thread.
 fn run_rest_thread(
     std_listener: std::net::TcpListener,
     state: AppState,
@@ -360,57 +408,9 @@ fn run_rest_thread(
 }
 
 // ---------------------------------------------------------------------------
-// DIDComm thread
-// ---------------------------------------------------------------------------
-
-/// DIDComm thread: connects to the mediator and processes inbound messages.
-fn run_didcomm_thread(
-    state: AppState,
-    secrets: ServerSecrets,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build DIDComm runtime");
-
-    rt.block_on(async {
-        info!("DIDComm thread started");
-
-        // Check preconditions
-        let server_did = match &state.config.server_did {
-            Some(did) => did.as_str(),
-            None => {
-                info!("DIDComm not configured — server_did not set, thread idle");
-                let _ = shutdown_rx.changed().await;
-                info!("DIDComm thread shutting down (idle)");
-                return;
-            }
-        };
-
-        // Initialize ATM connection
-        let (atm, profile) =
-            match messaging::init_didcomm_connection(&state.config, server_did, &secrets).await {
-                Some(handles) => handles,
-                None => {
-                    let _ = shutdown_rx.changed().await;
-                    info!("DIDComm thread shutting down (init failed)");
-                    return;
-                }
-            };
-
-        // Run message loop until shutdown
-        messaging::run_didcomm_loop(&atm, &profile, server_did, &state, shutdown_rx).await;
-
-        info!("DIDComm thread shutting down");
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Storage thread
 // ---------------------------------------------------------------------------
 
-/// Storage thread: runs cleanup loops and persists the store on shutdown.
 fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
@@ -478,8 +478,6 @@ fn run_storage_thread(
 // Auth initialization
 // ---------------------------------------------------------------------------
 
-/// Initialize JWT keys from secrets. Works independently of DIDComm setup,
-/// so passkey auth can issue tokens even without server_did.
 fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
     match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
         Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
@@ -499,15 +497,6 @@ fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
     }
 }
 
-/// Initialize DID resolver and secrets resolver for DIDComm authentication.
-///
-/// Keys are stored as multibase-encoded private keys in `ServerSecrets`.
-/// `Secret::from_multibase()` reconstructs the full `Secret` object including
-/// the multicodec type prefix, then the key ID is overridden to match the
-/// server DID fragment.
-///
-/// Returns `None` values if the server DID is not configured (server still starts
-/// but DIDComm auth endpoints will not work).
 async fn init_didcomm_auth(
     config: &AppConfig,
     secrets: &ServerSecrets,
@@ -537,7 +526,6 @@ async fn init_didcomm_auth(
     // 2. Secrets resolver with server's Ed25519 + X25519 secrets
     let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
 
-    // Load and insert server signing key (Ed25519) from multibase
     let kid = format!("{server_did}#key-0");
     match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
         Ok(secret) => {
@@ -547,7 +535,6 @@ async fn init_didcomm_auth(
         Err(e) => warn!("failed to decode signing_key: {e}"),
     }
 
-    // Load and insert server key-agreement key (X25519) from multibase
     let kid = format!("{server_did}#key-1");
     match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
         Ok(secret) => {
@@ -569,12 +556,6 @@ async fn init_didcomm_auth(
 // Auto-bootstrap
 // ---------------------------------------------------------------------------
 
-/// Attempt to bootstrap the root DID on startup if conditions are met:
-/// - `public_url` is configured
-/// - `.well-known` doesn't already exist
-///
-/// All failures are logged as warnings — server starts regardless.
-/// Takes `config` by value and returns it (possibly with `server_did` set).
 async fn auto_bootstrap_root_did(
     mut config: AppConfig,
     store: &Store,
@@ -621,10 +602,6 @@ async fn auto_bootstrap_root_did(
     config
 }
 
-/// Decode a multibase-encoded Ed25519 private key to raw 32 bytes.
-///
-/// Used for JWT key initialization, which needs raw bytes rather than a
-/// `Secret` object.
 pub(crate) fn decode_multibase_ed25519_key(
     multibase_key: &str,
 ) -> Result<[u8; 32], AppError> {

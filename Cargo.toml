@@ -25,6 +25,13 @@ rust-version = "1.91.0"
 
 # Affinidi Trust Development Kit
 affinidi-tdk = "0.6"
+affinidi-messaging-didcomm-service = "0.1"
+affinidi-tdk-common = "0.4"
+affinidi-messaging-didcomm = "0.12"
+affinidi-secrets-resolver = "0.5"
+
+# Cancellation token for DIDComm service
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Async runtime
 tokio = { version = "1", features = [

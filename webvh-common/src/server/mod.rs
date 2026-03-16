@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod auth;
 pub mod config;
+pub mod didcomm_profile;
 pub mod error;
 pub mod health;
 pub mod mnemonic;

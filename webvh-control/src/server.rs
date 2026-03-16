@@ -2,16 +2,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+};
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
+use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
 use axum::routing::get;
 use affinidi_webvh_common::server::passkey::PasskeyState;
+use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::error::AppError;
+use crate::messaging;
 use crate::registry::{self, ServiceStatus};
 use crate::routes;
 use crate::secret_store::ServerSecrets;
@@ -26,12 +34,17 @@ pub struct AppState {
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub registry_ks: KeyspaceHandle,
+    pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
+    /// ATM instance for outbound mediator-based DIDComm messaging (None if not configured).
+    pub atm: Option<Arc<ATM>>,
+    /// ATM profile for the control plane's outbound mediator connection.
+    pub atm_profile: Option<Arc<ATMProfile>>,
 }
 
 impl AppState {
@@ -100,6 +113,7 @@ pub async fn run(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let registry_ks = store.keyspace("registry")?;
+    let dids_ks = store.keyspace("dids")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
@@ -142,21 +156,38 @@ pub async fn run(
     let storage_registry_config = config.registry.clone();
     let has_auth = jwt_keys.is_some();
 
-    let state = AppState {
+    let mut state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
         registry_ks,
+        dids_ks,
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
+        atm: None,
+        atm_profile: None,
     };
 
     // Seed registry from static config
     seed_registry(&state).await;
+
+    // Initialize outbound ATM connection for sync push messages
+    if state.config.features.didcomm {
+        if let Some(ref control_did) = state.config.server_did {
+            if let Some((atm, profile)) =
+                messaging::init_outbound_atm(&state.config, control_did, &secrets).await
+            {
+                state.atm = Some(atm);
+                state.atm_profile = Some(profile);
+            }
+        } else {
+            warn!("DIDComm enabled but server_did not configured — messaging disabled");
+        }
+    }
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -168,8 +199,22 @@ pub async fn run(
             "disabled"
         }
     );
+    info!(
+        "  DIDComm  : {}",
+        if state.atm.is_some() {
+            "enabled (mediator connected)"
+        } else {
+            "disabled"
+        }
+    );
     if let Some(ref url) = state.config.public_url {
         info!("  public URL   : {url}");
+    }
+    if let Some(ref did) = state.config.server_did {
+        info!("  control DID  : {did}");
+    }
+    if let Some(ref did) = state.config.mediator_did {
+        info!("  mediator DID : {did}");
     }
 
     // Shutdown channels
@@ -213,14 +258,35 @@ pub async fn run(
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // Wait for REST to be ready
+    // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
+
+    // 3. Start DIDComm service for inbound messages
+    let didcomm_shutdown = CancellationToken::new();
+    let didcomm_service = if state.config.features.didcomm {
+        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => Some(svc),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("failed to start DIDComm service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Wait for shutdown signal
     shutdown_signal().await;
 
-    // Ordered shutdown: REST → Storage
+    // Ordered shutdown: DIDComm → REST → Storage
     let mut any_panic = false;
+
+    didcomm_shutdown.cancel();
+    if let Some(svc) = didcomm_service {
+        svc.shutdown().await;
+        info!("DIDComm service stopped");
+    }
 
     let _ = rest_shutdown_tx.send(true);
     if let Some(handle) = rest_handle {
@@ -256,6 +322,67 @@ pub async fn run(
 
     info!("control plane shut down");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DIDComm service startup (inbound)
+// ---------------------------------------------------------------------------
+
+async fn start_didcomm_service(
+    state: &AppState,
+    secrets: &ServerSecrets,
+    shutdown: CancellationToken,
+) -> Result<Option<DIDCommService>, AppError> {
+    let control_did = match &state.config.server_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("DIDComm not configured — server_did not set");
+            return Ok(None);
+        }
+    };
+
+    let mediator_did = match &state.config.mediator_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("mediator_did not configured — DIDComm messaging disabled");
+            return Ok(None);
+        }
+    };
+
+    let profile = build_tdk_profile(
+        "control",
+        control_did,
+        Some(mediator_did),
+        secrets,
+        state.did_resolver.as_ref(),
+    )
+    .await?;
+
+    let listener = ListenerConfig {
+        id: "control".into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        ..Default::default()
+    };
+
+    let router = messaging::build_control_router()
+        .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    let svc = DIDCommService::start(
+        DIDCommServiceConfig {
+            listeners: vec![listener],
+        },
+        router,
+        shutdown,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+
+    info!("DIDComm service started for {control_did}");
+    Ok(Some(svc))
 }
 
 // ---------------------------------------------------------------------------

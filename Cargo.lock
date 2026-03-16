@@ -273,6 +273,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "affinidi-messaging-didcomm-service"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd7feb6d73d1c22b5616ec0651fec7fb52aaac3659a336d9ae63e4ed073ecbd7"
+dependencies = [
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-sdk",
+ "affinidi-secrets-resolver",
+ "affinidi-tdk-common",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha256",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "affinidi-messaging-sdk"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,7 +415,9 @@ name = "affinidi-webvh-common"
 version = "0.0.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-secrets-resolver",
  "affinidi-tdk",
+ "affinidi-tdk-common",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
@@ -438,7 +463,11 @@ name = "affinidi-webvh-control"
 version = "0.0.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-didcomm-service",
+ "affinidi-secrets-resolver",
  "affinidi-tdk",
+ "affinidi-tdk-common",
  "affinidi-webvh-common",
  "anyhow",
  "aws-config",
@@ -448,6 +477,7 @@ dependencies = [
  "axum-extra",
  "azure_core",
  "azure_data_cosmos",
+ "bip39",
  "bytes",
  "clap",
  "dialoguer",
@@ -471,6 +501,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tower 0.5.3",
  "tower-http",
@@ -510,7 +541,11 @@ name = "affinidi-webvh-server"
 version = "0.0.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-didcomm-service",
+ "affinidi-secrets-resolver",
  "affinidi-tdk",
+ "affinidi-tdk-common",
  "affinidi-webvh-common",
  "anyhow",
  "aws-config",
@@ -548,6 +583,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tower 0.5.3",
  "tower-http",
@@ -582,7 +618,11 @@ version = "0.0.1"
 dependencies = [
  "affinidi-data-integrity 0.3.6",
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-didcomm-service",
+ "affinidi-secrets-resolver",
  "affinidi-tdk",
+ "affinidi-tdk-common",
  "affinidi-webvh-common",
  "axum",
  "axum-extra",
@@ -599,6 +639,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tower-http",
  "tracing",
@@ -7610,6 +7651,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -8163,7 +8205,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk",

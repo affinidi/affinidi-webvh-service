@@ -31,6 +31,8 @@ passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
 
 [dependencies]
 affinidi-tdk = { workspace = true }
+affinidi-tdk-common = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
 didwebvh-rs = { workspace = true }
 reqwest = { workspace = true }
