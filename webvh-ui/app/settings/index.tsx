@@ -133,7 +133,6 @@ export default function SettingsPage() {
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
         <Row label="Listen Address" value={config.listenAddress} />
-        <StatusRow label="DIDComm Messaging" enabled={config.didcommEnabled} />
       </View>
 
       {/* VTA */}
