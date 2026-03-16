@@ -77,11 +77,11 @@ pub async fn run_setup() -> Result<(), AppError> {
     // Try to discover the VTA's mediator
     let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did).await;
 
-    let mut mediator_options: Vec<&str> = vec!["No mediator"];
-    if vta_mediator.is_some() {
-        mediator_options.push("Use VTA's mediator");
+    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
+    if let Some(ref did) = vta_mediator {
+        mediator_options.push(format!("Use VTA's mediator ({did})"));
     }
-    mediator_options.push("Enter a custom mediator DID");
+    mediator_options.push("Enter a custom mediator DID".into());
 
     let mediator_idx = Select::new()
         .with_prompt("DIDComm mediator")
@@ -90,20 +90,16 @@ pub async fn run_setup() -> Result<(), AppError> {
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    let mediator_did = match mediator_options[mediator_idx] {
-        "No mediator" => None,
-        "Use VTA's mediator" => {
-            let did = vta_mediator.as_ref().unwrap();
-            eprintln!("  Using VTA mediator: {did}");
-            Some(did.clone())
-        }
-        _ => {
-            let did: String = Input::new()
-                .with_prompt("Mediator DID")
-                .interact_text()
-                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-            if did.is_empty() { None } else { Some(did) }
-        }
+    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
+        None
+    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
+        vta_mediator.clone()
+    } else {
+        let did: String = Input::new()
+            .with_prompt("Mediator DID")
+            .interact_text()
+            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+        if did.is_empty() { None } else { Some(did) }
     };
 
     // 6. Create control DID via VTA
