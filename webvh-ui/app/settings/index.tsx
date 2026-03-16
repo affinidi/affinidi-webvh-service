@@ -121,7 +121,7 @@ export default function SettingsPage() {
           value={config.mediatorDid ?? "Not configured"}
         />
         <Row
-          label="Public URL"
+          label="Control Plane URL"
           value={config.publicUrl ?? "Not configured"}
         />
         {config.didHostingUrl && (
@@ -132,9 +132,8 @@ export default function SettingsPage() {
       {/* Connectivity */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
-        <StatusRow label="DIDComm Messaging" enabled={config.didcommEnabled} />
-        <StatusRow label="REST API" enabled={config.restApiEnabled} />
         <Row label="Listen Address" value={config.listenAddress} />
+        <StatusRow label="DIDComm Messaging" enabled={config.didcommEnabled} />
       </View>
 
       {/* VTA */}
