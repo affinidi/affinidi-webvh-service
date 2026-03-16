@@ -26,9 +26,7 @@ the interactive setup wizard.
 ### Prerequisites
 
 - Rust 1.91.0+ (2024 Edition)
-- A running [VTA](https://github.com/nicktho/vtc-vta-rs) instance
-  with admin access (optional — needed to import a DID secrets
-  bundle; you can also generate keys during setup)
+- A VTA credential (base64url string) for the server's VTA context
 
 ### 1. Clone and build
 
@@ -46,40 +44,7 @@ Alternatively, you can install the server directly with Cargo:
 cargo install affinidi-webvh-server
 ```
 
-### 2. Obtain server DID credentials (optional)
-
-The WebVH server needs its own DID identity for DIDComm
-authentication. The setup wizard can either import credentials
-from your VTA or generate fresh keys.
-
-**Option A — Import from VTA (recommended):** Export a DID
-secrets bundle from your VTA instance:
-
-```bash
-vta export-admin
-```
-
-This prints output like:
-
-```
-VTA DID: did:webvh:vta.example.com
-Mediator DID: did:webvh:mediator.example.com
-
-Admin DID: did:key:z6Mk...
-  Label: webvh-server
-
-  Credential:
-  eyJkaWQiOiJkaWQ6a2V5Ono2TWsu...
-```
-
-Copy the base64url credential string — the setup wizard will
-ask for it.
-
-**Option B — Manual entry:** If you don't have a VTA instance,
-the setup wizard can generate new Ed25519 and X25519 keys for
-you, or you can paste your own multibase-encoded private keys.
-
-### 3. Run the setup wizard
+### 2. Run the setup wizard
 
 ```bash
 webvh-server setup
@@ -87,25 +52,23 @@ webvh-server setup
 
 The wizard walks you through all required configuration:
 
-- **Configuration file path** — where to write `config.toml`
+- **VTA credential** — authenticates with the server's VTA
+  context and creates the root DID automatically
 - **Features** — enable DIDComm messaging and/or REST API
-- **Server DID identity** — import a VTA secrets bundle *or*
-  enter the server DID and keys manually (generate or paste)
-- **Mediator DID** — the DIDComm mediator to route messages
-  through
 - **Public URL** — the externally reachable URL of this server
+- **Control plane** — URL and DID of the webvh-control service
 - **Host / port** — listen address (default: `0.0.0.0:8530`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
   (OS keyring, AWS Secrets Manager, or GCP Secret Manager)
-- **Admin bootstrap** — optionally create an initial admin
-  ACL entry
+- **Admin bootstrap** — enter an existing DID or generate a
+  new `did:key` identity
 
 The wizard writes `config.toml` (without any key material) and
 stores the server's private keys in the chosen secrets backend.
 
-### 4. Start the server
+### 3. Start the server
 
 ```bash
 webvh-server --config config.toml
@@ -227,14 +190,16 @@ time via feature flags and at runtime via config/env vars.
 | AWS Secrets Manager  | `aws-secrets` | `secrets.aws_secret_name`, `secrets.aws_region`  |
 | GCP Secret Manager   | `gcp-secrets` | `secrets.gcp_project`, `secrets.gcp_secret_name` |
 
-The server stores three keys as a JSON-serialized bundle in the
-backend:
+The server stores its key material as a JSON-serialized record
+in the backend:
 
 - **signing_key** — Ed25519 private key for server DID signing
 - **key_agreement_key** — X25519 private key for DIDComm
   encryption
 - **jwt_signing_key** — Ed25519 private key for JWT token
   signing
+- **vta_credential** — VTA credential for re-authentication
+  (optional)
 
 Keys are stored in multibase format (Base58BTC with multicodec
 type prefix), which is self-describing and can be directly

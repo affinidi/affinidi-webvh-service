@@ -8,9 +8,7 @@ use std::path::Path;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use vta_sdk::client::VtaClient;
 use vta_sdk::credentials::CredentialBundle;
-use vta_sdk::keys::KeyType;
 use vta_sdk::session::SessionStore;
-use vta_sdk::webvh::WebvhDidRecord;
 
 /// Metadata from a successful VTA connection.
 pub struct VtaConnectionInfo {
@@ -119,56 +117,6 @@ pub async fn create_did(
     })
 }
 
-/// Retrieve keys for an existing DID from a VTA context.
-///
-/// Lists keys in the context and matches Ed25519 (signing) and X25519
-/// (key agreement) keys, then fetches their private material.
-pub async fn retrieve_did_keys(
-    client: &VtaClient,
-    did: &str,
-    context_id: &str,
-) -> Result<VtaDidResult, Box<dyn std::error::Error>> {
-    // Verify the DID exists
-    let did_record = client.get_did_webvh(did).await?;
-
-    // List keys in this context
-    let keys_resp = client
-        .list_keys(0, 100, Some("active"), Some(context_id))
-        .await?;
-
-    let ed_key = keys_resp
-        .keys
-        .iter()
-        .find(|k| k.key_type == KeyType::Ed25519)
-        .ok_or("no active Ed25519 key found in VTA context")?;
-
-    let x_key = keys_resp
-        .keys
-        .iter()
-        .find(|k| k.key_type == KeyType::X25519)
-        .ok_or("no active X25519 key found in VTA context")?;
-
-    let signing_secret = client.get_key_secret(&ed_key.key_id).await?;
-    let ka_secret = client.get_key_secret(&x_key.key_id).await?;
-
-    Ok(VtaDidResult {
-        did: did_record.did,
-        scid: did_record.scid,
-        signing_key: signing_secret.private_key_multibase,
-        key_agreement_key: ka_secret.private_key_multibase,
-        log_entry: None,
-    })
-}
-
-/// List DIDs in a VTA context (for interactive selection).
-pub async fn list_context_dids(
-    client: &VtaClient,
-    context_id: &str,
-) -> Result<Vec<WebvhDidRecord>, Box<dyn std::error::Error>> {
-    let resp = client.list_dids_webvh(Some(context_id), None).await?;
-    Ok(resp.dids)
-}
-
 /// Generate a standalone did:key admin identity (no VTA needed).
 ///
 /// Returns `(did_string, private_key_multibase)`.
@@ -200,10 +148,3 @@ pub fn generate_ed25519_multibase() -> String {
         .expect("ed25519 multibase encoding")
 }
 
-/// Generate a random X25519 key and return its multibase-encoded private key.
-pub fn generate_x25519_multibase() -> String {
-    let secret = Secret::generate_x25519(None, None).expect("x25519 key generation");
-    secret
-        .get_private_keymultibase()
-        .expect("x25519 multibase encoding")
-}

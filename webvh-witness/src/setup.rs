@@ -148,10 +148,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .interact_text()?;
 
     // 10. Log level / format
-    let log_level: String = Input::new()
+    let log_levels = ["info", "debug", "warn", "error", "trace"];
+    let log_level_idx = Select::new()
         .with_prompt("Log level")
-        .default("info".to_string())
-        .interact_text()?;
+        .items(&log_levels)
+        .default(0)
+        .interact()?;
+    let log_level = log_levels[log_level_idx].to_string();
 
     let format_options = &["text", "json"];
     let format_idx = Select::new()

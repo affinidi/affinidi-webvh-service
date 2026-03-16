@@ -40,7 +40,6 @@ affinidi-data-integrity = "0.3"
 didwebvh-rs = { workspace = true }
 axum = "0.8"
 axum-extra = { workspace = true }
-base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }

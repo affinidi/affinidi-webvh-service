@@ -43,7 +43,7 @@ pub struct DaemonConfig {
 
     // Witness-specific
     #[serde(default)]
-    pub vta: affinidi_webvh_witness::config::VtaConfig,
+    pub vta: affinidi_webvh_common::server::config::VtaConfig,
 
     // Watcher-specific
     #[serde(default)]

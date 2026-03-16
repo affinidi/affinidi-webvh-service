@@ -8,10 +8,6 @@ pub use affinidi_webvh_common::server::config::{
     VtaConfig,
 };
 
-// Re-export PlaintextSecrets for setup.rs
-#[allow(unused_imports)]
-pub use affinidi_webvh_common::server::config::PlaintextSecrets;
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]

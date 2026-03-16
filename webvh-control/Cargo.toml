@@ -45,7 +45,6 @@ affinidi-tdk = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8"
 axum = "0.8"
 axum-extra = { workspace = true }
-base64 = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 ed25519-dalek = { workspace = true }
