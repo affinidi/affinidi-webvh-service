@@ -171,26 +171,24 @@ export interface LoginStartResponse {
   options: any;
 }
 
-export interface ServerConfig {
-  serverDid: string | null;
+export interface ControlPlaneConfig {
+  controlDid: string | null;
+  mediatorDid: string | null;
   publicUrl: string | null;
-  features: { didcomm: boolean; restApi: boolean };
-  server: { host: string; port: number };
-  log: { level: string; format: string };
-  store: { dataDir: string };
-  auth: {
-    accessTokenExpiry: number;
-    refreshTokenExpiry: number;
-    challengeTtl: number;
-    sessionCleanupInterval: number;
-    passkeyEnrollmentTtl: number;
-    cleanupTtlMinutes: number;
-  };
-  limits: {
-    uploadBodyLimit: number;
-    defaultMaxTotalSize: number;
-    defaultMaxDidCount: number;
-  };
+  didHostingUrl: string | null;
+  didcommEnabled: boolean;
+  restApiEnabled: boolean;
+  listenAddress: string;
+  vtaUrl: string | null;
+  vtaDid: string | null;
+  healthCheckIntervalSecs: number;
+  configuredInstances: number;
+  accessTokenExpiry: number;
+  refreshTokenExpiry: number;
+  passkeyEnrollmentTtl: number;
+  dataDir: string;
+  logLevel: string;
+  logFormat: string;
 }
 
 export class ApiError extends Error {
@@ -405,7 +403,7 @@ export const api = {
   deleteAcl: (did: string) =>
     request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
 
-  getConfig: () => request<ServerConfig>("/api/config"),
+  getConfig: () => request<ControlPlaneConfig>("/api/config"),
 
   // Passkey auth
   passkeyEnrollStart: (token: string) =>

@@ -11,8 +11,7 @@ import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { formatBytes } from "../../lib/format";
-import type { ServerConfig } from "../../lib/api";
+import type { ControlPlaneConfig } from "../../lib/api";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -30,15 +29,17 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Badge({ enabled }: { enabled: boolean }) {
+function Badge({ enabled, label }: { enabled: boolean; label?: string }) {
   return (
     <View style={[styles.badge, enabled ? styles.badgeOn : styles.badgeOff]}>
-      <Text style={styles.badgeText}>{enabled ? "Enabled" : "Disabled"}</Text>
+      <Text style={styles.badgeText}>
+        {label ?? (enabled ? "Enabled" : "Disabled")}
+      </Text>
     </View>
   );
 }
 
-function FeatureRow({ label, enabled }: { label: string; enabled: boolean }) {
+function StatusRow({ label, enabled }: { label: string; enabled: boolean }) {
   return (
     <View style={styles.row}>
       <Text style={styles.label}>{label}</Text>
@@ -51,7 +52,7 @@ export default function SettingsPage() {
   const api = useApi();
   const { isAuthenticated } = useAuth();
 
-  const [config, setConfig] = useState<ServerConfig | null>(null);
+  const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -73,7 +74,7 @@ export default function SettingsPage() {
   if (!isAuthenticated) {
     return (
       <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to view server settings.</Text>
+        <Text style={styles.hint}>Please log in to view settings.</Text>
         <Link href="/login" asChild>
           <Pressable style={styles.buttonPrimary}>
             <Text style={styles.buttonPrimaryText}>Login</Text>
@@ -106,24 +107,56 @@ export default function SettingsPage() {
       style={styles.scroll}
       contentContainerStyle={styles.container}
     >
-      <Text style={styles.title}>Server Settings</Text>
+      <Text style={styles.title}>Control Plane Settings</Text>
 
-      {/* Server */}
+      {/* Identity */}
       <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Server</Text>
-        <Row label="Server DID" value={config.serverDid ?? "Not configured"} />
-        <Row label="Public URL" value={config.publicUrl ?? "Not configured"} />
+        <Text style={styles.sectionTitle}>Identity</Text>
         <Row
-          label="Listen Address"
-          value={`${config.server.host}:${config.server.port}`}
+          label="Control Plane DID"
+          value={config.controlDid ?? "Not configured"}
         />
+        <Row
+          label="Mediator DID"
+          value={config.mediatorDid ?? "Not configured"}
+        />
+        <Row
+          label="Public URL"
+          value={config.publicUrl ?? "Not configured"}
+        />
+        {config.didHostingUrl && (
+          <Row label="DID Hosting URL" value={config.didHostingUrl} />
+        )}
       </View>
 
-      {/* Features */}
+      {/* Connectivity */}
       <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Features</Text>
-        <FeatureRow label="DIDComm" enabled={config.features.didcomm} />
-        <FeatureRow label="REST API" enabled={config.features.restApi} />
+        <Text style={styles.sectionTitle}>Connectivity</Text>
+        <StatusRow label="DIDComm Messaging" enabled={config.didcommEnabled} />
+        <StatusRow label="REST API" enabled={config.restApiEnabled} />
+        <Row label="Listen Address" value={config.listenAddress} />
+      </View>
+
+      {/* VTA */}
+      {(config.vtaUrl || config.vtaDid) && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>VTA Integration</Text>
+          {config.vtaUrl && <Row label="VTA URL" value={config.vtaUrl} />}
+          {config.vtaDid && <Row label="VTA DID" value={config.vtaDid} />}
+        </View>
+      )}
+
+      {/* Service Registry */}
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Service Registry</Text>
+        <Row
+          label="Health Check Interval"
+          value={formatDuration(config.healthCheckIntervalSecs)}
+        />
+        <Row
+          label="Configured Instances"
+          value={config.configuredInstances.toString()}
+        />
       </View>
 
       {/* Authentication */}
@@ -131,53 +164,24 @@ export default function SettingsPage() {
         <Text style={styles.sectionTitle}>Authentication</Text>
         <Row
           label="Access Token Expiry"
-          value={formatDuration(config.auth.accessTokenExpiry)}
+          value={formatDuration(config.accessTokenExpiry)}
         />
         <Row
           label="Refresh Token Expiry"
-          value={formatDuration(config.auth.refreshTokenExpiry)}
-        />
-        <Row
-          label="Challenge TTL"
-          value={formatDuration(config.auth.challengeTtl)}
-        />
-        <Row
-          label="Session Cleanup Interval"
-          value={formatDuration(config.auth.sessionCleanupInterval)}
+          value={formatDuration(config.refreshTokenExpiry)}
         />
         <Row
           label="Passkey Enrollment TTL"
-          value={formatDuration(config.auth.passkeyEnrollmentTtl)}
-        />
-        <Row
-          label="Empty DID Cleanup TTL"
-          value={`${config.auth.cleanupTtlMinutes}m`}
-        />
-      </View>
-
-      {/* Limits */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Limits</Text>
-        <Row
-          label="Upload Body Limit"
-          value={formatBytes(config.limits.uploadBodyLimit)}
-        />
-        <Row
-          label="Max Total Size"
-          value={formatBytes(config.limits.defaultMaxTotalSize)}
-        />
-        <Row
-          label="Max DID Count"
-          value={config.limits.defaultMaxDidCount.toLocaleString()}
+          value={formatDuration(config.passkeyEnrollmentTtl)}
         />
       </View>
 
       {/* Storage & Logging */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Storage & Logging</Text>
-        <Row label="Data Directory" value={config.store.dataDir} />
-        <Row label="Log Level" value={config.log.level} />
-        <Row label="Log Format" value={config.log.format} />
+        <Row label="Data Directory" value={config.dataDir} />
+        <Row label="Log Level" value={config.logLevel} />
+        <Row label="Log Format" value={config.logFormat} />
       </View>
     </ScrollView>
   );

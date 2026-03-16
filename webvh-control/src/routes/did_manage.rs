@@ -321,97 +321,55 @@ pub async fn get_server_timeseries(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigResponse {
-    pub server_did: Option<String>,
+    /// Identity
+    pub control_did: Option<String>,
+    pub mediator_did: Option<String>,
     pub public_url: Option<String>,
-    pub features: FeaturesResponse,
-    pub server: ServerResponse,
-    pub log: LogResponse,
-    pub store: StoreResponse,
-    pub auth: AuthResponse,
-    pub limits: LimitsResponse,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FeaturesResponse {
-    pub didcomm: bool,
-    pub rest_api: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ServerResponse {
-    pub host: String,
-    pub port: u16,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LogResponse {
-    pub level: String,
-    pub format: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoreResponse {
-    pub data_dir: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthResponse {
+    pub did_hosting_url: Option<String>,
+    /// Connectivity
+    pub didcomm_enabled: bool,
+    pub rest_api_enabled: bool,
+    pub listen_address: String,
+    /// VTA
+    pub vta_url: Option<String>,
+    pub vta_did: Option<String>,
+    /// Registry
+    pub health_check_interval_secs: u64,
+    pub configured_instances: u64,
+    /// Auth
     pub access_token_expiry: u64,
     pub refresh_token_expiry: u64,
-    pub challenge_ttl: u64,
-    pub session_cleanup_interval: u64,
     pub passkey_enrollment_ttl: u64,
-    pub cleanup_ttl_minutes: u64,
+    /// Storage & Logging
+    pub data_dir: String,
+    pub log_level: String,
+    pub log_format: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LimitsResponse {
-    pub upload_body_limit: u64,
-    pub default_max_total_size: u64,
-    pub default_max_did_count: u64,
-}
-
-/// GET /api/config — return server configuration (non-sensitive fields only).
+/// GET /api/config — return control plane configuration (non-sensitive fields only).
 pub async fn get_config(
     _auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Json<ConfigResponse> {
     let c = &state.config;
     Json(ConfigResponse {
-        server_did: c.server_did.clone(),
+        control_did: c.server_did.clone(),
+        mediator_did: c.mediator_did.clone(),
         public_url: c.public_url.clone(),
-        features: FeaturesResponse {
-            didcomm: c.features.didcomm,
-            rest_api: c.features.rest_api,
-        },
-        server: ServerResponse {
-            host: c.server.host.clone(),
-            port: c.server.port,
-        },
-        log: LogResponse {
-            level: c.log.level.clone(),
-            format: format!("{:?}", c.log.format).to_lowercase(),
-        },
-        store: StoreResponse {
-            data_dir: c.store.data_dir.display().to_string(),
-        },
-        auth: AuthResponse {
-            access_token_expiry: c.auth.access_token_expiry,
-            refresh_token_expiry: c.auth.refresh_token_expiry,
-            challenge_ttl: c.auth.challenge_ttl,
-            session_cleanup_interval: c.auth.session_cleanup_interval,
-            passkey_enrollment_ttl: c.auth.passkey_enrollment_ttl,
-            cleanup_ttl_minutes: c.auth.cleanup_ttl_minutes,
-        },
-        limits: LimitsResponse {
-            upload_body_limit: 10 * 1024 * 1024, // matches DefaultBodyLimit in routes
-            default_max_total_size: 0,
-            default_max_did_count: 0,
-        },
+        did_hosting_url: c.did_hosting_url.clone(),
+        didcomm_enabled: c.features.didcomm,
+        rest_api_enabled: c.features.rest_api,
+        listen_address: format!("{}:{}", c.server.host, c.server.port),
+        vta_url: c.vta.url.clone(),
+        vta_did: c.vta.did.clone(),
+        health_check_interval_secs: c.registry.health_check_interval,
+        configured_instances: c.registry.instances.len() as u64,
+        access_token_expiry: c.auth.access_token_expiry,
+        refresh_token_expiry: c.auth.refresh_token_expiry,
+        passkey_enrollment_ttl: c.auth.passkey_enrollment_ttl,
+        data_dir: c.store.data_dir.display().to_string(),
+        log_level: c.log.level.clone(),
+        log_format: format!("{:?}", c.log.format).to_lowercase(),
     })
 }
 
