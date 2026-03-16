@@ -67,6 +67,8 @@ pub fn router() -> Router<AppState> {
         // Stats & time-series
         .route("/stats", get(did_manage::get_server_stats))
         .route("/timeseries", get(did_manage::get_server_timeseries))
+        // Service overview (topology + health + stats)
+        .route("/services/overview", get(did_manage::get_services_overview))
         // Config
         .route("/config", get(did_manage::get_config))
         // Stats sync (server → control plane, no auth — servers self-identify by DID)

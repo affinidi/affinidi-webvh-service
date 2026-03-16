@@ -108,6 +108,51 @@ export interface TimeSeriesPoint {
 
 export type TimeRange = "1h" | "24h" | "7d" | "30d";
 
+// Service overview types
+export interface ServiceOverview {
+  control: ControlInfo;
+  services: ServiceInfo[];
+  aggregate: AggregateStats;
+}
+
+export interface ControlInfo {
+  version: string;
+  serverDid: string | null;
+  publicUrl: string | null;
+  didcommEnabled: boolean;
+  totalLocalDids: number;
+}
+
+export interface ServiceInfo {
+  instanceId: string;
+  serviceType: string;
+  label: string | null;
+  url: string;
+  status: string;
+  lastHealthCheck: number | null;
+  registeredAt: number;
+  did: string | null;
+  stats: ServiceStats | null;
+}
+
+export interface ServiceStats {
+  totalDids: number;
+  totalResolves: number;
+  totalUpdates: number;
+  lastResolvedAt: number | null;
+  lastUpdatedAt: number | null;
+}
+
+export interface AggregateStats {
+  totalServices: number;
+  activeServices: number;
+  degradedServices: number;
+  unreachableServices: number;
+  totalDids: number;
+  totalResolves: number;
+  totalUpdates: number;
+}
+
 export interface TokenResponse {
   session_id: string;
   access_token: string;
@@ -311,6 +356,8 @@ export const api = {
     request<DidStats>(`/api/stats/${mnemonic}`),
 
   getServerStats: () => request<ServerStats>("/api/stats"),
+
+  getServicesOverview: () => request<ServiceOverview>("/api/services/overview"),
 
   getServerTimeseries: (range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries?range=${range}`),

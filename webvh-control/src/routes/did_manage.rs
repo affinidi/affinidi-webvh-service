@@ -414,3 +414,147 @@ pub async fn get_config(
         },
     })
 }
+
+// ---------- GET /api/services/overview ----------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceOverviewResponse {
+    /// Control plane metadata
+    pub control: ControlInfo,
+    /// All registered service instances with enriched stats
+    pub services: Vec<ServiceInfo>,
+    /// Aggregate stats across all servers
+    pub aggregate: AggregateStats,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlInfo {
+    pub version: String,
+    pub server_did: Option<String>,
+    pub public_url: Option<String>,
+    pub didcomm_enabled: bool,
+    pub total_local_dids: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceInfo {
+    pub instance_id: String,
+    pub service_type: String,
+    pub label: Option<String>,
+    pub url: String,
+    pub status: String,
+    pub last_health_check: Option<u64>,
+    pub registered_at: u64,
+    pub did: Option<String>,
+    /// Stats from the server's stats sync (None if this service hasn't synced stats)
+    pub stats: Option<ServiceStats>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStats {
+    pub total_dids: u64,
+    pub total_resolves: u64,
+    pub total_updates: u64,
+    pub last_resolved_at: Option<u64>,
+    pub last_updated_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateStats {
+    pub total_services: u64,
+    pub active_services: u64,
+    pub degraded_services: u64,
+    pub unreachable_services: u64,
+    pub total_dids: u64,
+    pub total_resolves: u64,
+    pub total_updates: u64,
+}
+
+/// GET /api/services/overview — full service topology with health and stats.
+pub async fn get_services_overview(
+    _auth: AuthClaims,
+    State(state): State<AppState>,
+) -> Result<Json<ServiceOverviewResponse>, AppError> {
+    use crate::registry;
+
+    let instances = registry::list_instances(&state.registry_ks).await?;
+
+    // Snapshot stats under the lock, then release immediately
+    let stats_snapshot: std::collections::HashMap<String, affinidi_webvh_common::StatsSyncPayload> =
+        state.server_stats.read().map(|m| m.clone()).unwrap_or_default();
+
+    let mut active = 0u64;
+    let mut degraded = 0u64;
+    let mut unreachable = 0u64;
+    let mut agg_dids = 0u64;
+    let mut agg_resolves = 0u64;
+    let mut agg_updates = 0u64;
+
+    let mut services: Vec<ServiceInfo> = Vec::with_capacity(instances.len());
+
+    for inst in &instances {
+        match inst.status {
+            registry::ServiceStatus::Active => active += 1,
+            registry::ServiceStatus::Degraded => degraded += 1,
+            registry::ServiceStatus::Unreachable => unreachable += 1,
+        }
+
+        let service_did = inst.metadata.get("did").and_then(|v| v.as_str()).map(String::from);
+
+        let stats = service_did.as_deref().and_then(|did| {
+            let p = stats_snapshot.get(did)?;
+            agg_dids += p.total_dids;
+            agg_resolves += p.total_resolves;
+            agg_updates += p.total_updates;
+            Some(ServiceStats {
+                total_dids: p.total_dids,
+                total_resolves: p.total_resolves,
+                total_updates: p.total_updates,
+                last_resolved_at: p.last_resolved_at,
+                last_updated_at: p.last_updated_at,
+            })
+        });
+
+        let status_str = format!("{:?}", inst.status).to_lowercase();
+
+        services.push(ServiceInfo {
+            instance_id: inst.instance_id.clone(),
+            service_type: format!("{:?}", inst.service_type).to_lowercase(),
+            label: inst.label.clone(),
+            url: inst.url.clone(),
+            status: status_str,
+            last_health_check: inst.last_health_check,
+            registered_at: inst.registered_at,
+            did: service_did,
+            stats,
+        });
+    }
+
+    // Count local DIDs on control plane
+    let local_dids = state.dids_ks.prefix_iter_raw("did:").await?.len() as u64;
+
+    Ok(Json(ServiceOverviewResponse {
+        control: ControlInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            server_did: state.config.server_did.clone(),
+            public_url: state.config.public_url.clone(),
+            didcomm_enabled: state.config.features.didcomm,
+            total_local_dids: local_dids,
+        },
+        aggregate: AggregateStats {
+            total_services: services.len() as u64,
+            active_services: active,
+            degraded_services: degraded,
+            unreachable_services: unreachable,
+            total_dids: agg_dids.max(local_dids),
+            total_resolves: agg_resolves,
+            total_updates: agg_updates,
+        },
+        services,
+    }))
+}
