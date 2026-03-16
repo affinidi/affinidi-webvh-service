@@ -283,9 +283,20 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     // 16. Optional admin ACL bootstrap
     eprintln!();
+    eprintln!("  The Access Control List (ACL) determines who can authenticate");
+    eprintln!("  with this service. Without at least one admin entry, all");
+    eprintln!("  authenticated API calls will be rejected.");
+    eprintln!();
+    eprintln!("  Admins can manage all DIDs, modify ACL entries, and access");
+    eprintln!("  server configuration. Regular owners can only manage their");
+    eprintln!("  own DIDs.");
+    eprintln!();
+    eprintln!("  You can add more entries later with:");
+    eprintln!("    webvh-server add-acl --did <DID> --role admin");
+    eprintln!();
     let admin_options = &[
-        "Enter an existing DID",
-        "Generate a new did:key identity",
+        "Enter an existing DID (e.g. operator or service DID)",
+        "Generate a new did:key identity for the operator",
         "Skip (add later with webvh-server add-acl)",
     ];
     let admin_idx = Select::new()

@@ -261,11 +261,21 @@ pub async fn run_setup() -> Result<(), AppError> {
 
     // 15. Admin ACL bootstrap
     eprintln!();
-    eprintln!("  The control plane needs at least one admin in the ACL.");
+    eprintln!("  The Access Control List (ACL) determines who can authenticate");
+    eprintln!("  with this service. Without at least one admin entry, all");
+    eprintln!("  authenticated API calls will be rejected.");
+    eprintln!();
+    eprintln!("  For the control plane, the webvh-server's DID must be added");
+    eprintln!("  as an admin so it can register itself on startup. You can do");
+    eprintln!("  this now if you know the server DID, or later with:");
+    eprintln!("    webvh-control add-acl --did <server-did> --role admin");
+    eprintln!();
+    eprintln!("  You may also want an operator admin (your own DID or a");
+    eprintln!("  generated did:key) for manual management.");
     eprintln!();
     let admin_options = &[
-        "Enter an existing DID",
-        "Generate a new did:key identity",
+        "Enter an existing DID (e.g. server DID or operator DID)",
+        "Generate a new did:key identity for the operator",
         "Skip (add later with webvh-control add-acl)",
     ];
     let admin_idx = Select::new()
