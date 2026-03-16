@@ -72,6 +72,9 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
 
     // 1. Output path
+    eprintln!("  The configuration file stores all settings for the control plane.");
+    eprintln!("  You can edit it later or re-run setup to regenerate it.");
+    eprintln!();
     let output_path: String = Input::new()
         .with_prompt("Config file output path")
         .default("config.toml".into())
@@ -80,8 +83,14 @@ pub async fn run_setup() -> Result<(), AppError> {
     let output_path = PathBuf::from(output_path);
 
     // 2. Public URL (required for passkeys)
+    eprintln!();
+    eprintln!("  The public URL is used for WebAuthn/passkey authentication.");
+    eprintln!("  It must match the URL users will access in their browser.");
+    eprintln!("  For local development, use http://localhost:<port>.");
+    eprintln!("  For production, use the externally reachable HTTPS URL.");
+    eprintln!();
     let public_url: String = Input::new()
-        .with_prompt("Public URL (for passkey auth, e.g. https://control.example.com)")
+        .with_prompt("Public URL")
         .default("http://localhost:8532".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
@@ -92,8 +101,13 @@ pub async fn run_setup() -> Result<(), AppError> {
     };
 
     // 2b. DID hosting URL
+    eprintln!();
+    eprintln!("  The DID hosting URL is where your webvh-server serves DID documents.");
+    eprintln!("  The control plane displays this to users so they know where their");
+    eprintln!("  DIDs are publicly accessible. Leave empty if not yet known.");
+    eprintln!();
     let did_hosting_url: String = Input::new()
-        .with_prompt("DID hosting URL (where DIDs are publicly served, e.g. https://did.example.com)")
+        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
         .default(String::new())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
@@ -104,6 +118,10 @@ pub async fn run_setup() -> Result<(), AppError> {
     };
 
     // 3. Host & Port
+    eprintln!();
+    eprintln!("  Network binding for the control plane HTTP server.");
+    eprintln!("  Use 0.0.0.0 to listen on all interfaces, or 127.0.0.1 for localhost only.");
+    eprintln!();
     let host: String = Input::new()
         .with_prompt("Listen host")
         .default("0.0.0.0".into())
@@ -117,6 +135,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
     // 4. Log level & format
+    eprintln!();
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
@@ -139,6 +158,11 @@ pub async fn run_setup() -> Result<(), AppError> {
     };
 
     // 5. Data directory
+    eprintln!();
+    eprintln!("  The data directory stores the embedded database (fjall key-value store).");
+    eprintln!("  This includes ACL entries, sessions, and registry state.");
+    eprintln!("  The directory will be created automatically if it does not exist.");
+    eprintln!();
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
         .default("data/webvh-control".into())
@@ -150,9 +174,24 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!("  Generated JWT signing key.");
 
     // 7. Secrets backend
+    eprintln!();
+    eprintln!("  The control plane needs to store cryptographic keys (signing, key agreement,");
+    eprintln!("  JWT). Choose a backend for secure storage of these secrets.");
+    eprintln!();
     let secrets_config = configure_secrets()?;
 
     // 8. Identity — import PNM provision bundle or generate new keys
+    eprintln!();
+    eprintln!("  The control plane needs a DID identity for authentication and DIDComm.");
+    eprintln!();
+    eprintln!("  - Import a PNM bundle: If you provisioned a DID using the PNM CLI,");
+    eprintln!("    paste the base64url bundle here. This is the recommended approach");
+    eprintln!("    for production deployments.");
+    eprintln!("  - Generate new keys: Creates fresh Ed25519/X25519 keys without an");
+    eprintln!("    associated DID. Useful for local development or if you plan to");
+    eprintln!("    assign a DID later by editing server_did in the config file.");
+    eprintln!();
+
     let mut server_did = None;
     let mut signing_key = None;
     let mut key_agreement_key = None;
@@ -276,6 +315,18 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!("  Secrets stored.");
 
     // 11. Optional admin ACL bootstrap
+    eprintln!();
+    eprintln!("  The Access Control List (ACL) determines who can manage the control plane.");
+    eprintln!("  An admin can register/deregister service instances, manage users, and");
+    eprintln!("  perform all privileged operations.");
+    eprintln!();
+    eprintln!("  You need at least one admin DID in the ACL to authenticate and use the");
+    eprintln!("  control plane. This is typically the DID of the operator or the server");
+    eprintln!("  itself (the server_did configured above).");
+    eprintln!();
+    eprintln!("  You can also add admin entries later using:");
+    eprintln!("    webvh-control add-acl --did <DID> --role admin");
+    eprintln!();
     let add_admin = Confirm::new()
         .with_prompt("Add an admin DID to the ACL now?")
         .default(config.server_did.is_some())
@@ -283,6 +334,9 @@ pub async fn run_setup() -> Result<(), AppError> {
         .unwrap_or(false);
 
     if add_admin {
+        eprintln!();
+        eprintln!("  Enter the DID to grant admin access to (e.g. did:key:z6Mk... or did:webvh:...).");
+        eprintln!();
         let admin_did: String = Input::new()
             .with_prompt("Admin DID")
             .interact_text()
