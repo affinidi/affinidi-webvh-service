@@ -91,9 +91,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!();
 
     // Try to discover the VTA's mediator
-    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did)
-        .await
-        .unwrap_or(None);
+    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did).await;
 
     let mut mediator_options: Vec<&str> = vec!["No mediator"];
     if vta_mediator.is_some() {

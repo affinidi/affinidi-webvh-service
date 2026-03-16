@@ -109,11 +109,20 @@ pub async fn connect_vta(
 ///
 /// Looks for a `DIDCommMessaging` service endpoint in the VTA DID document
 /// that contains a DID URI (the mediator). Returns `None` if no mediator
-/// is configured or if DID resolution fails.
-pub async fn resolve_vta_mediator(
-    vta_did: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    vta_sdk::session::resolve_mediator_did(vta_did).await
+/// is configured, if DID resolution fails, or if resolution times out.
+pub async fn resolve_vta_mediator(vta_did: &str) -> Option<String> {
+    eprintln!("  Checking VTA for mediator configuration...");
+
+    // Use a timeout — DID resolution may hang if the network is unreachable
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        vta_sdk::session::resolve_mediator_did(vta_did),
+    )
+    .await
+    {
+        Ok(Ok(mediator)) => mediator,
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// Create a new did:webvh via VTA and fetch its private keys.
