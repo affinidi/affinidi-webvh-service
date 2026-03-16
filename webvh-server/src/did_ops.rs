@@ -17,83 +17,15 @@ use crate::server::AppState;
 use crate::stats;
 use crate::store::KeyspaceHandle;
 use affinidi_webvh_common::DidListEntry;
-use didwebvh_rs::log_entry::LogEntry;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-/// A record tracking a hosted DID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DidRecord {
-    pub owner: String,
-    pub mnemonic: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub version_count: u64,
-    #[serde(default)]
-    pub did_id: Option<String>,
-    #[serde(default)]
-    pub content_size: u64,
-    #[serde(default)]
-    pub disabled: bool,
-}
-
-/// A single parsed log entry with its DID document and parameters.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogEntryInfo {
-    pub version_id: Option<String>,
-    pub version_time: Option<String>,
-    pub state: Option<serde_json::Value>,
-    pub parameters: Option<serde_json::Value>,
-}
-
-/// Summary of WebVH log entry metadata parsed from the stored JSONL content.
-#[derive(Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogMetadata {
-    pub log_entry_count: u64,
-    pub latest_version_id: Option<String>,
-    pub latest_version_time: Option<String>,
-    pub method: Option<String>,
-    pub portable: bool,
-    pub pre_rotation: bool,
-    pub deactivated: bool,
-    pub ttl: Option<u32>,
-    pub witnesses: bool,
-    pub witness_count: u32,
-    pub witness_threshold: u32,
-    pub watchers: bool,
-    pub watcher_count: u32,
-    pub watcher_urls: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Store key helpers
-// ---------------------------------------------------------------------------
-
-pub fn did_key(mnemonic: &str) -> String {
-    format!("did:{mnemonic}")
-}
-
-pub fn content_log_key(mnemonic: &str) -> String {
-    format!("content:{mnemonic}:log")
-}
-
-pub fn content_witness_key(mnemonic: &str) -> String {
-    format!("content:{mnemonic}:witness")
-}
-
-pub fn owner_key(did: &str, mnemonic: &str) -> String {
-    format!("owner:{did}:{mnemonic}")
-}
-
-pub fn watcher_sync_key(mnemonic: &str) -> String {
-    format!("watcher_sync:{mnemonic}")
-}
+// Re-export shared types and helpers from webvh-common so existing code
+// that imports from `crate::did_ops::*` continues to work.
+pub use affinidi_webvh_common::did_ops::{
+    DidRecord, LogEntryInfo, LogMetadata,
+    did_key, content_log_key, content_witness_key, owner_key, watcher_sync_key,
+    extract_did_id, extract_log_metadata, extract_did_web_document, parse_log_entries,
+};
 
 // ---------------------------------------------------------------------------
 // Quota checks
@@ -227,160 +159,13 @@ pub async fn set_did_disabled(
 }
 
 // ---------------------------------------------------------------------------
-// JSONL validation & extraction
+// JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
-    if content.is_empty() {
-        return Err(AppError::Validation(
-            "did.jsonl content cannot be empty".into(),
-        ));
-    }
-
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        LogEntry::deserialize_string(line, None).map_err(|e| {
-            AppError::Validation(format!("invalid log entry at line {}: {e}", idx + 1))
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Extract the `did:webvh:...` identifier from the last line of JSONL content
-/// via the `state.id` field.
-pub fn extract_did_id(jsonl_content: &str) -> Option<String> {
-    let last_line = jsonl_content.lines().last()?;
-    let value: serde_json::Value = serde_json::from_str(last_line).ok()?;
-    value
-        .get("state")
-        .and_then(|state| state.get("id"))
-        .and_then(|id| id.as_str())
-        .filter(|s| s.starts_with("did:webvh:"))
-        .map(|s| s.to_string())
-}
-
-/// Parse JSONL content and extract metadata from the log entries.
-pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
-    let lines: Vec<&str> = jsonl_content.lines().collect();
-    let mut meta = LogMetadata {
-        log_entry_count: lines.len() as u64,
-        ..Default::default()
-    };
-
-    let Some(last_line) = lines.last() else {
-        return meta;
-    };
-    let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line) else {
-        return meta;
-    };
-
-    meta.latest_version_id = entry
-        .get("versionId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    meta.latest_version_time = entry
-        .get("versionTime")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    if let Some(params) = entry.get("parameters") {
-        meta.method = params
-            .get("method")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        meta.portable = params
-            .get("portable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        meta.pre_rotation = params
-            .get("nextKeyHashes")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty());
-
-        meta.deactivated = params
-            .get("deactivated")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        meta.ttl = params.get("ttl").and_then(|v| v.as_u64()).map(|v| v as u32);
-
-        if let Some(witness) = params.get("witness") {
-            let threshold = witness
-                .get("threshold")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let count = witness
-                .get("witnesses")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len() as u32)
-                .unwrap_or(0);
-            if count > 0 {
-                meta.witnesses = true;
-                meta.witness_count = count;
-                meta.witness_threshold = threshold;
-            }
-        }
-
-        if let Some(watchers_val) = params.get("watchers")
-            && let Some(arr) = watchers_val.as_array()
-            && !arr.is_empty()
-        {
-            meta.watchers = true;
-            meta.watcher_count = arr.len() as u32;
-            meta.watcher_urls = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-        }
-    }
-
-    meta
-}
-
-// ---------------------------------------------------------------------------
-// did:web document extraction
-// ---------------------------------------------------------------------------
-
-/// Extract a did:web document from JSONL content by rewriting the did:webvh identity.
-///
-/// Returns `Some(json_bytes)` if the last log entry's `state.alsoKnownAs` contains
-/// the expected `did:web` identifier. The returned document has all occurrences of
-/// the original `did:webvh:...` id replaced with the `did:web:...` id.
-///
-/// Returns `None` if there is no state, no `alsoKnownAs`, or the expected `did:web`
-/// is not declared.
-pub fn extract_did_web_document(jsonl_content: &str, expected_did_web: &str) -> Option<Vec<u8>> {
-    let last_line = jsonl_content.lines().last()?;
-    let entry: serde_json::Value = serde_json::from_str(last_line).ok()?;
-    let state = entry.get("state")?;
-
-    // Get the original did:webvh identifier
-    let webvh_id = state.get("id")?.as_str()?;
-    if !webvh_id.starts_with("did:webvh:") {
-        return None;
-    }
-
-    // Check that alsoKnownAs contains the expected did:web
-    let also_known_as = state.get("alsoKnownAs")?.as_array()?;
-    let found = also_known_as
-        .iter()
-        .any(|v| v.as_str() == Some(expected_did_web));
-    if !found {
-        return None;
-    }
-
-    // Rewrite: serialize the state and replace all occurrences of the webvh id
-    let state_json = serde_json::to_string(state).ok()?;
-    let rewritten = state_json.replace(webvh_id, expected_did_web);
-    Some(rewritten.into_bytes())
+    affinidi_webvh_common::did_ops::validate_did_jsonl(content)
+        .map_err(AppError::Validation)
 }
 
 // ---------------------------------------------------------------------------
@@ -629,25 +414,7 @@ pub async fn get_did_log(
     let content = String::from_utf8(bytes)
         .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
-    let entries: Vec<LogEntryInfo> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            Some(LogEntryInfo {
-                version_id: value
-                    .get("versionId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                version_time: value
-                    .get("versionTime")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                state: value.get("state").cloned(),
-                parameters: value.get("parameters").cloned(),
-            })
-        })
-        .collect();
+    let entries = parse_log_entries(&content);
 
     debug!(mnemonic = %mnemonic, count = entries.len(), "DID log entries retrieved");
 
@@ -909,117 +676,7 @@ pub async fn cleanup_empty_dids(
 mod tests {
     use super::*;
 
-    #[test]
-    fn extract_did_id_from_state_id() {
-        let jsonl = r#"{"versionId":"1-abc","parameters":{"method":"did:webvh:1.0"},"state":{"id":"did:webvh:abc123:example.com:test"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:abc123:example.com:test".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_ignores_parameters_method() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"},"state":{"id":"did:webvh:real:host:path"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:real:host:path".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_without_state() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"}}"#;
-        assert_eq!(extract_did_id(jsonl), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_non_webvh_state_id() {
-        let jsonl = r#"{"state":{"id":"did:key:z6Mk..."}}"#;
-        assert_eq!(extract_did_id(jsonl), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_invalid_json() {
-        assert_eq!(extract_did_id("not valid json"), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_empty() {
-        assert_eq!(extract_did_id(""), None);
-    }
-
-    #[test]
-    fn extract_did_id_uses_last_line() {
-        let jsonl = r#"{"state":{"id":"did:webvh:first:host:path"}}
-{"state":{"id":"did:webvh:second:host:path"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:second:host:path".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_realistic_entry() {
-        let jsonl = r#"{"versionId":"1-QmHash","versionTime":"2025-01-23T04:12:36Z","parameters":{"method":"did:webvh:1.0","scid":"QmSCID","updateKeys":["z82Lk"]},"state":{"@context":["https://www.w3.org/ns/did/v1"],"id":"did:webvh:QmSCID:localhost%3A3000:my-did","authentication":["did:webvh:QmSCID:localhost%3A3000:my-did#key-0"]},"proof":[{"type":"DataIntegrityProof"}]}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:QmSCID:localhost%3A3000:my-did".to_string())
-        );
-    }
-
-    // ---- extract_log_metadata tests ----
-
-    #[test]
-    fn log_metadata_empty_content() {
-        let meta = extract_log_metadata("");
-        assert_eq!(meta.log_entry_count, 0);
-        assert_eq!(meta.latest_version_id, None);
-    }
-
-    #[test]
-    fn log_metadata_basic_entry() {
-        let jsonl = r#"{"versionId":"1-QmHash","versionTime":"2025-01-23T04:12:36Z","parameters":{"method":"did:webvh:1.0","portable":true}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert_eq!(meta.log_entry_count, 1);
-        assert_eq!(meta.latest_version_id.as_deref(), Some("1-QmHash"));
-        assert_eq!(
-            meta.latest_version_time.as_deref(),
-            Some("2025-01-23T04:12:36Z")
-        );
-        assert_eq!(meta.method.as_deref(), Some("did:webvh:1.0"));
-        assert!(meta.portable);
-        assert!(!meta.pre_rotation);
-        assert!(!meta.witnesses);
-        assert!(!meta.watchers);
-        assert!(!meta.deactivated);
-    }
-
-    #[test]
-    fn log_metadata_with_witnesses_and_watchers() {
-        let jsonl = r#"{"versionId":"2-QmXyz","parameters":{"witness":{"threshold":2,"witnesses":[{"id":"did:key:z1"},{"id":"did:key:z2"},{"id":"did:key:z3"}]},"watchers":["https://w1.example.com","https://w2.example.com"],"nextKeyHashes":["QmHash1"]}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert!(meta.witnesses);
-        assert_eq!(meta.witness_count, 3);
-        assert_eq!(meta.witness_threshold, 2);
-        assert!(meta.watchers);
-        assert_eq!(meta.watcher_count, 2);
-        assert!(meta.pre_rotation);
-    }
-
-    #[test]
-    fn log_metadata_multi_line_uses_last() {
-        let jsonl = r#"{"versionId":"1-first","parameters":{"method":"did:webvh:1.0"}}
-{"versionId":"2-second","parameters":{"portable":true,"deactivated":true,"ttl":300}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert_eq!(meta.log_entry_count, 2);
-        assert_eq!(meta.latest_version_id.as_deref(), Some("2-second"));
-        assert!(meta.portable);
-        assert!(meta.deactivated);
-        assert_eq!(meta.ttl, Some(300));
-    }
-
-    // ---- validate_did_jsonl tests ----
+    // ---- validate_did_jsonl wrapper tests ----
 
     #[test]
     fn validate_jsonl_empty_string_rejected() {
@@ -1080,81 +737,6 @@ mod tests {
         assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
     }
 
-    // ---- extract_did_web_document tests ----
-
-    #[test]
-    fn did_web_document_rewrites_ids() {
-        let jsonl = r#"{"state":{"@context":["https://www.w3.org/ns/did/v1"],"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:example.com:my-did"],"authentication":["did:webvh:SCID123:example.com:my-did#key-0"],"verificationMethod":[{"id":"did:webvh:SCID123:example.com:my-did#key-0","type":"Multikey","controller":"did:webvh:SCID123:example.com:my-did","publicKeyMultibase":"z6MkPub"}]}}"#;
-        let result = extract_did_web_document(jsonl, "did:web:example.com:my-did").unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(doc["id"], "did:web:example.com:my-did");
-        assert_eq!(doc["authentication"][0], "did:web:example.com:my-did#key-0");
-        assert_eq!(
-            doc["verificationMethod"][0]["id"],
-            "did:web:example.com:my-did#key-0"
-        );
-        assert_eq!(
-            doc["verificationMethod"][0]["controller"],
-            "did:web:example.com:my-did"
-        );
-        // alsoKnownAs should still be present (unchanged)
-        assert!(doc["alsoKnownAs"].is_array());
-    }
-
-    #[test]
-    fn did_web_document_none_without_also_known_as() {
-        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did"}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_when_did_web_not_in_list() {
-        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:other.com:my-did"]}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_without_state() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:test").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_for_empty_content() {
-        assert!(extract_did_web_document("", "did:web:example.com:test").is_none());
-    }
-
-    #[test]
-    fn did_web_document_uses_last_line() {
-        let jsonl = r#"{"state":{"id":"did:webvh:OLD:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}
-{"state":{"id":"did:webvh:NEW:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}"#;
-        let result = extract_did_web_document(jsonl, "did:web:example.com:test").unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(doc["id"], "did:web:example.com:test");
-        // Verify the OLD id is not present (it was in a different line)
-        let text = String::from_utf8(result.clone()).unwrap();
-        assert!(!text.contains("did:webvh:OLD"));
-        assert!(!text.contains("did:webvh:NEW"));
-    }
-
-    // ---- DidRecord serde backwards compat ----
-
-    #[test]
-    fn did_record_deserialize_without_content_size() {
-        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":100,"version_count":1}"#;
-        let record: DidRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.content_size, 0);
-        assert!(record.did_id.is_none());
-    }
-
-    #[test]
-    fn did_record_deserialize_with_content_size() {
-        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":200,"version_count":2,"did_id":"did:webvh:abc:host:path","content_size":5000}"#;
-        let record: DidRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.content_size, 5000);
-        assert_eq!(record.did_id.as_deref(), Some("did:webvh:abc:host:path"));
-    }
-
     // ---- rollback helper tests (pure functions used by rollback_did) ----
 
     #[test]
@@ -1190,7 +772,6 @@ mod tests {
         let jsonl = format!("{line1}\n{line2}\n{line3}");
         let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
         let truncated = lines[..lines.len() - 1].join("\n");
-        // After rollback, did_id should come from line2 (now the last entry)
         assert_eq!(
             extract_did_id(&truncated),
             Some("did:webvh:update1:host:path".to_string())

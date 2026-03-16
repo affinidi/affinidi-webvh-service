@@ -41,6 +41,8 @@ const MSG_DELETE: &str = "https://affinidi.com/webvh/1.0/did/delete";
 const MSG_DELETE_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/delete-confirm";
 const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
 
+// Sync message types are handled via mediator in messaging.rs, not the REST endpoint
+
 // ---------------------------------------------------------------------------
 // Protocol error (maps to DIDComm problem-report)
 // ---------------------------------------------------------------------------
@@ -476,3 +478,6 @@ async fn handle_delete(
         }),
     ))
 }
+
+// Sync messages (did/sync-update, did/sync-delete) are handled via the mediator
+// message loop in messaging.rs, not through this REST DIDComm endpoint.

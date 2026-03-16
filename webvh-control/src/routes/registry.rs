@@ -204,12 +204,108 @@ pub async fn register_service(
 
 /// Compute DID sync updates for the registering service.
 ///
-/// Phase 1 stub: returns empty — sync infrastructure is in place but the
-/// control plane doesn't yet store/resolve DID content. This will be filled
-/// in when the control plane gains DID content awareness.
+/// Compares the control plane's DID store against the server's reported DIDs
+/// and returns updates for any DIDs the server is missing or has outdated.
 async fn compute_did_sync_updates(
-    _state: &AppState,
-    _reported_dids: &[DidSyncEntry],
+    state: &AppState,
+    reported_dids: &[DidSyncEntry],
 ) -> Vec<DidSyncUpdate> {
-    Vec::new()
+    use affinidi_webvh_common::did_ops::{self, DidRecord};
+    use std::collections::HashMap;
+
+    // Build a lookup of reported DIDs by mnemonic
+    let reported: HashMap<&str, &DidSyncEntry> = reported_dids
+        .iter()
+        .map(|e| (e.mnemonic.as_str(), e))
+        .collect();
+
+    // Iterate all DIDs on the control plane
+    let raw = match state.dids_ks.prefix_iter_raw("did:").await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(error = %e, "compute_did_sync_updates: failed to iterate DIDs");
+            return Vec::new();
+        }
+    };
+
+    let mut updates = Vec::new();
+
+    for (_key, value) in raw {
+        let record: DidRecord = match serde_json::from_slice(&value) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Skip empty (unpublished) DID slots
+        if record.version_count == 0 {
+            continue;
+        }
+
+        let needs_update = match reported.get(record.mnemonic.as_str()) {
+            // Server doesn't have this DID → send it
+            None => true,
+            // Server has it but with fewer versions → send update
+            Some(entry) => entry.version_count < record.version_count,
+        };
+
+        if !needs_update {
+            continue;
+        }
+
+        // Read the log content
+        let log_content = match state
+            .dids_ks
+            .get_raw(did_ops::content_log_key(&record.mnemonic))
+            .await
+        {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+
+        // Read witness content (optional)
+        let witness_content = match state
+            .dids_ks
+            .get_raw(did_ops::content_witness_key(&record.mnemonic))
+            .await
+        {
+            Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+            _ => None,
+        };
+
+        let did_id = record.did_id.unwrap_or_default();
+
+        updates.push(DidSyncUpdate {
+            mnemonic: record.mnemonic,
+            did_id,
+            log_content,
+            witness_content,
+            version_count: record.version_count,
+        });
+    }
+
+    // Log any DIDs the server has that the control plane doesn't
+    for entry in reported_dids {
+        let key = did_ops::did_key(&entry.mnemonic);
+        match state.dids_ks.get::<DidRecord>(key).await {
+            Ok(None) => {
+                tracing::warn!(
+                    mnemonic = %entry.mnemonic,
+                    "server has DID unknown to control plane — manual import may be needed"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !updates.is_empty() {
+        info!(
+            count = updates.len(),
+            "computed DID sync updates for registering server"
+        );
+    }
+
+    updates
 }

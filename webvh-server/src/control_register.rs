@@ -128,7 +128,7 @@ async fn collect_preloaded_dids(dids_ks: &KeyspaceHandle) -> Vec<DidSyncEntry> {
 ///
 /// Each update is validated and stored atomically. Failures are logged
 /// as warnings and do not affect other updates.
-async fn apply_did_updates(
+pub async fn apply_did_updates(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     updates: &[DidSyncUpdate],
@@ -145,7 +145,7 @@ async fn apply_did_updates(
 }
 
 /// Apply a single DID sync update atomically.
-async fn apply_single_update(
+pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     update: &DidSyncUpdate,

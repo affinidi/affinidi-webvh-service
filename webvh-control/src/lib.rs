@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod auth;
 pub mod config;
+pub mod did_ops;
 pub mod error;
 pub mod health;
 #[cfg(feature = "ui")]
@@ -10,5 +11,6 @@ pub mod registry;
 pub mod routes;
 pub mod secret_store;
 pub mod server;
+pub mod server_push;
 pub mod setup;
 pub mod store;

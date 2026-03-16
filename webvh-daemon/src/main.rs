@@ -296,6 +296,7 @@ async fn build_control(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let registry_ks = store.keyspace("registry")?;
+    let dids_ks = store.keyspace("dids")?;
 
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
@@ -319,12 +320,15 @@ async fn build_control(
         sessions_ks,
         acl_ks,
         registry_ks,
+        dids_ks,
         config: Arc::new(control_config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
+        atm: None,
+        atm_profile: None,
     };
 
     let router = affinidi_webvh_control::routes::router().with_state(state);
