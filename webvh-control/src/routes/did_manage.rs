@@ -231,7 +231,10 @@ pub async fn list_dids(
 #[serde(rename_all = "camelCase")]
 pub struct ServerStatsResponse {
     pub total_dids: u64,
-    pub total_published: u64,
+    pub total_resolves: u64,
+    pub total_updates: u64,
+    pub last_resolved_at: Option<u64>,
+    pub last_updated_at: Option<u64>,
 }
 
 pub async fn get_server_stats(
@@ -242,7 +245,8 @@ pub async fn get_server_stats(
 
     let raw = state.dids_ks.prefix_iter_raw("did:").await?;
     let mut total_dids = 0u64;
-    let mut total_published = 0u64;
+    let mut total_updates = 0u64;
+    let mut last_updated_at: Option<u64> = None;
 
     for (_key, value) in raw {
         let record: DidRecord = match serde_json::from_slice(&value) {
@@ -250,13 +254,19 @@ pub async fn get_server_stats(
             Err(_) => continue,
         };
         total_dids += 1;
-        if record.version_count > 0 {
-            total_published += 1;
+        if record.version_count > 1 {
+            total_updates += record.version_count - 1;
+        }
+        if record.updated_at > 0 {
+            last_updated_at = Some(last_updated_at.map_or(record.updated_at, |prev: u64| prev.max(record.updated_at)));
         }
     }
 
     Ok(Json(ServerStatsResponse {
         total_dids,
-        total_published,
+        total_resolves: 0,
+        total_updates,
+        last_resolved_at: None,
+        last_updated_at,
     }))
 }

@@ -53,6 +53,7 @@ export default function RootLayout() {
           <Stack.Screen name="dids/index" />
           <Stack.Screen name="dids/[...mnemonic]" />
           <Stack.Screen name="acl/index" />
+          <Stack.Screen name="settings/index" />
           <Stack.Screen name="enroll" />
         </Stack>
       </ApiProvider>
