@@ -51,7 +51,7 @@ export default function RootLayout() {
           <Stack.Screen name="index" />
           <Stack.Screen name="login" />
           <Stack.Screen name="dids/index" />
-          <Stack.Screen name="dids/[mnemonic]" />
+          <Stack.Screen name="dids/[...mnemonic]" />
           <Stack.Screen name="acl/index" />
           <Stack.Screen name="enroll" />
         </Stack>

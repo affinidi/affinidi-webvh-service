@@ -212,6 +212,15 @@ async function request<T>(
     return undefined as T;
   }
 
+  // Guard against HTML fallback responses (e.g., SPA catch-all returning index.html)
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    throw new ApiError(
+      res.status,
+      `Expected JSON response but got ${contentType || "unknown content type"} — is the API endpoint available?`,
+    );
+  }
+
   return res.json() as Promise<T>;
 }
 
