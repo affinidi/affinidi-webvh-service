@@ -13,7 +13,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Strip leading slash from path-extracted mnemonics.
 fn clean_mnemonic(m: &str) -> &str {
@@ -282,4 +282,135 @@ pub async fn get_server_stats(
         last_resolved_at,
         last_updated_at,
     }))
+}
+
+// ---------- GET /api/timeseries ----------
+
+#[derive(Debug, Serialize)]
+pub struct TimeSeriesPoint {
+    pub timestamp: u64,
+    pub resolves: u64,
+    pub updates: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimeseriesQuery {
+    #[serde(default = "default_range")]
+    pub range: String,
+}
+
+fn default_range() -> String {
+    "24h".to_string()
+}
+
+/// GET /api/timeseries — returns empty time-series data.
+///
+/// The control plane doesn't serve DIDs directly and has no resolve counters.
+/// Time-series data lives on each webvh-server instance. This endpoint exists
+/// so the UI doesn't get an HTML fallback response.
+pub async fn get_server_timeseries(
+    _auth: AuthClaims,
+    Query(params): Query<TimeseriesQuery>,
+) -> Json<Vec<TimeSeriesPoint>> {
+    debug!(range = %params.range, "timeseries requested (control plane — no data)");
+    Json(Vec::new())
+}
+
+// ---------- GET /api/config ----------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigResponse {
+    pub server_did: Option<String>,
+    pub public_url: Option<String>,
+    pub features: FeaturesResponse,
+    pub server: ServerResponse,
+    pub log: LogResponse,
+    pub store: StoreResponse,
+    pub auth: AuthResponse,
+    pub limits: LimitsResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturesResponse {
+    pub didcomm: bool,
+    pub rest_api: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServerResponse {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogResponse {
+    pub level: String,
+    pub format: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreResponse {
+    pub data_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthResponse {
+    pub access_token_expiry: u64,
+    pub refresh_token_expiry: u64,
+    pub challenge_ttl: u64,
+    pub session_cleanup_interval: u64,
+    pub passkey_enrollment_ttl: u64,
+    pub cleanup_ttl_minutes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitsResponse {
+    pub upload_body_limit: u64,
+    pub default_max_total_size: u64,
+    pub default_max_did_count: u64,
+}
+
+/// GET /api/config — return server configuration (non-sensitive fields only).
+pub async fn get_config(
+    _auth: AuthClaims,
+    State(state): State<AppState>,
+) -> Json<ConfigResponse> {
+    let c = &state.config;
+    Json(ConfigResponse {
+        server_did: c.server_did.clone(),
+        public_url: c.public_url.clone(),
+        features: FeaturesResponse {
+            didcomm: c.features.didcomm,
+            rest_api: c.features.rest_api,
+        },
+        server: ServerResponse {
+            host: c.server.host.clone(),
+            port: c.server.port,
+        },
+        log: LogResponse {
+            level: c.log.level.clone(),
+            format: format!("{:?}", c.log.format).to_lowercase(),
+        },
+        store: StoreResponse {
+            data_dir: c.store.data_dir.display().to_string(),
+        },
+        auth: AuthResponse {
+            access_token_expiry: c.auth.access_token_expiry,
+            refresh_token_expiry: c.auth.refresh_token_expiry,
+            challenge_ttl: c.auth.challenge_ttl,
+            session_cleanup_interval: c.auth.session_cleanup_interval,
+            passkey_enrollment_ttl: c.auth.passkey_enrollment_ttl,
+            cleanup_ttl_minutes: c.auth.cleanup_ttl_minutes,
+        },
+        limits: LimitsResponse {
+            upload_body_limit: 10 * 1024 * 1024, // matches DefaultBodyLimit in routes
+            default_max_total_size: 0,
+            default_max_did_count: 0,
+        },
+    })
 }

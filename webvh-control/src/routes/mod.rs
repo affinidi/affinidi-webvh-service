@@ -64,8 +64,11 @@ pub fn router() -> Router<AppState> {
         .route("/enable/{*mnemonic}", put(did_manage::enable_did))
         .route("/rollback/{*mnemonic}", post(did_manage::rollback_did))
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
-        // Stats (DID count from control plane)
+        // Stats & time-series
         .route("/stats", get(did_manage::get_server_stats))
+        .route("/timeseries", get(did_manage::get_server_timeseries))
+        // Config
+        .route("/config", get(did_manage::get_config))
         // Stats sync (server → control plane, no auth — servers self-identify by DID)
         .route("/control/stats", post(stats_sync::receive_stats))
         // Control plane
