@@ -105,18 +105,48 @@ pub async fn connect_vta(
     ))
 }
 
+/// Resolve the mediator DID from the VTA's DID document.
+///
+/// Looks for a `DIDCommMessaging` service endpoint in the VTA DID document
+/// that contains a DID URI (the mediator). Returns `None` if no mediator
+/// is configured or if DID resolution fails.
+pub async fn resolve_vta_mediator(
+    vta_did: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    vta_sdk::session::resolve_mediator_did(vta_did).await
+}
+
 /// Create a new did:webvh via VTA and fetch its private keys.
 ///
 /// The DID is created in "serverless" mode (no VTA-managed server registration).
 /// The log entry is returned for the caller to import into webvh-server.
+///
+/// If `mediator_did` is provided, a `DIDCommMessaging` service endpoint
+/// pointing to the mediator is embedded in the DID document.
 pub async fn create_did(
     client: &VtaClient,
     context_id: &str,
     hosting_url: &str,
     path: &str,
     label: Option<&str>,
+    mediator_did: Option<&str>,
 ) -> Result<VtaDidResult, Box<dyn std::error::Error>> {
     use vta_sdk::client::CreateDidWebvhRequest;
+
+    // If a mediator DID is provided, add a DIDCommMessaging service to the DID document
+    let (add_mediator, additional_services) = match mediator_did {
+        Some(did) => (
+            true,
+            Some(vec![serde_json::json!({
+                "type": "DIDCommMessaging",
+                "serviceEndpoint": {
+                    "uri": did,
+                    "accept": ["didcomm/v2"]
+                }
+            })]),
+        ),
+        None => (false, None),
+    };
 
     let req = CreateDidWebvhRequest {
         context_id: context_id.to_string(),
@@ -125,8 +155,8 @@ pub async fn create_did(
         path: Some(path.to_string()),
         label: label.map(|l| l.to_string()),
         portable: true,
-        add_mediator_service: false,
-        additional_services: None,
+        add_mediator_service: add_mediator,
+        additional_services,
         pre_rotation_count: 0,
     };
 

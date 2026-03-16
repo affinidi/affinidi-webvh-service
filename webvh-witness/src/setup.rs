@@ -85,7 +85,44 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .default("services/witness".into())
         .interact_text()?;
 
-    // 6. Create witness DID via VTA
+    // 6. Mediator selection (before DID creation so it's embedded in the DID doc)
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!();
+
+    // Try to discover the VTA's mediator
+    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did)
+        .await
+        .unwrap_or(None);
+
+    let mut mediator_options: Vec<&str> = vec!["No mediator"];
+    if vta_mediator.is_some() {
+        mediator_options.push("Use VTA's mediator");
+    }
+    mediator_options.push("Enter a custom mediator DID");
+
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()?;
+
+    let mediator_did = match mediator_options[mediator_idx] {
+        "No mediator" => None,
+        "Use VTA's mediator" => {
+            let did = vta_mediator.as_ref().unwrap();
+            eprintln!("  Using VTA mediator: {did}");
+            Some(did.clone())
+        }
+        _ => {
+            let did: String = Input::new()
+                .with_prompt("Mediator DID")
+                .interact_text()?;
+            if did.is_empty() { None } else { Some(did) }
+        }
+    };
+
+    // 7. Create witness DID via VTA
     eprintln!();
     eprintln!("  Creating witness DID via VTA...");
 
@@ -95,13 +132,14 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         &did_hosting_url,
         &did_path,
         Some("webvh-witness"),
+        mediator_did.as_deref(),
     )
     .await?;
 
     eprintln!("  Witness DID created: {}", did_result.did);
     eprintln!("  SCID: {}", did_result.scid);
 
-    // 7. Write log entry to file
+    // 8. Write log entry to file
     if let Some(ref log_entry) = did_result.log_entry {
         let default_log_path = "witness-did.jsonl".to_string();
         let log_path: String = Input::new()
@@ -120,20 +158,6 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             eprintln!("  {line}");
         }
         eprintln!("  ---");
-    }
-
-    // 8. Mediator DID (only if DIDComm enabled)
-    let mut mediator_did = None;
-    if enable_didcomm {
-        let med_did: String = Input::new()
-            .with_prompt("Mediator DID (leave empty if none)")
-            .default(String::new())
-            .interact_text()?;
-        mediator_did = if med_did.is_empty() {
-            None
-        } else {
-            Some(med_did)
-        };
     }
 
     // 9. Host / Port

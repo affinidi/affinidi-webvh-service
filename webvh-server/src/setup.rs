@@ -80,7 +80,44 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .interact_text()?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
-    // 5. Create root DID via VTA at .well-known
+    // 5. Mediator selection (before DID creation so it's embedded in the DID doc)
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!();
+
+    // Try to discover the VTA's mediator
+    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did)
+        .await
+        .unwrap_or(None);
+
+    let mut mediator_options: Vec<&str> = vec!["No mediator"];
+    if vta_mediator.is_some() {
+        mediator_options.push("Use VTA's mediator");
+    }
+    mediator_options.push("Enter a custom mediator DID");
+
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()?;
+
+    let mediator_did = match mediator_options[mediator_idx] {
+        "No mediator" => None,
+        "Use VTA's mediator" => {
+            let did = vta_mediator.as_ref().unwrap();
+            eprintln!("  Using VTA mediator: {did}");
+            Some(did.clone())
+        }
+        _ => {
+            let did: String = Input::new()
+                .with_prompt("Mediator DID")
+                .interact_text()?;
+            if did.is_empty() { None } else { Some(did) }
+        }
+    };
+
+    // 6. Create root DID via VTA at .well-known
     eprintln!();
     eprintln!("  Creating server root DID via VTA...");
 
@@ -90,6 +127,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         &public_url,
         ".well-known",
         Some("webvh-server"),
+        mediator_did.as_deref(),
     )
     .await?;
 
@@ -104,20 +142,6 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             eprintln!("  {line}");
         }
         eprintln!("  ---");
-    }
-
-    // 6. Mediator DID (only ask if DIDComm enabled)
-    let mut mediator_did = None;
-    if enable_didcomm {
-        let med_did: String = Input::new()
-            .with_prompt("Mediator DID (leave empty if none)")
-            .default(String::new())
-            .interact_text()?;
-        mediator_did = if med_did.is_empty() {
-            None
-        } else {
-            Some(med_did)
-        };
     }
 
     // 7. Control plane connection

@@ -67,7 +67,48 @@ pub async fn run_setup() -> Result<(), AppError> {
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    // 5. Create control DID via VTA
+    // 5. Mediator selection
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!("  If your VTA uses a mediator, you can embed the same one in");
+    eprintln!("  the control plane's DID document.");
+    eprintln!();
+
+    // Try to discover the VTA's mediator
+    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did)
+        .await
+        .unwrap_or(None);
+
+    let mut mediator_options: Vec<&str> = vec!["No mediator"];
+    if vta_mediator.is_some() {
+        mediator_options.push("Use VTA's mediator");
+    }
+    mediator_options.push("Enter a custom mediator DID");
+
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+    let mediator_did = match mediator_options[mediator_idx] {
+        "No mediator" => None,
+        "Use VTA's mediator" => {
+            let did = vta_mediator.as_ref().unwrap();
+            eprintln!("  Using VTA mediator: {did}");
+            Some(did.clone())
+        }
+        _ => {
+            let did: String = Input::new()
+                .with_prompt("Mediator DID")
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+            if did.is_empty() { None } else { Some(did) }
+        }
+    };
+
+    // 6. Create control DID via VTA
     eprintln!();
     eprintln!("  Creating control plane DID via VTA...");
 
@@ -77,6 +118,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         &did_hosting_url,
         &did_path,
         Some("webvh-control"),
+        mediator_did.as_deref(),
     )
     .await
     .map_err(|e| AppError::Config(format!("failed to create DID: {e}")))?;
@@ -191,7 +233,7 @@ pub async fn run_setup() -> Result<(), AppError> {
             rest_api: true,
         },
         server_did: Some(did_result.did.clone()),
-        mediator_did: None,
+        mediator_did,
         public_url,
         did_hosting_url: Some(did_hosting_url),
         server: ServerConfig { host, port },
