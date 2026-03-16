@@ -5,20 +5,27 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use tracing::info;
 
+use serde::Serialize;
+
 use crate::acl::{self, AclEntry};
 use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
 
+#[derive(Serialize)]
+pub struct AclListResponse {
+    pub entries: Vec<AclEntry>,
+}
+
 // ---------- GET /api/acl ----------
 
 pub async fn list_acl(
     _auth: AdminAuth,
     State(state): State<AppState>,
-) -> Result<Json<Vec<AclEntry>>, AppError> {
+) -> Result<Json<AclListResponse>, AppError> {
     let entries = acl::list_acl_entries(&state.acl_ks).await?;
-    Ok(Json(entries))
+    Ok(Json(AclListResponse { entries }))
 }
 
 // ---------- POST /api/acl ----------
