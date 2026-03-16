@@ -97,7 +97,7 @@ anyhow = "1"
 didwebvh-rs = "0.3"
 
 # VTA SDK
-vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = ["session", "config-session"] }
+vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = ["session"] }
 
 # Logging / tracing
 tracing = "0.1"

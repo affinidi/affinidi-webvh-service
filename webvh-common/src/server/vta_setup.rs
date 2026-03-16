@@ -5,10 +5,13 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use vta_sdk::client::VtaClient;
 use vta_sdk::credentials::CredentialBundle;
-use vta_sdk::session::SessionStore;
+use vta_sdk::session::{SessionBackend, SessionStore};
 
 /// Metadata from a successful VTA connection.
 pub struct VtaConnectionInfo {
@@ -30,10 +33,35 @@ pub struct VtaDidResult {
     pub log_entry: Option<String>,
 }
 
+/// In-memory session backend for ephemeral setup sessions.
+///
+/// The setup handshake only needs the session for the duration of the
+/// wizard — no persistence needed. This avoids touching disk or
+/// requiring any specific secrets backend to be configured.
+struct InMemoryBackend {
+    data: Mutex<HashMap<String, String>>,
+}
+
+impl SessionBackend for InMemoryBackend {
+    fn load(&self, key: &str) -> Option<String> {
+        self.data.lock().unwrap().get(key).cloned()
+    }
+    fn save(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.data
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+    fn clear(&self, key: &str) {
+        self.data.lock().unwrap().remove(key);
+    }
+}
+
 /// Decode a VTA credential, authenticate, and return a connected client.
 ///
 /// The credential is the base64url string issued by the VTA operator.
-/// A temporary session store is used for the challenge-response handshake.
+/// An in-memory session backend is used for the ephemeral setup handshake.
 pub async fn connect_vta(
     credential_b64: &str,
 ) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
@@ -44,11 +72,11 @@ pub async fn connect_vta(
         .clone()
         .ok_or("VTA credential does not contain a vta_url")?;
 
-    // Use a temp directory for the throwaway session store
-    let session_dir = std::env::temp_dir().join("webvh-vta-setup");
-    std::fs::create_dir_all(&session_dir)?;
-
-    let store = SessionStore::new("webvh-setup", session_dir);
+    // Use an in-memory backend — the session is only needed for this setup run
+    let backend = InMemoryBackend {
+        data: Mutex::new(HashMap::new()),
+    };
+    let store = SessionStore::with_backend(Box::new(backend));
     let session_key = "setup";
 
     let login_result = store.login(credential_b64, &vta_url, session_key).await?;
