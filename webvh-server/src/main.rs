@@ -38,6 +38,12 @@ enum Command {
     },
     /// List all access control entries
     ListAcl,
+    /// Remove an access control entry
+    RemoveAcl {
+        /// DID to remove from the ACL
+        #[arg(long)]
+        did: String,
+    },
     /// Export server data to a backup file
     Backup {
         /// Output file path (use "-" for stdout)
@@ -116,6 +122,12 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RemoveAcl { did }) => {
+            if let Err(e) = run_remove_acl(cli.config, did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -258,6 +270,38 @@ async fn run_list_acl(
 
     eprintln!();
     eprintln!("  {} entries total", entries.len());
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_remove_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_server::acl::{delete_acl_entry, get_acl_entry};
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    let existing = get_acl_entry(&acl_ks, &did).await?;
+    if existing.is_none() {
+        eprintln!();
+        eprintln!("  No ACL entry found for {did}");
+        eprintln!();
+        return Ok(());
+    }
+
+    let entry = existing.unwrap();
+    delete_acl_entry(&acl_ks, &did).await?;
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("  ACL entry removed!");
+    eprintln!();
+    eprintln!("  DID:  {}", entry.did);
+    eprintln!("  Role: {}", entry.role);
     eprintln!();
 
     Ok(())
