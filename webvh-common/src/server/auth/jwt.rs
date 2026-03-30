@@ -15,6 +15,9 @@ pub struct Claims {
     /// Issued-at timestamp (RFC 7519 §4.1.6).
     #[serde(default)]
     pub iat: u64,
+    /// Unique token ID — rotated on each refresh so old tokens are invalidated.
+    #[serde(default)]
+    pub jti: String,
 }
 
 /// Holds the JWT encoding and decoding keys derived from an Ed25519 seed.
@@ -91,6 +94,7 @@ impl JwtKeys {
             role,
             exp: now + expiry_secs,
             iat: now,
+            jti: uuid::Uuid::new_v4().to_string(),
         }
     }
 }

@@ -72,6 +72,14 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
             return Err(AppError::Unauthorized("session not authenticated".into()));
         }
 
+        // Validate token_id matches — prevents use of old tokens after refresh
+        if let Some(ref session_token_id) = session.token_id {
+            if !claims.jti.is_empty() && claims.jti != *session_token_id {
+                warn!(session_id = %claims.session_id, "auth rejected: token revoked (stale jti)");
+                return Err(AppError::Unauthorized("token has been revoked".into()));
+            }
+        }
+
         let role = Role::from_str(&claims.role)?;
 
         debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");

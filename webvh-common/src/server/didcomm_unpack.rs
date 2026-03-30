@@ -86,7 +86,27 @@ pub async fn unpack_signed(
         UnpackResult::Signed {
             message,
             signer_kid,
-        } => Ok((message, signer_kid)),
+        } => {
+            // Validate message freshness — reject messages older than 5 minutes
+            if let Some(created_time) = message.created_time {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let max_age = 300; // 5 minutes
+                if now.saturating_sub(created_time) > max_age {
+                    return Err(AppError::Authentication(
+                        "message too old (created_time exceeds 5-minute window)".into(),
+                    ));
+                }
+                if created_time > now + 60 {
+                    return Err(AppError::Authentication(
+                        "message created_time is in the future".into(),
+                    ));
+                }
+            }
+            Ok((message, signer_kid))
+        }
         UnpackResult::Plaintext(message) => Ok((message, None)),
         UnpackResult::Encrypted { message, .. } => Ok((message, None)),
     }

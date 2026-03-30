@@ -107,6 +107,7 @@ async fn token_for(env: &TestEnv, did: &str, role: Role) -> String {
         created_at: now_epoch(),
         refresh_token: None,
         refresh_expires_at: None,
+        token_id: None,
     };
     store_session(&env.state.sessions_ks, &session)
         .await

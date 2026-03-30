@@ -73,6 +73,7 @@ pub async fn challenge(
         created_at: now_epoch(),
         refresh_token: None,
         refresh_expires_at: None,
+        token_id: None,
     };
 
     store_session(&state.sessions_ks, &session).await?;

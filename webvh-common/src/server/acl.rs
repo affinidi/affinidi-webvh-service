@@ -100,6 +100,9 @@ pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, App
 ///
 /// Returns `Forbidden` if the DID is not found.
 pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError> {
+    if did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
     match get_acl_entry(acl, did).await? {
         Some(entry) => {
             debug!(did = %did, role = %entry.role, "ACL check passed");
