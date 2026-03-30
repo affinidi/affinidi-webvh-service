@@ -137,6 +137,9 @@ pub struct DidStatsDelta {
 pub struct StatsSyncPayload {
     /// DID of the reporting server.
     pub server_did: String,
+    /// Monotonic sequence number (incremented on each sync). Used by the
+    /// control plane to detect replayed or out-of-order payloads.
+    pub seq: u64,
     /// Per-DID counter deltas since the last sync.
     pub did_deltas: Vec<DidStatsDelta>,
 }

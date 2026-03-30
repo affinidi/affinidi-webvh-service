@@ -10,12 +10,18 @@
 
 pub use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
+
+/// Monotonic sequence counter for stats sync idempotency.
+static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Push per-DID stat deltas to the control plane via HTTP.
 ///
 /// Drains the collector's accumulated deltas. If nothing changed since the
 /// last sync, the HTTP POST is skipped entirely (zero cost when idle).
+/// Each payload includes a monotonic sequence number so the control plane
+/// can detect replayed or out-of-order payloads.
 pub async fn sync_to_control(
     http: &reqwest::Client,
     control_url: &str,
@@ -27,8 +33,11 @@ pub async fn sync_to_control(
         return; // Nothing changed — skip the POST
     }
 
+    let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
+
     let payload = affinidi_webvh_common::StatsSyncPayload {
         server_did: server_did.to_string(),
+        seq,
         did_deltas: deltas,
     };
 

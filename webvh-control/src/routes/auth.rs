@@ -11,11 +11,36 @@ use crate::auth::session::{self, SessionState, Session, now_epoch};
 use crate::error::AppError;
 use crate::server::AppState;
 
+/// Maximum concurrent pending challenges per DID.
+const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+
 /// POST /api/auth/challenge — request a challenge nonce.
 pub async fn challenge(
     State(state): State<AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
+    // Input validation
+    if req.did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
+
+    // Rate limit pending challenges per DID
+    let sessions = state.sessions_ks.prefix_iter_raw("session:").await?;
+    let pending = sessions
+        .iter()
+        .filter(|(_, v)| {
+            serde_json::from_slice::<Session>(v)
+                .map(|s| s.did == req.did && s.state == SessionState::ChallengeSent)
+                .unwrap_or(false)
+        })
+        .count();
+    if pending >= MAX_PENDING_CHALLENGES_PER_DID {
+        warn!(did = %req.did, pending, "challenge rate limited");
+        return Err(AppError::Validation(
+            "too many pending challenges — try again later".into(),
+        ));
+    }
+
     let challenge_bytes = rand::random::<[u8; 32]>();
     let challenge = challenge_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let session_id = uuid::Uuid::new_v4().to_string();

@@ -26,12 +26,37 @@ pub struct ChallengeRequest {
     pub did: String,
 }
 
+/// Maximum concurrent pending challenges per DID.
+const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+
 pub async fn challenge(
     State(state): State<AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
+    // Input validation: reject excessively long DIDs (DoS mitigation)
+    if req.did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
+
     // ACL enforcement: DID must be in the ACL to request a challenge
     check_acl(&state.acl_ks, &req.did).await?;
+
+    // Rate limit: prevent session exhaustion by limiting pending challenges per DID
+    let sessions = state.sessions_ks.prefix_iter_raw("session:").await?;
+    let pending_count = sessions
+        .iter()
+        .filter(|(_, v)| {
+            serde_json::from_slice::<Session>(v)
+                .map(|s| s.did == req.did && s.state == SessionState::ChallengeSent)
+                .unwrap_or(false)
+        })
+        .count();
+    if pending_count >= MAX_PENDING_CHALLENGES_PER_DID {
+        warn!(did = %req.did, pending = pending_count, "challenge rate limited");
+        return Err(AppError::Validation(
+            "too many pending challenges — try again later".into(),
+        ));
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
