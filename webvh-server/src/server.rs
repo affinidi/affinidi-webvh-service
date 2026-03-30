@@ -165,36 +165,6 @@ pub async fn run(
         stats_collector: Some(stats_collector.clone()),
     };
 
-    // Register with control plane if configured (DIDComm auth) — runs in background with retries
-    if let Some(control_url) = state.config.control_url.clone() {
-        if let Some(server_did) = state.config.server_did.clone() {
-            use affinidi_tdk::secrets_resolver::secrets::Secret;
-            let kid = format!("{server_did}#key-0");
-            match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-                Ok(signing_secret) => {
-                    let public_url = state.config.public_url.clone().unwrap_or_default();
-                    let dids_ks = state.dids_ks.clone();
-                    let store = state.store.clone();
-                    tokio::spawn(async move {
-                        control_register::register_with_control_retry(
-                            &control_url,
-                            &server_did,
-                            &signing_secret,
-                            &public_url,
-                            None,
-                            &dids_ks,
-                            &store,
-                        )
-                        .await;
-                    });
-                }
-                Err(e) => warn!("cannot register with control: {e}"),
-            }
-        } else {
-            warn!("control_url set but server_did missing — skipping registration");
-        }
-    }
-
     // Log startup configuration
     info!("--- enabled services ---");
     info!(
@@ -294,6 +264,36 @@ pub async fn run(
     } else {
         None
     };
+
+    // 4. Register with control plane in background (after REST is serving so our DID is resolvable)
+    if let Some(control_url) = state.config.control_url.clone() {
+        if let Some(server_did) = state.config.server_did.clone() {
+            use affinidi_tdk::secrets_resolver::secrets::Secret;
+            let kid = format!("{server_did}#key-0");
+            match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
+                Ok(signing_secret) => {
+                    let public_url = state.config.public_url.clone().unwrap_or_default();
+                    let dids_ks = state.dids_ks.clone();
+                    let store_clone = state.store.clone();
+                    tokio::spawn(async move {
+                        control_register::register_with_control_retry(
+                            &control_url,
+                            &server_did,
+                            &signing_secret,
+                            &public_url,
+                            None,
+                            &dids_ks,
+                            &store_clone,
+                        )
+                        .await;
+                    });
+                }
+                Err(e) => warn!("cannot register with control: {e}"),
+            }
+        } else {
+            warn!("control_url set but server_did missing — skipping registration");
+        }
+    }
 
     // Wait for shutdown signal
     shutdown_signal().await;
