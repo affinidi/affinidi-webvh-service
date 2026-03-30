@@ -291,28 +291,46 @@ pub async fn run(
 
     let _ = rest_shutdown_tx.send(true);
     if let Some(handle) = rest_handle {
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => info!("REST thread stopped"),
-            Ok(Err(_panic)) => {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || handle.join()),
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => info!("REST thread stopped"),
+            Ok(Ok(Err(_panic))) => {
                 error!("REST thread panicked");
                 any_panic = true;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("failed to join REST thread: {e}");
+                any_panic = true;
+            }
+            Err(_) => {
+                error!("REST thread shutdown timed out (30s)");
                 any_panic = true;
             }
         }
     }
 
     let _ = storage_shutdown_tx.send(true);
-    match tokio::task::spawn_blocking(move || storage_handle.join()).await {
-        Ok(Ok(())) => info!("storage thread stopped"),
-        Ok(Err(_panic)) => {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || storage_handle.join()),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => info!("storage thread stopped"),
+        Ok(Ok(Err(_panic))) => {
             error!("storage thread panicked");
             any_panic = true;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("failed to join storage thread: {e}");
+            any_panic = true;
+        }
+        Err(_) => {
+            error!("storage thread shutdown timed out (30s)");
             any_panic = true;
         }
     }

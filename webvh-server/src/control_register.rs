@@ -6,7 +6,7 @@ use affinidi_tdk::secrets_resolver::secrets::Secret;
 use affinidi_webvh_common::{
     ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::did_ops::{DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl};
 use crate::store::{KeyspaceHandle, Store};
@@ -26,6 +26,7 @@ pub async fn register_with_control_retry(
     store: &Store,
     did_cache: &crate::cache::ContentCache,
 ) {
+    const MAX_RETRIES: u32 = 20; // ~10 minutes with exponential backoff
     let mut backoff = 5u64;
     let mut attempt = 0u32;
     loop {
@@ -44,8 +45,13 @@ pub async fn register_with_control_retry(
         {
             return;
         }
+        if attempt >= MAX_RETRIES {
+            error!("control plane registration failed after {attempt} attempts — giving up");
+            return;
+        }
         info!(
             attempt,
+            max = MAX_RETRIES,
             backoff_secs = backoff,
             "retrying control plane registration"
         );

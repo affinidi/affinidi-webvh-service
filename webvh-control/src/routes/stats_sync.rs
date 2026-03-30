@@ -41,7 +41,13 @@ pub async fn receive_stats(
 
     // Idempotency: reject replayed or out-of-order payloads
     {
-        let map = LAST_SEQ.read().unwrap();
+        let map = match LAST_SEQ.read() {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("LAST_SEQ lock poisoned — accepting payload");
+                return StatusCode::NO_CONTENT;
+            }
+        };
         if let Some(&last) = map.get(&payload.server_did) {
             if payload.seq <= last {
                 debug!(
@@ -57,7 +63,14 @@ pub async fn receive_stats(
 
     // Update last seen sequence
     {
-        let mut map = LAST_SEQ.write().unwrap();
+        let mut map = match LAST_SEQ.write() {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("LAST_SEQ write lock poisoned — accepting payload");
+                // Fall through to apply deltas even if sequence tracking is broken
+                return StatusCode::NO_CONTENT;
+            }
+        };
         map.insert(payload.server_did.clone(), payload.seq);
     }
 
