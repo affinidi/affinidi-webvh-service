@@ -36,21 +36,24 @@ pub async fn bootstrap_root_did(
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
     ka_secret: Option<&Secret>,
+    mediator_did: Option<&str>,
     public_url: &str,
 ) -> Result<BootstrapResult, AppError> {
-    bootstrap_did(store, dids_ks, signing_secret, ka_secret, public_url, ".well-known").await
+    bootstrap_did(store, dids_ks, signing_secret, ka_secret, mediator_did, public_url, ".well-known").await
 }
 
 /// Create a DID log entry at the given path and store it atomically.
 ///
 /// The signing secret's public key is embedded in the DID document. If
 /// `ka_secret` is provided, an X25519 key agreement key is also added.
+/// If `mediator_did` is provided, a `DIDCommMessaging` service is added.
 /// The resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
 pub async fn bootstrap_did(
     store: &Store,
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
     ka_secret: Option<&Secret>,
+    mediator_did: Option<&str>,
     public_url: &str,
     mnemonic: &str,
 ) -> Result<BootstrapResult, AppError> {
@@ -73,10 +76,9 @@ pub async fn bootstrap_did(
         .transpose()
         .map_err(|e| AppError::Internal(format!("failed to get KA public key multibase: {e}")))?;
 
-    let auth_endpoint = format!("{}/api/auth/", public_url.trim_end_matches('/'));
     let doc = build_did_document(&host, mnemonic, &public_key, &DidDocumentOptions {
         key_agreement_multibase: ka_public_key.as_deref(),
-        auth_endpoint: Some(&auth_endpoint),
+        mediator_endpoint: mediator_did,
     });
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)

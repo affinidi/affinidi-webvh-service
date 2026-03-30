@@ -408,8 +408,16 @@ async fn run_recreate_did(
         .map_err(|e| format!("invalid signing_key: {e}"))?;
     let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
 
+    // Discover mediator from VTA DID for the DIDCommMessaging service
+    let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
+        use affinidi_webvh_common::server::didcomm_profile::resolve_mediator_did;
+        resolve_mediator_did(vta_did, None).await
+    } else {
+        None
+    };
+
     let result =
-        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), public_url, &mnemonic)
+        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
             .await?;
 
     store.persist().await?;
@@ -509,8 +517,16 @@ async fn run_bootstrap_did(
             .map_err(|e| format!("invalid signing_key: {e}"))?;
         let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
 
+        // Discover mediator from VTA DID for the DIDCommMessaging service
+        let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
+            use affinidi_webvh_common::server::didcomm_profile::resolve_mediator_did;
+            resolve_mediator_did(vta_did, None).await
+        } else {
+            None
+        };
+
         let result =
-            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), public_url, &mnemonic)
+            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
                 .await?;
 
         // Optional: request witness proof

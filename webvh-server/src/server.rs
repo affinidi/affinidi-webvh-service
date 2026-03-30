@@ -684,10 +684,18 @@ async fn auto_bootstrap_dids(
 
     let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
 
+    // Discover mediator from VTA DID (if configured) for the DID document
+    let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
+        use affinidi_webvh_common::server::didcomm_profile::resolve_mediator_did;
+        resolve_mediator_did(vta_did, None).await
+    } else {
+        None
+    };
+
     // Bootstrap root DID (.well-known) if it doesn't exist
     match bootstrap::root_did_exists(dids_ks).await {
         Ok(false) => {
-            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, ka_secret.as_ref(), &public_url).await
+            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), &public_url).await
             {
                 Ok(result) => {
                     info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");

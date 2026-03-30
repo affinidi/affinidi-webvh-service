@@ -69,9 +69,10 @@ pub struct DidDocumentOptions<'a> {
     /// `keyAgreement` verification method (`#key-1`) is added to the document.
     /// Required for DIDComm encrypted messaging.
     pub key_agreement_multibase: Option<&'a str>,
-    /// Auth service endpoint URL. When set, an `#auth` service entry is added.
-    /// Required by the TDK authentication module.
-    pub auth_endpoint: Option<&'a str>,
+    /// Mediator DID or URL for the `DIDCommMessaging` service endpoint.
+    /// When set, a `DIDCommMessaging` service is added so other parties
+    /// know how to route messages to this DID.
+    pub mediator_endpoint: Option<&'a str>,
 }
 
 /// Build a standard DID document with `{SCID}` placeholders.
@@ -117,11 +118,14 @@ pub fn build_did_document(
 
     // Add services
     let mut services = vec![];
-    if let Some(endpoint) = opts.auth_endpoint {
+    if let Some(mediator) = opts.mediator_endpoint {
         services.push(json!({
-            "id": format!("{did_id}#auth"),
-            "type": "Authentication",
-            "serviceEndpoint": endpoint,
+            "id": format!("{did_id}#didcomm"),
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": [{
+                "accept": ["didcomm/v2"],
+                "uri": mediator,
+            }],
         }));
     }
     if !services.is_empty() {
@@ -262,21 +266,22 @@ mod tests {
     }
 
     #[test]
-    fn build_did_document_with_auth_service() {
+    fn build_did_document_with_didcomm_service() {
         let doc = build_did_document(
             "example.com",
             "test",
             "z6MkPubKey",
             &DidDocumentOptions {
-                auth_endpoint: Some("https://example.com/api/auth/"),
+                mediator_endpoint: Some("did:example:mediator"),
                 ..Default::default()
             },
         );
         let service = &doc["service"];
         assert!(service.is_array());
-        let auth = &service[0];
-        assert!(auth["id"].as_str().unwrap().ends_with("#auth"));
-        assert_eq!(auth["type"], "Authentication");
-        assert_eq!(auth["serviceEndpoint"], "https://example.com/api/auth/");
+        let svc = &service[0];
+        assert!(svc["id"].as_str().unwrap().ends_with("#didcomm"));
+        assert_eq!(svc["type"], "DIDCommMessaging");
+        assert_eq!(svc["serviceEndpoint"][0]["uri"], "did:example:mediator");
+        assert_eq!(svc["serviceEndpoint"][0]["accept"][0], "didcomm/v2");
     }
 }
