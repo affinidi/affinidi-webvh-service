@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::auth::AdminAuth;
+use crate::auth::{AdminAuth, ServiceAuth};
 use crate::error::AppError;
 use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
 use crate::server::AppState;
@@ -129,7 +129,7 @@ pub struct RegisterServiceWithSyncRequest {
 /// Idempotent: if an instance with the same URL and service type already
 /// exists, its status is set to Active and the existing record is returned.
 pub async fn register_service(
-    auth: AdminAuth,
+    auth: ServiceAuth,
     State(state): State<AppState>,
     Json(req): Json<RegisterServiceWithSyncRequest>,
 ) -> Result<(StatusCode, Json<RegisterServiceResponse>), AppError> {

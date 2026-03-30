@@ -83,6 +83,34 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
     }
 }
 
+/// Extractor that requires the caller to have Service role.
+///
+/// Use on endpoints that only service accounts should access (e.g. register-service):
+/// ```ignore
+/// async fn handler(auth: ServiceAuth, ...) { }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ServiceAuth(pub AuthClaims);
+
+impl<S: AuthState> FromRequestParts<S> for ServiceAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let claims = AuthClaims::from_request_parts(parts, state).await?;
+
+        match claims.role {
+            Role::Service => Ok(ServiceAuth(claims)),
+            _ => {
+                warn!(did = %claims.did, role = %claims.role, "auth rejected: service role required");
+                Err(AppError::Forbidden("service role required".into()))
+            }
+        }
+    }
+}
+
 /// Extractor that requires the caller to have Admin role.
 ///
 /// Use on endpoints that manage ACL entries and other admin tasks:
