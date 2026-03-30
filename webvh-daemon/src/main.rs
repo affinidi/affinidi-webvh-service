@@ -142,10 +142,10 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     let app = combined
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
                 .on_response(
                     DefaultOnResponse::new()
-                        .level(Level::INFO)
+                        .level(Level::DEBUG)
                         .latency_unit(tower_http::LatencyUnit::Millis),
                 ),
         )
