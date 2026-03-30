@@ -1,4 +1,4 @@
-//! Stats sync endpoint — receives aggregate stats pushed by webvh-server instances.
+//! Stats sync endpoint — receives per-DID deltas from webvh-server instances.
 
 use axum::Json;
 use axum::extract::State;
@@ -9,26 +9,33 @@ use tracing::debug;
 
 use crate::server::AppState;
 
-/// POST /api/control/stats — receive stats from a server instance.
+/// POST /api/control/stats — receive per-DID deltas from a server instance.
 ///
 /// No authentication required — servers self-identify by their DID in the payload.
-/// This is intentional: stats are non-sensitive aggregate counters, and requiring
-/// auth would add complexity to the sync hot path.
+/// Deltas are merged into the in-memory collector (fast, no I/O). A separate
+/// flush timer on the storage thread writes dirty per-DID stats to the store.
 pub async fn receive_stats(
     State(state): State<AppState>,
     Json(payload): Json<StatsSyncPayload>,
 ) -> StatusCode {
+    let delta_count = payload.did_deltas.len();
+
+    for delta in &payload.did_deltas {
+        // Update in-memory per-DID deltas (will be flushed to store periodically)
+        state.stats_collector.record_deltas(
+            &delta.mnemonic,
+            delta.resolve_delta,
+            delta.update_delta,
+            delta.last_resolved_at,
+            delta.last_updated_at,
+        );
+    }
+
     debug!(
         server_did = %payload.server_did,
-        total_dids = payload.total_dids,
-        total_resolves = payload.total_resolves,
-        total_updates = payload.total_updates,
+        delta_count,
         "received stats sync"
     );
-
-    if let Ok(mut map) = state.server_stats.write() {
-        map.insert(payload.server_did.clone(), payload);
-    }
 
     StatusCode::NO_CONTENT
 }

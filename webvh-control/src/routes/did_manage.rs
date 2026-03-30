@@ -13,7 +13,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::info;
 
 /// Strip leading slash from path-extracted mnemonics.
 fn clean_mnemonic(m: &str) -> &str {
@@ -237,51 +237,35 @@ pub struct ServerStatsResponse {
     pub last_updated_at: Option<u64>,
 }
 
-/// GET /api/stats — aggregates stats from all connected server instances.
-///
-/// If no servers have synced stats yet, falls back to counting local DID records.
+/// GET /api/stats — O(1) aggregate from in-memory atomic counters.
 pub async fn get_server_stats(
     _auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatsResponse>, AppError> {
-    let mut total_dids = 0u64;
-    let mut total_resolves = 0u64;
-    let mut total_updates = 0u64;
-    let mut last_resolved_at: Option<u64> = None;
-    let mut last_updated_at: Option<u64> = None;
-    let mut has_server_stats = false;
-
-    // Aggregate across all server instances that have synced stats
-    if let Ok(map) = state.server_stats.read() {
-        for payload in map.values() {
-            has_server_stats = true;
-            total_dids += payload.total_dids;
-            total_resolves += payload.total_resolves;
-            total_updates += payload.total_updates;
-            last_resolved_at = match (last_resolved_at, payload.last_resolved_at) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-            last_updated_at = match (last_updated_at, payload.last_updated_at) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-        }
-    }
-
-    // Fallback: if no servers have synced, count local DID records
-    if !has_server_stats {
-        let raw = state.dids_ks.prefix_iter_raw("did:").await?;
-        total_dids = raw.len() as u64;
-    }
-
+    let agg = state.stats_collector.get_aggregate();
     Ok(Json(ServerStatsResponse {
-        total_dids,
-        total_resolves,
-        total_updates,
-        last_resolved_at,
-        last_updated_at,
+        total_dids: agg.total_dids,
+        total_resolves: agg.total_resolves,
+        total_updates: agg.total_updates,
+        last_resolved_at: agg.last_resolved_at,
+        last_updated_at: agg.last_updated_at,
     }))
+}
+
+/// GET /api/stats/{mnemonic} — per-DID stats from persistent store.
+pub async fn get_did_stats(
+    _auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<Json<affinidi_webvh_common::DidStats>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let key = format!("stats:{mnemonic}");
+    let stats: affinidi_webvh_common::DidStats = state
+        .stats_ks
+        .get(key)
+        .await?
+        .unwrap_or_default();
+    Ok(Json(stats))
 }
 
 // ---------- GET /api/timeseries ----------
@@ -294,6 +278,7 @@ pub struct TimeSeriesPoint {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TimeseriesQuery {
     #[serde(default = "default_range")]
     pub range: String,
@@ -303,16 +288,20 @@ fn default_range() -> String {
     "24h".to_string()
 }
 
-/// GET /api/timeseries — returns empty time-series data.
-///
-/// The control plane doesn't serve DIDs directly and has no resolve counters.
-/// Time-series data lives on each webvh-server instance. This endpoint exists
-/// so the UI doesn't get an HTML fallback response.
+/// GET /api/timeseries — returns empty time-series data (follow-up feature).
 pub async fn get_server_timeseries(
     _auth: AuthClaims,
-    Query(params): Query<TimeseriesQuery>,
+    Query(_params): Query<TimeseriesQuery>,
 ) -> Json<Vec<TimeSeriesPoint>> {
-    debug!(range = %params.range, "timeseries requested (control plane — no data)");
+    Json(Vec::new())
+}
+
+/// GET /api/timeseries/{mnemonic} — returns empty time-series data (follow-up feature).
+pub async fn get_did_timeseries(
+    _auth: AuthClaims,
+    Path(_mnemonic): Path<String>,
+    Query(_params): Query<TimeseriesQuery>,
+) -> Json<Vec<TimeSeriesPoint>> {
     Json(Vec::new())
 }
 
@@ -442,16 +431,12 @@ pub async fn get_services_overview(
 
     let instances = registry::list_instances(&state.registry_ks).await?;
 
-    // Snapshot stats under the lock, then release immediately
-    let stats_snapshot: std::collections::HashMap<String, affinidi_webvh_common::StatsSyncPayload> =
-        state.server_stats.read().map(|m| m.clone()).unwrap_or_default();
+    // Get aggregate stats from the collector (O(1), lock-free)
+    let agg = state.stats_collector.get_aggregate();
 
     let mut active = 0u64;
     let mut degraded = 0u64;
     let mut unreachable = 0u64;
-    let mut agg_dids = 0u64;
-    let mut agg_resolves = 0u64;
-    let mut agg_updates = 0u64;
 
     let mut services: Vec<ServiceInfo> = Vec::with_capacity(instances.len());
 
@@ -464,19 +449,8 @@ pub async fn get_services_overview(
 
         let service_did = inst.metadata.get("did").and_then(|v| v.as_str()).map(String::from);
 
-        let stats = service_did.as_deref().and_then(|did| {
-            let p = stats_snapshot.get(did)?;
-            agg_dids += p.total_dids;
-            agg_resolves += p.total_resolves;
-            agg_updates += p.total_updates;
-            Some(ServiceStats {
-                total_dids: p.total_dids,
-                total_resolves: p.total_resolves,
-                total_updates: p.total_updates,
-                last_resolved_at: p.last_resolved_at,
-                last_updated_at: p.last_updated_at,
-            })
-        });
+        // Per-service stats not available individually in the new model
+        let stats: Option<ServiceStats> = None;
 
         let status_str = format!("{:?}", inst.status).to_lowercase();
 
@@ -509,9 +483,9 @@ pub async fn get_services_overview(
             active_services: active,
             degraded_services: degraded,
             unreachable_services: unreachable,
-            total_dids: agg_dids.max(local_dids),
-            total_resolves: agg_resolves,
-            total_updates: agg_updates,
+            total_dids: agg.total_dids.max(local_dids),
+            total_resolves: agg.total_resolves,
+            total_updates: agg.total_updates,
         },
         services,
     }))

@@ -34,7 +34,6 @@ pub struct AppState {
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub dids_ks: KeyspaceHandle,
-    pub stats_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
@@ -84,8 +83,6 @@ pub async fn run(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
-    let stats_ks = store.keyspace("stats")?;
-
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
     let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
 
@@ -112,36 +109,18 @@ pub async fn run(
     // Gather storage thread inputs before moving config into Arc
     let storage_sessions_ks = sessions_ks.clone();
     let storage_dids_ks = dids_ks.clone();
-    let storage_stats_ks = stats_ks.clone();
     let storage_auth_config = config.auth.clone();
     let has_auth = jwt_keys.is_some();
 
     let upload_body_limit = config.limits.upload_body_limit;
     let stats_config = config.stats.clone();
 
-    // Initialize in-memory stats collector and seed from storage
+    // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
         let collector = stats::StatsCollector::new();
-        // Load existing aggregate from storage to seed the collector
-        match stats::load_aggregate(&storage_stats_ks).await {
-            Ok(agg) => {
-                let total_dids = storage_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
-                collector.seed_aggregate(&stats::StatsAggregate {
-                    total_dids,
-                    total_resolves: agg.total_resolves,
-                    total_updates: agg.total_updates,
-                    last_resolved_at: agg.last_resolved_at,
-                    last_updated_at: agg.last_updated_at,
-                });
-                info!(
-                    total_dids,
-                    total_resolves = agg.total_resolves,
-                    total_updates = agg.total_updates,
-                    "stats collector seeded from storage"
-                );
-            }
-            Err(e) => warn!("failed to seed stats collector: {e}"),
-        }
+        let total_dids = storage_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
+        collector.set_total_dids(total_dids);
+        info!(total_dids, "stats collector initialized");
         Arc::new(collector)
     };
 
@@ -150,7 +129,6 @@ pub async fn run(
         sessions_ks,
         acl_ks,
         dids_ks,
-        stats_ks,
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
@@ -235,7 +213,6 @@ pub async fn run(
                 store,
                 storage_sessions_ks,
                 storage_dids_ks,
-                storage_stats_ks,
                 storage_auth_config,
                 has_auth,
                 storage_collector,
@@ -464,7 +441,6 @@ fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
-    stats_ks: KeyspaceHandle,
     auth_config: AuthConfig,
     has_auth: bool,
     collector: Arc<stats::StatsCollector>,
@@ -481,7 +457,6 @@ fn run_storage_thread(
 
     rt.block_on(async {
         info!(
-            flush_interval = stats_config.flush_interval_secs,
             sync_interval = stats_config.sync_interval_secs,
             "storage thread started"
         );
@@ -489,19 +464,16 @@ fn run_storage_thread(
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let did_ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-        let flush_interval = Duration::from_secs(stats_config.flush_interval_secs.max(1));
         let sync_enabled = stats_config.sync_interval_secs > 0 && control_url.is_some();
         let sync_interval = Duration::from_secs(stats_config.sync_interval_secs.max(1));
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut did_timer = tokio::time::interval(did_interval);
-        let mut flush_timer = tokio::time::interval(flush_interval);
         let mut sync_timer = tokio::time::interval(sync_interval);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
         session_timer.tick().await;
         did_timer.tick().await;
-        flush_timer.tick().await;
         sync_timer.tick().await;
 
         loop {
@@ -512,22 +484,12 @@ fn run_storage_thread(
                     }
                 }
                 _ = did_timer.tick() => {
-                    match cleanup_empty_dids(&dids_ks, &stats_ks, did_ttl_seconds).await {
+                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
                         Ok(0) => {}
                         Ok(n) => info!(count = n, "cleaned up empty DID records"),
                         Err(e) => warn!("DID cleanup error: {e}"),
                     }
-                    match stats::cleanup_old_timeseries(&stats_ks).await {
-                        Ok(0) => {}
-                        Ok(n) => info!(count = n, "cleaned up old time-series buckets"),
-                        Err(e) => warn!("time-series cleanup error: {e}"),
-                    }
-                }
-                _ = flush_timer.tick() => {
-                    if let Err(e) = stats::flush_to_storage(&collector, &stats_ks, &store).await {
-                        warn!("stats flush error: {e}");
-                    }
-                    // Update total DID count in collector after flush
+                    // Update total DID count in collector
                     if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
                         collector.set_total_dids(dids.len() as u64);
                     }
@@ -542,11 +504,6 @@ fn run_storage_thread(
                     break;
                 }
             }
-        }
-
-        // Final flush before shutdown
-        if let Err(e) = stats::flush_to_storage(&collector, &stats_ks, &store).await {
-            warn!("final stats flush error: {e}");
         }
 
         // Persist store before closing

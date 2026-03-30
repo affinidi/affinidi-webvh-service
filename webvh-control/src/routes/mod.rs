@@ -66,7 +66,9 @@ pub fn router() -> Router<AppState> {
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Stats & time-series
         .route("/stats", get(did_manage::get_server_stats))
+        .route("/stats/{*mnemonic}", get(did_manage::get_did_stats))
         .route("/timeseries", get(did_manage::get_server_timeseries))
+        .route("/timeseries/{*mnemonic}", get(did_manage::get_did_timeseries))
         // Service overview (topology + health + stats)
         .route("/services/overview", get(did_manage::get_services_overview))
         // Config

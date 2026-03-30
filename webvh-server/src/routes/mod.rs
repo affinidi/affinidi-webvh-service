@@ -41,12 +41,9 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Services (authenticated, any role)
         .route("/services", get(config::get_services))
-        // Stats (authenticated)
+        // Stats (authenticated — in-memory only, authoritative stats on control plane)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
-        // Time-series (authenticated)
-        .route("/timeseries", get(stats::get_server_timeseries))
-        .route("/timeseries/{*mnemonic}", get(stats::get_did_timeseries))
         // DIDComm protocol endpoint
         .route("/didcomm", post(didcomm::handle))
         // Server config (admin only)

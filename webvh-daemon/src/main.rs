@@ -202,8 +202,6 @@ async fn build_server(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
-    let stats_ks = store.keyspace("stats")?;
-
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
     let signing_key_bytes = decode_signing_key(secrets);
@@ -213,7 +211,6 @@ async fn build_server(
         sessions_ks,
         acl_ks,
         dids_ks,
-        stats_ks,
         config: Arc::new(server_config),
         did_resolver,
         secrets_resolver,
@@ -332,7 +329,12 @@ async fn build_control(
         http_client: reqwest::Client::new(),
         atm: None,
         atm_profile: None,
-        server_stats: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        stats_collector: {
+            let collector = affinidi_webvh_common::server::stats_collector::StatsCollector::new();
+            // Daemon mode: basic init, no seeding from store
+            std::sync::Arc::new(collector)
+        },
+        stats_ks: store.keyspace("stats").expect("failed to open stats keyspace"),
     };
 
     let router = affinidi_webvh_control::routes::router().with_state(state);

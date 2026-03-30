@@ -14,7 +14,7 @@ use crate::mnemonic::{
     generate_unique_mnemonic, is_path_available, validate_custom_path, validate_mnemonic,
 };
 use crate::server::AppState;
-use crate::stats;
+
 use crate::store::KeyspaceHandle;
 use affinidi_webvh_common::DidListEntry;
 use tracing::{debug, info, warn};
@@ -363,7 +363,7 @@ pub async fn upload_witness(
 pub struct DidInfoResult {
     pub record: DidRecord,
     pub log_metadata: Option<LogMetadata>,
-    pub stats: stats::DidStats,
+    pub stats: affinidi_webvh_common::DidStats,
     pub did_url: String,
 }
 
@@ -384,7 +384,7 @@ pub async fn get_did_info(
         None => None,
     };
 
-    let did_stats = stats::get_stats(&state.stats_ks, mnemonic).await?;
+    let did_stats = affinidi_webvh_common::DidStats::default();
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID info retrieved");
@@ -448,7 +448,7 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            let did_stats = stats::get_stats(&state.stats_ks, &mnemonic).await?;
+            let did_stats = affinidi_webvh_common::DidStats::default();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -480,7 +480,7 @@ async fn list_all_dids(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let did_stats = stats::get_stats(&state.stats_ks, &record.mnemonic).await?;
+        let did_stats = affinidi_webvh_common::DidStats::default();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -521,10 +521,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
-    batch.remove(&state.stats_ks, format!("stats:{mnemonic}"));
     batch.commit().await?;
-
-    let _ = stats::delete_timeseries(&state.stats_ks, mnemonic).await;
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
@@ -639,7 +636,6 @@ pub async fn get_raw_log(
 /// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
-    stats_ks: &KeyspaceHandle,
     ttl_seconds: u64,
 ) -> Result<u64, AppError> {
     let now = now_epoch();
@@ -660,8 +656,6 @@ pub async fn cleanup_empty_dids(
             dids_ks
                 .remove(owner_key(&record.owner, &record.mnemonic))
                 .await?;
-            stats::delete_stats(stats_ks, &record.mnemonic).await?;
-            let _ = stats::delete_timeseries(stats_ks, &record.mnemonic).await;
             removed += 1;
         }
     }
