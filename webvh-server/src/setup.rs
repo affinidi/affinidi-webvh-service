@@ -364,7 +364,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 }
 
 /// Update `server_did` in the config file without clobbering other sections.
-fn update_server_did_in_config(
+pub fn update_server_did_in_config(
     config_path: &PathBuf,
     server_did: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {

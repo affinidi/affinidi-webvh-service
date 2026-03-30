@@ -86,8 +86,8 @@ pub async fn run(
     let dids_ks = store.keyspace("dids")?;
     let stats_ks = store.keyspace("stats")?;
 
-    // Auto-bootstrap the root DID if public_url is set and no .well-known exists yet
-    let config = auto_bootstrap_root_did(config, &store, &dids_ks, &secrets).await;
+    // Auto-bootstrap DIDs if public_url is set and they don't exist yet
+    let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
@@ -635,7 +635,33 @@ async fn init_didcomm_auth(
 // Auto-bootstrap
 // ---------------------------------------------------------------------------
 
-async fn auto_bootstrap_root_did(
+/// Extract the mnemonic (path) from a did:webvh DID string.
+///
+/// `did:webvh:{SCID}:{host}:{path:components}` → `path/components`
+/// Colons in the path portion are converted back to `/`.
+fn mnemonic_from_did(did: &str) -> Option<String> {
+    // did:webvh:{SCID}:{host}:{path...}
+    let rest = did.strip_prefix("did:webvh:")?;
+    let parts: Vec<&str> = rest.splitn(4, ':').collect();
+    // parts[0] = SCID, parts[1] = host (possibly with %3A port), parts[2..] = path
+    if parts.len() < 3 {
+        return None;
+    }
+    // The host may contain %3A (encoded port), which counts as one segment.
+    // After SCID and host, the remaining colon-separated segments form the path.
+    // But the host itself may have been split if it didn't contain %3A.
+    // Re-parse: skip SCID, skip host (which may contain %3A), rest is path.
+    let after_scid = rest.split_once(':')?.1; // "{host}:{path...}"
+
+    // Host is everything up to the first segment that doesn't look like a host
+    // Simpler: host is the first segment after SCID (it contains the domain)
+    let after_host = after_scid.split_once(':')?.1; // "{path...}"
+
+    let mnemonic = after_host.replace(':', "/");
+    Some(mnemonic)
+}
+
+async fn auto_bootstrap_dids(
     mut config: AppConfig,
     store: &Store,
     dids_ks: &KeyspaceHandle,
@@ -648,15 +674,6 @@ async fn auto_bootstrap_root_did(
         None => return config,
     };
 
-    match bootstrap::root_did_exists(dids_ks).await {
-        Ok(true) => return config,
-        Ok(false) => {}
-        Err(e) => {
-            warn!("auto-bootstrap: failed to check root DID: {e}");
-            return config;
-        }
-    }
-
     let signing_secret = match Secret::from_multibase(&secrets.signing_key, None) {
         Ok(s) => s,
         Err(e) => {
@@ -665,17 +682,70 @@ async fn auto_bootstrap_root_did(
         }
     };
 
-    match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, &public_url).await {
-        Ok(result) => {
-            info!(did = %result.did_id, "auto-bootstrapped root DID");
-            if config.server_did.is_none() {
-                info!("setting server_did to bootstrapped DID");
-                config.server_did = Some(result.did_id);
+    // Bootstrap root DID (.well-known) if it doesn't exist
+    match bootstrap::root_did_exists(dids_ks).await {
+        Ok(false) => {
+            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, &public_url).await
+            {
+                Ok(result) => {
+                    info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");
+                    if config.server_did.is_none() {
+                        info!("setting server_did to bootstrapped DID");
+                        config.server_did = Some(result.did_id);
+                    }
+                }
+                Err(e) => warn!("auto-bootstrap: failed to create root DID: {e}"),
             }
         }
-        Err(e) => {
-            warn!("auto-bootstrap: failed to create root DID: {e}");
+        Ok(true) => {}
+        Err(e) => warn!("auto-bootstrap: failed to check root DID: {e}"),
+    }
+
+    // Verify server_did exists in store (if configured and not root)
+    if let Some(ref server_did) = config.server_did {
+        if let Some(mnemonic) = mnemonic_from_did(server_did) {
+            if mnemonic != ".well-known" {
+                let exists = dids_ks
+                    .contains_key(format!("did:{mnemonic}"))
+                    .await
+                    .unwrap_or(false);
+                if exists {
+                    info!(path = %mnemonic, "server DID loaded from store");
+                } else {
+                    error!(
+                        did = %server_did,
+                        path = %mnemonic,
+                        "server DID not found in store — DID resolution will fail"
+                    );
+                    error!(
+                        "  To create it, run:  webvh-server bootstrap-did --path {mnemonic}"
+                    );
+                    error!(
+                        "  Then update server_did in config.toml with the new DID"
+                    );
+                }
+            }
         }
+    }
+
+    // Log all DIDs present in the store
+    match dids_ks.prefix_iter_raw("did:").await {
+        Ok(entries) => {
+            let count = entries.len();
+            if count == 0 {
+                warn!("no DIDs in store — run `webvh-server bootstrap-did` to create one");
+            } else {
+                info!(count, "DIDs in store:");
+                for (key, _) in &entries {
+                    let mnemonic = String::from_utf8_lossy(key)
+                        .strip_prefix("did:")
+                        .unwrap_or("?")
+                        .to_string();
+                    info!(path = %mnemonic, "  DID loaded");
+                }
+            }
+        }
+        Err(e) => warn!("failed to list DIDs: {e}"),
     }
 
     config
@@ -716,5 +786,34 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => info!("received SIGINT"),
         () = terminate => info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mnemonic_from_did_simple() {
+        let did = "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
+        assert_eq!(mnemonic_from_did(did).unwrap(), "webvh/server1");
+    }
+
+    #[test]
+    fn mnemonic_from_did_single_path() {
+        let did = "did:webvh:QmABC:example.com:my-did";
+        assert_eq!(mnemonic_from_did(did).unwrap(), "my-did");
+    }
+
+    #[test]
+    fn mnemonic_from_did_deep_path() {
+        let did = "did:webvh:QmABC:example.com:people:staff:glenn";
+        assert_eq!(mnemonic_from_did(did).unwrap(), "people/staff/glenn");
+    }
+
+    #[test]
+    fn mnemonic_from_did_invalid() {
+        assert!(mnemonic_from_did("did:web:example.com").is_none());
+        assert!(mnemonic_from_did("not-a-did").is_none());
     }
 }

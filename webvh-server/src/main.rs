@@ -68,6 +68,12 @@ enum Command {
         #[arg(long)]
         did_witness: Option<PathBuf>,
     },
+    /// Recreate a DID at a given path (deletes existing, creates new, updates config)
+    RecreateDid {
+        /// DID path/mnemonic to recreate (e.g. "webvh/server1")
+        #[arg(long)]
+        path: String,
+    },
     /// Bootstrap a DID for this server (defaults to root .well-known)
     BootstrapDid {
         /// DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth")
@@ -150,6 +156,12 @@ async fn main() {
             did_witness,
         }) => {
             if let Err(e) = run_load_did(cli.config, path, did_log, did_witness).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RecreateDid { path }) => {
+            if let Err(e) = run_recreate_did(cli.config, path).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -345,6 +357,79 @@ async fn run_load_did(
     eprintln!("  DID:  {}", result.did_id);
     eprintln!("  SCID: {}", result.scid);
     eprintln!("  Path: {path}/did.jsonl");
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_recreate_did(
+    config_path: Option<PathBuf>,
+    mnemonic: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let config = AppConfig::load(config_path)?;
+    let config_file = config.config_path.clone();
+
+    let public_url = config
+        .public_url
+        .as_deref()
+        .ok_or("public_url must be set in config")?;
+
+    let store = store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    // Delete existing DID at this path if it exists
+    let did_key = affinidi_webvh_server::did_ops::did_key(&mnemonic);
+    if dids_ks.contains_key(did_key.clone()).await? {
+        // Remove the DID record and its content
+        dids_ks.remove(did_key).await?;
+        dids_ks
+            .remove(affinidi_webvh_server::did_ops::content_log_key(&mnemonic))
+            .await?;
+        dids_ks
+            .remove(affinidi_webvh_server::did_ops::content_witness_key(&mnemonic))
+            .await?;
+        // Remove owner index entry (owner is "system" for bootstrapped DIDs)
+        dids_ks
+            .remove(affinidi_webvh_server::did_ops::owner_key("system", &mnemonic))
+            .await?;
+        eprintln!("  Removed existing DID at path '{mnemonic}'");
+    }
+
+    // Create new DID
+    let secret_store = secret_store::create_secret_store(&config)?;
+    let secrets = secret_store
+        .get()
+        .await?
+        .ok_or("no secrets found — run `webvh-server setup` first")?;
+
+    let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
+        .map_err(|e| format!("invalid signing_key: {e}"))?;
+
+    let result =
+        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, public_url, &mnemonic)
+            .await?;
+
+    store.persist().await?;
+
+    // Update server_did in config file
+    setup::update_server_did_in_config(&config_file, &result.did_id)?;
+
+    let url_path = if mnemonic == ".well-known" {
+        ".well-known/did.jsonl".to_string()
+    } else {
+        format!("{mnemonic}/did.jsonl")
+    };
+
+    eprintln!();
+    eprintln!("  DID recreated at path '{mnemonic}'!");
+    eprintln!();
+    eprintln!("  DID:   {}", result.did_id);
+    eprintln!("  SCID:  {}", result.scid);
+    eprintln!("  JSONL: {public_url}/{url_path}");
+    eprintln!();
+    eprintln!("  config.toml updated with new server_did.");
     eprintln!();
 
     Ok(())
