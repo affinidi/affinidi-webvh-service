@@ -165,24 +165,28 @@ pub async fn run(
         stats_collector: Some(stats_collector.clone()),
     };
 
-    // Register with control plane if configured (DIDComm auth)
-    if let Some(control_url) = &state.config.control_url {
-        if let Some(ref server_did) = state.config.server_did {
+    // Register with control plane if configured (DIDComm auth) — runs in background with retries
+    if let Some(control_url) = state.config.control_url.clone() {
+        if let Some(server_did) = state.config.server_did.clone() {
             use affinidi_tdk::secrets_resolver::secrets::Secret;
             let kid = format!("{server_did}#key-0");
             match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
                 Ok(signing_secret) => {
-                    let public_url = state.config.public_url.as_deref().unwrap_or_default();
-                    control_register::register_with_control(
-                        control_url,
-                        server_did,
-                        &signing_secret,
-                        public_url,
-                        None,
-                        &state.dids_ks,
-                        &state.store,
-                    )
-                    .await;
+                    let public_url = state.config.public_url.clone().unwrap_or_default();
+                    let dids_ks = state.dids_ks.clone();
+                    let store = state.store.clone();
+                    tokio::spawn(async move {
+                        control_register::register_with_control_retry(
+                            &control_url,
+                            &server_did,
+                            &signing_secret,
+                            &public_url,
+                            None,
+                            &dids_ks,
+                            &store,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => warn!("cannot register with control: {e}"),
             }

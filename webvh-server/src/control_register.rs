@@ -11,15 +11,12 @@ use tracing::{info, warn};
 use crate::did_ops::{DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl};
 use crate::store::{KeyspaceHandle, Store};
 
-/// Register this server instance with the control plane via DIDComm auth.
+/// Register with the control plane, retrying with exponential backoff.
 ///
-/// 1. Authenticates with the control plane using DIDComm challenge-response
-/// 2. Collects preloaded (system-owned) DIDs from the store
-/// 3. Sends registration request with DID sync data
-/// 4. Applies any DID updates received from the control plane
-///
-/// All failures are logged as warnings — registration is never fatal.
-pub async fn register_with_control(
+/// Keeps retrying until registration succeeds. Backoff starts at 5s and
+/// caps at 60s. Designed to run as a background task so the server can
+/// start serving while waiting for the control plane to become available.
+pub async fn register_with_control_retry(
     control_url: &str,
     server_did: &str,
     signing_secret: &Secret,
@@ -28,6 +25,50 @@ pub async fn register_with_control(
     dids_ks: &KeyspaceHandle,
     store: &Store,
 ) {
+    let mut backoff = 5u64;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        if register_with_control(
+            control_url,
+            server_did,
+            signing_secret,
+            public_url,
+            label,
+            dids_ks,
+            store,
+        )
+        .await
+        {
+            return;
+        }
+        info!(
+            attempt,
+            backoff_secs = backoff,
+            "retrying control plane registration"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(60);
+    }
+}
+
+/// Register this server instance with the control plane via DIDComm auth.
+///
+/// 1. Authenticates with the control plane using DIDComm challenge-response
+/// 2. Collects preloaded (system-owned) DIDs from the store
+/// 3. Sends registration request with DID sync data
+/// 4. Applies any DID updates received from the control plane
+///
+/// Returns `true` on success, `false` on failure (logged as warnings).
+pub async fn register_with_control(
+    control_url: &str,
+    server_did: &str,
+    signing_secret: &Secret,
+    public_url: &str,
+    label: Option<&str>,
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+) -> bool {
     // 1. Authenticate with control plane via DIDComm
     let mut client = ControlClient::new(control_url);
     if let Err(e) = client.authenticate(server_did, signing_secret).await {
@@ -36,7 +77,7 @@ pub async fn register_with_control(
             error = %e,
             "failed to authenticate with control plane"
         );
-        return;
+        return false;
     }
 
     // 2. Collect preloaded DIDs (system-owned)
@@ -66,6 +107,7 @@ pub async fn register_with_control(
             if !resp.did_updates.is_empty() {
                 apply_did_updates(dids_ks, store, &resp.did_updates).await;
             }
+            true
         }
         Err(e) => {
             warn!(
@@ -73,6 +115,7 @@ pub async fn register_with_control(
                 error = %e,
                 "control plane registration failed"
             );
+            false
         }
     }
 }
