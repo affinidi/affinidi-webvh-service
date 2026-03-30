@@ -169,7 +169,8 @@ pub async fn run(
     if let Some(control_url) = &state.config.control_url {
         if let Some(ref server_did) = state.config.server_did {
             use affinidi_tdk::secrets_resolver::secrets::Secret;
-            match Secret::from_multibase(&secrets.signing_key, None) {
+            let kid = format!("{server_did}#key-0");
+            match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
                 Ok(signing_secret) => {
                     let public_url = state.config.public_url.as_deref().unwrap_or_default();
                     control_register::register_with_control(
