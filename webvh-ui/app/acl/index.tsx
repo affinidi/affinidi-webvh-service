@@ -23,6 +23,7 @@ import type { AclEntry, DidRecord } from "../../lib/api";
 
 interface EditState {
   did: string;
+  role: "admin" | "owner" | "service";
   label: string;
   maxTotalSize: string;
   maxDidCount: string;
@@ -57,6 +58,7 @@ const AclEntryRow = memo(function AclEntryRow({
   onCancelEdit: () => void;
   onSave: (did: string) => void;
   onDelete: (did: string) => void;
+  onChangeRole: (v: "admin" | "owner" | "service") => void;
   onChangeLabel: (v: string) => void;
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
@@ -76,6 +78,7 @@ const AclEntryRow = memo(function AclEntryRow({
             style={[
               styles.roleBadge,
               item.role === "admin" && styles.adminBadge,
+              item.role === "service" && styles.serviceBadge,
             ]}
           >
             <Text style={styles.roleBadgeText}>{item.role}</Text>
@@ -90,6 +93,27 @@ const AclEntryRow = memo(function AclEntryRow({
 
         {isEditing ? (
           <View style={styles.editFields}>
+            <View style={styles.roleRow}>
+              {(["owner", "admin", "service"] as const).map((r) => (
+                <Pressable
+                  key={r}
+                  style={[
+                    styles.roleButton,
+                    editing.role === r && styles.roleActive,
+                  ]}
+                  onPress={() => onChangeRole(r)}
+                >
+                  <Text
+                    style={[
+                      styles.roleText,
+                      editing.role === r && styles.roleTextActive,
+                    ]}
+                  >
+                    {r.charAt(0).toUpperCase() + r.slice(1)}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
             <TextInput
               style={styles.editInput}
               placeholder="Label"
@@ -184,7 +208,7 @@ export default function AclManagement() {
 
   // New entry form
   const [newDid, setNewDid] = useState("");
-  const [newRole, setNewRole] = useState<"admin" | "owner">("owner");
+  const [newRole, setNewRole] = useState<"admin" | "owner" | "service">("owner");
   const [newLabel, setNewLabel] = useState("");
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
@@ -296,6 +320,7 @@ export default function AclManagement() {
   const startEditing = useCallback((entry: AclEntry) => {
     setEditing({
       did: entry.did,
+      role: entry.role,
       label: entry.label ?? "",
       maxTotalSize:
         entry.max_total_size != null ? bytesToMb(entry.max_total_size) : "",
@@ -308,6 +333,11 @@ export default function AclManagement() {
     setEditing(null);
   }, []);
 
+  const onChangeRole = useCallback(
+    (v: "admin" | "owner" | "service") =>
+      setEditing((prev) => (prev ? { ...prev, role: v } : prev)),
+    [],
+  );
   const onChangeLabel = useCallback(
     (v: string) => setEditing((prev) => (prev ? { ...prev, label: v } : prev)),
     [],
@@ -329,6 +359,7 @@ export default function AclManagement() {
       setSaving(true);
       try {
         await api.updateAcl(did, {
+          role: editing.role,
           label: editing.label.trim() || null,
           maxTotalSize: parseMbToBytes(editing.maxTotalSize),
           maxDidCount: parseOptionalInt(editing.maxDidCount),
@@ -369,6 +400,7 @@ export default function AclManagement() {
       onCancelEdit={cancelEditing}
       onSave={handleSave}
       onDelete={handleDelete}
+      onChangeRole={onChangeRole}
       onChangeLabel={onChangeLabel}
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
@@ -392,38 +424,25 @@ export default function AclManagement() {
           autoCorrect={false}
         />
         <View style={styles.roleRow}>
-          <Pressable
-            style={[
-              styles.roleButton,
-              newRole === "owner" && styles.roleActive,
-            ]}
-            onPress={() => setNewRole("owner")}
-          >
-            <Text
+          {(["owner", "admin", "service"] as const).map((r) => (
+            <Pressable
+              key={r}
               style={[
-                styles.roleText,
-                newRole === "owner" && styles.roleTextActive,
+                styles.roleButton,
+                newRole === r && styles.roleActive,
               ]}
+              onPress={() => setNewRole(r)}
             >
-              Owner
-            </Text>
-          </Pressable>
-          <Pressable
-            style={[
-              styles.roleButton,
-              newRole === "admin" && styles.roleActive,
-            ]}
-            onPress={() => setNewRole("admin")}
-          >
-            <Text
-              style={[
-                styles.roleText,
-                newRole === "admin" && styles.roleTextActive,
-              ]}
-            >
-              Admin
-            </Text>
-          </Pressable>
+              <Text
+                style={[
+                  styles.roleText,
+                  newRole === r && styles.roleTextActive,
+                ]}
+              >
+                {r.charAt(0).toUpperCase() + r.slice(1)}
+              </Text>
+            </Pressable>
+          ))}
         </View>
         <TextInput
           style={styles.input}
@@ -635,6 +654,9 @@ const styles = StyleSheet.create({
   },
   adminBadge: {
     backgroundColor: "rgba(59, 113, 255, 0.15)",
+  },
+  serviceBadge: {
+    backgroundColor: "rgba(168, 85, 247, 0.15)",
   },
   roleBadgeText: {
     fontSize: 11,

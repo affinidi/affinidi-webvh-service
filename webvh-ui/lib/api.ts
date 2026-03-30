@@ -74,7 +74,7 @@ export interface CheckNameResponse {
 
 export interface AclEntry {
   did: string;
-  role: "admin" | "owner";
+  role: "admin" | "owner" | "service";
   label: string | null;
   created_at: number;
   max_total_size: number | null;
@@ -367,7 +367,7 @@ export const api = {
 
   createAcl: (
     did: string,
-    role: "admin" | "owner",
+    role: "admin" | "owner" | "service",
     opts?: { label?: string; maxTotalSize?: number; maxDidCount?: number },
   ) =>
     request<AclEntry>("/api/acl", {
@@ -385,6 +385,7 @@ export const api = {
   updateAcl: (
     did: string,
     updates: {
+      role?: "admin" | "owner" | "service";
       label?: string | null;
       maxTotalSize?: number | null;
       maxDidCount?: number | null;
@@ -394,6 +395,7 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        role: updates.role,
         label: updates.label,
         max_total_size: updates.maxTotalSize,
         max_did_count: updates.maxDidCount,

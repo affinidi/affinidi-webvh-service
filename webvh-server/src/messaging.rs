@@ -212,9 +212,9 @@ async fn do_sync_update(
     use affinidi_webvh_common::DidSyncUpdate;
 
     let role = check_acl(&state.acl_ks, sender).await.map_err(|e| e.to_string())?;
-    if role != Role::Admin {
-        warn!(did = sender, "sync message rejected: sender is not admin");
-        return Ok(problem_report("e.p.did.unauthorized", "only admin can send sync messages"));
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(did = sender, "sync message rejected: requires admin or service role");
+        return Ok(problem_report("e.p.did.unauthorized", "admin or service role required for sync messages"));
     }
 
     let mnemonic = msg.body.get("mnemonic").and_then(|v| v.as_str())
@@ -260,9 +260,9 @@ async fn do_sync_delete(
     msg: &Message,
 ) -> Result<(String, Value), String> {
     let role = check_acl(&state.acl_ks, sender).await.map_err(|e| e.to_string())?;
-    if role != Role::Admin {
-        warn!(did = sender, "sync message rejected: sender is not admin");
-        return Ok(problem_report("e.p.did.unauthorized", "only admin can send sync messages"));
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(did = sender, "sync message rejected: requires admin or service role");
+        return Ok(problem_report("e.p.did.unauthorized", "admin or service role required for sync messages"));
     }
 
     let mnemonic = msg.body.get("mnemonic").and_then(|v| v.as_str())

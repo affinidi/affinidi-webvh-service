@@ -196,7 +196,7 @@ async fn run_add_acl(
     use affinidi_webvh_server::auth::session::now_epoch;
 
     let role_parsed = Role::from_str(&role)
-        .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
+        .map_err(|_| format!("invalid role '{role}': use 'admin', 'owner', or 'service'"))?;
 
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
