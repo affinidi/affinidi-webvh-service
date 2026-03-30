@@ -2,13 +2,14 @@
 //!
 //! Used to cache DID document content (`did.jsonl`) to reduce store lookups
 //! on the hot DID resolution path. Entries are evicted on read after TTL expires.
+//! Uses `Arc<Vec<u8>>` to avoid cloning large documents on cache hits.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 struct CacheEntry {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     inserted_at: Instant,
 }
 
@@ -17,6 +18,9 @@ struct CacheEntry {
 /// Uses `RwLock<HashMap>` — reads only acquire a read lock (no contention
 /// between concurrent resolves). Writes acquire a write lock (infrequent:
 /// only on cache miss or invalidation).
+///
+/// Data is stored behind `Arc` so cache hits return a cheap reference-counted
+/// pointer instead of cloning the entire document.
 pub struct ContentCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
@@ -32,11 +36,12 @@ impl ContentCache {
     }
 
     /// Get cached content if it exists and hasn't expired.
-    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+    /// Returns an `Arc<Vec<u8>>` — cheap clone (reference count bump only).
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         let entries = self.entries.read().ok()?;
         let entry = entries.get(key)?;
         if entry.inserted_at.elapsed() < self.ttl {
-            Some(entry.data.clone())
+            Some(entry.data.clone()) // Arc clone = atomic ref count increment
         } else {
             None // Expired — caller should fetch from store and re-insert
         }
@@ -48,7 +53,7 @@ impl ContentCache {
             entries.insert(
                 key,
                 CacheEntry {
-                    data,
+                    data: Arc::new(data),
                     inserted_at: Instant::now(),
                 },
             );

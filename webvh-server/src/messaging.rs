@@ -398,7 +398,7 @@ async fn dispatch_did_op(
         }
         MSG_LIST_REQUEST => {
             let requested_owner = msg.body.get("owner").and_then(|v| v.as_str());
-            let entries = did_ops::list_dids(auth, state, requested_owner).await?;
+            let entries = did_ops::list_dids(auth, state, requested_owner, None, None).await?;
             let entries_json: Vec<Value> = entries
                 .into_iter()
                 .map(|e| {

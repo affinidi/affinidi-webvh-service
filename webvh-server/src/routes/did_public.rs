@@ -29,7 +29,7 @@ async fn serve_content(
         }
     }
 
-    // Check cache first (hot path — read lock only, no I/O)
+    // Check cache first (hot path — read lock only, no I/O, Arc clone only)
     let content = if let Some(cached) = state.did_cache.get(key) {
         cached
     } else {
@@ -39,7 +39,7 @@ async fn serve_content(
             .await?
             .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
         state.did_cache.insert(key.to_string(), data.clone());
-        data
+        std::sync::Arc::new(data)
     };
 
     if track_stats {
@@ -50,7 +50,7 @@ async fn serve_content(
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
+    Ok((StatusCode::OK, [("content-type", content_type)], (*content).clone()).into_response())
 }
 
 

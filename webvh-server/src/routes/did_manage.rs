@@ -278,6 +278,6 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref()).await?;
+    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), None, None).await?;
     Ok(Json(entries))
 }

@@ -422,7 +422,7 @@ async fn handle_list_request(
 ) -> Result<(String, Value), ProtocolError> {
     let requested_owner = msg.body.get("owner").and_then(|v| v.as_str());
 
-    let entries = did_ops::list_dids(auth, state, requested_owner)
+    let entries = did_ops::list_dids(auth, state, requested_owner, None, None)
         .await
         .map_err(map_app_error)?;
 

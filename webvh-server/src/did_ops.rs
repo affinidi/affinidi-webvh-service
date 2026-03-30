@@ -480,6 +480,8 @@ pub async fn list_dids(
     auth: &AuthClaims,
     state: &AppState,
     requested_owner: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<DidListEntry>, AppError> {
     // Admin with no owner filter → return all DIDs across all owners.
     if auth.role == Role::Admin && requested_owner.is_none() {
@@ -514,7 +516,13 @@ pub async fn list_dids(
         }
     }
 
-    info!(did = %auth.did, role = %auth.role, owner = %target_owner, count = entries.len(), "DIDs listed");
+    // Apply pagination
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(1000); // Default max 1000
+    let total = entries.len();
+    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+
+    info!(did = %auth.did, role = %auth.role, owner = %target_owner, total, returned = entries.len(), "DIDs listed");
 
     Ok(entries)
 }
