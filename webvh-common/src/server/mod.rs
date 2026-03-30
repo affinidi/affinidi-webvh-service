@@ -5,6 +5,8 @@ pub mod didcomm_profile;
 pub mod didcomm_unpack;
 pub mod error;
 pub mod health;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod mnemonic;
 pub mod stats_collector;
 #[cfg(feature = "passkey")]

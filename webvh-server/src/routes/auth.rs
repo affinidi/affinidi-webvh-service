@@ -78,7 +78,7 @@ pub async fn challenge(
 
     store_session(&state.sessions_ks, &session).await?;
 
-    info!(did = %session.did, session_id = %session.session_id, "auth challenge issued");
+    info!(audit = true, did = %session.did, session_id = %session.session_id, "auth challenge issued");
 
     Ok(Json(ChallengeResponse {
         session_id,
@@ -182,7 +182,7 @@ pub async fn authenticate(
     )
     .await?;
 
-    info!(did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
+    info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
 
     Ok(Json(AuthenticateResponse {
         session_id: token_resp.session_id,
@@ -257,7 +257,7 @@ pub async fn refresh(
     let access_expires_at = claims.exp;
     let access_token = jwt_keys.encode(&claims)?;
 
-    info!(did = %session.did, role = %role, session_id = %session.session_id, "token refreshed");
+    info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "token refreshed");
 
     Ok(Json(RefreshResponse {
         session_id: session.session_id,

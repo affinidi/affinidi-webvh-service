@@ -92,7 +92,7 @@ pub async fn create_acl(
 
     store_acl_entry(&state.acl_ks, &entry).await?;
 
-    info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
+    info!(audit = true, caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
 }
 

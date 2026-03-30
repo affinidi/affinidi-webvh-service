@@ -14,6 +14,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+metrics = ["server-core", "dep:prometheus"]
 server-core = [
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio",
@@ -78,6 +79,9 @@ bytes = { version = "1", optional = true }
 # passkey / WebAuthn (optional)
 webauthn-rs = { workspace = true, optional = true }
 webauthn-rs-proto = { workspace = true, optional = true }
+
+# Prometheus metrics (optional, behind `metrics` feature)
+prometheus = { version = "0.13", optional = true }
 
 # base64 (needed by firestore/cosmosdb store backends)
 base64 = { workspace = true }

@@ -280,7 +280,7 @@ pub async fn create_did(
     if let Some(ref collector) = state.stats_collector {
         collector.increment_total_dids();
     }
-    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
+    info!(audit = true, did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
 
     Ok(CreateDidResult { mnemonic, did_url })
 }
@@ -583,7 +583,7 @@ pub async fn delete_did(
     if let Some(ref collector) = state.stats_collector {
         collector.decrement_total_dids();
     }
-    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
+    info!(audit = true, did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(DeleteDidResult {
         mnemonic: mnemonic.to_string(),
