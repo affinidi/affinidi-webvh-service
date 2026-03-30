@@ -143,22 +143,22 @@ struct FjallBatch {
 
 impl BatchOps for FjallBatch {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-        // Resolve keyspace eagerly and add directly to the native batch.
-        // keyspace() with default options is a no-op if the keyspace already exists.
-        if let Ok(ks) = self
+        match self
             .db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
         {
-            self.batch.insert(&ks, key, value);
+            Ok(ks) => self.batch.insert(&ks, key, value),
+            Err(e) => tracing::error!(keyspace, error = %e, "batch insert: keyspace lookup failed"),
         }
     }
 
     fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-        if let Ok(ks) = self
+        match self
             .db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
         {
-            self.batch.remove(&ks, key);
+            Ok(ks) => self.batch.remove(&ks, key),
+            Err(e) => tracing::error!(keyspace, error = %e, "batch remove: keyspace lookup failed"),
         }
     }
 

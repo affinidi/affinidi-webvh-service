@@ -486,7 +486,8 @@ fn run_rest_thread(
     shutdown_rx: &mut watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .expect("failed to build REST runtime");
@@ -643,7 +644,7 @@ async fn flush_stats_to_store(
     Ok(())
 }
 
-/// Run health checks against all registered instances.
+/// Run health checks against all registered instances in parallel.
 async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     http: &reqwest::Client,
@@ -651,18 +652,29 @@ async fn run_health_checks(
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
-    for instance in &instances {
-        let status = registry::health_check(http, instance).await;
-        if status != instance.status {
-            info!(
-                instance_id = %instance.instance_id,
-                url = %instance.url,
-                old_status = ?instance.status,
-                new_status = ?status,
-                "instance status changed"
-            );
+    // Run all health checks concurrently
+    let mut handles = Vec::with_capacity(instances.len());
+    for inst in instances {
+        let http = http.clone();
+        handles.push(tokio::spawn(async move {
+            let new_status = registry::health_check(&http, &inst).await;
+            (inst, new_status)
+        }));
+    }
+
+    for handle in handles {
+        if let Ok((inst, new_status)) = handle.await {
+            if new_status != inst.status {
+                info!(
+                    instance_id = %inst.instance_id,
+                    url = %inst.url,
+                    old_status = ?inst.status,
+                    new_status = ?new_status,
+                    "instance status changed"
+                );
+            }
+            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now).await?;
         }
-        registry::update_instance_status(registry_ks, &instance.instance_id, status, now).await?;
     }
     Ok(())
 }

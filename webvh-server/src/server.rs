@@ -392,13 +392,14 @@ fn run_rest_thread(
     shutdown_rx: &mut watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .expect("failed to build REST runtime");
 
     rt.block_on(async {
-        info!("REST thread started");
+        info!("REST thread started (multi-threaded, 4 workers)");
 
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");

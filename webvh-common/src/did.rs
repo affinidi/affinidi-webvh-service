@@ -168,12 +168,15 @@ pub async fn create_log_entry(
 
     let scid = state.scid().to_string();
 
-    let jsonl: String = state
+    let lines: Vec<String> = state
         .log_entries()
         .iter()
-        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|e| {
+            serde_json::to_string(&e.log_entry)
+                .map_err(|e| WebVHError::DIDComm(format!("failed to serialize log entry: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let jsonl = lines.join("\n");
 
     Ok((scid, jsonl))
 }
