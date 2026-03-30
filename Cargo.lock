@@ -8090,7 +8090,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8ceb80e5cb15a686be6a6e68aa0eb1708972417260d60715b17f7069f726f44"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk",
