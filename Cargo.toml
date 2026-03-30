@@ -26,8 +26,8 @@ rust-version = "1.91.0"
 # Affinidi Trust Development Kit
 affinidi-tdk = "0.6"
 affinidi-messaging-didcomm-service = "0.1"
-affinidi-tdk-common = "0.4"
-affinidi-messaging-didcomm = "0.12"
+affinidi-tdk-common = "0.5"
+affinidi-messaging-didcomm = "0.13"
 affinidi-secrets-resolver = "0.5"
 
 # Cancellation token for DIDComm service
@@ -101,10 +101,12 @@ reqwest = { version = "0.13", features = ["json"] }
 anyhow = "1"
 
 # DID WebVH
-didwebvh-rs = "0.3"
+didwebvh-rs = "0.4"
 
 # VTA SDK
-vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = ["session"] }
+vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = [
+  "session",
+] }
 
 # Logging / tracing
 tracing = "0.1"

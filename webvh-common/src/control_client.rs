@@ -1,9 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::didcomm::Message;
+use affinidi_tdk::didcomm::message::pack;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::debug;
@@ -88,16 +87,13 @@ impl ControlClient {
         did: &str,
         secret: &Secret,
     ) -> Result<AuthenticateResponse> {
-        // 1. DID resolver
-        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-            .await
-            .map_err(|e| WebVHError::Resolver(format!("failed to create DID resolver: {e}")))?;
+        // 1. Extract private key bytes for signing
+        let private_key_bytes: [u8; 32] = secret
+            .get_private_bytes()
+            .try_into()
+            .map_err(|_| WebVHError::DIDComm("signing key must be 32 bytes".into()))?;
 
-        // 2. Secrets resolver
-        let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
-        secrets_resolver.insert(secret.clone()).await;
-
-        // 3. Request challenge
+        // 2. Request challenge
         let challenge_resp: ChallengeResponse = self
             .http
             .post(format!("{}/api/auth/challenge", self.server_url))
@@ -113,7 +109,7 @@ impl ControlClient {
 
         debug!(session_id = %challenge_resp.session_id, "challenge received from control plane");
 
-        // 4. Build DIDComm message
+        // 3. Build DIDComm message
         let created_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
@@ -130,13 +126,11 @@ impl ControlClient {
         .created_time(created_time)
         .finalize();
 
-        // 5. Pack signed
-        let (packed, _meta) = msg
-            .pack_signed(&secret.id, &did_resolver, &secrets_resolver)
-            .await
+        // 4. Pack signed
+        let packed = pack::pack_signed(&msg, &secret.id, &private_key_bytes)
             .map_err(|e| WebVHError::DIDComm(format!("failed to pack signed message: {e}")))?;
 
-        // 6. Authenticate
+        // 5. Authenticate
         let auth_resp: AuthenticateResponse = self
             .http
             .post(format!("{}/api/auth/", self.server_url))

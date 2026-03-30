@@ -206,6 +206,7 @@ async fn build_server(
 
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
+    let signing_key_bytes = decode_signing_key(secrets);
 
     let state = AppState {
         store: store.clone(),
@@ -217,6 +218,7 @@ async fn build_server(
         did_resolver,
         secrets_resolver,
         jwt_keys,
+        signing_key_bytes,
         http_client: reqwest::Client::new(),
         stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
     };
@@ -401,6 +403,13 @@ fn init_jwt_keys(
             None
         }
     }
+}
+
+fn decode_signing_key(secrets: &ServerSecrets) -> Option<[u8; 32]> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let secret = Secret::from_multibase(&secrets.signing_key, None).ok()?;
+    secret.get_private_bytes().try_into().ok()
 }
 
 async fn init_didcomm_auth(

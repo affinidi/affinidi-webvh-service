@@ -65,7 +65,7 @@ async fn handle_sync_ack(
         sender = sender,
         mnemonic = mnemonic,
         status = status,
-        msg_type = %message.type_,
+        msg_type = %message.typ,
         "sync acknowledgement received"
     );
     Ok(None)
@@ -254,7 +254,6 @@ pub async fn send_sync_update(
             target_did,
             Some(control_did),
             Some(control_did),
-            None,
         )
         .await?;
 
@@ -298,7 +297,6 @@ pub async fn send_sync_delete(
             target_did,
             Some(control_did),
             Some(control_did),
-            None,
         )
         .await?;
 

@@ -39,6 +39,7 @@ pub struct AppState {
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub signing_key_bytes: Option<[u8; 32]>,
     pub http_client: reqwest::Client,
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
 }
@@ -93,6 +94,9 @@ pub async fn run(
 
     // Initialize JWT keys independently — needed by both DIDComm and passkey auth
     let jwt_keys = init_jwt_keys(&secrets);
+
+    // Extract raw signing key bytes for pack_signed operations
+    let signing_key_bytes = decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
     // Bind TCP listener on the main thread for early port validation (only if REST is enabled)
     let std_listener = if config.features.rest_api {
@@ -151,6 +155,7 @@ pub async fn run(
         did_resolver,
         secrets_resolver,
         jwt_keys,
+        signing_key_bytes,
         http_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))

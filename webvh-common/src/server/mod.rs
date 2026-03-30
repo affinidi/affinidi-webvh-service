@@ -2,6 +2,7 @@ pub mod acl;
 pub mod auth;
 pub mod config;
 pub mod didcomm_profile;
+pub mod didcomm_unpack;
 pub mod error;
 pub mod health;
 pub mod mnemonic;

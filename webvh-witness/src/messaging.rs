@@ -102,12 +102,12 @@ async fn handle_fallback(
     _ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    warn!(type_ = %message.type_, "unknown DIDComm message type");
+    warn!(type_ = %message.typ, "unknown DIDComm message type");
     Ok(Some(DIDCommResponse::new(
         MSG_WITNESS_PROBLEM_REPORT,
         json!({
             "code": "e.p.witness.unknown-type",
-            "comment": format!("unknown message type: {}", message.type_),
+            "comment": format!("unknown message type: {}", message.typ),
         }),
     )
     .thid(message.id.clone())))

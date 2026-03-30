@@ -143,14 +143,14 @@ async fn handle_webvh_message(
                 Ok(result) => result,
                 Err(e) => {
                     let code = map_app_error_code(&e);
-                    warn!(code, msg_type = %message.type_, did = sender, "DIDComm protocol error");
+                    warn!(code, msg_type = %message.typ, did = sender, "DIDComm protocol error");
                     problem_report(code, &e.to_string())
                 }
             }
         }
         Err(e) => {
             let code = map_app_error_code(&e);
-            warn!(code, msg_type = %message.type_, did = sender, "mediator: ACL denied");
+            warn!(code, msg_type = %message.typ, did = sender, "mediator: ACL denied");
             problem_report(code, &e.to_string())
         }
     };
@@ -195,7 +195,7 @@ async fn handle_fallback(
     _ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    warn!(msg_type = %message.type_, "unknown message type — ignoring");
+    warn!(msg_type = %message.typ, "unknown message type — ignoring");
     Ok(None)
 }
 
@@ -303,7 +303,7 @@ async fn dispatch_did_op(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), AppError> {
-    match msg.type_.as_str() {
+    match msg.typ.as_str() {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
             let result = did_ops::create_did(auth, state, path).await?;
