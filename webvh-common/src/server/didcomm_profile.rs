@@ -131,13 +131,8 @@ pub async fn resolve_mediator_did(
     // get_uri() returns JSON-encoded strings (with quotes) for Map endpoints
     let mediator = uri.trim_matches('"').to_string();
 
-    if mediator.starts_with("did:") {
-        info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
-        Some(mediator)
-    } else {
-        warn!(peer = peer_did, uri = %mediator, "DIDCommMessaging service endpoint is not a DID");
-        None
-    }
+    info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
+    Some(mediator)
 }
 
 /// Build a `TDKProfile` suitable for use with `DIDCommService`.
