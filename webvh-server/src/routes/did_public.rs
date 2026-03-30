@@ -29,11 +29,18 @@ async fn serve_content(
         }
     }
 
-    let content = state
-        .dids_ks
-        .get_raw(key)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+    // Check cache first (hot path — read lock only, no I/O)
+    let content = if let Some(cached) = state.did_cache.get(key) {
+        cached
+    } else {
+        let data = state
+            .dids_ks
+            .get_raw(key)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+        state.did_cache.insert(key.to_string(), data.clone());
+        data
+    };
 
     if track_stats {
         if let Some(ref collector) = state.stats_collector {

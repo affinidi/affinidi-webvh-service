@@ -41,6 +41,8 @@ pub struct AppState {
     pub signing_key_bytes: Option<[u8; 32]>,
     pub http_client: reqwest::Client,
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
+    /// In-memory cache for DID content (did.jsonl). TTL-based eviction on read.
+    pub did_cache: Arc<crate::cache::ContentCache>,
 }
 
 impl AppState {
@@ -141,6 +143,7 @@ pub async fn run(
             .build()
             .expect("failed to build HTTP client"),
         stats_collector: Some(stats_collector.clone()),
+        did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
     };
 
     // Log startup configuration
@@ -252,6 +255,7 @@ pub async fn run(
                     let public_url = state.config.public_url.clone().unwrap_or_default();
                     let dids_ks = state.dids_ks.clone();
                     let store_clone = state.store.clone();
+                    let cache = state.did_cache.clone();
                     tokio::spawn(async move {
                         control_register::register_with_control_retry(
                             &control_url,
@@ -261,6 +265,7 @@ pub async fn run(
                             None,
                             &dids_ks,
                             &store_clone,
+                            &cache,
                         )
                         .await;
                     });

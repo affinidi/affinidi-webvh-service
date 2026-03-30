@@ -293,6 +293,9 @@ pub async fn publish_did(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.commit().await?;
 
+    // Invalidate cache for this DID
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
     if let Some(ref collector) = state.stats_collector {
         collector.record_update(mnemonic);
     }
@@ -523,6 +526,8 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
     batch.commit().await?;
 
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(DeleteDidResult {
@@ -591,6 +596,8 @@ pub async fn rollback_did(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.commit().await?;
+
+    state.did_cache.invalidate(&content_log_key(mnemonic));
 
     let log_metadata = Some(extract_log_metadata(&truncated));
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());

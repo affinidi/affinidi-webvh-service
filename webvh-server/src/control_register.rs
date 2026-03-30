@@ -24,6 +24,7 @@ pub async fn register_with_control_retry(
     label: Option<&str>,
     dids_ks: &KeyspaceHandle,
     store: &Store,
+    did_cache: &crate::cache::ContentCache,
 ) {
     let mut backoff = 5u64;
     let mut attempt = 0u32;
@@ -37,6 +38,7 @@ pub async fn register_with_control_retry(
             label,
             dids_ks,
             store,
+            did_cache,
         )
         .await
         {
@@ -68,6 +70,7 @@ pub async fn register_with_control(
     label: Option<&str>,
     dids_ks: &KeyspaceHandle,
     store: &Store,
+    did_cache: &crate::cache::ContentCache,
 ) -> bool {
     // 1. Authenticate with control plane via DIDComm
     let mut client = ControlClient::new(control_url);
@@ -105,7 +108,7 @@ pub async fn register_with_control(
 
             // 4. Apply any DID updates from the control plane
             if !resp.did_updates.is_empty() {
-                apply_did_updates(dids_ks, store, &resp.did_updates).await;
+                apply_did_updates(dids_ks, store, &resp.did_updates, did_cache).await;
             }
             true
         }
@@ -175,9 +178,10 @@ pub async fn apply_did_updates(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     updates: &[DidSyncUpdate],
+    did_cache: &crate::cache::ContentCache,
 ) {
     for update in updates {
-        if let Err(e) = apply_single_update(dids_ks, store, update).await {
+        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache).await {
             warn!(
                 mnemonic = %update.mnemonic,
                 error = %e,
@@ -192,6 +196,7 @@ pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     update: &DidSyncUpdate,
+    did_cache: &crate::cache::ContentCache,
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
@@ -230,6 +235,8 @@ pub async fn apply_single_update(
         );
     }
     batch.commit().await?;
+
+    did_cache.invalidate(&content_log_key(&update.mnemonic));
 
     info!(
         mnemonic = %update.mnemonic,

@@ -218,6 +218,9 @@ async fn build_server(
         signing_key_bytes,
         http_client: reqwest::Client::new(),
         stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
+        did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
+            std::time::Duration::from_secs(300),
+        )),
     };
 
     let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);

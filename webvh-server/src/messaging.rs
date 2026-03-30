@@ -237,7 +237,7 @@ async fn do_sync_update(
         version_count,
     };
 
-    apply_single_update(&state.dids_ks, &state.store, &update)
+    apply_single_update(&state.dids_ks, &state.store, &update, &state.did_cache)
         .await
         .map_err(|e| e.to_string())?;
 
