@@ -406,9 +406,10 @@ async fn run_recreate_did(
 
     let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
         .map_err(|e| format!("invalid signing_key: {e}"))?;
+    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
 
     let result =
-        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, public_url, &mnemonic)
+        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), public_url, &mnemonic)
             .await?;
 
     store.persist().await?;
@@ -506,9 +507,10 @@ async fn run_bootstrap_did(
 
         let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
             .map_err(|e| format!("invalid signing_key: {e}"))?;
+        let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
 
         let result =
-            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, public_url, &mnemonic)
+            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), public_url, &mnemonic)
                 .await?;
 
         // Optional: request witness proof

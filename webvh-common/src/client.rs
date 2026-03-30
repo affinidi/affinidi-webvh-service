@@ -193,7 +193,7 @@ impl WebVHClient {
             .map_err(|e| WebVHError::DIDComm(format!("failed to get public key: {e}")))?;
 
         let did_doc =
-            build_did_document(&host, &create_resp.mnemonic, &public_key_multibase, None);
+            build_did_document(&host, &create_resp.mnemonic, &public_key_multibase, &Default::default());
         let (scid, jsonl) = create_log_entry(&did_doc, secret).await?;
 
         self.upload_did(&create_resp.mnemonic, &jsonl).await?;

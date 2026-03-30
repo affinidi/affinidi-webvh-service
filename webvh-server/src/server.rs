@@ -682,10 +682,12 @@ async fn auto_bootstrap_dids(
         }
     };
 
+    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
+
     // Bootstrap root DID (.well-known) if it doesn't exist
     match bootstrap::root_did_exists(dids_ks).await {
         Ok(false) => {
-            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, &public_url).await
+            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, ka_secret.as_ref(), &public_url).await
             {
                 Ok(result) => {
                     info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");

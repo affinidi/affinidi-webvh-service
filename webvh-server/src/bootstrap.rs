@@ -4,7 +4,7 @@
 //! auto-bootstrap path on server startup.
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
+use affinidi_webvh_common::did::{DidDocumentOptions, build_did_document, create_log_entry, encode_host};
 use tracing::info;
 
 use crate::auth::session::now_epoch;
@@ -35,19 +35,22 @@ pub async fn bootstrap_root_did(
     store: &Store,
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
+    ka_secret: Option<&Secret>,
     public_url: &str,
 ) -> Result<BootstrapResult, AppError> {
-    bootstrap_did(store, dids_ks, signing_secret, public_url, ".well-known").await
+    bootstrap_did(store, dids_ks, signing_secret, ka_secret, public_url, ".well-known").await
 }
 
 /// Create a DID log entry at the given path and store it atomically.
 ///
-/// The signing secret's public key is embedded in the DID document. The
-/// resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
+/// The signing secret's public key is embedded in the DID document. If
+/// `ka_secret` is provided, an X25519 key agreement key is also added.
+/// The resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
 pub async fn bootstrap_did(
     store: &Store,
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
+    ka_secret: Option<&Secret>,
     public_url: &str,
     mnemonic: &str,
 ) -> Result<BootstrapResult, AppError> {
@@ -65,8 +68,16 @@ pub async fn bootstrap_did(
         .get_public_keymultibase()
         .map_err(|e| AppError::Internal(format!("failed to get public key multibase: {e}")))?;
 
+    let ka_public_key = ka_secret
+        .map(|s| s.get_public_keymultibase())
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("failed to get KA public key multibase: {e}")))?;
+
     let auth_endpoint = format!("{}/api/auth/", public_url.trim_end_matches('/'));
-    let doc = build_did_document(&host, mnemonic, &public_key, Some(&auth_endpoint));
+    let doc = build_did_document(&host, mnemonic, &public_key, &DidDocumentOptions {
+        key_agreement_multibase: ka_public_key.as_deref(),
+        auth_endpoint: Some(&auth_endpoint),
+    });
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)
         .await

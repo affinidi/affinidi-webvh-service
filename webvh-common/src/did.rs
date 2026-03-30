@@ -62,42 +62,70 @@ pub fn build_did_web_id(server_url: &str, mnemonic: &str) -> Result<String> {
     }
 }
 
+/// Options for building a DID document beyond the required signing key.
+#[derive(Default)]
+pub struct DidDocumentOptions<'a> {
+    /// X25519 key agreement public key (multibase-encoded). When set, a
+    /// `keyAgreement` verification method (`#key-1`) is added to the document.
+    /// Required for DIDComm encrypted messaging.
+    pub key_agreement_multibase: Option<&'a str>,
+    /// Auth service endpoint URL. When set, an `#auth` service entry is added.
+    /// Required by the TDK authentication module.
+    pub auth_endpoint: Option<&'a str>,
+}
+
 /// Build a standard DID document with `{SCID}` placeholders.
 ///
-/// The returned JSON value uses the did:webvh identifier format with a
-/// single Ed25519 verification method at `#key-0`.
-///
-/// If `auth_endpoint` is provided, an `#auth` service entry is added to
-/// the document pointing at the given URL. This is required by the TDK's
-/// authentication module when other services authenticate against this DID.
+/// The returned JSON value uses the did:webvh identifier format with an
+/// Ed25519 verification method at `#key-0`. Additional keys and services
+/// can be added via [`DidDocumentOptions`].
 pub fn build_did_document(
     host: &str,
     mnemonic: &str,
     public_key_multibase: &str,
-    auth_endpoint: Option<&str>,
+    opts: &DidDocumentOptions<'_>,
 ) -> serde_json::Value {
     let did_path = mnemonic.replace('/', ":");
     let did_id = format!("did:webvh:{{SCID}}:{host}:{did_path}");
+
+    let mut vm = vec![json!({
+        "id": format!("{did_id}#key-0"),
+        "type": "Multikey",
+        "controller": &did_id,
+        "publicKeyMultibase": public_key_multibase,
+    })];
 
     let mut doc = json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did_id,
         "authentication": [format!("{did_id}#key-0")],
         "assertionMethod": [format!("{did_id}#key-0")],
-        "verificationMethod": [{
-            "id": format!("{did_id}#key-0"),
-            "type": "Multikey",
-            "controller": did_id,
-            "publicKeyMultibase": public_key_multibase,
-        }],
     });
 
-    if let Some(endpoint) = auth_endpoint {
-        doc["service"] = json!([{
+    // Add X25519 key agreement key
+    if let Some(ka_key) = opts.key_agreement_multibase {
+        vm.push(json!({
+            "id": format!("{did_id}#key-1"),
+            "type": "Multikey",
+            "controller": &did_id,
+            "publicKeyMultibase": ka_key,
+        }));
+        doc["keyAgreement"] = json!([format!("{did_id}#key-1")]);
+    }
+
+    doc["verificationMethod"] = json!(vm);
+
+    // Add services
+    let mut services = vec![];
+    if let Some(endpoint) = opts.auth_endpoint {
+        services.push(json!({
             "id": format!("{did_id}#auth"),
             "type": "Authentication",
             "serviceEndpoint": endpoint,
-        }]);
+        }));
+    }
+    if !services.is_empty() {
+        doc["service"] = json!(services);
     }
 
     doc
@@ -206,7 +234,7 @@ mod tests {
 
     #[test]
     fn build_did_document_correct_did_id() {
-        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...", None);
+        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.starts_with("did:webvh:{SCID}:example.com%3A8085:"));
         assert!(id.ends_with(":mypath"));
@@ -214,7 +242,7 @@ mod tests {
 
     #[test]
     fn build_did_document_nested_path() {
-        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...", None);
+        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.contains(":people:staff:glenn"));
         assert!(!id.contains('/'));
@@ -222,7 +250,7 @@ mod tests {
 
     #[test]
     fn build_did_document_structure() {
-        let doc = build_did_document("example.com", "test", "z6MkPubKey", None);
+        let doc = build_did_document("example.com", "test", "z6MkPubKey", &Default::default());
         assert!(doc["@context"].is_array());
         assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
         assert!(doc["authentication"].is_array());
@@ -239,7 +267,10 @@ mod tests {
             "example.com",
             "test",
             "z6MkPubKey",
-            Some("https://example.com/api/auth/"),
+            &DidDocumentOptions {
+                auth_endpoint: Some("https://example.com/api/auth/"),
+                ..Default::default()
+            },
         );
         let service = &doc["service"];
         assert!(service.is_array());
