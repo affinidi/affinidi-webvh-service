@@ -492,12 +492,14 @@ fn run_storage_thread(
                 _ = did_timer.tick() => {
                     match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
                         Ok(0) => {}
-                        Ok(n) => info!(count = n, "cleaned up empty DID records"),
+                        Ok(n) => {
+                            info!(count = n, "cleaned up empty DID records");
+                            // Adjust count for cleaned up records
+                            for _ in 0..n {
+                                collector.decrement_total_dids();
+                            }
+                        }
                         Err(e) => warn!("DID cleanup error: {e}"),
-                    }
-                    // Update total DID count in collector
-                    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-                        collector.set_total_dids(dids.len() as u64);
                     }
                 }
                 _ = sync_timer.tick(), if sync_enabled => {

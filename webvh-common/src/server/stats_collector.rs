@@ -99,6 +99,16 @@ impl StatsCollector {
         self.agg_total_dids.store(count, Ordering::Relaxed);
     }
 
+    /// Increment total DID count by 1 (call on DID create).
+    pub fn increment_total_dids(&self) {
+        self.agg_total_dids.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement total DID count by 1 (call on DID delete).
+    pub fn decrement_total_dids(&self) {
+        self.agg_total_dids.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Increment aggregate counters by the given deltas (used by the control
     /// plane when receiving sync data from servers).
     pub fn apply_deltas(&self, resolve_delta: u64, update_delta: u64, last_resolved_at: Option<u64>, last_updated_at: Option<u64>) {

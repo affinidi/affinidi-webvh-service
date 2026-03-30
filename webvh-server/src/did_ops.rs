@@ -235,6 +235,9 @@ pub async fn create_did(
 
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
+    if let Some(ref collector) = state.stats_collector {
+        collector.increment_total_dids();
+    }
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
 
     Ok(CreateDidResult { mnemonic, did_url })
@@ -528,6 +531,9 @@ pub async fn delete_did(
 
     state.did_cache.invalidate(&content_log_key(mnemonic));
 
+    if let Some(ref collector) = state.stats_collector {
+        collector.decrement_total_dids();
+    }
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(DeleteDidResult {

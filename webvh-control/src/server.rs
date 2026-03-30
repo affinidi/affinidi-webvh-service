@@ -635,10 +635,13 @@ async fn flush_stats_to_store(
     }
     batch.commit().await?;
 
-    // Update total DID count
+    // Update total DID count (periodic reconciliation)
     if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
         collector.set_total_dids(dids.len() as u64);
     }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
 
     debug!(count = deltas.len(), "flushed stats deltas to store");
     Ok(())
