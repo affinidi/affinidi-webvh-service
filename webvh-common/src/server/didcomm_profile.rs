@@ -157,10 +157,18 @@ pub async fn build_tdk_profile(
     let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, Some(&ka_kid))
         .map_err(|e| AppError::Config(format!("failed to decode key_agreement_key: {e}")))?;
 
-    // Discover the actual mediator DID from the peer's DID document
+    // Discover the actual mediator DID from the peer's DID document.
+    // Only follow one level: if the discovered endpoint is a DID, use it;
+    // if it's a URL (i.e. the peer IS the mediator), use the peer DID directly.
     let mediator_did = if let Some(peer) = peer_did {
         match resolve_mediator_did(peer, did_resolver).await {
-            Some(mediator) => Some(mediator),
+            Some(mediator) if mediator.starts_with("did:") => Some(mediator),
+            Some(_url) => {
+                // The peer's DIDCommMessaging points to a URL, meaning the
+                // peer itself is the mediator — use the peer DID directly.
+                info!("peer {peer} is a mediator (endpoint is a URL) — using it directly");
+                Some(peer.to_string())
+            }
             None => {
                 warn!(
                     "could not discover mediator from {peer} — \
