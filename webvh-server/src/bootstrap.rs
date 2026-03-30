@@ -65,7 +65,8 @@ pub async fn bootstrap_did(
         .get_public_keymultibase()
         .map_err(|e| AppError::Internal(format!("failed to get public key multibase: {e}")))?;
 
-    let doc = build_did_document(&host, mnemonic, &public_key);
+    let auth_endpoint = format!("{}/api/auth/", public_url.trim_end_matches('/'));
+    let doc = build_did_document(&host, mnemonic, &public_key, Some(&auth_endpoint));
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)
         .await

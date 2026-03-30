@@ -85,15 +85,72 @@ pub async fn resolve_server_key_ids(
     }
 }
 
+/// Resolve the mediator DID from a peer's DID document.
+///
+/// Looks for a `DIDCommMessaging` service endpoint in the peer's DID document
+/// and extracts the mediator DID URI from it. This follows the DIDComm v2
+/// convention where the `serviceEndpoint.uri` of a `DIDCommMessaging` service
+/// points to the mediator that relays messages for the peer.
+///
+/// Returns `None` if the DID cannot be resolved or has no `DIDCommMessaging` service.
+pub async fn resolve_mediator_did(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<String> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for mediator discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for mediator discovery: {e}");
+            return None;
+        }
+    };
+
+    // Find the DIDCommMessaging service
+    let service = doc.service.iter().find(|s| {
+        s.type_.iter().any(|t| t == "DIDCommMessaging")
+    })?;
+
+    // Extract the URI from the service endpoint
+    let uri = service.service_endpoint.get_uri()?;
+
+    // get_uri() returns JSON-encoded strings (with quotes) for Map endpoints
+    let mediator = uri.trim_matches('"').to_string();
+
+    if mediator.starts_with("did:") {
+        info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
+        Some(mediator)
+    } else {
+        warn!(peer = peer_did, uri = %mediator, "DIDCommMessaging service endpoint is not a DID");
+        None
+    }
+}
+
 /// Build a `TDKProfile` suitable for use with `DIDCommService`.
 ///
 /// 1. Resolves the DID document to discover actual verification-method key IDs.
 /// 2. Creates `Secret` objects from the configured private keys with the correct KIDs.
-/// 3. Returns a `TDKProfile` ready for `ListenerConfig`.
+/// 3. If `peer_did` is provided, resolves it to discover the mediator DID from
+///    its `DIDCommMessaging` service endpoint.
+/// 4. Returns a `TDKProfile` ready for `ListenerConfig`.
 pub async fn build_tdk_profile(
     alias: &str,
     service_did: &str,
-    mediator_did: Option<&str>,
+    peer_did: Option<&str>,
     secrets: &ServerSecrets,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<TDKProfile, AppError> {
@@ -105,10 +162,26 @@ pub async fn build_tdk_profile(
     let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, Some(&ka_kid))
         .map_err(|e| AppError::Config(format!("failed to decode key_agreement_key: {e}")))?;
 
+    // Discover the actual mediator DID from the peer's DID document
+    let mediator_did = if let Some(peer) = peer_did {
+        match resolve_mediator_did(peer, did_resolver).await {
+            Some(mediator) => Some(mediator),
+            None => {
+                warn!(
+                    "could not discover mediator from {peer} — \
+                     falling back to using it directly as mediator"
+                );
+                Some(peer.to_string())
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(TDKProfile::new(
         alias,
         service_did,
-        mediator_did,
+        mediator_did.as_deref(),
         vec![signing_secret, ka_secret],
     ))
 }

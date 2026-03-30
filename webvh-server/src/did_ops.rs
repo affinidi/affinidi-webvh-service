@@ -710,7 +710,7 @@ mod tests {
         let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
         let pk = secret.get_public_keymultibase().unwrap();
         let host = encode_host("http://localhost:3000").unwrap();
-        let doc = build_did_document(&host, "test-validate", &pk);
+        let doc = build_did_document(&host, "test-validate", &pk, None);
         let (_scid, jsonl) = create_log_entry(&doc, &secret).await.unwrap();
         jsonl
     }
