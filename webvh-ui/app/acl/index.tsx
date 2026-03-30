@@ -47,6 +47,7 @@ const AclEntryRow = memo(function AclEntryRow({
   onCancelEdit,
   onSave,
   onDelete,
+  onChangeRole,
   onChangeLabel,
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
