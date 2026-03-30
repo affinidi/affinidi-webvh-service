@@ -17,6 +17,7 @@ use crate::server::AppState;
 
 use crate::store::KeyspaceHandle;
 use affinidi_webvh_common::DidListEntry;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 // Re-export shared types and helpers from webvh-common so existing code
@@ -28,7 +29,61 @@ pub use affinidi_webvh_common::did_ops::{
 };
 
 // ---------------------------------------------------------------------------
-// Quota checks
+// Quota index — O(1) per-owner count and size tracking
+// ---------------------------------------------------------------------------
+
+/// Per-owner quota index stored at `quota:{owner_did}`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuotaIndex {
+    pub did_count: u64,
+    pub total_size: u64,
+}
+
+pub fn quota_key(owner: &str) -> String {
+    format!("quota:{owner}")
+}
+
+/// Get or create the quota index for an owner.
+pub async fn get_quota(dids_ks: &KeyspaceHandle, owner: &str) -> Result<QuotaIndex, AppError> {
+    Ok(dids_ks.get(quota_key(owner)).await?.unwrap_or_default())
+}
+
+/// Increment the quota index on DID create.
+pub async fn quota_on_create(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.did_count += 1;
+    dids_ks.insert(quota_key(owner), &q).await
+}
+
+/// Decrement the quota index on DID delete and subtract content size.
+pub async fn quota_on_delete(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+    content_size: u64,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.did_count = q.did_count.saturating_sub(1);
+    q.total_size = q.total_size.saturating_sub(content_size);
+    dids_ks.insert(quota_key(owner), &q).await
+}
+
+/// Adjust the quota index on DID publish (size change).
+pub async fn quota_on_size_change(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+    old_size: u64,
+    new_size: u64,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.total_size = q.total_size.saturating_sub(old_size).saturating_add(new_size);
+    dids_ks.insert(quota_key(owner), &q).await
+}
+
+// ---------------------------------------------------------------------------
+// Quota checks — O(1) using the index
 // ---------------------------------------------------------------------------
 
 /// Check whether the owner has reached their DID count limit.
@@ -48,27 +103,25 @@ pub async fn check_did_count_limit(
         .map(|e| e.effective_max_did_count(config.limits.default_max_did_count))
         .unwrap_or(config.limits.default_max_did_count);
 
-    let prefix = format!("owner:{}:", auth.did);
-    let owned = dids_ks.prefix_iter_raw(prefix).await?;
-    let count = owned.len() as u64;
-    if count >= max {
-        warn!(did = %auth.did, count, max, "DID count quota exceeded");
+    let quota = get_quota(dids_ks, &auth.did).await?;
+    if quota.did_count >= max {
+        warn!(did = %auth.did, count = quota.did_count, max, "DID count quota exceeded");
         return Err(AppError::QuotaExceeded(format!(
             "DID count limit reached ({max})"
         )));
     }
-    debug!(did = %auth.did, count, max, "DID count quota check passed");
+    debug!(did = %auth.did, count = quota.did_count, max, "DID count quota check passed");
     Ok(())
 }
 
 /// Check whether storing `new_size` bytes would exceed the owner's total size quota.
-/// Admins are exempt. `exclude_mnemonic` is excluded from the sum (the upload replaces it).
+/// Admins are exempt. `old_size` is the current size of the DID being replaced (0 for new).
 pub async fn check_total_size_limit(
     auth: &AuthClaims,
     dids_ks: &KeyspaceHandle,
     acl_ks: &KeyspaceHandle,
     config: &AppConfig,
-    exclude_mnemonic: &str,
+    old_size: u64,
     new_size: u64,
 ) -> Result<(), AppError> {
     if auth.role == Role::Admin {
@@ -80,29 +133,15 @@ pub async fn check_total_size_limit(
         .map(|e| e.effective_max_total_size(config.limits.default_max_total_size))
         .unwrap_or(config.limits.default_max_total_size);
 
-    let prefix = format!("owner:{}:", auth.did);
-    let owned = dids_ks.prefix_iter_raw(prefix).await?;
-
-    let mut total: u64 = 0;
-    for (_key, value) in owned {
-        let mnemonic = String::from_utf8(value)
-            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if mnemonic == exclude_mnemonic {
-            continue;
-        }
-        if let Some(record) = dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            total = total.saturating_add(record.content_size);
-        }
-    }
-
-    let proposed = total.saturating_add(new_size);
+    let quota = get_quota(dids_ks, &auth.did).await?;
+    let proposed = quota.total_size.saturating_sub(old_size).saturating_add(new_size);
     if proposed > max {
-        warn!(did = %auth.did, current = total, new_size, max, "total size quota exceeded");
+        warn!(did = %auth.did, current = quota.total_size, old_size, new_size, max, "total size quota exceeded");
         return Err(AppError::QuotaExceeded(format!(
             "total DID document size would exceed limit ({max} bytes)"
         )));
     }
-    debug!(did = %auth.did, current = total, new_size, max, "total size quota check passed");
+    debug!(did = %auth.did, current = quota.total_size, new_size, max, "total size quota check passed");
     Ok(())
 }
 
@@ -233,6 +272,9 @@ pub async fn create_did(
     );
     batch.commit().await?;
 
+    // Update quota index
+    quota_on_create(&state.dids_ks, &auth.did).await?;
+
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     if let Some(ref collector) = state.stats_collector {
@@ -264,12 +306,13 @@ pub async fn publish_did(
     validate_did_jsonl(did_log)?;
 
     let new_size = did_log.len() as u64;
+    let old_size = record.content_size;
     check_total_size_limit(
         auth,
         &state.dids_ks,
         &state.acl_ks,
         &state.config,
-        mnemonic,
+        old_size,
         new_size,
     )
     .await?;
@@ -295,6 +338,9 @@ pub async fn publish_did(
     );
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.commit().await?;
+
+    // Update quota index for size change
+    quota_on_size_change(&state.dids_ks, &record.owner, old_size, new_size).await?;
 
     // Invalidate cache for this DID
     state.did_cache.invalidate(&content_log_key(mnemonic));
@@ -528,6 +574,9 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
     batch.commit().await?;
+
+    // Update quota index
+    quota_on_delete(&state.dids_ks, &record.owner, record.content_size).await?;
 
     state.did_cache.invalidate(&content_log_key(mnemonic));
 

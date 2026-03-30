@@ -6,6 +6,8 @@
 //! instances. Messages are encrypted and routed through the mediator —
 //! no point-to-point connections are made.
 
+use std::future::Future;
+
 use affinidi_webvh_common::did_ops::{self, DidRecord};
 use affinidi_webvh_common::DidSyncUpdate;
 use tracing::{info, warn};
@@ -120,24 +122,24 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
                 }
             };
 
-            match messaging::send_sync_update(&atm, &profile, control_did, server_did, &update)
-                .await
+            if let Err(e) = send_with_retry(
+                || messaging::send_sync_update(&atm, &profile, control_did, server_did, &update),
+                3,
+            )
+            .await
             {
-                Ok(()) => {
-                    info!(
-                        server_did = server_did,
-                        mnemonic = %mnemonic,
-                        "pushed DID update to server via mediator"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        server_did = server_did,
-                        mnemonic = %mnemonic,
-                        error = %e,
-                        "failed to push DID update via mediator"
-                    );
-                }
+                warn!(
+                    server_did = server_did,
+                    mnemonic = %mnemonic,
+                    error = %e,
+                    "failed to push DID update via mediator after retries"
+                );
+            } else {
+                info!(
+                    server_did = server_did,
+                    mnemonic = %mnemonic,
+                    "pushed DID update to server via mediator"
+                );
             }
         }
     });
@@ -190,25 +192,55 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
                 }
             };
 
-            match messaging::send_sync_delete(&atm, &profile, control_did, server_did, &mnemonic)
-                .await
+            if let Err(e) = send_with_retry(
+                || messaging::send_sync_delete(&atm, &profile, control_did, server_did, &mnemonic),
+                3,
+            )
+            .await
             {
-                Ok(()) => {
-                    info!(
-                        server_did = server_did,
-                        mnemonic = %mnemonic,
-                        "pushed DID delete to server via mediator"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        server_did = server_did,
-                        mnemonic = %mnemonic,
-                        error = %e,
-                        "failed to push DID delete via mediator"
-                    );
-                }
+                warn!(
+                    server_did = server_did,
+                    mnemonic = %mnemonic,
+                    error = %e,
+                    "failed to push DID delete via mediator after retries"
+                );
+            } else {
+                info!(
+                    server_did = server_did,
+                    mnemonic = %mnemonic,
+                    "pushed DID delete to server via mediator"
+                );
             }
         }
     });
+}
+
+/// Retry a send operation with exponential backoff.
+///
+/// Retries up to `max_retries` times with 2s, 4s, 8s... backoff.
+/// Returns the last error if all attempts fail.
+async fn send_with_retry<F, Fut, E>(
+    make_future: F,
+    max_retries: u32,
+) -> Result<(), E>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut backoff = 2u64;
+    for attempt in 0..=max_retries {
+        match make_future().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(e);
+                }
+                warn!(attempt = attempt + 1, backoff_secs = backoff, error = %e, "DID push failed, retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+            }
+        }
+    }
+    unreachable!()
 }
