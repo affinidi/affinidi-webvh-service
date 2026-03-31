@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_watcher::config::AppConfig;
-use affinidi_webvh_watcher::{server, store};
+use affinidi_webvh_watcher::{health, server, store};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,6 +18,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
 }
 
 #[tokio::main]
@@ -31,6 +33,12 @@ async fn main() {
             eprintln!("Setup wizard not yet implemented for webvh-watcher.");
             eprintln!("Create a config.toml manually.");
             std::process::exit(1);
+        }
+        Some(Command::Health) => {
+            if let Err(e) = health::run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
+                std::process::exit(1);
+            }
         }
         None => run_watcher(cli.config).await,
     }

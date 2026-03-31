@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-common"
 description = "WebVH Common, Common methods and structs related to WebVH Content"
-version = "0.0.1"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -14,6 +14,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+metrics = ["server-core", "dep:prometheus"]
 server-core = [
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio",
@@ -31,6 +32,8 @@ passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
 
 [dependencies]
 affinidi-tdk = { workspace = true }
+affinidi-tdk-common = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
 didwebvh-rs = { workspace = true }
 reqwest = { workspace = true }
@@ -40,6 +43,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+vta-sdk = { workspace = true }
 
 # server-core dependencies (optional)
 axum = { version = "0.8", optional = true }
@@ -75,6 +79,9 @@ bytes = { version = "1", optional = true }
 # passkey / WebAuthn (optional)
 webauthn-rs = { workspace = true, optional = true }
 webauthn-rs-proto = { workspace = true, optional = true }
+
+# Prometheus metrics (optional, behind `metrics` feature)
+prometheus = { version = "0.13", optional = true }
 
 # base64 (needed by firestore/cosmosdb store backends)
 base64 = { workspace = true }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::routing::get;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::routes;
@@ -55,14 +56,15 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                     .with_state(rest_state)
                     .layer(
                         TraceLayer::new_for_http()
-                            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                            .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
                             .on_response(
                                 DefaultOnResponse::new()
-                                    .level(Level::INFO)
+                                    .level(Level::DEBUG)
                                     .latency_unit(tower_http::LatencyUnit::Millis),
                             ),
                     )
-                    .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers));
+                    .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+                    .route("/api/health", get(routes::health::health));
 
                 axum::serve(listener, app)
                     .with_graceful_shutdown(async move {

@@ -40,11 +40,44 @@ pub struct ServerSecrets {
     pub key_agreement_key: String,
     /// Ed25519 private key for JWT token signing (multibase-encoded).
     pub jwt_signing_key: String,
+    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
+    #[serde(default)]
+    pub vta_credential: Option<String>,
 }
 
 pub trait SecretStore: Send + Sync {
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>>;
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>>;
+}
+
+/// Returns `true` when the plaintext fallback backend will actually be used.
+///
+/// This mirrors the priority logic in [`create_secret_store`]: AWS → GCP →
+/// keyring → plaintext. Returns `true` only when no higher-priority backend
+/// is both compiled in and configured.
+#[allow(unused_variables)]
+pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
+    // If any secure backend is compiled in AND would be selected, not plaintext.
+    #[cfg(feature = "aws-secrets")]
+    if secrets.aws_secret_name.is_some() {
+        return false;
+    }
+
+    #[cfg(feature = "gcp-secrets")]
+    if secrets.gcp_secret_name.is_some() {
+        return false;
+    }
+
+    // Keyring is only used when compiled in AND no cloud backend was selected above.
+    // But it is unconditionally preferred over plaintext when compiled in.
+    #[cfg(feature = "keyring")]
+    {
+        return false;
+    }
+
+    // No secure backend compiled in — plaintext fallback will be used.
+    #[allow(unreachable_code)]
+    true
 }
 
 /// Create a secret store backend based on compiled features and configuration.

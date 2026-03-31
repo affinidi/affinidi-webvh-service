@@ -5,12 +5,14 @@ import {
   StyleSheet,
   Pressable,
   ActivityIndicator,
+  ScrollView,
 } from "react-native";
 import { Link } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
 import { UsageChart } from "../components/UsageChart";
+import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { HealthResponse, ServerStats } from "../lib/api";
 
@@ -51,10 +53,14 @@ export default function Dashboard() {
   }
 
   return (
-    <View style={styles.container}>
-      <AffinidiLogo size={48} />
-
-      <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
+    <ScrollView
+      style={styles.scroll}
+      contentContainerStyle={styles.scrollContent}
+    >
+      <View style={styles.header}>
+        <AffinidiLogo size={48} />
+        <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
+      </View>
 
       {error ? (
         <View style={[styles.card, styles.errorCard]}>
@@ -91,16 +97,32 @@ export default function Dashboard() {
         <ActivityIndicator color={colors.accent} size="large" />
       )}
 
+      {/* Service topology overview */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Service Topology</Text>
+        <ServiceOverviewPanel />
+      </View>
+
+      {/* Usage chart */}
       {serverStats && (
-        <View style={{ width: "100%", maxWidth: 700 }}>
+        <View style={styles.section}>
           <UsageChart />
         </View>
       )}
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
+  scroll: {
+    flex: 1,
+    backgroundColor: colors.bgPrimary,
+  },
+  scrollContent: {
+    padding: spacing.xl,
+    alignItems: "center",
+    paddingBottom: spacing.xxxl,
+  },
   container: {
     flex: 1,
     padding: spacing.xl,
@@ -108,13 +130,27 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: colors.bgPrimary,
   },
+  header: {
+    alignItems: "center",
+    marginBottom: spacing.lg,
+  },
   subtitle: {
     fontSize: 14,
     fontFamily: fonts.regular,
     color: colors.textTertiary,
     marginTop: spacing.md,
-    marginBottom: spacing.xxl,
     letterSpacing: 0.5,
+  },
+  section: {
+    width: "100%",
+    maxWidth: 800,
+    marginTop: spacing.xl,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontFamily: fonts.bold,
+    color: colors.textPrimary,
+    marginBottom: spacing.md,
   },
   statusRow: {
     flexDirection: "row",

@@ -130,7 +130,23 @@ impl IntoResponse for AppError {
 
         debug!(status = %status.as_u16(), error = %self, "client error");
 
-        let body = serde_json::json!({ "error": self.to_string() });
+        // Sanitize client-facing error messages — avoid leaking internal paths/IDs
+        let message = match &self {
+            AppError::NotFound(_) => "not found".to_string(),
+            AppError::Authentication(_) => "authentication failed".to_string(),
+            AppError::Unauthorized(_) => "unauthorized".to_string(),
+            AppError::Forbidden(msg) => {
+                if msg.contains("ACL") || msg.contains("did:") {
+                    "forbidden".to_string()
+                } else {
+                    msg.clone()
+                }
+            }
+            // Validation and conflict errors are safe — they describe user input issues
+            other => other.to_string(),
+        };
+
+        let body = serde_json::json!({ "error": message });
         (status, axum::Json(body)).into_response()
     }
 }

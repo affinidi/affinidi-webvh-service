@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 
-use affinidi_tdk::secrets_resolver::secrets::Secret;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
-use serde::Deserialize;
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
@@ -15,35 +11,7 @@ use crate::config::{
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
-/// Generate a random Ed25519 key and return its multibase-encoded private key.
-fn generate_ed25519_multibase() -> String {
-    let secret = Secret::generate_ed25519(None, None);
-    secret
-        .get_private_keymultibase()
-        .expect("ed25519 multibase encoding")
-}
-
-/// Generate a random X25519 key and return its multibase-encoded private key.
-fn generate_x25519_multibase() -> String {
-    let secret = Secret::generate_x25519(None, None).expect("x25519 key generation");
-    secret
-        .get_private_keymultibase()
-        .expect("x25519 multibase encoding")
-}
-
-/// VTA secrets bundle format (base64url-encoded JSON).
-#[derive(Deserialize)]
-struct SecretsBundle {
-    did: String,
-    secrets: Vec<SecretEntry>,
-}
-
-#[derive(Deserialize)]
-struct SecretEntry {
-    key_id: String,
-    key_type: String,
-    private_key_multibase: String,
-}
+use affinidi_webvh_common::server::vta_setup;
 
 pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
@@ -85,153 +53,108 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     let enable_didcomm = selected.contains(&0);
     let enable_rest_api = selected.contains(&1);
-
-    // 3. DIDComm-specific: server identity and keys
-    let mut server_did = None;
-    let mut mediator_did = None;
-    let mut signing_key = None;
-    let mut key_agreement_key = None;
     let auth = AuthConfig::default();
 
-    if enable_didcomm {
-        let identity_options = &[
-            "Import a VTA secrets bundle (recommended)",
-            "Enter each parameter manually",
-        ];
-        let identity_idx = Select::new()
-            .with_prompt("How do you want to configure the witness DID identity?")
-            .items(identity_options)
-            .default(0)
-            .interact()?;
+    // 3. VTA credential — authenticate with witness's VTA context
+    eprintln!();
+    eprintln!("  The witness needs a VTA credential to create its DID identity.");
+    eprintln!("  This is the base64url string issued by the VTA operator.");
+    eprintln!();
 
-        if identity_idx == 0 {
-            // --- VTA bundle import ---
-            eprintln!();
-            eprintln!("  Paste the VTA secrets bundle export for the witness DID.");
-            eprintln!("  (This is the base64url string from `vta export-admin`)");
-            eprintln!();
+    let credential_b64: String = Input::new()
+        .with_prompt("VTA credential (base64url)")
+        .interact_text()?;
 
-            let bundle: SecretsBundle = loop {
-                let input: String = Input::new()
-                    .with_prompt("VTA secrets bundle (base64url)")
-                    .interact_text()?;
+    let (client, conn_info) = vta_setup::connect_vta(credential_b64.trim()).await?;
 
-                let decoded = match BASE64.decode(input.trim()) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("  Error: invalid base64url encoding: {e}");
-                        continue;
-                    }
-                };
+    eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
+    eprintln!("  VTA context: {}", conn_info.context_id);
 
-                match serde_json::from_slice::<SecretsBundle>(&decoded) {
-                    Ok(b) => break b,
-                    Err(e) => {
-                        eprintln!("  Error: invalid bundle JSON: {e}");
-                        continue;
-                    }
-                }
-            };
+    // 4. DID hosting URL (where webvh-server serves DIDs)
+    eprintln!();
+    eprintln!("  The witness DID will be hosted on your webvh-server.");
+    eprintln!();
+    let did_hosting_url: String = Input::new()
+        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
+        .interact_text()?;
+    let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
-            server_did = Some(bundle.did.clone());
+    // 5. DID path
+    let did_path: String = Input::new()
+        .with_prompt("DID path on the server")
+        .default("services/witness".into())
+        .interact_text()?;
 
-            let ed_entry = bundle
-                .secrets
-                .iter()
-                .find(|s| s.key_type == "ed25519")
-                .ok_or("bundle has no Ed25519 signing key".to_string())?;
-            signing_key = Some(ed_entry.private_key_multibase.clone());
+    // 6. Mediator selection (before DID creation so it's embedded in the DID doc)
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!();
 
-            match bundle.secrets.iter().find(|s| s.key_type == "x25519") {
-                Some(x_entry) => {
-                    key_agreement_key = Some(x_entry.private_key_multibase.clone());
-                }
-                None => {
-                    eprintln!(
-                        "  Warning: bundle has no X25519 key agreement key; generating one."
-                    );
-                }
-            }
+    // Try to discover the VTA's mediator
+    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did).await;
 
-            eprintln!();
-            eprintln!("  Imported server DID: {}", bundle.did);
-            eprintln!(
-                "  Signing key (Ed25519):     loaded from {}",
-                ed_entry.key_id
-            );
-            if let Some(x_entry) = bundle.secrets.iter().find(|s| s.key_type == "x25519") {
-                eprintln!(
-                    "  Key agreement (X25519):    loaded from {}",
-                    x_entry.key_id
-                );
-            }
-            eprintln!();
-        } else {
-            // --- Manual entry ---
-            eprintln!();
+    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
+    if let Some(ref did) = vta_mediator {
+        mediator_options.push(format!("Use VTA's mediator ({did})"));
+    }
+    mediator_options.push("Enter a custom mediator DID".into());
 
-            let did: String = Input::new()
-                .with_prompt("Witness server DID (e.g. did:webvh:witness.example.com)")
-                .interact_text()?;
-            server_did = Some(did);
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()?;
 
-            let sk_options = &[
-                "Generate a new Ed25519 signing key",
-                "Paste an existing multibase-encoded key",
-            ];
-            let sk_idx = Select::new()
-                .with_prompt("Ed25519 signing key")
-                .items(sk_options)
-                .default(0)
-                .interact()?;
-
-            if sk_idx == 0 {
-                let key = generate_ed25519_multibase();
-                eprintln!("  Generated Ed25519 signing key.");
-                signing_key = Some(key);
-            } else {
-                let key: String = Input::new()
-                    .with_prompt("Multibase-encoded Ed25519 private key")
-                    .interact_text()?;
-                signing_key = Some(key.trim().to_string());
-            }
-
-            let ka_options = &[
-                "Generate a new X25519 key agreement key",
-                "Paste an existing multibase-encoded key",
-            ];
-            let ka_idx = Select::new()
-                .with_prompt("X25519 key agreement key")
-                .items(ka_options)
-                .default(0)
-                .interact()?;
-
-            if ka_idx == 0 {
-                let key = generate_x25519_multibase();
-                eprintln!("  Generated X25519 key agreement key.");
-                key_agreement_key = Some(key);
-            } else {
-                let key: String = Input::new()
-                    .with_prompt("Multibase-encoded X25519 private key")
-                    .interact_text()?;
-                key_agreement_key = Some(key.trim().to_string());
-            }
-
-            eprintln!();
-        }
-
-        let med_did: String = Input::new()
-            .with_prompt("Mediator DID (e.g. did:webvh:mediator.example.com)")
-            .default(String::new())
+    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
+        None
+    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
+        vta_mediator.clone()
+    } else {
+        let did: String = Input::new()
+            .with_prompt("Mediator DID")
             .interact_text()?;
-        mediator_did = if med_did.is_empty() {
-            None
-        } else {
-            Some(med_did)
-        };
+        if did.is_empty() { None } else { Some(did) }
+    };
+
+    // 7. Create witness DID via VTA
+    eprintln!();
+    eprintln!("  Creating witness DID via VTA...");
+
+    let did_result = vta_setup::create_did(
+        &client,
+        &conn_info.context_id,
+        &did_hosting_url,
+        &did_path,
+        Some("webvh-witness"),
+        mediator_did.as_deref(),
+    )
+    .await?;
+
+    eprintln!("  Witness DID created: {}", did_result.did);
+    eprintln!("  SCID: {}", did_result.scid);
+
+    // 8. Write log entry to file
+    if let Some(ref log_entry) = did_result.log_entry {
+        let default_log_path = "witness-did.jsonl".to_string();
+        let log_path: String = Input::new()
+            .with_prompt("DID log entry output file")
+            .default(default_log_path)
+            .interact_text()?;
+
+        vta_setup::write_log_entry_file(log_entry, &PathBuf::from(&log_path))?;
+        eprintln!("  DID log entry written to {log_path}");
+
+        // Dump raw log entry
+        eprintln!();
+        eprintln!("  DID Log Entry:");
+        eprintln!("  ---");
+        for line in log_entry.lines() {
+            eprintln!("  {line}");
+        }
+        eprintln!("  ---");
     }
 
-    // 4. Host / Port
+    // 9. Host / Port
     let host: String = Input::new()
         .with_prompt("Listen host")
         .default("0.0.0.0".to_string())
@@ -242,11 +165,14 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .default(8102u16)
         .interact_text()?;
 
-    // 5. Log level / format
-    let log_level: String = Input::new()
+    // 10. Log level / format
+    let log_levels = ["info", "debug", "warn", "error", "trace"];
+    let log_level_idx = Select::new()
         .with_prompt("Log level")
-        .default("info".to_string())
-        .interact_text()?;
+        .items(&log_levels)
+        .default(0)
+        .interact()?;
+    let log_level = log_levels[log_level_idx].to_string();
 
     let format_options = &["text", "json"];
     let format_idx = Select::new()
@@ -259,73 +185,26 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         _ => LogFormat::Text,
     };
 
-    // 6. Data directory
+    // 11. Data directory
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
         .default("data/webvh-witness".to_string())
         .interact_text()?;
 
-    // 7. JWT signing key
-    let mut jwt_signing_key = None;
-    if enable_didcomm {
-        let jsk = generate_ed25519_multibase();
-        eprintln!("  Generated JWT signing key.");
-        jwt_signing_key = Some(jsk);
-    } else {
-        let jwt_options = &[
-            "Generate a new random key",
-            "Paste an existing multibase key",
-            "Skip (no auth)",
-        ];
-        let jwt_idx = Select::new()
-            .with_prompt("JWT signing key (required for token auth)")
-            .items(jwt_options)
-            .default(0)
-            .interact()?;
+    // 12. JWT signing key (always generated)
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!("  Generated JWT signing key.");
 
-        match jwt_idx {
-            0 => {
-                let jsk = generate_ed25519_multibase();
-                eprintln!();
-                eprintln!("  Generated JWT signing key.");
-                eprintln!();
-                jwt_signing_key = Some(jsk);
-            }
-            1 => {
-                let jsk: String = Input::new()
-                    .with_prompt("Multibase-encoded Ed25519 private key")
-                    .interact_text()?;
-                let trimmed = jsk.trim().to_string();
-                if !trimmed.is_empty() {
-                    jwt_signing_key = Some(trimmed);
-                }
-            }
-            _ => {
-                eprintln!("  Skipping JWT key — auth endpoints will not work.");
-            }
-        }
-    }
-
-    let has_jwt_key = jwt_signing_key.is_some();
-
-    // Fill in defaults for signing/key-agreement if not from bundle
-    let signing_key = signing_key.unwrap_or_else(generate_ed25519_multibase);
-    let key_agreement_key = key_agreement_key.unwrap_or_else(generate_x25519_multibase);
-    let jwt_signing_key = jwt_signing_key.unwrap_or_else(generate_ed25519_multibase);
-
-    // 8. VTA configuration (optional)
-    let vta_config = configure_vta()?;
-
-    // 9. Secrets backend selection
+    // 13. Secrets backend selection
     let secrets_config = configure_secrets()?;
 
-    // 10. Build and write config
+    // 14. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: enable_didcomm,
             rest_api: enable_rest_api,
         },
-        server_did,
+        server_did: Some(did_result.did.clone()),
         mediator_did,
         server: ServerConfig { host, port },
         log: LogConfig {
@@ -338,7 +217,11 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         },
         auth,
         secrets: secrets_config,
-        vta: vta_config,
+        vta: VtaConfig {
+            url: Some(conn_info.vta_url),
+            did: Some(conn_info.vta_did),
+            context_id: Some(conn_info.context_id),
+        },
         config_path: output_path.clone(),
     };
 
@@ -346,105 +229,100 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     std::fs::write(&output_path, &toml_str)?;
     eprintln!("  Configuration written to {}", output_path.display());
 
-    // 11. Store secrets in the chosen backend
+    // 15. Store secrets
     let server_secrets = ServerSecrets {
-        signing_key,
-        key_agreement_key,
+        signing_key: did_result.signing_key,
+        key_agreement_key: did_result.key_agreement_key,
         jwt_signing_key,
+        vta_credential: Some(credential_b64.trim().to_string()),
     };
 
     let secret_store = create_secret_store(&config)?;
     secret_store.set(&server_secrets).await?;
     eprintln!("  Secrets stored in secret store.");
 
-    // 12. Optional admin bootstrap
-    if enable_didcomm || enable_rest_api {
-        let bootstrap = Confirm::new()
-            .with_prompt("Bootstrap an initial admin ACL entry?")
-            .default(true)
-            .interact()?;
+    // 16. Optional admin ACL bootstrap
+    eprintln!();
+    eprintln!("  The Access Control List (ACL) determines who can authenticate");
+    eprintln!("  with this service. Without at least one admin entry, all");
+    eprintln!("  authenticated API calls will be rejected.");
+    eprintln!();
+    eprintln!("  Admins can create and manage witness identities, which are");
+    eprintln!("  needed before the witness can sign proofs.");
+    eprintln!();
+    eprintln!("  You can add more entries later with:");
+    eprintln!("    webvh-witness add-acl --did <DID> --role admin");
+    eprintln!();
+    let admin_options = &[
+        "Enter an existing DID (e.g. operator or service DID)",
+        "Generate a new did:key identity for the operator",
+        "Skip (add later with webvh-witness add-acl)",
+    ];
+    let admin_idx = Select::new()
+        .with_prompt("Admin ACL entry")
+        .items(admin_options)
+        .default(0)
+        .interact()?;
 
-        if bootstrap {
-            let admin_did: String = Input::new()
+    if admin_idx <= 1 {
+        let admin_did = if admin_idx == 0 {
+            let did: String = Input::new()
                 .with_prompt("Admin DID")
                 .interact_text()?;
+            did
+        } else {
+            let (did, sk) = vta_setup::generate_admin_did_key();
+            eprintln!("  Generated admin did:key: {did}");
+            eprintln!("  Private key (save this!): {sk}");
+            did
+        };
 
-            let admin_label: String = Input::new()
-                .with_prompt("Label (optional)")
-                .default(String::new())
-                .interact_text()?;
+        let admin_label: String = Input::new()
+            .with_prompt("Label (optional)")
+            .default(String::new())
+            .interact_text()?;
 
-            let label = if admin_label.is_empty() {
-                None
-            } else {
-                Some(admin_label)
-            };
+        let label = if admin_label.is_empty() {
+            None
+        } else {
+            Some(admin_label)
+        };
 
-            let store = Store::open(&config.store).await?;
-            let acl_ks = store.keyspace("acl")?;
+        let store = Store::open(&config.store).await?;
+        let acl_ks = store.keyspace("acl")?;
 
-            let entry = AclEntry {
-                did: admin_did.clone(),
-                role: Role::Admin,
-                label,
-                created_at: now_epoch(),
-                max_total_size: None,
-                max_did_count: None,
-            };
+        let entry = AclEntry {
+            did: admin_did.clone(),
+            role: Role::Admin,
+            label,
+            created_at: now_epoch(),
+            max_total_size: None,
+            max_did_count: None,
+        };
 
-            store_acl_entry(&acl_ks, &entry).await?;
-            eprintln!("  Admin ACL entry created for {admin_did}");
-        }
+        store_acl_entry(&acl_ks, &entry).await?;
+        eprintln!("  Admin ACL entry created for {admin_did}");
     }
 
-    if !has_jwt_key {
-        eprintln!();
-        eprintln!("  Note: No JWT signing key was configured. Auth endpoints will not work.");
-    }
-
+    // 17. Summary
     eprintln!();
-    eprintln!("  Setup complete! Start the witness server with:");
-    eprintln!("    webvh-witness --config {}", output_path.display());
+    eprintln!("  Setup complete!");
+    eprintln!();
+    eprintln!("  Witness DID: {}", did_result.did);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Import this DID on the server:"
+    );
+    eprintln!(
+        "       webvh-server bootstrap-did --path {} --did-log witness-did.jsonl",
+        did_path
+    );
+    eprintln!("    2. Start the witness:");
+    eprintln!("       webvh-witness --config {}", output_path.display());
     eprintln!();
 
     Ok(())
-}
-
-/// Prompt for VTA configuration.
-fn configure_vta() -> Result<VtaConfig, Box<dyn std::error::Error>> {
-    let enable = Confirm::new()
-        .with_prompt("Configure VTA (Verifiable Trust Architecture) integration?")
-        .default(false)
-        .interact()?;
-
-    if !enable {
-        return Ok(VtaConfig::default());
-    }
-
-    let url: String = Input::new()
-        .with_prompt("VTA REST URL")
-        .default(String::new())
-        .interact_text()?;
-
-    let did: String = Input::new()
-        .with_prompt("VTA DID (for DIDComm)")
-        .default(String::new())
-        .interact_text()?;
-
-    let context_id: String = Input::new()
-        .with_prompt("VTA context ID for witness keys")
-        .default(String::new())
-        .interact_text()?;
-
-    Ok(VtaConfig {
-        url: if url.is_empty() { None } else { Some(url) },
-        did: if did.is_empty() { None } else { Some(did) },
-        context_id: if context_id.is_empty() {
-            None
-        } else {
-            Some(context_id)
-        },
-    })
 }
 
 /// Prompt for secrets backend selection and configuration.

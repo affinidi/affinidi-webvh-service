@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use affinidi_webvh_control::config::AppConfig;
-use affinidi_webvh_control::{server, setup, store, secret_store};
+use affinidi_webvh_control::{health, server, setup, store, secret_store};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,6 +18,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
     /// Add an ACL entry
     AddAcl {
         /// DID to add to the ACL
@@ -32,6 +34,24 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Remove an ACL entry
+    RemoveAcl {
+        /// DID to remove from the ACL
+        #[arg(long)]
+        did: String,
+    },
+    /// Create a passkey enrollment invite
+    Invite {
+        /// DID to invite
+        #[arg(long)]
+        did: String,
+        /// Role (admin or owner)
+        #[arg(long, default_value = "owner")]
+        role: String,
+        /// Override enrollment TTL (in hours)
+        #[arg(long)]
+        ttl_hours: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -47,6 +67,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Health) => {
+            if let Err(e) = health::run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::AddAcl { did, role, label }) => {
             if let Err(e) = run_add_acl(cli.config, did, role, label).await {
                 eprintln!("Error: {e}");
@@ -55,6 +81,18 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RemoveAcl { did }) => {
+            if let Err(e) = run_remove_acl(cli.config, did).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Invite { did, role, ttl_hours }) => {
+            if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -194,6 +232,78 @@ async fn run_list_acl(
 
     eprintln!();
     eprintln!("  {} entries total", entries.len());
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_remove_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_control::acl::{delete_acl_entry, get_acl_entry};
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    let existing = get_acl_entry(&acl_ks, &did).await?;
+    if existing.is_none() {
+        eprintln!();
+        eprintln!("  No ACL entry found for {did}");
+        eprintln!();
+        return Ok(());
+    }
+
+    let entry = existing.unwrap();
+    delete_acl_entry(&acl_ks, &did).await?;
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("  ACL entry removed!");
+    eprintln!();
+    eprintln!("  DID:  {}", entry.did);
+    eprintln!("  Role: {}", entry.role);
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_invite(
+    config_path: Option<PathBuf>,
+    did: String,
+    role: String,
+    ttl_hours: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::passkey::routes::create_enrollment_invite;
+
+    let config = AppConfig::load(config_path)?;
+
+    let base_url = config
+        .public_url
+        .as_deref()
+        .ok_or("public_url must be set in config for enrollment invites")?;
+
+    let enrollment_ttl = match ttl_hours {
+        Some(hours) => hours * 3600,
+        None => config.auth.passkey_enrollment_ttl,
+    };
+
+    let store = store::Store::open(&config.store).await?;
+    let sessions_ks = store.keyspace("sessions")?;
+
+    let resp = create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
+
+    eprintln!();
+    eprintln!("  Enrollment invite created!");
+    eprintln!();
+    eprintln!("  DID:     {did}");
+    eprintln!("  Role:    {role}");
+    let ttl_hours = enrollment_ttl / 3600;
+    eprintln!("  Expires: in {ttl_hours}h (epoch {})", resp.expires_at);
+    eprintln!();
+    eprintln!("  Enrollment URL:");
+    eprintln!("  {}", resp.enrollment_url);
     eprintln!();
 
     Ok(())

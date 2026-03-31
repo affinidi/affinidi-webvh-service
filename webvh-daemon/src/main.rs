@@ -28,6 +28,8 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Run health check diagnostics
+    Health,
 }
 
 #[tokio::main]
@@ -41,6 +43,12 @@ async fn main() {
             eprintln!("  Setup wizard not yet implemented for the daemon.");
             eprintln!("  Configure each service individually, then create a combined config.toml.");
             std::process::exit(1);
+        }
+        Some(Command::Health) => {
+            if let Err(e) = run_health(cli.config).await {
+                eprintln!("Health check error: {e}");
+                std::process::exit(1);
+            }
         }
         None => run_daemon(cli.config).await,
     }
@@ -130,19 +138,18 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // Daemon-level health
-    combined = combined.route("/health", get(daemon_health));
-
-    // Apply tracing layer
-    let app = combined.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_response(
-                DefaultOnResponse::new()
-                    .level(Level::INFO)
-                    .latency_unit(tower_http::LatencyUnit::Millis),
-            ),
-    );
+    // Apply tracing layer, then add health route *after* so it's not traced
+    let app = combined
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::DEBUG)
+                        .latency_unit(tower_http::LatencyUnit::Millis),
+                ),
+        )
+        .route("/health", get(daemon_health));
 
     // Log startup summary
     info!("--- daemon services ---");
@@ -195,22 +202,25 @@ async fn build_server(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
-    let stats_ks = store.keyspace("stats")?;
-
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
+    let signing_key_bytes = decode_signing_key(secrets);
 
     let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
         dids_ks,
-        stats_ks,
         config: Arc::new(server_config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
+        signing_key_bytes,
         http_client: reqwest::Client::new(),
+        stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
+        did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
+            std::time::Duration::from_secs(300),
+        )),
     };
 
     let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);
@@ -289,6 +299,7 @@ async fn build_control(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let registry_ks = store.keyspace("registry")?;
+    let dids_ks = store.keyspace("dids")?;
 
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
@@ -312,12 +323,21 @@ async fn build_control(
         sessions_ks,
         acl_ks,
         registry_ks,
+        dids_ks,
         config: Arc::new(control_config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
+        atm: None,
+        atm_profile: None,
+        stats_collector: {
+            let collector = affinidi_webvh_common::server::stats_collector::StatsCollector::new();
+            // Daemon mode: basic init, no seeding from store
+            std::sync::Arc::new(collector)
+        },
+        stats_ks: store.keyspace("stats").expect("failed to open stats keyspace"),
     };
 
     let router = affinidi_webvh_control::routes::router().with_state(state);
@@ -390,6 +410,13 @@ fn init_jwt_keys(
     }
 }
 
+fn decode_signing_key(secrets: &ServerSecrets) -> Option<[u8; 32]> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+    let secret = Secret::from_multibase(&secrets.signing_key, None).ok()?;
+    secret.get_private_bytes().try_into().ok()
+}
+
 async fn init_didcomm_auth(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -430,6 +457,131 @@ async fn init_didcomm_auth(
     }
 
     (Some(did_resolver), Some(Arc::new(secrets_resolver)))
+}
+
+// ---------------------------------------------------------------------------
+// CLI health check
+// ---------------------------------------------------------------------------
+
+async fn run_health(
+    config_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::health;
+
+    health::header("webvh-daemon", env!("CARGO_PKG_VERSION"));
+
+    // ── Configuration ──────────────────────────────────────────────
+    let config = match DaemonConfig::load(config_path) {
+        Ok(c) => {
+            health::section("Configuration");
+            health::check_config_loaded(&c.config_path);
+            health::check_value("server_did", &c.server_did);
+            health::check_value("public_url", &c.public_url);
+            health::check_value("did_hosting_url", &c.did_hosting_url);
+            health::check_value("mediator_did", &c.mediator_did);
+            Some(c)
+        }
+        Err(e) => {
+            health::section("Configuration");
+            health::fail(&format!("Config load failed: {e}"));
+            None
+        }
+    };
+
+    // ── Compile Features ───────────────────────────────────────────
+    health::section("Compile Features");
+    health::print_feature("store-fjall", cfg!(feature = "store-fjall"));
+    health::print_feature("keyring", cfg!(feature = "keyring"));
+    health::print_feature("ui", cfg!(feature = "ui"));
+    health::print_feature("passkey", cfg!(feature = "passkey"));
+
+    let config = match config {
+        Some(c) => c,
+        None => {
+            eprintln!();
+            return Ok(());
+        }
+    };
+
+    // ── Enabled Services ───────────────────────────────────────────
+    health::section("Enabled Services");
+    health::print_feature("server", config.enable.server);
+    health::print_feature("witness", config.enable.witness);
+    health::print_feature("watcher", config.enable.watcher);
+    health::print_feature("control", config.enable.control);
+
+    // ── Secrets ────────────────────────────────────────────────────
+    health::section("Secrets");
+    health::check_secrets(&config.secrets, &config.config_path).await;
+
+    // ── Per-service Stores ─────────────────────────────────────────
+    if config.enable.server {
+        health::section("Store (server)");
+        let store = health::check_store(&config.server_store).await;
+
+        // Root DID check via server store
+        if let Some(ref store) = store {
+            if let Ok(dids_ks) = store.keyspace("dids") {
+                health::section("Root DID (.well-known)");
+                match affinidi_webvh_server::bootstrap::root_did_exists(&dids_ks).await {
+                    Ok(true) => {
+                        health::pass("Root DID exists");
+                        match dids_ks
+                            .get::<affinidi_webvh_server::did_ops::DidRecord>(
+                                affinidi_webvh_server::did_ops::did_key(".well-known"),
+                            )
+                            .await
+                        {
+                            Ok(Some(record)) => {
+                                if let Some(ref did_id) = record.did_id {
+                                    health::info_msg(&format!("DID: {did_id}"));
+                                }
+                                health::info_msg(&format!(
+                                    "Version count: {}",
+                                    record.version_count
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                health::warn_msg(&format!("Could not read DID record: {e}"))
+                            }
+                        }
+                    }
+                    Ok(false) => health::skip("Root DID not yet bootstrapped"),
+                    Err(e) => health::fail(&format!("Root DID check failed: {e}")),
+                }
+            }
+        }
+    }
+
+    if config.enable.witness {
+        health::section("Store (witness)");
+        health::check_store(&config.witness_store).await;
+    }
+
+    if config.enable.watcher {
+        health::section("Store (watcher)");
+        health::check_store(&config.watcher_store).await;
+    }
+
+    if config.enable.control {
+        health::section("Store (control)");
+        health::check_store(&config.control_store).await;
+    }
+
+    // ── DID Resolution ─────────────────────────────────────────────
+    if let Some(ref did) = config.server_did {
+        health::section("DID Resolution");
+        health::check_did_resolution("Server DID resolves", did).await;
+    }
+
+    if let Some(ref did) = config.mediator_did {
+        health::section("Mediator DID Resolution");
+        health::check_did_resolution("Mediator DID resolves", did).await;
+    }
+
+    eprintln!();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

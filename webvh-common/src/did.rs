@@ -62,30 +62,77 @@ pub fn build_did_web_id(server_url: &str, mnemonic: &str) -> Result<String> {
     }
 }
 
+/// Options for building a DID document beyond the required signing key.
+#[derive(Default)]
+pub struct DidDocumentOptions<'a> {
+    /// X25519 key agreement public key (multibase-encoded). When set, a
+    /// `keyAgreement` verification method (`#key-1`) is added to the document.
+    /// Required for DIDComm encrypted messaging.
+    pub key_agreement_multibase: Option<&'a str>,
+    /// Mediator DID or URL for the `DIDCommMessaging` service endpoint.
+    /// When set, a `DIDCommMessaging` service is added so other parties
+    /// know how to route messages to this DID.
+    pub mediator_endpoint: Option<&'a str>,
+}
+
 /// Build a standard DID document with `{SCID}` placeholders.
 ///
-/// The returned JSON value uses the did:webvh identifier format with a
-/// single Ed25519 verification method at `#key-0`.
+/// The returned JSON value uses the did:webvh identifier format with an
+/// Ed25519 verification method at `#key-0`. Additional keys and services
+/// can be added via [`DidDocumentOptions`].
 pub fn build_did_document(
     host: &str,
     mnemonic: &str,
     public_key_multibase: &str,
+    opts: &DidDocumentOptions<'_>,
 ) -> serde_json::Value {
     let did_path = mnemonic.replace('/', ":");
     let did_id = format!("did:webvh:{{SCID}}:{host}:{did_path}");
 
-    json!({
+    let mut vm = vec![json!({
+        "id": format!("{did_id}#key-0"),
+        "type": "Multikey",
+        "controller": &did_id,
+        "publicKeyMultibase": public_key_multibase,
+    })];
+
+    let mut doc = json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did_id,
         "authentication": [format!("{did_id}#key-0")],
         "assertionMethod": [format!("{did_id}#key-0")],
-        "verificationMethod": [{
-            "id": format!("{did_id}#key-0"),
+    });
+
+    // Add X25519 key agreement key
+    if let Some(ka_key) = opts.key_agreement_multibase {
+        vm.push(json!({
+            "id": format!("{did_id}#key-1"),
             "type": "Multikey",
-            "controller": did_id,
-            "publicKeyMultibase": public_key_multibase,
-        }],
-    })
+            "controller": &did_id,
+            "publicKeyMultibase": ka_key,
+        }));
+        doc["keyAgreement"] = json!([format!("{did_id}#key-1")]);
+    }
+
+    doc["verificationMethod"] = json!(vm);
+
+    // Add services
+    let mut services = vec![];
+    if let Some(mediator) = opts.mediator_endpoint {
+        services.push(json!({
+            "id": format!("{did_id}#didcomm"),
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": [{
+                "accept": ["didcomm/v2"],
+                "uri": mediator,
+            }],
+        }));
+    }
+    if !services.is_empty() {
+        doc["service"] = json!(services);
+    }
+
+    doc
 }
 
 /// Create a WebVH log entry from a DID document and signing secret.
@@ -93,7 +140,7 @@ pub fn build_did_document(
 /// Returns `(scid, jsonl)` where:
 /// - `scid` is the self-certifying identifier derived from the log entry
 /// - `jsonl` is the serialized log entry ready for upload to the server
-pub fn create_log_entry(
+pub async fn create_log_entry(
     did_document: &serde_json::Value,
     secret: &Secret,
 ) -> Result<(String, String)> {
@@ -101,24 +148,35 @@ pub fn create_log_entry(
         .get_public_keymultibase()
         .map_err(|e| WebVHError::DIDComm(format!("failed to get public key multibase: {e}")))?;
 
+    // didwebvh-rs 0.3 requires the signing key's verification_method to
+    // contain '#' followed by the multibase public key.
+    let mut signing_key = secret.clone();
+    if !signing_key.id.contains('#') {
+        signing_key.id = format!("did:key:{public_key_multibase}#{public_key_multibase}");
+    }
+
     let mut state = DIDWebVHState::default();
     let params = Parameters {
-        update_keys: Some(Arc::new(vec![public_key_multibase])),
+        update_keys: Some(Arc::new(vec![public_key_multibase.into()])),
         ..Default::default()
     };
 
     state
-        .create_log_entry(None, did_document, &params, secret)
+        .create_log_entry(None, did_document, &params, &signing_key)
+        .await
         .map_err(|e| WebVHError::DIDComm(format!("failed to create WebVH log entry: {e}")))?;
 
-    let scid = state.scid.clone();
+    let scid = state.scid().to_string();
 
-    let jsonl: String = state
-        .log_entries
+    let lines: Vec<String> = state
+        .log_entries()
         .iter()
-        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|e| {
+            serde_json::to_string(&e.log_entry)
+                .map_err(|e| WebVHError::DIDComm(format!("failed to serialize log entry: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let jsonl = lines.join("\n");
 
     Ok((scid, jsonl))
 }
@@ -183,7 +241,7 @@ mod tests {
 
     #[test]
     fn build_did_document_correct_did_id() {
-        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...");
+        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.starts_with("did:webvh:{SCID}:example.com%3A8085:"));
         assert!(id.ends_with(":mypath"));
@@ -191,7 +249,7 @@ mod tests {
 
     #[test]
     fn build_did_document_nested_path() {
-        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...");
+        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.contains(":people:staff:glenn"));
         assert!(!id.contains('/'));
@@ -199,7 +257,7 @@ mod tests {
 
     #[test]
     fn build_did_document_structure() {
-        let doc = build_did_document("example.com", "test", "z6MkPubKey");
+        let doc = build_did_document("example.com", "test", "z6MkPubKey", &Default::default());
         assert!(doc["@context"].is_array());
         assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
         assert!(doc["authentication"].is_array());
@@ -207,5 +265,26 @@ mod tests {
         let vm = &doc["verificationMethod"][0];
         assert_eq!(vm["type"], "Multikey");
         assert_eq!(vm["publicKeyMultibase"], "z6MkPubKey");
+        assert!(doc.get("service").is_none());
+    }
+
+    #[test]
+    fn build_did_document_with_didcomm_service() {
+        let doc = build_did_document(
+            "example.com",
+            "test",
+            "z6MkPubKey",
+            &DidDocumentOptions {
+                mediator_endpoint: Some("did:example:mediator"),
+                ..Default::default()
+            },
+        );
+        let service = &doc["service"];
+        assert!(service.is_array());
+        let svc = &service[0];
+        assert!(svc["id"].as_str().unwrap().ends_with("#didcomm"));
+        assert_eq!(svc["type"], "DIDCommMessaging");
+        assert_eq!(svc["serviceEndpoint"][0]["uri"], "did:example:mediator");
+        assert_eq!(svc["serviceEndpoint"][0]["accept"][0], "didcomm/v2");
     }
 }

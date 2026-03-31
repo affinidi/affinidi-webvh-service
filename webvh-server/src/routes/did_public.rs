@@ -9,7 +9,6 @@ use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
-use crate::stats;
 
 /// Serve stored content for a mnemonic, optionally incrementing resolve stats.
 async fn serve_content(
@@ -25,25 +24,39 @@ async fn serve_content(
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
     {
-        if record.disabled {
+        if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
     }
 
-    let content = state
-        .dids_ks
-        .get_raw(key)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+    // Check cache first (hot path — read lock only, no I/O, Arc clone only)
+    let content = if let Some(cached) = state.did_cache.get(key) {
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_cache_hit();
+        cached
+    } else {
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_cache_miss();
+        let data = state
+            .dids_ks
+            .get_raw(key)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+        state.did_cache.insert(key.to_string(), data.clone());
+        std::sync::Arc::new(data)
+    };
 
     if track_stats {
-        let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
-        let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
+        if let Some(ref collector) = state.stats_collector {
+            collector.record_resolve(mnemonic);
+        }
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_resolve();
     }
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
+    Ok((StatusCode::OK, [("content-type", content_type)], (*content).clone()).into_response())
 }
 
 
@@ -59,7 +72,7 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
     {
-        if record.disabled {
+        if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
     }
@@ -81,8 +94,9 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
 
     // Track stats (same counters as did:webvh resolves)
-    let _ = stats::increment_resolves(&state.stats_ks, mnemonic).await;
-    let _ = stats::record_timeseries_resolve(&state.stats_ks, mnemonic).await;
+    if let Some(ref collector) = state.stats_collector {
+        collector.record_resolve(mnemonic);
+    }
 
     debug!(mnemonic = %mnemonic, size = doc_bytes.len(), "did:web document resolved");
 

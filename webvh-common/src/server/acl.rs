@@ -13,6 +13,10 @@ use super::store::KeyspaceHandle;
 pub enum Role {
     Admin,
     Owner,
+    /// Service accounts (e.g. webvh-server registering with the control plane).
+    /// Can authenticate and manage DIDs they own, plus send/receive DIDComm
+    /// sync messages. Cannot access admin management endpoints.
+    Service,
 }
 
 impl fmt::Display for Role {
@@ -20,6 +24,7 @@ impl fmt::Display for Role {
         match self {
             Role::Admin => write!(f, "admin"),
             Role::Owner => write!(f, "owner"),
+            Role::Service => write!(f, "service"),
         }
     }
 }
@@ -30,6 +35,7 @@ impl Role {
         match s {
             "admin" => Ok(Role::Admin),
             "owner" => Ok(Role::Owner),
+            "service" => Ok(Role::Service),
             _ => Err(AppError::Validation(format!("unknown role: {s}"))),
         }
     }
@@ -94,6 +100,9 @@ pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, App
 ///
 /// Returns `Forbidden` if the DID is not found.
 pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError> {
+    if did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
     match get_acl_entry(acl, did).await? {
         Some(entry) => {
             debug!(did = %did, role = %entry.role, "ACL check passed");
@@ -134,6 +143,11 @@ mod tests {
     }
 
     #[test]
+    fn role_from_str_service() {
+        assert_eq!(Role::from_str("service").unwrap(), Role::Service);
+    }
+
+    #[test]
     fn role_from_str_unknown_returns_error() {
         assert!(Role::from_str("superuser").is_err());
     }
@@ -142,6 +156,7 @@ mod tests {
     fn role_display() {
         assert_eq!(Role::Admin.to_string(), "admin");
         assert_eq!(Role::Owner.to_string(), "owner");
+        assert_eq!(Role::Service.to_string(), "service");
     }
 
     // --- effective_max_total_size ---

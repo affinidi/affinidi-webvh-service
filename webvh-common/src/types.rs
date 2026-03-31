@@ -111,6 +111,40 @@ pub struct DidStats {
 }
 
 // ---------------------------------------------------------------------------
+// Stats sync (server → control plane)
+// ---------------------------------------------------------------------------
+
+/// Per-DID counter delta for a single sync interval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidStatsDelta {
+    pub mnemonic: String,
+    pub resolve_delta: u64,
+    pub update_delta: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_resolved_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at: Option<u64>,
+}
+
+/// Payload sent by webvh-server to the control plane with per-DID deltas.
+///
+/// Pushed periodically (configurable via `stats.sync_interval_secs`).
+/// Only sent when there are actual changes — empty syncs are skipped.
+/// The control plane merges these deltas into its persistent per-DID stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsSyncPayload {
+    /// DID of the reporting server.
+    pub server_did: String,
+    /// Monotonic sequence number (incremented on each sync). Used by the
+    /// control plane to detect replayed or out-of-order payloads.
+    pub seq: u64,
+    /// Per-DID counter deltas since the last sync.
+    pub did_deltas: Vec<DidStatsDelta>,
+}
+
+// ---------------------------------------------------------------------------
 // High-level create result
 // ---------------------------------------------------------------------------
 

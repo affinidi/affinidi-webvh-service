@@ -23,6 +23,7 @@ pub struct DaemonConfig {
     pub server_did: Option<String>,
     pub mediator_did: Option<String>,
     pub public_url: Option<String>,
+    pub did_hosting_url: Option<String>,
 
     // Per-service store locations (separate to avoid keyspace collisions)
     #[serde(default = "default_server_store")]
@@ -42,7 +43,7 @@ pub struct DaemonConfig {
 
     // Witness-specific
     #[serde(default)]
-    pub vta: affinidi_webvh_witness::config::VtaConfig,
+    pub vta: affinidi_webvh_common::server::config::VtaConfig,
 
     // Watcher-specific
     #[serde(default)]
@@ -153,6 +154,7 @@ impl DaemonConfig {
         env_opt!("DAEMON_SERVER_DID", config.server_did);
         env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
         env_opt!("DAEMON_PUBLIC_URL", config.public_url);
+        env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
 
         if let Ok(v) = std::env::var("DAEMON_SERVER_HOST") {
             config.server.host = v;
@@ -168,6 +170,9 @@ impl DaemonConfig {
 
         // Normalize
         if let Some(ref mut url) = config.public_url {
+            *url = url.trim_end_matches('/').to_string();
+        }
+        if let Some(ref mut url) = config.did_hosting_url {
             *url = url.trim_end_matches('/').to_string();
         }
 
@@ -188,6 +193,10 @@ impl DaemonConfig {
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
             watchers: self.watchers.clone(),
+            control_url: None,
+            control_did: None,
+            vta: self.vta.clone(),
+            stats: affinidi_webvh_server::config::StatsConfig::default(),
             config_path: self.config_path.clone(),
         }
     }
@@ -226,11 +235,13 @@ impl DaemonConfig {
             server_did: self.server_did.clone(),
             mediator_did: self.mediator_did.clone(),
             public_url: self.public_url.clone(),
+            did_hosting_url: self.did_hosting_url.clone(),
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.control_store.clone(),
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
             registry: self.registry.clone(),
             config_path: self.config_path.clone(),
         }

@@ -16,8 +16,7 @@ pub fn router() -> Router<AppState> {
         .layer(DefaultBodyLimit::max(256 * 1024)); // 256 KB
 
     let api = Router::new()
-        .nest("/sync", sync_routes)
-        .route("/health", get(health::health));
+        .nest("/sync", sync_routes);
 
     Router::new()
         .nest("/api", api)

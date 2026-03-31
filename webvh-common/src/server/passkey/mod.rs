@@ -19,6 +19,8 @@ pub trait PasskeyState: AuthState {
     fn acl_ks(&self) -> &KeyspaceHandle;
     fn access_token_expiry(&self) -> u64;
     fn refresh_token_expiry(&self) -> u64;
+    fn public_url(&self) -> Option<&str>;
+    fn enrollment_ttl(&self) -> u64;
 }
 
 /// Build a `Webauthn` instance from the server's `public_url` configuration.

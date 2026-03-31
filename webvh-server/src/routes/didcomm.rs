@@ -4,9 +4,11 @@
 //! `POST /api/didcomm` endpoint. Business-logic errors are returned as packed
 //! `did/problem-report` messages; transport-level errors are returned as HTTP errors.
 
-use affinidi_tdk::didcomm::{Message, UnpackOptions};
+use affinidi_tdk::didcomm::Message;
+use affinidi_tdk::didcomm::message::pack;
 use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
 use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
+use affinidi_webvh_common::server::didcomm_unpack;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -40,6 +42,8 @@ const MSG_LIST: &str = "https://affinidi.com/webvh/1.0/did/list";
 const MSG_DELETE: &str = "https://affinidi.com/webvh/1.0/did/delete";
 const MSG_DELETE_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/delete-confirm";
 const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
+
+// Sync message types are handled via mediator in messaging.rs, not the REST endpoint
 
 // ---------------------------------------------------------------------------
 // Protocol error (maps to DIDComm problem-report)
@@ -94,17 +98,11 @@ pub async fn handle(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Response, AppError> {
-    let (did_resolver, secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
+    let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
     // Unpack the incoming DIDComm message
-    let (msg, _metadata) = Message::unpack_string(
-        &body,
-        did_resolver,
-        secrets_resolver,
-        &UnpackOptions::default(),
-    )
-    .await
-    .map_err(|e| AppError::Validation(format!("failed to unpack DIDComm message: {e}")))?;
+    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await
+        .map_err(|e| AppError::Validation(format!("failed to unpack DIDComm message: {e}")))?;
 
     // Verify the DIDComm sender matches the authenticated DID
     let sender_did = msg
@@ -131,7 +129,7 @@ pub async fn handle(
             warn!(
                 code = %pe.code,
                 comment = %pe.comment,
-                msg_type = %msg.type_,
+                msg_type = %msg.typ,
                 did = %auth.did,
                 "DIDComm protocol error"
             );
@@ -155,10 +153,12 @@ pub async fn handle(
     .finalize();
 
     // Sign with the server's Ed25519 key
+    let signing_key = state
+        .signing_key_bytes
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("server signing key not configured".into()))?;
     let kid = format!("{server_did}#key-0");
-    let (packed, _meta) = response_msg
-        .pack_signed(&kid, did_resolver, secrets_resolver)
-        .await
+    let packed = pack::pack_signed(&response_msg, &kid, signing_key)
         .map_err(|e| AppError::Internal(format!("failed to pack DIDComm response: {e}")))?;
 
     Ok((
@@ -179,7 +179,7 @@ async fn dispatch(
     msg: &Message,
     server_did: &str,
 ) -> Result<(String, Value), ProtocolError> {
-    match msg.type_.as_str() {
+    match msg.typ.as_str() {
         TRUST_PING_TYPE => handle_trust_ping(msg, server_did),
         DISCOVER_FEATURES_QUERY_TYPE => handle_discover_features(msg, server_did),
         MSG_DID_REQUEST => handle_did_request(auth, state, msg).await,
@@ -217,7 +217,7 @@ fn handle_trust_ping(
         .generate_pong_message(ping, Some(server_did))
         .map_err(|e| ProtocolError::new("e.p.trust-ping.error", e.to_string()))?;
 
-    Ok((pong.type_.clone(), pong.body.clone()))
+    Ok((pong.typ.clone(), pong.body.clone()))
 }
 
 /// `discover-features/2.0/queries` -> `discover-features/2.0/disclose`
@@ -254,7 +254,7 @@ fn handle_discover_features(
         .generate_disclosure_message(server_did, sender_did, query_msg, None)
         .map_err(|e| ProtocolError::new("e.p.discover-features.error", e.to_string()))?;
 
-    Ok((disclosure.type_.clone(), disclosure.body.clone()))
+    Ok((disclosure.typ.clone(), disclosure.body.clone()))
 }
 
 /// `did/request` -> `did/offer`
@@ -422,7 +422,7 @@ async fn handle_list_request(
 ) -> Result<(String, Value), ProtocolError> {
     let requested_owner = msg.body.get("owner").and_then(|v| v.as_str());
 
-    let entries = did_ops::list_dids(auth, state, requested_owner)
+    let entries = did_ops::list_dids(auth, state, requested_owner, None, None)
         .await
         .map_err(map_app_error)?;
 
@@ -476,3 +476,6 @@ async fn handle_delete(
         }),
     ))
 }
+
+// Sync messages (did/sync-update, did/sync-delete) are handled via the mediator
+// message loop in messaging.rs, not through this REST DIDComm endpoint.

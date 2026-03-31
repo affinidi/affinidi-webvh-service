@@ -92,7 +92,7 @@ pub async fn create_acl(
 
     store_acl_entry(&state.acl_ks, &entry).await?;
 
-    info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
+    info!(audit = true, caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
 }
 
@@ -100,6 +100,7 @@ pub async fn create_acl(
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateAclRequest {
+    pub role: Option<Role>,
     pub label: Option<String>,
     pub max_total_size: Option<u64>,
     pub max_did_count: Option<u64>,
@@ -115,6 +116,9 @@ pub async fn update_acl(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found for DID: {did}")))?;
 
+    if let Some(role) = req.role {
+        entry.role = role;
+    }
     if let Some(label) = req.label {
         entry.label = Some(label);
     }

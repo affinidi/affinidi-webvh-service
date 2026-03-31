@@ -88,7 +88,7 @@ export default function Login() {
         </Text>
         <View style={styles.codeBlock}>
           <Text style={styles.codeText} selectable>
-            webvh-server invite --did {"<"}your-did{">"} --role admin
+            webvh-control invite --did {"<"}your-did{">"} --role admin
           </Text>
         </View>
         <Text style={styles.cliHint}>

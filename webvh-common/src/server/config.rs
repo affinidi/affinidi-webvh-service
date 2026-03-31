@@ -87,6 +87,28 @@ fn default_cleanup_ttl_minutes() -> u64 {
     60
 }
 
+impl AuthConfig {
+    /// Validate configuration values are within acceptable ranges.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.challenge_ttl < 10 {
+            return Err(AppError::Config(
+                "challenge_ttl must be at least 10 seconds".into(),
+            ));
+        }
+        if self.session_cleanup_interval < 10 {
+            return Err(AppError::Config(
+                "session_cleanup_interval must be at least 10 seconds".into(),
+            ));
+        }
+        if self.access_token_expiry < 30 {
+            return Err(AppError::Config(
+                "access_token_expiry must be at least 30 seconds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -168,6 +190,19 @@ pub struct SecretsConfig {
     /// Plaintext secrets stored directly in the config file.
     /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
     pub plaintext: Option<PlaintextSecrets>,
+}
+
+/// VTA (Verifiable Trust Architecture) connection configuration.
+///
+/// Used by services that integrate with a VTA for key management and DID operations.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct VtaConfig {
+    /// VTA REST URL for remote key management
+    pub url: Option<String>,
+    /// VTA DID for DIDComm communication
+    pub did: Option<String>,
+    /// VTA context ID for this service's keys
+    pub context_id: Option<String>,
 }
 
 /// Plaintext secret key material stored directly in the configuration file.

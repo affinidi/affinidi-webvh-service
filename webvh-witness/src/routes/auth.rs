@@ -63,6 +63,7 @@ pub async fn challenge(
         created_at: now,
         refresh_token: None,
         refresh_expires_at: None,
+        token_id: None,
     };
 
     store_session(&state.sessions_ks, &session).await?;
@@ -77,24 +78,16 @@ pub async fn authenticate(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<AuthenticateResponse>, AppError> {
-    use affinidi_tdk::didcomm::Message;
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (did_resolver, secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
-
-    let (msg, _metadata) = Message::unpack_string(
-        &body,
-        did_resolver,
-        secrets_resolver,
-        &affinidi_tdk::didcomm::UnpackOptions::default(),
-    )
-    .await
-    .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
+    let (msg, _signer_kid) =
+        affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
-    if msg.type_ != "https://affinidi.com/webvh/1.0/authenticate" {
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
-            msg.type_
+            msg.typ
         )));
     }
 
@@ -195,23 +188,15 @@ pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use affinidi_tdk::didcomm::Message;
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (did_resolver, secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+    let (msg, _signer_kid) =
+        affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    let (msg, _metadata) = Message::unpack_string(
-        &body,
-        did_resolver,
-        secrets_resolver,
-        &affinidi_tdk::didcomm::UnpackOptions::default(),
-    )
-    .await
-    .map_err(|e| AppError::Authentication(format!("failed to unpack refresh message: {e}")))?;
-
-    if msg.type_ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
-            msg.type_
+            msg.typ
         )));
     }
 

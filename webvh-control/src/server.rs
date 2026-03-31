@@ -2,15 +2,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+};
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
+use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use axum::routing::get;
 use affinidi_webvh_common::server::passkey::PasskeyState;
+use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::error::AppError;
+use crate::messaging;
 use crate::registry::{self, ServiceStatus};
 use crate::routes;
 use crate::secret_store::ServerSecrets;
@@ -25,12 +34,22 @@ pub struct AppState {
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub registry_ks: KeyspaceHandle,
+    pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
+    /// ATM instance for outbound mediator-based DIDComm messaging (None if not configured).
+    pub atm: Option<Arc<ATM>>,
+    /// ATM profile for the control plane's outbound mediator connection.
+    pub atm_profile: Option<Arc<ATMProfile>>,
+    /// In-memory stats collector — accumulates per-DID deltas from servers,
+    /// flushed periodically to the stats keyspace.
+    pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
+    /// Stats keyspace for persistent per-DID stats.
+    pub stats_ks: KeyspaceHandle,
 }
 
 impl AppState {
@@ -80,6 +99,14 @@ impl PasskeyState for AppState {
     fn refresh_token_expiry(&self) -> u64 {
         self.config.auth.refresh_token_expiry
     }
+
+    fn public_url(&self) -> Option<&str> {
+        self.config.public_url.as_deref()
+    }
+
+    fn enrollment_ttl(&self) -> u64 {
+        self.config.auth.passkey_enrollment_ttl
+    }
 }
 
 pub async fn run(
@@ -91,6 +118,8 @@ pub async fn run(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let registry_ks = store.keyspace("registry")?;
+    let dids_ks = store.keyspace("dids")?;
+    let stats_ks = store.keyspace("stats")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
@@ -133,21 +162,75 @@ pub async fn run(
     let storage_registry_config = config.registry.clone();
     let has_auth = jwt_keys.is_some();
 
-    let state = AppState {
+    let stats_dids_ks = dids_ks.clone();
+    let mut state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
         registry_ks,
+        dids_ks,
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
+        atm: None,
+        atm_profile: None,
+        stats_collector: {
+            use affinidi_webvh_common::server::stats_collector::{StatsCollector, StatsAggregate};
+            let collector = StatsCollector::new();
+            // Seed aggregate from stored per-DID stats
+            let mut total_resolves = 0u64;
+            let mut total_updates = 0u64;
+            let mut last_resolved_at: Option<u64> = None;
+            let mut last_updated_at: Option<u64> = None;
+            if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
+                for (_key, value) in raw {
+                    if let Ok(s) = serde_json::from_slice::<affinidi_webvh_common::DidStats>(&value) {
+                        total_resolves += s.total_resolves;
+                        total_updates += s.total_updates;
+                        last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                        last_updated_at = match (last_updated_at, s.last_updated_at) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                }
+            }
+            let total_dids = stats_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
+            collector.seed_aggregate(&StatsAggregate {
+                total_dids,
+                total_resolves,
+                total_updates,
+                last_resolved_at,
+                last_updated_at,
+            });
+            info!(total_dids, total_resolves, total_updates, "stats collector seeded from store");
+            Arc::new(collector)
+        },
+        stats_ks: stats_ks.clone(),
     };
 
     // Seed registry from static config
     seed_registry(&state).await;
+
+    // Initialize outbound ATM connection for sync push messages
+    if state.config.features.didcomm {
+        if let Some(ref control_did) = state.config.server_did {
+            if let Some((atm, profile)) =
+                messaging::init_outbound_atm(&state.config, control_did, &secrets).await
+            {
+                state.atm = Some(atm);
+                state.atm_profile = Some(profile);
+            }
+        } else {
+            warn!("DIDComm enabled but server_did not configured — messaging disabled");
+        }
+    }
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -159,8 +242,22 @@ pub async fn run(
             "disabled"
         }
     );
+    info!(
+        "  DIDComm  : {}",
+        if state.atm.is_some() {
+            "enabled (mediator connected)"
+        } else {
+            "disabled"
+        }
+    );
     if let Some(ref url) = state.config.public_url {
         info!("  public URL   : {url}");
+    }
+    if let Some(ref did) = state.config.server_did {
+        info!("  control DID  : {did}");
+    }
+    if let Some(ref did) = state.config.mediator_did {
+        info!("  mediator DID : {did}");
     }
 
     // Shutdown channels
@@ -185,9 +282,12 @@ pub async fn run(
         None
     };
 
-    // 2. Spawn storage thread (cleanup + health checks)
+    // 2. Spawn storage thread (cleanup + health checks + stats flush)
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_http = state.http_client.clone();
+    let storage_stats_ks = state.stats_ks.clone();
+    let storage_dids_ks = state.dids_ks.clone();
+    let storage_collector = state.stats_collector.clone();
     let storage_handle = std::thread::Builder::new()
         .name("control-storage".into())
         .spawn(move || {
@@ -195,23 +295,48 @@ pub async fn run(
                 store,
                 storage_sessions_ks,
                 storage_registry_ks,
+                storage_stats_ks,
+                storage_dids_ks,
                 storage_auth_config,
                 storage_registry_config,
                 has_auth,
                 storage_http,
+                storage_collector,
+
                 &mut storage_shutdown,
             )
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // Wait for REST to be ready
+    // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
+
+    // 3. Start DIDComm service for inbound messages
+    let didcomm_shutdown = CancellationToken::new();
+    let didcomm_service = if state.config.features.didcomm {
+        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => Some(svc),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("failed to start DIDComm service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Wait for shutdown signal
     shutdown_signal().await;
 
-    // Ordered shutdown: REST → Storage
+    // Ordered shutdown: DIDComm → REST → Storage
     let mut any_panic = false;
+
+    didcomm_shutdown.cancel();
+    if let Some(svc) = didcomm_service {
+        svc.shutdown().await;
+        info!("DIDComm service stopped");
+    }
 
     let _ = rest_shutdown_tx.send(true);
     if let Some(handle) = rest_handle {
@@ -247,6 +372,67 @@ pub async fn run(
 
     info!("control plane shut down");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DIDComm service startup (inbound)
+// ---------------------------------------------------------------------------
+
+async fn start_didcomm_service(
+    state: &AppState,
+    secrets: &ServerSecrets,
+    shutdown: CancellationToken,
+) -> Result<Option<DIDCommService>, AppError> {
+    let control_did = match &state.config.server_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("DIDComm not configured — server_did not set");
+            return Ok(None);
+        }
+    };
+
+    let mediator_did = match &state.config.mediator_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("mediator_did not configured — DIDComm messaging disabled");
+            return Ok(None);
+        }
+    };
+
+    let profile = build_tdk_profile(
+        "control",
+        control_did,
+        Some(mediator_did),
+        secrets,
+        state.did_resolver.as_ref(),
+    )
+    .await?;
+
+    let listener = ListenerConfig {
+        id: "control".into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        ..Default::default()
+    };
+
+    let router = messaging::build_control_router()
+        .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    let svc = DIDCommService::start(
+        DIDCommServiceConfig {
+            listeners: vec![listener],
+        },
+        router,
+        shutdown,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+
+    info!("DIDComm service started for {control_did}");
+    Ok(Some(svc))
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +486,8 @@ fn run_rest_thread(
     shutdown_rx: &mut watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .expect("failed to build REST runtime");
@@ -315,14 +502,15 @@ fn run_rest_thread(
             .with_state(state)
             .layer(
                 TraceLayer::new_for_http()
-                    .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                    .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
                     .on_response(
                         DefaultOnResponse::new()
-                            .level(Level::INFO)
+                            .level(Level::DEBUG)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers));
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+            .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());
 
@@ -346,10 +534,13 @@ fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
     registry_ks: KeyspaceHandle,
+    stats_ks: KeyspaceHandle,
+    dids_ks: KeyspaceHandle,
     auth_config: AuthConfig,
     registry_config: crate::config::RegistryConfig,
     has_auth: bool,
     http: reqwest::Client,
+    collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -362,13 +553,16 @@ fn run_storage_thread(
 
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let health_interval = Duration::from_secs(registry_config.health_check_interval.max(10));
+        let flush_interval = Duration::from_secs(10);
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut health_timer = tokio::time::interval(health_interval);
+        let mut flush_timer = tokio::time::interval(flush_interval);
 
         // Skip first tick (immediate)
         session_timer.tick().await;
         health_timer.tick().await;
+        flush_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -382,12 +576,21 @@ fn run_storage_thread(
                         warn!("health check error: {e}");
                     }
                 }
+                _ = flush_timer.tick() => {
+                    // Flush accumulated per-DID stats deltas to persistent store
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await {
+                        warn!("stats flush error: {e}");
+                    }
+                }
                 _ = shutdown_rx.changed() => {
                     info!("storage thread shutting down");
                     break;
                 }
             }
         }
+
+        // Final flush before shutdown
+        let _ = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await;
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -397,7 +600,54 @@ fn run_storage_thread(
     });
 }
 
-/// Run health checks against all registered instances.
+/// Flush accumulated stats deltas from the in-memory collector to the store.
+async fn flush_stats_to_store(
+    collector: &affinidi_webvh_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
+    let deltas = collector.drain_for_sync();
+    if deltas.is_empty() {
+        // Update total DID count even if no deltas
+        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+            collector.set_total_dids(dids.len() as u64);
+        }
+        return Ok(());
+    }
+
+    let mut batch = store.batch();
+    for d in &deltas {
+        let key = format!("stats:{}", d.mnemonic);
+        let mut stats: affinidi_webvh_common::DidStats = stats_ks
+            .get(key.as_str())
+            .await?
+            .unwrap_or_default();
+        stats.total_resolves += d.resolve_delta;
+        stats.total_updates += d.update_delta;
+        if let Some(t) = d.last_resolved_at {
+            stats.last_resolved_at = Some(stats.last_resolved_at.map_or(t, |prev| prev.max(t)));
+        }
+        if let Some(t) = d.last_updated_at {
+            stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
+        }
+        batch.insert(stats_ks, key, &stats)?;
+    }
+    batch.commit().await?;
+
+    // Update total DID count (periodic reconciliation)
+    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+        collector.set_total_dids(dids.len() as u64);
+    }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
+
+    debug!(count = deltas.len(), "flushed stats deltas to store");
+    Ok(())
+}
+
+/// Run health checks against all registered instances in parallel.
 async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     http: &reqwest::Client,
@@ -405,18 +655,29 @@ async fn run_health_checks(
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
-    for instance in &instances {
-        let status = registry::health_check(http, instance).await;
-        if status != instance.status {
-            info!(
-                instance_id = %instance.instance_id,
-                url = %instance.url,
-                old_status = ?instance.status,
-                new_status = ?status,
-                "instance status changed"
-            );
+    // Run all health checks concurrently
+    let mut handles = Vec::with_capacity(instances.len());
+    for inst in instances {
+        let http = http.clone();
+        handles.push(tokio::spawn(async move {
+            let new_status = registry::health_check(&http, &inst).await;
+            (inst, new_status)
+        }));
+    }
+
+    for handle in handles {
+        if let Ok((inst, new_status)) = handle.await {
+            if new_status != inst.status {
+                info!(
+                    instance_id = %inst.instance_id,
+                    url = %inst.url,
+                    old_status = ?inst.status,
+                    new_status = ?new_status,
+                    "instance status changed"
+                );
+            }
+            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now).await?;
         }
-        registry::update_instance_status(registry_ks, &instance.instance_id, status, now).await?;
     }
     Ok(())
 }

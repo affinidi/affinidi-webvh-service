@@ -35,15 +35,17 @@ webvh-witness setup
 
 The wizard walks you through configuration:
 
-- **Configuration file path** — where to write `config.toml`
+- **VTA credential** — authenticates with the witness's VTA
+  context and creates the witness DID automatically
 - **Features** — enable DIDComm messaging and/or REST API
-- **Server DID identity** — import a VTA secrets bundle or
-  generate keys
-- **Host / port** — listen address (default: `0.0.0.0:8531`)
+- **DID hosting** — URL and path where webvh-server will host
+  the witness DID
+- **Host / port** — listen address (default: `0.0.0.0:8102`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
-- **Admin bootstrap** — create an initial admin ACL entry
+- **Admin bootstrap** — enter an existing DID or generate a
+  new `did:key` identity
 
 ### 3. Start the witness
 

@@ -11,4 +11,4 @@ pub mod extractor {
     pub use affinidi_webvh_common::server::auth::extractor::*;
 }
 
-pub use extractor::{AdminAuth, AuthClaims};
+pub use extractor::{AdminAuth, AuthClaims, ServiceAuth};

@@ -74,7 +74,7 @@ export interface CheckNameResponse {
 
 export interface AclEntry {
   did: string;
-  role: "admin" | "owner";
+  role: "admin" | "owner" | "service";
   label: string | null;
   created_at: number;
   max_total_size: number | null;
@@ -108,6 +108,51 @@ export interface TimeSeriesPoint {
 
 export type TimeRange = "1h" | "24h" | "7d" | "30d";
 
+// Service overview types
+export interface ServiceOverview {
+  control: ControlInfo;
+  services: ServiceInfo[];
+  aggregate: AggregateStats;
+}
+
+export interface ControlInfo {
+  version: string;
+  serverDid: string | null;
+  publicUrl: string | null;
+  didcommEnabled: boolean;
+  totalLocalDids: number;
+}
+
+export interface ServiceInfo {
+  instanceId: string;
+  serviceType: string;
+  label: string | null;
+  url: string;
+  status: string;
+  lastHealthCheck: number | null;
+  registeredAt: number;
+  did: string | null;
+  stats: ServiceStats | null;
+}
+
+export interface ServiceStats {
+  totalDids: number;
+  totalResolves: number;
+  totalUpdates: number;
+  lastResolvedAt: number | null;
+  lastUpdatedAt: number | null;
+}
+
+export interface AggregateStats {
+  totalServices: number;
+  activeServices: number;
+  degradedServices: number;
+  unreachableServices: number;
+  totalDids: number;
+  totalResolves: number;
+  totalUpdates: number;
+}
+
 export interface TokenResponse {
   session_id: string;
   access_token: string;
@@ -126,26 +171,24 @@ export interface LoginStartResponse {
   options: any;
 }
 
-export interface ServerConfig {
-  serverDid: string | null;
+export interface ControlPlaneConfig {
+  controlDid: string | null;
+  mediatorDid: string | null;
   publicUrl: string | null;
-  features: { didcomm: boolean; restApi: boolean };
-  server: { host: string; port: number };
-  log: { level: string; format: string };
-  store: { dataDir: string };
-  auth: {
-    accessTokenExpiry: number;
-    refreshTokenExpiry: number;
-    challengeTtl: number;
-    sessionCleanupInterval: number;
-    passkeyEnrollmentTtl: number;
-    cleanupTtlMinutes: number;
-  };
-  limits: {
-    uploadBodyLimit: number;
-    defaultMaxTotalSize: number;
-    defaultMaxDidCount: number;
-  };
+  didHostingUrl: string | null;
+  didcommEnabled: boolean;
+  restApiEnabled: boolean;
+  listenAddress: string;
+  vtaUrl: string | null;
+  vtaDid: string | null;
+  healthCheckIntervalSecs: number;
+  configuredInstances: number;
+  accessTokenExpiry: number;
+  refreshTokenExpiry: number;
+  passkeyEnrollmentTtl: number;
+  dataDir: string;
+  logLevel: string;
+  logFormat: string;
 }
 
 export class ApiError extends Error {
@@ -210,6 +253,15 @@ async function request<T>(
 
   if (res.status === 204) {
     return undefined as T;
+  }
+
+  // Guard against HTML fallback responses (e.g., SPA catch-all returning index.html)
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    throw new ApiError(
+      res.status,
+      `Expected JSON response but got ${contentType || "unknown content type"} — is the API endpoint available?`,
+    );
   }
 
   return res.json() as Promise<T>;
@@ -303,6 +355,8 @@ export const api = {
 
   getServerStats: () => request<ServerStats>("/api/stats"),
 
+  getServicesOverview: () => request<ServiceOverview>("/api/services/overview"),
+
   getServerTimeseries: (range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries?range=${range}`),
 
@@ -313,7 +367,7 @@ export const api = {
 
   createAcl: (
     did: string,
-    role: "admin" | "owner",
+    role: "admin" | "owner" | "service",
     opts?: { label?: string; maxTotalSize?: number; maxDidCount?: number },
   ) =>
     request<AclEntry>("/api/acl", {
@@ -331,6 +385,7 @@ export const api = {
   updateAcl: (
     did: string,
     updates: {
+      role?: "admin" | "owner" | "service";
       label?: string | null;
       maxTotalSize?: number | null;
       maxDidCount?: number | null;
@@ -340,6 +395,7 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        role: updates.role,
         label: updates.label,
         max_total_size: updates.maxTotalSize,
         max_did_count: updates.maxDidCount,
@@ -349,7 +405,7 @@ export const api = {
   deleteAcl: (did: string) =>
     request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
 
-  getConfig: () => request<ServerConfig>("/api/config"),
+  getConfig: () => request<ControlPlaneConfig>("/api/config"),
 
   // Passkey auth
   passkeyEnrollStart: (token: string) =>

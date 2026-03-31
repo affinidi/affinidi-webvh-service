@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use affinidi_webvh_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, LogFormat, PlaintextSecrets, SecretsConfig,
-    ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
+    VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub server_did: Option<String>,
     pub mediator_did: Option<String>,
     pub public_url: Option<String>,
+    pub did_hosting_url: Option<String>,
     #[serde(default = "default_server")]
     pub server: ServerConfig,
     #[serde(default)]
@@ -25,6 +26,8 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub vta: VtaConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
     #[serde(skip)]
@@ -124,13 +127,23 @@ impl AppConfig {
         env_opt!("CONTROL_SERVER_DID", config.server_did);
         env_opt!("CONTROL_MEDIATOR_DID", config.mediator_did);
         env_opt!("CONTROL_PUBLIC_URL", config.public_url);
+        env_opt!("CONTROL_DID_HOSTING_URL", config.did_hosting_url);
+
+        // VTA config
+        env_opt!("CONTROL_VTA_URL", config.vta.url);
+        env_opt!("CONTROL_VTA_DID", config.vta.did);
+        env_opt!("CONTROL_VTA_CONTEXT_ID", config.vta.context_id);
         env_parse!(
             "CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL",
             config.registry.health_check_interval
         );
 
-        // Normalize: strip trailing slashes from public_url
+        // Normalize: strip trailing slashes from public_url and did_hosting_url
         if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+        if let Some(ref mut url) = config.did_hosting_url {
             let trimmed = url.trim_end_matches('/').to_string();
             *url = trimmed;
         }

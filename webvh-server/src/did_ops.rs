@@ -14,89 +14,76 @@ use crate::mnemonic::{
     generate_unique_mnemonic, is_path_available, validate_custom_path, validate_mnemonic,
 };
 use crate::server::AppState;
-use crate::stats;
+
 use crate::store::KeyspaceHandle;
 use affinidi_webvh_common::DidListEntry;
-use didwebvh_rs::log_entry::LogEntry;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-/// A record tracking a hosted DID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DidRecord {
-    pub owner: String,
-    pub mnemonic: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub version_count: u64,
-    #[serde(default)]
-    pub did_id: Option<String>,
-    #[serde(default)]
-    pub content_size: u64,
-    #[serde(default)]
-    pub disabled: bool,
-}
-
-/// A single parsed log entry with its DID document and parameters.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogEntryInfo {
-    pub version_id: Option<String>,
-    pub version_time: Option<String>,
-    pub state: Option<serde_json::Value>,
-    pub parameters: Option<serde_json::Value>,
-}
-
-/// Summary of WebVH log entry metadata parsed from the stored JSONL content.
-#[derive(Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogMetadata {
-    pub log_entry_count: u64,
-    pub latest_version_id: Option<String>,
-    pub latest_version_time: Option<String>,
-    pub method: Option<String>,
-    pub portable: bool,
-    pub pre_rotation: bool,
-    pub deactivated: bool,
-    pub ttl: Option<u32>,
-    pub witnesses: bool,
-    pub witness_count: u32,
-    pub witness_threshold: u32,
-    pub watchers: bool,
-    pub watcher_count: u32,
-    pub watcher_urls: Vec<String>,
-}
+// Re-export shared types and helpers from webvh-common so existing code
+// that imports from `crate::did_ops::*` continues to work.
+pub use affinidi_webvh_common::did_ops::{
+    DidRecord, LogEntryInfo, LogMetadata,
+    did_key, content_log_key, content_witness_key, owner_key, watcher_sync_key,
+    extract_did_id, extract_log_metadata, extract_did_web_document, parse_log_entries,
+};
 
 // ---------------------------------------------------------------------------
-// Store key helpers
+// Quota index — O(1) per-owner count and size tracking
 // ---------------------------------------------------------------------------
 
-pub fn did_key(mnemonic: &str) -> String {
-    format!("did:{mnemonic}")
+/// Per-owner quota index stored at `quota:{owner_did}`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuotaIndex {
+    pub did_count: u64,
+    pub total_size: u64,
 }
 
-pub fn content_log_key(mnemonic: &str) -> String {
-    format!("content:{mnemonic}:log")
+pub fn quota_key(owner: &str) -> String {
+    format!("quota:{owner}")
 }
 
-pub fn content_witness_key(mnemonic: &str) -> String {
-    format!("content:{mnemonic}:witness")
+/// Get or create the quota index for an owner.
+pub async fn get_quota(dids_ks: &KeyspaceHandle, owner: &str) -> Result<QuotaIndex, AppError> {
+    Ok(dids_ks.get(quota_key(owner)).await?.unwrap_or_default())
 }
 
-pub fn owner_key(did: &str, mnemonic: &str) -> String {
-    format!("owner:{did}:{mnemonic}")
+/// Increment the quota index on DID create.
+pub async fn quota_on_create(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.did_count += 1;
+    dids_ks.insert(quota_key(owner), &q).await
 }
 
-pub fn watcher_sync_key(mnemonic: &str) -> String {
-    format!("watcher_sync:{mnemonic}")
+/// Decrement the quota index on DID delete and subtract content size.
+pub async fn quota_on_delete(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+    content_size: u64,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.did_count = q.did_count.saturating_sub(1);
+    q.total_size = q.total_size.saturating_sub(content_size);
+    dids_ks.insert(quota_key(owner), &q).await
+}
+
+/// Adjust the quota index on DID publish (size change).
+pub async fn quota_on_size_change(
+    dids_ks: &KeyspaceHandle,
+    owner: &str,
+    old_size: u64,
+    new_size: u64,
+) -> Result<(), AppError> {
+    let mut q = get_quota(dids_ks, owner).await?;
+    q.total_size = q.total_size.saturating_sub(old_size).saturating_add(new_size);
+    dids_ks.insert(quota_key(owner), &q).await
 }
 
 // ---------------------------------------------------------------------------
-// Quota checks
+// Quota checks — O(1) using the index
 // ---------------------------------------------------------------------------
 
 /// Check whether the owner has reached their DID count limit.
@@ -116,27 +103,25 @@ pub async fn check_did_count_limit(
         .map(|e| e.effective_max_did_count(config.limits.default_max_did_count))
         .unwrap_or(config.limits.default_max_did_count);
 
-    let prefix = format!("owner:{}:", auth.did);
-    let owned = dids_ks.prefix_iter_raw(prefix).await?;
-    let count = owned.len() as u64;
-    if count >= max {
-        warn!(did = %auth.did, count, max, "DID count quota exceeded");
+    let quota = get_quota(dids_ks, &auth.did).await?;
+    if quota.did_count >= max {
+        warn!(did = %auth.did, count = quota.did_count, max, "DID count quota exceeded");
         return Err(AppError::QuotaExceeded(format!(
             "DID count limit reached ({max})"
         )));
     }
-    debug!(did = %auth.did, count, max, "DID count quota check passed");
+    debug!(did = %auth.did, count = quota.did_count, max, "DID count quota check passed");
     Ok(())
 }
 
 /// Check whether storing `new_size` bytes would exceed the owner's total size quota.
-/// Admins are exempt. `exclude_mnemonic` is excluded from the sum (the upload replaces it).
+/// Admins are exempt. `old_size` is the current size of the DID being replaced (0 for new).
 pub async fn check_total_size_limit(
     auth: &AuthClaims,
     dids_ks: &KeyspaceHandle,
     acl_ks: &KeyspaceHandle,
     config: &AppConfig,
-    exclude_mnemonic: &str,
+    old_size: u64,
     new_size: u64,
 ) -> Result<(), AppError> {
     if auth.role == Role::Admin {
@@ -148,29 +133,15 @@ pub async fn check_total_size_limit(
         .map(|e| e.effective_max_total_size(config.limits.default_max_total_size))
         .unwrap_or(config.limits.default_max_total_size);
 
-    let prefix = format!("owner:{}:", auth.did);
-    let owned = dids_ks.prefix_iter_raw(prefix).await?;
-
-    let mut total: u64 = 0;
-    for (_key, value) in owned {
-        let mnemonic = String::from_utf8(value)
-            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if mnemonic == exclude_mnemonic {
-            continue;
-        }
-        if let Some(record) = dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            total = total.saturating_add(record.content_size);
-        }
-    }
-
-    let proposed = total.saturating_add(new_size);
+    let quota = get_quota(dids_ks, &auth.did).await?;
+    let proposed = quota.total_size.saturating_sub(old_size).saturating_add(new_size);
     if proposed > max {
-        warn!(did = %auth.did, current = total, new_size, max, "total size quota exceeded");
+        warn!(did = %auth.did, current = quota.total_size, old_size, new_size, max, "total size quota exceeded");
         return Err(AppError::QuotaExceeded(format!(
             "total DID document size would exceed limit ({max} bytes)"
         )));
     }
-    debug!(did = %auth.did, current = total, new_size, max, "total size quota check passed");
+    debug!(did = %auth.did, current = quota.total_size, new_size, max, "total size quota check passed");
     Ok(())
 }
 
@@ -227,160 +198,13 @@ pub async fn set_did_disabled(
 }
 
 // ---------------------------------------------------------------------------
-// JSONL validation & extraction
+// JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
-    if content.is_empty() {
-        return Err(AppError::Validation(
-            "did.jsonl content cannot be empty".into(),
-        ));
-    }
-
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        LogEntry::deserialize_string(line, None).map_err(|e| {
-            AppError::Validation(format!("invalid log entry at line {}: {e}", idx + 1))
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Extract the `did:webvh:...` identifier from the last line of JSONL content
-/// via the `state.id` field.
-pub fn extract_did_id(jsonl_content: &str) -> Option<String> {
-    let last_line = jsonl_content.lines().last()?;
-    let value: serde_json::Value = serde_json::from_str(last_line).ok()?;
-    value
-        .get("state")
-        .and_then(|state| state.get("id"))
-        .and_then(|id| id.as_str())
-        .filter(|s| s.starts_with("did:webvh:"))
-        .map(|s| s.to_string())
-}
-
-/// Parse JSONL content and extract metadata from the log entries.
-pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
-    let lines: Vec<&str> = jsonl_content.lines().collect();
-    let mut meta = LogMetadata {
-        log_entry_count: lines.len() as u64,
-        ..Default::default()
-    };
-
-    let Some(last_line) = lines.last() else {
-        return meta;
-    };
-    let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line) else {
-        return meta;
-    };
-
-    meta.latest_version_id = entry
-        .get("versionId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    meta.latest_version_time = entry
-        .get("versionTime")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    if let Some(params) = entry.get("parameters") {
-        meta.method = params
-            .get("method")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        meta.portable = params
-            .get("portable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        meta.pre_rotation = params
-            .get("nextKeyHashes")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty());
-
-        meta.deactivated = params
-            .get("deactivated")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        meta.ttl = params.get("ttl").and_then(|v| v.as_u64()).map(|v| v as u32);
-
-        if let Some(witness) = params.get("witness") {
-            let threshold = witness
-                .get("threshold")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let count = witness
-                .get("witnesses")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len() as u32)
-                .unwrap_or(0);
-            if count > 0 {
-                meta.witnesses = true;
-                meta.witness_count = count;
-                meta.witness_threshold = threshold;
-            }
-        }
-
-        if let Some(watchers_val) = params.get("watchers")
-            && let Some(arr) = watchers_val.as_array()
-            && !arr.is_empty()
-        {
-            meta.watchers = true;
-            meta.watcher_count = arr.len() as u32;
-            meta.watcher_urls = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-        }
-    }
-
-    meta
-}
-
-// ---------------------------------------------------------------------------
-// did:web document extraction
-// ---------------------------------------------------------------------------
-
-/// Extract a did:web document from JSONL content by rewriting the did:webvh identity.
-///
-/// Returns `Some(json_bytes)` if the last log entry's `state.alsoKnownAs` contains
-/// the expected `did:web` identifier. The returned document has all occurrences of
-/// the original `did:webvh:...` id replaced with the `did:web:...` id.
-///
-/// Returns `None` if there is no state, no `alsoKnownAs`, or the expected `did:web`
-/// is not declared.
-pub fn extract_did_web_document(jsonl_content: &str, expected_did_web: &str) -> Option<Vec<u8>> {
-    let last_line = jsonl_content.lines().last()?;
-    let entry: serde_json::Value = serde_json::from_str(last_line).ok()?;
-    let state = entry.get("state")?;
-
-    // Get the original did:webvh identifier
-    let webvh_id = state.get("id")?.as_str()?;
-    if !webvh_id.starts_with("did:webvh:") {
-        return None;
-    }
-
-    // Check that alsoKnownAs contains the expected did:web
-    let also_known_as = state.get("alsoKnownAs")?.as_array()?;
-    let found = also_known_as
-        .iter()
-        .any(|v| v.as_str() == Some(expected_did_web));
-    if !found {
-        return None;
-    }
-
-    // Rewrite: serialize the state and replace all occurrences of the webvh id
-    let state_json = serde_json::to_string(state).ok()?;
-    let rewritten = state_json.replace(webvh_id, expected_did_web);
-    Some(rewritten.into_bytes())
+    affinidi_webvh_common::did_ops::validate_did_jsonl(content)
+        .map_err(AppError::Validation)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +261,7 @@ pub async fn create_did(
         did_id: None,
         content_size: 0,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = state.store.batch();
@@ -448,9 +273,15 @@ pub async fn create_did(
     );
     batch.commit().await?;
 
+    // Update quota index
+    quota_on_create(&state.dids_ks, &auth.did).await?;
+
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
-    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
+    if let Some(ref collector) = state.stats_collector {
+        collector.increment_total_dids();
+    }
+    info!(audit = true, did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID URI created");
 
     Ok(CreateDidResult { mnemonic, did_url })
 }
@@ -476,12 +307,13 @@ pub async fn publish_did(
     validate_did_jsonl(did_log)?;
 
     let new_size = did_log.len() as u64;
+    let old_size = record.content_size;
     check_total_size_limit(
         auth,
         &state.dids_ks,
         &state.acl_ks,
         &state.config,
-        mnemonic,
+        old_size,
         new_size,
     )
     .await?;
@@ -508,8 +340,15 @@ pub async fn publish_did(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.commit().await?;
 
-    stats::increment_updates(&state.stats_ks, mnemonic).await?;
-    let _ = stats::record_timeseries_update(&state.stats_ks, mnemonic).await;
+    // Update quota index for size change
+    quota_on_size_change(&state.dids_ks, &record.owner, old_size, new_size).await?;
+
+    // Invalidate cache for this DID
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
+    if let Some(ref collector) = state.stats_collector {
+        collector.record_update(mnemonic);
+    }
 
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
@@ -577,7 +416,7 @@ pub async fn upload_witness(
 pub struct DidInfoResult {
     pub record: DidRecord,
     pub log_metadata: Option<LogMetadata>,
-    pub stats: stats::DidStats,
+    pub stats: affinidi_webvh_common::DidStats,
     pub did_url: String,
 }
 
@@ -598,7 +437,7 @@ pub async fn get_did_info(
         None => None,
     };
 
-    let did_stats = stats::get_stats(&state.stats_ks, mnemonic).await?;
+    let did_stats = affinidi_webvh_common::DidStats::default();
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID info retrieved");
@@ -629,25 +468,7 @@ pub async fn get_did_log(
     let content = String::from_utf8(bytes)
         .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
-    let entries: Vec<LogEntryInfo> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            Some(LogEntryInfo {
-                version_id: value
-                    .get("versionId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                version_time: value
-                    .get("versionTime")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                state: value.get("state").cloned(),
-                parameters: value.get("parameters").cloned(),
-            })
-        })
-        .collect();
+    let entries = parse_log_entries(&content);
 
     debug!(mnemonic = %mnemonic, count = entries.len(), "DID log entries retrieved");
 
@@ -660,6 +481,8 @@ pub async fn list_dids(
     auth: &AuthClaims,
     state: &AppState,
     requested_owner: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<DidListEntry>, AppError> {
     // Admin with no owner filter → return all DIDs across all owners.
     if auth.role == Role::Admin && requested_owner.is_none() {
@@ -680,7 +503,7 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            let did_stats = stats::get_stats(&state.stats_ks, &mnemonic).await?;
+            let did_stats = affinidi_webvh_common::DidStats::default();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -694,7 +517,13 @@ pub async fn list_dids(
         }
     }
 
-    info!(did = %auth.did, role = %auth.role, owner = %target_owner, count = entries.len(), "DIDs listed");
+    // Apply pagination
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(1000); // Default max 1000
+    let total = entries.len();
+    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+
+    info!(did = %auth.did, role = %auth.role, owner = %target_owner, total, returned = entries.len(), "DIDs listed");
 
     Ok(entries)
 }
@@ -712,7 +541,7 @@ async fn list_all_dids(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let did_stats = stats::get_stats(&state.stats_ks, &record.mnemonic).await?;
+        let did_stats = affinidi_webvh_common::DidStats::default();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -736,34 +565,66 @@ pub struct DeleteDidResult {
     pub did_id: Option<String>,
 }
 
-/// Delete a DID and all its associated data.
+/// Soft-delete a DID. Content is preserved for recovery within the retention period.
+/// The cleanup thread will hard-delete records after the configured retention.
 pub async fn delete_did(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
 ) -> Result<DeleteDidResult, AppError> {
     validate_mnemonic(mnemonic)?;
-    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let did_id = record.did_id.clone();
 
-    let mut batch = state.store.batch();
-    batch.remove(&state.dids_ks, did_key(mnemonic));
-    batch.remove(&state.dids_ks, content_log_key(mnemonic));
-    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
-    batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
-    batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
-    batch.remove(&state.stats_ks, format!("stats:{mnemonic}"));
-    batch.commit().await?;
+    // Mark as deleted instead of removing
+    record.deleted_at = Some(now_epoch());
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
 
-    let _ = stats::delete_timeseries(&state.stats_ks, mnemonic).await;
+    // Update quota index (content is still stored but quota is freed)
+    quota_on_delete(&state.dids_ks, &record.owner, record.content_size).await?;
 
-    info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
+    if let Some(ref collector) = state.stats_collector {
+        collector.decrement_total_dids();
+    }
+    info!(audit = true, did = %auth.did, role = %auth.role, mnemonic = %mnemonic, "DID deleted");
 
     Ok(DeleteDidResult {
         mnemonic: mnemonic.to_string(),
         did_id,
     })
+}
+
+/// Recover a soft-deleted DID by clearing its `deleted_at` timestamp.
+pub async fn recover_did(
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic)?;
+
+    let mut record: DidRecord = state
+        .dids_ks
+        .get(did_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
+
+    if record.deleted_at.is_none() {
+        return Err(AppError::Validation("DID is not deleted".into()));
+    }
+
+    record.deleted_at = None;
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+
+    // Restore quota
+    quota_on_create(&state.dids_ks, &record.owner).await?;
+
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
+    info!(audit = true, mnemonic = %mnemonic, owner = %record.owner, "DID recovered from soft delete");
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +688,8 @@ pub async fn rollback_did(
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.commit().await?;
 
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
     let log_metadata = Some(extract_log_metadata(&truncated));
     let did_url = format!("{}/{mnemonic}/did.jsonl", state.config.public_base_url());
 
@@ -868,12 +731,13 @@ pub async fn get_raw_log(
 // Cleanup
 // ---------------------------------------------------------------------------
 
-/// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`.
+/// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`,
+/// or soft-deleted records past the 30-day retention period.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
-    stats_ks: &KeyspaceHandle,
     ttl_seconds: u64,
 ) -> Result<u64, AppError> {
+    const SOFT_DELETE_RETENTION: u64 = 30 * 24 * 3600; // 30 days
     let now = now_epoch();
     let raw = dids_ks.prefix_iter_raw("did:").await?;
     let mut removed = 0u64;
@@ -883,7 +747,14 @@ pub async fn cleanup_empty_dids(
             Ok(r) => r,
             Err(_) => continue,
         };
-        if record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds {
+
+        let should_remove =
+            // Empty records past TTL
+            (record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds)
+            // Soft-deleted records past retention
+            || record.deleted_at.is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION);
+
+        if should_remove {
             dids_ks.remove(did_key(&record.mnemonic)).await?;
             dids_ks.remove(content_log_key(&record.mnemonic)).await?;
             dids_ks
@@ -892,8 +763,6 @@ pub async fn cleanup_empty_dids(
             dids_ks
                 .remove(owner_key(&record.owner, &record.mnemonic))
                 .await?;
-            stats::delete_stats(stats_ks, &record.mnemonic).await?;
-            let _ = stats::delete_timeseries(stats_ks, &record.mnemonic).await;
             removed += 1;
         }
     }
@@ -909,117 +778,7 @@ pub async fn cleanup_empty_dids(
 mod tests {
     use super::*;
 
-    #[test]
-    fn extract_did_id_from_state_id() {
-        let jsonl = r#"{"versionId":"1-abc","parameters":{"method":"did:webvh:1.0"},"state":{"id":"did:webvh:abc123:example.com:test"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:abc123:example.com:test".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_ignores_parameters_method() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"},"state":{"id":"did:webvh:real:host:path"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:real:host:path".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_without_state() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"}}"#;
-        assert_eq!(extract_did_id(jsonl), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_non_webvh_state_id() {
-        let jsonl = r#"{"state":{"id":"did:key:z6Mk..."}}"#;
-        assert_eq!(extract_did_id(jsonl), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_invalid_json() {
-        assert_eq!(extract_did_id("not valid json"), None);
-    }
-
-    #[test]
-    fn extract_did_id_returns_none_for_empty() {
-        assert_eq!(extract_did_id(""), None);
-    }
-
-    #[test]
-    fn extract_did_id_uses_last_line() {
-        let jsonl = r#"{"state":{"id":"did:webvh:first:host:path"}}
-{"state":{"id":"did:webvh:second:host:path"}}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:second:host:path".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_did_id_realistic_entry() {
-        let jsonl = r#"{"versionId":"1-QmHash","versionTime":"2025-01-23T04:12:36Z","parameters":{"method":"did:webvh:1.0","scid":"QmSCID","updateKeys":["z82Lk"]},"state":{"@context":["https://www.w3.org/ns/did/v1"],"id":"did:webvh:QmSCID:localhost%3A3000:my-did","authentication":["did:webvh:QmSCID:localhost%3A3000:my-did#key-0"]},"proof":[{"type":"DataIntegrityProof"}]}"#;
-        assert_eq!(
-            extract_did_id(jsonl),
-            Some("did:webvh:QmSCID:localhost%3A3000:my-did".to_string())
-        );
-    }
-
-    // ---- extract_log_metadata tests ----
-
-    #[test]
-    fn log_metadata_empty_content() {
-        let meta = extract_log_metadata("");
-        assert_eq!(meta.log_entry_count, 0);
-        assert_eq!(meta.latest_version_id, None);
-    }
-
-    #[test]
-    fn log_metadata_basic_entry() {
-        let jsonl = r#"{"versionId":"1-QmHash","versionTime":"2025-01-23T04:12:36Z","parameters":{"method":"did:webvh:1.0","portable":true}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert_eq!(meta.log_entry_count, 1);
-        assert_eq!(meta.latest_version_id.as_deref(), Some("1-QmHash"));
-        assert_eq!(
-            meta.latest_version_time.as_deref(),
-            Some("2025-01-23T04:12:36Z")
-        );
-        assert_eq!(meta.method.as_deref(), Some("did:webvh:1.0"));
-        assert!(meta.portable);
-        assert!(!meta.pre_rotation);
-        assert!(!meta.witnesses);
-        assert!(!meta.watchers);
-        assert!(!meta.deactivated);
-    }
-
-    #[test]
-    fn log_metadata_with_witnesses_and_watchers() {
-        let jsonl = r#"{"versionId":"2-QmXyz","parameters":{"witness":{"threshold":2,"witnesses":[{"id":"did:key:z1"},{"id":"did:key:z2"},{"id":"did:key:z3"}]},"watchers":["https://w1.example.com","https://w2.example.com"],"nextKeyHashes":["QmHash1"]}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert!(meta.witnesses);
-        assert_eq!(meta.witness_count, 3);
-        assert_eq!(meta.witness_threshold, 2);
-        assert!(meta.watchers);
-        assert_eq!(meta.watcher_count, 2);
-        assert!(meta.pre_rotation);
-    }
-
-    #[test]
-    fn log_metadata_multi_line_uses_last() {
-        let jsonl = r#"{"versionId":"1-first","parameters":{"method":"did:webvh:1.0"}}
-{"versionId":"2-second","parameters":{"portable":true,"deactivated":true,"ttl":300}}"#;
-        let meta = extract_log_metadata(jsonl);
-        assert_eq!(meta.log_entry_count, 2);
-        assert_eq!(meta.latest_version_id.as_deref(), Some("2-second"));
-        assert!(meta.portable);
-        assert!(meta.deactivated);
-        assert_eq!(meta.ttl, Some(300));
-    }
-
-    // ---- validate_did_jsonl tests ----
+    // ---- validate_did_jsonl wrapper tests ----
 
     #[test]
     fn validate_jsonl_empty_string_rejected() {
@@ -1046,113 +805,38 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn make_valid_jsonl() -> String {
+    async fn make_valid_jsonl() -> String {
         use affinidi_webvh_common::did::{build_did_document, create_log_entry, encode_host};
 
         let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
         let pk = secret.get_public_keymultibase().unwrap();
         let host = encode_host("http://localhost:3000").unwrap();
-        let doc = build_did_document(&host, "test-validate", &pk);
-        let (_scid, jsonl) = create_log_entry(&doc, &secret).unwrap();
+        let doc = build_did_document(&host, "test-validate", &pk, &Default::default());
+        let (_scid, jsonl) = create_log_entry(&doc, &secret).await.unwrap();
         jsonl
     }
 
-    #[test]
-    fn validate_jsonl_blank_lines_skipped() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_blank_lines_skipped() {
+        let entry = make_valid_jsonl().await;
         let with_blanks = format!("\n{entry}\n\n");
         assert!(validate_did_jsonl(&with_blanks).is_ok());
     }
 
-    #[test]
-    fn validate_jsonl_valid_single_entry() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_valid_single_entry() {
+        let entry = make_valid_jsonl().await;
         assert!(validate_did_jsonl(&entry).is_ok());
     }
 
-    #[test]
-    fn validate_jsonl_second_line_invalid() {
-        let entry = make_valid_jsonl();
+    #[tokio::test]
+    async fn validate_jsonl_second_line_invalid() {
+        let entry = make_valid_jsonl().await;
         let content = format!("{entry}\nnot valid json");
         let result = validate_did_jsonl(&content);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
-    }
-
-    // ---- extract_did_web_document tests ----
-
-    #[test]
-    fn did_web_document_rewrites_ids() {
-        let jsonl = r#"{"state":{"@context":["https://www.w3.org/ns/did/v1"],"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:example.com:my-did"],"authentication":["did:webvh:SCID123:example.com:my-did#key-0"],"verificationMethod":[{"id":"did:webvh:SCID123:example.com:my-did#key-0","type":"Multikey","controller":"did:webvh:SCID123:example.com:my-did","publicKeyMultibase":"z6MkPub"}]}}"#;
-        let result = extract_did_web_document(jsonl, "did:web:example.com:my-did").unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(doc["id"], "did:web:example.com:my-did");
-        assert_eq!(doc["authentication"][0], "did:web:example.com:my-did#key-0");
-        assert_eq!(
-            doc["verificationMethod"][0]["id"],
-            "did:web:example.com:my-did#key-0"
-        );
-        assert_eq!(
-            doc["verificationMethod"][0]["controller"],
-            "did:web:example.com:my-did"
-        );
-        // alsoKnownAs should still be present (unchanged)
-        assert!(doc["alsoKnownAs"].is_array());
-    }
-
-    #[test]
-    fn did_web_document_none_without_also_known_as() {
-        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did"}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_when_did_web_not_in_list() {
-        let jsonl = r#"{"state":{"id":"did:webvh:SCID123:example.com:my-did","alsoKnownAs":["did:web:other.com:my-did"]}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:my-did").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_without_state() {
-        let jsonl = r#"{"parameters":{"method":"did:webvh:1.0"}}"#;
-        assert!(extract_did_web_document(jsonl, "did:web:example.com:test").is_none());
-    }
-
-    #[test]
-    fn did_web_document_none_for_empty_content() {
-        assert!(extract_did_web_document("", "did:web:example.com:test").is_none());
-    }
-
-    #[test]
-    fn did_web_document_uses_last_line() {
-        let jsonl = r#"{"state":{"id":"did:webvh:OLD:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}
-{"state":{"id":"did:webvh:NEW:example.com:test","alsoKnownAs":["did:web:example.com:test"]}}"#;
-        let result = extract_did_web_document(jsonl, "did:web:example.com:test").unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(doc["id"], "did:web:example.com:test");
-        // Verify the OLD id is not present (it was in a different line)
-        let text = String::from_utf8(result.clone()).unwrap();
-        assert!(!text.contains("did:webvh:OLD"));
-        assert!(!text.contains("did:webvh:NEW"));
-    }
-
-    // ---- DidRecord serde backwards compat ----
-
-    #[test]
-    fn did_record_deserialize_without_content_size() {
-        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":100,"version_count":1}"#;
-        let record: DidRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.content_size, 0);
-        assert!(record.did_id.is_none());
-    }
-
-    #[test]
-    fn did_record_deserialize_with_content_size() {
-        let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":200,"version_count":2,"did_id":"did:webvh:abc:host:path","content_size":5000}"#;
-        let record: DidRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.content_size, 5000);
-        assert_eq!(record.did_id.as_deref(), Some("did:webvh:abc:host:path"));
     }
 
     // ---- rollback helper tests (pure functions used by rollback_did) ----
@@ -1190,7 +874,6 @@ mod tests {
         let jsonl = format!("{line1}\n{line2}\n{line3}");
         let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
         let truncated = lines[..lines.len() - 1].join("\n");
-        // After rollback, did_id should come from line2 (now the last entry)
         assert_eq!(
             extract_did_id(&truncated),
             Some("did:webvh:update1:host:path".to_string())

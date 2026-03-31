@@ -4,10 +4,9 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use affinidi_webvh_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, LogFormat, PlaintextSecrets, SecretsConfig,
-    ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
+    VtaConfig,
 };
-// PlaintextSecrets is used by setup.rs
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -29,7 +28,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
     pub watchers: Vec<WatcherEndpoint>,
+    /// URL of the control plane for service registration.
+    pub control_url: Option<String>,
+    /// DID of the control plane service (for DIDComm authentication).
+    pub control_did: Option<String>,
+    #[serde(default)]
+    pub vta: VtaConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -71,6 +78,35 @@ impl Default for LimitsConfig {
             upload_body_limit: default_upload_body_limit(),
             default_max_total_size: default_max_total_size(),
             default_max_did_count: default_max_did_count(),
+        }
+    }
+}
+
+/// Stats collection and sync configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StatsConfig {
+    /// How often (seconds) to flush in-memory counters to storage. Default: 5.
+    #[serde(default = "default_stats_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// How often (seconds) to push aggregate stats to the control plane. Default: 1.
+    /// Set to 0 to disable sync.
+    #[serde(default = "default_stats_sync_interval")]
+    pub sync_interval_secs: u64,
+}
+
+fn default_stats_flush_interval() -> u64 {
+    5
+}
+
+fn default_stats_sync_interval() -> u64 {
+    1
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: default_stats_flush_interval(),
+            sync_interval_secs: default_stats_sync_interval(),
         }
     }
 }
@@ -123,14 +159,42 @@ impl AppConfig {
         env_opt!("WEBVH_SERVER_DID", config.server_did);
         env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
         env_opt!("WEBVH_PUBLIC_URL", config.public_url);
+        env_opt!("WEBVH_CONTROL_URL", config.control_url);
+        env_opt!("WEBVH_CONTROL_DID", config.control_did);
+
+        // VTA config
+        env_opt!("WEBVH_VTA_URL", config.vta.url);
+        env_opt!("WEBVH_VTA_DID", config.vta.did);
+        env_opt!("WEBVH_VTA_CONTEXT_ID", config.vta.context_id);
 
         // Limits
         env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
         env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
 
-        // Normalize: strip trailing slashes from public_url
+        // Stats
+        env_parse!("WEBVH_STATS_FLUSH_INTERVAL_SECS", config.stats.flush_interval_secs);
+        env_parse!("WEBVH_STATS_SYNC_INTERVAL_SECS", config.stats.sync_interval_secs);
+
+        // Validate configuration
+        config.auth.validate()?;
+        if let Some(ref did) = config.server_did {
+            if !did.starts_with("did:") {
+                return Err(AppError::Config(format!("server_did must start with 'did:': {did}")));
+            }
+        }
+        if let Some(ref url) = config.public_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(AppError::Config(format!("public_url must start with http:// or https://: {url}")));
+            }
+        }
+
+        // Normalize: strip trailing slashes from URLs
         if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+        if let Some(ref mut url) = config.control_url {
             let trimmed = url.trim_end_matches('/').to_string();
             *url = trimmed;
         }

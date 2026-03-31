@@ -89,8 +89,8 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
           <ActivityIndicator color={colors.accent} />
         </View>
       ) : (
-        <div style={{ width: "100%", height: 260 }}>
-          <ResponsiveContainer width="100%" height="100%">
+        <View style={{ width: "100%", height: 260 }}>
+          <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="gradResolves" x1="0" y1="0" x2="0" y2="1">
@@ -148,7 +148,7 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
               />
             </AreaChart>
           </ResponsiveContainer>
-        </div>
+        </View>
       )}
     </View>
   );

@@ -25,6 +25,10 @@ pub struct Session {
     pub created_at: u64,
     pub refresh_token: Option<String>,
     pub refresh_expires_at: Option<u64>,
+    /// Current token ID — JWT `jti` must match this to be valid. Rotated on
+    /// each token issue/refresh so old tokens are immediately invalidated.
+    #[serde(default)]
+    pub token_id: Option<String>,
 }
 
 fn session_key(session_id: &str) -> String {
@@ -178,7 +182,7 @@ fn generate_tokens(
     role: &Role,
     access_expiry: u64,
     refresh_expiry: u64,
-) -> Result<(String, u64, String, u64), AppError> {
+) -> Result<(String, u64, String, u64, String), AppError> {
     let claims = JwtKeys::new_claims(
         did.to_string(),
         session_id.to_string(),
@@ -186,10 +190,11 @@ fn generate_tokens(
         access_expiry,
     );
     let access_expires_at = claims.exp;
+    let token_id = claims.jti.clone();
     let access_token = jwt_keys.encode(&claims)?;
     let refresh_token = Uuid::new_v4().to_string();
     let refresh_expires_at = now_epoch() + refresh_expiry;
-    Ok((access_token, access_expires_at, refresh_token, refresh_expires_at))
+    Ok((access_token, access_expires_at, refresh_token, refresh_expires_at, token_id))
 }
 
 /// Upgrade an existing `ChallengeSent` session to `Authenticated`, generating
@@ -203,12 +208,13 @@ pub async fn finalize_challenge_session(
     access_expiry: u64,
     refresh_expiry: u64,
 ) -> Result<TokenResponse, AppError> {
-    let (access_token, access_expires_at, refresh_token, refresh_expires_at) =
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
         generate_tokens(jwt_keys, &session.did, &session.session_id, role, access_expiry, refresh_expiry)?;
 
     session.state = SessionState::Authenticated;
     session.refresh_token = Some(refresh_token.clone());
     session.refresh_expires_at = Some(refresh_expires_at);
+    session.token_id = Some(token_id);
     store_session(sessions, session).await?;
 
     store_refresh_index(sessions, &refresh_token, &session.session_id).await?;
@@ -235,7 +241,7 @@ pub async fn create_authenticated_session(
 ) -> Result<TokenResponse, AppError> {
     let session_id = Uuid::new_v4().to_string();
 
-    let (access_token, access_expires_at, refresh_token, refresh_expires_at) =
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
         generate_tokens(jwt_keys, did, &session_id, role, access_expiry, refresh_expiry)?;
 
     let session = Session {
@@ -246,6 +252,7 @@ pub async fn create_authenticated_session(
         created_at: now_epoch(),
         refresh_token: Some(refresh_token.clone()),
         refresh_expires_at: Some(refresh_expires_at),
+        token_id: Some(token_id),
     };
 
     store_session(sessions, &session).await?;

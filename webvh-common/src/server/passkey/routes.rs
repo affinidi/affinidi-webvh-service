@@ -6,6 +6,7 @@ use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
 use crate::server::acl::{self, check_acl, AclEntry, Role};
+use crate::server::auth::extractor::AdminAuth;
 use crate::server::auth::session::{create_authenticated_session, now_epoch, TokenResponse};
 use crate::server::error::AppError;
 use super::{PasskeyState, store};
@@ -297,4 +298,89 @@ pub async fn login_finish<S: PasskeyState>(
     info!(did = %user.did, "passkey login successful");
 
     Ok(Json(token_resp))
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth/passkey/invite  (admin-only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateInviteRequest {
+    pub did: String,
+    #[serde(default = "default_invite_role")]
+    pub role: String,
+}
+
+fn default_invite_role() -> String {
+    "owner".into()
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateInviteResponse {
+    pub token: String,
+    pub enrollment_url: String,
+    pub expires_at: u64,
+}
+
+/// Core logic shared by the REST handler and CLI subcommand.
+pub async fn create_enrollment_invite(
+    sessions_ks: &crate::server::store::KeyspaceHandle,
+    base_url: &str,
+    enrollment_ttl: u64,
+    did: &str,
+    role: &str,
+) -> Result<CreateInviteResponse, AppError> {
+    // Validate role
+    let _ = Role::from_str(role)?;
+
+    // Generate a 32-byte random token
+    let token = {
+        use rand::RngExt;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        hex::encode(bytes)
+    };
+
+    let now = now_epoch();
+    let enrollment = store::Enrollment {
+        token: token.clone(),
+        did: did.to_string(),
+        role: role.to_string(),
+        created_at: now,
+        expires_at: now + enrollment_ttl,
+    };
+
+    store::store_enrollment(sessions_ks, &enrollment).await?;
+
+    let enrollment_url = format!("{base_url}/enroll?token={token}");
+
+    info!(did = %did, role = %role, "enrollment invite created");
+
+    Ok(CreateInviteResponse {
+        token,
+        enrollment_url,
+        expires_at: enrollment.expires_at,
+    })
+}
+
+/// Axum handler — requires admin auth.
+pub async fn create_invite<S: PasskeyState>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    Json(req): Json<CreateInviteRequest>,
+) -> Result<Json<CreateInviteResponse>, AppError> {
+    let base_url = state
+        .public_url()
+        .ok_or_else(|| AppError::Config("public_url is required for enrollment invites".into()))?;
+
+    let resp = create_enrollment_invite(
+        state.sessions_ks(),
+        base_url,
+        state.enrollment_ttl(),
+        &req.did,
+        &req.role,
+    )
+    .await?;
+
+    Ok(Json(resp))
 }

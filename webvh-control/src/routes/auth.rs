@@ -11,11 +11,36 @@ use crate::auth::session::{self, SessionState, Session, now_epoch};
 use crate::error::AppError;
 use crate::server::AppState;
 
+/// Maximum concurrent pending challenges per DID.
+const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+
 /// POST /api/auth/challenge — request a challenge nonce.
 pub async fn challenge(
     State(state): State<AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
+    // Input validation
+    if req.did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
+
+    // Rate limit pending challenges per DID
+    let sessions = state.sessions_ks.prefix_iter_raw("session:").await?;
+    let pending = sessions
+        .iter()
+        .filter(|(_, v)| {
+            serde_json::from_slice::<Session>(v)
+                .map(|s| s.did == req.did && s.state == SessionState::ChallengeSent)
+                .unwrap_or(false)
+        })
+        .count();
+    if pending >= MAX_PENDING_CHALLENGES_PER_DID {
+        warn!(did = %req.did, pending, "challenge rate limited");
+        return Err(AppError::Validation(
+            "too many pending challenges — try again later".into(),
+        ));
+    }
+
     let challenge_bytes = rand::random::<[u8; 32]>();
     let challenge = challenge_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -28,6 +53,7 @@ pub async fn challenge(
         created_at: now_epoch(),
         refresh_token: None,
         refresh_expires_at: None,
+        token_id: None,
     };
 
     session::store_session(&state.sessions_ks, &session).await?;
@@ -45,25 +71,18 @@ pub async fn authenticate(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<affinidi_webvh_common::AuthenticateResponse>, AppError> {
-    use affinidi_tdk::didcomm::Message;
+    use affinidi_webvh_common::server::didcomm_unpack;
 
-    let (did_resolver, secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
     // Unpack the signed DIDComm message
-    let (msg, _metadata) = Message::unpack_string(
-        &body,
-        did_resolver,
-        secrets_resolver,
-        &affinidi_tdk::didcomm::UnpackOptions::default(),
-    )
-    .await
-    .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
+    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
-    if msg.type_ != "https://affinidi.com/webvh/1.0/authenticate" {
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
-            msg.type_
+            msg.typ
         )));
     }
 

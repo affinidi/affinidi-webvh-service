@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-server"
 description = "WebVH Server, handles management and serving of WebVH Content"
-version = "0.0.1"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -15,18 +15,20 @@ build = "build.rs"
 
 [features]
 default = ["keyring", "store-fjall"]
-keyring = ["dep:keyring"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
+metrics = ["affinidi-webvh-common/metrics"]
+keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
   "dep:bytes",
+  "affinidi-webvh-common/gcp-secrets",
 ]
 store-fjall = ["dep:fjall"]
-store-redis = ["dep:redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
-store-firestore = ["dep:firestore", "dep:futures"]
-store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+store-redis = ["dep:redis", "affinidi-webvh-common/store-redis"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "affinidi-webvh-common/store-dynamodb"]
+store-firestore = ["dep:firestore", "dep:futures", "affinidi-webvh-common/store-firestore"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "affinidi-webvh-common/store-cosmosdb"]
 
 [lib]
 name = "affinidi_webvh_server"
@@ -39,6 +41,11 @@ path = "src/main.rs"
 [dependencies]
 affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall"] }
 affinidi-tdk = { workspace = true }
+affinidi-messaging-didcomm-service = { workspace = true }
+affinidi-tdk-common = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
+tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8"
 axum = "0.8"
 axum-extra = { workspace = true }
@@ -60,6 +67,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 toml = "1.0"
+vta-sdk = { workspace = true }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

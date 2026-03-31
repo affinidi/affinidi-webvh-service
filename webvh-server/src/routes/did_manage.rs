@@ -1,4 +1,4 @@
-use crate::auth::AuthClaims;
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::mnemonic::{is_path_available, validate_custom_path};
@@ -250,6 +250,18 @@ pub async fn rollback_did(
     )))
 }
 
+// ---------- POST /recover/{mnemonic} ----------
+
+pub async fn recover_did(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::recover_did(&state, mnemonic).await?;
+    Ok(axum::http::StatusCode::OK)
+}
+
 // ---------- GET /raw/{mnemonic} ----------
 
 pub async fn get_raw_log(
@@ -271,6 +283,8 @@ pub async fn get_raw_log(
 #[derive(Debug, Deserialize)]
 pub struct ListDidsQuery {
     pub owner: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 pub async fn list_dids(
@@ -278,6 +292,6 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref()).await?;
+    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), query.limit, query.offset).await?;
     Ok(Json(entries))
 }

@@ -2,9 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+};
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
-
 use affinidi_webvh_common::server::auth::extractor::AuthState;
+use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use tokio_util::sync::CancellationToken;
+
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
@@ -127,10 +132,9 @@ pub async fn run(
 
     // Separate shutdown channels for ordered shutdown (DIDComm -> REST -> Storage)
     let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
-    let (didcomm_shutdown_tx, didcomm_shutdown_rx) = watch::channel(false);
     let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
 
-    // REST ready signal — DIDComm thread waits for this before starting
+    // REST ready signal — DIDComm waits for this before starting
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
     // 1. Spawn REST thread
@@ -165,21 +169,19 @@ pub async fn run(
         })
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // 3. Wait for REST, then start DIDComm
+    // 3. Wait for REST, then start DIDComm service
     let _ = rest_ready_rx.await;
 
-    let didcomm_handle = if state.config.features.didcomm {
-        let mut didcomm_shutdown = didcomm_shutdown_rx.clone();
-        let didcomm_state = state.clone();
-        let didcomm_secrets = secrets;
-        Some(
-            std::thread::Builder::new()
-                .name("witness-didcomm".into())
-                .spawn(move || {
-                    run_didcomm_thread(didcomm_state, didcomm_secrets, &mut didcomm_shutdown)
-                })
-                .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?,
-        )
+    let didcomm_shutdown = CancellationToken::new();
+    let didcomm_service = if state.config.features.didcomm {
+        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => Some(svc),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("failed to start DIDComm service: {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -190,13 +192,10 @@ pub async fn run(
     // Ordered shutdown: DIDComm -> REST -> Storage
     let mut any_panic = false;
 
-    let _ = didcomm_shutdown_tx.send(true);
-    if let Some(handle) = didcomm_handle {
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => info!("DIDComm thread stopped"),
-            Ok(Err(_)) => { error!("DIDComm thread panicked"); any_panic = true; }
-            Err(e) => { error!("failed to join DIDComm thread: {e}"); any_panic = true; }
-        }
+    didcomm_shutdown.cancel();
+    if let Some(svc) = didcomm_service {
+        svc.shutdown().await;
+        info!("DIDComm service stopped");
     }
 
     let _ = rest_shutdown_tx.send(true);
@@ -224,6 +223,67 @@ pub async fn run(
 }
 
 // ---------------------------------------------------------------------------
+// DIDComm service startup
+// ---------------------------------------------------------------------------
+
+async fn start_didcomm_service(
+    state: &AppState,
+    secrets: &ServerSecrets,
+    shutdown: CancellationToken,
+) -> Result<Option<DIDCommService>, AppError> {
+    let server_did = match &state.config.server_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("DIDComm not configured — server_did not set");
+            return Ok(None);
+        }
+    };
+
+    let mediator_did = match &state.config.mediator_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("mediator_did not configured — DIDComm messaging disabled");
+            return Ok(None);
+        }
+    };
+
+    let profile = build_tdk_profile(
+        "witness",
+        server_did,
+        Some(mediator_did),
+        secrets,
+        state.did_resolver.as_ref(),
+    )
+    .await?;
+
+    let listener = ListenerConfig {
+        id: "witness".into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        ..Default::default()
+    };
+
+    let router = messaging::build_witness_router(state.clone())
+        .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    let svc = DIDCommService::start(
+        DIDCommServiceConfig {
+            listeners: vec![listener],
+        },
+        router,
+        shutdown,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+
+    info!("DIDComm service started for {server_did}");
+    Ok(Some(svc))
+}
+
+// ---------------------------------------------------------------------------
 // REST thread
 // ---------------------------------------------------------------------------
 
@@ -233,7 +293,8 @@ fn run_rest_thread(
     shutdown_rx: &mut watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .expect("failed to build REST runtime");
@@ -248,10 +309,10 @@ fn run_rest_thread(
             .with_state(state)
             .layer(
                 TraceLayer::new_for_http()
-                    .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                    .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
                     .on_response(
                         DefaultOnResponse::new()
-                            .level(Level::INFO)
+                            .level(Level::DEBUG)
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
@@ -270,49 +331,6 @@ fn run_rest_thread(
             .expect("axum serve failed");
 
         info!("REST thread shutting down");
-    });
-}
-
-// ---------------------------------------------------------------------------
-// DIDComm thread
-// ---------------------------------------------------------------------------
-
-fn run_didcomm_thread(
-    state: AppState,
-    secrets: ServerSecrets,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build DIDComm runtime");
-
-    rt.block_on(async {
-        info!("DIDComm thread started");
-
-        let server_did = match &state.config.server_did {
-            Some(did) => did.as_str(),
-            None => {
-                info!("DIDComm not configured — server_did not set, thread idle");
-                let _ = shutdown_rx.changed().await;
-                info!("DIDComm thread shutting down (idle)");
-                return;
-            }
-        };
-
-        let (atm, profile) =
-            match messaging::init_didcomm_connection(&state.config, server_did, &secrets, state.did_resolver.as_ref()).await {
-                Some(handles) => handles,
-                None => {
-                    let _ = shutdown_rx.changed().await;
-                    info!("DIDComm thread shutting down (init failed)");
-                    return;
-                }
-            };
-
-        messaging::run_didcomm_loop(&atm, &profile, server_did, &state, shutdown_rx).await;
-
-        info!("DIDComm thread shutting down");
     });
 }
 

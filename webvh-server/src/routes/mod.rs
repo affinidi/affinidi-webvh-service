@@ -38,15 +38,13 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/enable/{*mnemonic}", put(did_manage::enable_did))
         // Rollback + raw log (authenticated)
         .route("/rollback/{*mnemonic}", post(did_manage::rollback_did))
+        .route("/recover/{*mnemonic}", post(did_manage::recover_did))
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Services (authenticated, any role)
         .route("/services", get(config::get_services))
-        // Stats (authenticated)
+        // Stats (authenticated — in-memory only, authoritative stats on control plane)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
-        // Time-series (authenticated)
-        .route("/timeseries", get(stats::get_server_timeseries))
-        .route("/timeseries/{*mnemonic}", get(stats::get_did_timeseries))
         // DIDComm protocol endpoint
         .route("/didcomm", post(didcomm::handle))
         // Server config (admin only)
@@ -60,10 +58,17 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
-    Router::new()
-        .nest("/api", api)
-        // Health route (no auth required)
-        .route("/api/health", get(health::health))
+    #[allow(unused_mut)]
+    let mut router = Router::new()
+        .nest("/api", api);
+
+    // Prometheus metrics endpoint (only when metrics feature is enabled)
+    #[cfg(feature = "metrics")]
+    {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    router
         // .well-known routes (specific routes take priority over fallback)
         .route(
             "/.well-known/did.jsonl",
@@ -79,4 +84,13 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         )
         // Combined fallback: DID serving (no SPA - UI moved to webvh-control)
         .fallback(did_public::serve_public)
+}
+
+#[cfg(feature = "metrics")]
+async fn metrics_handler() -> (axum::http::StatusCode, [(& 'static str, &'static str); 1], String) {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        affinidi_webvh_common::server::metrics::render(),
+    )
 }
