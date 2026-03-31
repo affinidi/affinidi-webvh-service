@@ -556,15 +556,18 @@ fn run_storage_thread(
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let health_interval = Duration::from_secs(registry_config.health_check_interval.max(10));
         let flush_interval = Duration::from_secs(10);
+        let cleanup_interval = Duration::from_secs(3600); // 1 hour
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut health_timer = tokio::time::interval(health_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
+        let mut cleanup_timer = tokio::time::interval(cleanup_interval);
 
         // Skip first tick (immediate)
         session_timer.tick().await;
         health_timer.tick().await;
         flush_timer.tick().await;
+        cleanup_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -579,9 +582,15 @@ fn run_storage_thread(
                     }
                 }
                 _ = flush_timer.tick() => {
-                    // Flush accumulated per-DID stats deltas to persistent store
                     if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await {
                         warn!("stats flush error: {e}");
+                    }
+                }
+                _ = cleanup_timer.tick() => {
+                    match cleanup_old_buckets(&stats_ks).await {
+                        Ok(0) => {}
+                        Ok(n) => info!(removed = n, "cleaned up old time-series buckets"),
+                        Err(e) => warn!("bucket cleanup error: {e}"),
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -602,23 +611,35 @@ fn run_storage_thread(
     });
 }
 
-/// Flush accumulated stats deltas from the in-memory collector to the store.
+/// Flush accumulated stats from the in-memory collector to the store.
+///
+/// Drains both per-DID deltas and time-series buckets, then writes everything
+/// in a single atomic batch. This ensures consistency between per-DID stats
+/// and time-series data, and eliminates per-delta I/O from the receive path.
 async fn flush_stats_to_store(
     collector: &affinidi_webvh_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
     dids_ks: &KeyspaceHandle,
     store: &Store,
 ) -> Result<(), AppError> {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Default)]
+    struct BucketData {
+        r: u64,
+        u: u64,
+    }
+
     let deltas = collector.drain_for_sync();
-    if deltas.is_empty() {
-        // Update total DID count even if no deltas
-        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-            collector.set_total_dids(dids.len() as u64);
-        }
+    let buckets = collector.drain_buckets();
+
+    if deltas.is_empty() && buckets.is_empty() {
         return Ok(());
     }
 
     let mut batch = store.batch();
+
+    // Merge per-DID stat deltas
     for d in &deltas {
         let key = format!("stats:{}", d.mnemonic);
         let mut stats: affinidi_webvh_common::DidStats =
@@ -633,18 +654,61 @@ async fn flush_stats_to_store(
         }
         batch.insert(stats_ks, key, &stats)?;
     }
+
+    // Merge time-series bucket deltas
+    for b in &buckets {
+        let key = format!("ts:{}:{:010}", b.mnemonic, b.epoch);
+        let mut bucket: BucketData = stats_ks.get(key.as_str()).await?.unwrap_or_default();
+        bucket.r += b.resolves;
+        bucket.u += b.updates;
+        batch.insert(stats_ks, key, &bucket)?;
+    }
+
+    // Single atomic commit for everything
     batch.commit().await?;
 
     // Update total DID count (periodic reconciliation)
     if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
         collector.set_total_dids(dids.len() as u64);
     }
-    // Note: control plane still does the full scan because DIDs are managed
-    // from external sources (REST API, sync) making incremental tracking complex.
-    // This runs every 10s and is acceptable at 10K DIDs.
 
-    debug!(count = deltas.len(), "flushed stats deltas to store");
+    if !deltas.is_empty() || !buckets.is_empty() {
+        debug!(
+            did_deltas = deltas.len(),
+            ts_buckets = buckets.len(),
+            "flushed stats to store"
+        );
+    }
     Ok(())
+}
+
+/// Remove time-series buckets older than 30 days.
+async fn cleanup_old_buckets(stats_ks: &KeyspaceHandle) -> Result<u64, AppError> {
+    const RETENTION_SECS: u64 = 30 * 24 * 3600;
+    let cutoff = now_epoch().saturating_sub(RETENTION_SECS);
+    let raw = stats_ks.prefix_iter_raw("ts:").await?;
+    let mut removed = 0u64;
+
+    for (key, _) in &raw {
+        let key_str = std::str::from_utf8(key).unwrap_or_default();
+        // Key format: ts:{mnemonic}:{epoch:010}
+        if let Some(epoch_str) = key_str.rsplit(':').next() {
+            if let Ok(epoch) = epoch_str.parse::<u64>() {
+                if epoch < cutoff {
+                    stats_ks.remove(key.clone()).await?;
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Run health checks against all registered instances in parallel.
