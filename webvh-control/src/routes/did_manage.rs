@@ -303,21 +303,104 @@ fn default_range() -> String {
     "24h".to_string()
 }
 
-/// GET /api/timeseries — returns empty time-series data (follow-up feature).
+/// GET /api/timeseries — server-wide time-series data.
 pub async fn get_server_timeseries(
     _auth: AuthClaims,
-    Query(_params): Query<TimeseriesQuery>,
-) -> Json<Vec<TimeSeriesPoint>> {
-    Json(Vec::new())
+    State(state): State<AppState>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
+    let points = query_timeseries(&state.stats_ks, "_all", &params.range).await?;
+    Ok(Json(points))
 }
 
-/// GET /api/timeseries/{mnemonic} — returns empty time-series data (follow-up feature).
+/// GET /api/timeseries/{mnemonic} — per-DID time-series data.
 pub async fn get_did_timeseries(
     _auth: AuthClaims,
-    Path(_mnemonic): Path<String>,
-    Query(_params): Query<TimeseriesQuery>,
-) -> Json<Vec<TimeSeriesPoint>> {
-    Json(Vec::new())
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let points = query_timeseries(&state.stats_ks, mnemonic, &params.range).await?;
+    Ok(Json(points))
+}
+
+/// Query time-series buckets for a given mnemonic and range.
+async fn query_timeseries(
+    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    mnemonic: &str,
+    range: &str,
+) -> Result<Vec<TimeSeriesPoint>, AppError> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Default)]
+    struct BucketData {
+        r: u64,
+        u: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (duration, step) = match range {
+        "1h" => (3600u64, 300u64),
+        "7d" => (7 * 24 * 3600, 3600),
+        "30d" => (30 * 24 * 3600, 14400),
+        _ => (24 * 3600, 900), // default 24h
+    };
+
+    let cutoff = now.saturating_sub(duration);
+    let start = cutoff / 300 * 300; // align to 5-min bucket
+    let end = now / 300 * 300;
+
+    let prefix = format!("ts:{mnemonic}:");
+    let raw = stats_ks.prefix_iter_raw(prefix.as_str()).await?;
+
+    // Collect raw buckets within range
+    let prefix_len = prefix.len();
+    let mut bucket_map: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    for (key, value) in &raw {
+        let key_str = std::str::from_utf8(key).unwrap_or_default();
+        if let Some(epoch_str) = key_str.get(prefix_len..) {
+            if let Ok(epoch) = epoch_str.parse::<u64>() {
+                if epoch >= cutoff {
+                    if let Ok(data) = serde_json::from_slice::<BucketData>(value) {
+                        let entry = bucket_map.entry(epoch).or_insert((0, 0));
+                        entry.0 += data.r;
+                        entry.1 += data.u;
+                    }
+                }
+            }
+        }
+    }
+
+    // Build aggregated display points
+    let mut points = Vec::new();
+    let mut ts = start;
+    while ts <= end {
+        let mut resolves = 0u64;
+        let mut updates = 0u64;
+        // Aggregate all 5-min buckets within this step
+        let mut bucket_ts = ts;
+        while bucket_ts < ts + step && bucket_ts <= end {
+            if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
+                resolves += r;
+                updates += u;
+            }
+            bucket_ts += 300;
+        }
+        points.push(TimeSeriesPoint {
+            timestamp: ts,
+            resolves,
+            updates,
+        });
+        ts += step;
+    }
+
+    Ok(points)
 }
 
 // ---------- GET /api/config ----------

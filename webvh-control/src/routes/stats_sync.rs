@@ -77,6 +77,12 @@ pub async fn receive_stats(
 
     let delta_count = payload.did_deltas.len();
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bucket_epoch = now / 300 * 300; // 5-minute bucket
+
     for delta in &payload.did_deltas {
         state.stats_collector.record_deltas(
             &delta.mnemonic,
@@ -85,6 +91,26 @@ pub async fn receive_stats(
             delta.last_resolved_at,
             delta.last_updated_at,
         );
+
+        // Record time-series buckets (per-DID + global)
+        if delta.resolve_delta > 0 || delta.update_delta > 0 {
+            let _ = record_ts_bucket(
+                &state.stats_ks,
+                &delta.mnemonic,
+                bucket_epoch,
+                delta.resolve_delta,
+                delta.update_delta,
+            )
+            .await;
+            let _ = record_ts_bucket(
+                &state.stats_ks,
+                "_all",
+                bucket_epoch,
+                delta.resolve_delta,
+                delta.update_delta,
+            )
+            .await;
+        }
     }
 
     #[cfg(feature = "metrics")]
@@ -98,4 +124,27 @@ pub async fn receive_stats(
     );
 
     StatusCode::NO_CONTENT
+}
+
+/// Record resolve/update deltas into a 5-minute time-series bucket.
+async fn record_ts_bucket(
+    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    mnemonic: &str,
+    epoch: u64,
+    resolves: u64,
+    updates: u64,
+) -> Result<(), affinidi_webvh_common::server::error::AppError> {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Default)]
+    struct BucketData {
+        r: u64,
+        u: u64,
+    }
+
+    let key = format!("ts:{mnemonic}:{epoch:010}");
+    let mut bucket: BucketData = stats_ks.get(key.as_str()).await?.unwrap_or_default();
+    bucket.r += resolves;
+    bucket.u += updates;
+    stats_ks.insert(key, &bucket).await
 }
