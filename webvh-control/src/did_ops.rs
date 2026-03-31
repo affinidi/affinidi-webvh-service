@@ -325,6 +325,12 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            let stats_key = format!("stats:{mnemonic}");
+            let did_stats: affinidi_webvh_common::DidStats = state
+                .stats_ks
+                .get(stats_key)
+                .await?
+                .unwrap_or_default();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -332,7 +338,7 @@ pub async fn list_dids(
                 updated_at: record.updated_at,
                 version_count: record.version_count,
                 did_id: record.did_id,
-                total_resolves: 0, // control plane doesn't track resolves
+                total_resolves: did_stats.total_resolves,
                 disabled: record.disabled,
             });
         }
@@ -359,6 +365,12 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             Ok(r) => r,
             Err(_) => continue,
         };
+        let stats_key = format!("stats:{}", record.mnemonic);
+        let did_stats: affinidi_webvh_common::DidStats = state
+            .stats_ks
+            .get(stats_key)
+            .await?
+            .unwrap_or_default();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -366,7 +378,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             updated_at: record.updated_at,
             version_count: record.version_count,
             did_id: record.did_id,
-            total_resolves: 0,
+            total_resolves: did_stats.total_resolves,
             disabled: record.disabled,
         });
     }
