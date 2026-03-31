@@ -58,6 +58,7 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
+    #[allow(unused_mut)]
     let mut router = Router::new()
         .nest("/api", api);
 

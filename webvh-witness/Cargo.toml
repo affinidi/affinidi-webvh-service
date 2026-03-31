@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-witness"
 description = "WebVH Witness Node. Approves and generates proofs for DID Changes"
-version = "0.0.1"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
