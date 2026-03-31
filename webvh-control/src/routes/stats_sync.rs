@@ -49,7 +49,8 @@ pub async fn receive_stats(
             }
         };
         if let Some(&last) = map.get(&payload.server_did) {
-            if payload.seq <= last {
+            // seq=0 means server restarted — accept and reset tracking
+            if payload.seq > 0 && payload.seq <= last {
                 debug!(
                     server_did = %payload.server_did,
                     seq = payload.seq,
