@@ -145,15 +145,24 @@ pub async fn authenticate(
         .created_time
         .ok_or_else(|| AppError::Authentication("message missing created_time".into()))?;
     if created_time < session.created_at {
-        warn!(session_id, created_time, session_created = session.created_at,
-            "authentication rejected: message created_time before challenge");
+        warn!(
+            session_id,
+            created_time,
+            session_created = session.created_at,
+            "authentication rejected: message created_time before challenge"
+        );
         return Err(AppError::Authentication(
             "message created_time is before the challenge was issued".into(),
         ));
     }
     if now.saturating_sub(created_time) > challenge_ttl {
-        warn!(session_id, created_time, now, challenge_ttl,
-            "authentication rejected: message created_time outside challenge TTL");
+        warn!(
+            session_id,
+            created_time,
+            now,
+            challenge_ttl,
+            "authentication rejected: message created_time outside challenge TTL"
+        );
         return Err(AppError::Authentication(
             "message created_time is outside the challenge TTL window".into(),
         ));

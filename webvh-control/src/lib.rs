@@ -3,9 +3,9 @@ pub mod auth;
 pub mod config;
 pub mod did_ops;
 pub mod error;
-pub mod health;
 #[cfg(feature = "ui")]
 pub mod frontend;
+pub mod health;
 pub mod messaging;
 pub mod registry;
 pub mod routes;

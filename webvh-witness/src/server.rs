@@ -19,8 +19,8 @@ use crate::routes;
 use crate::secret_store::ServerSecrets;
 use crate::signing::{LocalSigner, WitnessSigner};
 use crate::store::{KeyspaceHandle, Store};
-use tokio::sync::{oneshot, watch};
 use axum::routing::get;
+use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
@@ -69,11 +69,7 @@ impl AuthState for AppState {
     }
 }
 
-pub async fn run(
-    config: AppConfig,
-    store: Store,
-    secrets: ServerSecrets,
-) -> Result<(), AppError> {
+pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -117,11 +113,19 @@ pub async fn run(
     info!("--- enabled services ---");
     info!(
         "  REST API : {}",
-        if state.config.features.rest_api { "enabled" } else { "disabled" }
+        if state.config.features.rest_api {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     info!(
         "  DIDComm  : {}",
-        if state.config.features.didcomm { "enabled" } else { "disabled" }
+        if state.config.features.didcomm {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     if let Some(ref did) = state.config.server_did {
         info!("  server DID   : {did}");
@@ -202,16 +206,28 @@ pub async fn run(
     if let Some(handle) = rest_handle {
         match tokio::task::spawn_blocking(move || handle.join()).await {
             Ok(Ok(())) => info!("REST thread stopped"),
-            Ok(Err(_)) => { error!("REST thread panicked"); any_panic = true; }
-            Err(e) => { error!("failed to join REST thread: {e}"); any_panic = true; }
+            Ok(Err(_)) => {
+                error!("REST thread panicked");
+                any_panic = true;
+            }
+            Err(e) => {
+                error!("failed to join REST thread: {e}");
+                any_panic = true;
+            }
         }
     }
 
     let _ = storage_shutdown_tx.send(true);
     match tokio::task::spawn_blocking(move || storage_handle.join()).await {
         Ok(Ok(())) => info!("storage thread stopped"),
-        Ok(Err(_)) => { error!("storage thread panicked"); any_panic = true; }
-        Err(e) => { error!("failed to join storage thread: {e}"); any_panic = true; }
+        Ok(Err(_)) => {
+            error!("storage thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join storage thread: {e}");
+            any_panic = true;
+        }
     }
 
     if any_panic {
@@ -316,7 +332,9 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+            .layer(axum::middleware::from_fn(
+                affinidi_webvh_common::server::security_headers,
+            ))
             .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());
@@ -405,10 +423,7 @@ fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
 async fn init_didcomm_auth(
     config: &AppConfig,
     secrets: &ServerSecrets,
-) -> (
-    Option<DIDCacheClient>,
-    Option<Arc<ThreadedSecretsResolver>>,
-) {
+) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let server_did = match &config.server_did {
@@ -452,9 +467,7 @@ async fn init_didcomm_auth(
     (Some(did_resolver), Some(Arc::new(secrets_resolver)))
 }
 
-pub(crate) fn decode_multibase_ed25519_key(
-    multibase_key: &str,
-) -> Result<[u8; 32], AppError> {
+pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let secret = Secret::from_multibase(multibase_key, None)

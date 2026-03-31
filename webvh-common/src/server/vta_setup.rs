@@ -214,4 +214,3 @@ pub fn generate_ed25519_multibase() -> String {
         .get_private_keymultibase()
         .expect("ed25519 multibase encoding")
 }
-

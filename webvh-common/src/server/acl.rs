@@ -71,10 +71,7 @@ fn acl_key(did: &str) -> String {
 }
 
 /// Retrieve an ACL entry by DID.
-pub async fn get_acl_entry(
-    acl: &KeyspaceHandle,
-    did: &str,
-) -> Result<Option<AclEntry>, AppError> {
+pub async fn get_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<Option<AclEntry>, AppError> {
     acl.get(acl_key(did)).await
 }
 

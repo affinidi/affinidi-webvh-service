@@ -1,16 +1,16 @@
 use axum::Json;
+use axum::extract::FromRequestParts;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::extract::FromRequestParts;
 use tracing::{info, warn};
 
-use affinidi_webvh_common::{SyncDidRequest, SyncDeleteRequest};
-use affinidi_webvh_common::server::auth::constant_time_eq;
-use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::watcher_ops::{self, WatcherRecord};
+use affinidi_webvh_common::server::auth::constant_time_eq;
+use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
+use affinidi_webvh_common::{SyncDeleteRequest, SyncDidRequest};
 
 // ---------------------------------------------------------------------------
 // SyncAuth extractor — validates bearer token against configured push_tokens
@@ -25,14 +25,20 @@ impl FromRequestParts<AppState> for SyncAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = parts.headers.get("authorization")
+        let token = parts
+            .headers
+            .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AppError::Authentication("missing sync token".into()))?;
 
-        if state.config.sync.push_tokens.iter().any(|t| {
-            constant_time_eq(t.as_bytes(), token.as_bytes())
-        }) {
+        if state
+            .config
+            .sync
+            .push_tokens
+            .iter()
+            .any(|t| constant_time_eq(t.as_bytes(), token.as_bytes()))
+        {
             Ok(SyncAuth)
         } else {
             Err(AppError::Authentication("invalid sync token".into()))
@@ -77,17 +83,23 @@ pub async fn receive_did(
     watcher_ops::store_record(&state.dids_ks, &record).await?;
 
     // Store log content
-    state.dids_ks.insert_raw(
-        watcher_ops::content_log_key(&req.mnemonic),
-        req.log_content.into_bytes(),
-    ).await?;
+    state
+        .dids_ks
+        .insert_raw(
+            watcher_ops::content_log_key(&req.mnemonic),
+            req.log_content.into_bytes(),
+        )
+        .await?;
 
     // Store witness content if present
     if let Some(witness) = req.witness_content {
-        state.dids_ks.insert_raw(
-            watcher_ops::content_witness_key(&req.mnemonic),
-            witness.into_bytes(),
-        ).await?;
+        state
+            .dids_ks
+            .insert_raw(
+                watcher_ops::content_witness_key(&req.mnemonic),
+                witness.into_bytes(),
+            )
+            .await?;
     }
 
     info!(mnemonic = %req.mnemonic, "DID content synced from source");

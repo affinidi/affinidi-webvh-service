@@ -76,12 +76,7 @@ impl JwtKeys {
     }
 
     /// Create claims for a new access token.
-    pub fn new_claims(
-        sub: String,
-        session_id: String,
-        role: String,
-        expiry_secs: u64,
-    ) -> Claims {
+    pub fn new_claims(sub: String, session_id: String, role: String, expiry_secs: u64) -> Claims {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

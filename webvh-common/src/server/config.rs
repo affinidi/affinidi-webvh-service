@@ -248,16 +248,36 @@ pub fn apply_env_overrides(
     auth: &mut AuthConfig,
     secrets: &mut SecretsConfig,
 ) -> Result<(), AppError> {
-    macro_rules! env_str { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = v; } }; }
-    macro_rules! env_opt { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = Some(v); } }; }
-    macro_rules! env_parse { ($var:expr, $field:expr) => {
-        if let Ok(v) = std::env::var($var) {
-            $field = v.parse().map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
-        }
-    }; }
-    macro_rules! env_bool { ($var:expr, $field:expr) => {
-        if let Ok(v) = std::env::var($var) { $field = v == "1" || v.eq_ignore_ascii_case("true"); }
-    }; }
+    macro_rules! env_str {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = v;
+            }
+        };
+    }
+    macro_rules! env_opt {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = Some(v);
+            }
+        };
+    }
+    macro_rules! env_parse {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = v
+                    .parse()
+                    .map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
+            }
+        };
+    }
+    macro_rules! env_bool {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = v == "1" || v.eq_ignore_ascii_case("true");
+            }
+        };
+    }
 
     // Features
     env_bool!(&format!("{prefix}_FEATURES_DIDCOMM"), features.didcomm);
@@ -288,27 +308,72 @@ pub fn apply_env_overrides(
         store.data_dir = PathBuf::from(data_dir);
     }
     env_opt!(&format!("{prefix}_STORE_REDIS_URL"), store.redis_url);
-    env_opt!(&format!("{prefix}_STORE_DYNAMODB_TABLE_PREFIX"), store.dynamodb_table_prefix);
-    env_opt!(&format!("{prefix}_STORE_DYNAMODB_REGION"), store.dynamodb_region);
-    env_opt!(&format!("{prefix}_STORE_FIRESTORE_PROJECT"), store.firestore_project);
-    env_opt!(&format!("{prefix}_STORE_FIRESTORE_DATABASE"), store.firestore_database);
-    env_opt!(&format!("{prefix}_STORE_COSMOSDB_CONNECTION_STRING"), store.cosmosdb_connection_string);
-    env_opt!(&format!("{prefix}_STORE_COSMOSDB_DATABASE"), store.cosmosdb_database);
+    env_opt!(
+        &format!("{prefix}_STORE_DYNAMODB_TABLE_PREFIX"),
+        store.dynamodb_table_prefix
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_DYNAMODB_REGION"),
+        store.dynamodb_region
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
+        store.firestore_project
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_FIRESTORE_DATABASE"),
+        store.firestore_database
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_COSMOSDB_CONNECTION_STRING"),
+        store.cosmosdb_connection_string
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
+        store.cosmosdb_database
+    );
 
     // Auth
-    env_parse!(&format!("{prefix}_AUTH_ACCESS_EXPIRY"), auth.access_token_expiry);
-    env_parse!(&format!("{prefix}_AUTH_REFRESH_EXPIRY"), auth.refresh_token_expiry);
+    env_parse!(
+        &format!("{prefix}_AUTH_ACCESS_EXPIRY"),
+        auth.access_token_expiry
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_REFRESH_EXPIRY"),
+        auth.refresh_token_expiry
+    );
     env_parse!(&format!("{prefix}_AUTH_CHALLENGE_TTL"), auth.challenge_ttl);
-    env_parse!(&format!("{prefix}_AUTH_SESSION_CLEANUP_INTERVAL"), auth.session_cleanup_interval);
-    env_parse!(&format!("{prefix}_AUTH_PASSKEY_ENROLLMENT_TTL"), auth.passkey_enrollment_ttl);
-    env_parse!(&format!("{prefix}_CLEANUP_TTL_MINUTES"), auth.cleanup_ttl_minutes);
+    env_parse!(
+        &format!("{prefix}_AUTH_SESSION_CLEANUP_INTERVAL"),
+        auth.session_cleanup_interval
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_PASSKEY_ENROLLMENT_TTL"),
+        auth.passkey_enrollment_ttl
+    );
+    env_parse!(
+        &format!("{prefix}_CLEANUP_TTL_MINUTES"),
+        auth.cleanup_ttl_minutes
+    );
 
     // Secrets
-    env_opt!(&format!("{prefix}_SECRETS_AWS_SECRET_NAME"), secrets.aws_secret_name);
+    env_opt!(
+        &format!("{prefix}_SECRETS_AWS_SECRET_NAME"),
+        secrets.aws_secret_name
+    );
     env_opt!(&format!("{prefix}_SECRETS_AWS_REGION"), secrets.aws_region);
-    env_opt!(&format!("{prefix}_SECRETS_GCP_PROJECT"), secrets.gcp_project);
-    env_opt!(&format!("{prefix}_SECRETS_GCP_SECRET_NAME"), secrets.gcp_secret_name);
-    env_str!(&format!("{prefix}_SECRETS_KEYRING_SERVICE"), secrets.keyring_service);
+    env_opt!(
+        &format!("{prefix}_SECRETS_GCP_PROJECT"),
+        secrets.gcp_project
+    );
+    env_opt!(
+        &format!("{prefix}_SECRETS_GCP_SECRET_NAME"),
+        secrets.gcp_secret_name
+    );
+    env_str!(
+        &format!("{prefix}_SECRETS_KEYRING_SERVICE"),
+        secrets.keyring_service
+    );
 
     Ok(())
 }
@@ -317,8 +382,7 @@ pub fn apply_env_overrides(
 pub fn init_tracing(log: &LogConfig) {
     use tracing_subscriber::EnvFilter;
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log.level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log.level));
 
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
 

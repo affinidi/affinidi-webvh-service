@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand};
 use affinidi_webvh_server::config::{AppConfig, LogFormat};
 use affinidi_webvh_server::{backup, bootstrap, health, secret_store, server, setup, store};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -185,9 +185,15 @@ async fn main() {
             witness_url,
             witness_id,
         }) => {
-            if let Err(e) =
-                run_bootstrap_did(cli.config, path, did_log, did_witness, witness_url, witness_id)
-                    .await
+            if let Err(e) = run_bootstrap_did(
+                cli.config,
+                path,
+                did_log,
+                did_witness,
+                witness_url,
+                witness_id,
+            )
+            .await
             {
                 eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
@@ -251,9 +257,7 @@ async fn run_add_acl(
     Ok(())
 }
 
-async fn run_list_acl(
-    config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_webvh_server::acl::list_acl_entries;
 
     let config = AppConfig::load(config_path)?;
@@ -352,14 +356,9 @@ async fn run_load_did(
         None => None,
     };
 
-    let result = bootstrap::import_did_at_path(
-        &store,
-        &dids_ks,
-        &path,
-        &jsonl,
-        witness_content.as_deref(),
-    )
-    .await?;
+    let result =
+        bootstrap::import_did_at_path(&store, &dids_ks, &path, &jsonl, witness_content.as_deref())
+            .await?;
 
     store.persist().await?;
 
@@ -435,11 +434,15 @@ async fn run_recreate_did(
             .remove(affinidi_webvh_server::did_ops::content_log_key(&mnemonic))
             .await?;
         dids_ks
-            .remove(affinidi_webvh_server::did_ops::content_witness_key(&mnemonic))
+            .remove(affinidi_webvh_server::did_ops::content_witness_key(
+                &mnemonic,
+            ))
             .await?;
         // Remove owner index entry (owner is "system" for bootstrapped DIDs)
         dids_ks
-            .remove(affinidi_webvh_server::did_ops::owner_key("system", &mnemonic))
+            .remove(affinidi_webvh_server::did_ops::owner_key(
+                "system", &mnemonic,
+            ))
             .await?;
         eprintln!("  Removed existing DID at path '{mnemonic}'");
     }
@@ -463,9 +466,16 @@ async fn run_recreate_did(
         None
     };
 
-    let result =
-        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
-            .await?;
+    let result = bootstrap::bootstrap_did(
+        &store,
+        &dids_ks,
+        &signing_secret,
+        ka_secret.as_ref(),
+        mediator_uri.as_deref(),
+        public_url,
+        &mnemonic,
+    )
+    .await?;
 
     store.persist().await?;
 
@@ -572,9 +582,16 @@ async fn run_bootstrap_did(
             None
         };
 
-        let result =
-            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
-                .await?;
+        let result = bootstrap::bootstrap_did(
+            &store,
+            &dids_ks,
+            &signing_secret,
+            ka_secret.as_ref(),
+            mediator_uri.as_deref(),
+            public_url,
+            &mnemonic,
+        )
+        .await?;
 
         // Optional: request witness proof
         if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {

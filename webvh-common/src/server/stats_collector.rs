@@ -21,8 +21,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::DidStatsDelta;
 
@@ -111,9 +111,17 @@ impl StatsCollector {
 
     /// Increment aggregate counters by the given deltas (used by the control
     /// plane when receiving sync data from servers).
-    pub fn apply_deltas(&self, resolve_delta: u64, update_delta: u64, last_resolved_at: Option<u64>, last_updated_at: Option<u64>) {
-        self.agg_total_resolves.fetch_add(resolve_delta, Ordering::Relaxed);
-        self.agg_total_updates.fetch_add(update_delta, Ordering::Relaxed);
+    pub fn apply_deltas(
+        &self,
+        resolve_delta: u64,
+        update_delta: u64,
+        last_resolved_at: Option<u64>,
+        last_updated_at: Option<u64>,
+    ) {
+        self.agg_total_resolves
+            .fetch_add(resolve_delta, Ordering::Relaxed);
+        self.agg_total_updates
+            .fetch_add(update_delta, Ordering::Relaxed);
         if let Some(ts) = last_resolved_at {
             self.agg_last_resolved_at.fetch_max(ts, Ordering::Relaxed);
         }
@@ -168,18 +176,20 @@ impl StatsCollector {
             entry.resolves += resolve_delta;
             entry.updates += update_delta;
             if let Some(ts) = last_resolved_at {
-                entry.last_resolved_at = Some(
-                    entry.last_resolved_at.map_or(ts, |prev| prev.max(ts)),
-                );
+                entry.last_resolved_at =
+                    Some(entry.last_resolved_at.map_or(ts, |prev| prev.max(ts)));
             }
             if let Some(ts) = last_updated_at {
-                entry.last_updated_at = Some(
-                    entry.last_updated_at.map_or(ts, |prev| prev.max(ts)),
-                );
+                entry.last_updated_at = Some(entry.last_updated_at.map_or(ts, |prev| prev.max(ts)));
             }
         }
 
-        self.apply_deltas(resolve_delta, update_delta, last_resolved_at, last_updated_at);
+        self.apply_deltas(
+            resolve_delta,
+            update_delta,
+            last_resolved_at,
+            last_updated_at,
+        );
     }
 
     /// Drain all accumulated per-DID deltas for sync to the control plane.

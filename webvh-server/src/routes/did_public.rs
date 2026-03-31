@@ -56,9 +56,13 @@ async fn serve_content(
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((StatusCode::OK, [("content-type", content_type)], (*content).clone()).into_response())
+    Ok((
+        StatusCode::OK,
+        [("content-type", content_type)],
+        (*content).clone(),
+    )
+        .into_response())
 }
-
 
 /// Serve a did:web document (`did.json`) for the given mnemonic.
 ///
@@ -115,12 +119,26 @@ pub async fn serve_root_did_web(State(state): State<AppState>) -> Result<Respons
 
 /// GET /.well-known/did.jsonl — serve the root DID log (mnemonic = ".well-known")
 pub async fn serve_root_did_log(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(&state, ".well-known", "content:.well-known:log", "application/jsonl+json", true).await
+    serve_content(
+        &state,
+        ".well-known",
+        "content:.well-known:log",
+        "application/jsonl+json",
+        true,
+    )
+    .await
 }
 
 /// GET /.well-known/did-witness.json — serve the root witness
 pub async fn serve_root_witness(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(&state, ".well-known", "content:.well-known:witness", "application/json", false).await
+    serve_content(
+        &state,
+        ".well-known",
+        "content:.well-known:witness",
+        "application/json",
+        false,
+    )
+    .await
 }
 
 /// Combined fallback handler: serves DID documents for any path ending

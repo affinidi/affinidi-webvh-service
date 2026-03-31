@@ -5,9 +5,9 @@
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
-    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MessagePolicy,
-    RequestLogging, Router, TRUST_PING_TYPE, MESSAGE_PICKUP_STATUS_TYPE,
-    handler_fn, ignore_handler, trust_ping_handler,
+    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
+    MessagePolicy, RequestLogging, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
+    trust_ping_handler,
 };
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -67,7 +67,11 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
         .fallback(handler_fn(handle_fallback))
-        .layer(MessagePolicy::new().require_encrypted(true).require_sender_did(true))
+        .layer(
+            MessagePolicy::new()
+                .require_encrypted(true)
+                .require_sender_did(true),
+        )
         .layer(RequestLogging))
 }
 
@@ -122,8 +126,9 @@ async fn handle_authenticate(
         }
     };
 
-    Ok(Some(DIDCommResponse::new(response_type, response_body)
-        .thid(message.id.clone())))
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
 }
 
 async fn handle_webvh_message(
@@ -155,8 +160,9 @@ async fn handle_webvh_message(
         }
     };
 
-    Ok(Some(DIDCommResponse::new(response_type, response_body)
-        .thid(message.id.clone())))
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
 }
 
 async fn handle_sync_update(
@@ -171,8 +177,9 @@ async fn handle_sync_update(
         Err(e) => problem_report("e.p.did.internal-error", &e),
     };
 
-    Ok(Some(DIDCommResponse::new(response_type, response_body)
-        .thid(message.id.clone())))
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
 }
 
 async fn handle_sync_delete(
@@ -187,8 +194,9 @@ async fn handle_sync_delete(
         Err(e) => problem_report("e.p.did.internal-error", &e),
     };
 
-    Ok(Some(DIDCommResponse::new(response_type, response_body)
-        .thid(message.id.clone())))
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
 }
 
 async fn handle_fallback(
@@ -211,22 +219,44 @@ async fn do_sync_update(
     use crate::control_register::apply_single_update;
     use affinidi_webvh_common::DidSyncUpdate;
 
-    let role = check_acl(&state.acl_ks, sender).await.map_err(|e| e.to_string())?;
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
     if !matches!(role, Role::Admin | Role::Service) {
-        warn!(did = sender, "sync message rejected: requires admin or service role");
-        return Ok(problem_report("e.p.did.unauthorized", "admin or service role required for sync messages"));
+        warn!(
+            did = sender,
+            "sync message rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.did.unauthorized",
+            "admin or service role required for sync messages",
+        ));
     }
 
-    let mnemonic = msg.body.get("mnemonic").and_then(|v| v.as_str())
+    let mnemonic = msg
+        .body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
         .ok_or("missing 'mnemonic' in sync-update")?;
-    let did_id = msg.body.get("did_id").and_then(|v| v.as_str())
+    let did_id = msg
+        .body
+        .get("did_id")
+        .and_then(|v| v.as_str())
         .ok_or("missing 'did_id' in sync-update")?;
-    let log_content = msg.body.get("log_content").and_then(|v| v.as_str())
+    let log_content = msg
+        .body
+        .get("log_content")
+        .and_then(|v| v.as_str())
         .ok_or("missing 'log_content' in sync-update")?;
-    let witness_content = msg.body.get("witness_content")
+    let witness_content = msg
+        .body
+        .get("witness_content")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let version_count = msg.body.get("version_count").and_then(|v| v.as_u64())
+    let version_count = msg
+        .body
+        .get("version_count")
+        .and_then(|v| v.as_u64())
         .ok_or("missing 'version_count' in sync-update")?;
 
     let update = DidSyncUpdate {
@@ -259,13 +289,24 @@ async fn do_sync_delete(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), String> {
-    let role = check_acl(&state.acl_ks, sender).await.map_err(|e| e.to_string())?;
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
     if !matches!(role, Role::Admin | Role::Service) {
-        warn!(did = sender, "sync message rejected: requires admin or service role");
-        return Ok(problem_report("e.p.did.unauthorized", "admin or service role required for sync messages"));
+        warn!(
+            did = sender,
+            "sync message rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.did.unauthorized",
+            "admin or service role required for sync messages",
+        ));
     }
 
-    let mnemonic = msg.body.get("mnemonic").and_then(|v| v.as_str())
+    let mnemonic = msg
+        .body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
         .ok_or("missing 'mnemonic' in sync-delete")?;
 
     let record: Option<did_ops::DidRecord> = state

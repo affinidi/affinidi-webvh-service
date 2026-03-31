@@ -12,10 +12,14 @@ fn main() {
     let enabled_count = store_features.iter().filter(|&&f| f).count();
 
     if enabled_count == 0 {
-        println!("cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb");
+        println!(
+            "cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb"
+        );
     }
     if enabled_count > 1 {
-        println!("cargo:warning=Multiple storage backend features enabled — only one will be used at runtime.");
+        println!(
+            "cargo:warning=Multiple storage backend features enabled — only one will be used at runtime."
+        );
     }
 
     // ---- Secret store feature-gate validation ----

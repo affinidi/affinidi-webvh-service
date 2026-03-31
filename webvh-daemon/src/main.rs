@@ -1,9 +1,9 @@
 mod config;
 
-use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info, warn};
 
@@ -14,7 +14,11 @@ use affinidi_webvh_common::server::secret_store::ServerSecrets;
 use config::DaemonConfig;
 
 #[derive(Parser)]
-#[command(name = "webvh-daemon", about = "WebVH Daemon — Unified Service", version)]
+#[command(
+    name = "webvh-daemon",
+    about = "WebVH Daemon — Unified Service",
+    version
+)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, global = true)]
@@ -188,10 +192,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
 type ServiceResult = Result<(Router, affinidi_webvh_common::server::store::Store), AppError>;
 
-async fn build_server(
-    config: &DaemonConfig,
-    secrets: &ServerSecrets,
-) -> ServiceResult {
+async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
     use affinidi_webvh_server::server::AppState;
     use affinidi_webvh_server::store::Store;
 
@@ -229,10 +230,7 @@ async fn build_server(
     Ok((router, store))
 }
 
-async fn build_witness(
-    config: &DaemonConfig,
-    secrets: &ServerSecrets,
-) -> ServiceResult {
+async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
     use affinidi_webvh_witness::server::AppState;
     use affinidi_webvh_witness::signing::LocalSigner;
     use affinidi_webvh_witness::store::Store;
@@ -286,10 +284,7 @@ async fn build_watcher(config: &DaemonConfig) -> ServiceResult {
     Ok((router, store))
 }
 
-async fn build_control(
-    config: &DaemonConfig,
-    secrets: &ServerSecrets,
-) -> ServiceResult {
+async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
     use affinidi_webvh_control::server::AppState;
     use affinidi_webvh_control::store::Store;
 
@@ -337,7 +332,9 @@ async fn build_control(
             // Daemon mode: basic init, no seeding from store
             std::sync::Arc::new(collector)
         },
-        stats_ks: store.keyspace("stats").expect("failed to open stats keyspace"),
+        stats_ks: store
+            .keyspace("stats")
+            .expect("failed to open stats keyspace"),
     };
 
     let router = affinidi_webvh_control::routes::router().with_state(state);
@@ -352,15 +349,14 @@ async fn build_control(
 
 async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
     // Use the server's secret store config (shared across all services)
-    let secret_store =
-        affinidi_webvh_common::server::secret_store::create_secret_store(
-            &config.secrets,
-            &config.config_path,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Error creating secret store: {e}");
-            std::process::exit(1);
-        });
+    let secret_store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        &config.secrets,
+        &config.config_path,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error creating secret store: {e}");
+        std::process::exit(1);
+    });
 
     match secret_store.get().await {
         Ok(Some(s)) => {
@@ -425,8 +421,8 @@ async fn init_didcomm_auth(
     Option<Arc<affinidi_tdk::secrets_resolver::ThreadedSecretsResolver>>,
 ) {
     use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-    use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
     use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
     use tracing::debug;
 
     let server_did = match &config.server_did {
@@ -542,9 +538,7 @@ async fn run_health(
                                 ));
                             }
                             Ok(None) => {}
-                            Err(e) => {
-                                health::warn_msg(&format!("Could not read DID record: {e}"))
-                            }
+                            Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
                         }
                     }
                     Ok(false) => health::skip("Root DID not yet bootstrapped"),

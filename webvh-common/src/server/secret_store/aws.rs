@@ -60,16 +60,13 @@ impl super::SecretStore for AwsSecretStore {
             match result {
                 Ok(output) => {
                     let json_str = output.secret_string().ok_or_else(|| {
-                        AppError::SecretStore(
-                            "AWS secret exists but has no string value".into(),
-                        )
+                        AppError::SecretStore("AWS secret exists but has no string value".into())
                     })?;
-                    let secrets: ServerSecrets =
-                        serde_json::from_str(json_str).map_err(|e| {
-                            AppError::SecretStore(format!(
-                                "failed to deserialize secrets from AWS: {e}"
-                            ))
-                        })?;
+                    let secrets: ServerSecrets = serde_json::from_str(json_str).map_err(|e| {
+                        AppError::SecretStore(format!(
+                            "failed to deserialize secrets from AWS: {e}"
+                        ))
+                    })?;
                     debug!(secret_name = %self.secret_name, "secrets loaded from AWS Secrets Manager");
                     Ok(Some(secrets))
                 }

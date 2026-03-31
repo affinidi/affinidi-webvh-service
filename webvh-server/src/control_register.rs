@@ -3,12 +3,12 @@
 //! for synchronisation.
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_webvh_common::{
-    ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest,
-};
+use affinidi_webvh_common::{ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest};
 use tracing::{error, info, warn};
 
-use crate::did_ops::{DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl};
+use crate::did_ops::{
+    DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
+};
 use crate::store::{KeyspaceHandle, Store};
 
 /// Register with the control plane, retrying with exponential backoff.

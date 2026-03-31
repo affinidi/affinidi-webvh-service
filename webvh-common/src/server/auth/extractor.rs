@@ -37,10 +37,7 @@ pub struct AuthClaims {
 impl<S: AuthState> FromRequestParts<S> for AuthClaims {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         // Extract Bearer token from Authorization header
         let TypedHeader(auth) =
             TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, state)
@@ -103,10 +100,7 @@ pub struct ServiceAuth(pub AuthClaims);
 impl<S: AuthState> FromRequestParts<S> for ServiceAuth {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let claims = AuthClaims::from_request_parts(parts, state).await?;
 
         match claims.role {
@@ -131,10 +125,7 @@ pub struct AdminAuth(pub AuthClaims);
 impl<S: AuthState> FromRequestParts<S> for AdminAuth {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let claims = AuthClaims::from_request_parts(parts, state).await?;
 
         match claims.role {

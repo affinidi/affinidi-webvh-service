@@ -325,9 +325,7 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
     eprintln!("  Next steps:");
     eprintln!("    1. Set up webvh-server (if not already done)");
-    eprintln!(
-        "    2. Import this DID on the server:"
-    );
+    eprintln!("    2. Import this DID on the server:");
     eprintln!(
         "       webvh-server bootstrap-did --path {} --did-log control-did.jsonl",
         did_path

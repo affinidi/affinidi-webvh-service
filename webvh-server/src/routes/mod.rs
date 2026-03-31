@@ -1,9 +1,9 @@
 mod acl;
 mod auth;
 mod config;
-mod didcomm;
 pub(crate) mod did_manage;
 mod did_public;
+mod didcomm;
 pub(crate) mod health;
 mod stats;
 
@@ -28,7 +28,10 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/auth/refresh", post(auth::refresh))
         // DID management (authenticated)
         .route("/dids/check", post(did_manage::check_name))
-        .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
+        .route(
+            "/dids",
+            post(did_manage::request_uri).get(did_manage::list_dids),
+        )
         .route(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
@@ -51,16 +54,12 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/config", get(config::get_config))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route(
-            "/acl/{did}",
-            put(acl::update_acl).delete(acl::delete_acl),
-        )
+        .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
     #[allow(unused_mut)]
-    let mut router = Router::new()
-        .nest("/api", api);
+    let mut router = Router::new().nest("/api", api);
 
     // Prometheus metrics endpoint (only when metrics feature is enabled)
     #[cfg(feature = "metrics")]
@@ -74,10 +73,7 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
             "/.well-known/did.jsonl",
             get(did_public::serve_root_did_log),
         )
-        .route(
-            "/.well-known/did.json",
-            get(did_public::serve_root_did_web),
-        )
+        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
         .route(
             "/.well-known/did-witness.json",
             get(did_public::serve_root_witness),
@@ -87,7 +83,11 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
 }
 
 #[cfg(feature = "metrics")]
-async fn metrics_handler() -> (axum::http::StatusCode, [(& 'static str, &'static str); 1], String) {
+async fn metrics_handler() -> (
+    axum::http::StatusCode,
+    [(&'static str, &'static str); 1],
+    String,
+) {
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

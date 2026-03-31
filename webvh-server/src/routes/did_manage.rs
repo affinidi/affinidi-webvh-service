@@ -268,12 +268,22 @@ pub async fn get_raw_log(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
-) -> Result<(StatusCode, [(axum::http::HeaderName, &'static str); 1], String), AppError> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        String,
+    ),
+    AppError,
+> {
     let mnemonic = clean_mnemonic(&mnemonic);
     let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         content,
     ))
 }
@@ -292,6 +302,13 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), query.limit, query.offset).await?;
+    let entries = did_ops::list_dids(
+        &auth,
+        &state,
+        query.owner.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
     Ok(Json(entries))
 }

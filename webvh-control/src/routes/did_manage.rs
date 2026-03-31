@@ -199,12 +199,22 @@ pub async fn get_raw_log(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
-) -> Result<(StatusCode, [(axum::http::HeaderName, &'static str); 1], String), AppError> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        String,
+    ),
+    AppError,
+> {
     let mnemonic = clean_mnemonic(&mnemonic);
     let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         content,
     ))
 }
@@ -223,7 +233,14 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), query.limit, query.offset).await?;
+    let entries = did_ops::list_dids(
+        &auth,
+        &state,
+        query.owner.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
     Ok(Json(entries))
 }
 
@@ -262,11 +279,7 @@ pub async fn get_did_stats(
 ) -> Result<Json<affinidi_webvh_common::DidStats>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     let key = format!("stats:{mnemonic}");
-    let stats: affinidi_webvh_common::DidStats = state
-        .stats_ks
-        .get(key)
-        .await?
-        .unwrap_or_default();
+    let stats: affinidi_webvh_common::DidStats = state.stats_ks.get(key).await?.unwrap_or_default();
     Ok(Json(stats))
 }
 
@@ -338,10 +351,7 @@ pub struct ConfigResponse {
 }
 
 /// GET /api/config — return control plane configuration (non-sensitive fields only).
-pub async fn get_config(
-    _auth: AuthClaims,
-    State(state): State<AppState>,
-) -> Json<ConfigResponse> {
+pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Json<ConfigResponse> {
     let c = &state.config;
     Json(ConfigResponse {
         control_did: c.server_did.clone(),
@@ -449,7 +459,11 @@ pub async fn get_services_overview(
             registry::ServiceStatus::Unreachable => unreachable += 1,
         }
 
-        let service_did = inst.metadata.get("did").and_then(|v| v.as_str()).map(String::from);
+        let service_did = inst
+            .metadata
+            .get("did")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Per-service stats not available individually in the new model
         let stats: Option<ServiceStats> = None;

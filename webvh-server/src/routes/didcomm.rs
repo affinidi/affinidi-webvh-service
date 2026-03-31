@@ -101,7 +101,8 @@ pub async fn handle(
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
     // Unpack the incoming DIDComm message
-    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await
+    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver)
+        .await
         .map_err(|e| AppError::Validation(format!("failed to unpack DIDComm message: {e}")))?;
 
     // Verify the DIDComm sender matches the authenticated DID
@@ -202,14 +203,10 @@ async fn dispatch(
 /// `trust-ping/2.0/ping` -> `trust-ping/2.0/ping-response`
 ///
 /// Returns the pong message type and body directly; the caller packs it.
-fn handle_trust_ping(
-    ping: &Message,
-    server_did: &str,
-) -> Result<(String, Value), ProtocolError> {
-    let sender_did = ping
-        .from
-        .as_deref()
-        .ok_or_else(|| ProtocolError::new("e.p.trust-ping.no-from", "trust-ping has no 'from' DID"))?;
+fn handle_trust_ping(ping: &Message, server_did: &str) -> Result<(String, Value), ProtocolError> {
+    let sender_did = ping.from.as_deref().ok_or_else(|| {
+        ProtocolError::new("e.p.trust-ping.no-from", "trust-ping has no 'from' DID")
+    })?;
 
     info!(from = sender_did, "received trust-ping");
 
@@ -227,15 +224,12 @@ fn handle_discover_features(
     query_msg: &Message,
     server_did: &str,
 ) -> Result<(String, Value), ProtocolError> {
-    let sender_did = query_msg
-        .from
-        .as_deref()
-        .ok_or_else(|| {
-            ProtocolError::new(
-                "e.p.discover-features.no-from",
-                "discover-features query has no 'from' DID",
-            )
-        })?;
+    let sender_did = query_msg.from.as_deref().ok_or_else(|| {
+        ProtocolError::new(
+            "e.p.discover-features.no-from",
+            "discover-features query has no 'from' DID",
+        )
+    })?;
 
     info!(from = sender_did, "received discover-features query");
 

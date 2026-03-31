@@ -24,10 +24,7 @@ pub fn router() -> Router<AppState> {
             "/registry/{instance_id}/health",
             post(registry::health_check),
         )
-        .route(
-            "/register-service",
-            post(registry::register_service),
-        );
+        .route("/register-service", post(registry::register_service));
 
     // Upload routes with a custom body-size limit (DID log + witness)
     let upload_routes = Router::new()
@@ -41,20 +38,35 @@ pub fn router() -> Router<AppState> {
         .route("/auth/", post(auth::authenticate))
         .route("/auth/refresh", post(auth::refresh))
         // Passkey (WebAuthn)
-        .route("/auth/passkey/enroll/start", post(passkey::enroll_start::<AppState>))
-        .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish::<AppState>))
-        .route("/auth/passkey/login/start", post(passkey::login_start::<AppState>))
-        .route("/auth/passkey/login/finish", post(passkey::login_finish::<AppState>))
-        .route("/auth/passkey/invite", post(passkey::create_invite::<AppState>))
+        .route(
+            "/auth/passkey/enroll/start",
+            post(passkey::enroll_start::<AppState>),
+        )
+        .route(
+            "/auth/passkey/enroll/finish",
+            post(passkey::enroll_finish::<AppState>),
+        )
+        .route(
+            "/auth/passkey/login/start",
+            post(passkey::login_start::<AppState>),
+        )
+        .route(
+            "/auth/passkey/login/finish",
+            post(passkey::login_finish::<AppState>),
+        )
+        .route(
+            "/auth/passkey/invite",
+            post(passkey::create_invite::<AppState>),
+        )
         // ACL
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route(
-            "/acl/{did}",
-            put(acl::update_acl).delete(acl::delete_acl),
-        )
+        .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
         // DID management (authenticated)
         .route("/dids/check", post(did_manage::check_name))
-        .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
+        .route(
+            "/dids",
+            post(did_manage::request_uri).get(did_manage::list_dids),
+        )
         .route(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
@@ -68,7 +80,10 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(did_manage::get_server_stats))
         .route("/stats/{*mnemonic}", get(did_manage::get_did_stats))
         .route("/timeseries", get(did_manage::get_server_timeseries))
-        .route("/timeseries/{*mnemonic}", get(did_manage::get_did_timeseries))
+        .route(
+            "/timeseries/{*mnemonic}",
+            get(did_manage::get_did_timeseries),
+        )
         // Service overview (topology + health + stats)
         .route("/services/overview", get(did_manage::get_services_overview))
         // Config
@@ -107,7 +122,11 @@ pub fn router() -> Router<AppState> {
 }
 
 #[cfg(feature = "metrics")]
-async fn metrics_handler() -> (axum::http::StatusCode, [(&'static str, &'static str); 1], String) {
+async fn metrics_handler() -> (
+    axum::http::StatusCode,
+    [(&'static str, &'static str); 1],
+    String,
+) {
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

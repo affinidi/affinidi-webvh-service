@@ -76,11 +76,7 @@ impl AuthState for AppState {
     }
 }
 
-pub async fn run(
-    config: AppConfig,
-    store: Store,
-    secrets: ServerSecrets,
-) -> Result<(), AppError> {
+pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -89,7 +85,10 @@ pub async fn run(
     // Integrity check on DID keyspace
     match dids_ks.verify_integrity().await {
         Ok(0) => debug!("store integrity check passed"),
-        Ok(n) => warn!(corrupted = n, "store integrity check found corrupted entries"),
+        Ok(n) => warn!(
+            corrupted = n,
+            "store integrity check found corrupted entries"
+        ),
         Err(e) => warn!(error = %e, "store integrity check failed"),
     }
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
@@ -127,7 +126,11 @@ pub async fn run(
     // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
         let collector = stats::StatsCollector::new();
-        let total_dids = storage_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
+        let total_dids = storage_dids_ks
+            .prefix_iter_raw("did:")
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0) as u64;
         collector.set_total_dids(total_dids);
         info!(total_dids, "stats collector initialized");
         Arc::new(collector)
@@ -445,7 +448,9 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+            .layer(axum::middleware::from_fn(
+                affinidi_webvh_common::server::security_headers,
+            ))
             .route("/api/health", get(routes::health::health));
 
         // Signal that REST is ready to serve
@@ -574,10 +579,7 @@ fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
 async fn init_didcomm_auth(
     config: &AppConfig,
     secrets: &ServerSecrets,
-) -> (
-    Option<DIDCacheClient>,
-    Option<Arc<ThreadedSecretsResolver>>,
-) {
+) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let server_did = match &config.server_did {
@@ -620,10 +622,7 @@ async fn init_didcomm_auth(
 
     info!("DIDComm auth initialized for DID {server_did}");
 
-    (
-        Some(did_resolver),
-        Some(Arc::new(secrets_resolver)),
-    )
+    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +689,15 @@ async fn auto_bootstrap_dids(
     // Bootstrap root DID (.well-known) if it doesn't exist
     match bootstrap::root_did_exists(dids_ks).await {
         Ok(false) => {
-            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), &public_url).await
+            match bootstrap::bootstrap_root_did(
+                store,
+                dids_ks,
+                &signing_secret,
+                ka_secret.as_ref(),
+                mediator_uri.as_deref(),
+                &public_url,
+            )
+            .await
             {
                 Ok(result) => {
                     info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");
@@ -722,12 +729,8 @@ async fn auto_bootstrap_dids(
                         path = %mnemonic,
                         "server DID not found in store — DID resolution will fail"
                     );
-                    error!(
-                        "  To create it, run:  webvh-server bootstrap-did --path {mnemonic}"
-                    );
-                    error!(
-                        "  Then update server_did in config.toml with the new DID"
-                    );
+                    error!("  To create it, run:  webvh-server bootstrap-did --path {mnemonic}");
+                    error!("  Then update server_did in config.toml with the new DID");
                 }
             }
         }
@@ -756,9 +759,7 @@ async fn auto_bootstrap_dids(
     config
 }
 
-pub(crate) fn decode_multibase_ed25519_key(
-    multibase_key: &str,
-) -> Result<[u8; 32], AppError> {
+pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let secret = Secret::from_multibase(multibase_key, None)
@@ -800,7 +801,8 @@ mod tests {
 
     #[test]
     fn mnemonic_from_did_simple() {
-        let did = "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
+        let did =
+            "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
         assert_eq!(mnemonic_from_did(did).unwrap(), "webvh/server1");
     }
 

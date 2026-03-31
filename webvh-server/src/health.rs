@@ -64,9 +64,7 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
                     health::pass("Root DID exists");
                     // Try to read the DidRecord for more info
                     match dids_ks
-                        .get::<crate::did_ops::DidRecord>(
-                            crate::did_ops::did_key(".well-known"),
-                        )
+                        .get::<crate::did_ops::DidRecord>(crate::did_ops::did_key(".well-known"))
                         .await
                     {
                         Ok(Some(record)) => {

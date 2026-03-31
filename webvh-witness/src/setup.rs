@@ -34,7 +34,10 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     if output_path.exists() {
         let overwrite = Confirm::new()
-            .with_prompt(format!("{} already exists. Overwrite?", output_path.display()))
+            .with_prompt(format!(
+                "{} already exists. Overwrite?",
+                output_path.display()
+            ))
             .default(false)
             .interact()?;
         if !overwrite {
@@ -110,9 +113,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     } else if mediator_options[mediator_idx].starts_with("Use VTA") {
         vta_mediator.clone()
     } else {
-        let did: String = Input::new()
-            .with_prompt("Mediator DID")
-            .interact_text()?;
+        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
         if did.is_empty() { None } else { Some(did) }
     };
 
@@ -266,9 +267,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     if admin_idx <= 1 {
         let admin_did = if admin_idx == 0 {
-            let did: String = Input::new()
-                .with_prompt("Admin DID")
-                .interact_text()?;
+            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
             did
         } else {
             let (did, sk) = vta_setup::generate_admin_did_key();
@@ -311,9 +310,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  Witness DID: {}", did_result.did);
     eprintln!();
     eprintln!("  Next steps:");
-    eprintln!(
-        "    1. Import this DID on the server:"
-    );
+    eprintln!("    1. Import this DID on the server:");
     eprintln!(
         "       webvh-server bootstrap-did --path {} --did-log witness-did.jsonl",
         did_path
@@ -390,9 +387,7 @@ fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
             secrets_config.aws_region = Some(region);
         }
     } else if chosen.starts_with("GCP") {
-        let project: String = Input::new()
-            .with_prompt("GCP project ID")
-            .interact_text()?;
+        let project: String = Input::new().with_prompt("GCP project ID").interact_text()?;
         secrets_config.gcp_project = Some(project);
 
         let name: String = Input::new()
