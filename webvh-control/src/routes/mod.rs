@@ -90,11 +90,26 @@ pub fn router() -> Router<AppState> {
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
-    let router = Router::new().nest("/api", api);
+    let mut router = Router::new().nest("/api", api);
+
+    // Prometheus metrics endpoint (only when metrics feature is enabled)
+    #[cfg(feature = "metrics")]
+    {
+        router = router.route("/metrics", get(metrics_handler));
+    }
 
     // SPA fallback when UI feature is enabled
     #[cfg(feature = "ui")]
     let router = router.fallback(crate::frontend::static_handler);
 
     router
+}
+
+#[cfg(feature = "metrics")]
+async fn metrics_handler() -> (axum::http::StatusCode, [(&'static str, &'static str); 1], String) {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        affinidi_webvh_common::server::metrics::render(),
+    )
 }

@@ -93,6 +93,12 @@ enum Command {
         #[arg(long)]
         witness_id: Option<String>,
     },
+    /// Recover a soft-deleted DID
+    RecoverDid {
+        /// DID path/mnemonic to recover (e.g. "webvh/server1")
+        #[arg(long)]
+        path: String,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +168,12 @@ async fn main() {
         }
         Some(Command::RecreateDid { path }) => {
             if let Err(e) = run_recreate_did(cli.config, path).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RecoverDid { path }) => {
+            if let Err(e) = run_recover_did(cli.config, path).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -357,6 +369,41 @@ async fn run_load_did(
     eprintln!("  DID:  {}", result.did_id);
     eprintln!("  SCID: {}", result.scid);
     eprintln!("  Path: {path}/did.jsonl");
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_recover_did(
+    config_path: Option<PathBuf>,
+    mnemonic: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::did_ops::DidRecord;
+
+    let config = AppConfig::load(config_path)?;
+    let store_instance = store::Store::open(&config.store).await?;
+    let dids_ks = store_instance.keyspace("dids")?;
+
+    let did_key = format!("did:{mnemonic}");
+    let mut record: DidRecord = dids_ks
+        .get(did_key.as_str())
+        .await?
+        .ok_or(format!("DID not found at path '{mnemonic}'"))?;
+
+    if record.deleted_at.is_none() {
+        eprintln!("  DID at path '{mnemonic}' is not deleted.");
+        return Ok(());
+    }
+
+    record.deleted_at = None;
+    dids_ks.insert(did_key.as_str(), &record).await?;
+    store_instance.persist().await?;
+
+    eprintln!();
+    eprintln!("  DID recovered at path '{mnemonic}'!");
+    if let Some(ref did_id) = record.did_id {
+        eprintln!("  DID: {did_id}");
+    }
     eprintln!();
 
     Ok(())

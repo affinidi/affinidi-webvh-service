@@ -58,8 +58,16 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
-    Router::new()
-        .nest("/api", api)
+    let mut router = Router::new()
+        .nest("/api", api);
+
+    // Prometheus metrics endpoint (only when metrics feature is enabled)
+    #[cfg(feature = "metrics")]
+    {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    router
         // .well-known routes (specific routes take priority over fallback)
         .route(
             "/.well-known/did.jsonl",
@@ -75,4 +83,13 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         )
         // Combined fallback: DID serving (no SPA - UI moved to webvh-control)
         .fallback(did_public::serve_public)
+}
+
+#[cfg(feature = "metrics")]
+async fn metrics_handler() -> (axum::http::StatusCode, [(& 'static str, &'static str); 1], String) {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        affinidi_webvh_common::server::metrics::render(),
+    )
 }

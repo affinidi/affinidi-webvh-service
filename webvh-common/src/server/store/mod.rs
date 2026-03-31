@@ -258,6 +258,28 @@ impl KeyspaceHandle {
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
         Ok(self.prefix_iter_raw(b"").await?.len())
     }
+
+    /// Verify integrity of all entries in this keyspace.
+    ///
+    /// Scans all key-value pairs and attempts to parse each value as JSON.
+    /// Returns the number of corrupted (unparseable) entries found.
+    /// Corrupted entries are logged as warnings.
+    pub async fn verify_integrity(&self) -> Result<u64, AppError> {
+        let all = self.prefix_iter_raw(b"").await?;
+        let mut corrupted = 0u64;
+        for (key, value) in &all {
+            let key_str = String::from_utf8_lossy(key);
+            // Skip raw content entries (did.jsonl, witnesses) — not JSON
+            if key_str.starts_with("content:") {
+                continue;
+            }
+            if serde_json::from_slice::<serde_json::Value>(value).is_err() {
+                tracing::warn!(key = %key_str, "integrity check: corrupted entry (invalid JSON)");
+                corrupted += 1;
+            }
+        }
+        Ok(corrupted)
+    }
 }
 
 // ---------------------------------------------------------------------------

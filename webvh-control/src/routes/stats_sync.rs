@@ -86,6 +86,9 @@ pub async fn receive_stats(
         );
     }
 
+    #[cfg(feature = "metrics")]
+    affinidi_webvh_common::server::metrics::inc_stats_sync();
+
     debug!(
         server_did = %payload.server_did,
         seq = payload.seq,

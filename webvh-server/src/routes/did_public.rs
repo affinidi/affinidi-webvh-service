@@ -31,8 +31,12 @@ async fn serve_content(
 
     // Check cache first (hot path — read lock only, no I/O, Arc clone only)
     let content = if let Some(cached) = state.did_cache.get(key) {
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_cache_hit();
         cached
     } else {
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_cache_miss();
         let data = state
             .dids_ks
             .get_raw(key)
@@ -46,6 +50,8 @@ async fn serve_content(
         if let Some(ref collector) = state.stats_collector {
             collector.record_resolve(mnemonic);
         }
+        #[cfg(feature = "metrics")]
+        affinidi_webvh_common::server::metrics::inc_resolve();
     }
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");

@@ -304,6 +304,8 @@ pub async fn list_dids(
     auth: &AuthClaims,
     state: &AppState,
     requested_owner: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<DidListEntry>, AppError> {
     use crate::acl::Role;
 
@@ -338,7 +340,13 @@ pub async fn list_dids(
         }
     }
 
-    info!(did = %auth.did, owner = %target_owner, count = entries.len(), "DIDs listed on control plane");
+    // Apply pagination
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(1000);
+    let total = entries.len();
+    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+
+    info!(did = %auth.did, owner = %target_owner, total, returned = entries.len(), "DIDs listed on control plane");
 
     Ok(entries)
 }

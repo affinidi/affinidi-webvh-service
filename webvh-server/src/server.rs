@@ -85,6 +85,13 @@ pub async fn run(
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
+
+    // Integrity check on DID keyspace
+    match dids_ks.verify_integrity().await {
+        Ok(0) => debug!("store integrity check passed"),
+        Ok(n) => warn!(corrupted = n, "store integrity check found corrupted entries"),
+        Err(e) => warn!(error = %e, "store integrity check failed"),
+    }
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
     let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
 

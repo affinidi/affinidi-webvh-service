@@ -78,6 +78,8 @@ pub async fn challenge(
 
     store_session(&state.sessions_ks, &session).await?;
 
+    #[cfg(feature = "metrics")]
+    affinidi_webvh_common::server::metrics::inc_auth_challenge();
     info!(audit = true, did = %session.did, session_id = %session.session_id, "auth challenge issued");
 
     Ok(Json(ChallengeResponse {
@@ -182,6 +184,8 @@ pub async fn authenticate(
     )
     .await?;
 
+    #[cfg(feature = "metrics")]
+    affinidi_webvh_common::server::metrics::inc_auth_success();
     info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
 
     Ok(Json(AuthenticateResponse {

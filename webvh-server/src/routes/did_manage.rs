@@ -283,6 +283,8 @@ pub async fn get_raw_log(
 #[derive(Debug, Deserialize)]
 pub struct ListDidsQuery {
     pub owner: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 pub async fn list_dids(
@@ -290,6 +292,6 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), None, None).await?;
+    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), query.limit, query.offset).await?;
     Ok(Json(entries))
 }

@@ -15,6 +15,7 @@ build = "build.rs"
 
 [features]
 default = ["keyring", "store-fjall"]
+metrics = ["affinidi-webvh-common/metrics"]
 keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [

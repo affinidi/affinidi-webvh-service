@@ -42,7 +42,13 @@ pub async fn sync_to_control(
     };
 
     let url = format!("{control_url}/api/control/stats");
-    if let Err(e) = http.post(&url).json(&payload).send().await {
-        warn!(error = %e, url = %url, "failed to sync stats to control plane");
+    match http.post(&url).json(&payload).send().await {
+        Ok(_) => {
+            #[cfg(feature = "metrics")]
+            affinidi_webvh_common::server::metrics::inc_stats_sync();
+        }
+        Err(e) => {
+            warn!(error = %e, url = %url, "failed to sync stats to control plane");
+        }
     }
 }
