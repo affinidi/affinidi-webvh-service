@@ -135,6 +135,7 @@ pub async fn create_did(
         did_id: None,
         content_size: 0,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = state.store.batch();

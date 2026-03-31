@@ -1,4 +1,4 @@
-use crate::auth::AuthClaims;
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::mnemonic::{is_path_available, validate_custom_path};
@@ -248,6 +248,18 @@ pub async fn rollback_did(
         result.log_metadata,
         watcher_sync,
     )))
+}
+
+// ---------- POST /recover/{mnemonic} ----------
+
+pub async fn recover_did(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::recover_did(&state, mnemonic).await?;
+    Ok(axum::http::StatusCode::OK)
 }
 
 // ---------- GET /raw/{mnemonic} ----------

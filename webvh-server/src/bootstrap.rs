@@ -100,6 +100,7 @@ pub async fn bootstrap_did(
         did_id: Some(did_id.clone()),
         content_size: jsonl.len() as u64,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = store.batch();
@@ -198,6 +199,7 @@ pub async fn import_did_at_path(
         did_id: Some(did_id.clone()),
         content_size: jsonl.len() as u64,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = store.batch();

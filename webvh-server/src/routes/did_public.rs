@@ -24,7 +24,7 @@ async fn serve_content(
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
     {
-        if record.disabled {
+        if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
     }
@@ -66,7 +66,7 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
     {
-        if record.disabled {
+        if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
     }

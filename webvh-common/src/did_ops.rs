@@ -25,6 +25,10 @@ pub struct DidRecord {
     pub content_size: u64,
     #[serde(default)]
     pub disabled: bool,
+    /// Soft-delete timestamp. When set, the DID is treated as deleted but
+    /// content is preserved for recovery within the retention period.
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
 }
 
 /// A single parsed log entry with its DID document and parameters.

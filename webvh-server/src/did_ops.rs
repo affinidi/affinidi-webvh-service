@@ -261,6 +261,7 @@ pub async fn create_did(
         did_id: None,
         content_size: 0,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = state.store.batch();
@@ -564,26 +565,23 @@ pub struct DeleteDidResult {
     pub did_id: Option<String>,
 }
 
-/// Delete a DID and all its associated data.
+/// Soft-delete a DID. Content is preserved for recovery within the retention period.
+/// The cleanup thread will hard-delete records after the configured retention.
 pub async fn delete_did(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
 ) -> Result<DeleteDidResult, AppError> {
     validate_mnemonic(mnemonic)?;
-    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let did_id = record.did_id.clone();
 
-    let mut batch = state.store.batch();
-    batch.remove(&state.dids_ks, did_key(mnemonic));
-    batch.remove(&state.dids_ks, content_log_key(mnemonic));
-    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
-    batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
-    batch.remove(&state.dids_ks, watcher_sync_key(mnemonic));
-    batch.commit().await?;
+    // Mark as deleted instead of removing
+    record.deleted_at = Some(now_epoch());
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
 
-    // Update quota index
+    // Update quota index (content is still stored but quota is freed)
     quota_on_delete(&state.dids_ks, &record.owner, record.content_size).await?;
 
     state.did_cache.invalidate(&content_log_key(mnemonic));
@@ -597,6 +595,36 @@ pub async fn delete_did(
         mnemonic: mnemonic.to_string(),
         did_id,
     })
+}
+
+/// Recover a soft-deleted DID by clearing its `deleted_at` timestamp.
+pub async fn recover_did(
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic)?;
+
+    let mut record: DidRecord = state
+        .dids_ks
+        .get(did_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("DID not found: {mnemonic}")))?;
+
+    if record.deleted_at.is_none() {
+        return Err(AppError::Validation("DID is not deleted".into()));
+    }
+
+    record.deleted_at = None;
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+
+    // Restore quota
+    quota_on_create(&state.dids_ks, &record.owner).await?;
+
+    state.did_cache.invalidate(&content_log_key(mnemonic));
+
+    info!(audit = true, mnemonic = %mnemonic, owner = %record.owner, "DID recovered from soft delete");
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -703,11 +731,13 @@ pub async fn get_raw_log(
 // Cleanup
 // ---------------------------------------------------------------------------
 
-/// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`.
+/// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`,
+/// or soft-deleted records past the 30-day retention period.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
     ttl_seconds: u64,
 ) -> Result<u64, AppError> {
+    const SOFT_DELETE_RETENTION: u64 = 30 * 24 * 3600; // 30 days
     let now = now_epoch();
     let raw = dids_ks.prefix_iter_raw("did:").await?;
     let mut removed = 0u64;
@@ -717,7 +747,14 @@ pub async fn cleanup_empty_dids(
             Ok(r) => r,
             Err(_) => continue,
         };
-        if record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds {
+
+        let should_remove =
+            // Empty records past TTL
+            (record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds)
+            // Soft-deleted records past retention
+            || record.deleted_at.is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION);
+
+        if should_remove {
             dids_ks.remove(did_key(&record.mnemonic)).await?;
             dids_ks.remove(content_log_key(&record.mnemonic)).await?;
             dids_ks

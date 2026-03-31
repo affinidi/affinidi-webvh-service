@@ -38,6 +38,7 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
         .route("/enable/{*mnemonic}", put(did_manage::enable_did))
         // Rollback + raw log (authenticated)
         .route("/rollback/{*mnemonic}", post(did_manage::rollback_did))
+        .route("/recover/{*mnemonic}", post(did_manage::recover_did))
         .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Services (authenticated, any role)
         .route("/services", get(config::get_services))

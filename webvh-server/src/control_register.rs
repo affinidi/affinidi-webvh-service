@@ -219,6 +219,7 @@ pub async fn apply_single_update(
         did_id: Some(update.did_id.clone()),
         content_size: update.log_content.len() as u64,
         disabled: false,
+        deleted_at: None,
     };
 
     let mut batch = store.batch();
