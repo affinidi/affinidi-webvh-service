@@ -104,8 +104,8 @@ anyhow = "1"
 didwebvh-rs = "0.4"
 
 # VTA SDK
-vta-sdk = { version = "0.2", features = [
-  "session",
+vta-sdk = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure.git", branch = "nightly", features = [
+  "integration",
 ] }
 
 # Logging / tracing

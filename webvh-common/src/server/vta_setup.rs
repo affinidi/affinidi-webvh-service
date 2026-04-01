@@ -5,13 +5,9 @@
 
 use std::path::Path;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use vta_sdk::client::VtaClient;
-use vta_sdk::credentials::CredentialBundle;
-use vta_sdk::session::{SessionBackend, SessionStore};
+use vta_sdk::integration::{self, VtaServiceConfig};
 
 /// Metadata from a successful VTA connection.
 pub struct VtaConnectionInfo {
@@ -33,55 +29,30 @@ pub struct VtaDidResult {
     pub log_entry: Option<String>,
 }
 
-/// In-memory session backend for ephemeral setup sessions.
-///
-/// The setup handshake only needs the session for the duration of the
-/// wizard — no persistence needed. This avoids touching disk or
-/// requiring any specific secrets backend to be configured.
-struct InMemoryBackend {
-    data: Mutex<HashMap<String, String>>,
-}
-
-impl SessionBackend for InMemoryBackend {
-    fn load(&self, key: &str) -> Option<String> {
-        self.data.lock().unwrap().get(key).cloned()
-    }
-    fn save(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_string());
-        Ok(())
-    }
-    fn clear(&self, key: &str) {
-        self.data.lock().unwrap().remove(key);
-    }
-}
-
 /// Decode a VTA credential, authenticate, and return a connected client.
 ///
-/// The credential is the base64url string issued by the VTA operator.
-/// An in-memory session backend is used for the ephemeral setup handshake.
+/// Uses the shared `integration::authenticate()` two-tier strategy:
+/// 1. Lightweight REST auth (works for did:key VTAs)
+/// 2. Session-based challenge-response fallback (for did:web/did:webvh VTAs)
 pub async fn connect_vta(
     credential_b64: &str,
 ) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
-    let bundle = CredentialBundle::decode(credential_b64)?;
+    let bundle = vta_sdk::credentials::CredentialBundle::decode(credential_b64)?;
 
     let vta_url = bundle
         .vta_url
         .clone()
         .ok_or("VTA credential does not contain a vta_url")?;
 
-    // Use an in-memory backend — the session is only needed for this setup run
-    let backend = InMemoryBackend {
-        data: Mutex::new(HashMap::new()),
+    let config = VtaServiceConfig {
+        credential: credential_b64.to_string(),
+        context: String::new(), // context discovered below
+        url_override: Some(vta_url.clone()),
     };
-    let store = SessionStore::with_backend(Box::new(backend));
-    let session_key = "setup";
 
-    let login_result = store.login(credential_b64, &vta_url, session_key).await?;
-
-    let client = store.connect(session_key, Some(&vta_url)).await?;
+    let client = integration::authenticate(&config).await.map_err(|e| {
+        format!("VTA authentication failed: {e}")
+    })?;
 
     // Discover the context: list contexts and pick the one the credential has access to
     let contexts = client.list_contexts().await?;
@@ -98,9 +69,9 @@ pub async fn connect_vta(
         client,
         VtaConnectionInfo {
             vta_url,
-            vta_did: login_result.vta_did,
+            vta_did: bundle.vta_did,
             context_id,
-            client_did: login_result.client_did,
+            client_did: bundle.did,
         },
     ))
 }
