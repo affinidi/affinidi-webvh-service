@@ -84,7 +84,9 @@ pub async fn connect_vta(
 
     let login_result = store.login(credential_b64, &vta_url, session_key).await?;
 
-    let client = store.connect(session_key, Some(&vta_url)).await?;
+    // Pass None so connect() resolves the VTA DID and uses DIDComm transport
+    // through the VTA's mediator (required for create_did_webvh etc.)
+    let client = store.connect(session_key, None).await?;
 
     // Discover the context: list contexts and pick the one the credential has access to
     let contexts = client.list_contexts().await?;
