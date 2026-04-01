@@ -8178,8 +8178,8 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.3.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure.git?branch=nightly#fe6e9ed40dad9209c97192a61dc10ddee4f56444"
+version = "0.4.0"
+source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure.git?branch=nightly#a9657bbe0364a5ac137625e21b25217662fb270d"
 dependencies = [
  "aes",
  "aes-gcm",

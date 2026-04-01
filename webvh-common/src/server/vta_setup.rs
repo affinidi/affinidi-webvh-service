@@ -48,6 +48,7 @@ pub async fn connect_vta(
         credential: credential_b64.to_string(),
         context: String::new(), // context discovered below
         url_override: Some(vta_url.clone()),
+        timeout: None,
     };
 
     let client = integration::authenticate(&config).await.map_err(|e| {

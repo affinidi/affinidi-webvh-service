@@ -727,6 +727,7 @@ async fn run_server(config_path: Option<PathBuf>) {
                 credential: credential.clone(),
                 context: context_id.clone(),
                 url_override: config.vta.url.clone(),
+                timeout: None,
             };
             let cache = WebvhSecretCache::new(secret_store.as_ref());
 
