@@ -3,11 +3,14 @@
 //! Used by all three service setup wizards to authenticate with VTA,
 //! create DIDs, and retrieve key material.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use vta_sdk::client::VtaClient;
-use vta_sdk::integration::{self, VtaServiceConfig};
+use vta_sdk::credentials::CredentialBundle;
+use vta_sdk::session::{SessionBackend, SessionStore};
 
 /// Metadata from a successful VTA connection.
 pub struct VtaConnectionInfo {
@@ -29,31 +32,59 @@ pub struct VtaDidResult {
     pub log_entry: Option<String>,
 }
 
-/// Decode a VTA credential, authenticate, and return a connected client.
+/// In-memory session backend for ephemeral setup sessions.
 ///
-/// Uses the shared `integration::authenticate()` two-tier strategy:
-/// 1. Lightweight REST auth (works for did:key VTAs)
-/// 2. Session-based challenge-response fallback (for did:web/did:webvh VTAs)
+/// The setup handshake only needs the session for the duration of the
+/// wizard — no persistence needed. This avoids touching disk or
+/// requiring any specific secrets backend to be configured.
+struct InMemoryBackend {
+    data: Mutex<HashMap<String, String>>,
+}
+
+impl SessionBackend for InMemoryBackend {
+    fn load(&self, key: &str) -> Option<String> {
+        self.data.lock().unwrap().get(key).cloned()
+    }
+    fn save(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.data
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+    fn clear(&self, key: &str) {
+        self.data.lock().unwrap().remove(key);
+    }
+}
+
+/// Decode a VTA credential, authenticate via DIDComm, and return a connected client.
+///
+/// Uses `SessionStore` to establish a full DIDComm session through the VTA's
+/// mediator. This is required for operations like `create_did_webvh` where the
+/// VTA needs to relay DIDComm messages to the webvh server.
+///
+/// An in-memory session backend is used — the session is only needed for the
+/// duration of the setup wizard.
 pub async fn connect_vta(
     credential_b64: &str,
 ) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
-    let bundle = vta_sdk::credentials::CredentialBundle::decode(credential_b64)?;
+    let bundle = CredentialBundle::decode(credential_b64)?;
 
     let vta_url = bundle
         .vta_url
         .clone()
         .ok_or("VTA credential does not contain a vta_url")?;
 
-    let config = VtaServiceConfig {
-        credential: credential_b64.to_string(),
-        context: String::new(), // context discovered below
-        url_override: Some(vta_url.clone()),
-        timeout: None,
+    // Use an in-memory backend — the session is only needed for this setup run
+    let backend = InMemoryBackend {
+        data: Mutex::new(HashMap::new()),
     };
+    let store = SessionStore::with_backend(Box::new(backend));
+    let session_key = "setup";
 
-    let client = integration::authenticate(&config).await.map_err(|e| {
-        format!("VTA authentication failed: {e}")
-    })?;
+    let login_result = store.login(credential_b64, &vta_url, session_key).await?;
+
+    let client = store.connect(session_key, Some(&vta_url)).await?;
 
     // Discover the context: list contexts and pick the one the credential has access to
     let contexts = client.list_contexts().await?;
@@ -70,9 +101,9 @@ pub async fn connect_vta(
         client,
         VtaConnectionInfo {
             vta_url,
-            vta_did: bundle.vta_did,
+            vta_did: login_result.vta_did,
             context_id,
-            client_did: bundle.did,
+            client_did: login_result.client_did,
         },
     ))
 }
