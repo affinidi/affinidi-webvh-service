@@ -205,91 +205,117 @@ In daemon mode, inter-service communication happens in-process without network c
 
 ## Cold-Start Bootstrap (No Running Services)
 
-When bootstrapping a new environment from scratch — no DID resolution, no DIDComm, no running VTA or mediator — use this offline flow. DIDs are created locally on the VTA and loaded manually into each service.
+Bootstraps a complete environment from scratch — no DID resolution, no DIDComm, no running services. All DIDs are created offline on the VTA and loaded manually.
 
 ### Prerequisites
 
-- VTA binary (`vta`) with setup completed (`vta setup`)
-- Compiled `webvh-server` and `mediator-setup-vta` binaries
-- A `config.toml` for the webvh-server (can be minimal — just `public_url`, `[server]`, `[store]`, `[secrets]`)
-- A `mediator.toml` for the mediator
+- Compiled binaries: `vta`, `webvh-server`, `mediator-setup-vta`, `mediator`
+- A minimal `config.toml` for the webvh-server (`public_url`, `[server]`, `[store]`, `[secrets]`)
+- A `mediator.toml` for the mediator (use the template in `conf/mediator.toml`)
+- Redis running (required by the mediator)
 
-### Step 1: Create DIDs on the VTA (offline)
+### Step 1: VTA Setup (offline)
 
 ```bash
-# Create the webvh-server's DID
-vta create-did-webvh --context ctx1 --label server
-# → saves did-server.jsonl, optionally exports secrets bundle
-
-# Create the mediator's DID
-vta create-did-webvh --context mediator --label mediator
-# → saves did-mediator.jsonl, optionally exports secrets bundle
+vta setup
 ```
 
-When prompted, export the secrets bundle for each DID. Copy the base64url output — you'll need it in the next steps.
+Creates the master seed, VTA DID, and local data store. When prompted, choose to create the VTA DID in serverless mode. Save the `did-vta.jsonl` and note the VTA credential.
 
-### Step 2: Set up the WebVH Server (offline)
+### Step 2: Create DIDs on the VTA (offline)
 
 ```bash
-# Import the server's signing/KA keys from the VTA bundle
+vta create-did-webvh --context ctx1 --label server
+vta create-did-webvh --context mediator --label mediator
+```
+
+Each command prompts for a WebVH URL, creates the DID locally (serverless mode), and saves a `did.jsonl` file. When prompted, **export the secrets bundle** for each — copy the base64url output.
+
+You should now have:
+- `did-vta.jsonl` + VTA credential (from step 1)
+- `did-server.jsonl` + server secrets bundle (from step 2)
+- `did-mediator.jsonl` + mediator secrets bundle (from step 2)
+
+### Step 3: Set up the WebVH Server (offline)
+
+```bash
+# Import the server's keys
 webvh-server import-secrets --config config.toml \
   --vta-bundle <server-secrets-bundle>
 
-# Load all DIDs into the server's store
+# Load all three DIDs
 webvh-server load-did --path .well-known --did-log did-server.jsonl
 webvh-server load-did --path <vta-path> --did-log did-vta.jsonl
 webvh-server load-did --path <mediator-path> --did-log did-mediator.jsonl
 ```
 
-### Step 3: Start the WebVH Server
+### Step 4: Start the WebVH Server
 
 ```bash
 webvh-server --config config.toml
 ```
 
-All DIDs are now resolvable via HTTP. The server starts with DIDComm in degraded mode (mediator not yet available).
+All three DIDs are now resolvable via HTTP.
 
-### Step 4: Set up the Mediator (offline)
+### Step 5: Set up the Mediator (offline)
 
 ```bash
 mediator-setup-vta --import-bundle --config conf/mediator.toml
 ```
 
 When prompted:
-1. Paste the **mediator secrets bundle** (from step 1)
-2. Paste the **VTA credential** (from `vta setup`)
+1. Paste the **mediator secrets bundle**
+2. Paste the **VTA credential**
 3. Choose a storage backend (string/AWS/keyring)
-4. **DID document path** — provide the `did-mediator.jsonl` from step 1 so the mediator can resolve its own DID locally without needing the webvh-server
-5. Enter the context ID (e.g., `mediator`)
+4. Provide `did-mediator.jsonl` path — enables the mediator to resolve its own DID locally, so it can restart independently of the webvh-server
+5. Enter the VTA context ID (e.g., `mediator`)
 
-This pre-seeds the VTA secret cache and configures `did_web_self_hosted` so the mediator can start without a running VTA or webvh-server.
-
-### Step 5: Start the Mediator
+### Step 6: Start the Mediator
 
 ```bash
 mediator
 ```
 
-The mediator tries to reach the VTA, falls back to the cached secrets, and starts. Its DID is already resolvable via the webvh-server.
+Falls back to cached secrets (VTA not yet running). Resolves its own DID from the local document.
 
-### Step 6: Start the VTA
+### Step 7: Start the VTA
 
 ```bash
 vta --config config.toml
 ```
 
-All three services can now resolve each other. DIDComm is fully operational.
+All services can now resolve each other. DIDComm is fully operational.
+
+### Post-Bootstrap
+
+After all services are running:
+
+- **Register the webvh-server with the VTA** (required for creating new DIDs via VTA):
+  ```bash
+  vta webvh add-server --id <server-id> --did <server-did>
+  ```
+- **Change the mediator JWT key** for production — update `jwt_authorization_secret` in `mediator.toml`
+- **Optional:** Pass `--vta-credential` to `webvh-server import-secrets` if you want the server to refresh keys from the VTA automatically on restart
+
+### Restart Behavior
+
+All services restart cleanly during normal operations:
+
+- **WebVH server** — loads DIDs from persistent store, re-registers with control plane in background
+- **Mediator** — fetches fresh secrets from VTA if available, falls back to cache if VTA is down. Resolves own DID from local document (no webvh-server dependency)
+- **VTA** — DIDComm retries mediator connection with backoff. REST API works immediately
 
 ### Cold-Start Summary
 
 | Step | Action | Network? | Services Running |
 |------|--------|----------|------------------|
-| 1 | `vta create-did-webvh` (×2) | No | None |
-| 2 | `webvh-server import-secrets` + `load-did` (×3) | No | None |
-| 3 | Start webvh-server | No | WebVH |
-| 4 | `mediator-setup-vta --import-bundle` | No | WebVH |
-| 5 | Start mediator | Yes (DID resolution) | WebVH, Mediator |
-| 6 | Start VTA | Yes (DID resolution) | All |
+| 1 | `vta setup` | No | None |
+| 2 | `vta create-did-webvh` (×2) | No | None |
+| 3 | `webvh-server import-secrets` + `load-did` (×3) | No | None |
+| 4 | Start webvh-server | No | WebVH |
+| 5 | `mediator-setup-vta --import-bundle` | No | WebVH |
+| 6 | Start mediator | Yes (DID resolution) | WebVH, Mediator |
+| 7 | Start VTA | Yes (DID resolution) | All |
 
 ## Verifying the Setup
 
