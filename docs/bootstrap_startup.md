@@ -259,9 +259,10 @@ When prompted:
 1. Paste the **mediator secrets bundle** (from step 1)
 2. Paste the **VTA credential** (from `vta setup`)
 3. Choose a storage backend (string/AWS/keyring)
-4. Enter the context ID (e.g., `mediator`)
+4. **DID document path** — provide the `did-mediator.jsonl` from step 1 so the mediator can resolve its own DID locally without needing the webvh-server
+5. Enter the context ID (e.g., `mediator`)
 
-This pre-seeds the VTA secret cache so the mediator can start without a running VTA.
+This pre-seeds the VTA secret cache and configures `did_web_self_hosted` so the mediator can start without a running VTA or webvh-server.
 
 ### Step 5: Start the Mediator
 
