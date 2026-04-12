@@ -167,6 +167,11 @@ pub async fn create_did(
         add_mediator_service: add_mediator,
         additional_services,
         pre_rotation_count: 0,
+        did_document: None,
+        did_log: None,
+        set_primary: true,
+        signing_key_id: None,
+        ka_key_id: None,
     };
 
     let result = client.create_did_webvh(req).await?;
@@ -214,4 +219,3 @@ pub fn generate_ed25519_multibase() -> String {
         .get_private_keymultibase()
         .expect("ed25519 multibase encoding")
 }
-
