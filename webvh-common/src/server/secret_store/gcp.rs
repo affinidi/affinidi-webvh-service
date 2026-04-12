@@ -59,12 +59,9 @@ impl super::SecretStore for GcpSecretStore {
                     let payload = response.payload.ok_or_else(|| {
                         AppError::SecretStore("GCP secret version has no payload".into())
                     })?;
-                    let json_str =
-                        String::from_utf8(payload.data.to_vec()).map_err(|e| {
-                            AppError::SecretStore(format!(
-                                "GCP secret payload is not valid UTF-8: {e}"
-                            ))
-                        })?;
+                    let json_str = String::from_utf8(payload.data.to_vec()).map_err(|e| {
+                        AppError::SecretStore(format!("GCP secret payload is not valid UTF-8: {e}"))
+                    })?;
                     let secrets: ServerSecrets =
                         serde_json::from_str(json_str.trim()).map_err(|e| {
                             AppError::SecretStore(format!(
@@ -131,9 +128,7 @@ impl super::SecretStore for GcpSecretStore {
                             .send()
                             .await
                             .map_err(|e| {
-                                AppError::SecretStore(format!(
-                                    "failed to create GCP secret: {e}"
-                                ))
+                                AppError::SecretStore(format!("failed to create GCP secret: {e}"))
                             })?;
 
                         // Now add the version

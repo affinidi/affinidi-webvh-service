@@ -199,12 +199,22 @@ pub async fn get_raw_log(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
-) -> Result<(StatusCode, [(axum::http::HeaderName, &'static str); 1], String), AppError> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        String,
+    ),
+    AppError,
+> {
     let mnemonic = clean_mnemonic(&mnemonic);
     let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         content,
     ))
 }
@@ -223,7 +233,14 @@ pub async fn list_dids(
     State(state): State<AppState>,
     Query(query): Query<ListDidsQuery>,
 ) -> Result<Json<Vec<DidListEntry>>, AppError> {
-    let entries = did_ops::list_dids(&auth, &state, query.owner.as_deref(), query.limit, query.offset).await?;
+    let entries = did_ops::list_dids(
+        &auth,
+        &state,
+        query.owner.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
     Ok(Json(entries))
 }
 
@@ -262,11 +279,7 @@ pub async fn get_did_stats(
 ) -> Result<Json<affinidi_webvh_common::DidStats>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
     let key = format!("stats:{mnemonic}");
-    let stats: affinidi_webvh_common::DidStats = state
-        .stats_ks
-        .get(key)
-        .await?
-        .unwrap_or_default();
+    let stats: affinidi_webvh_common::DidStats = state.stats_ks.get(key).await?.unwrap_or_default();
     Ok(Json(stats))
 }
 
@@ -290,21 +303,102 @@ fn default_range() -> String {
     "24h".to_string()
 }
 
-/// GET /api/timeseries — returns empty time-series data (follow-up feature).
+/// GET /api/timeseries — server-wide time-series data.
 pub async fn get_server_timeseries(
     _auth: AuthClaims,
-    Query(_params): Query<TimeseriesQuery>,
-) -> Json<Vec<TimeSeriesPoint>> {
-    Json(Vec::new())
+    State(state): State<AppState>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
+    let points = query_timeseries(&state.stats_ks, "_all", &params.range).await?;
+    Ok(Json(points))
 }
 
-/// GET /api/timeseries/{mnemonic} — returns empty time-series data (follow-up feature).
+/// GET /api/timeseries/{mnemonic} — per-DID time-series data.
 pub async fn get_did_timeseries(
     _auth: AuthClaims,
-    Path(_mnemonic): Path<String>,
-    Query(_params): Query<TimeseriesQuery>,
-) -> Json<Vec<TimeSeriesPoint>> {
-    Json(Vec::new())
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    Query(params): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
+    let mnemonic = mnemonic.trim_start_matches('/');
+    let points = query_timeseries(&state.stats_ks, mnemonic, &params.range).await?;
+    Ok(Json(points))
+}
+
+/// Query time-series buckets for a given mnemonic and range.
+async fn query_timeseries(
+    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    mnemonic: &str,
+    range: &str,
+) -> Result<Vec<TimeSeriesPoint>, AppError> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Default)]
+    struct BucketData {
+        r: u64,
+        u: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (duration, step) = match range {
+        "1h" => (3600u64, 300u64),
+        "7d" => (7 * 24 * 3600, 3600),
+        "30d" => (30 * 24 * 3600, 14400),
+        _ => (24 * 3600, 900), // default 24h
+    };
+
+    let cutoff = now.saturating_sub(duration);
+    let start = cutoff / 300 * 300; // align to 5-min bucket
+    let end = now / 300 * 300;
+
+    let prefix = format!("ts:{mnemonic}:");
+    let raw = stats_ks.prefix_iter_raw(prefix.as_str()).await?;
+
+    // Collect raw buckets within range
+    let prefix_len = prefix.len();
+    let mut bucket_map: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    for (key, value) in &raw {
+        let key_str = std::str::from_utf8(key).unwrap_or_default();
+        if let Some(epoch_str) = key_str.get(prefix_len..)
+            && let Ok(epoch) = epoch_str.parse::<u64>()
+            && epoch >= cutoff
+            && let Ok(data) = serde_json::from_slice::<BucketData>(value)
+        {
+            let entry = bucket_map.entry(epoch).or_insert((0, 0));
+            entry.0 += data.r;
+            entry.1 += data.u;
+        }
+    }
+
+    // Build aggregated display points
+    let mut points = Vec::new();
+    let mut ts = start;
+    while ts <= end {
+        let mut resolves = 0u64;
+        let mut updates = 0u64;
+        // Aggregate all 5-min buckets within this step
+        let mut bucket_ts = ts;
+        while bucket_ts < ts + step && bucket_ts <= end {
+            if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
+                resolves += r;
+                updates += u;
+            }
+            bucket_ts += 300;
+        }
+        points.push(TimeSeriesPoint {
+            timestamp: ts,
+            resolves,
+            updates,
+        });
+        ts += step;
+    }
+
+    Ok(points)
 }
 
 // ---------- GET /api/config ----------
@@ -331,6 +425,8 @@ pub struct ConfigResponse {
     pub access_token_expiry: u64,
     pub refresh_token_expiry: u64,
     pub passkey_enrollment_ttl: u64,
+    /// Deployment
+    pub deployment_mode: String,
     /// Storage & Logging
     pub data_dir: String,
     pub log_level: String,
@@ -338,10 +434,7 @@ pub struct ConfigResponse {
 }
 
 /// GET /api/config — return control plane configuration (non-sensitive fields only).
-pub async fn get_config(
-    _auth: AuthClaims,
-    State(state): State<AppState>,
-) -> Json<ConfigResponse> {
+pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Json<ConfigResponse> {
     let c = &state.config;
     Json(ConfigResponse {
         control_did: c.server_did.clone(),
@@ -350,6 +443,7 @@ pub async fn get_config(
         did_hosting_url: c.did_hosting_url.clone(),
         didcomm_enabled: c.features.didcomm,
         rest_api_enabled: c.features.rest_api,
+        deployment_mode: c.features.deployment_mode.clone(),
         listen_address: format!("{}:{}", c.server.host, c.server.port),
         vta_url: c.vta.url.clone(),
         vta_did: c.vta.did.clone(),
@@ -449,7 +543,11 @@ pub async fn get_services_overview(
             registry::ServiceStatus::Unreachable => unreachable += 1,
         }
 
-        let service_did = inst.metadata.get("did").and_then(|v| v.as_str()).map(String::from);
+        let service_did = inst
+            .metadata
+            .get("did")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Per-service stats not available individually in the new model
         let stats: Option<ServiceStats> = None;

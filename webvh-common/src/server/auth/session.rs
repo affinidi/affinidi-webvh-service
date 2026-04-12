@@ -147,11 +147,11 @@ pub async fn cleanup_expired_sessions(
         struct EnrollmentExpiry {
             expires_at: u64,
         }
-        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value) {
-            if now > e.expires_at {
-                sessions.remove(key).await?;
-                removed += 1;
-            }
+        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value)
+            && now > e.expires_at
+        {
+            sessions.remove(key).await?;
+            removed += 1;
         }
     }
 
@@ -194,7 +194,13 @@ fn generate_tokens(
     let access_token = jwt_keys.encode(&claims)?;
     let refresh_token = Uuid::new_v4().to_string();
     let refresh_expires_at = now_epoch() + refresh_expiry;
-    Ok((access_token, access_expires_at, refresh_token, refresh_expires_at, token_id))
+    Ok((
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+        token_id,
+    ))
 }
 
 /// Upgrade an existing `ChallengeSent` session to `Authenticated`, generating
@@ -209,7 +215,14 @@ pub async fn finalize_challenge_session(
     refresh_expiry: u64,
 ) -> Result<TokenResponse, AppError> {
     let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
-        generate_tokens(jwt_keys, &session.did, &session.session_id, role, access_expiry, refresh_expiry)?;
+        generate_tokens(
+            jwt_keys,
+            &session.did,
+            &session.session_id,
+            role,
+            access_expiry,
+            refresh_expiry,
+        )?;
 
     session.state = SessionState::Authenticated;
     session.refresh_token = Some(refresh_token.clone());
@@ -242,7 +255,14 @@ pub async fn create_authenticated_session(
     let session_id = Uuid::new_v4().to_string();
 
     let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
-        generate_tokens(jwt_keys, did, &session_id, role, access_expiry, refresh_expiry)?;
+        generate_tokens(
+            jwt_keys,
+            did,
+            &session_id,
+            role,
+            access_expiry,
+            refresh_expiry,
+        )?;
 
     let session = Session {
         session_id: session_id.clone(),

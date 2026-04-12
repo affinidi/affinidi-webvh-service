@@ -5,24 +5,26 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
-use crate::server::acl::{self, check_acl, AclEntry, Role};
-use crate::server::auth::extractor::AdminAuth;
-use crate::server::auth::session::{create_authenticated_session, now_epoch, TokenResponse};
-use crate::server::error::AppError;
 use super::{PasskeyState, store};
+use crate::server::acl::{self, AclEntry, Role, check_acl};
+use crate::server::auth::extractor::AdminAuth;
+use crate::server::auth::session::{TokenResponse, create_authenticated_session, now_epoch};
+use crate::server::error::AppError;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn require_webauthn<S: PasskeyState>(state: &S) -> Result<&Webauthn, AppError> {
-    state
-        .webauthn()
-        .map(|w| w.as_ref())
-        .ok_or_else(|| AppError::Authentication("passkey auth not configured (set public_url)".into()))
+    state.webauthn().map(|w| w.as_ref()).ok_or_else(|| {
+        warn!("passkey request rejected: WebAuthn not configured (set public_url)");
+        AppError::Authentication("passkey auth not configured (set public_url)".into())
+    })
 }
 
-fn require_jwt_keys<S: PasskeyState>(state: &S) -> Result<&crate::server::auth::jwt::JwtKeys, AppError> {
+fn require_jwt_keys<S: PasskeyState>(
+    state: &S,
+) -> Result<&crate::server::auth::jwt::JwtKeys, AppError> {
     state
         .jwt_keys()
         .map(|k| k.as_ref())
@@ -63,16 +65,15 @@ pub async fn enroll_start<S: PasskeyState>(
     // Check expiry
     if now_epoch() > enrollment.expires_at {
         warn!(did = %enrollment.did, "passkey enrollment rejected: link expired");
-        return Err(AppError::Authentication("enrollment link has expired".into()));
+        return Err(AppError::Authentication(
+            "enrollment link has expired".into(),
+        ));
     }
 
     // Ensure DID is in ACL — the enrollment itself is the admin's authorization,
     // so create the ACL entry if it doesn't already exist.
-    let role = Role::from_str(&enrollment.role)?;
-    if acl::get_acl_entry(acl_ks, &enrollment.did)
-        .await?
-        .is_none()
-    {
+    let role = enrollment.role.parse::<Role>()?;
+    if acl::get_acl_entry(acl_ks, &enrollment.did).await?.is_none() {
         let entry = AclEntry {
             did: enrollment.did.clone(),
             role: role.clone(),
@@ -100,17 +101,17 @@ pub async fn enroll_start<S: PasskeyState>(
     let exclude: Option<Vec<CredentialID>> = if user.credentials.is_empty() {
         None
     } else {
-        Some(user.credentials.iter().map(|c| c.cred_id().clone()).collect())
+        Some(
+            user.credentials
+                .iter()
+                .map(|c| c.cred_id().clone())
+                .collect(),
+        )
     };
 
     // Start registration ceremony
     let (ccr, reg_state) = webauthn
-        .start_passkey_registration(
-            user.user_uuid,
-            &user.did,
-            &user.display_name,
-            exclude,
-        )
+        .start_passkey_registration(user.user_uuid, &user.did, &user.display_name, exclude)
         .map_err(|e| AppError::Internal(format!("webauthn registration start failed: {e}")))?;
 
     // Persist the user (so finish can find it), registration state, and user mapping
@@ -150,7 +151,9 @@ pub async fn enroll_finish<S: PasskeyState>(
     // Atomically load and delete registration state (prevents race conditions)
     let reg_state = store::take_registration_state(sessions_ks, &req.registration_id)
         .await?
-        .ok_or_else(|| AppError::Authentication("registration state not found or expired".into()))?;
+        .ok_or_else(|| {
+            AppError::Authentication("registration state not found or expired".into())
+        })?;
 
     // Complete registration ceremony
     let passkey = webauthn
@@ -217,6 +220,7 @@ pub async fn login_start<S: PasskeyState>(
     let all_passkeys = store::get_all_passkeys(sessions_ks).await?;
 
     if all_passkeys.is_empty() {
+        warn!("passkey login failed: no passkeys registered on this server");
         return Err(AppError::Authentication(
             "no passkeys registered on this server".into(),
         ));
@@ -331,7 +335,7 @@ pub async fn create_enrollment_invite(
     role: &str,
 ) -> Result<CreateInviteResponse, AppError> {
     // Validate role
-    let _ = Role::from_str(role)?;
+    let _ = role.parse::<Role>()?;
 
     // Generate a 32-byte random token
     let token = {

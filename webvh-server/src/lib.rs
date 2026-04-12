@@ -1,13 +1,13 @@
 pub mod acl;
 pub mod auth;
 pub mod backup;
-pub mod cache;
 pub mod bootstrap;
+pub mod cache;
 pub mod config;
-pub mod health;
 pub mod control_register;
 pub mod did_ops;
 pub mod error;
+pub mod health;
 pub mod messaging;
 pub mod mnemonic;
 pub mod routes;

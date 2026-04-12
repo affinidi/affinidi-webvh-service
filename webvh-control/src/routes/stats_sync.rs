@@ -1,4 +1,7 @@
 //! Stats sync endpoint — receives per-DID deltas from webvh-server instances.
+//!
+//! All I/O is deferred to the periodic flush cycle. This handler only updates
+//! in-memory counters (nanosecond cost per delta).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -14,14 +17,14 @@ use tracing::{debug, warn};
 use crate::server::AppState;
 
 /// Tracks the last accepted sequence number per server DID.
-/// Prevents replayed or out-of-order stats payloads from being applied twice.
 static LAST_SEQ: std::sync::LazyLock<RwLock<HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// POST /api/control/stats — receive per-DID deltas from a server instance.
 ///
-/// Validates that `server_did` is in the ACL, and that the sequence number
-/// is strictly increasing (rejects replayed payloads).
+/// Validates ACL, checks sequence for idempotency, then records deltas into
+/// the in-memory collector. Zero I/O — everything is flushed to store by
+/// the periodic flush cycle in the storage thread.
 pub async fn receive_stats(
     State(state): State<AppState>,
     Json(payload): Json<StatsSyncPayload>,
@@ -39,43 +42,27 @@ pub async fn receive_stats(
         }
     }
 
-    // Idempotency: reject replayed or out-of-order payloads
+    // Idempotency: reject replayed payloads (seq=0 means server restart)
+    if let Ok(map) = LAST_SEQ.read()
+        && let Some(&last) = map.get(&payload.server_did)
+        && payload.seq > 0
+        && payload.seq <= last
     {
-        let map = match LAST_SEQ.read() {
-            Ok(m) => m,
-            Err(_) => {
-                warn!("LAST_SEQ lock poisoned — accepting payload");
-                return StatusCode::NO_CONTENT;
-            }
-        };
-        if let Some(&last) = map.get(&payload.server_did) {
-            if payload.seq <= last {
-                debug!(
-                    server_did = %payload.server_did,
-                    seq = payload.seq,
-                    last_seq = last,
-                    "stats sync rejected: stale sequence"
-                );
-                return StatusCode::NO_CONTENT; // Silently accept (idempotent)
-            }
-        }
+        debug!(
+            server_did = %payload.server_did,
+            seq = payload.seq,
+            last_seq = last,
+            "stats sync: stale sequence (skipped)"
+        );
+        return StatusCode::NO_CONTENT;
     }
 
     // Update last seen sequence
-    {
-        let mut map = match LAST_SEQ.write() {
-            Ok(m) => m,
-            Err(_) => {
-                warn!("LAST_SEQ write lock poisoned — accepting payload");
-                // Fall through to apply deltas even if sequence tracking is broken
-                return StatusCode::NO_CONTENT;
-            }
-        };
+    if let Ok(mut map) = LAST_SEQ.write() {
         map.insert(payload.server_did.clone(), payload.seq);
     }
 
-    let delta_count = payload.did_deltas.len();
-
+    // Record deltas into in-memory collector (no I/O)
     for delta in &payload.did_deltas {
         state.stats_collector.record_deltas(
             &delta.mnemonic,
@@ -92,8 +79,8 @@ pub async fn receive_stats(
     debug!(
         server_did = %payload.server_did,
         seq = payload.seq,
-        delta_count,
-        "received stats sync"
+        delta_count = payload.did_deltas.len(),
+        "stats sync accepted"
     );
 
     StatusCode::NO_CONTENT

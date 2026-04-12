@@ -4,11 +4,11 @@ use serde::Serialize;
 
 use tracing::info;
 
-use affinidi_webvh_common::DidStats;
 use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
+use affinidi_webvh_common::DidStats;
 
 /// GET /stats/{mnemonic} — per-DID stats (in-memory only on server, returns default).
 ///

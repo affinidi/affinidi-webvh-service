@@ -269,8 +269,12 @@ impl KeyspaceHandle {
         let mut corrupted = 0u64;
         for (key, value) in &all {
             let key_str = String::from_utf8_lossy(key);
-            // Skip raw content entries (did.jsonl, witnesses) — not JSON
-            if key_str.starts_with("content:") {
+            // Skip entries that store raw bytes, not JSON
+            if key_str.starts_with("content:")
+                || key_str.starts_with("owner:")
+                || key_str.starts_with("refresh:")
+                || key_str.starts_with("ts:")
+            {
                 continue;
             }
             if serde_json::from_slice::<serde_json::Value>(value).is_err() {

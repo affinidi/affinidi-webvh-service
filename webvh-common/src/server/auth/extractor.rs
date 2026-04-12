@@ -37,10 +37,7 @@ pub struct AuthClaims {
 impl<S: AuthState> FromRequestParts<S> for AuthClaims {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         // Extract Bearer token from Authorization header
         let TypedHeader(auth) =
             TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, state)
@@ -73,14 +70,15 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         }
 
         // Validate token_id matches — prevents use of old tokens after refresh
-        if let Some(ref session_token_id) = session.token_id {
-            if !claims.jti.is_empty() && claims.jti != *session_token_id {
-                warn!(session_id = %claims.session_id, "auth rejected: token revoked (stale jti)");
-                return Err(AppError::Unauthorized("token has been revoked".into()));
-            }
+        if let Some(ref session_token_id) = session.token_id
+            && !claims.jti.is_empty()
+            && claims.jti != *session_token_id
+        {
+            warn!(session_id = %claims.session_id, "auth rejected: token revoked (stale jti)");
+            return Err(AppError::Unauthorized("token has been revoked".into()));
         }
 
-        let role = Role::from_str(&claims.role)?;
+        let role = claims.role.parse::<Role>()?;
 
         debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");
 
@@ -103,10 +101,7 @@ pub struct ServiceAuth(pub AuthClaims);
 impl<S: AuthState> FromRequestParts<S> for ServiceAuth {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let claims = AuthClaims::from_request_parts(parts, state).await?;
 
         match claims.role {
@@ -131,10 +126,7 @@ pub struct AdminAuth(pub AuthClaims);
 impl<S: AuthState> FromRequestParts<S> for AdminAuth {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let claims = AuthClaims::from_request_parts(parts, state).await?;
 
         match claims.role {

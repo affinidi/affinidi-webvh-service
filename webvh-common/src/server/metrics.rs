@@ -4,9 +4,7 @@
 //! for DID operations, auth events, cache performance, and stats sync.
 //! Access via `GET /metrics` (unauthenticated).
 
-use prometheus::{
-    Encoder, IntCounter, Registry, TextEncoder,
-};
+use prometheus::{Encoder, IntCounter, Registry, TextEncoder};
 use std::sync::LazyLock;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
@@ -24,13 +22,21 @@ static UPDATES: LazyLock<IntCounter> = LazyLock::new(|| {
 });
 
 static AUTH_CHALLENGES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_auth_challenges_total", "Total auth challenges issued").unwrap();
+    let c = IntCounter::new(
+        "webvh_auth_challenges_total",
+        "Total auth challenges issued",
+    )
+    .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
     c
 });
 
 static AUTH_SUCCESSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_auth_successes_total", "Total successful authentications").unwrap();
+    let c = IntCounter::new(
+        "webvh_auth_successes_total",
+        "Total successful authentications",
+    )
+    .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
     c
 });
@@ -104,6 +110,8 @@ pub fn render() -> String {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .unwrap_or_default();
     String::from_utf8(buffer).unwrap_or_default()
 }

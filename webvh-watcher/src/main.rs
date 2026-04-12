@@ -1,10 +1,14 @@
-use clap::{Parser, Subcommand};
 use affinidi_webvh_watcher::config::AppConfig;
 use affinidi_webvh_watcher::{health, server, store};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "webvh-watcher", about = "WebVH Watcher — Read-Only DID Mirror", version)]
+#[command(
+    name = "webvh-watcher",
+    about = "WebVH Watcher — Read-Only DID Mirror",
+    version
+)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, global = true)]

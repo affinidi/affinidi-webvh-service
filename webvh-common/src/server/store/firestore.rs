@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use firestore::*;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -153,8 +153,8 @@ impl KeyspaceOps for FirestoreKeyspace {
 
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
-            let params = FirestoreListDocParams::new(self.collection.clone())
-                .with_page_size(10_000);
+            let params =
+                FirestoreListDocParams::new(self.collection.clone()).with_page_size(10_000);
 
             let mut stream = self
                 .db
@@ -226,9 +226,10 @@ impl BatchOps for FirestoreBatch {
         Box::pin(async move {
             // Firestore batched writes support up to 500 operations per request.
             for chunk in self.ops.chunks(500) {
-                let mut batch = self.db.begin_transaction().await.map_err(|e| {
-                    AppError::Store(format!("firestore begin transaction: {e}"))
-                })?;
+                let mut batch =
+                    self.db.begin_transaction().await.map_err(|e| {
+                        AppError::Store(format!("firestore begin transaction: {e}"))
+                    })?;
 
                 for op in chunk {
                     match op {
@@ -248,10 +249,7 @@ impl BatchOps for FirestoreBatch {
                                     AppError::Store(format!("firestore batch insert: {e}"))
                                 })?;
                         }
-                        FirestoreBatchOp::Remove {
-                            collection,
-                            doc_id,
-                        } => {
+                        FirestoreBatchOp::Remove { collection, doc_id } => {
                             self.db
                                 .fluent()
                                 .delete()
@@ -265,9 +263,10 @@ impl BatchOps for FirestoreBatch {
                     }
                 }
 
-                batch.commit().await.map_err(|e| {
-                    AppError::Store(format!("firestore commit transaction: {e}"))
-                })?;
+                batch
+                    .commit()
+                    .await
+                    .map_err(|e| AppError::Store(format!("firestore commit transaction: {e}")))?;
             }
             Ok(())
         })

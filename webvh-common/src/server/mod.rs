@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;
@@ -8,11 +9,13 @@ pub mod health;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mnemonic;
-pub mod stats_collector;
 #[cfg(feature = "passkey")]
 pub mod passkey;
 pub mod secret_store;
+pub mod stats_collector;
 pub mod store;
+pub mod tasks;
+pub mod vta_cache;
 pub mod vta_setup;
 
 /// Axum middleware that sets security response headers on every response.

@@ -23,9 +23,9 @@ use tracing::{debug, info, warn};
 // Re-export shared types and helpers from webvh-common so existing code
 // that imports from `crate::did_ops::*` continues to work.
 pub use affinidi_webvh_common::did_ops::{
-    DidRecord, LogEntryInfo, LogMetadata,
-    did_key, content_log_key, content_witness_key, owner_key, watcher_sync_key,
-    extract_did_id, extract_log_metadata, extract_did_web_document, parse_log_entries,
+    DidRecord, LogEntryInfo, LogMetadata, content_log_key, content_witness_key, did_key,
+    extract_did_id, extract_did_web_document, extract_log_metadata, owner_key, parse_log_entries,
+    watcher_sync_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,10 +49,7 @@ pub async fn get_quota(dids_ks: &KeyspaceHandle, owner: &str) -> Result<QuotaInd
 }
 
 /// Increment the quota index on DID create.
-pub async fn quota_on_create(
-    dids_ks: &KeyspaceHandle,
-    owner: &str,
-) -> Result<(), AppError> {
+pub async fn quota_on_create(dids_ks: &KeyspaceHandle, owner: &str) -> Result<(), AppError> {
     let mut q = get_quota(dids_ks, owner).await?;
     q.did_count += 1;
     dids_ks.insert(quota_key(owner), &q).await
@@ -78,7 +75,10 @@ pub async fn quota_on_size_change(
     new_size: u64,
 ) -> Result<(), AppError> {
     let mut q = get_quota(dids_ks, owner).await?;
-    q.total_size = q.total_size.saturating_sub(old_size).saturating_add(new_size);
+    q.total_size = q
+        .total_size
+        .saturating_sub(old_size)
+        .saturating_add(new_size);
     dids_ks.insert(quota_key(owner), &q).await
 }
 
@@ -134,7 +134,10 @@ pub async fn check_total_size_limit(
         .unwrap_or(config.limits.default_max_total_size);
 
     let quota = get_quota(dids_ks, &auth.did).await?;
-    let proposed = quota.total_size.saturating_sub(old_size).saturating_add(new_size);
+    let proposed = quota
+        .total_size
+        .saturating_sub(old_size)
+        .saturating_add(new_size);
     if proposed > max {
         warn!(did = %auth.did, current = quota.total_size, old_size, new_size, max, "total size quota exceeded");
         return Err(AppError::QuotaExceeded(format!(
@@ -203,8 +206,7 @@ pub async fn set_did_disabled(
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
-    affinidi_webvh_common::did_ops::validate_did_jsonl(content)
-        .map_err(AppError::Validation)
+    affinidi_webvh_common::did_ops::validate_did_jsonl(content).map_err(AppError::Validation)
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +326,11 @@ pub async fn publish_did(
         .lines()
         .last()
         .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .and_then(|v| v.get("versionId").and_then(|id| id.as_str()).map(String::from));
+        .and_then(|v| {
+            v.get("versionId")
+                .and_then(|id| id.as_str())
+                .map(String::from)
+        });
 
     record.updated_at = now_epoch();
     record.version_count += 1;
@@ -391,9 +397,8 @@ pub async fn upload_witness(
     }
 
     // Validate that witness content is well-formed JSON
-    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
-        AppError::Validation(format!("did-witness.json must be valid JSON: {e}"))
-    })?;
+    serde_json::from_str::<serde_json::Value>(witness_content)
+        .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
 
     let size = witness_content.len();
 
@@ -405,7 +410,10 @@ pub async fn upload_witness(
         )
         .await?;
 
-    let witness_url = format!("{}/{mnemonic}/did-witness.json", state.config.public_base_url());
+    let witness_url = format!(
+        "{}/{mnemonic}/did-witness.json",
+        state.config.public_base_url()
+    );
 
     info!(did = %auth.did, role = %auth.role, mnemonic = %mnemonic, size, "did-witness.json uploaded");
 
@@ -529,10 +537,7 @@ pub async fn list_dids(
 }
 
 /// List all DIDs in the store (admin only). Iterates the `did:` prefix.
-async fn list_all_dids(
-    auth: &AuthClaims,
-    state: &AppState,
-) -> Result<Vec<DidListEntry>, AppError> {
+async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidListEntry>, AppError> {
     let raw = state.dids_ks.prefix_iter_raw("did:").await?;
 
     let mut entries = Vec::with_capacity(raw.len());
@@ -598,10 +603,7 @@ pub async fn delete_did(
 }
 
 /// Recover a soft-deleted DID by clearing its `deleted_at` timestamp.
-pub async fn recover_did(
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<(), AppError> {
+pub async fn recover_did(state: &AppState, mnemonic: &str) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
 
     let mut record: DidRecord = state
@@ -723,8 +725,7 @@ pub async fn get_raw_log(
         .await?
         .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
 
-    String::from_utf8(bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
+    String::from_utf8(bytes).map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -860,10 +861,7 @@ mod tests {
     fn rollback_rejects_single_entry() {
         let jsonl = r#"{"state":{"id":"did:webvh:only:host:path"}}"#;
         let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert!(
-            lines.len() < 2,
-            "single entry should not be rollback-able"
-        );
+        assert!(lines.len() < 2, "single entry should not be rollback-able");
     }
 
     #[test]

@@ -3,46 +3,38 @@
 //! for synchronisation.
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_webvh_common::{
-    ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest,
-};
+use affinidi_webvh_common::{ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest};
 use tracing::{error, info, warn};
 
-use crate::did_ops::{DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl};
+use crate::did_ops::{
+    DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
+};
 use crate::store::{KeyspaceHandle, Store};
+
+/// Parameters for control plane registration.
+pub struct ControlRegistrationParams<'a> {
+    pub control_url: &'a str,
+    pub server_did: &'a str,
+    pub signing_secret: &'a Secret,
+    pub public_url: &'a str,
+    pub label: Option<&'a str>,
+    pub dids_ks: &'a KeyspaceHandle,
+    pub store: &'a Store,
+    pub did_cache: &'a crate::cache::ContentCache,
+}
 
 /// Register with the control plane, retrying with exponential backoff.
 ///
 /// Keeps retrying until registration succeeds. Backoff starts at 5s and
 /// caps at 60s. Designed to run as a background task so the server can
 /// start serving while waiting for the control plane to become available.
-pub async fn register_with_control_retry(
-    control_url: &str,
-    server_did: &str,
-    signing_secret: &Secret,
-    public_url: &str,
-    label: Option<&str>,
-    dids_ks: &KeyspaceHandle,
-    store: &Store,
-    did_cache: &crate::cache::ContentCache,
-) {
+pub async fn register_with_control_retry(params: &ControlRegistrationParams<'_>) {
     const MAX_RETRIES: u32 = 20; // ~10 minutes with exponential backoff
     let mut backoff = 5u64;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        if register_with_control(
-            control_url,
-            server_did,
-            signing_secret,
-            public_url,
-            label,
-            dids_ks,
-            store,
-            did_cache,
-        )
-        .await
-        {
+        if register_with_control(params).await {
             return;
         }
         if attempt >= MAX_RETRIES {
@@ -68,16 +60,18 @@ pub async fn register_with_control_retry(
 /// 4. Applies any DID updates received from the control plane
 ///
 /// Returns `true` on success, `false` on failure (logged as warnings).
-pub async fn register_with_control(
-    control_url: &str,
-    server_did: &str,
-    signing_secret: &Secret,
-    public_url: &str,
-    label: Option<&str>,
-    dids_ks: &KeyspaceHandle,
-    store: &Store,
-    did_cache: &crate::cache::ContentCache,
-) -> bool {
+pub async fn register_with_control(params: &ControlRegistrationParams<'_>) -> bool {
+    let ControlRegistrationParams {
+        control_url,
+        server_did,
+        signing_secret,
+        public_url,
+        label,
+        dids_ks,
+        store,
+        did_cache,
+    } = params;
+
     // 1. Authenticate with control plane via DIDComm
     let mut client = ControlClient::new(control_url);
     if let Err(e) = client.authenticate(server_did, signing_secret).await {

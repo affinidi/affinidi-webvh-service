@@ -4,7 +4,9 @@
 //! auto-bootstrap path on server startup.
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_webvh_common::did::{DidDocumentOptions, build_did_document, create_log_entry, encode_host};
+use affinidi_webvh_common::did::{
+    DidDocumentOptions, build_did_document, create_log_entry, encode_host,
+};
 use tracing::info;
 
 use crate::auth::session::now_epoch;
@@ -39,7 +41,16 @@ pub async fn bootstrap_root_did(
     mediator_did: Option<&str>,
     public_url: &str,
 ) -> Result<BootstrapResult, AppError> {
-    bootstrap_did(store, dids_ks, signing_secret, ka_secret, mediator_did, public_url, ".well-known").await
+    bootstrap_did(
+        store,
+        dids_ks,
+        signing_secret,
+        ka_secret,
+        mediator_did,
+        public_url,
+        ".well-known",
+    )
+    .await
 }
 
 /// Create a DID log entry at the given path and store it atomically.
@@ -76,10 +87,15 @@ pub async fn bootstrap_did(
         .transpose()
         .map_err(|e| AppError::Internal(format!("failed to get KA public key multibase: {e}")))?;
 
-    let doc = build_did_document(&host, mnemonic, &public_key, &DidDocumentOptions {
-        key_agreement_multibase: ka_public_key.as_deref(),
-        mediator_endpoint: mediator_did,
-    });
+    let doc = build_did_document(
+        &host,
+        mnemonic,
+        &public_key,
+        &DidDocumentOptions {
+            key_agreement_multibase: ka_public_key.as_deref(),
+            mediator_endpoint: mediator_did,
+        },
+    );
 
     let (scid, jsonl) = create_log_entry(&doc, signing_secret)
         .await
@@ -161,9 +177,9 @@ pub async fn import_did_at_path(
 ) -> Result<BootstrapResult, AppError> {
     // Guard: must not already exist at this path
     if dids_ks.contains_key(did_key(mnemonic)).await? {
-        return Err(AppError::Conflict(
-            format!("DID at path '{mnemonic}' already exists"),
-        ));
+        return Err(AppError::Conflict(format!(
+            "DID at path '{mnemonic}' already exists"
+        )));
     }
 
     // Validate the JSONL content
