@@ -1,3 +1,4 @@
+use affinidi_webvh_common::server::cli;
 use affinidi_webvh_witness::config::AppConfig;
 use affinidi_webvh_witness::{health, secret_store, server, setup, store, witness_ops};
 use clap::{Parser, Subcommand};
@@ -73,19 +74,22 @@ async fn main() {
             }
         }
         Some(Command::AddAcl { did, role }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role).await {
+            let config = load_config(cli.config);
+            if let Err(e) = cli::add_acl(&config.store, &did, &role, None, None, None).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
+            let config = load_config(cli.config);
+            if let Err(e) = cli::list_acl(&config.store).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
+            let config = load_config(cli.config);
+            if let Err(e) = cli::remove_acl(&config.store, &did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -112,114 +116,14 @@ async fn main() {
     }
 }
 
-async fn run_add_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-    role: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_witness::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-    use affinidi_webvh_witness::auth::session::now_epoch;
-
-    let role_parsed = role
-        .parse::<Role>()
-        .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
-
-    let config = AppConfig::load(config_path)?;
-    let store = store::Store::open(&config.store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    if let Some(existing) = get_acl_entry(&acl_ks, &did).await? {
-        eprintln!();
-        eprintln!("  ACL entry already exists for this DID:");
-        eprintln!("  DID:  {}", existing.did);
-        eprintln!("  Role: {}", existing.role);
-        eprintln!();
-        return Err("ACL entry already exists — delete it first to change the role".into());
+fn load_config(config_path: Option<PathBuf>) -> AppConfig {
+    match AppConfig::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading config: {e}");
+            std::process::exit(1);
+        }
     }
-
-    let entry = AclEntry {
-        did: did.clone(),
-        role: role_parsed.clone(),
-        label: None,
-        created_at: now_epoch(),
-        max_total_size: None,
-        max_did_count: None,
-    };
-
-    store_acl_entry(&acl_ks, &entry).await?;
-
-    eprintln!();
-    eprintln!("  ACL entry created!");
-    eprintln!();
-    eprintln!("  DID:  {did}");
-    eprintln!("  Role: {role_parsed}");
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_witness::acl::list_acl_entries;
-
-    let config = AppConfig::load(config_path)?;
-    let store = store::Store::open(&config.store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    let entries = list_acl_entries(&acl_ks).await?;
-
-    if entries.is_empty() {
-        eprintln!();
-        eprintln!("  No ACL entries found.");
-        eprintln!();
-        return Ok(());
-    }
-
-    eprintln!();
-    eprintln!("  {:<50} {:<8} LABEL", "DID", "ROLE");
-    eprintln!("  {}", "-".repeat(80));
-
-    for entry in &entries {
-        let label = entry.label.as_deref().unwrap_or("-");
-        eprintln!("  {:<50} {:<8} {}", entry.did, entry.role, label);
-    }
-
-    eprintln!();
-    eprintln!("  {} entries total", entries.len());
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_remove_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_witness::acl::{delete_acl_entry, get_acl_entry};
-
-    let config = AppConfig::load(config_path)?;
-    let store = store::Store::open(&config.store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    let existing = get_acl_entry(&acl_ks, &did).await?;
-    if existing.is_none() {
-        eprintln!();
-        eprintln!("  No ACL entry found for {did}");
-        eprintln!();
-        return Ok(());
-    }
-
-    let entry = existing.unwrap();
-    delete_acl_entry(&acl_ks, &did).await?;
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  ACL entry removed!");
-    eprintln!();
-    eprintln!("  DID:  {}", entry.did);
-    eprintln!("  Role: {}", entry.role);
-    eprintln!();
-
-    Ok(())
 }
 
 async fn run_create_witness(

@@ -642,121 +642,47 @@ async fn run_add_acl(
     role_str: String,
     label: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-    use affinidi_webvh_common::server::auth::session::now_epoch;
-
-    let role = role_str
-        .parse::<Role>()
-        .map_err(|_| format!("invalid role '{role_str}': use 'admin' or 'owner'"))?;
+    use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    let store = affinidi_webvh_common::server::store::Store::open(&config.control_store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    if let Some(existing) = get_acl_entry(&acl_ks, &did).await? {
-        eprintln!();
-        eprintln!("  ACL entry already exists for this DID:");
-        eprintln!("  DID:  {}", existing.did);
-        eprintln!("  Role: {}", existing.role);
-        eprintln!();
-        return Err("ACL entry already exists — delete it first to change the role".into());
-    }
-
-    let entry = AclEntry {
-        did: did.clone(),
-        role: role.clone(),
-        label,
-        created_at: now_epoch(),
-        max_total_size: None,
-        max_did_count: None,
-    };
-
-    store_acl_entry(&acl_ks, &entry).await?;
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  ACL entry created!");
-    eprintln!();
-    eprintln!("  DID:  {did}");
-    eprintln!("  Role: {role}");
-    eprintln!();
-
-    Ok(())
+    cli::add_acl(
+        &config.control_store,
+        &did,
+        &role_str,
+        label.as_deref(),
+        None,
+        None,
+    )
+    .await
 }
 
 async fn run_list_acl(
     config_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_common::server::acl::list_acl_entries;
+    use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    let store = affinidi_webvh_common::server::store::Store::open(&config.control_store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    let entries = list_acl_entries(&acl_ks).await?;
-
-    if entries.is_empty() {
-        eprintln!();
-        eprintln!("  No ACL entries found.");
-        eprintln!();
-        return Ok(());
-    }
-
-    eprintln!();
-    eprintln!("  {:<50} {:<8} LABEL", "DID", "ROLE");
-    eprintln!("  {}", "-".repeat(80));
-
-    for entry in &entries {
-        let label = entry.label.as_deref().unwrap_or("-");
-        eprintln!("  {:<50} {:<8} {}", entry.did, entry.role, label);
-    }
-
-    eprintln!();
-    eprintln!("  {} entries total", entries.len());
-    eprintln!();
-
-    Ok(())
+    cli::list_acl(&config.control_store).await
 }
 
 async fn run_remove_acl(
     config_path: Option<std::path::PathBuf>,
     did: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_common::server::acl::{delete_acl_entry, get_acl_entry};
+    use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    let store = affinidi_webvh_common::server::store::Store::open(&config.control_store).await?;
-    let acl_ks = store.keyspace("acl")?;
-
-    let existing = get_acl_entry(&acl_ks, &did).await?;
-    if existing.is_none() {
-        eprintln!();
-        eprintln!("  No ACL entry found for {did}");
-        eprintln!();
-        return Ok(());
-    }
-
-    let entry = existing.unwrap();
-    delete_acl_entry(&acl_ks, &did).await?;
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  ACL entry removed!");
-    eprintln!();
-    eprintln!("  DID:  {}", entry.did);
-    eprintln!("  Role: {}", entry.role);
-    eprintln!();
-
-    Ok(())
+    cli::remove_acl(&config.control_store, &did).await
 }
 
+#[cfg(feature = "passkey")]
 async fn run_invite(
     config_path: Option<std::path::PathBuf>,
     did: String,
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_webvh_common::server::passkey::routes::create_enrollment_invite;
+    use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
 
@@ -770,27 +696,17 @@ async fn run_invite(
         None => config.auth.passkey_enrollment_ttl,
     };
 
-    let store = affinidi_webvh_common::server::store::Store::open(&config.control_store).await?;
-    let sessions_ks = store.keyspace("sessions")?;
+    cli::invite(&config.control_store, base_url, enrollment_ttl, &did, &role).await
+}
 
-    let resp =
-        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
-
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  Enrollment invite created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    let ttl_display = enrollment_ttl / 3600;
-    eprintln!("  Expires: in {ttl_display}h (epoch {})", resp.expires_at);
-    eprintln!();
-    eprintln!("  Enrollment URL:");
-    eprintln!("  {}", resp.enrollment_url);
-    eprintln!();
-
-    Ok(())
+#[cfg(not(feature = "passkey"))]
+async fn run_invite(
+    _config_path: Option<std::path::PathBuf>,
+    _did: String,
+    _role: String,
+    _ttl_hours: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("passkey feature is not enabled — rebuild with --features passkey".into())
 }
 
 async fn run_import_secrets(

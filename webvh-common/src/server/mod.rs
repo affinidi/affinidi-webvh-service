@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;

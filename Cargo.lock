@@ -542,6 +542,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vta-sdk",
  "webauthn-rs",
 ]
 
