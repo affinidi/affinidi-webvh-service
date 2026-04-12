@@ -197,16 +197,50 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     let registry_ks = store.keyspace("registry").expect("registry keyspace");
     let stats_ks = store.keyspace("stats").expect("stats keyspace");
 
-    // Initialize stats collector and seed with actual DID count
+    // Initialize stats collector and seed from persisted store data
     let stats_collector = {
+        use affinidi_webvh_common::server::stats_collector::StatsAggregate;
+
         let collector = StatsCollector::new();
+
+        // Sum per-DID stats from the store to reconstruct aggregates
+        let mut total_resolves = 0u64;
+        let mut total_updates = 0u64;
+        let mut last_resolved_at: Option<u64> = None;
+        let mut last_updated_at: Option<u64> = None;
+        if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
+            for (_key, value) in raw {
+                if let Ok(s) = serde_json::from_slice::<affinidi_webvh_common::DidStats>(&value) {
+                    total_resolves += s.total_resolves;
+                    total_updates += s.total_updates;
+                    last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    last_updated_at = match (last_updated_at, s.last_updated_at) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+            }
+        }
         let total_dids = dids_ks
             .prefix_iter_raw("did:")
             .await
             .map(|v| v.len())
             .unwrap_or(0) as u64;
-        collector.set_total_dids(total_dids);
-        info!(total_dids, "stats collector initialized");
+
+        collector.seed_aggregate(&StatsAggregate {
+            total_dids,
+            total_resolves,
+            total_updates,
+            last_resolved_at,
+            last_updated_at,
+        });
+        info!(
+            total_dids,
+            total_resolves, total_updates, "stats collector seeded from store"
+        );
         Arc::new(collector)
     };
 
