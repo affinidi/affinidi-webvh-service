@@ -525,8 +525,6 @@ dependencies = [
 name = "affinidi-webvh-daemon"
 version = "0.3.0"
 dependencies = [
- "affinidi-did-resolver-cache-sdk",
- "affinidi-tdk",
  "affinidi-webvh-common",
  "affinidi-webvh-control",
  "affinidi-webvh-server",
@@ -542,8 +540,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "vta-sdk",
- "webauthn-rs",
 ]
 
 [[package]]
