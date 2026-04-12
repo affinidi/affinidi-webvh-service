@@ -26,7 +26,6 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info, warn};
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AppState {
     pub store: Store,
     pub sessions_ks: KeyspaceHandle,
