@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use affinidi_webvh_common::server::init;
+
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::routes;
@@ -105,7 +107,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // Wait for shutdown signal
-    shutdown_signal().await;
+    init::shutdown_signal().await;
 
     let _ = shutdown_tx.send(true);
 
@@ -141,28 +143,4 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
 
     info!("watcher shut down");
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => info!("received SIGINT"),
-        () = terminate => info!("received SIGTERM"),
-    }
 }

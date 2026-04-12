@@ -254,7 +254,6 @@ impl KeyspaceHandle {
     }
 
     /// Returns the approximate number of items in the keyspace.
-    #[allow(dead_code)]
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
         Ok(self.prefix_iter_raw(b"").await?.len())
     }

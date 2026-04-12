@@ -1,4 +1,3 @@
-use affinidi_webvh_common::server::cli;
 use affinidi_webvh_control::config::AppConfig;
 use affinidi_webvh_control::{health, secret_store, server, setup, store};
 use clap::{Parser, Subcommand};
@@ -167,12 +166,20 @@ async fn run_add_acl(
     label: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    cli::add_acl(&config.store, &did, &role_str, label.as_deref(), None, None).await
+    affinidi_webvh_common::server::cli_acl::run_add_acl(
+        &config.store,
+        did,
+        role_str,
+        label,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    cli::list_acl(&config.store).await
+    affinidi_webvh_common::server::cli_acl::run_list_acl(&config.store).await
 }
 
 async fn run_remove_acl(
@@ -180,7 +187,7 @@ async fn run_remove_acl(
     did: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    cli::remove_acl(&config.store, &did).await
+    affinidi_webvh_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }
 
 async fn run_invite(
@@ -189,6 +196,8 @@ async fn run_invite(
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::passkey::routes::create_enrollment_invite;
+
     let config = AppConfig::load(config_path)?;
 
     let base_url = config
@@ -201,7 +210,25 @@ async fn run_invite(
         None => config.auth.passkey_enrollment_ttl,
     };
 
-    cli::invite(&config.store, base_url, enrollment_ttl, &did, &role).await
+    let store = store::Store::open(&config.store).await?;
+    let sessions_ks = store.keyspace("sessions")?;
+
+    let resp =
+        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
+
+    eprintln!();
+    eprintln!("  Enrollment invite created!");
+    eprintln!();
+    eprintln!("  DID:     {did}");
+    eprintln!("  Role:    {role}");
+    let ttl_hours = enrollment_ttl / 3600;
+    eprintln!("  Expires: in {ttl_hours}h (epoch {})", resp.expires_at);
+    eprintln!();
+    eprintln!("  Enrollment URL:");
+    eprintln!("  {}", resp.enrollment_url);
+    eprintln!();
+
+    Ok(())
 }
 
 fn print_banner() {

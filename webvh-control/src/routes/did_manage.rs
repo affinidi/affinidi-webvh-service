@@ -293,7 +293,6 @@ pub struct TimeSeriesPoint {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TimeseriesQuery {
     #[serde(default = "default_range")]
     pub range: String,

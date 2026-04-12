@@ -525,8 +525,6 @@ dependencies = [
 name = "affinidi-webvh-daemon"
 version = "0.3.0"
 dependencies = [
- "affinidi-did-resolver-cache-sdk",
- "affinidi-tdk",
  "affinidi-webvh-common",
  "affinidi-webvh-control",
  "affinidi-webvh-server",
@@ -542,8 +540,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "vta-sdk",
- "webauthn-rs",
 ]
 
 [[package]]
@@ -8179,8 +8175,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.3.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure.git?branch=nightly#300ac3cd3ed0b63a4abef80e6bdee1ea40bf13cc"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90f88495372a6ebf5f67e38d8c588d19929157c3670c7be640ae23431e2757ef"
 dependencies = [
  "aes",
  "aes-gcm",

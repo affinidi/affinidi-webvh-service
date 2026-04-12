@@ -1,4 +1,3 @@
-use affinidi_webvh_common::server::cli;
 use affinidi_webvh_witness::config::AppConfig;
 use affinidi_webvh_witness::{health, secret_store, server, setup, store, witness_ops};
 use clap::{Parser, Subcommand};
@@ -74,22 +73,19 @@ async fn main() {
             }
         }
         Some(Command::AddAcl { did, role }) => {
-            let config = load_config(cli.config);
-            if let Err(e) = cli::add_acl(&config.store, &did, &role, None, None, None).await {
+            if let Err(e) = run_add_acl(cli.config, did, role).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::ListAcl) => {
-            let config = load_config(cli.config);
-            if let Err(e) = cli::list_acl(&config.store).await {
+            if let Err(e) = run_list_acl(cli.config).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::RemoveAcl { did }) => {
-            let config = load_config(cli.config);
-            if let Err(e) = cli::remove_acl(&config.store, &did).await {
+            if let Err(e) = run_remove_acl(cli.config, did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -116,14 +112,27 @@ async fn main() {
     }
 }
 
-fn load_config(config_path: Option<PathBuf>) -> AppConfig {
-    match AppConfig::load(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error loading config: {e}");
-            std::process::exit(1);
-        }
-    }
+async fn run_add_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+    role: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_add_acl(&config.store, did, role, None, None, None)
+        .await
+}
+
+async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_list_acl(&config.store).await
+}
+
+async fn run_remove_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }
 
 async fn run_create_witness(
@@ -167,8 +176,8 @@ async fn run_list_witnesses(
 
     eprintln!();
     eprintln!(
-        "  {:<50} {:<50} {:<10} LABEL",
-        "WITNESS ID", "DID", "PROOFS"
+        "  {:<50} {:<50} {:<10} {}",
+        "WITNESS ID", "DID", "PROOFS", "LABEL"
     );
     eprintln!("  {}", "-".repeat(120));
 

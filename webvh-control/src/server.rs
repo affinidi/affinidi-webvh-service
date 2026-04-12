@@ -1,17 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
 use affinidi_tdk::messaging::ATM;
 use affinidi_tdk::messaging::profiles::ATMProfile;
-use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use affinidi_webvh_common::server::init;
 use affinidi_webvh_common::server::passkey::PasskeyState;
-use affinidi_webvh_common::server::tasks::{cleanup_old_buckets, flush_stats_to_store};
+use axum::routing::get;
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
@@ -118,10 +119,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let stats_ks = store.keyspace("stats")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
 
     // Initialize JWT keys
-    let jwt_keys = init_jwt_keys(&secrets);
+    let jwt_keys = init::init_jwt_keys(&secrets);
 
     // Initialize WebAuthn for passkeys
     let webauthn = config.public_url.as_ref().and_then(|url| {
@@ -293,18 +295,16 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .name("control-storage".into())
         .spawn(move || {
             run_storage_thread(
-                StorageThreadParams {
-                    store,
-                    sessions_ks: storage_sessions_ks,
-                    registry_ks: storage_registry_ks,
-                    stats_ks: storage_stats_ks,
-                    dids_ks: storage_dids_ks,
-                    auth_config: storage_auth_config,
-                    registry_config: storage_registry_config,
-                    has_auth,
-                    http: storage_http,
-                    collector: storage_collector,
-                },
+                store,
+                storage_sessions_ks,
+                storage_registry_ks,
+                storage_stats_ks,
+                storage_dids_ks,
+                storage_auth_config,
+                storage_registry_config,
+                has_auth,
+                storage_http,
+                storage_collector,
                 &mut storage_shutdown,
             )
         })
@@ -329,7 +329,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     // Wait for shutdown signal
-    shutdown_signal().await;
+    init::shutdown_signal().await;
 
     // Ordered shutdown: DIDComm → REST → Storage
     let mut any_panic = false;
@@ -513,7 +513,8 @@ fn run_rest_thread(
             )
             .layer(axum::middleware::from_fn(
                 affinidi_webvh_common::server::security_headers,
-            ));
+            ))
+            .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());
 
@@ -533,7 +534,7 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-struct StorageThreadParams {
+fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
     registry_ks: KeyspaceHandle,
@@ -544,21 +545,8 @@ struct StorageThreadParams {
     has_auth: bool,
     http: reqwest::Client,
     collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
-}
-
-fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
-    let StorageThreadParams {
-        store,
-        sessions_ks,
-        registry_ks,
-        stats_ks,
-        dids_ks,
-        auth_config,
-        registry_config,
-        has_auth,
-        http,
-        collector,
-    } = params;
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -570,18 +558,15 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let health_interval = Duration::from_secs(registry_config.health_check_interval.max(10));
         let flush_interval = Duration::from_secs(10);
-        let cleanup_interval = Duration::from_secs(3600); // 1 hour
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut health_timer = tokio::time::interval(health_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
-        let mut cleanup_timer = tokio::time::interval(cleanup_interval);
 
         // Skip first tick (immediate)
         session_timer.tick().await;
         health_timer.tick().await;
         flush_timer.tick().await;
-        cleanup_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -596,15 +581,9 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                     }
                 }
                 _ = flush_timer.tick() => {
+                    // Flush accumulated per-DID stats deltas to persistent store
                     if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await {
                         warn!("stats flush error: {e}");
-                    }
-                }
-                _ = cleanup_timer.tick() => {
-                    match cleanup_old_buckets(&stats_ks).await {
-                        Ok(0) => {}
-                        Ok(n) => info!(removed = n, "cleaned up old time-series buckets"),
-                        Err(e) => warn!("bucket cleanup error: {e}"),
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -623,6 +602,51 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
             info!("store persisted");
         }
     });
+}
+
+/// Flush accumulated stats deltas from the in-memory collector to the store.
+async fn flush_stats_to_store(
+    collector: &affinidi_webvh_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
+    let deltas = collector.drain_for_sync();
+    if deltas.is_empty() {
+        // Update total DID count even if no deltas
+        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+            collector.set_total_dids(dids.len() as u64);
+        }
+        return Ok(());
+    }
+
+    let mut batch = store.batch();
+    for d in &deltas {
+        let key = format!("stats:{}", d.mnemonic);
+        let mut stats: affinidi_webvh_common::DidStats =
+            stats_ks.get(key.as_str()).await?.unwrap_or_default();
+        stats.total_resolves += d.resolve_delta;
+        stats.total_updates += d.update_delta;
+        if let Some(t) = d.last_resolved_at {
+            stats.last_resolved_at = Some(stats.last_resolved_at.map_or(t, |prev| prev.max(t)));
+        }
+        if let Some(t) = d.last_updated_at {
+            stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
+        }
+        batch.insert(stats_ks, key, &stats)?;
+    }
+    batch.commit().await?;
+
+    // Update total DID count (periodic reconciliation)
+    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+        collector.set_total_dids(dids.len() as u64);
+    }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
+
+    debug!(count = deltas.len(), "flushed stats deltas to store");
+    Ok(())
 }
 
 /// Run health checks against all registered instances in parallel.
@@ -659,110 +683,4 @@ async fn run_health_checks(
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Auth initialization
-// ---------------------------------------------------------------------------
-
-fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
-    match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
-        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
-            Ok(keys) => {
-                debug!("JWT signing key loaded");
-                Some(Arc::new(keys))
-            }
-            Err(e) => {
-                warn!("failed to construct JWT keys: {e} — auth endpoints will not work");
-                None
-            }
-        },
-        Err(e) => {
-            warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
-            None
-        }
-    }
-}
-
-async fn init_didcomm_auth(
-    config: &AppConfig,
-    secrets: &ServerSecrets,
-) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let server_did = match &config.server_did {
-        Some(did) => did.clone(),
-        None => {
-            warn!("server_did not configured — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
-
-    let kid = format!("{server_did}#key-0");
-    match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server signing secret loaded");
-        }
-        Err(e) => warn!("failed to decode signing_key: {e}"),
-    }
-
-    let kid = format!("{server_did}#key-1");
-    match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server key-agreement secret loaded");
-        }
-        Err(e) => warn!("failed to decode key_agreement_key: {e}"),
-    }
-
-    info!("DIDComm auth initialized for DID {server_did}");
-
-    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
-}
-
-pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let secret = Secret::from_multibase(multibase_key, None)
-        .map_err(|e| AppError::Config(format!("invalid multibase key: {e}")))?;
-
-    let bytes = secret.get_private_bytes();
-    bytes
-        .try_into()
-        .map_err(|_| AppError::Config("key must be exactly 32 bytes".into()))
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => info!("received SIGINT"),
-        () = terminate => info!("received SIGTERM"),
-    }
 }

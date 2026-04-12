@@ -104,9 +104,8 @@ anyhow = "1"
 didwebvh-rs = "0.4"
 
 # VTA SDK
-# TODO: Switch to crates.io once 0.4.0 is published (API incompatibility with 0.3.x)
-vta-sdk = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure.git", branch = "nightly", features = [
-  "integration",
+vta-sdk = { version = "0.3", features = [
+  "session",
 ] }
 
 # Logging / tracing

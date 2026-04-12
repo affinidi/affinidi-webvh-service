@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use affinidi_webvh_common::server::init;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::jwt::JwtKeys;
@@ -22,10 +23,9 @@ use crate::store::{KeyspaceHandle, Store};
 use axum::routing::get;
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{Level, debug, error, info, warn};
+use tracing::{Level, error, info, warn};
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AppState {
     pub store: Store,
     pub sessions_ks: KeyspaceHandle,
@@ -76,10 +76,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let witnesses_ks = store.keyspace("witnesses")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(&config, &secrets).await;
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
 
     // Initialize JWT keys
-    let jwt_keys = init_jwt_keys(&secrets);
+    let jwt_keys = init::init_jwt_keys(&secrets);
 
     // Bind TCP listener on the main thread for early port validation
     let std_listener = if config.features.rest_api {
@@ -191,7 +192,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     // Wait for shutdown signal
-    shutdown_signal().await;
+    init::shutdown_signal().await;
 
     // Ordered shutdown: DIDComm -> REST -> Storage
     let mut any_panic = false;
@@ -400,105 +401,3 @@ fn run_storage_thread(
 // ---------------------------------------------------------------------------
 // Auth initialization
 // ---------------------------------------------------------------------------
-
-fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
-    match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
-        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
-            Ok(keys) => {
-                debug!("JWT signing key loaded");
-                Some(Arc::new(keys))
-            }
-            Err(e) => {
-                warn!("failed to construct JWT keys: {e} — auth endpoints will not work");
-                None
-            }
-        },
-        Err(e) => {
-            warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
-            None
-        }
-    }
-}
-
-async fn init_didcomm_auth(
-    config: &AppConfig,
-    secrets: &ServerSecrets,
-) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let server_did = match &config.server_did {
-        Some(did) => did.clone(),
-        None => {
-            warn!("server_did not configured — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
-
-    let kid = format!("{server_did}#key-0");
-    match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server signing secret loaded");
-        }
-        Err(e) => warn!("failed to decode signing_key: {e}"),
-    }
-
-    let kid = format!("{server_did}#key-1");
-    match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server key-agreement secret loaded");
-        }
-        Err(e) => warn!("failed to decode key_agreement_key: {e}"),
-    }
-
-    info!("DIDComm auth initialized for DID {server_did}");
-
-    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
-}
-
-pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let secret = Secret::from_multibase(multibase_key, None)
-        .map_err(|e| AppError::Config(format!("invalid multibase key: {e}")))?;
-
-    let bytes = secret.get_private_bytes();
-    bytes
-        .try_into()
-        .map_err(|_| AppError::Config("key must be exactly 32 bytes".into()))
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => info!("received SIGINT"),
-        () = terminate => info!("received SIGTERM"),
-    }
-}
