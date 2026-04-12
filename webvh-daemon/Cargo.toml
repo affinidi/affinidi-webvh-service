@@ -36,6 +36,7 @@ metrics = [
   "affinidi-webvh-control/metrics",
 ]
 store-fjall = [
+  "affinidi-webvh-common/store-fjall",
   "affinidi-webvh-server/store-fjall",
   "affinidi-webvh-witness/store-fjall",
   "affinidi-webvh-watcher/store-fjall",
@@ -71,11 +72,11 @@ name = "webvh-daemon"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall"] }
-affinidi-webvh-server = { path = "../webvh-server" }
-affinidi-webvh-witness = { path = "../webvh-witness" }
-affinidi-webvh-watcher = { path = "../webvh-watcher" }
-affinidi-webvh-control = { path = "../webvh-control" }
+affinidi-webvh-common = { path = "../webvh-common", default-features = false, features = ["server-core"] }
+affinidi-webvh-server = { path = "../webvh-server", default-features = false }
+affinidi-webvh-witness = { path = "../webvh-witness", default-features = false }
+affinidi-webvh-watcher = { path = "../webvh-watcher", default-features = false }
+affinidi-webvh-control = { path = "../webvh-control", default-features = false }
 affinidi-did-resolver-cache-sdk = "0.8"
 affinidi-tdk = { workspace = true }
 axum = "0.8"
