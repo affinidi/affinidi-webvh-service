@@ -13,7 +13,8 @@ use axum::routing::{any, get, post, put};
 
 use crate::server::AppState;
 
-pub fn router() -> Router<AppState> {
+/// Build the control plane router without the UI fallback (daemon mode).
+pub fn router_without_fallback() -> Router<AppState> {
     let control = Router::new()
         .route("/registry", get(registry::list).post(registry::register))
         .route(
@@ -114,11 +115,20 @@ pub fn router() -> Router<AppState> {
         router = router.route("/metrics", get(metrics_handler));
     }
 
-    // SPA fallback when UI feature is enabled
-    #[cfg(feature = "ui")]
-    let router = router.fallback(crate::frontend::static_handler);
-
     router
+}
+
+/// Build the full control plane router with UI fallback (standalone mode).
+pub fn router() -> Router<AppState> {
+    #[allow(unused_mut)]
+    let mut r = router_without_fallback();
+
+    #[cfg(feature = "ui")]
+    {
+        r = r.fallback(crate::frontend::static_handler);
+    }
+
+    r
 }
 
 #[cfg(feature = "metrics")]

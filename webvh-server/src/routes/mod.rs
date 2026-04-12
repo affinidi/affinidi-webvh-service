@@ -83,6 +83,23 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         )
 }
 
+/// Build a minimal router with only public DID-serving routes (daemon mode).
+///
+/// In daemon mode, the control plane handles all `/api/` management routes.
+/// The server only needs `.well-known` routes and the public DID fallback.
+pub fn router_public_only() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/.well-known/did.jsonl",
+            get(did_public::serve_root_did_log),
+        )
+        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
+        .route(
+            "/.well-known/did-witness.json",
+            get(did_public::serve_root_witness),
+        )
+}
+
 /// Build the full server router with DID-serving fallback (standalone mode).
 pub fn router(upload_body_limit: usize) -> Router<AppState> {
     router_without_fallback(upload_body_limit).fallback(did_public::serve_public)

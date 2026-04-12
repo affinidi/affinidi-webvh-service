@@ -192,7 +192,9 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Server AppState needed for the combined DID-serving fallback
     let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
 
-    // 1. Server (mounted at root — DID serving needs /)
+    // 1. Server (public DID-serving routes only — .well-known + fallback)
+    //    In daemon mode the control plane handles all /api/ management routes,
+    //    so the server only contributes public DID resolution.
     if config.enable.server {
         match build_server(&config, &secrets).await {
             Ok((router, store, state)) => {
@@ -238,13 +240,13 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 4. Control plane (nested at /control, UI also served at /)
+    // 4. Control plane (merged at root so /api/ routes are accessible to the UI)
     if config.enable.control {
         match build_control(&config, &secrets).await {
             Ok((router, store)) => {
-                combined = combined.nest("/control", router);
+                combined = combined.merge(router);
                 stores.push(store);
-                enabled_services.push("control (/control)");
+                enabled_services.push("control (/)");
             }
             Err(e) => {
                 error!("failed to initialize control plane: {e}");
@@ -345,7 +347,6 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServerS
     use tracing::debug;
 
     let server_config = config.server_config();
-    let upload_body_limit = server_config.limits.upload_body_limit;
 
     let store = Store::open(&server_config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
@@ -405,9 +406,8 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServerS
         )),
     };
 
-    // Use router without fallback — daemon adds a combined DID + UI fallback
-    let router = affinidi_webvh_server::routes::router_without_fallback(upload_body_limit)
-        .with_state(state.clone());
+    // Public DID-serving routes only — control plane handles /api/ management
+    let router = affinidi_webvh_server::routes::router_public_only().with_state(state.clone());
     info!("server service initialized");
 
     Ok((router, store, state))
@@ -520,7 +520,8 @@ async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
             .expect("failed to open stats keyspace"),
     };
 
-    let router = affinidi_webvh_control::routes::router().with_state(state);
+    // Use router without UI fallback — daemon sets its own combined fallback
+    let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
     info!("control plane service initialized");
 
     Ok((router, store))
