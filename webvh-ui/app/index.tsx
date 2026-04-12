@@ -14,14 +14,17 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { UsageChart } from "../components/UsageChart";
 import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { HealthResponse, ServerStats } from "../lib/api";
+import type { ControlPlaneConfig, HealthResponse, ServerStats } from "../lib/api";
 
 export default function Dashboard() {
   const { isAuthenticated } = useAuth();
   const api = useApi();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
+  const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const isDaemon = config?.deploymentMode === "daemon";
 
   useEffect(() => {
     api
@@ -35,6 +38,10 @@ export default function Dashboard() {
     api
       .getServerStats()
       .then(setServerStats)
+      .catch(() => {});
+    api
+      .getConfig()
+      .then(setConfig)
       .catch(() => {});
   }, [isAuthenticated, api]);
 
@@ -76,6 +83,12 @@ export default function Dashboard() {
             <Text style={styles.cardLabel}>Version</Text>
             <Text style={styles.cardValue}>{health.version}</Text>
           </View>
+          {isDaemon && (
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Mode</Text>
+              <Text style={styles.cardValue}>Daemon</Text>
+            </View>
+          )}
           {serverStats && (
             <>
               <View style={styles.card}>
@@ -97,11 +110,13 @@ export default function Dashboard() {
         <ActivityIndicator color={colors.accent} size="large" />
       )}
 
-      {/* Service topology overview */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Service Topology</Text>
-        <ServiceOverviewPanel />
-      </View>
+      {/* Service topology overview (standalone mode only) */}
+      {!isDaemon && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Service Topology</Text>
+          <ServiceOverviewPanel />
+        </View>
+      )}
 
       {/* Usage chart */}
       {serverStats && (

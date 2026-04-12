@@ -225,6 +225,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         features: FeaturesConfig {
             didcomm: false,
             rest_api: true,
+            ..Default::default()
         },
         server_did: Some(did_result.did.clone()),
         mediator_did,

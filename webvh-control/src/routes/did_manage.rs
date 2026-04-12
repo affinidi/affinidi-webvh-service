@@ -425,6 +425,8 @@ pub struct ConfigResponse {
     pub access_token_expiry: u64,
     pub refresh_token_expiry: u64,
     pub passkey_enrollment_ttl: u64,
+    /// Deployment
+    pub deployment_mode: String,
     /// Storage & Logging
     pub data_dir: String,
     pub log_level: String,
@@ -441,6 +443,7 @@ pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Jso
         did_hosting_url: c.did_hosting_url.clone(),
         didcomm_enabled: c.features.didcomm,
         rest_api_enabled: c.features.rest_api,
+        deployment_mode: c.features.deployment_mode.clone(),
         listen_address: format!("{}:{}", c.server.host, c.server.port),
         vta_url: c.vta.url.clone(),
         vta_did: c.vta.did.clone(),

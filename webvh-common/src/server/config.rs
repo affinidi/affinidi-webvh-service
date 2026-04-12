@@ -8,6 +8,14 @@ pub struct FeaturesConfig {
     pub didcomm: bool,
     #[serde(default)]
     pub rest_api: bool,
+    /// Deployment mode: "standalone" for individual services, "daemon" for unified binary.
+    /// Controls UI behavior (e.g., hiding service topology in daemon mode).
+    #[serde(default = "default_deployment_mode")]
+    pub deployment_mode: String,
+}
+
+fn default_deployment_mode() -> String {
+    "standalone".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

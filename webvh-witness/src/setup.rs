@@ -204,6 +204,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         features: FeaturesConfig {
             didcomm: enable_didcomm,
             rest_api: enable_rest_api,
+            ..Default::default()
         },
         server_did: Some(did_result.did.clone()),
         mediator_did,

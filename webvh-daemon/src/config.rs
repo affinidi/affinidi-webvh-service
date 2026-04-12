@@ -233,6 +233,7 @@ impl DaemonConfig {
         FeaturesConfig {
             didcomm: false,
             rest_api: true,
+            deployment_mode: "daemon".to_string(),
         }
     }
 }
