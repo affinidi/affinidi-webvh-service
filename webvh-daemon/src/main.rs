@@ -166,6 +166,9 @@ async fn main() {
 }
 
 async fn run_daemon(config_path: Option<std::path::PathBuf>) {
+    use affinidi_webvh_common::server::stats_collector::StatsCollector;
+    use affinidi_webvh_common::server::store::Store;
+
     let config = match DaemonConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -182,9 +185,37 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Load secrets (shared across server, witness, control)
     let secrets = load_secrets(&config).await;
 
+    // Open shared primary store (used by server, control, watcher)
+    let store = Store::open(&config.store).await.unwrap_or_else(|e| {
+        error!("failed to open store: {e}");
+        std::process::exit(1);
+    });
+
+    let sessions_ks = store.keyspace("sessions").expect("sessions keyspace");
+    let acl_ks = store.keyspace("acl").expect("acl keyspace");
+    let dids_ks = store.keyspace("dids").expect("dids keyspace");
+    let registry_ks = store.keyspace("registry").expect("registry keyspace");
+    let stats_ks = store.keyspace("stats").expect("stats keyspace");
+
+    // Initialize stats collector and seed with actual DID count
+    let stats_collector = {
+        let collector = StatsCollector::new();
+        let total_dids = dids_ks
+            .prefix_iter_raw("did:")
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0) as u64;
+        collector.set_total_dids(total_dids);
+        info!(total_dids, "stats collector initialized");
+        Arc::new(collector)
+    };
+
+    // Determine whether DIDComm auth is available (needed for background tasks)
+    let jwt_keys = init_jwt_keys(&secrets);
+    let has_auth = jwt_keys.is_some();
+
     // Build each enabled service's router
     let mut combined: Router = Router::new();
-    let mut stores: Vec<affinidi_webvh_common::server::store::Store> = Vec::new();
 
     // Track what's enabled for the summary
     let mut enabled_services = Vec::new();
@@ -192,18 +223,27 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Server AppState needed for the combined DID-serving fallback
     let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
 
-    // Control plane's DID keyspace — shared with the server so that DIDs created
-    // via the control plane API are immediately resolvable via public DID paths.
-    let mut control_dids_ks: Option<affinidi_webvh_common::server::store::KeyspaceHandle> = None;
+    // Witness store is separate — persisted independently
+    let mut witness_store: Option<Store> = None;
 
     // 1. Control plane (merged at root so /api/ routes are accessible to the UI)
     //    Built first because server DID resolution reads from the control store.
     if config.enable.control {
-        match build_control(&config, &secrets).await {
-            Ok((router, store, dids_ks)) => {
-                control_dids_ks = Some(dids_ks);
+        match build_control(
+            &config,
+            &secrets,
+            &store,
+            &sessions_ks,
+            &acl_ks,
+            &dids_ks,
+            &registry_ks,
+            &stats_ks,
+            &stats_collector,
+        )
+        .await
+        {
+            Ok(router) => {
                 combined = combined.merge(router);
-                stores.push(store);
                 enabled_services.push("control (/)");
             }
             Err(e) => {
@@ -214,13 +254,21 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     }
 
     // 2. Server (public DID-serving routes only — .well-known + fallback)
-    //    Uses the control plane's dids_ks so DIDs created via the UI are resolvable.
     if config.enable.server {
-        match build_server(&config, &secrets, control_dids_ks.clone()).await {
-            Ok((router, store, state)) => {
+        match build_server(
+            &config,
+            &secrets,
+            &store,
+            &dids_ks,
+            &sessions_ks,
+            &acl_ks,
+            &stats_collector,
+        )
+        .await
+        {
+            Ok((router, state)) => {
                 server_state = Some(state);
                 combined = combined.merge(router);
-                stores.push(store);
                 enabled_services.push("server (/)");
             }
             Err(e) => {
@@ -230,12 +278,12 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 3. Witness (nested at /witness)
+    // 3. Witness (nested at /witness — uses its own separate store)
     if config.enable.witness {
         match build_witness(&config, &secrets).await {
-            Ok((router, store)) => {
+            Ok((router, w_store)) => {
                 combined = combined.nest("/witness", router);
-                stores.push(store);
+                witness_store = Some(w_store);
                 enabled_services.push("witness (/witness)");
             }
             Err(e) => {
@@ -245,12 +293,11 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 4. Watcher (nested at /watcher)
+    // 4. Watcher (nested at /watcher — uses shared store)
     if config.enable.watcher {
-        match build_watcher(&config).await {
-            Ok((router, store)) => {
+        match build_watcher(&config, &dids_ks, &store).await {
+            Ok(router) => {
                 combined = combined.nest("/watcher", router);
-                stores.push(store);
                 enabled_services.push("watcher (/watcher)");
             }
             Err(e) => {
@@ -300,6 +347,25 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         )
         .route("/health", get(daemon_health));
 
+    // Shutdown channel for background tasks
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn background tasks (session cleanup, stats flush, bucket cleanup)
+    let bg_handle = if has_auth || config.enable.control {
+        Some(tokio::spawn(run_background_tasks(
+            store.clone(),
+            sessions_ks.clone(),
+            dids_ks.clone(),
+            stats_ks.clone(),
+            stats_collector.clone(),
+            config.auth.clone(),
+            has_auth,
+            shutdown_rx,
+        )))
+    } else {
+        None
+    };
+
     // Log startup summary
     info!("--- daemon services ---");
     for svc in &enabled_services {
@@ -321,11 +387,17 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         .await
         .expect("axum serve failed");
 
-    // Persist all stores on shutdown
-    for store in &stores {
-        if let Err(e) = store.persist().await {
-            error!("failed to persist store: {e}");
-        }
+    // Signal background tasks to shut down
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = bg_handle {
+        let _ = handle.await;
+    }
+
+    // Persist witness store separately (primary store is persisted by the background task)
+    if let Some(ref w_store) = witness_store
+        && let Err(e) = w_store.persist().await
+    {
+        error!("failed to persist witness store: {e}");
     }
 
     info!("daemon shut down");
@@ -335,42 +407,21 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 // Service builders
 // ---------------------------------------------------------------------------
 
-type ServiceResult = Result<(Router, affinidi_webvh_common::server::store::Store), AppError>;
-type ServerServiceResult = Result<
-    (
-        Router,
-        affinidi_webvh_common::server::store::Store,
-        affinidi_webvh_server::server::AppState,
-    ),
-    AppError,
->;
+type WitnessServiceResult = Result<(Router, affinidi_webvh_common::server::store::Store), AppError>;
 
 async fn build_server(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
-    control_dids_ks: Option<affinidi_webvh_common::server::store::KeyspaceHandle>,
-) -> ServerServiceResult {
-    use affinidi_webvh_common::server::stats_collector::StatsCollector;
+    store: &affinidi_webvh_common::server::store::Store,
+    dids_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    sessions_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    acl_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    stats_collector: &Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
+) -> Result<(Router, affinidi_webvh_server::server::AppState), AppError> {
     use affinidi_webvh_server::server::AppState;
-    use affinidi_webvh_server::store::Store;
     use tracing::debug;
 
     let server_config = config.server_config();
-
-    let store = Store::open(&server_config.store).await?;
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-
-    // Use the control plane's dids_ks when available — DIDs created via the
-    // control plane API are stored there, and the server needs to resolve them.
-    // Falls back to the server's own dids keyspace if control is disabled.
-    let dids_ks = match control_dids_ks {
-        Some(ks) => {
-            info!("server using control plane DID store for resolution");
-            ks
-        }
-        None => store.keyspace("dids")?,
-    };
 
     // Integrity check on DID keyspace (matches standalone server behavior)
     match dids_ks.verify_integrity().await {
@@ -383,43 +434,27 @@ async fn build_server(
     }
 
     // Auto-bootstrap DIDs (root DID, server_did verification, DID listing)
-    let server_config = affinidi_webvh_server::server::auto_bootstrap_dids(
-        server_config,
-        &store,
-        &dids_ks,
-        secrets,
-    )
-    .await;
+    let server_config =
+        affinidi_webvh_server::server::auto_bootstrap_dids(server_config, store, dids_ks, secrets)
+            .await;
 
     // Re-initialize DIDComm auth after bootstrap (server_did may have been set)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
     let signing_key_bytes = decode_signing_key(secrets);
 
-    // Initialize stats collector with actual DID count
-    let stats_collector = {
-        let collector = StatsCollector::new();
-        let total_dids = dids_ks
-            .prefix_iter_raw("did:")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0) as u64;
-        collector.set_total_dids(total_dids);
-        Arc::new(collector)
-    };
-
     let state = AppState {
         store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        dids_ks,
+        sessions_ks: sessions_ks.clone(),
+        acl_ks: acl_ks.clone(),
+        dids_ks: dids_ks.clone(),
         config: Arc::new(server_config),
         did_resolver,
         secrets_resolver,
         jwt_keys,
         signing_key_bytes,
         http_client: reqwest::Client::new(),
-        stats_collector: Some(stats_collector),
+        stats_collector: Some(stats_collector.clone()),
         did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
             std::time::Duration::from_secs(300),
         )),
@@ -429,10 +464,10 @@ async fn build_server(
     let router = affinidi_webvh_server::routes::router_public_only().with_state(state.clone());
     info!("server service initialized");
 
-    Ok((router, store, state))
+    Ok((router, state))
 }
 
-async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> WitnessServiceResult {
     use affinidi_webvh_witness::server::AppState;
     use affinidi_webvh_witness::signing::LocalSigner;
     use affinidi_webvh_witness::store::Store;
@@ -465,48 +500,42 @@ async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     Ok((router, store))
 }
 
-async fn build_watcher(config: &DaemonConfig) -> ServiceResult {
+async fn build_watcher(
+    config: &DaemonConfig,
+    dids_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    store: &affinidi_webvh_common::server::store::Store,
+) -> Result<Router, AppError> {
     use affinidi_webvh_watcher::server::AppState;
-    use affinidi_webvh_watcher::store::Store;
 
     let watcher_config = config.watcher_config();
 
-    let store = Store::open(&watcher_config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
-
     let state = AppState {
         store: store.clone(),
-        dids_ks,
+        dids_ks: dids_ks.clone(),
         config: Arc::new(watcher_config),
     };
 
     let router = affinidi_webvh_watcher::routes::router().with_state(state);
     info!("watcher service initialized");
 
-    Ok((router, store))
+    Ok(router)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
-) -> Result<
-    (
-        Router,
-        affinidi_webvh_common::server::store::Store,
-        affinidi_webvh_common::server::store::KeyspaceHandle,
-    ),
-    AppError,
-> {
+    store: &affinidi_webvh_common::server::store::Store,
+    sessions_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    acl_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    dids_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    registry_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    stats_collector: &Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
+) -> Result<Router, AppError> {
     use affinidi_webvh_control::server::AppState;
-    use affinidi_webvh_control::store::Store;
 
     let control_config = config.control_config();
-
-    let store = Store::open(&control_config.store).await?;
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let registry_ks = store.keyspace("registry")?;
-    let dids_ks = store.keyspace("dids")?;
 
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
@@ -527,9 +556,9 @@ async fn build_control(
 
     let state = AppState {
         store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        registry_ks,
+        sessions_ks: sessions_ks.clone(),
+        acl_ks: acl_ks.clone(),
+        registry_ks: registry_ks.clone(),
         dids_ks: dids_ks.clone(),
         config: Arc::new(control_config),
         did_resolver,
@@ -539,21 +568,85 @@ async fn build_control(
         http_client: reqwest::Client::new(),
         atm: None,
         atm_profile: None,
-        stats_collector: {
-            let collector = affinidi_webvh_common::server::stats_collector::StatsCollector::new();
-            // Daemon mode: basic init, no seeding from store
-            std::sync::Arc::new(collector)
-        },
-        stats_ks: store
-            .keyspace("stats")
-            .expect("failed to open stats keyspace"),
+        stats_collector: stats_collector.clone(),
+        stats_ks: stats_ks.clone(),
     };
 
     // Use router without UI fallback — daemon sets its own combined fallback
     let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
     info!("control plane service initialized");
 
-    Ok((router, store, dids_ks))
+    Ok(router)
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_background_tasks(
+    store: affinidi_webvh_common::server::store::Store,
+    sessions_ks: affinidi_webvh_common::server::store::KeyspaceHandle,
+    dids_ks: affinidi_webvh_common::server::store::KeyspaceHandle,
+    stats_ks: affinidi_webvh_common::server::store::KeyspaceHandle,
+    stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
+    auth_config: affinidi_webvh_common::server::config::AuthConfig,
+    has_auth: bool,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use affinidi_webvh_common::server::auth::session::cleanup_expired_sessions;
+    use affinidi_webvh_common::server::tasks::{cleanup_old_buckets, flush_stats_to_store};
+    use std::time::Duration;
+
+    let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
+    let flush_interval = Duration::from_secs(10);
+    let cleanup_interval = Duration::from_secs(3600);
+
+    let mut session_timer = tokio::time::interval(session_interval);
+    let mut flush_timer = tokio::time::interval(flush_interval);
+    let mut cleanup_timer = tokio::time::interval(cleanup_interval);
+
+    // Skip first tick (immediate)
+    session_timer.tick().await;
+    flush_timer.tick().await;
+    cleanup_timer.tick().await;
+
+    info!("background tasks started");
+
+    loop {
+        tokio::select! {
+            _ = session_timer.tick(), if has_auth => {
+                if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
+                    warn!("session cleanup error: {e}");
+                }
+            }
+            _ = flush_timer.tick() => {
+                if let Err(e) = flush_stats_to_store(&stats_collector, &stats_ks, &dids_ks, &store).await {
+                    warn!("stats flush error: {e}");
+                }
+            }
+            _ = cleanup_timer.tick() => {
+                match cleanup_old_buckets(&stats_ks).await {
+                    Ok(0) => {}
+                    Ok(n) => info!(removed = n, "cleaned up old time-series buckets"),
+                    Err(e) => warn!("bucket cleanup error: {e}"),
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("background tasks shutting down");
+                break;
+            }
+        }
+    }
+
+    // Final flush before shutdown
+    let _ = flush_stats_to_store(&stats_collector, &stats_ks, &dids_ks, &store).await;
+
+    if let Err(e) = store.persist().await {
+        error!("failed to persist store on shutdown: {e}");
+    } else {
+        info!("store persisted");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -681,15 +774,7 @@ async fn run_add_acl(
     use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    cli::add_acl(
-        &config.control_store,
-        &did,
-        &role_str,
-        label.as_deref(),
-        None,
-        None,
-    )
-    .await
+    cli::add_acl(&config.store, &did, &role_str, label.as_deref(), None, None).await
 }
 
 async fn run_list_acl(
@@ -698,7 +783,7 @@ async fn run_list_acl(
     use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    cli::list_acl(&config.control_store).await
+    cli::list_acl(&config.store).await
 }
 
 async fn run_remove_acl(
@@ -708,7 +793,7 @@ async fn run_remove_acl(
     use affinidi_webvh_common::server::cli;
 
     let config = DaemonConfig::load(config_path)?;
-    cli::remove_acl(&config.control_store, &did).await
+    cli::remove_acl(&config.store, &did).await
 }
 
 #[cfg(feature = "passkey")]
@@ -732,7 +817,7 @@ async fn run_invite(
         None => config.auth.passkey_enrollment_ttl,
     };
 
-    cli::invite(&config.control_store, base_url, enrollment_ttl, &did, &role).await
+    cli::invite(&config.store, base_url, enrollment_ttl, &did, &role).await
 }
 
 #[cfg(not(feature = "passkey"))]
@@ -903,54 +988,43 @@ async fn run_health(
     health::section("Secrets");
     health::check_secrets(&config.secrets, &config.config_path).await;
 
-    // ── Per-service Stores ─────────────────────────────────────────
-    if config.enable.server {
-        health::section("Store (server)");
-        let store = health::check_store(&config.server_store).await;
+    // ── Stores ─────────────────────────────────────────────────────
+    health::section("Store (main)");
+    let store = health::check_store(&config.store).await;
 
-        // Root DID check via server store
-        if let Some(ref store) = store
-            && let Ok(dids_ks) = store.keyspace("dids")
-        {
-            health::section("Root DID (.well-known)");
-            match affinidi_webvh_server::bootstrap::root_did_exists(&dids_ks).await {
-                Ok(true) => {
-                    health::pass("Root DID exists");
-                    match dids_ks
-                        .get::<affinidi_webvh_server::did_ops::DidRecord>(
-                            affinidi_webvh_server::did_ops::did_key(".well-known"),
-                        )
-                        .await
-                    {
-                        Ok(Some(record)) => {
-                            if let Some(ref did_id) = record.did_id {
-                                health::info_msg(&format!("DID: {did_id}"));
-                            }
-                            health::info_msg(&format!("Version count: {}", record.version_count));
+    // Root DID check via main store
+    if config.enable.server
+        && let Some(ref store) = store
+        && let Ok(dids_ks) = store.keyspace("dids")
+    {
+        health::section("Root DID (.well-known)");
+        match affinidi_webvh_server::bootstrap::root_did_exists(&dids_ks).await {
+            Ok(true) => {
+                health::pass("Root DID exists");
+                match dids_ks
+                    .get::<affinidi_webvh_server::did_ops::DidRecord>(
+                        affinidi_webvh_server::did_ops::did_key(".well-known"),
+                    )
+                    .await
+                {
+                    Ok(Some(record)) => {
+                        if let Some(ref did_id) = record.did_id {
+                            health::info_msg(&format!("DID: {did_id}"));
                         }
-                        Ok(None) => {}
-                        Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
+                        health::info_msg(&format!("Version count: {}", record.version_count));
                     }
+                    Ok(None) => {}
+                    Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
                 }
-                Ok(false) => health::skip("Root DID not yet bootstrapped"),
-                Err(e) => health::fail(&format!("Root DID check failed: {e}")),
             }
+            Ok(false) => health::skip("Root DID not yet bootstrapped"),
+            Err(e) => health::fail(&format!("Root DID check failed: {e}")),
         }
     }
 
     if config.enable.witness {
         health::section("Store (witness)");
         health::check_store(&config.witness_store).await;
-    }
-
-    if config.enable.watcher {
-        health::section("Store (watcher)");
-        health::check_store(&config.watcher_store).await;
-    }
-
-    if config.enable.control {
-        health::section("Store (control)");
-        health::check_store(&config.control_store).await;
     }
 
     // ── DID Resolution ─────────────────────────────────────────────

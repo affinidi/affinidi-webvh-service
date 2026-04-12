@@ -14,6 +14,7 @@ pub mod passkey;
 pub mod secret_store;
 pub mod stats_collector;
 pub mod store;
+pub mod tasks;
 pub mod vta_cache;
 pub mod vta_setup;
 
