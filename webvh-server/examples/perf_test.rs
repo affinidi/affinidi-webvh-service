@@ -285,6 +285,7 @@ impl Aggregator {
     }
 
     /// Absorb a batch of metrics from the shared atomic counters.
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
         raw_total: u64,
@@ -553,7 +554,7 @@ async fn run_aggregator(
         if agg.warmup_remaining > 0 {
             // During warmup: decrement counter, discard latencies, publish warmup snapshot
             agg.warmup_remaining -= 1;
-            let secs_left = (agg.warmup_remaining + 9) / 10; // ceiling division to whole seconds
+            let secs_left = agg.warmup_remaining.div_ceil(10); // ceiling division to whole seconds
 
             if agg.warmup_remaining == 0 {
                 // Warmup just ended — capture baselines and reset aggregator state
@@ -1310,7 +1311,7 @@ async fn main() -> Result<()> {
     // Install panic hook to restore terminal on crash
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::restore();
+        ratatui::restore();
         original_hook(info);
     }));
 
@@ -1372,33 +1373,32 @@ fn run_tui(
         }
 
         // Poll for keyboard events (non-blocking)
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            shutdown.store(true, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
-                            let cur = target_rate.load(Ordering::Relaxed);
-                            target_rate.store(cur.saturating_add(10), Ordering::Relaxed);
-                        }
-                        KeyCode::Char('-') | KeyCode::Down => {
-                            let cur = target_rate.load(Ordering::Relaxed);
-                            target_rate.store(cur.saturating_sub(10).max(1), Ordering::Relaxed);
-                        }
-                        KeyCode::Char(']') => {
-                            let cur = target_rate.load(Ordering::Relaxed);
-                            target_rate.store(cur.saturating_mul(2), Ordering::Relaxed);
-                        }
-                        KeyCode::Char('[') => {
-                            let cur = target_rate.load(Ordering::Relaxed);
-                            target_rate.store((cur / 2).max(1), Ordering::Relaxed);
-                        }
-                        _ => {}
-                    }
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    shutdown.store(true, Ordering::Relaxed);
+                    return Ok(());
                 }
+                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
+                    let cur = target_rate.load(Ordering::Relaxed);
+                    target_rate.store(cur.saturating_add(10), Ordering::Relaxed);
+                }
+                KeyCode::Char('-') | KeyCode::Down => {
+                    let cur = target_rate.load(Ordering::Relaxed);
+                    target_rate.store(cur.saturating_sub(10).max(1), Ordering::Relaxed);
+                }
+                KeyCode::Char(']') => {
+                    let cur = target_rate.load(Ordering::Relaxed);
+                    target_rate.store(cur.saturating_mul(2), Ordering::Relaxed);
+                }
+                KeyCode::Char('[') => {
+                    let cur = target_rate.load(Ordering::Relaxed);
+                    target_rate.store((cur / 2).max(1), Ordering::Relaxed);
+                }
+                _ => {}
             }
         }
     }

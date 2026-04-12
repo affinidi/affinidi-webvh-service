@@ -180,7 +180,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
-        .items(&log_levels)
+        .items(log_levels)
         .default(0)
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
@@ -385,6 +385,7 @@ pub fn update_server_did_in_config(
 }
 
 /// Prompt for secrets backend selection and configuration.
+#[allow(clippy::vec_init_then_push)]
 fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
     #[allow(unused_mut)]
     let mut backends: Vec<&str> = Vec::new();

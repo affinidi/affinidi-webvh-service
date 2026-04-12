@@ -257,7 +257,8 @@ async fn run_add_acl(
     use affinidi_webvh_server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
     use affinidi_webvh_server::auth::session::now_epoch;
 
-    let role_parsed = Role::from_str(&role)
+    let role_parsed = role
+        .parse::<Role>()
         .map_err(|_| format!("invalid role '{role}': use 'admin', 'owner', or 'service'"))?;
 
     let config = AppConfig::load(config_path)?;
@@ -319,8 +320,8 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
 
     eprintln!();
     eprintln!(
-        "  {:<50} {:<8} {:<15} {:<15} {}",
-        "DID", "ROLE", "MAX SIZE", "MAX DIDS", "LABEL"
+        "  {:<50} {:<8} {:<15} {:<15} LABEL",
+        "DID", "ROLE", "MAX SIZE", "MAX DIDS"
     );
     eprintln!("  {}", "-".repeat(100));
 
@@ -737,10 +738,8 @@ async fn run_import_secrets(
     let secret_store = secret_store::create_secret_store(&config)?;
 
     // Check for existing secrets
-    if !force {
-        if let Ok(Some(_)) = secret_store.get().await {
-            return Err("secrets already exist — use --force to overwrite".into());
-        }
+    if !force && let Ok(Some(_)) = secret_store.get().await {
+        return Err("secrets already exist — use --force to overwrite".into());
     }
 
     let (resolved_signing, resolved_ka, resolved_vta_cred) =
@@ -864,42 +863,42 @@ async fn run_server(config_path: Option<PathBuf>) {
 
     // If VTA is configured, try to fetch fresh keys and cache them locally.
     // Falls back to the existing locally-stored keys if VTA is unreachable.
-    if let Some(ref context_id) = config.vta.context_id {
-        if let Some(ref credential) = secrets.vta_credential {
-            use affinidi_webvh_common::server::vta_cache::WebvhSecretCache;
-            use vta_sdk::integration::{self, VtaServiceConfig};
+    if let Some(ref context_id) = config.vta.context_id
+        && let Some(ref credential) = secrets.vta_credential
+    {
+        use affinidi_webvh_common::server::vta_cache::WebvhSecretCache;
+        use vta_sdk::integration::{self, VtaServiceConfig};
 
-            let vta_config = VtaServiceConfig {
-                credential: credential.clone(),
-                context: context_id.clone(),
-                url_override: config.vta.url.clone(),
-                timeout: None,
-            };
-            let cache = WebvhSecretCache::new(secret_store.as_ref());
+        let vta_config = VtaServiceConfig {
+            credential: credential.clone(),
+            context: context_id.clone(),
+            url_override: config.vta.url.clone(),
+            timeout: None,
+        };
+        let cache = WebvhSecretCache::new(secret_store.as_ref());
 
-            match integration::startup(&vta_config, &cache).await {
-                Ok(result) => {
-                    tracing::info!(
-                        source = ?result.source,
-                        secrets = result.bundle.secrets.len(),
-                        "VTA secrets loaded",
-                    );
-                    // Update in-memory secrets with fresh keys from VTA
-                    for entry in &result.bundle.secrets {
-                        match entry.key_type {
-                            vta_sdk::keys::KeyType::Ed25519 => {
-                                secrets.signing_key = entry.private_key_multibase.clone();
-                            }
-                            vta_sdk::keys::KeyType::X25519 => {
-                                secrets.key_agreement_key = entry.private_key_multibase.clone();
-                            }
-                            _ => {}
+        match integration::startup(&vta_config, &cache).await {
+            Ok(result) => {
+                tracing::info!(
+                    source = ?result.source,
+                    secrets = result.bundle.secrets.len(),
+                    "VTA secrets loaded",
+                );
+                // Update in-memory secrets with fresh keys from VTA
+                for entry in &result.bundle.secrets {
+                    match entry.key_type {
+                        vta_sdk::keys::KeyType::Ed25519 => {
+                            secrets.signing_key = entry.private_key_multibase.clone();
                         }
+                        vta_sdk::keys::KeyType::X25519 => {
+                            secrets.key_agreement_key = entry.private_key_multibase.clone();
+                        }
+                        _ => {}
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("VTA startup failed ({e}), using locally stored keys");
-                }
+            }
+            Err(e) => {
+                tracing::warn!("VTA startup failed ({e}), using locally stored keys");
             }
         }
     }

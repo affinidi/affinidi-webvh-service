@@ -56,32 +56,32 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
     let store = health::check_store(&config.store).await;
 
     // ── Root DID (.well-known) ─────────────────────────────────────
-    if let Some(ref store) = store {
-        if let Ok(dids_ks) = store.keyspace("dids") {
-            health::section("Root DID (.well-known)");
-            match crate::bootstrap::root_did_exists(&dids_ks).await {
-                Ok(true) => {
-                    health::pass("Root DID exists");
-                    // Try to read the DidRecord for more info
-                    match dids_ks
-                        .get::<crate::did_ops::DidRecord>(crate::did_ops::did_key(".well-known"))
-                        .await
-                    {
-                        Ok(Some(record)) => {
-                            if let Some(ref did_id) = record.did_id {
-                                health::info_msg(&format!("DID: {did_id}"));
-                            }
-                            health::info_msg(&format!("Version count: {}", record.version_count));
+    if let Some(ref store) = store
+        && let Ok(dids_ks) = store.keyspace("dids")
+    {
+        health::section("Root DID (.well-known)");
+        match crate::bootstrap::root_did_exists(&dids_ks).await {
+            Ok(true) => {
+                health::pass("Root DID exists");
+                // Try to read the DidRecord for more info
+                match dids_ks
+                    .get::<crate::did_ops::DidRecord>(crate::did_ops::did_key(".well-known"))
+                    .await
+                {
+                    Ok(Some(record)) => {
+                        if let Some(ref did_id) = record.did_id {
+                            health::info_msg(&format!("DID: {did_id}"));
                         }
-                        Ok(None) => {}
-                        Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
+                        health::info_msg(&format!("Version count: {}", record.version_count));
                     }
+                    Ok(None) => {}
+                    Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
                 }
-                Ok(false) => {
-                    health::skip("Root DID not yet bootstrapped");
-                }
-                Err(e) => health::fail(&format!("Root DID check failed: {e}")),
             }
+            Ok(false) => {
+                health::skip("Root DID not yet bootstrapped");
+            }
+            Err(e) => health::fail(&format!("Root DID check failed: {e}")),
         }
     }
 

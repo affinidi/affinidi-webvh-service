@@ -203,19 +203,20 @@ impl AppConfig {
 
         // Validate configuration
         config.auth.validate()?;
-        if let Some(ref did) = config.server_did {
-            if !did.starts_with("did:") {
-                return Err(AppError::Config(format!(
-                    "server_did must start with 'did:': {did}"
-                )));
-            }
+        if let Some(ref did) = config.server_did
+            && !did.starts_with("did:")
+        {
+            return Err(AppError::Config(format!(
+                "server_did must start with 'did:': {did}"
+            )));
         }
-        if let Some(ref url) = config.public_url {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(AppError::Config(format!(
-                    "public_url must start with http:// or https://: {url}"
-                )));
-            }
+        if let Some(ref url) = config.public_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            return Err(AppError::Config(format!(
+                "public_url must start with http:// or https://: {url}"
+            )));
         }
 
         // Normalize: strip trailing slashes from URLs

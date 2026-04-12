@@ -364,16 +364,14 @@ async fn query_timeseries(
         std::collections::HashMap::new();
     for (key, value) in &raw {
         let key_str = std::str::from_utf8(key).unwrap_or_default();
-        if let Some(epoch_str) = key_str.get(prefix_len..) {
-            if let Ok(epoch) = epoch_str.parse::<u64>() {
-                if epoch >= cutoff {
-                    if let Ok(data) = serde_json::from_slice::<BucketData>(value) {
-                        let entry = bucket_map.entry(epoch).or_insert((0, 0));
-                        entry.0 += data.r;
-                        entry.1 += data.u;
-                    }
-                }
-            }
+        if let Some(epoch_str) = key_str.get(prefix_len..)
+            && let Ok(epoch) = epoch_str.parse::<u64>()
+            && epoch >= cutoff
+            && let Ok(data) = serde_json::from_slice::<BucketData>(value)
+        {
+            let entry = bucket_map.entry(epoch).or_insert((0, 0));
+            entry.0 += data.r;
+            entry.1 += data.u;
         }
     }
 

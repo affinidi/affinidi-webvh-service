@@ -326,11 +326,8 @@ pub async fn list_dids(
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
             let stats_key = format!("stats:{mnemonic}");
-            let did_stats: affinidi_webvh_common::DidStats = state
-                .stats_ks
-                .get(stats_key)
-                .await?
-                .unwrap_or_default();
+            let did_stats: affinidi_webvh_common::DidStats =
+                state.stats_ks.get(stats_key).await?.unwrap_or_default();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -366,11 +363,8 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             Err(_) => continue,
         };
         let stats_key = format!("stats:{}", record.mnemonic);
-        let did_stats: affinidi_webvh_common::DidStats = state
-            .stats_ks
-            .get(stats_key)
-            .await?
-            .unwrap_or_default();
+        let did_stats: affinidi_webvh_common::DidStats =
+            state.stats_ks.get(stats_key).await?.unwrap_or_default();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,

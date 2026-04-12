@@ -23,10 +23,9 @@ async fn serve_content(
         .dids_ks
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
+        && (record.disabled || record.deleted_at.is_some())
     {
-        if record.disabled || record.deleted_at.is_some() {
-            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
-        }
+        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
 
     // Check cache first (hot path — read lock only, no I/O, Arc clone only)
@@ -46,10 +45,8 @@ async fn serve_content(
         std::sync::Arc::new(data)
     };
 
-    if track_stats {
-        if let Some(ref collector) = state.stats_collector {
-            collector.record_resolve(mnemonic);
-        }
+    if track_stats && let Some(ref collector) = state.stats_collector {
+        collector.record_resolve(mnemonic);
         #[cfg(feature = "metrics")]
         affinidi_webvh_common::server::metrics::inc_resolve();
     }
@@ -75,10 +72,9 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .dids_ks
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
+        && (record.disabled || record.deleted_at.is_some())
     {
-        if record.disabled || record.deleted_at.is_some() {
-            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
-        }
+        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
 
     let content_bytes = state

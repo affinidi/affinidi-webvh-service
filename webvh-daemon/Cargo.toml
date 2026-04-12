@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-daemon"
 description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"

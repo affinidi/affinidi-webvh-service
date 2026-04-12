@@ -176,13 +176,12 @@ pub fn notify_watchers_did(
         }
 
         // Persist sync statuses.
-        if !statuses.is_empty() {
-            if let Err(e) = dids_ks
+        if !statuses.is_empty()
+            && let Err(e) = dids_ks
                 .insert(did_ops::watcher_sync_key(&mnemonic), &statuses)
                 .await
-            {
-                warn!(mnemonic = %mnemonic, error = %e, "failed to persist watcher sync status");
-            }
+        {
+            warn!(mnemonic = %mnemonic, error = %e, "failed to persist watcher sync status");
         }
     });
 }

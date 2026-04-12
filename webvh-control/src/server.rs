@@ -293,16 +293,18 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .name("control-storage".into())
         .spawn(move || {
             run_storage_thread(
-                store,
-                storage_sessions_ks,
-                storage_registry_ks,
-                storage_stats_ks,
-                storage_dids_ks,
-                storage_auth_config,
-                storage_registry_config,
-                has_auth,
-                storage_http,
-                storage_collector,
+                StorageThreadParams {
+                    store,
+                    sessions_ks: storage_sessions_ks,
+                    registry_ks: storage_registry_ks,
+                    stats_ks: storage_stats_ks,
+                    dids_ks: storage_dids_ks,
+                    auth_config: storage_auth_config,
+                    registry_config: storage_registry_config,
+                    has_auth,
+                    http: storage_http,
+                    collector: storage_collector,
+                },
                 &mut storage_shutdown,
             )
         })
@@ -532,7 +534,7 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-fn run_storage_thread(
+struct StorageThreadParams {
     store: Store,
     sessions_ks: KeyspaceHandle,
     registry_ks: KeyspaceHandle,
@@ -543,8 +545,21 @@ fn run_storage_thread(
     has_auth: bool,
     http: reqwest::Client,
     collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
+}
+
+fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
+    let StorageThreadParams {
+        store,
+        sessions_ks,
+        registry_ks,
+        stats_ks,
+        dids_ks,
+        auth_config,
+        registry_config,
+        has_auth,
+        http,
+        collector,
+    } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -692,13 +707,12 @@ async fn cleanup_old_buckets(stats_ks: &KeyspaceHandle) -> Result<u64, AppError>
     for (key, _) in &raw {
         let key_str = std::str::from_utf8(key).unwrap_or_default();
         // Key format: ts:{mnemonic}:{epoch:010}
-        if let Some(epoch_str) = key_str.rsplit(':').next() {
-            if let Ok(epoch) = epoch_str.parse::<u64>() {
-                if epoch < cutoff {
-                    stats_ks.remove(key.clone()).await?;
-                    removed += 1;
-                }
-            }
+        if let Some(epoch_str) = key_str.rsplit(':').next()
+            && let Ok(epoch) = epoch_str.parse::<u64>()
+            && epoch < cutoff
+        {
+            stats_ks.remove(key.clone()).await?;
+            removed += 1;
         }
     }
     Ok(removed)

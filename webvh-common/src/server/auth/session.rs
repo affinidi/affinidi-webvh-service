@@ -147,11 +147,11 @@ pub async fn cleanup_expired_sessions(
         struct EnrollmentExpiry {
             expires_at: u64,
         }
-        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value) {
-            if now > e.expires_at {
-                sessions.remove(key).await?;
-                removed += 1;
-            }
+        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value)
+            && now > e.expires_at
+        {
+            sessions.remove(key).await?;
+            removed += 1;
         }
     }
 

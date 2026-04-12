@@ -194,11 +194,11 @@ pub async fn refresh(
     }
 
     // Check refresh token hasn't expired
-    if let Some(expires_at) = session.refresh_expires_at {
-        if now_epoch() > expires_at {
-            session::delete_session(&state.sessions_ks, &session_id).await?;
-            return Err(AppError::Authentication("refresh token expired".into()));
-        }
+    if let Some(expires_at) = session.refresh_expires_at
+        && now_epoch() > expires_at
+    {
+        session::delete_session(&state.sessions_ks, &session_id).await?;
+        return Err(AppError::Authentication("refresh token expired".into()));
     }
 
     // Invalidate the old session to prevent refresh token reuse

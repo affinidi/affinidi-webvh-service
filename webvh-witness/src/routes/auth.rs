@@ -229,10 +229,10 @@ pub async fn refresh(
     }
 
     let now = now_epoch();
-    if let Some(expires) = session.refresh_expires_at {
-        if now > expires {
-            return Err(AppError::Authentication("refresh token expired".into()));
-        }
+    if let Some(expires) = session.refresh_expires_at
+        && now > expires
+    {
+        return Err(AppError::Authentication("refresh token expired".into()));
     }
 
     // Re-check ACL

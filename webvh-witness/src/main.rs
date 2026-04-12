@@ -120,7 +120,8 @@ async fn run_add_acl(
     use affinidi_webvh_witness::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
     use affinidi_webvh_witness::auth::session::now_epoch;
 
-    let role_parsed = Role::from_str(&role)
+    let role_parsed = role
+        .parse::<Role>()
         .map_err(|_| format!("invalid role '{role}': use 'admin' or 'owner'"))?;
 
     let config = AppConfig::load(config_path)?;
@@ -174,7 +175,7 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
     }
 
     eprintln!();
-    eprintln!("  {:<50} {:<8} {}", "DID", "ROLE", "LABEL");
+    eprintln!("  {:<50} {:<8} LABEL", "DID", "ROLE");
     eprintln!("  {}", "-".repeat(80));
 
     for entry in &entries {
@@ -262,8 +263,8 @@ async fn run_list_witnesses(
 
     eprintln!();
     eprintln!(
-        "  {:<50} {:<50} {:<10} {}",
-        "WITNESS ID", "DID", "PROOFS", "LABEL"
+        "  {:<50} {:<50} {:<10} LABEL",
+        "WITNESS ID", "DID", "PROOFS"
     );
     eprintln!("  {}", "-".repeat(120));
 

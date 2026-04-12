@@ -71,7 +71,7 @@ pub async fn enroll_start<S: PasskeyState>(
 
     // Ensure DID is in ACL — the enrollment itself is the admin's authorization,
     // so create the ACL entry if it doesn't already exist.
-    let role = Role::from_str(&enrollment.role)?;
+    let role = enrollment.role.parse::<Role>()?;
     if acl::get_acl_entry(acl_ks, &enrollment.did).await?.is_none() {
         let entry = AclEntry {
             did: enrollment.did.clone(),
@@ -333,7 +333,7 @@ pub async fn create_enrollment_invite(
     role: &str,
 ) -> Result<CreateInviteResponse, AppError> {
     // Validate role
-    let _ = Role::from_str(role)?;
+    let _ = role.parse::<Role>()?;
 
     // Generate a 32-byte random token
     let token = {

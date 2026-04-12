@@ -223,16 +223,18 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .name("webvh-storage".into())
         .spawn(move || {
             run_storage_thread(
-                store,
-                storage_sessions_ks,
-                storage_dids_ks,
-                storage_auth_config,
-                has_auth,
-                storage_collector,
-                storage_stats_config,
-                storage_http,
-                storage_control_url,
-                storage_server_did,
+                StorageThreadParams {
+                    store,
+                    sessions_ks: storage_sessions_ks,
+                    dids_ks: storage_dids_ks,
+                    auth_config: storage_auth_config,
+                    has_auth,
+                    collector: storage_collector,
+                    stats_config: storage_stats_config,
+                    http: storage_http,
+                    control_url: storage_control_url,
+                    server_did: storage_server_did,
+                },
                 &mut storage_shutdown,
             )
         })
@@ -267,17 +269,17 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     let store_clone = state.store.clone();
                     let cache = state.did_cache.clone();
                     tokio::spawn(async move {
-                        control_register::register_with_control_retry(
-                            &control_url,
-                            &server_did,
-                            &signing_secret,
-                            &public_url,
-                            None,
-                            &dids_ks,
-                            &store_clone,
-                            &cache,
-                        )
-                        .await;
+                        let params = control_register::ControlRegistrationParams {
+                            control_url: &control_url,
+                            server_did: &server_did,
+                            signing_secret: &signing_secret,
+                            public_url: &public_url,
+                            label: None,
+                            dids_ks: &dids_ks,
+                            store: &store_clone,
+                            did_cache: &cache,
+                        };
+                        control_register::register_with_control_retry(&params).await;
                     });
                 }
                 Err(e) => warn!("cannot register with control: {e}"),
@@ -473,7 +475,8 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-fn run_storage_thread(
+/// Parameters for the background storage thread.
+struct StorageThreadParams {
     store: Store,
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
@@ -484,8 +487,21 @@ fn run_storage_thread(
     http: reqwest::Client,
     control_url: Option<String>,
     server_did: Option<String>,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
+}
+
+fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
+    let StorageThreadParams {
+        store,
+        sessions_ks,
+        dids_ks,
+        auth_config,
+        has_auth,
+        collector,
+        stats_config,
+        http,
+        control_url,
+        server_did,
+    } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -714,25 +730,24 @@ async fn auto_bootstrap_dids(
     }
 
     // Verify server_did exists in store (if configured and not root)
-    if let Some(ref server_did) = config.server_did {
-        if let Some(mnemonic) = mnemonic_from_did(server_did) {
-            if mnemonic != ".well-known" {
-                let exists = dids_ks
-                    .contains_key(format!("did:{mnemonic}"))
-                    .await
-                    .unwrap_or(false);
-                if exists {
-                    info!(path = %mnemonic, "server DID loaded from store");
-                } else {
-                    error!(
-                        did = %server_did,
-                        path = %mnemonic,
-                        "server DID not found in store — DID resolution will fail"
-                    );
-                    error!("  To create it, run:  webvh-server bootstrap-did --path {mnemonic}");
-                    error!("  Then update server_did in config.toml with the new DID");
-                }
-            }
+    if let Some(ref server_did) = config.server_did
+        && let Some(mnemonic) = mnemonic_from_did(server_did)
+        && mnemonic != ".well-known"
+    {
+        let exists = dids_ks
+            .contains_key(format!("did:{mnemonic}"))
+            .await
+            .unwrap_or(false);
+        if exists {
+            info!(path = %mnemonic, "server DID loaded from store");
+        } else {
+            error!(
+                did = %server_did,
+                path = %mnemonic,
+                "server DID not found in store — DID resolution will fail"
+            );
+            error!("  To create it, run:  webvh-server bootstrap-did --path {mnemonic}");
+            error!("  Then update server_did in config.toml with the new DID");
         }
     }
 

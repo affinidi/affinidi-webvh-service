@@ -168,7 +168,8 @@ async fn run_add_acl(
     use affinidi_webvh_control::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
     use affinidi_webvh_control::auth::session::now_epoch;
 
-    let role = Role::from_str(&role_str)
+    let role = role_str
+        .parse::<Role>()
         .map_err(|_| format!("invalid role '{role_str}': use 'admin' or 'owner'"))?;
 
     let config = AppConfig::load(config_path)?;
@@ -222,7 +223,7 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
     }
 
     eprintln!();
-    eprintln!("  {:<50} {:<8} {}", "DID", "ROLE", "LABEL");
+    eprintln!("  {:<50} {:<8} LABEL", "DID", "ROLE");
     eprintln!("  {}", "-".repeat(80));
 
     for entry in &entries {

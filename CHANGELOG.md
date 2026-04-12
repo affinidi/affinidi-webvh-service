@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.0 (2026-04-12)
+
+### Added
+
+- **import-secrets CLI command**: Cold-start bootstrap support for importing
+  signing keys from file, enabling automated provisioning without interactive
+  setup
+- **VTA integration redesign**: Unified startup flow with local caching via
+  `VtaCache`, replacing the previous bundle-paste workflow with direct VTA
+  connection
+- **Time-series tracking**: Control plane now records per-DID usage over time
+  with batched flush via the unified `StatsCollector`
+- **Cold-start bootstrap documentation**: Complete flow documentation for VTA,
+  mediator, and webvh-server bootstrap scenarios
+- **webvh-daemon feature flags**: Forward `aws-secrets`, `gcp-secrets`,
+  `metrics`, `store-redis`, `store-dynamodb`, `store-firestore`, and
+  `store-cosmosdb` feature flags to sub-crates
+
+### Fixed
+
+- DIDComm session restore for setup wizard VTA authentication
+- `SessionStore::connect()` now passes `None` for DIDComm transport correctly
+- DID list shows actual resolve counts from per-DID stats instead of aggregates
+- Server restart now accepts `seq=0` and shows empty chart message in UI
+- Store integrity check skips non-JSON keys (`owner:`, `refresh:`, `ts:`)
+
+### Changed
+
+- `StatsCollector` refactored to unified batched flush architecture
+- `vta-sdk` dependency switched from crates.io release to git nightly branch
+  with `integration` feature
+
 ## 0.1.0 (2026-03-31)
 
 First production-hardened release. Major improvements across all services in

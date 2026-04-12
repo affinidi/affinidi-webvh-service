@@ -41,9 +41,11 @@ impl SecretCache for WebvhSecretCache<'_> {
         &self,
         bundle: &DidSecretsBundle,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let encoded = bundle.encode().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Failed to encode secrets bundle: {e}").into()
-        })?;
+        let encoded = bundle
+            .encode()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Failed to encode secrets bundle: {e}").into()
+            })?;
 
         // Load existing secrets so we preserve signing_key, jwt_signing_key, etc.
         let mut secrets = match self.store.get().await {
@@ -54,7 +56,9 @@ impl SecretCache for WebvhSecretCache<'_> {
                 return Ok(());
             }
             Err(e) => {
-                return Err(format!("Failed to load existing secrets for cache update: {e}").into());
+                return Err(
+                    format!("Failed to load existing secrets for cache update: {e}").into(),
+                );
             }
         };
 
@@ -74,9 +78,11 @@ impl SecretCache for WebvhSecretCache<'_> {
             }
         }
 
-        self.store.set(&secrets).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Failed to save updated secrets: {e}").into()
-        })?;
+        self.store.set(&secrets).await.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Failed to save updated secrets: {e}").into()
+            },
+        )?;
 
         tracing::debug!("Cached VTA secrets bundle to secret store");
         Ok(())
@@ -103,7 +109,9 @@ impl SecretCache for WebvhSecretCache<'_> {
                     Err(_) => {
                         // vta_credential might contain the original credential string
                         // (from setup), not an encoded bundle — that's not a cached bundle
-                        tracing::debug!("vta_credential is not an encoded secrets bundle (may be original credential)");
+                        tracing::debug!(
+                            "vta_credential is not an encoded secrets bundle (may be original credential)"
+                        );
                         Ok(None)
                     }
                 }

@@ -21,10 +21,9 @@ async fn serve_content(
         .dids_ks
         .get::<WatcherRecord>(watcher_ops::did_key(mnemonic))
         .await?
+        && record.disabled
     {
-        if record.disabled {
-            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
-        }
+        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
 
     let content = state

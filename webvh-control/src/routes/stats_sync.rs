@@ -43,18 +43,18 @@ pub async fn receive_stats(
     }
 
     // Idempotency: reject replayed payloads (seq=0 means server restart)
-    if let Ok(map) = LAST_SEQ.read() {
-        if let Some(&last) = map.get(&payload.server_did) {
-            if payload.seq > 0 && payload.seq <= last {
-                debug!(
-                    server_did = %payload.server_did,
-                    seq = payload.seq,
-                    last_seq = last,
-                    "stats sync: stale sequence (skipped)"
-                );
-                return StatusCode::NO_CONTENT;
-            }
-        }
+    if let Ok(map) = LAST_SEQ.read()
+        && let Some(&last) = map.get(&payload.server_did)
+        && payload.seq > 0
+        && payload.seq <= last
+    {
+        debug!(
+            server_did = %payload.server_did,
+            seq = payload.seq,
+            last_seq = last,
+            "stats sync: stale sequence (skipped)"
+        );
+        return StatusCode::NO_CONTENT;
     }
 
     // Update last seen sequence
