@@ -98,6 +98,27 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Import secrets from a VTA secrets bundle or individual keys
+    ImportSecrets {
+        /// Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
+        #[arg(long, group = "source")]
+        vta_bundle: Option<String>,
+        /// Ed25519 signing key (multibase-encoded)
+        #[arg(long, group = "source")]
+        signing_key: Option<String>,
+        /// X25519 key agreement key (multibase-encoded, required with --signing-key)
+        #[arg(long)]
+        ka_key: Option<String>,
+        /// Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
+        #[arg(long)]
+        jwt_key: Option<String>,
+        /// VTA credential bundle (base64url-encoded, optional)
+        #[arg(long)]
+        vta_credential: Option<String>,
+        /// Overwrite existing secrets without prompting
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +194,29 @@ async fn main() {
         }
         Some(Command::RecoverDid { path }) => {
             if let Err(e) = run_recover_did(cli.config, path).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ImportSecrets {
+            vta_bundle,
+            signing_key,
+            ka_key,
+            jwt_key,
+            vta_credential,
+            force,
+        }) => {
+            if let Err(e) = run_import_secrets(
+                cli.config,
+                vta_bundle,
+                signing_key,
+                ka_key,
+                jwt_key,
+                vta_credential,
+                force,
+            )
+            .await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -568,6 +612,108 @@ async fn run_bootstrap_did(
     if is_root && config.server_did.is_none() {
         eprintln!("  Hint: set server_did in your config.toml:");
         eprintln!("    server_did = \"{}\"", result.did_id);
+        eprintln!();
+    }
+
+    Ok(())
+}
+
+async fn run_import_secrets(
+    config_path: Option<PathBuf>,
+    vta_bundle: Option<String>,
+    signing_key: Option<String>,
+    ka_key: Option<String>,
+    jwt_key: Option<String>,
+    vta_credential: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use affinidi_webvh_common::server::vta_setup::generate_ed25519_multibase;
+    use vta_sdk::did_secrets::DidSecretsBundle;
+    use vta_sdk::keys::KeyType;
+
+    let config = AppConfig::load(config_path)?;
+    let secret_store = secret_store::create_secret_store(&config)?;
+
+    // Check for existing secrets
+    if !force {
+        if let Ok(Some(_)) = secret_store.get().await {
+            return Err("secrets already exist — use --force to overwrite".into());
+        }
+    }
+
+    let (resolved_signing, resolved_ka, resolved_vta_cred) =
+        if let Some(ref bundle_str) = vta_bundle {
+            // Decode VTA secrets bundle
+            let bundle = DidSecretsBundle::decode(bundle_str)
+                .map_err(|e| format!("failed to decode VTA secrets bundle: {e}"))?;
+
+            let mut signing = None;
+            let mut ka = None;
+
+            for entry in &bundle.secrets {
+                match entry.key_type {
+                    KeyType::Ed25519 => {
+                        if signing.is_none() {
+                            signing = Some(entry.private_key_multibase.clone());
+                        }
+                    }
+                    KeyType::X25519 => {
+                        if ka.is_none() {
+                            ka = Some(entry.private_key_multibase.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let signing = signing.ok_or("VTA bundle contains no Ed25519 signing key")?;
+            let ka = ka.ok_or("VTA bundle contains no X25519 key agreement key")?;
+
+            eprintln!("  VTA bundle decoded for DID: {}", bundle.did);
+            eprintln!("  Found {} secret(s)", bundle.secrets.len());
+
+            (signing, ka, vta_credential)
+        } else if let Some(signing) = signing_key {
+            let ka = ka_key.ok_or("--ka-key is required when using --signing-key")?;
+            (signing, ka, vta_credential)
+        } else {
+            return Err("provide either --vta-bundle or --signing-key + --ka-key".into());
+        };
+
+    // Validate keys by attempting to parse them
+    Secret::from_multibase(&resolved_signing, None)
+        .map_err(|e| format!("invalid signing key: {e}"))?;
+    Secret::from_multibase(&resolved_ka, None)
+        .map_err(|e| format!("invalid key agreement key: {e}"))?;
+
+    // Generate or validate JWT key
+    let resolved_jwt = match jwt_key {
+        Some(key) => {
+            Secret::from_multibase(&key, None)
+                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
+            key
+        }
+        None => {
+            eprintln!("  Generated JWT signing key.");
+            generate_ed25519_multibase()
+        }
+    };
+
+    let server_secrets = secret_store::ServerSecrets {
+        signing_key: resolved_signing,
+        key_agreement_key: resolved_ka,
+        jwt_signing_key: resolved_jwt,
+        vta_credential: resolved_vta_cred,
+    };
+
+    secret_store.set(&server_secrets).await?;
+
+    eprintln!();
+    eprintln!("  Secrets imported successfully!");
+    eprintln!();
+    if secret_store::is_plaintext_backend(&config.secrets) {
+        eprintln!("  WARNING: secrets stored in plaintext — not for production use.");
         eprintln!();
     }
 
