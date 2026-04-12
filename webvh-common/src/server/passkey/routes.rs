@@ -17,6 +17,7 @@ use crate::server::error::AppError;
 
 fn require_webauthn<S: PasskeyState>(state: &S) -> Result<&Webauthn, AppError> {
     state.webauthn().map(|w| w.as_ref()).ok_or_else(|| {
+        warn!("passkey request rejected: WebAuthn not configured (set public_url)");
         AppError::Authentication("passkey auth not configured (set public_url)".into())
     })
 }
@@ -219,6 +220,7 @@ pub async fn login_start<S: PasskeyState>(
     let all_passkeys = store::get_all_passkeys(sessions_ks).await?;
 
     if all_passkeys.is_empty() {
+        warn!("passkey login failed: no passkeys registered on this server");
         return Err(AppError::Authentication(
             "no passkeys registered on this server".into(),
         ));
