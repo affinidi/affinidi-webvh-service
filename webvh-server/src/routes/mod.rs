@@ -2,7 +2,7 @@ mod acl;
 mod auth;
 mod config;
 pub(crate) mod did_manage;
-mod did_public;
+pub mod did_public;
 mod didcomm;
 pub(crate) mod health;
 mod stats;
@@ -13,7 +13,10 @@ use axum::routing::{get, post, put};
 
 use crate::server::AppState;
 
-pub fn router(upload_body_limit: usize) -> Router<AppState> {
+/// Build the server router without the DID-serving fallback.
+///
+/// Used by the daemon to allow a combined fallback (DID serving + UI).
+pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
     // Upload routes with a custom body-size limit
     let upload_routes = Router::new()
         .route("/dids/{*mnemonic}", put(did_manage::upload_did))
@@ -78,8 +81,11 @@ pub fn router(upload_body_limit: usize) -> Router<AppState> {
             "/.well-known/did-witness.json",
             get(did_public::serve_root_witness),
         )
-        // Combined fallback: DID serving (no SPA - UI moved to webvh-control)
-        .fallback(did_public::serve_public)
+}
+
+/// Build the full server router with DID-serving fallback (standalone mode).
+pub fn router(upload_body_limit: usize) -> Router<AppState> {
+    router_without_fallback(upload_body_limit).fallback(did_public::serve_public)
 }
 
 #[cfg(feature = "metrics")]

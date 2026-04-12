@@ -1,6 +1,10 @@
 mod config;
 
+use axum::Extension;
 use axum::Router;
+use axum::extract::State;
+use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -82,10 +86,14 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Track what's enabled for the summary
     let mut enabled_services = Vec::new();
 
+    // Server AppState needed for the combined DID-serving fallback
+    let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
+
     // 1. Server (mounted at root — DID serving needs /)
     if config.enable.server {
         match build_server(&config, &secrets).await {
-            Ok((router, store)) => {
+            Ok((router, store, state)) => {
+                server_state = Some(state);
                 combined = combined.merge(router);
                 stores.push(store);
                 enabled_services.push("server (/)");
@@ -127,7 +135,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 4. Control plane (nested at /control)
+    // 4. Control plane (nested at /control, UI also served at /)
     if config.enable.control {
         match build_control(&config, &secrets).await {
             Ok((router, store)) => {
@@ -140,6 +148,26 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Combined fallback: try DID serving first, then UI static assets.
+    // When server is enabled, unmatched paths check for DID documents before
+    // falling through to the control plane UI. When only control is enabled,
+    // the fallback serves the UI directly.
+    #[cfg(feature = "ui")]
+    if let Some(state) = server_state {
+        combined = combined
+            .layer(Extension(Arc::new(state)))
+            .fallback(daemon_fallback_with_dids);
+    } else {
+        combined = combined.fallback(affinidi_webvh_control::frontend::static_handler);
+    }
+
+    #[cfg(not(feature = "ui"))]
+    if let Some(state) = server_state {
+        combined = combined
+            .layer(Extension(Arc::new(state)))
+            .fallback(daemon_fallback_dids_only);
     }
 
     // Apply tracing layer, then add health route *after* so it's not traced
@@ -191,10 +219,20 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 // ---------------------------------------------------------------------------
 
 type ServiceResult = Result<(Router, affinidi_webvh_common::server::store::Store), AppError>;
+type ServerServiceResult = Result<
+    (
+        Router,
+        affinidi_webvh_common::server::store::Store,
+        affinidi_webvh_server::server::AppState,
+    ),
+    AppError,
+>;
 
-async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServerServiceResult {
+    use affinidi_webvh_common::server::stats_collector::StatsCollector;
     use affinidi_webvh_server::server::AppState;
     use affinidi_webvh_server::store::Store;
+    use tracing::debug;
 
     let server_config = config.server_config();
     let upload_body_limit = server_config.limits.upload_body_limit;
@@ -203,9 +241,42 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> Service
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
+
+    // Integrity check on DID keyspace (matches standalone server behavior)
+    match dids_ks.verify_integrity().await {
+        Ok(0) => debug!("store integrity check passed"),
+        Ok(n) => warn!(
+            corrupted = n,
+            "store integrity check found corrupted entries"
+        ),
+        Err(e) => warn!(error = %e, "store integrity check failed"),
+    }
+
+    // Auto-bootstrap DIDs (root DID, server_did verification, DID listing)
+    let server_config = affinidi_webvh_server::server::auto_bootstrap_dids(
+        server_config,
+        &store,
+        &dids_ks,
+        secrets,
+    )
+    .await;
+
+    // Re-initialize DIDComm auth after bootstrap (server_did may have been set)
     let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
     let jwt_keys = init_jwt_keys(secrets);
     let signing_key_bytes = decode_signing_key(secrets);
+
+    // Initialize stats collector with actual DID count
+    let stats_collector = {
+        let collector = StatsCollector::new();
+        let total_dids = dids_ks
+            .prefix_iter_raw("did:")
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0) as u64;
+        collector.set_total_dids(total_dids);
+        Arc::new(collector)
+    };
 
     let state = AppState {
         store: store.clone(),
@@ -218,16 +289,18 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> Service
         jwt_keys,
         signing_key_bytes,
         http_client: reqwest::Client::new(),
-        stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
+        stats_collector: Some(stats_collector),
         did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
             std::time::Duration::from_secs(300),
         )),
     };
 
-    let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);
+    // Use router without fallback — daemon adds a combined DID + UI fallback
+    let router = affinidi_webvh_server::routes::router_without_fallback(upload_body_limit)
+        .with_state(state.clone());
     info!("server service initialized");
 
-    Ok((router, store))
+    Ok((router, store, state))
 }
 
 async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
@@ -629,4 +702,35 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Combined daemon fallback handlers
+// ---------------------------------------------------------------------------
+
+/// Fallback when both server and UI are enabled: try DID serving, then UI.
+#[cfg(feature = "ui")]
+async fn daemon_fallback_with_dids(
+    Extension(state): Extension<Arc<affinidi_webvh_server::server::AppState>>,
+    uri: Uri,
+) -> Response {
+    let resp = affinidi_webvh_server::routes::did_public::serve_public(
+        State((*state).clone()),
+        uri.clone(),
+    )
+    .await;
+    if resp.status() == StatusCode::NOT_FOUND {
+        // DID not found — try serving UI static assets
+        return affinidi_webvh_control::frontend::static_handler(uri).await;
+    }
+    resp
+}
+
+/// Fallback when server is enabled but UI is not: DID serving only.
+#[cfg(not(feature = "ui"))]
+async fn daemon_fallback_dids_only(
+    Extension(state): Extension<Arc<affinidi_webvh_server::server::AppState>>,
+    uri: Uri,
+) -> Response {
+    affinidi_webvh_server::routes::did_public::serve_public(State((*state).clone()), uri).await
 }

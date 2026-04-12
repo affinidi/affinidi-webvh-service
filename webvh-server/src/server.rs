@@ -671,7 +671,7 @@ fn mnemonic_from_did(did: &str) -> Option<String> {
     Some(mnemonic)
 }
 
-async fn auto_bootstrap_dids(
+pub async fn auto_bootstrap_dids(
     mut config: AppConfig,
     store: &Store,
     dids_ks: &KeyspaceHandle,
