@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.0 (2026-04-12)
+
+### Added
+
+- **Daemon CLI commands**: `add-acl`, `list-acl`, `remove-acl`, `invite`
+  (passkey enrollment), and `import-secrets` — full management without
+  needing standalone binaries
+- **Deployment mode indicator**: Dashboard shows "Daemon" badge and hides
+  the service topology panel (irrelevant when all services are in-process)
+- **Background tasks in daemon**: Session cleanup, stats flushing (10s),
+  and time-series bucket cleanup (1h) — stats now persist across restarts
+- **Auto-rebuild UI assets**: `build.rs` detects stale `dist/` and runs
+  `npm run build:web` automatically during `cargo build`
+- **Shared CLI module** (`webvh-common::server::cli`): ACL and passkey
+  invite logic consolidated into one place, used by all 4 binaries
+
+### Changed
+
+- **Daemon store layout** (breaking): Consolidated from 4 separate stores
+  (`server_store`, `control_store`, `watcher_store`, `witness_store`) to 2
+  (`store` for primary, `witness_store` for witness). Config must be updated.
+- **Daemon routing**: Control plane merged at root so the UI's `/api/`
+  requests work without path prefix issues. Server contributes only
+  public DID-serving routes (`.well-known` + fallback).
+- **Shared task functions**: `flush_stats_to_store` and `cleanup_old_buckets`
+  moved from `webvh-control` to `webvh-common::server::tasks` for reuse
+- **Feature flag control**: Daemon sub-crate dependencies use
+  `default-features = false` so `--no-default-features` works correctly
+- **`/api/health` route**: Moved into the control plane router (was
+  registered ad-hoc in `server.rs`, missing in daemon mode)
+
+### Fixed
+
+- DID resolution in daemon mode (server and control now share one store)
+- Passkey login returning "authentication failed" silently — added warn
+  logging to `require_webauthn` and empty-passkeys checks
+- UI returning "Expected JSON but got text/html" — API routes now reachable
+  at `/api/` in daemon mode
+- Daemon fallback using `Extension` which axum doesn't apply to fallback
+  handlers — replaced with closure capture
+- Stats collector not seeded on daemon restart — dashboard totals now
+  match per-DID sums after restart
+- `Role::from_str` changed to `FromStr` trait impl (clippy)
+- All clippy warnings resolved across workspace
+
 ## 0.2.0 (2026-04-12)
 
 ### Added
