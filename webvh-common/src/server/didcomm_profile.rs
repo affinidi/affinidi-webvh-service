@@ -121,9 +121,10 @@ pub async fn resolve_mediator_did(
     };
 
     // Find the DIDCommMessaging service
-    let service = doc.service.iter().find(|s| {
-        s.type_.iter().any(|t| t == "DIDCommMessaging")
-    })?;
+    let service = doc
+        .service
+        .iter()
+        .find(|s| s.type_.iter().any(|t| t == "DIDCommMessaging"))?;
 
     // Extract the URI from the service endpoint
     let uri = service.service_endpoint.get_uri()?;

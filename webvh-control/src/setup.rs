@@ -178,7 +178,7 @@ pub async fn run_setup() -> Result<(), AppError> {
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
-        .items(&log_levels)
+        .items(log_levels)
         .default(0)
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
@@ -187,7 +187,7 @@ pub async fn run_setup() -> Result<(), AppError> {
     let log_formats = ["text", "json"];
     let log_format_idx = Select::new()
         .with_prompt("Log format")
-        .items(&log_formats)
+        .items(log_formats)
         .default(0)
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
@@ -225,6 +225,7 @@ pub async fn run_setup() -> Result<(), AppError> {
         features: FeaturesConfig {
             didcomm: false,
             rest_api: true,
+            ..Default::default()
         },
         server_did: Some(did_result.did.clone()),
         mediator_did,
@@ -325,9 +326,7 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
     eprintln!("  Next steps:");
     eprintln!("    1. Set up webvh-server (if not already done)");
-    eprintln!(
-        "    2. Import this DID on the server:"
-    );
+    eprintln!("    2. Import this DID on the server:");
     eprintln!(
         "       webvh-server bootstrap-did --path {} --did-log control-did.jsonl",
         did_path
@@ -340,6 +339,7 @@ pub async fn run_setup() -> Result<(), AppError> {
 }
 
 /// Prompt for secrets backend selection and configuration.
+#[allow(clippy::vec_init_then_push)]
 fn configure_secrets() -> Result<SecretsConfig, AppError> {
     #[allow(unused_mut)]
     let mut backends: Vec<&str> = Vec::new();

@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-webvh-common"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-secrets-resolver",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-webvh-control"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-webvh-daemon"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk",
@@ -542,12 +542,13 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vta-sdk",
  "webauthn-rs",
 ]
 
 [[package]]
 name = "affinidi-webvh-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -604,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-webvh-watcher"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-webvh-common",
  "axum",
@@ -623,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-webvh-witness"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "affinidi-data-integrity 0.3.6",
  "affinidi-did-resolver-cache-sdk",

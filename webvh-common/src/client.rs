@@ -31,7 +31,11 @@ impl WebVHClient {
     ///
     /// On success the client stores the access token internally so that
     /// subsequent calls to authenticated endpoints will work automatically.
-    pub async fn authenticate(&mut self, did: &str, secret: &Secret) -> Result<AuthenticateResponse> {
+    pub async fn authenticate(
+        &mut self,
+        did: &str,
+        secret: &Secret,
+    ) -> Result<AuthenticateResponse> {
         // 1. Extract private key bytes for signing
         let private_key_bytes: [u8; 32] = secret
             .get_private_bytes()
@@ -180,11 +184,7 @@ impl WebVHClient {
     ///
     /// This combines `request_uri` + DID doc building + log creation +
     /// `upload_did` into a single call.
-    pub async fn create_did(
-        &self,
-        secret: &Secret,
-        path: Option<&str>,
-    ) -> Result<CreateDidResult> {
+    pub async fn create_did(&self, secret: &Secret, path: Option<&str>) -> Result<CreateDidResult> {
         let create_resp = self.request_uri(path).await?;
 
         let host = encode_host(&self.server_url)?;
@@ -192,8 +192,12 @@ impl WebVHClient {
             .get_public_keymultibase()
             .map_err(|e| WebVHError::DIDComm(format!("failed to get public key: {e}")))?;
 
-        let did_doc =
-            build_did_document(&host, &create_resp.mnemonic, &public_key_multibase, &Default::default());
+        let did_doc = build_did_document(
+            &host,
+            &create_resp.mnemonic,
+            &public_key_multibase,
+            &Default::default(),
+        );
         let (scid, jsonl) = create_log_entry(&did_doc, secret).await?;
 
         self.upload_did(&create_resp.mnemonic, &jsonl).await?;

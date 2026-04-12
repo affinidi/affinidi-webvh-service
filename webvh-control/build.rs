@@ -12,10 +12,14 @@ fn main() {
     let enabled_count = store_features.iter().filter(|&&f| f).count();
 
     if enabled_count == 0 {
-        println!("cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb");
+        println!(
+            "cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb"
+        );
     }
     if enabled_count > 1 {
-        println!("cargo:warning=Multiple storage backend features enabled — only one will be used at runtime.");
+        println!(
+            "cargo:warning=Multiple storage backend features enabled — only one will be used at runtime."
+        );
     }
 
     // ---- Secret store feature-gate validation ----
@@ -62,8 +66,17 @@ fn build_ui() {
         }
     }
 
-    // Skip build if dist already exists (CI / pre-built)
-    if dist_dir.join("index.html").exists() {
+    // Rebuild if dist is missing or stale (any tracked source file is newer)
+    let needs_build = if let Ok(dist_meta) = std::fs::metadata(dist_dir.join("index.html")) {
+        let dist_mtime = dist_meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        any_source_newer(ui_dir, dist_mtime)
+    } else {
+        true // dist doesn't exist
+    };
+
+    if !needs_build {
         return;
     }
 
@@ -86,6 +99,52 @@ fn run_npm(cwd: &Path, args: &[&str]) {
     if !status.success() {
         panic!("npm {} failed with {status}", args.join(" "));
     }
+}
+
+/// Returns true if any source file under the UI dirs is newer than `threshold`.
+#[cfg(feature = "ui")]
+fn any_source_newer(ui_dir: &Path, threshold: std::time::SystemTime) -> bool {
+    for dir_name in &["app", "components", "lib"] {
+        let path = ui_dir.join(dir_name);
+        if path.is_dir() && dir_has_newer(&path, threshold) {
+            return true;
+        }
+    }
+    for file in &["package.json", "tsconfig.json", "app.json"] {
+        let path = ui_dir.join(file);
+        if let Ok(meta) = std::fs::metadata(&path)
+            && let Ok(mtime) = meta.modified()
+            && mtime > threshold
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "ui")]
+fn dir_has_newer(dir: &Path, threshold: std::time::SystemTime) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if dir_has_newer(&path, threshold) {
+                return true;
+            }
+        } else if let Ok(meta) = std::fs::metadata(&path)
+            && let Ok(mtime) = meta.modified()
+            && mtime > threshold
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(feature = "ui")]

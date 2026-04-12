@@ -8,8 +8,8 @@
 
 use std::future::Future;
 
-use affinidi_webvh_common::did_ops::{self, DidRecord};
 use affinidi_webvh_common::DidSyncUpdate;
+use affinidi_webvh_common::did_ops::{self, DidRecord};
 use tracing::{info, warn};
 
 use crate::messaging;
@@ -41,10 +41,7 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
         };
 
         // Read the DID record
-        let record = match dids_ks
-            .get::<DidRecord>(did_ops::did_key(&mnemonic))
-            .await
-        {
+        let record = match dids_ks.get::<DidRecord>(did_ops::did_key(&mnemonic)).await {
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
@@ -54,10 +51,7 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
         };
 
         // Read log content
-        let log_content = match dids_ks
-            .get_raw(did_ops::content_log_key(&mnemonic))
-            .await
-        {
+        let log_content = match dids_ks.get_raw(did_ops::content_log_key(&mnemonic)).await {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => {
@@ -103,8 +97,7 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
         let servers: Vec<_> = instances
             .into_iter()
             .filter(|i| {
-                i.service_type == ServiceType::Server
-                    && i.status == registry::ServiceStatus::Active
+                i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
             })
             .collect();
 
@@ -175,8 +168,7 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
         let servers: Vec<_> = instances
             .into_iter()
             .filter(|i| {
-                i.service_type == ServiceType::Server
-                    && i.status == registry::ServiceStatus::Active
+                i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
             })
             .collect();
 
@@ -219,10 +211,7 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
 ///
 /// Retries up to `max_retries` times with 2s, 4s, 8s... backoff.
 /// Returns the last error if all attempts fail.
-async fn send_with_retry<F, Fut, E>(
-    make_future: F,
-    max_retries: u32,
-) -> Result<(), E>
+async fn send_with_retry<F, Fut, E>(make_future: F, max_retries: u32) -> Result<(), E>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<(), E>>,

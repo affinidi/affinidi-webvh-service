@@ -1,10 +1,15 @@
-use clap::{Parser, Subcommand};
 use affinidi_webvh_control::config::AppConfig;
-use affinidi_webvh_control::{health, server, setup, store, secret_store};
+use affinidi_webvh_control::{health, secret_store, server, setup, store};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser)]
-#[command(name = "webvh-control", about = "WebVH Control Plane — Unified Management", version)]
+#[command(
+    name = "webvh-control",
+    about = "WebVH Control Plane — Unified Management",
+    version
+)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, global = true)]
@@ -91,7 +96,11 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Invite { did, role, ttl_hours }) => {
+        Some(Command::Invite {
+            did,
+            role,
+            ttl_hours,
+        }) => {
             if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -197,9 +206,7 @@ async fn run_add_acl(
     Ok(())
 }
 
-async fn run_list_acl(
-    config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_webvh_control::acl::list_acl_entries;
 
     let config = AppConfig::load(config_path)?;
@@ -216,18 +223,12 @@ async fn run_list_acl(
     }
 
     eprintln!();
-    eprintln!(
-        "  {:<50} {:<8} {}",
-        "DID", "ROLE", "LABEL"
-    );
+    eprintln!("  {:<50} {:<8} {}", "DID", "ROLE", "LABEL");
     eprintln!("  {}", "-".repeat(80));
 
     for entry in &entries {
         let label = entry.label.as_deref().unwrap_or("-");
-        eprintln!(
-            "  {:<50} {:<8} {}",
-            entry.did, entry.role, label
-        );
+        eprintln!("  {:<50} {:<8} {}", entry.did, entry.role, label);
     }
 
     eprintln!();
@@ -292,7 +293,8 @@ async fn run_invite(
     let store = store::Store::open(&config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
 
-    let resp = create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
+    let resp =
+        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
 
     eprintln!();
     eprintln!("  Enrollment invite created!");

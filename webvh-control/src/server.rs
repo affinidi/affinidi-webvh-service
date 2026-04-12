@@ -10,8 +10,8 @@ use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
-use axum::routing::get;
 use affinidi_webvh_common::server::passkey::PasskeyState;
+use axum::routing::get;
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
@@ -109,11 +109,7 @@ impl PasskeyState for AppState {
     }
 }
 
-pub async fn run(
-    config: AppConfig,
-    store: Store,
-    secrets: ServerSecrets,
-) -> Result<(), AppError> {
+pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -128,21 +124,18 @@ pub async fn run(
     let jwt_keys = init_jwt_keys(&secrets);
 
     // Initialize WebAuthn for passkeys
-    let webauthn = config
-        .public_url
-        .as_ref()
-        .and_then(|url| {
-            match affinidi_webvh_common::server::passkey::build_webauthn(url) {
-                Ok(w) => {
-                    info!("WebAuthn (passkey) auth enabled");
-                    Some(Arc::new(w))
-                }
-                Err(e) => {
-                    warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
-                    None
-                }
+    let webauthn = config.public_url.as_ref().and_then(|url| {
+        match affinidi_webvh_common::server::passkey::build_webauthn(url) {
+            Ok(w) => {
+                info!("WebAuthn (passkey) auth enabled");
+                Some(Arc::new(w))
             }
-        });
+            Err(e) => {
+                warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
+                None
+            }
+        }
+    });
 
     // Bind TCP listener on the main thread
     let std_listener = if config.features.rest_api {
@@ -178,7 +171,7 @@ pub async fn run(
         atm: None,
         atm_profile: None,
         stats_collector: {
-            use affinidi_webvh_common::server::stats_collector::{StatsCollector, StatsAggregate};
+            use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
             let collector = StatsCollector::new();
             // Seed aggregate from stored per-DID stats
             let mut total_resolves = 0u64;
@@ -187,7 +180,8 @@ pub async fn run(
             let mut last_updated_at: Option<u64> = None;
             if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
                 for (_key, value) in raw {
-                    if let Ok(s) = serde_json::from_slice::<affinidi_webvh_common::DidStats>(&value) {
+                    if let Ok(s) = serde_json::from_slice::<affinidi_webvh_common::DidStats>(&value)
+                    {
                         total_resolves += s.total_resolves;
                         total_updates += s.total_updates;
                         last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
@@ -201,7 +195,11 @@ pub async fn run(
                     }
                 }
             }
-            let total_dids = stats_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
+            let total_dids = stats_dids_ks
+                .prefix_iter_raw("did:")
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0) as u64;
             collector.seed_aggregate(&StatsAggregate {
                 total_dids,
                 total_resolves,
@@ -209,7 +207,10 @@ pub async fn run(
                 last_resolved_at,
                 last_updated_at,
             });
-            info!(total_dids, total_resolves, total_updates, "stats collector seeded from store");
+            info!(
+                total_dids,
+                total_resolves, total_updates, "stats collector seeded from store"
+            );
             Arc::new(collector)
         },
         stats_ks: stats_ks.clone(),
@@ -302,7 +303,6 @@ pub async fn run(
                 has_auth,
                 storage_http,
                 storage_collector,
-
                 &mut storage_shutdown,
             )
         })
@@ -509,7 +509,9 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
+            .layer(axum::middleware::from_fn(
+                affinidi_webvh_common::server::security_headers,
+            ))
             .route("/api/health", get(routes::health::health));
 
         let _ = ready_tx.send(());
@@ -619,10 +621,8 @@ async fn flush_stats_to_store(
     let mut batch = store.batch();
     for d in &deltas {
         let key = format!("stats:{}", d.mnemonic);
-        let mut stats: affinidi_webvh_common::DidStats = stats_ks
-            .get(key.as_str())
-            .await?
-            .unwrap_or_default();
+        let mut stats: affinidi_webvh_common::DidStats =
+            stats_ks.get(key.as_str()).await?.unwrap_or_default();
         stats.total_resolves += d.resolve_delta;
         stats.total_updates += d.update_delta;
         if let Some(t) = d.last_resolved_at {
@@ -676,7 +676,8 @@ async fn run_health_checks(
                     "instance status changed"
                 );
             }
-            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now).await?;
+            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now)
+                .await?;
         }
     }
     Ok(())
@@ -708,10 +709,7 @@ fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
 async fn init_didcomm_auth(
     config: &AppConfig,
     secrets: &ServerSecrets,
-) -> (
-    Option<DIDCacheClient>,
-    Option<Arc<ThreadedSecretsResolver>>,
-) {
+) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let server_did = match &config.server_did {

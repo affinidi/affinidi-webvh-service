@@ -4,10 +4,10 @@ use axum::Json;
 use axum::extract::State;
 use tracing::{info, warn};
 
-use affinidi_webvh_common::{ChallengeRequest, ChallengeResponse, ChallengeData};
 use affinidi_webvh_common::server::auth::constant_time_eq;
+use affinidi_webvh_common::{ChallengeData, ChallengeRequest, ChallengeResponse};
 
-use crate::auth::session::{self, SessionState, Session, now_epoch};
+use crate::auth::session::{self, Session, SessionState, now_epoch};
 use crate::error::AppError;
 use crate::server::AppState;
 
@@ -42,7 +42,10 @@ pub async fn challenge(
     }
 
     let challenge_bytes = rand::random::<[u8; 32]>();
-    let challenge = challenge_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let challenge = challenge_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let session = Session {
@@ -105,7 +108,9 @@ pub async fn authenticate(
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
     if session.state != SessionState::ChallengeSent {
-        return Err(AppError::Authentication("session already authenticated".into()));
+        return Err(AppError::Authentication(
+            "session already authenticated".into(),
+        ));
     }
     if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
         warn!(session_id, "authentication rejected: challenge mismatch");
@@ -174,10 +179,9 @@ pub async fn refresh(
 
     let refresh_token = body.trim().trim_matches('"');
 
-    let session_id =
-        session::get_session_by_refresh(&state.sessions_ks, refresh_token)
-            .await?
-            .ok_or_else(|| AppError::Authentication("invalid refresh token".into()))?;
+    let session_id = session::get_session_by_refresh(&state.sessions_ks, refresh_token)
+        .await?
+        .ok_or_else(|| AppError::Authentication("invalid refresh token".into()))?;
 
     let session = session::get_session(&state.sessions_ks, &session_id)
         .await?
@@ -190,11 +194,11 @@ pub async fn refresh(
     }
 
     // Check refresh token hasn't expired
-    if let Some(expires_at) = session.refresh_expires_at {
-        if now_epoch() > expires_at {
-            session::delete_session(&state.sessions_ks, &session_id).await?;
-            return Err(AppError::Authentication("refresh token expired".into()));
-        }
+    if let Some(expires_at) = session.refresh_expires_at
+        && now_epoch() > expires_at
+    {
+        session::delete_session(&state.sessions_ks, &session_id).await?;
+        return Err(AppError::Authentication("refresh token expired".into()));
     }
 
     // Invalidate the old session to prevent refresh token reuse

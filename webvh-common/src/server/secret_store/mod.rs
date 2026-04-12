@@ -88,7 +88,10 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
 /// 3. OS keyring (if `keyring` compiled — the default)
 /// 4. Plaintext in config file (fallback when no secure backend is available)
 #[allow(unused_variables)]
-pub fn create_secret_store(secrets: &SecretsConfig, config_path: &std::path::Path) -> Result<Box<dyn SecretStore>, AppError> {
+pub fn create_secret_store(
+    secrets: &SecretsConfig,
+    config_path: &std::path::Path,
+) -> Result<Box<dyn SecretStore>, AppError> {
     #[cfg(feature = "aws-secrets")]
     if secrets.aws_secret_name.is_some() {
         let store = AwsSecretStore::new(
@@ -111,8 +114,7 @@ pub fn create_secret_store(secrets: &SecretsConfig, config_path: &std::path::Pat
 
     #[cfg(feature = "keyring")]
     {
-        let store =
-            KeyringSecretStore::new(&secrets.keyring_service, "server_secrets");
+        let store = KeyringSecretStore::new(&secrets.keyring_service, "server_secrets");
         return Ok(Box::new(store));
     }
 

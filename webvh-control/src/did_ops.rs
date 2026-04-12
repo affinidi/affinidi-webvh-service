@@ -219,9 +219,8 @@ pub async fn upload_witness(
         ));
     }
 
-    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
-        AppError::Validation(format!("did-witness.json must be valid JSON: {e}"))
-    })?;
+    serde_json::from_str::<serde_json::Value>(witness_content)
+        .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
 
     state
         .dids_ks
@@ -294,8 +293,7 @@ pub async fn get_raw_log(
         .await?
         .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
 
-    String::from_utf8(bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
+    String::from_utf8(bytes).map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
 }
 
 /// List DIDs owned by the caller (or by a specific owner if admin).
@@ -327,6 +325,9 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            let stats_key = format!("stats:{mnemonic}");
+            let did_stats: affinidi_webvh_common::DidStats =
+                state.stats_ks.get(stats_key).await?.unwrap_or_default();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -334,7 +335,7 @@ pub async fn list_dids(
                 updated_at: record.updated_at,
                 version_count: record.version_count,
                 did_id: record.did_id,
-                total_resolves: 0, // control plane doesn't track resolves
+                total_resolves: did_stats.total_resolves,
                 disabled: record.disabled,
             });
         }
@@ -361,6 +362,9 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             Ok(r) => r,
             Err(_) => continue,
         };
+        let stats_key = format!("stats:{}", record.mnemonic);
+        let did_stats: affinidi_webvh_common::DidStats =
+            state.stats_ks.get(stats_key).await?.unwrap_or_default();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -368,12 +372,15 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             updated_at: record.updated_at,
             version_count: record.version_count,
             did_id: record.did_id,
-            total_resolves: 0,
+            total_resolves: did_stats.total_resolves,
             disabled: record.disabled,
         });
     }
 
-    info!(count = entries.len(), "all DIDs listed (admin) on control plane");
+    info!(
+        count = entries.len(),
+        "all DIDs listed (admin) on control plane"
+    );
 
     Ok(entries)
 }
@@ -482,10 +489,7 @@ pub async fn rollback_did(
 }
 
 /// Check if a custom path is available.
-pub async fn check_name(
-    state: &AppState,
-    path: &str,
-) -> Result<CheckNameResponse, AppError> {
+pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameResponse, AppError> {
     validate_custom_path(path)?;
     let available = is_path_available(&state.dids_ks, path).await?;
     Ok(CheckNameResponse {

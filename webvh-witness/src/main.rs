@@ -1,7 +1,8 @@
-use clap::{Parser, Subcommand};
 use affinidi_webvh_witness::config::AppConfig;
 use affinidi_webvh_witness::{health, secret_store, server, setup, store, witness_ops};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "webvh-witness", about = "WebVH Witness Node", version)]
@@ -157,9 +158,7 @@ async fn run_add_acl(
     Ok(())
 }
 
-async fn run_list_acl(
-    config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_webvh_witness::acl::list_acl_entries;
 
     let config = AppConfig::load(config_path)?;
@@ -176,18 +175,12 @@ async fn run_list_acl(
     }
 
     eprintln!();
-    eprintln!(
-        "  {:<50} {:<8} {}",
-        "DID", "ROLE", "LABEL"
-    );
+    eprintln!("  {:<50} {:<8} {}", "DID", "ROLE", "LABEL");
     eprintln!("  {}", "-".repeat(80));
 
     for entry in &entries {
         let label = entry.label.as_deref().unwrap_or("-");
-        eprintln!(
-            "  {:<50} {:<8} {}",
-            entry.did, entry.role, label
-        );
+        eprintln!("  {:<50} {:<8} {}", entry.did, entry.role, label);
     }
 
     eprintln!();

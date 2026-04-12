@@ -2,9 +2,7 @@ use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub use affinidi_webvh_common::server::config::{
-    LogConfig, LogFormat, ServerConfig, StoreConfig,
-};
+pub use affinidi_webvh_common::server::config::{LogConfig, LogFormat, ServerConfig, StoreConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {

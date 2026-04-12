@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, Delete, KeySchemaElement, KeyType, Put, ProvisionedThroughput,
+    AttributeValue, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put,
     ScalarAttributeType, TransactWriteItem,
 };
-use aws_sdk_dynamodb::Client;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -37,8 +37,7 @@ impl DynamoDbBackend {
 
         let mut aws_config_loader = aws_config::from_env();
         if let Some(ref region) = config.dynamodb_region {
-            aws_config_loader =
-                aws_config_loader.region(aws_config::Region::new(region.clone()));
+            aws_config_loader = aws_config_loader.region(aws_config::Region::new(region.clone()));
         }
         let aws_config = aws_config_loader.load().await;
         let client = Client::new(&aws_config);
@@ -336,9 +335,7 @@ impl BatchOps for DynamoDbBatch {
                                 .item(PK_ATTR, AttributeValue::B(Blob::new(key.clone())))
                                 .item(VAL_ATTR, AttributeValue::B(Blob::new(value.clone())))
                                 .build()
-                                .map_err(|e| {
-                                    AppError::Store(format!("dynamodb put build: {e}"))
-                                })?;
+                                .map_err(|e| AppError::Store(format!("dynamodb put build: {e}")))?;
                             items.push(TransactWriteItem::builder().put(put).build());
                         }
                         DynamoDbBatchOp::Remove { table, key } => {

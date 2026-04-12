@@ -15,8 +15,7 @@ pub fn router() -> Router<AppState> {
         .route("/delete", post(sync::receive_delete))
         .layer(DefaultBodyLimit::max(256 * 1024)); // 256 KB
 
-    let api = Router::new()
-        .nest("/sync", sync_routes);
+    let api = Router::new().nest("/sync", sync_routes);
 
     Router::new()
         .nest("/api", api)

@@ -8,10 +8,10 @@ pub mod health;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mnemonic;
-pub mod stats_collector;
 #[cfg(feature = "passkey")]
 pub mod passkey;
 pub mod secret_store;
+pub mod stats_collector;
 pub mod store;
 pub mod vta_setup;
 

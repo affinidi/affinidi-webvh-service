@@ -64,9 +64,11 @@ impl super::SecretStore for KeyringSecretStore {
         let user = self.user.clone();
         let json_str = match serde_json::to_string(secrets) {
             Ok(s) => s,
-            Err(e) => return Box::pin(async move {
-                Err(AppError::Internal(format!("secrets serialization: {e}")))
-            }),
+            Err(e) => {
+                return Box::pin(async move {
+                    Err(AppError::Internal(format!("secrets serialization: {e}")))
+                });
+            }
         };
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
