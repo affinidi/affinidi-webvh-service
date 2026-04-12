@@ -21,11 +21,49 @@ keyring = [
   "affinidi-webvh-witness/keyring",
   "affinidi-webvh-control/keyring",
 ]
+aws-secrets = [
+  "affinidi-webvh-server/aws-secrets",
+  "affinidi-webvh-witness/aws-secrets",
+  "affinidi-webvh-control/aws-secrets",
+]
+gcp-secrets = [
+  "affinidi-webvh-server/gcp-secrets",
+  "affinidi-webvh-witness/gcp-secrets",
+  "affinidi-webvh-control/gcp-secrets",
+]
+metrics = [
+  "affinidi-webvh-server/metrics",
+  "affinidi-webvh-control/metrics",
+]
 store-fjall = [
   "affinidi-webvh-server/store-fjall",
   "affinidi-webvh-witness/store-fjall",
   "affinidi-webvh-watcher/store-fjall",
   "affinidi-webvh-control/store-fjall",
+]
+store-redis = [
+  "affinidi-webvh-server/store-redis",
+  "affinidi-webvh-witness/store-redis",
+  "affinidi-webvh-watcher/store-redis",
+  "affinidi-webvh-control/store-redis",
+]
+store-dynamodb = [
+  "affinidi-webvh-server/store-dynamodb",
+  "affinidi-webvh-witness/store-dynamodb",
+  "affinidi-webvh-watcher/store-dynamodb",
+  "affinidi-webvh-control/store-dynamodb",
+]
+store-firestore = [
+  "affinidi-webvh-server/store-firestore",
+  "affinidi-webvh-witness/store-firestore",
+  "affinidi-webvh-watcher/store-firestore",
+  "affinidi-webvh-control/store-firestore",
+]
+store-cosmosdb = [
+  "affinidi-webvh-server/store-cosmosdb",
+  "affinidi-webvh-witness/store-cosmosdb",
+  "affinidi-webvh-watcher/store-cosmosdb",
+  "affinidi-webvh-control/store-cosmosdb",
 ]
 
 [[bin]]
