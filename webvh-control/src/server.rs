@@ -11,7 +11,6 @@ use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
 use affinidi_webvh_common::server::passkey::PasskeyState;
-use axum::routing::get;
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
@@ -513,8 +512,7 @@ fn run_rest_thread(
             )
             .layer(axum::middleware::from_fn(
                 affinidi_webvh_common::server::security_headers,
-            ))
-            .route("/api/health", get(routes::health::health));
+            ));
 
         let _ = ready_tx.send(());
 

@@ -107,7 +107,9 @@ pub fn router_without_fallback() -> Router<AppState> {
         .merge(upload_routes);
 
     #[allow(unused_mut)]
-    let mut router = Router::new().nest("/api", api);
+    let mut router = Router::new()
+        .nest("/api", api)
+        .route("/api/health", get(health::health));
 
     // Prometheus metrics endpoint (only when metrics feature is enabled)
     #[cfg(feature = "metrics")]
