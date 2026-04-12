@@ -1,6 +1,5 @@
 mod config;
 
-use axum::Extension;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
@@ -258,20 +257,27 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // When server is enabled, unmatched paths check for DID documents before
     // falling through to the control plane UI. When only control is enabled,
     // the fallback serves the UI directly.
+    //
+    // We capture the server AppState in a closure rather than using Extension,
+    // because axum layers don't apply to fallback handlers.
     #[cfg(feature = "ui")]
     if let Some(state) = server_state {
-        combined = combined
-            .layer(Extension(Arc::new(state)))
-            .fallback(daemon_fallback_with_dids);
+        let state = Arc::new(state);
+        combined = combined.fallback(move |uri: Uri| {
+            let state = state.clone();
+            async move { daemon_fallback_with_dids(state, uri).await }
+        });
     } else {
         combined = combined.fallback(affinidi_webvh_control::frontend::static_handler);
     }
 
     #[cfg(not(feature = "ui"))]
     if let Some(state) = server_state {
-        combined = combined
-            .layer(Extension(Arc::new(state)))
-            .fallback(daemon_fallback_dids_only);
+        let state = Arc::new(state);
+        combined = combined.fallback(move |uri: Uri| {
+            let state = state.clone();
+            async move { daemon_fallback_dids_only(state, uri).await }
+        });
     }
 
     // Apply tracing layer, then add health route *after* so it's not traced
@@ -995,7 +1001,7 @@ fn print_banner() {
 /// Fallback when both server and UI are enabled: try DID serving, then UI.
 #[cfg(feature = "ui")]
 async fn daemon_fallback_with_dids(
-    Extension(state): Extension<Arc<affinidi_webvh_server::server::AppState>>,
+    state: Arc<affinidi_webvh_server::server::AppState>,
     uri: Uri,
 ) -> Response {
     let resp = affinidi_webvh_server::routes::did_public::serve_public(
@@ -1013,7 +1019,7 @@ async fn daemon_fallback_with_dids(
 /// Fallback when server is enabled but UI is not: DID serving only.
 #[cfg(not(feature = "ui"))]
 async fn daemon_fallback_dids_only(
-    Extension(state): Extension<Arc<affinidi_webvh_server::server::AppState>>,
+    state: Arc<affinidi_webvh_server::server::AppState>,
     uri: Uri,
 ) -> Response {
     affinidi_webvh_server::routes::did_public::serve_public(State((*state).clone()), uri).await
