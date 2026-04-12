@@ -192,11 +192,31 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Server AppState needed for the combined DID-serving fallback
     let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
 
-    // 1. Server (public DID-serving routes only — .well-known + fallback)
-    //    In daemon mode the control plane handles all /api/ management routes,
-    //    so the server only contributes public DID resolution.
+    // Control plane's DID keyspace — shared with the server so that DIDs created
+    // via the control plane API are immediately resolvable via public DID paths.
+    let mut control_dids_ks: Option<affinidi_webvh_common::server::store::KeyspaceHandle> = None;
+
+    // 1. Control plane (merged at root so /api/ routes are accessible to the UI)
+    //    Built first because server DID resolution reads from the control store.
+    if config.enable.control {
+        match build_control(&config, &secrets).await {
+            Ok((router, store, dids_ks)) => {
+                control_dids_ks = Some(dids_ks);
+                combined = combined.merge(router);
+                stores.push(store);
+                enabled_services.push("control (/)");
+            }
+            Err(e) => {
+                error!("failed to initialize control plane: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 2. Server (public DID-serving routes only — .well-known + fallback)
+    //    Uses the control plane's dids_ks so DIDs created via the UI are resolvable.
     if config.enable.server {
-        match build_server(&config, &secrets).await {
+        match build_server(&config, &secrets, control_dids_ks.clone()).await {
             Ok((router, store, state)) => {
                 server_state = Some(state);
                 combined = combined.merge(router);
@@ -210,7 +230,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 2. Witness (nested at /witness)
+    // 3. Witness (nested at /witness)
     if config.enable.witness {
         match build_witness(&config, &secrets).await {
             Ok((router, store)) => {
@@ -225,7 +245,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 3. Watcher (nested at /watcher)
+    // 4. Watcher (nested at /watcher)
     if config.enable.watcher {
         match build_watcher(&config).await {
             Ok((router, store)) => {
@@ -235,21 +255,6 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
             }
             Err(e) => {
                 error!("failed to initialize watcher: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // 4. Control plane (merged at root so /api/ routes are accessible to the UI)
-    if config.enable.control {
-        match build_control(&config, &secrets).await {
-            Ok((router, store)) => {
-                combined = combined.merge(router);
-                stores.push(store);
-                enabled_services.push("control (/)");
-            }
-            Err(e) => {
-                error!("failed to initialize control plane: {e}");
                 std::process::exit(1);
             }
         }
@@ -340,7 +345,11 @@ type ServerServiceResult = Result<
     AppError,
 >;
 
-async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServerServiceResult {
+async fn build_server(
+    config: &DaemonConfig,
+    secrets: &ServerSecrets,
+    control_dids_ks: Option<affinidi_webvh_common::server::store::KeyspaceHandle>,
+) -> ServerServiceResult {
     use affinidi_webvh_common::server::stats_collector::StatsCollector;
     use affinidi_webvh_server::server::AppState;
     use affinidi_webvh_server::store::Store;
@@ -351,7 +360,17 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServerS
     let store = Store::open(&server_config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
-    let dids_ks = store.keyspace("dids")?;
+
+    // Use the control plane's dids_ks when available — DIDs created via the
+    // control plane API are stored there, and the server needs to resolve them.
+    // Falls back to the server's own dids keyspace if control is disabled.
+    let dids_ks = match control_dids_ks {
+        Some(ks) => {
+            info!("server using control plane DID store for resolution");
+            ks
+        }
+        None => store.keyspace("dids")?,
+    };
 
     // Integrity check on DID keyspace (matches standalone server behavior)
     match dids_ks.verify_integrity().await {
@@ -467,7 +486,17 @@ async fn build_watcher(config: &DaemonConfig) -> ServiceResult {
     Ok((router, store))
 }
 
-async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_control(
+    config: &DaemonConfig,
+    secrets: &ServerSecrets,
+) -> Result<
+    (
+        Router,
+        affinidi_webvh_common::server::store::Store,
+        affinidi_webvh_common::server::store::KeyspaceHandle,
+    ),
+    AppError,
+> {
     use affinidi_webvh_control::server::AppState;
     use affinidi_webvh_control::store::Store;
 
@@ -501,7 +530,7 @@ async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
         sessions_ks,
         acl_ks,
         registry_ks,
-        dids_ks,
+        dids_ks: dids_ks.clone(),
         config: Arc::new(control_config),
         did_resolver,
         secrets_resolver,
@@ -524,7 +553,7 @@ async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
     info!("control plane service initialized");
 
-    Ok((router, store))
+    Ok((router, store, dids_ks))
 }
 
 // ---------------------------------------------------------------------------
