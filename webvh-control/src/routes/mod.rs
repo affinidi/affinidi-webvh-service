@@ -13,8 +13,7 @@ use axum::routing::{any, get, post, put};
 
 use crate::server::AppState;
 
-/// Build the control plane router without the UI fallback (daemon mode).
-pub fn router_without_fallback() -> Router<AppState> {
+pub fn router() -> Router<AppState> {
     let control = Router::new()
         .route("/registry", get(registry::list).post(registry::register))
         .route(
@@ -25,7 +24,10 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/registry/{instance_id}/health",
             post(registry::health_check),
         )
-        .route("/register-service", post(registry::register_service));
+        .route(
+            "/register-service",
+            post(registry::register_service),
+        );
 
     // Upload routes with a custom body-size limit (DID log + witness)
     let upload_routes = Router::new()
@@ -39,35 +41,20 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route("/auth/", post(auth::authenticate))
         .route("/auth/refresh", post(auth::refresh))
         // Passkey (WebAuthn)
-        .route(
-            "/auth/passkey/enroll/start",
-            post(passkey::enroll_start::<AppState>),
-        )
-        .route(
-            "/auth/passkey/enroll/finish",
-            post(passkey::enroll_finish::<AppState>),
-        )
-        .route(
-            "/auth/passkey/login/start",
-            post(passkey::login_start::<AppState>),
-        )
-        .route(
-            "/auth/passkey/login/finish",
-            post(passkey::login_finish::<AppState>),
-        )
-        .route(
-            "/auth/passkey/invite",
-            post(passkey::create_invite::<AppState>),
-        )
+        .route("/auth/passkey/enroll/start", post(passkey::enroll_start::<AppState>))
+        .route("/auth/passkey/enroll/finish", post(passkey::enroll_finish::<AppState>))
+        .route("/auth/passkey/login/start", post(passkey::login_start::<AppState>))
+        .route("/auth/passkey/login/finish", post(passkey::login_finish::<AppState>))
+        .route("/auth/passkey/invite", post(passkey::create_invite::<AppState>))
         // ACL
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
+        .route(
+            "/acl/{did}",
+            put(acl::update_acl).delete(acl::delete_acl),
+        )
         // DID management (authenticated)
         .route("/dids/check", post(did_manage::check_name))
-        .route(
-            "/dids",
-            post(did_manage::request_uri).get(did_manage::list_dids),
-        )
+        .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
         .route(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
@@ -81,10 +68,7 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route("/stats", get(did_manage::get_server_stats))
         .route("/stats/{*mnemonic}", get(did_manage::get_did_stats))
         .route("/timeseries", get(did_manage::get_server_timeseries))
-        .route(
-            "/timeseries/{*mnemonic}",
-            get(did_manage::get_did_timeseries),
-        )
+        .route("/timeseries/{*mnemonic}", get(did_manage::get_did_timeseries))
         // Service overview (topology + health + stats)
         .route("/services/overview", get(did_manage::get_services_overview))
         // Config
@@ -107,9 +91,7 @@ pub fn router_without_fallback() -> Router<AppState> {
         .merge(upload_routes);
 
     #[allow(unused_mut)]
-    let mut router = Router::new()
-        .nest("/api", api)
-        .route("/api/health", get(health::health));
+    let mut router = Router::new().nest("/api", api);
 
     // Prometheus metrics endpoint (only when metrics feature is enabled)
     #[cfg(feature = "metrics")]
@@ -117,28 +99,15 @@ pub fn router_without_fallback() -> Router<AppState> {
         router = router.route("/metrics", get(metrics_handler));
     }
 
+    // SPA fallback when UI feature is enabled
+    #[cfg(feature = "ui")]
+    let router = router.fallback(crate::frontend::static_handler);
+
     router
 }
 
-/// Build the full control plane router with UI fallback (standalone mode).
-pub fn router() -> Router<AppState> {
-    #[allow(unused_mut)]
-    let mut r = router_without_fallback();
-
-    #[cfg(feature = "ui")]
-    {
-        r = r.fallback(crate::frontend::static_handler);
-    }
-
-    r
-}
-
 #[cfg(feature = "metrics")]
-async fn metrics_handler() -> (
-    axum::http::StatusCode,
-    [(&'static str, &'static str); 1],
-    String,
-) {
+async fn metrics_handler() -> (axum::http::StatusCode, [(&'static str, &'static str); 1], String) {
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

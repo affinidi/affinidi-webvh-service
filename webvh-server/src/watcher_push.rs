@@ -32,6 +32,7 @@ pub struct WatcherSyncStatus {
 // Helpers
 // ---------------------------------------------------------------------------
 
+
 /// Normalize a URL for comparison by trimming trailing slashes.
 fn normalize_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
@@ -73,7 +74,10 @@ pub fn notify_watchers_did(
             }
         };
 
-        let log_content = match dids_ks.get_raw(did_ops::content_log_key(&mnemonic)).await {
+        let log_content = match dids_ks
+            .get_raw(did_ops::content_log_key(&mnemonic))
+            .await
+        {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => {
@@ -141,7 +145,10 @@ pub fn notify_watchers_did(
 
             let (ok, last_error) = match req.send().await {
                 Ok(resp) if resp.status().is_success() => (true, None),
-                Ok(resp) => (false, Some(format!("HTTP {}", resp.status()))),
+                Ok(resp) => (
+                    false,
+                    Some(format!("HTTP {}", resp.status())),
+                ),
                 Err(e) => {
                     warn!(url = %url, error = %e, "failed to push DID to watcher");
                     (false, Some(e.to_string()))
@@ -176,12 +183,13 @@ pub fn notify_watchers_did(
         }
 
         // Persist sync statuses.
-        if !statuses.is_empty()
-            && let Err(e) = dids_ks
+        if !statuses.is_empty() {
+            if let Err(e) = dids_ks
                 .insert(did_ops::watcher_sync_key(&mnemonic), &statuses)
                 .await
-        {
-            warn!(mnemonic = %mnemonic, error = %e, "failed to persist watcher sync status");
+            {
+                warn!(mnemonic = %mnemonic, error = %e, "failed to persist watcher sync status");
+            }
         }
     });
 }

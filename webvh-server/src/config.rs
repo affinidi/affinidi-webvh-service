@@ -114,9 +114,9 @@ impl Default for StatsConfig {
 impl AppConfig {
     /// Return the public-facing base URL for this server.
     pub fn public_base_url(&self) -> String {
-        self.public_url
-            .clone()
-            .unwrap_or_else(|| format!("http://{}:{}", self.server.host, self.server.port))
+        self.public_url.clone().unwrap_or_else(|| {
+            format!("http://{}:{}", self.server.host, self.server.port)
+        })
     }
 
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
@@ -149,22 +149,12 @@ impl AppConfig {
         )?;
 
         // Server identity (webvh-server specific env vars)
-        macro_rules! env_opt {
-            ($var:expr, $field:expr) => {
-                if let Ok(v) = std::env::var($var) {
-                    $field = Some(v);
-                }
-            };
-        }
-        macro_rules! env_parse {
-            ($var:expr, $field:expr) => {
-                if let Ok(v) = std::env::var($var) {
-                    $field = v
-                        .parse()
-                        .map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
-                }
-            };
-        }
+        macro_rules! env_opt { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = Some(v); } }; }
+        macro_rules! env_parse { ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = v.parse().map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
+            }
+        }; }
 
         env_opt!("WEBVH_SERVER_DID", config.server_did);
         env_opt!("WEBVH_MEDIATOR_DID", config.mediator_did);
@@ -178,45 +168,25 @@ impl AppConfig {
         env_opt!("WEBVH_VTA_CONTEXT_ID", config.vta.context_id);
 
         // Limits
-        env_parse!(
-            "WEBVH_LIMITS_UPLOAD_BODY_LIMIT",
-            config.limits.upload_body_limit
-        );
-        env_parse!(
-            "WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE",
-            config.limits.default_max_total_size
-        );
-        env_parse!(
-            "WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT",
-            config.limits.default_max_did_count
-        );
+        env_parse!("WEBVH_LIMITS_UPLOAD_BODY_LIMIT", config.limits.upload_body_limit);
+        env_parse!("WEBVH_LIMITS_DEFAULT_MAX_TOTAL_SIZE", config.limits.default_max_total_size);
+        env_parse!("WEBVH_LIMITS_DEFAULT_MAX_DID_COUNT", config.limits.default_max_did_count);
 
         // Stats
-        env_parse!(
-            "WEBVH_STATS_FLUSH_INTERVAL_SECS",
-            config.stats.flush_interval_secs
-        );
-        env_parse!(
-            "WEBVH_STATS_SYNC_INTERVAL_SECS",
-            config.stats.sync_interval_secs
-        );
+        env_parse!("WEBVH_STATS_FLUSH_INTERVAL_SECS", config.stats.flush_interval_secs);
+        env_parse!("WEBVH_STATS_SYNC_INTERVAL_SECS", config.stats.sync_interval_secs);
 
         // Validate configuration
         config.auth.validate()?;
-        if let Some(ref did) = config.server_did
-            && !did.starts_with("did:")
-        {
-            return Err(AppError::Config(format!(
-                "server_did must start with 'did:': {did}"
-            )));
+        if let Some(ref did) = config.server_did {
+            if !did.starts_with("did:") {
+                return Err(AppError::Config(format!("server_did must start with 'did:': {did}")));
+            }
         }
-        if let Some(ref url) = config.public_url
-            && !url.starts_with("http://")
-            && !url.starts_with("https://")
-        {
-            return Err(AppError::Config(format!(
-                "public_url must start with http:// or https://: {url}"
-            )));
+        if let Some(ref url) = config.public_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(AppError::Config(format!("public_url must start with http:// or https://: {url}")));
+            }
         }
 
         // Normalize: strip trailing slashes from URLs

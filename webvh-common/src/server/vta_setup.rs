@@ -3,8 +3,9 @@
 //! Used by all three service setup wizards to authenticate with VTA,
 //! create DIDs, and retrieve key material.
 
-use std::collections::HashMap;
 use std::path::Path;
+
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -57,14 +58,10 @@ impl SessionBackend for InMemoryBackend {
     }
 }
 
-/// Decode a VTA credential, authenticate via DIDComm, and return a connected client.
+/// Decode a VTA credential, authenticate, and return a connected client.
 ///
-/// Uses `SessionStore` to establish a full DIDComm session through the VTA's
-/// mediator. This is required for operations like `create_did_webvh` where the
-/// VTA needs to relay DIDComm messages to the webvh server.
-///
-/// An in-memory session backend is used — the session is only needed for the
-/// duration of the setup wizard.
+/// The credential is the base64url string issued by the VTA operator.
+/// An in-memory session backend is used for the ephemeral setup handshake.
 pub async fn connect_vta(
     credential_b64: &str,
 ) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
@@ -84,9 +81,7 @@ pub async fn connect_vta(
 
     let login_result = store.login(credential_b64, &vta_url, session_key).await?;
 
-    // Pass None so connect() resolves the VTA DID and uses DIDComm transport
-    // through the VTA's mediator (required for create_did_webvh etc.)
-    let client = store.connect(session_key, None).await?;
+    let client = store.connect(session_key, Some(&vta_url)).await?;
 
     // Discover the context: list contexts and pick the one the credential has access to
     let contexts = client.list_contexts().await?;
@@ -219,3 +214,4 @@ pub fn generate_ed25519_multibase() -> String {
         .get_private_keymultibase()
         .expect("ed25519 multibase encoding")
 }
+

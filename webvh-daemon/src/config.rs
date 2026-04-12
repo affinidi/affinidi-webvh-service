@@ -25,11 +25,15 @@ pub struct DaemonConfig {
     pub public_url: Option<String>,
     pub did_hosting_url: Option<String>,
 
-    // Store locations
-    #[serde(default = "default_store")]
-    pub store: StoreConfig,
+    // Per-service store locations (separate to avoid keyspace collisions)
+    #[serde(default = "default_server_store")]
+    pub server_store: StoreConfig,
     #[serde(default = "default_witness_store")]
     pub witness_store: StoreConfig,
+    #[serde(default = "default_watcher_store")]
+    pub watcher_store: StoreConfig,
+    #[serde(default = "default_control_store")]
+    pub control_store: StoreConfig,
 
     // Server-specific
     #[serde(default)]
@@ -64,9 +68,9 @@ fn default_server() -> ServerConfig {
     }
 }
 
-fn default_store() -> StoreConfig {
+fn default_server_store() -> StoreConfig {
     StoreConfig {
-        data_dir: PathBuf::from("data/daemon/store"),
+        data_dir: PathBuf::from("data/daemon/server"),
         ..StoreConfig::default()
     }
 }
@@ -74,6 +78,20 @@ fn default_store() -> StoreConfig {
 fn default_witness_store() -> StoreConfig {
     StoreConfig {
         data_dir: PathBuf::from("data/daemon/witness"),
+        ..StoreConfig::default()
+    }
+}
+
+fn default_watcher_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/daemon/watcher"),
+        ..StoreConfig::default()
+    }
+}
+
+fn default_control_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/daemon/control"),
         ..StoreConfig::default()
     }
 }
@@ -170,7 +188,7 @@ impl DaemonConfig {
             public_url: self.public_url.clone(),
             server: self.server.clone(),
             log: self.log.clone(),
-            store: self.store.clone(),
+            store: self.server_store.clone(),
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
@@ -204,7 +222,7 @@ impl DaemonConfig {
         affinidi_webvh_watcher::config::AppConfig {
             server: self.server.clone(),
             log: self.log.clone(),
-            store: self.store.clone(),
+            store: self.watcher_store.clone(),
             sync: self.watcher_sync.clone(),
             config_path: self.config_path.clone(),
         }
@@ -220,7 +238,7 @@ impl DaemonConfig {
             did_hosting_url: self.did_hosting_url.clone(),
             server: self.server.clone(),
             log: self.log.clone(),
-            store: self.store.clone(),
+            store: self.control_store.clone(),
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
@@ -233,7 +251,6 @@ impl DaemonConfig {
         FeaturesConfig {
             didcomm: false,
             rest_api: true,
-            deployment_mode: "daemon".to_string(),
         }
     }
 }

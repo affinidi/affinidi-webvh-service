@@ -76,7 +76,11 @@ impl AuthState for AppState {
     }
 }
 
-pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+pub async fn run(
+    config: AppConfig,
+    store: Store,
+    secrets: ServerSecrets,
+) -> Result<(), AppError> {
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -85,10 +89,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Integrity check on DID keyspace
     match dids_ks.verify_integrity().await {
         Ok(0) => debug!("store integrity check passed"),
-        Ok(n) => warn!(
-            corrupted = n,
-            "store integrity check found corrupted entries"
-        ),
+        Ok(n) => warn!(corrupted = n, "store integrity check found corrupted entries"),
         Err(e) => warn!(error = %e, "store integrity check failed"),
     }
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
@@ -126,11 +127,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
         let collector = stats::StatsCollector::new();
-        let total_dids = storage_dids_ks
-            .prefix_iter_raw("did:")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0) as u64;
+        let total_dids = storage_dids_ks.prefix_iter_raw("did:").await.map(|v| v.len()).unwrap_or(0) as u64;
         collector.set_total_dids(total_dids);
         info!(total_dids, "stats collector initialized");
         Arc::new(collector)
@@ -223,18 +220,16 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .name("webvh-storage".into())
         .spawn(move || {
             run_storage_thread(
-                StorageThreadParams {
-                    store,
-                    sessions_ks: storage_sessions_ks,
-                    dids_ks: storage_dids_ks,
-                    auth_config: storage_auth_config,
-                    has_auth,
-                    collector: storage_collector,
-                    stats_config: storage_stats_config,
-                    http: storage_http,
-                    control_url: storage_control_url,
-                    server_did: storage_server_did,
-                },
+                store,
+                storage_sessions_ks,
+                storage_dids_ks,
+                storage_auth_config,
+                has_auth,
+                storage_collector,
+                storage_stats_config,
+                storage_http,
+                storage_control_url,
+                storage_server_did,
                 &mut storage_shutdown,
             )
         })
@@ -269,17 +264,17 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     let store_clone = state.store.clone();
                     let cache = state.did_cache.clone();
                     tokio::spawn(async move {
-                        let params = control_register::ControlRegistrationParams {
-                            control_url: &control_url,
-                            server_did: &server_did,
-                            signing_secret: &signing_secret,
-                            public_url: &public_url,
-                            label: None,
-                            dids_ks: &dids_ks,
-                            store: &store_clone,
-                            did_cache: &cache,
-                        };
-                        control_register::register_with_control_retry(&params).await;
+                        control_register::register_with_control_retry(
+                            &control_url,
+                            &server_did,
+                            &signing_secret,
+                            &public_url,
+                            None,
+                            &dids_ks,
+                            &store_clone,
+                            &cache,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => warn!("cannot register with control: {e}"),
@@ -450,9 +445,7 @@ fn run_rest_thread(
                             .latency_unit(tower_http::LatencyUnit::Millis),
                     ),
             )
-            .layer(axum::middleware::from_fn(
-                affinidi_webvh_common::server::security_headers,
-            ))
+            .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
             .route("/api/health", get(routes::health::health));
 
         // Signal that REST is ready to serve
@@ -475,8 +468,7 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-/// Parameters for the background storage thread.
-struct StorageThreadParams {
+fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
@@ -487,21 +479,8 @@ struct StorageThreadParams {
     http: reqwest::Client,
     control_url: Option<String>,
     server_did: Option<String>,
-}
-
-fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
-    let StorageThreadParams {
-        store,
-        sessions_ks,
-        dids_ks,
-        auth_config,
-        has_auth,
-        collector,
-        stats_config,
-        http,
-        control_url,
-        server_did,
-    } = params;
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -595,7 +574,10 @@ fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
 async fn init_didcomm_auth(
     config: &AppConfig,
     secrets: &ServerSecrets,
-) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
+) -> (
+    Option<DIDCacheClient>,
+    Option<Arc<ThreadedSecretsResolver>>,
+) {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let server_did = match &config.server_did {
@@ -638,7 +620,10 @@ async fn init_didcomm_auth(
 
     info!("DIDComm auth initialized for DID {server_did}");
 
-    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
+    (
+        Some(did_resolver),
+        Some(Arc::new(secrets_resolver)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +656,7 @@ fn mnemonic_from_did(did: &str) -> Option<String> {
     Some(mnemonic)
 }
 
-pub async fn auto_bootstrap_dids(
+async fn auto_bootstrap_dids(
     mut config: AppConfig,
     store: &Store,
     dids_ks: &KeyspaceHandle,
@@ -705,15 +690,7 @@ pub async fn auto_bootstrap_dids(
     // Bootstrap root DID (.well-known) if it doesn't exist
     match bootstrap::root_did_exists(dids_ks).await {
         Ok(false) => {
-            match bootstrap::bootstrap_root_did(
-                store,
-                dids_ks,
-                &signing_secret,
-                ka_secret.as_ref(),
-                mediator_uri.as_deref(),
-                &public_url,
-            )
-            .await
+            match bootstrap::bootstrap_root_did(store, dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), &public_url).await
             {
                 Ok(result) => {
                     info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");
@@ -730,24 +707,29 @@ pub async fn auto_bootstrap_dids(
     }
 
     // Verify server_did exists in store (if configured and not root)
-    if let Some(ref server_did) = config.server_did
-        && let Some(mnemonic) = mnemonic_from_did(server_did)
-        && mnemonic != ".well-known"
-    {
-        let exists = dids_ks
-            .contains_key(format!("did:{mnemonic}"))
-            .await
-            .unwrap_or(false);
-        if exists {
-            info!(path = %mnemonic, "server DID loaded from store");
-        } else {
-            error!(
-                did = %server_did,
-                path = %mnemonic,
-                "server DID not found in store — DID resolution will fail"
-            );
-            error!("  To create it, run:  webvh-server bootstrap-did --path {mnemonic}");
-            error!("  Then update server_did in config.toml with the new DID");
+    if let Some(ref server_did) = config.server_did {
+        if let Some(mnemonic) = mnemonic_from_did(server_did) {
+            if mnemonic != ".well-known" {
+                let exists = dids_ks
+                    .contains_key(format!("did:{mnemonic}"))
+                    .await
+                    .unwrap_or(false);
+                if exists {
+                    info!(path = %mnemonic, "server DID loaded from store");
+                } else {
+                    error!(
+                        did = %server_did,
+                        path = %mnemonic,
+                        "server DID not found in store — DID resolution will fail"
+                    );
+                    error!(
+                        "  To create it, run:  webvh-server bootstrap-did --path {mnemonic}"
+                    );
+                    error!(
+                        "  Then update server_did in config.toml with the new DID"
+                    );
+                }
+            }
         }
     }
 
@@ -774,7 +756,9 @@ pub async fn auto_bootstrap_dids(
     config
 }
 
-pub(crate) fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], AppError> {
+pub(crate) fn decode_multibase_ed25519_key(
+    multibase_key: &str,
+) -> Result<[u8; 32], AppError> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     let secret = Secret::from_multibase(multibase_key, None)
@@ -816,8 +800,7 @@ mod tests {
 
     #[test]
     fn mnemonic_from_did_simple() {
-        let did =
-            "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
+        let did = "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
         assert_eq!(mnemonic_from_did(did).unwrap(), "webvh/server1");
     }
 

@@ -181,7 +181,6 @@ export interface ControlPlaneConfig {
   listenAddress: string;
   vtaUrl: string | null;
   vtaDid: string | null;
-  deploymentMode: string;
   healthCheckIntervalSecs: number;
   configuredInstances: number;
   accessTokenExpiry: number;

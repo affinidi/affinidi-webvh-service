@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use axum::routing::get;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::routes;
 use crate::store::{KeyspaceHandle, Store};
-use axum::routing::get;
 use tokio::sync::watch;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
@@ -63,9 +63,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                                     .latency_unit(tower_http::LatencyUnit::Millis),
                             ),
                     )
-                    .layer(axum::middleware::from_fn(
-                        affinidi_webvh_common::server::security_headers,
-                    ))
+                    .layer(axum::middleware::from_fn(affinidi_webvh_common::server::security_headers))
                     .route("/api/health", get(routes::health::health));
 
                 axum::serve(listener, app)
@@ -113,26 +111,14 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
 
     match tokio::task::spawn_blocking(move || rest_handle.join()).await {
         Ok(Ok(())) => info!("REST thread stopped"),
-        Ok(Err(_)) => {
-            error!("REST thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join REST thread: {e}");
-            any_panic = true;
-        }
+        Ok(Err(_)) => { error!("REST thread panicked"); any_panic = true; }
+        Err(e) => { error!("failed to join REST thread: {e}"); any_panic = true; }
     }
 
     match tokio::task::spawn_blocking(move || storage_handle.join()).await {
         Ok(Ok(())) => info!("storage thread stopped"),
-        Ok(Err(_)) => {
-            error!("storage thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join storage thread: {e}");
-            any_panic = true;
-        }
+        Ok(Err(_)) => { error!("storage thread panicked"); any_panic = true; }
+        Err(e) => { error!("failed to join storage thread: {e}"); any_panic = true; }
     }
 
     if any_panic {

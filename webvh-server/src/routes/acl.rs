@@ -48,10 +48,8 @@ pub async fn list_acl(
     State(state): State<AppState>,
 ) -> Result<Json<AclListResponse>, AppError> {
     let all_entries = list_acl_entries(&state.acl_ks).await?;
-    let entries: Vec<AclEntryResponse> = all_entries
-        .into_iter()
-        .map(AclEntryResponse::from)
-        .collect();
+    let entries: Vec<AclEntryResponse> =
+        all_entries.into_iter().map(AclEntryResponse::from).collect();
     info!(caller = %auth.0.did, count = entries.len(), "ACL listed");
     Ok(Json(AclListResponse { entries }))
 }

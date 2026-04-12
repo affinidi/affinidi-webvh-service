@@ -167,7 +167,10 @@ pub async fn delete_registration_user(ks: &KeyspaceHandle, reg_id: &str) -> Resu
 // Passkey user CRUD
 // ---------------------------------------------------------------------------
 
-pub async fn store_passkey_user(ks: &KeyspaceHandle, user: &PasskeyUser) -> Result<(), AppError> {
+pub async fn store_passkey_user(
+    ks: &KeyspaceHandle,
+    user: &PasskeyUser,
+) -> Result<(), AppError> {
     ks.insert(passkey_user_key(&user.user_uuid), user).await?;
     // Maintain DID → user UUID reverse index
     ks.insert_raw(

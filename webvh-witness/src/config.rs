@@ -75,13 +75,7 @@ impl AppConfig {
         )?;
 
         // Witness-specific env vars
-        macro_rules! env_opt {
-            ($var:expr, $field:expr) => {
-                if let Ok(v) = std::env::var($var) {
-                    $field = Some(v);
-                }
-            };
-        }
+        macro_rules! env_opt { ($var:expr, $field:expr) => { if let Ok(v) = std::env::var($var) { $field = Some(v); } }; }
 
         env_opt!("WITNESS_SERVER_DID", config.server_did);
         env_opt!("WITNESS_MEDIATOR_DID", config.mediator_did);

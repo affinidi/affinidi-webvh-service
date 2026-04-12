@@ -117,14 +117,13 @@ pub fn active_secrets_backend(secrets: &SecretsConfig) -> &'static str {
 pub async fn check_secrets(secrets_config: &SecretsConfig, config_path: &Path) {
     let backend_name = active_secrets_backend(secrets_config);
 
-    let store: Box<dyn SecretStore> =
-        match secret_store::create_secret_store(secrets_config, config_path) {
-            Ok(s) => s,
-            Err(e) => {
-                fail(&format!("Secret store creation failed: {e}"));
-                return;
-            }
-        };
+    let store: Box<dyn SecretStore> = match secret_store::create_secret_store(secrets_config, config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("Secret store creation failed: {e}"));
+            return;
+        }
+    };
 
     if secret_store::is_plaintext_backend(secrets_config) {
         warn_msg(&format!("Secret store backend: {backend_name} (INSECURE)"));
@@ -146,16 +145,11 @@ pub async fn check_secrets(secrets_config: &SecretsConfig, config_path: &Path) {
 /// Try to open the store and report success/failure.
 ///
 /// Returns `Some(store)` on success so the caller can run further checks.
-pub async fn check_store(
-    store_config: &crate::server::config::StoreConfig,
-) -> Option<crate::server::store::Store> {
+pub async fn check_store(store_config: &crate::server::config::StoreConfig) -> Option<crate::server::store::Store> {
     let backend_name = active_store_backend();
     match crate::server::store::Store::open(store_config).await {
         Ok(store) => {
-            pass(&format!(
-                "Store opened ({backend_name} @ {})",
-                store_config.data_dir.display()
-            ));
+            pass(&format!("Store opened ({backend_name} @ {})", store_config.data_dir.display()));
             Some(store)
         }
         Err(e) => {

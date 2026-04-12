@@ -1,8 +1,8 @@
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::store::{RawKvPair, Store};
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -121,8 +121,8 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let json = std::fs::read_to_string(&input)
         .map_err(|e| AppError::Config(format!("failed to read backup file {input}: {e}")))?;
 
-    let backup: Backup = serde_json::from_str(&json)
-        .map_err(|e| AppError::Config(format!("invalid backup JSON: {e}")))?;
+    let backup: Backup =
+        serde_json::from_str(&json).map_err(|e| AppError::Config(format!("invalid backup JSON: {e}")))?;
 
     if backup.version != BACKUP_VERSION {
         return Err(AppError::Config(format!(

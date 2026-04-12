@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-daemon"
 description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
-version = "0.3.0"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -15,56 +15,17 @@ rust-version.workspace = true
 [features]
 default = ["keyring", "store-fjall", "ui", "passkey"]
 ui = ["affinidi-webvh-control/ui"]
-passkey = ["affinidi-webvh-control/passkey", "affinidi-webvh-common/passkey"]
+passkey = ["affinidi-webvh-control/passkey"]
 keyring = [
   "affinidi-webvh-server/keyring",
   "affinidi-webvh-witness/keyring",
   "affinidi-webvh-control/keyring",
 ]
-aws-secrets = [
-  "affinidi-webvh-server/aws-secrets",
-  "affinidi-webvh-witness/aws-secrets",
-  "affinidi-webvh-control/aws-secrets",
-]
-gcp-secrets = [
-  "affinidi-webvh-server/gcp-secrets",
-  "affinidi-webvh-witness/gcp-secrets",
-  "affinidi-webvh-control/gcp-secrets",
-]
-metrics = [
-  "affinidi-webvh-server/metrics",
-  "affinidi-webvh-control/metrics",
-]
 store-fjall = [
-  "affinidi-webvh-common/store-fjall",
   "affinidi-webvh-server/store-fjall",
   "affinidi-webvh-witness/store-fjall",
   "affinidi-webvh-watcher/store-fjall",
   "affinidi-webvh-control/store-fjall",
-]
-store-redis = [
-  "affinidi-webvh-server/store-redis",
-  "affinidi-webvh-witness/store-redis",
-  "affinidi-webvh-watcher/store-redis",
-  "affinidi-webvh-control/store-redis",
-]
-store-dynamodb = [
-  "affinidi-webvh-server/store-dynamodb",
-  "affinidi-webvh-witness/store-dynamodb",
-  "affinidi-webvh-watcher/store-dynamodb",
-  "affinidi-webvh-control/store-dynamodb",
-]
-store-firestore = [
-  "affinidi-webvh-server/store-firestore",
-  "affinidi-webvh-witness/store-firestore",
-  "affinidi-webvh-watcher/store-firestore",
-  "affinidi-webvh-control/store-firestore",
-]
-store-cosmosdb = [
-  "affinidi-webvh-server/store-cosmosdb",
-  "affinidi-webvh-witness/store-cosmosdb",
-  "affinidi-webvh-watcher/store-cosmosdb",
-  "affinidi-webvh-control/store-cosmosdb",
 ]
 
 [[bin]]
@@ -72,11 +33,11 @@ name = "webvh-daemon"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", default-features = false, features = ["server-core"] }
-affinidi-webvh-server = { path = "../webvh-server", default-features = false }
-affinidi-webvh-witness = { path = "../webvh-witness", default-features = false }
-affinidi-webvh-watcher = { path = "../webvh-watcher", default-features = false }
-affinidi-webvh-control = { path = "../webvh-control", default-features = false }
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall"] }
+affinidi-webvh-server = { path = "../webvh-server" }
+affinidi-webvh-witness = { path = "../webvh-witness" }
+affinidi-webvh-watcher = { path = "../webvh-watcher" }
+affinidi-webvh-control = { path = "../webvh-control" }
 affinidi-did-resolver-cache-sdk = "0.8"
 affinidi-tdk = { workspace = true }
 axum = "0.8"
@@ -89,5 +50,4 @@ toml = "1.0"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-vta-sdk = { workspace = true }
 webauthn-rs = { workspace = true }

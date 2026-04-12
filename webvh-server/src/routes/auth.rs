@@ -2,12 +2,12 @@ use axum::Json;
 use axum::extract::State;
 use serde::Deserialize;
 
-use affinidi_webvh_common::server::auth::constant_time_eq;
-use affinidi_webvh_common::server::didcomm_unpack;
 use affinidi_webvh_common::{
     AuthenticateData, AuthenticateResponse, ChallengeData, ChallengeResponse, RefreshData,
     RefreshResponse,
 };
+use affinidi_webvh_common::server::auth::constant_time_eq;
+use affinidi_webvh_common::server::didcomm_unpack;
 
 use crate::acl::check_acl;
 use crate::auth::jwt::JwtKeys;
@@ -156,24 +156,15 @@ pub async fn authenticate(
         .ok_or_else(|| AppError::Authentication("message missing created_time".into()))?;
     let challenge_ttl = state.config.auth.challenge_ttl;
     if created_time < session.created_at {
-        warn!(
-            session_id,
-            created_time,
-            session_created = session.created_at,
-            "authentication rejected: message created_time before challenge"
-        );
+        warn!(session_id, created_time, session_created = session.created_at,
+            "authentication rejected: message created_time before challenge");
         return Err(AppError::Authentication(
             "message created_time is before the challenge was issued".into(),
         ));
     }
     if now.saturating_sub(created_time) > challenge_ttl {
-        warn!(
-            session_id,
-            created_time,
-            now,
-            challenge_ttl,
-            "authentication rejected: message created_time outside challenge TTL"
-        );
+        warn!(session_id, created_time, now, challenge_ttl,
+            "authentication rejected: message created_time outside challenge TTL");
         return Err(AppError::Authentication(
             "message created_time is outside the challenge TTL window".into(),
         ));

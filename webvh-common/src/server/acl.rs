@@ -29,10 +29,9 @@ impl fmt::Display for Role {
     }
 }
 
-impl std::str::FromStr for Role {
-    type Err = AppError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl Role {
+    /// Parse a role from its string representation.
+    pub fn from_str(s: &str) -> Result<Self, AppError> {
         match s {
             "admin" => Ok(Role::Admin),
             "owner" => Ok(Role::Owner),
@@ -72,7 +71,10 @@ fn acl_key(did: &str) -> String {
 }
 
 /// Retrieve an ACL entry by DID.
-pub async fn get_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<Option<AclEntry>, AppError> {
+pub async fn get_acl_entry(
+    acl: &KeyspaceHandle,
+    did: &str,
+) -> Result<Option<AclEntry>, AppError> {
     acl.get(acl_key(did)).await
 }
 
@@ -116,7 +118,6 @@ pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     fn make_entry(max_total_size: Option<u64>, max_did_count: Option<u64>) -> AclEntry {
         AclEntry {

@@ -5,9 +5,9 @@
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
-    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
-    MessagePolicy, RequestLogging, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
-    trust_ping_handler,
+    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MessagePolicy,
+    RequestLogging, Router, TRUST_PING_TYPE, MESSAGE_PICKUP_STATUS_TYPE,
+    handler_fn, ignore_handler, trust_ping_handler,
 };
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -36,11 +36,7 @@ pub fn build_witness_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_WITNESS_PROOF_REQUEST, handler_fn(handle_proof_request))?
         .route(MSG_WITNESS_LIST_REQUEST, handler_fn(handle_list_request))?
         .fallback(handler_fn(handle_fallback))
-        .layer(
-            MessagePolicy::new()
-                .require_encrypted(true)
-                .require_sender_did(true),
-        )
+        .layer(MessagePolicy::new().require_encrypted(true).require_sender_did(true))
         .layer(RequestLogging))
 }
 
@@ -60,9 +56,8 @@ async fn handle_authenticate(
         Err(e) => error_response(&e),
     };
 
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
+    Ok(Some(DIDCommResponse::new(response_type, response_body)
+        .thid(message.id.clone())))
 }
 
 async fn handle_proof_request(
@@ -80,9 +75,8 @@ async fn handle_proof_request(
         Err(e) => error_response(&e),
     };
 
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
+    Ok(Some(DIDCommResponse::new(response_type, response_body)
+        .thid(message.id.clone())))
 }
 
 async fn handle_list_request(
@@ -100,9 +94,8 @@ async fn handle_list_request(
         Err(e) => error_response(&e),
     };
 
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
+    Ok(Some(DIDCommResponse::new(response_type, response_body)
+        .thid(message.id.clone())))
 }
 
 async fn handle_fallback(
@@ -110,23 +103,24 @@ async fn handle_fallback(
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     warn!(type_ = %message.typ, "unknown DIDComm message type");
-    Ok(Some(
-        DIDCommResponse::new(
-            MSG_WITNESS_PROBLEM_REPORT,
-            json!({
-                "code": "e.p.witness.unknown-type",
-                "comment": format!("unknown message type: {}", message.typ),
-            }),
-        )
-        .thid(message.id.clone()),
-    ))
+    Ok(Some(DIDCommResponse::new(
+        MSG_WITNESS_PROBLEM_REPORT,
+        json!({
+            "code": "e.p.witness.unknown-type",
+            "comment": format!("unknown message type: {}", message.typ),
+        }),
+    )
+    .thid(message.id.clone())))
 }
 
 // ---------------------------------------------------------------------------
 // Business logic (unchanged from previous implementation)
 // ---------------------------------------------------------------------------
 
-async fn do_authenticate(state: &AppState, sender_base: &str) -> Result<(String, Value), AppError> {
+async fn do_authenticate(
+    state: &AppState,
+    sender_base: &str,
+) -> Result<(String, Value), AppError> {
     let role = check_acl(&state.acl_ks, sender_base).await?;
 
     let jwt_keys = state
@@ -158,7 +152,10 @@ async fn do_authenticate(state: &AppState, sender_base: &str) -> Result<(String,
     ))
 }
 
-async fn do_proof_request(state: &AppState, msg: &Message) -> Result<(String, Value), AppError> {
+async fn do_proof_request(
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), AppError> {
     let witness_id = msg
         .body
         .get("witness_id")
@@ -203,10 +200,7 @@ async fn do_list_request(state: &AppState) -> Result<(String, Value), AppError> 
         })
         .collect();
 
-    Ok((
-        MSG_WITNESS_LIST.to_string(),
-        json!({ "witnesses": witnesses }),
-    ))
+    Ok((MSG_WITNESS_LIST.to_string(), json!({ "witnesses": witnesses })))
 }
 
 // ---------------------------------------------------------------------------

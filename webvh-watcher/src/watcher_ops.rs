@@ -33,7 +33,10 @@ pub fn content_witness_key(mnemonic: &str) -> String {
 // CRUD operations
 // ---------------------------------------------------------------------------
 
-pub async fn store_record(ks: &KeyspaceHandle, record: &WatcherRecord) -> Result<(), AppError> {
+pub async fn store_record(
+    ks: &KeyspaceHandle,
+    record: &WatcherRecord,
+) -> Result<(), AppError> {
     ks.insert(did_key(&record.mnemonic), record).await
 }
 
@@ -44,14 +47,19 @@ pub async fn get_record(
     ks.get(did_key(mnemonic)).await
 }
 
-pub async fn delete_record(ks: &KeyspaceHandle, mnemonic: &str) -> Result<(), AppError> {
+pub async fn delete_record(
+    ks: &KeyspaceHandle,
+    mnemonic: &str,
+) -> Result<(), AppError> {
     ks.remove(did_key(mnemonic)).await?;
     ks.remove(content_log_key(mnemonic)).await?;
     ks.remove(content_witness_key(mnemonic)).await?;
     Ok(())
 }
 
-pub async fn list_records(ks: &KeyspaceHandle) -> Result<Vec<WatcherRecord>, AppError> {
+pub async fn list_records(
+    ks: &KeyspaceHandle,
+) -> Result<Vec<WatcherRecord>, AppError> {
     let entries = ks.prefix_iter_raw("did:").await?;
     let mut records = Vec::new();
     for (_key, value) in entries {

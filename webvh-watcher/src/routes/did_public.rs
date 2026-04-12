@@ -21,9 +21,10 @@ async fn serve_content(
         .dids_ks
         .get::<WatcherRecord>(watcher_ops::did_key(mnemonic))
         .await?
-        && record.disabled
     {
-        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        if record.disabled {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
     }
 
     let content = state
@@ -39,24 +40,12 @@ async fn serve_content(
 
 /// GET /.well-known/did.jsonl — serve the root DID log
 pub async fn serve_root_did_log(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(
-        &state,
-        ".well-known",
-        "content:.well-known:log",
-        "application/jsonl+json",
-    )
-    .await
+    serve_content(&state, ".well-known", "content:.well-known:log", "application/jsonl+json").await
 }
 
 /// GET /.well-known/did-witness.json — serve the root witness
 pub async fn serve_root_witness(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(
-        &state,
-        ".well-known",
-        "content:.well-known:witness",
-        "application/json",
-    )
-    .await
+    serve_content(&state, ".well-known", "content:.well-known:witness", "application/json").await
 }
 
 /// Combined fallback handler: serves DID documents for any path ending

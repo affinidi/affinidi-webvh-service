@@ -1,7 +1,6 @@
-use affinidi_webvh_common::server::cli;
+use clap::{Parser, Subcommand};
 use affinidi_webvh_server::config::{AppConfig, LogFormat};
 use affinidi_webvh_server::{backup, bootstrap, health, secret_store, server, setup, store};
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -100,27 +99,6 @@ enum Command {
         #[arg(long)]
         path: String,
     },
-    /// Import secrets from a VTA secrets bundle or individual keys
-    ImportSecrets {
-        /// Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
-        #[arg(long, group = "source")]
-        vta_bundle: Option<String>,
-        /// Ed25519 signing key (multibase-encoded)
-        #[arg(long, group = "source")]
-        signing_key: Option<String>,
-        /// X25519 key agreement key (multibase-encoded, required with --signing-key)
-        #[arg(long)]
-        ka_key: Option<String>,
-        /// Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
-        #[arg(long)]
-        jwt_key: Option<String>,
-        /// VTA credential bundle (base64url-encoded, optional)
-        #[arg(long)]
-        vta_credential: Option<String>,
-        /// Overwrite existing secrets without prompting
-        #[arg(long)]
-        force: bool,
-    },
 }
 
 #[tokio::main]
@@ -148,40 +126,20 @@ async fn main() {
             max_total_size,
             max_did_count,
         }) => {
-            let config = AppConfig::load(cli.config).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-            if let Err(e) = cli::add_acl(
-                &config.store,
-                &did,
-                &role,
-                None,
-                max_total_size,
-                max_did_count,
-            )
-            .await
+            if let Err(e) = run_add_acl(cli.config, did, role, max_total_size, max_did_count).await
             {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::ListAcl) => {
-            let config = AppConfig::load(cli.config).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-            if let Err(e) = cli::list_acl(&config.store).await {
+            if let Err(e) = run_list_acl(cli.config).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::RemoveAcl { did }) => {
-            let config = AppConfig::load(cli.config).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-            if let Err(e) = cli::remove_acl(&config.store, &did).await {
+            if let Err(e) = run_remove_acl(cli.config, did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -220,29 +178,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::ImportSecrets {
-            vta_bundle,
-            signing_key,
-            ka_key,
-            jwt_key,
-            vta_credential,
-            force,
-        }) => {
-            if let Err(e) = run_import_secrets(
-                cli.config,
-                vta_bundle,
-                signing_key,
-                ka_key,
-                jwt_key,
-                vta_credential,
-                force,
-            )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
         Some(Command::BootstrapDid {
             path,
             did_log,
@@ -250,15 +185,9 @@ async fn main() {
             witness_url,
             witness_id,
         }) => {
-            if let Err(e) = run_bootstrap_did(
-                cli.config,
-                path,
-                did_log,
-                did_witness,
-                witness_url,
-                witness_id,
-            )
-            .await
+            if let Err(e) =
+                run_bootstrap_did(cli.config, path, did_log, did_witness, witness_url, witness_id)
+                    .await
             {
                 eprintln!("Bootstrap error: {e}");
                 std::process::exit(1);
@@ -266,6 +195,140 @@ async fn main() {
         }
         None => run_server(cli.config).await,
     }
+}
+
+async fn run_add_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+    role: String,
+    max_total_size: Option<u64>,
+    max_did_count: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+    use affinidi_webvh_server::auth::session::now_epoch;
+
+    let role_parsed = Role::from_str(&role)
+        .map_err(|_| format!("invalid role '{role}': use 'admin', 'owner', or 'service'"))?;
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    // Check if the entry already exists
+    if let Some(existing) = get_acl_entry(&acl_ks, &did).await? {
+        eprintln!();
+        eprintln!("  ACL entry already exists for this DID:");
+        eprintln!("  DID:  {}", existing.did);
+        eprintln!("  Role: {}", existing.role);
+        eprintln!();
+        return Err("ACL entry already exists — delete it first to change the role".into());
+    }
+
+    let entry = AclEntry {
+        did: did.clone(),
+        role: role_parsed.clone(),
+        label: None,
+        created_at: now_epoch(),
+        max_total_size,
+        max_did_count,
+    };
+
+    store_acl_entry(&acl_ks, &entry).await?;
+
+    eprintln!();
+    eprintln!("  ACL entry created!");
+    eprintln!();
+    eprintln!("  DID:  {did}");
+    eprintln!("  Role: {role_parsed}");
+    if let Some(size) = max_total_size {
+        eprintln!("  Max total size: {size} bytes");
+    }
+    if let Some(count) = max_did_count {
+        eprintln!("  Max DID count:  {count}");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_list_acl(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_server::acl::list_acl_entries;
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    let entries = list_acl_entries(&acl_ks).await?;
+
+    if entries.is_empty() {
+        eprintln!();
+        eprintln!("  No ACL entries found.");
+        eprintln!();
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {:<50} {:<8} {:<15} {:<15} {}",
+        "DID", "ROLE", "MAX SIZE", "MAX DIDS", "LABEL"
+    );
+    eprintln!("  {}", "-".repeat(100));
+
+    for entry in &entries {
+        let max_size = entry
+            .max_total_size
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".into());
+        let max_dids = entry
+            .max_did_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        let label = entry.label.as_deref().unwrap_or("-");
+        eprintln!(
+            "  {:<50} {:<8} {:<15} {:<15} {}",
+            entry.did, entry.role, max_size, max_dids, label
+        );
+    }
+
+    eprintln!();
+    eprintln!("  {} entries total", entries.len());
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_remove_acl(
+    config_path: Option<PathBuf>,
+    did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_server::acl::{delete_acl_entry, get_acl_entry};
+
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let acl_ks = store.keyspace("acl")?;
+
+    let existing = get_acl_entry(&acl_ks, &did).await?;
+    if existing.is_none() {
+        eprintln!();
+        eprintln!("  No ACL entry found for {did}");
+        eprintln!();
+        return Ok(());
+    }
+
+    let entry = existing.unwrap();
+    delete_acl_entry(&acl_ks, &did).await?;
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("  ACL entry removed!");
+    eprintln!();
+    eprintln!("  DID:  {}", entry.did);
+    eprintln!("  Role: {}", entry.role);
+    eprintln!();
+
+    Ok(())
 }
 
 async fn run_load_did(
@@ -289,9 +352,14 @@ async fn run_load_did(
         None => None,
     };
 
-    let result =
-        bootstrap::import_did_at_path(&store, &dids_ks, &path, &jsonl, witness_content.as_deref())
-            .await?;
+    let result = bootstrap::import_did_at_path(
+        &store,
+        &dids_ks,
+        &path,
+        &jsonl,
+        witness_content.as_deref(),
+    )
+    .await?;
 
     store.persist().await?;
 
@@ -367,15 +435,11 @@ async fn run_recreate_did(
             .remove(affinidi_webvh_server::did_ops::content_log_key(&mnemonic))
             .await?;
         dids_ks
-            .remove(affinidi_webvh_server::did_ops::content_witness_key(
-                &mnemonic,
-            ))
+            .remove(affinidi_webvh_server::did_ops::content_witness_key(&mnemonic))
             .await?;
         // Remove owner index entry (owner is "system" for bootstrapped DIDs)
         dids_ks
-            .remove(affinidi_webvh_server::did_ops::owner_key(
-                "system", &mnemonic,
-            ))
+            .remove(affinidi_webvh_server::did_ops::owner_key("system", &mnemonic))
             .await?;
         eprintln!("  Removed existing DID at path '{mnemonic}'");
     }
@@ -399,16 +463,9 @@ async fn run_recreate_did(
         None
     };
 
-    let result = bootstrap::bootstrap_did(
-        &store,
-        &dids_ks,
-        &signing_secret,
-        ka_secret.as_ref(),
-        mediator_uri.as_deref(),
-        public_url,
-        &mnemonic,
-    )
-    .await?;
+    let result =
+        bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
+            .await?;
 
     store.persist().await?;
 
@@ -515,16 +572,9 @@ async fn run_bootstrap_did(
             None
         };
 
-        let result = bootstrap::bootstrap_did(
-            &store,
-            &dids_ks,
-            &signing_secret,
-            ka_secret.as_ref(),
-            mediator_uri.as_deref(),
-            public_url,
-            &mnemonic,
-        )
-        .await?;
+        let result =
+            bootstrap::bootstrap_did(&store, &dids_ks, &signing_secret, ka_secret.as_ref(), mediator_uri.as_deref(), public_url, &mnemonic)
+                .await?;
 
         // Optional: request witness proof
         if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
@@ -608,106 +658,6 @@ async fn run_bootstrap_did(
     Ok(())
 }
 
-async fn run_import_secrets(
-    config_path: Option<PathBuf>,
-    vta_bundle: Option<String>,
-    signing_key: Option<String>,
-    ka_key: Option<String>,
-    jwt_key: Option<String>,
-    vta_credential: Option<String>,
-    force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use affinidi_webvh_common::server::vta_setup::generate_ed25519_multibase;
-    use vta_sdk::did_secrets::DidSecretsBundle;
-    use vta_sdk::keys::KeyType;
-
-    let config = AppConfig::load(config_path)?;
-    let secret_store = secret_store::create_secret_store(&config)?;
-
-    // Check for existing secrets
-    if !force && let Ok(Some(_)) = secret_store.get().await {
-        return Err("secrets already exist — use --force to overwrite".into());
-    }
-
-    let (resolved_signing, resolved_ka, resolved_vta_cred) =
-        if let Some(ref bundle_str) = vta_bundle {
-            // Decode VTA secrets bundle
-            let bundle = DidSecretsBundle::decode(bundle_str)
-                .map_err(|e| format!("failed to decode VTA secrets bundle: {e}"))?;
-
-            let mut signing = None;
-            let mut ka = None;
-
-            for entry in &bundle.secrets {
-                match entry.key_type {
-                    KeyType::Ed25519 => {
-                        if signing.is_none() {
-                            signing = Some(entry.private_key_multibase.clone());
-                        }
-                    }
-                    KeyType::X25519 => {
-                        if ka.is_none() {
-                            ka = Some(entry.private_key_multibase.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let signing = signing.ok_or("VTA bundle contains no Ed25519 signing key")?;
-            let ka = ka.ok_or("VTA bundle contains no X25519 key agreement key")?;
-
-            eprintln!("  VTA bundle decoded for DID: {}", bundle.did);
-            eprintln!("  Found {} secret(s)", bundle.secrets.len());
-
-            (signing, ka, vta_credential)
-        } else if let Some(signing) = signing_key {
-            let ka = ka_key.ok_or("--ka-key is required when using --signing-key")?;
-            (signing, ka, vta_credential)
-        } else {
-            return Err("provide either --vta-bundle or --signing-key + --ka-key".into());
-        };
-
-    // Validate keys by attempting to parse them
-    Secret::from_multibase(&resolved_signing, None)
-        .map_err(|e| format!("invalid signing key: {e}"))?;
-    Secret::from_multibase(&resolved_ka, None)
-        .map_err(|e| format!("invalid key agreement key: {e}"))?;
-
-    // Generate or validate JWT key
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
-
-    let server_secrets = affinidi_webvh_server::secret_store::ServerSecrets {
-        signing_key: resolved_signing,
-        key_agreement_key: resolved_ka,
-        jwt_signing_key: resolved_jwt,
-        vta_credential: resolved_vta_cred,
-    };
-
-    secret_store.set(&server_secrets).await?;
-
-    eprintln!();
-    eprintln!("  Secrets imported successfully!");
-    eprintln!();
-    if secret_store::is_plaintext_backend(&config.secrets) {
-        eprintln!("  WARNING: secrets stored in plaintext — not for production use.");
-        eprintln!();
-    }
-
-    Ok(())
-}
-
 async fn run_server(config_path: Option<PathBuf>) {
     let config = match AppConfig::load(config_path) {
         Ok(config) => config,
@@ -734,7 +684,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         }
     };
 
-    let mut secrets = match secret_store.get().await {
+    let secrets = match secret_store.get().await {
         Ok(Some(s)) => {
             tracing::info!("secrets loaded from secret store");
             s
@@ -748,48 +698,6 @@ async fn run_server(config_path: Option<PathBuf>) {
             std::process::exit(1);
         }
     };
-
-    // If VTA is configured, try to fetch fresh keys and cache them locally.
-    // Falls back to the existing locally-stored keys if VTA is unreachable.
-    if let Some(ref context_id) = config.vta.context_id
-        && let Some(ref credential) = secrets.vta_credential
-    {
-        use affinidi_webvh_common::server::vta_cache::WebvhSecretCache;
-        use vta_sdk::integration::{self, VtaServiceConfig};
-
-        let vta_config = VtaServiceConfig {
-            credential: credential.clone(),
-            context: context_id.clone(),
-            url_override: config.vta.url.clone(),
-            timeout: None,
-        };
-        let cache = WebvhSecretCache::new(secret_store.as_ref());
-
-        match integration::startup(&vta_config, &cache).await {
-            Ok(result) => {
-                tracing::info!(
-                    source = ?result.source,
-                    secrets = result.bundle.secrets.len(),
-                    "VTA secrets loaded",
-                );
-                // Update in-memory secrets with fresh keys from VTA
-                for entry in &result.bundle.secrets {
-                    match entry.key_type {
-                        vta_sdk::keys::KeyType::Ed25519 => {
-                            secrets.signing_key = entry.private_key_multibase.clone();
-                        }
-                        vta_sdk::keys::KeyType::X25519 => {
-                            secrets.key_agreement_key = entry.private_key_multibase.clone();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("VTA startup failed ({e}), using locally stored keys");
-            }
-        }
-    }
 
     if secret_store::is_plaintext_backend(&config.secrets) {
         tracing::warn!("============================================================");

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
-    DIDCommResponse, DIDCommServiceError, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
-    RequestLogging, Router, TRUST_PING_TYPE, handler_fn, ignore_handler, trust_ping_handler,
+    DIDCommResponse, DIDCommServiceError, HandlerContext, RequestLogging, Router,
+    TRUST_PING_TYPE, MESSAGE_PICKUP_STATUS_TYPE,
+    handler_fn, ignore_handler, trust_ping_handler,
 };
 use affinidi_tdk::common::TDKSharedState;
 use affinidi_tdk::messaging::ATM;
@@ -58,16 +59,8 @@ async fn handle_sync_ack(
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
-    let status = message
-        .body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let mnemonic = message
-        .body
-        .get("mnemonic")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let status = message.body.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let mnemonic = message.body.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("unknown");
     debug!(
         sender = sender,
         mnemonic = mnemonic,
@@ -256,7 +249,12 @@ pub async fn send_sync_update(
     .finalize();
 
     let (packed, _) = atm
-        .pack_encrypted(&msg, target_did, Some(control_did), Some(control_did))
+        .pack_encrypted(
+            &msg,
+            target_did,
+            Some(control_did),
+            Some(control_did),
+        )
         .await?;
 
     atm.send_message(profile, &packed, &msg.id, false, false)
@@ -294,7 +292,12 @@ pub async fn send_sync_delete(
     .finalize();
 
     let (packed, _) = atm
-        .pack_encrypted(&msg, target_did, Some(control_did), Some(control_did))
+        .pack_encrypted(
+            &msg,
+            target_did,
+            Some(control_did),
+            Some(control_did),
+        )
         .await?;
 
     atm.send_message(profile, &packed, &msg.id, false, false)

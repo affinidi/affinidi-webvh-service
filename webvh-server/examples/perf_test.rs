@@ -23,8 +23,8 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -285,17 +285,7 @@ impl Aggregator {
     }
 
     /// Absorb a batch of metrics from the shared atomic counters.
-    #[allow(clippy::too_many_arguments)]
-    fn update(
-        &mut self,
-        raw_total: u64,
-        raw_success: u64,
-        raw_errors: u64,
-        raw_bytes_in: u64,
-        raw_bytes_out: u64,
-        active_workers: u64,
-        latencies: &[f64],
-    ) {
+    fn update(&mut self, raw_total: u64, raw_success: u64, raw_errors: u64, raw_bytes_in: u64, raw_bytes_out: u64, active_workers: u64, latencies: &[f64]) {
         if active_workers > self.peak_workers {
             self.peak_workers = active_workers;
         }
@@ -507,10 +497,7 @@ async fn dispatcher(
                 m.bytes_inbound.fetch_add(resp_bytes, Ordering::Relaxed);
                 m.bytes_outbound.fetch_add(req_bytes, Ordering::Relaxed);
                 if !timed_out {
-                    m.latencies
-                        .lock()
-                        .unwrap()
-                        .push(latency.as_secs_f64() * 1000.0);
+                    m.latencies.lock().unwrap().push(latency.as_secs_f64() * 1000.0);
                 }
                 m.active_workers.fetch_sub(1, Ordering::Relaxed);
 
@@ -554,7 +541,7 @@ async fn run_aggregator(
         if agg.warmup_remaining > 0 {
             // During warmup: decrement counter, discard latencies, publish warmup snapshot
             agg.warmup_remaining -= 1;
-            let secs_left = agg.warmup_remaining.div_ceil(10); // ceiling division to whole seconds
+            let secs_left = (agg.warmup_remaining + 9) / 10; // ceiling division to whole seconds
 
             if agg.warmup_remaining == 0 {
                 // Warmup just ended — capture baselines and reset aggregator state
@@ -612,12 +599,9 @@ async fn run_aggregator(
 fn draw(frame: &mut Frame, snap: &Snapshot) {
     let area = frame.area();
 
-    let [header, main, footer] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(10),
-        Constraint::Length(3),
-    ])
-    .areas(area);
+    let [header, main, footer] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+            .areas(area);
 
     // ---- Header ----
     let elapsed = format_duration(snap.elapsed);
@@ -627,11 +611,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
     );
     frame.render_widget(
         Paragraph::new(header_text)
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::bordered().border_style(Style::default().fg(Color::DarkGray))),
         header,
     );
@@ -641,7 +621,8 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(main);
 
     let [throughput_area, latency_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top_row);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(top_row);
 
     let [left_bottom, summary_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -655,9 +636,11 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
     // Split each sparkline area into a y-axis label column and the sparkline.
     // ratatui Sparkline renders from the start of the slice, so we pass only
     // the tail matching the inner width to get immediate scrolling.
-    let [tp_y, tp_spark] =
-        Layout::horizontal([Constraint::Length(Y_AXIS_WIDTH), Constraint::Min(1)])
-            .areas(throughput_area);
+    let [tp_y, tp_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(throughput_area);
     let tp_tail = sparkline_tail(&snap.throughput_history, tp_spark.width);
     let tp_max = tp_tail.iter().copied().max().unwrap_or(0);
     render_y_axis(frame, tp_y, &fmt_compact(tp_max));
@@ -667,18 +650,18 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             .style(Style::default().fg(Color::Green))
             .block(sparkline_block(
                 format!(" Throughput ({} req/s) ", snap.current_rps),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 tp_tail.len(),
             )),
         tp_spark,
     );
 
     // ---- Latency sparkline ----
-    let [lat_y, lat_spark] =
-        Layout::horizontal([Constraint::Length(Y_AXIS_WIDTH), Constraint::Min(1)])
-            .areas(latency_area);
+    let [lat_y, lat_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(latency_area);
     let lat_tail = sparkline_tail(&snap.latency_history, lat_spark.width);
     let lat_max = lat_tail.iter().copied().max().unwrap_or(0);
     render_y_axis(frame, lat_y, &fmt_compact(lat_max));
@@ -688,25 +671,20 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             .style(Style::default().fg(Color::Yellow))
             .block(sparkline_block(
                 format!(" Latency ({:.1}ms avg) ", snap.avg_latency_ms),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 lat_tail.len(),
             )),
         lat_spark,
     );
 
     // ---- Workers sparkline ----
-    let [wk_y, wk_spark] =
-        Layout::horizontal([Constraint::Length(Y_AXIS_WIDTH), Constraint::Min(1)])
-            .areas(worker_area);
+    let [wk_y, wk_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(worker_area);
     let wk_tail = sparkline_tail(&snap.worker_history, wk_spark.width);
-    let wk_max = wk_tail
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .max(snap.max_workers as u64);
+    let wk_max = wk_tail.iter().copied().max().unwrap_or(0).max(snap.max_workers as u64);
     render_y_axis(frame, wk_y, &fmt_compact(wk_max));
     frame.render_widget(
         Sparkline::default()
@@ -718,9 +696,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
                     " Workers ({}/{} | peak {}) ",
                     snap.active_workers, snap.max_workers, snap.peak_workers
                 ),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 wk_tail.len(),
             )),
         wk_spark,
@@ -732,9 +708,11 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
     } else {
         0.0
     };
-    let [err_y, err_spark] =
-        Layout::horizontal([Constraint::Length(Y_AXIS_WIDTH), Constraint::Min(1)])
-            .areas(error_area);
+    let [err_y, err_spark] = Layout::horizontal([
+        Constraint::Length(Y_AXIS_WIDTH),
+        Constraint::Min(1),
+    ])
+    .areas(error_area);
     let err_tail = sparkline_tail(&snap.error_history, err_spark.width);
     let err_max = err_tail.iter().copied().max().unwrap_or(0);
     render_y_axis(frame, err_y, &fmt_compact(err_max));
@@ -762,17 +740,14 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
     };
 
     let summary_lines = vec![
-        Line::from(vec![Span::styled(
-            "  Requests",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![
+            Span::styled("  Requests", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(vec![
             Span::raw("   Total:    "),
             Span::styled(
                 format!("{:>10}", fmt_num(snap.total)),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -781,10 +756,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
                 format!("{:>10}", fmt_num(snap.success)),
                 Style::default().fg(Color::Green),
             ),
-            Span::styled(
-                format!("  ({:.1}%)", success_pct),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("  ({:.1}%)", success_pct), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::raw("   Errors:   "),
@@ -792,16 +764,12 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
                 format!("{:>10}", fmt_num(snap.errors)),
                 Style::default().fg(Color::Red),
             ),
-            Span::styled(
-                format!("  ({:.1}%)", error_pct),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("  ({:.1}%)", error_pct), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Throughput",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![
+            Span::styled("  Throughput", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(vec![
             Span::raw("   Current:  "),
             Span::styled(
@@ -817,10 +785,9 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             ),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Latency",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![
+            Span::styled("  Latency", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(vec![
             Span::raw("   Min: "),
             Span::styled(
@@ -858,10 +825,9 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             ),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Network",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![
+            Span::styled("  Network", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(vec![
             Span::raw("   ↑ Out: "),
             Span::styled(
@@ -900,9 +866,11 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
 
     // ---- Footer ----
     frame.render_widget(
-        Paragraph::new(" q: quit | +/Up: +10 req/s | -/Down: -10 req/s | ]: 2x | [: 0.5x")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::bordered().border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(
+            " q: quit | +/Up: +10 req/s | -/Down: -10 req/s | ]: 2x | [: 0.5x",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::bordered().border_style(Style::default().fg(Color::DarkGray))),
         footer,
     );
 
@@ -914,9 +882,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Line::from(""),
             Line::styled(
                 "  Starting test...",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Line::styled(
                 format!("  Warming up ({}s remaining)", snap.warmup_secs_left),
@@ -928,11 +894,7 @@ fn draw(frame: &mut Frame, snap: &Snapshot) {
             Paragraph::new(popup_text).block(
                 Block::bordered()
                     .title(" Initializing ")
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
             popup_area,
@@ -963,9 +925,7 @@ fn sparkline_block(title: String, title_style: Style, visible_secs: usize) -> Bl
 
     if visible_secs > 0 {
         block = block
-            .title_bottom(
-                Line::styled(format!(" {} ", format_age(visible_secs)), axis).left_aligned(),
-            )
+            .title_bottom(Line::styled(format!(" {} ", format_age(visible_secs)), axis).left_aligned())
             .title_bottom(Line::styled(" now ", axis).right_aligned());
     }
     block
@@ -1230,7 +1190,10 @@ async fn main() -> Result<()> {
 
         // Fetch active DIDs
         eprintln!("  Fetching DID list...");
-        let all_dids = client.list_dids().await.context("failed to list DIDs")?;
+        let all_dids = client
+            .list_dids()
+            .await
+            .context("failed to list DIDs")?;
 
         let active_mnemonics: Vec<String> = all_dids
             .iter()
@@ -1301,27 +1264,19 @@ async fn main() -> Result<()> {
     let a_metrics = metrics.clone();
     let a_label = display_label.clone();
     tokio::spawn(async move {
-        run_aggregator(
-            a_metrics, snap_tx, a_rate, did_count, a_label, d_workers, a_shutdown,
-        )
-        .await;
+        run_aggregator(a_metrics, snap_tx, a_rate, did_count, a_label, d_workers, a_shutdown).await;
     });
 
     // ----- TUI event loop -----
     // Install panic hook to restore terminal on crash
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        let _ = ratatui::restore();
         original_hook(info);
     }));
 
     let mut terminal = ratatui::init();
-    let result = run_tui(
-        &mut terminal,
-        snap_rx,
-        target_rate.clone(),
-        shutdown.clone(),
-    );
+    let result = run_tui(&mut terminal, snap_rx, target_rate.clone(), shutdown.clone());
 
     ratatui::restore();
 
@@ -1330,17 +1285,10 @@ async fn main() -> Result<()> {
     }
 
     // Print final stats
-    let snap = snap_rx_final(
-        &display_label,
-        did_count,
-        target_rate.load(Ordering::Relaxed),
-    );
+    let snap = snap_rx_final(&display_label, did_count, target_rate.load(Ordering::Relaxed));
     eprintln!();
     eprintln!("  Performance test complete.");
-    eprintln!(
-        "  Total: {} | Success: {} | Errors: {}",
-        snap.total, snap.success, snap.errors
-    );
+    eprintln!("  Total: {} | Success: {} | Errors: {}", snap.total, snap.success, snap.errors);
     eprintln!();
 
     Ok(())
@@ -1373,32 +1321,33 @@ fn run_tui(
         }
 
         // Poll for keyboard events (non-blocking)
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    shutdown.store(true, Ordering::Relaxed);
-                    return Ok(());
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            shutdown.store(true, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
+                            let cur = target_rate.load(Ordering::Relaxed);
+                            target_rate.store(cur.saturating_add(10), Ordering::Relaxed);
+                        }
+                        KeyCode::Char('-') | KeyCode::Down => {
+                            let cur = target_rate.load(Ordering::Relaxed);
+                            target_rate.store(cur.saturating_sub(10).max(1), Ordering::Relaxed);
+                        }
+                        KeyCode::Char(']') => {
+                            let cur = target_rate.load(Ordering::Relaxed);
+                            target_rate.store(cur.saturating_mul(2), Ordering::Relaxed);
+                        }
+                        KeyCode::Char('[') => {
+                            let cur = target_rate.load(Ordering::Relaxed);
+                            target_rate.store((cur / 2).max(1), Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
                 }
-                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
-                    let cur = target_rate.load(Ordering::Relaxed);
-                    target_rate.store(cur.saturating_add(10), Ordering::Relaxed);
-                }
-                KeyCode::Char('-') | KeyCode::Down => {
-                    let cur = target_rate.load(Ordering::Relaxed);
-                    target_rate.store(cur.saturating_sub(10).max(1), Ordering::Relaxed);
-                }
-                KeyCode::Char(']') => {
-                    let cur = target_rate.load(Ordering::Relaxed);
-                    target_rate.store(cur.saturating_mul(2), Ordering::Relaxed);
-                }
-                KeyCode::Char('[') => {
-                    let cur = target_rate.load(Ordering::Relaxed);
-                    target_rate.store((cur / 2).max(1), Ordering::Relaxed);
-                }
-                _ => {}
             }
         }
     }

@@ -21,8 +21,8 @@ impl RedisBackend {
 
         info!(url, "opening redis store");
 
-        let client =
-            redis::Client::open(url).map_err(|e| AppError::Store(format!("redis connect: {e}")))?;
+        let client = redis::Client::open(url)
+            .map_err(|e| AppError::Store(format!("redis connect: {e}")))?;
 
         let mut conn = client
             .get_multiplexed_async_connection()
@@ -168,8 +168,13 @@ impl KeyspaceOps for RedisKeyspace {
 }
 
 enum RedisBatchOp {
-    Insert { full_key: Vec<u8>, value: Vec<u8> },
-    Remove { full_key: Vec<u8> },
+    Insert {
+        full_key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Remove {
+        full_key: Vec<u8>,
+    },
 }
 
 struct RedisBatch {

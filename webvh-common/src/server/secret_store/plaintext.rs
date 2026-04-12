@@ -18,9 +18,7 @@ pub struct PlaintextSecretStore {
 
 impl PlaintextSecretStore {
     pub fn new(plaintext: Option<&PlaintextSecrets>, config_path: PathBuf) -> Self {
-        warn!(
-            "plaintext secret store is insecure — use keyring, aws-secrets, or gcp-secrets in production"
-        );
+        warn!("plaintext secret store is insecure — use keyring, aws-secrets, or gcp-secrets in production");
         Self {
             secrets: plaintext.map(|p| ServerSecrets {
                 signing_key: p.signing_key.clone(),
@@ -44,12 +42,14 @@ impl SecretStore for PlaintextSecretStore {
         let config_path = self.config_path.clone();
         Box::pin(async move {
             // Read the existing config file
-            let contents = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
-                AppError::Config(format!(
-                    "failed to read config file {}: {e}",
-                    config_path.display()
-                ))
-            })?;
+            let contents = tokio::fs::read_to_string(&config_path)
+                .await
+                .map_err(|e| {
+                    AppError::Config(format!(
+                        "failed to read config file {}: {e}",
+                        config_path.display()
+                    ))
+                })?;
 
             let mut doc: toml::Value = toml::from_str(&contents).map_err(|e| {
                 AppError::Config(format!(
@@ -83,8 +83,9 @@ impl SecretStore for PlaintextSecretStore {
             secrets_table.insert("plaintext".to_string(), plaintext_value);
 
             // Write back
-            let output = toml::to_string_pretty(&doc)
-                .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
+            let output = toml::to_string_pretty(&doc).map_err(|e| {
+                AppError::Config(format!("failed to serialize config: {e}"))
+            })?;
 
             tokio::fs::write(&config_path, output).await.map_err(|e| {
                 AppError::Config(format!(
@@ -154,18 +155,12 @@ mod tests {
         let doc: toml::Value = toml::from_str(&contents).unwrap();
 
         let plaintext = doc["secrets"]["plaintext"].as_table().unwrap();
-        assert_eq!(
-            plaintext["signing_key"].as_str().unwrap(),
-            "z6Mktest_signing"
-        );
+        assert_eq!(plaintext["signing_key"].as_str().unwrap(), "z6Mktest_signing");
         assert_eq!(
             plaintext["key_agreement_key"].as_str().unwrap(),
             "z6LStest_agreement"
         );
-        assert_eq!(
-            plaintext["jwt_signing_key"].as_str().unwrap(),
-            "z6Mktest_jwt"
-        );
+        assert_eq!(plaintext["jwt_signing_key"].as_str().unwrap(), "z6Mktest_jwt");
     }
 
     #[tokio::test]
@@ -222,10 +217,8 @@ rest_api = true
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let doc: toml::Value = toml::from_str(&contents).unwrap();
         let pt_value = &doc["secrets"]["plaintext"];
-        let reloaded: PlaintextSecrets = pt_value
-            .clone()
-            .try_into()
-            .expect("should deserialize PlaintextSecrets");
+        let reloaded: PlaintextSecrets =
+            pt_value.clone().try_into().expect("should deserialize PlaintextSecrets");
 
         // Create a new store from the reloaded data and verify get() works
         let store2 = PlaintextSecretStore::new(Some(&reloaded), config_path);

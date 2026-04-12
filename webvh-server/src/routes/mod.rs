@@ -1,9 +1,9 @@
 mod acl;
 mod auth;
 mod config;
-pub(crate) mod did_manage;
-pub mod did_public;
 mod didcomm;
+pub(crate) mod did_manage;
+mod did_public;
 pub(crate) mod health;
 mod stats;
 
@@ -13,10 +13,7 @@ use axum::routing::{get, post, put};
 
 use crate::server::AppState;
 
-/// Build the server router without the DID-serving fallback.
-///
-/// Used by the daemon to allow a combined fallback (DID serving + UI).
-pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
+pub fn router(upload_body_limit: usize) -> Router<AppState> {
     // Upload routes with a custom body-size limit
     let upload_routes = Router::new()
         .route("/dids/{*mnemonic}", put(did_manage::upload_did))
@@ -31,10 +28,7 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         .route("/auth/refresh", post(auth::refresh))
         // DID management (authenticated)
         .route("/dids/check", post(did_manage::check_name))
-        .route(
-            "/dids",
-            post(did_manage::request_uri).get(did_manage::list_dids),
-        )
+        .route("/dids", post(did_manage::request_uri).get(did_manage::list_dids))
         .route(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
@@ -57,12 +51,16 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         .route("/config", get(config::get_config))
         // ACL management (admin only)
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
-        .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
+        .route(
+            "/acl/{did}",
+            put(acl::update_acl).delete(acl::delete_acl),
+        )
         // Merge upload routes (body-limited) into the API router
         .merge(upload_routes);
 
     #[allow(unused_mut)]
-    let mut router = Router::new().nest("/api", api);
+    let mut router = Router::new()
+        .nest("/api", api);
 
     // Prometheus metrics endpoint (only when metrics feature is enabled)
     #[cfg(feature = "metrics")]
@@ -76,41 +74,20 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
             "/.well-known/did.jsonl",
             get(did_public::serve_root_did_log),
         )
-        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
+        .route(
+            "/.well-known/did.json",
+            get(did_public::serve_root_did_web),
+        )
         .route(
             "/.well-known/did-witness.json",
             get(did_public::serve_root_witness),
         )
-}
-
-/// Build a minimal router with only public DID-serving routes (daemon mode).
-///
-/// In daemon mode, the control plane handles all `/api/` management routes.
-/// The server only needs `.well-known` routes and the public DID fallback.
-pub fn router_public_only() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/.well-known/did.jsonl",
-            get(did_public::serve_root_did_log),
-        )
-        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
-        .route(
-            "/.well-known/did-witness.json",
-            get(did_public::serve_root_witness),
-        )
-}
-
-/// Build the full server router with DID-serving fallback (standalone mode).
-pub fn router(upload_body_limit: usize) -> Router<AppState> {
-    router_without_fallback(upload_body_limit).fallback(did_public::serve_public)
+        // Combined fallback: DID serving (no SPA - UI moved to webvh-control)
+        .fallback(did_public::serve_public)
 }
 
 #[cfg(feature = "metrics")]
-async fn metrics_handler() -> (
-    axum::http::StatusCode,
-    [(&'static str, &'static str); 1],
-    String,
-) {
+async fn metrics_handler() -> (axum::http::StatusCode, [(& 'static str, &'static str); 1], String) {
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

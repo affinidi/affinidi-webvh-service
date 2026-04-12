@@ -88,10 +88,6 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
         <View style={styles.loadingBox}>
           <ActivityIndicator color={colors.accent} />
         </View>
-      ) : data.length === 0 ? (
-        <View style={styles.loadingBox}>
-          <Text style={styles.emptyText}>No usage data yet</Text>
-        </View>
       ) : (
         <View style={{ width: "100%", height: 260 }}>
           <ResponsiveContainer width="100%" height={260}>
@@ -210,10 +206,5 @@ const styles = StyleSheet.create({
     height: 260,
     justifyContent: "center",
     alignItems: "center",
-  },
-  emptyText: {
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    fontSize: 14,
   },
 });

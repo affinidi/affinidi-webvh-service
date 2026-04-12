@@ -241,12 +241,7 @@ mod tests {
 
     #[test]
     fn build_did_document_correct_did_id() {
-        let doc = build_did_document(
-            "example.com%3A8085",
-            "mypath",
-            "z6Mk...",
-            &Default::default(),
-        );
+        let doc = build_did_document("example.com%3A8085", "mypath", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.starts_with("did:webvh:{SCID}:example.com%3A8085:"));
         assert!(id.ends_with(":mypath"));
@@ -254,12 +249,7 @@ mod tests {
 
     #[test]
     fn build_did_document_nested_path() {
-        let doc = build_did_document(
-            "example.com",
-            "people/staff/glenn",
-            "z6Mk...",
-            &Default::default(),
-        );
+        let doc = build_did_document("example.com", "people/staff/glenn", "z6Mk...", &Default::default());
         let id = doc["id"].as_str().unwrap();
         assert!(id.contains(":people:staff:glenn"));
         assert!(!id.contains('/'));

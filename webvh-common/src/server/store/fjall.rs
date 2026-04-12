@@ -36,7 +36,10 @@ impl StorageBackend for FjallBackend {
             .db
             .keyspace(name, KeyspaceCreateOptions::default)
             .map_err(|e| AppError::Store(e.to_string()))?;
-        Ok((name.to_string(), Arc::new(FjallKeyspace { keyspace: ks })))
+        Ok((
+            name.to_string(),
+            Arc::new(FjallKeyspace { keyspace: ks }),
+        ))
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -140,14 +143,20 @@ struct FjallBatch {
 
 impl BatchOps for FjallBatch {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-        match self.db.keyspace(keyspace, KeyspaceCreateOptions::default) {
+        match self
+            .db
+            .keyspace(keyspace, KeyspaceCreateOptions::default)
+        {
             Ok(ks) => self.batch.insert(&ks, key, value),
             Err(e) => tracing::error!(keyspace, error = %e, "batch insert: keyspace lookup failed"),
         }
     }
 
     fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-        match self.db.keyspace(keyspace, KeyspaceCreateOptions::default) {
+        match self
+            .db
+            .keyspace(keyspace, KeyspaceCreateOptions::default)
+        {
             Ok(ks) => self.batch.remove(&ks, key),
             Err(e) => tracing::error!(keyspace, error = %e, "batch remove: keyspace lookup failed"),
         }
@@ -157,7 +166,9 @@ impl BatchOps for FjallBatch {
         Box::pin(async move {
             let batch = self.batch;
             tokio::task::spawn_blocking(move || {
-                batch.commit().map_err(|e| AppError::Store(e.to_string()))
+                batch
+                    .commit()
+                    .map_err(|e| AppError::Store(e.to_string()))
             })
             .await
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?

@@ -119,14 +119,12 @@ pub async fn update_instance_status(
 }
 
 /// Perform a health check against an instance.
-pub async fn health_check(http: &reqwest::Client, instance: &ServiceInstance) -> ServiceStatus {
+pub async fn health_check(
+    http: &reqwest::Client,
+    instance: &ServiceInstance,
+) -> ServiceStatus {
     let url = format!("{}/api/health", instance.url.trim_end_matches('/'));
-    match http
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
+    match http.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) if resp.status().is_success() => ServiceStatus::Active,
         Ok(_) => ServiceStatus::Degraded,
         Err(_) => ServiceStatus::Unreachable,

@@ -67,13 +67,19 @@ refresh_token_expiry = 86400
 [secrets]
 keyring_service = "webvh-daemon"
 
-# Main store (server, watcher, control share this)
-[store]
-data_dir = "data/daemon/store"
+# Per-service data directories (kept separate to avoid
+# keyspace collisions)
+[server_store]
+data_dir = "data/daemon/server"
 
-# Witness store (separate to avoid keyspace collisions)
 [witness_store]
 data_dir = "data/daemon/witness"
+
+[watcher_store]
+data_dir = "data/daemon/watcher"
+
+[control_store]
+data_dir = "data/daemon/control"
 
 # Which services to enable (all default to true except watcher)
 [enable]

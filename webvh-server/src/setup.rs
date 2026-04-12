@@ -35,10 +35,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     if output_path.exists() {
         let overwrite = Confirm::new()
-            .with_prompt(format!(
-                "{} already exists. Overwrite?",
-                output_path.display()
-            ))
+            .with_prompt(format!("{} already exists. Overwrite?", output_path.display()))
             .default(false)
             .interact()?;
         if !overwrite {
@@ -108,7 +105,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     } else if mediator_options[mediator_idx].starts_with("Use VTA") {
         vta_mediator.clone()
     } else {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
+        let did: String = Input::new()
+            .with_prompt("Mediator DID")
+            .interact_text()?;
         if did.is_empty() { None } else { Some(did) }
     };
 
@@ -180,7 +179,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
-        .items(log_levels)
+        .items(&log_levels)
         .default(0)
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
@@ -214,7 +213,6 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         features: FeaturesConfig {
             didcomm: enable_didcomm,
             rest_api: enable_rest_api,
-            ..Default::default()
         },
         server_did: Some(did_result.did.clone()),
         mediator_did,
@@ -310,7 +308,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     if admin_idx <= 1 {
         let admin_did = if admin_idx == 0 {
-            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
+            let did: String = Input::new()
+                .with_prompt("Admin DID")
+                .interact_text()?;
             did
         } else {
             let (did, sk) = vta_setup::generate_admin_did_key();
@@ -355,10 +355,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  Next steps:");
     eprintln!("    1. Import companion service DIDs with `webvh-server bootstrap-did`");
     eprintln!("    2. Grant the server DID admin access on the control plane:");
-    eprintln!(
-        "       webvh-control add-acl --did {} --role admin",
-        did_result.did
-    );
+    eprintln!("       webvh-control add-acl --did {} --role admin", did_result.did);
     eprintln!("    3. Start the server:");
     eprintln!("       webvh-server --config {}", output_path.display());
     eprintln!();
@@ -386,7 +383,6 @@ pub fn update_server_did_in_config(
 }
 
 /// Prompt for secrets backend selection and configuration.
-#[allow(clippy::vec_init_then_push)]
 fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
     #[allow(unused_mut)]
     let mut backends: Vec<&str> = Vec::new();
@@ -451,7 +447,9 @@ fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
             secrets_config.aws_region = Some(region);
         }
     } else if chosen.starts_with("GCP") {
-        let project: String = Input::new().with_prompt("GCP project ID").interact_text()?;
+        let project: String = Input::new()
+            .with_prompt("GCP project ID")
+            .interact_text()?;
         secrets_config.gcp_project = Some(project);
 
         let name: String = Input::new()

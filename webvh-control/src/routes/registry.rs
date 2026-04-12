@@ -289,11 +289,14 @@ async fn compute_did_sync_updates(
     // Log any DIDs the server has that the control plane doesn't
     for entry in reported_dids {
         let key = did_ops::did_key(&entry.mnemonic);
-        if let Ok(None) = state.dids_ks.get::<DidRecord>(key).await {
-            tracing::warn!(
-                mnemonic = %entry.mnemonic,
-                "server has DID unknown to control plane — manual import may be needed"
-            );
+        match state.dids_ks.get::<DidRecord>(key).await {
+            Ok(None) => {
+                tracing::warn!(
+                    mnemonic = %entry.mnemonic,
+                    "server has DID unknown to control plane — manual import may be needed"
+                );
+            }
+            _ => {}
         }
     }
 

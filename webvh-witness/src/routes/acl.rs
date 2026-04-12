@@ -61,9 +61,7 @@ pub async fn create_acl(
     Json(req): Json<CreateAclRequest>,
 ) -> Result<(StatusCode, Json<AclEntryResponse>), AppError> {
     // Parse role
-    let role = req
-        .role
-        .parse::<Role>()
+    let role = Role::from_str(&req.role)
         .map_err(|_| AppError::Validation(format!("invalid role: {}", req.role)))?;
 
     // Check for duplicates
@@ -99,8 +97,7 @@ pub async fn update_acl(
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
 
     if let Some(role_str) = &req.role {
-        entry.role = role_str
-            .parse::<Role>()
+        entry.role = Role::from_str(role_str)
             .map_err(|_| AppError::Validation(format!("invalid role: {role_str}")))?;
     }
     if let Some(label) = req.label {

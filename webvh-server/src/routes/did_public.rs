@@ -23,9 +23,10 @@ async fn serve_content(
         .dids_ks
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
-        && (record.disabled || record.deleted_at.is_some())
     {
-        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        if record.disabled || record.deleted_at.is_some() {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
     }
 
     // Check cache first (hot path — read lock only, no I/O, Arc clone only)
@@ -45,21 +46,19 @@ async fn serve_content(
         std::sync::Arc::new(data)
     };
 
-    if track_stats && let Some(ref collector) = state.stats_collector {
-        collector.record_resolve(mnemonic);
+    if track_stats {
+        if let Some(ref collector) = state.stats_collector {
+            collector.record_resolve(mnemonic);
+        }
         #[cfg(feature = "metrics")]
         affinidi_webvh_common::server::metrics::inc_resolve();
     }
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((
-        StatusCode::OK,
-        [("content-type", content_type)],
-        (*content).clone(),
-    )
-        .into_response())
+    Ok((StatusCode::OK, [("content-type", content_type)], (*content).clone()).into_response())
 }
+
 
 /// Serve a did:web document (`did.json`) for the given mnemonic.
 ///
@@ -72,9 +71,10 @@ async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, App
         .dids_ks
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
-        && (record.disabled || record.deleted_at.is_some())
     {
-        return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        if record.disabled || record.deleted_at.is_some() {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
     }
 
     let content_bytes = state
@@ -115,26 +115,12 @@ pub async fn serve_root_did_web(State(state): State<AppState>) -> Result<Respons
 
 /// GET /.well-known/did.jsonl — serve the root DID log (mnemonic = ".well-known")
 pub async fn serve_root_did_log(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(
-        &state,
-        ".well-known",
-        "content:.well-known:log",
-        "application/jsonl+json",
-        true,
-    )
-    .await
+    serve_content(&state, ".well-known", "content:.well-known:log", "application/jsonl+json", true).await
 }
 
 /// GET /.well-known/did-witness.json — serve the root witness
 pub async fn serve_root_witness(State(state): State<AppState>) -> Result<Response, AppError> {
-    serve_content(
-        &state,
-        ".well-known",
-        "content:.well-known:witness",
-        "application/json",
-        false,
-    )
-    .await
+    serve_content(&state, ".well-known", "content:.well-known:witness", "application/json", false).await
 }
 
 /// Combined fallback handler: serves DID documents for any path ending

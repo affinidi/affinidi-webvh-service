@@ -7,12 +7,12 @@ use tracing::info;
 
 use serde::{Deserialize, Serialize};
 
+use affinidi_webvh_common::server::acl::Role;
 use crate::acl::{self, AclEntry};
 use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
-use affinidi_webvh_common::server::acl::Role;
 
 #[derive(Serialize)]
 pub struct AclListResponse {
@@ -37,10 +37,7 @@ pub async fn create_acl(
     Json(mut entry): Json<AclEntry>,
 ) -> Result<(StatusCode, Json<AclEntry>), AppError> {
     // Check if entry already exists
-    if acl::get_acl_entry(&state.acl_ks, &entry.did)
-        .await?
-        .is_some()
-    {
+    if acl::get_acl_entry(&state.acl_ks, &entry.did).await?.is_some() {
         return Err(AppError::Conflict(format!(
             "ACL entry already exists for {}",
             entry.did

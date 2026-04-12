@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-use azure_data_cosmos::{CosmosAccountEndpoint, CosmosAccountReference, CosmosClient};
-use base64::Engine;
+use azure_data_cosmos::{
+    CosmosAccountEndpoint, CosmosAccountReference, CosmosClient,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -137,7 +139,9 @@ fn encode_doc_id(key: &[u8]) -> String {
 }
 
 impl CosmosDbKeyspace {
-    async fn container(&self) -> azure_data_cosmos::clients::ContainerClient {
+    async fn container(
+        &self,
+    ) -> azure_data_cosmos::clients::ContainerClient {
         self.client
             .database_client(&self.database)
             .container_client(&self.container_name)
@@ -189,7 +193,10 @@ impl KeyspaceOps for CosmosDbKeyspace {
         Box::pin(async move {
             let container = self.container().await;
             let doc_id = encode_doc_id(&key);
-            match container.delete_item(PARTITION_VALUE, &doc_id, None).await {
+            match container
+                .delete_item(PARTITION_VALUE, &doc_id, None)
+                .await
+            {
                 Ok(_) => Ok(()),
                 Err(e) if is_not_found(&e) => Ok(()),
                 Err(e) => Err(AppError::Store(format!("cosmosdb delete: {e}"))),
@@ -217,9 +224,11 @@ impl KeyspaceOps for CosmosDbKeyspace {
             let container = self.container().await;
 
             let query = if prefix.is_empty() {
-                azure_data_cosmos::Query::from("SELECT * FROM c WHERE c.pk = @pk")
-                    .with_parameter("@pk", PARTITION_VALUE)
-                    .map_err(|e| AppError::Store(format!("cosmosdb query param: {e}")))?
+                azure_data_cosmos::Query::from(
+                    "SELECT * FROM c WHERE c.pk = @pk",
+                )
+                .with_parameter("@pk", PARTITION_VALUE)
+                .map_err(|e| AppError::Store(format!("cosmosdb query param: {e}")))?
             } else {
                 let prefix_encoded = encode_doc_id(&prefix);
                 azure_data_cosmos::Query::from(
@@ -322,7 +331,9 @@ impl BatchOps for CosmosDbBatch {
                         container_client
                             .upsert_item(PARTITION_VALUE, doc, None)
                             .await
-                            .map_err(|e| AppError::Store(format!("cosmosdb batch upsert: {e}")))?;
+                            .map_err(|e| {
+                                AppError::Store(format!("cosmosdb batch upsert: {e}"))
+                            })?;
                     }
                     CosmosDbBatchOp::Remove { key, .. } => {
                         let doc_id = encode_doc_id(key);
@@ -333,7 +344,9 @@ impl BatchOps for CosmosDbBatch {
                             Ok(_) => {}
                             Err(e) if is_not_found(&e) => {}
                             Err(e) => {
-                                return Err(AppError::Store(format!("cosmosdb batch delete: {e}")));
+                                return Err(AppError::Store(format!(
+                                    "cosmosdb batch delete: {e}"
+                                )));
                             }
                         }
                     }

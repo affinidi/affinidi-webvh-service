@@ -51,11 +51,14 @@ async fn resolve_verifying_key(
         .await
         .map_err(|e| AppError::Authentication(format!("failed to resolve DID {base_did}: {e}")))?;
 
-    let vm = resolved.doc.get_verification_method(kid).ok_or_else(|| {
-        AppError::Authentication(format!(
-            "verification method {kid} not found in DID document"
-        ))
-    })?;
+    let vm = resolved
+        .doc
+        .get_verification_method(kid)
+        .ok_or_else(|| {
+            AppError::Authentication(format!(
+                "verification method {kid} not found in DID document"
+            ))
+        })?;
 
     let pk_bytes = vm
         .get_public_key_bytes()

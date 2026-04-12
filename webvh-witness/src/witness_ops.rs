@@ -82,7 +82,9 @@ pub async fn get_witness(
 }
 
 /// List all witness records.
-pub async fn list_witnesses(witnesses_ks: &KeyspaceHandle) -> Result<Vec<WitnessRecord>, AppError> {
+pub async fn list_witnesses(
+    witnesses_ks: &KeyspaceHandle,
+) -> Result<Vec<WitnessRecord>, AppError> {
     let entries = witnesses_ks.prefix_iter_raw("witness:").await?;
     let mut records = Vec::new();
     for (_key, value) in entries {
@@ -138,7 +140,8 @@ fn is_valid_version_id(version_id: &str) -> bool {
     if num_part.is_empty() || hash_part.is_empty() {
         return false;
     }
-    num_part.chars().all(|c| c.is_ascii_digit()) && hash_part.chars().all(|c| !c.is_whitespace())
+    num_part.chars().all(|c| c.is_ascii_digit())
+        && hash_part.chars().all(|c| !c.is_whitespace())
 }
 
 #[cfg(test)]
@@ -148,9 +151,7 @@ mod tests {
     #[test]
     fn test_valid_version_ids() {
         assert!(is_valid_version_id("1-QmTest123"));
-        assert!(is_valid_version_id(
-            "2-QmaFkyeG4Rksig3tjyn2qQu3eCVeoAZ5txLT4RwyLZZ6ur"
-        ));
+        assert!(is_valid_version_id("2-QmaFkyeG4Rksig3tjyn2qQu3eCVeoAZ5txLT4RwyLZZ6ur"));
         assert!(is_valid_version_id("42-abc"));
     }
 
