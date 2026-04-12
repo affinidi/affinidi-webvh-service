@@ -9,6 +9,7 @@ use tracing::{Level, error, info, warn};
 
 use affinidi_webvh_common::server::config::init_tracing;
 use affinidi_webvh_common::server::error::AppError;
+use affinidi_webvh_common::server::init;
 use affinidi_webvh_common::server::secret_store::ServerSecrets;
 
 use config::DaemonConfig;
@@ -172,7 +173,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     info!("daemon listening on {addr}");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(init::shutdown_signal())
         .await
         .expect("axum serve failed");
 
@@ -203,9 +204,10 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> Service
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
-    let jwt_keys = init_jwt_keys(secrets);
-    let signing_key_bytes = decode_signing_key(secrets);
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let jwt_keys = init::init_jwt_keys(secrets);
+    let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
     let state = AppState {
         store: store.clone(),
@@ -242,8 +244,9 @@ async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     let acl_ks = store.keyspace("acl")?;
     let witnesses_ks = store.keyspace("witnesses")?;
 
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
-    let jwt_keys = init_jwt_keys(secrets);
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let jwt_keys = init::init_jwt_keys(secrets);
 
     let state = AppState {
         store: store.clone(),
@@ -296,8 +299,9 @@ async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     let registry_ks = store.keyspace("registry")?;
     let dids_ks = store.keyspace("dids")?;
 
-    let (did_resolver, secrets_resolver) = init_didcomm_auth(config, secrets).await;
-    let jwt_keys = init_jwt_keys(secrets);
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let jwt_keys = init::init_jwt_keys(secrets);
 
     // Initialize WebAuthn for passkeys
     let webauthn = control_config.public_url.as_ref().and_then(|url| {
@@ -372,87 +376,6 @@ async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
             std::process::exit(1);
         }
     }
-}
-
-fn init_jwt_keys(
-    secrets: &ServerSecrets,
-) -> Option<Arc<affinidi_webvh_common::server::auth::jwt::JwtKeys>> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use affinidi_webvh_common::server::auth::jwt::JwtKeys;
-
-    let secret = match Secret::from_multibase(&secrets.jwt_signing_key, None) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("failed to decode JWT signing key: {e} — auth disabled");
-            return None;
-        }
-    };
-
-    let bytes = secret.get_private_bytes();
-    let key_bytes: [u8; 32] = match bytes.try_into() {
-        Ok(b) => b,
-        Err(_) => {
-            warn!("JWT signing key must be 32 bytes — auth disabled");
-            return None;
-        }
-    };
-
-    match JwtKeys::from_ed25519_bytes(&key_bytes) {
-        Ok(keys) => Some(Arc::new(keys)),
-        Err(e) => {
-            warn!("failed to construct JWT keys: {e} — auth disabled");
-            None
-        }
-    }
-}
-
-fn decode_signing_key(secrets: &ServerSecrets) -> Option<[u8; 32]> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let secret = Secret::from_multibase(&secrets.signing_key, None).ok()?;
-    secret.get_private_bytes().try_into().ok()
-}
-
-async fn init_didcomm_auth(
-    config: &DaemonConfig,
-    secrets: &ServerSecrets,
-) -> (
-    Option<affinidi_did_resolver_cache_sdk::DIDCacheClient>,
-    Option<Arc<affinidi_tdk::secrets_resolver::ThreadedSecretsResolver>>,
-) {
-    use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
-    use tracing::debug;
-
-    let server_did = match &config.server_did {
-        Some(did) => did.clone(),
-        None => return (None, None),
-    };
-
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("failed to create DID resolver: {e}");
-            return (None, None);
-        }
-    };
-
-    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
-
-    let kid = format!("{server_did}#key-0");
-    if let Ok(secret) = Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-        secrets_resolver.insert(secret).await;
-        debug!(kid = %kid, "signing secret loaded");
-    }
-
-    let kid = format!("{server_did}#key-1");
-    if let Ok(secret) = Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
-        secrets_resolver.insert(secret).await;
-        debug!(kid = %kid, "key-agreement secret loaded");
-    }
-
-    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
 }
 
 // ---------------------------------------------------------------------------
@@ -587,30 +510,6 @@ async fn daemon_health() -> axum::Json<serde_json::Value> {
         "status": "ok",
         "service": "webvh-daemon",
     }))
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => info!("received SIGINT"),
-        () = terminate => info!("received SIGTERM"),
-    }
 }
 
 fn print_banner() {

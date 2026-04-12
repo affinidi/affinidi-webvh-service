@@ -1,9 +1,8 @@
-use affinidi_webvh_server::config::{AppConfig, LogFormat};
+use affinidi_webvh_server::config::AppConfig;
 use affinidi_webvh_server::{backup, bootstrap, health, secret_store, server, setup, store};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "webvh-server", about = "WebVH DID Hosting Server", version)]
@@ -691,7 +690,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         }
     };
 
-    init_tracing(&config);
+    affinidi_webvh_common::server::config::init_tracing(&config.log);
 
     // Load secrets from the configured backend
     let secret_store = match secret_store::create_secret_store(&config) {
@@ -756,16 +755,4 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
-}
-
-fn init_tracing(config: &AppConfig) {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.level));
-
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-
-    match config.log.format {
-        LogFormat::Json => subscriber.json().init(),
-        LogFormat::Text => subscriber.init(),
-    }
 }
