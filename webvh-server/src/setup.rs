@@ -1,16 +1,12 @@
 use std::path::PathBuf;
 
-use dialoguer::{Confirm, Input, MultiSelect, Select};
+use dialoguer::{Confirm, Input, Select};
 
-use crate::acl::{AclEntry, Role, store_acl_entry};
-use crate::auth::session::now_epoch;
-use crate::bootstrap;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
 use crate::secret_store::{ServerSecrets, create_secret_store};
-use crate::store::Store;
 
 use affinidi_webvh_common::server::vta_setup;
 
@@ -18,6 +14,10 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!();
     eprintln!("  WebVH Server — Setup Wizard");
     eprintln!("  ===========================");
+    eprintln!();
+    eprintln!("  This configures a read-only server edge node that serves DID");
+    eprintln!("  documents and receives sync updates from the control plane.");
+    eprintln!("  All DID management is handled by the control plane.");
     eprintln!();
 
     // 1. Output path
@@ -47,19 +47,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         }
     }
 
-    // 2. Feature selection
-    let feature_items = &["DIDComm Messaging", "REST API"];
-    let selected = MultiSelect::new()
-        .with_prompt("Which features do you want to enable? (Space to toggle, Enter to confirm)")
-        .items(feature_items)
-        .defaults(&[true, true])
-        .interact()?;
-
-    let enable_didcomm = selected.contains(&0);
-    let enable_rest_api = selected.contains(&1);
-    let auth = AuthConfig::default();
-
-    // 3. VTA credential — authenticate with server's VTA context
+    // 2. VTA credential — authenticate with server's VTA context
     eprintln!();
     eprintln!("  The server needs a VTA credential to create its root DID identity.");
     eprintln!("  This is the base64url string issued by the VTA operator.");
@@ -74,7 +62,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
     eprintln!("  VTA context: {}", conn_info.context_id);
 
-    // 4. Public URL
+    // 3. Public URL
     eprintln!();
     eprintln!("  The public URL is where this server will serve DID documents.");
     eprintln!();
@@ -83,9 +71,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .interact_text()?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
-    // 5. Mediator selection (before DID creation so it's embedded in the DID doc)
+    // 4. Mediator selection (before DID creation so it's embedded in the DID doc)
     eprintln!();
-    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!("  A DIDComm mediator routes sync messages from the control plane.");
     eprintln!();
 
     // Try to discover the VTA's mediator
@@ -112,7 +100,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         if did.is_empty() { None } else { Some(did) }
     };
 
-    // 6. Create root DID via VTA at .well-known
+    // 5. Create root DID via VTA at .well-known
     eprintln!();
     eprintln!("  Creating server root DID via VTA...");
 
@@ -139,10 +127,10 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         eprintln!("  ---");
     }
 
-    // 7. Control plane connection
+    // 6. Control plane connection
     eprintln!();
-    eprintln!("  If you have a control plane, enter its URL and DID.");
-    eprintln!("  Leave empty to skip (can be set later in config.toml).");
+    eprintln!("  The control plane manages all DIDs and pushes updates to this server.");
+    eprintln!("  Enter its URL and DID so this server can register and receive sync.");
     eprintln!();
 
     let control_url: String = Input::new()
@@ -165,7 +153,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         None
     };
 
-    // 8. Host / Port
+    // 7. Host / Port
     let host: String = Input::new()
         .with_prompt("Listen host")
         .default("0.0.0.0".to_string())
@@ -176,7 +164,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .default(8530)
         .interact_text()?;
 
-    // 9. Log level / format
+    // 8. Log level / format
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
@@ -196,24 +184,24 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         _ => LogFormat::Text,
     };
 
-    // 10. Data directory
+    // 9. Data directory
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
         .default("data/webvh-server".to_string())
         .interact_text()?;
 
-    // 11. JWT signing key (always generated)
+    // 10. JWT signing key (always generated)
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
     eprintln!("  Generated JWT signing key.");
 
-    // 12. Secrets backend selection
+    // 11. Secrets backend selection
     let secrets_config = configure_secrets()?;
 
-    // 13. Build and write config
-    let mut config = AppConfig {
+    // 12. Build and write config
+    let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: enable_didcomm,
-            rest_api: enable_rest_api,
+            didcomm: mediator_did.is_some(),
+            rest_api: false,
             ..Default::default()
         },
         server_did: Some(did_result.did.clone()),
@@ -228,7 +216,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             data_dir: PathBuf::from(&data_dir),
             ..StoreConfig::default()
         },
-        auth,
+        auth: AuthConfig::default(),
         secrets: secrets_config,
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
@@ -247,7 +235,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     std::fs::write(&output_path, &toml_str)?;
     eprintln!("  Configuration written to {}", output_path.display());
 
-    // 14. Store secrets
+    // 13. Store secrets
     let server_secrets = ServerSecrets {
         signing_key: did_result.signing_key,
         key_agreement_key: did_result.key_agreement_key,
@@ -259,21 +247,20 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     secret_store.set(&server_secrets).await?;
     eprintln!("  Secrets stored in secret store.");
 
-    // 15. Import root DID log entry into store
+    // 14. Import root DID log entry into store
     if let Some(ref log_entry) = did_result.log_entry {
         eprintln!();
         eprintln!("  Importing root DID into server store...");
 
-        let store = Store::open(&config.store).await?;
+        let store = crate::store::Store::open(&config.store).await?;
         let dids_ks = store.keyspace("dids")?;
 
-        match bootstrap::import_root_did(&store, &dids_ks, log_entry, None).await {
+        match crate::bootstrap::import_root_did(&store, &dids_ks, log_entry, None).await {
             Ok(result) => {
                 eprintln!("  Root DID imported!");
                 eprintln!("  DID:  {}", result.did_id);
                 eprintln!("  SCID: {}", result.scid);
 
-                config.server_did = Some(result.did_id.clone());
                 update_server_did_in_config(&output_path, &result.did_id)?;
                 eprintln!("  server_did updated in {}", output_path.display());
             }
@@ -284,83 +271,17 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         }
     }
 
-    // 16. Optional admin ACL bootstrap
-    eprintln!();
-    eprintln!("  The Access Control List (ACL) determines who can authenticate");
-    eprintln!("  with this service. Without at least one admin entry, all");
-    eprintln!("  authenticated API calls will be rejected.");
-    eprintln!();
-    eprintln!("  Admins can manage all DIDs, modify ACL entries, and access");
-    eprintln!("  server configuration. Regular owners can only manage their");
-    eprintln!("  own DIDs.");
-    eprintln!();
-    eprintln!("  You can add more entries later with:");
-    eprintln!("    webvh-server add-acl --did <DID> --role admin");
-    eprintln!();
-    let admin_options = &[
-        "Enter an existing DID (e.g. operator or service DID)",
-        "Generate a new did:key identity for the operator",
-        "Skip (add later with webvh-server add-acl)",
-    ];
-    let admin_idx = Select::new()
-        .with_prompt("Admin ACL entry")
-        .items(admin_options)
-        .default(0)
-        .interact()?;
-
-    if admin_idx <= 1 {
-        let admin_did = if admin_idx == 0 {
-            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
-            did
-        } else {
-            let (did, sk) = vta_setup::generate_admin_did_key();
-            eprintln!("  Generated admin did:key: {did}");
-            eprintln!("  Private key (save this!): {sk}");
-            did
-        };
-
-        let admin_label: String = Input::new()
-            .with_prompt("Label (optional)")
-            .default(String::new())
-            .interact_text()?;
-
-        let label = if admin_label.is_empty() {
-            None
-        } else {
-            Some(admin_label)
-        };
-
-        let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
-
-        let entry = AclEntry {
-            did: admin_did.clone(),
-            role: Role::Admin,
-            label,
-            created_at: now_epoch(),
-            max_total_size: None,
-            max_did_count: None,
-        };
-
-        store_acl_entry(&acl_ks, &entry).await?;
-        eprintln!("  Admin ACL entry created for {admin_did}");
-    }
-
-    // 17. Summary
+    // 15. Summary
     eprintln!();
     eprintln!("  Setup complete!");
     eprintln!();
     eprintln!("  Server DID: {}", did_result.did);
     eprintln!();
-    eprintln!("  Next steps:");
-    eprintln!("    1. Import companion service DIDs with `webvh-server bootstrap-did`");
-    eprintln!("    2. Grant the server DID admin access on the control plane:");
-    eprintln!(
-        "       webvh-control add-acl --did {} --role admin",
-        did_result.did
-    );
-    eprintln!("    3. Start the server:");
-    eprintln!("       webvh-server --config {}", output_path.display());
+    eprintln!("  This server is a read-only edge node. To manage DIDs,");
+    eprintln!("  use the control plane (webvh-control) or the daemon (webvh-daemon).");
+    eprintln!();
+    eprintln!("  Start the server:");
+    eprintln!("    webvh-server --config {}", output_path.display());
     eprintln!();
 
     Ok(())
