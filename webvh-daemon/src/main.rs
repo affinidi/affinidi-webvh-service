@@ -559,33 +559,8 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         storage_shutdown_rx,
     ));
 
-    // 3b. DIDComm service (for VTA integration via control plane)
-    let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if config.didcomm {
-        if let Some(ref state) = control_state {
-            match affinidi_webvh_control::server::start_didcomm_service(
-                state,
-                &secrets,
-                didcomm_shutdown.clone(),
-            )
-            .await
-            {
-                Ok(Some(svc)) => Some(svc),
-                Ok(None) => None,
-                Err(e) => {
-                    warn!("failed to start DIDComm service: {e}");
-                    None
-                }
-            }
-        } else {
-            warn!("DIDComm enabled but control plane not enabled — skipping");
-            None
-        }
-    } else {
-        None
-    };
-
-    // ── Phase 4: Serve HTTP ───────────────────────────────────────────
+    // ── Phase 4: Serve HTTP (must start before DIDComm so self-hosted
+    //    DIDs are resolvable when the mediator connection is established) ──
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -596,10 +571,61 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         });
     info!("daemon listening on {addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(init::shutdown_signal())
-        .await
-        .expect("axum serve failed");
+    let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let http_handle = tokio::spawn(async move {
+        let _ = http_ready_tx.send(());
+        axum::serve(listener, app)
+            .with_graceful_shutdown(init::shutdown_signal())
+            .await
+            .expect("axum serve failed");
+    });
+
+    // Wait for HTTP to be serving before starting DIDComm — the mediator DID
+    // may be hosted by this daemon and needs to be resolvable.
+    let _ = http_ready_rx.await;
+
+    // 4b. DIDComm service (for VTA integration via control plane)
+    let didcomm_shutdown = CancellationToken::new();
+    let didcomm_service = if config.didcomm {
+        if let Some(ref state) = control_state {
+            info!(
+                server_did = ?state.config.server_did,
+                mediator_did = ?state.config.mediator_did,
+                "starting control plane DIDComm service"
+            );
+            match affinidi_webvh_control::server::start_didcomm_service(
+                state,
+                &secrets,
+                didcomm_shutdown.clone(),
+            )
+            .await
+            {
+                Ok(Some(svc)) => {
+                    info!("DIDComm service started successfully");
+                    Some(svc)
+                }
+                Ok(None) => {
+                    warn!(
+                        "DIDComm service returned None — check server_did and mediator_did config"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!("failed to start DIDComm service: {e}");
+                    None
+                }
+            }
+        } else {
+            warn!("DIDComm enabled but control plane not enabled — skipping");
+            None
+        }
+    } else {
+        info!("DIDComm disabled in config");
+        None
+    };
+
+    // Wait for HTTP server to complete (shutdown signal received)
+    let _ = http_handle.await;
 
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
 

@@ -415,6 +415,12 @@ pub async fn start_didcomm_service(
         }
     };
 
+    info!(
+        control_did = control_did,
+        mediator_did = mediator_did,
+        "building TDK profile for DIDComm"
+    );
+
     let profile = build_tdk_profile(
         "control",
         control_did,
@@ -423,6 +429,8 @@ pub async fn start_didcomm_service(
         state.did_resolver.as_ref(),
     )
     .await?;
+
+    info!("TDK profile built, configuring DIDComm listener");
 
     let listener = ListenerConfig {
         id: "control".into(),
@@ -436,6 +444,8 @@ pub async fn start_didcomm_service(
 
     let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    info!("starting DIDComm service with mediator connection");
 
     let svc = DIDCommService::start(
         DIDCommServiceConfig {

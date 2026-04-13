@@ -83,6 +83,7 @@ async fn handle_authenticate(
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = require_sender(&ctx)?;
+    info!(sender = sender, msg_type = %message.typ, "inbound DIDComm: authenticate");
 
     let (response_type, response_body) = match check_acl(&state.acl_ks, sender).await {
         Ok(role) => {
@@ -135,6 +136,7 @@ async fn handle_webvh_message(
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = require_sender(&ctx)?;
+    info!(sender = sender, msg_type = %message.typ, "inbound DIDComm: webvh message");
 
     let (response_type, response_body) = match check_acl(&state.acl_ks, sender).await {
         Ok(role) => {
@@ -382,10 +384,11 @@ async fn handle_sync_ack(
 }
 
 async fn handle_fallback(
-    _ctx: HandlerContext,
+    ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    warn!(msg_type = %message.typ, "unknown message type — ignoring");
+    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
+    warn!(sender = sender, msg_type = %message.typ, "inbound DIDComm: unknown message type — ignoring");
     Ok(None)
 }
 
