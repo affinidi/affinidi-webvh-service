@@ -18,6 +18,7 @@ use affinidi_webvh_common::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
 };
 use affinidi_webvh_common::didcomm_types::MSG_SERVER_REGISTER;
+use affinidi_webvh_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -64,6 +65,36 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         control_did = %control_did,
         "registering with control plane via DIDComm"
     );
+
+    // Ensure the control plane DID is in the server's ACL so it can send
+    // sync-update and sync-delete messages that pass the ACL check.
+    match get_acl_entry(&state.acl_ks, &control_did).await {
+        Ok(Some(entry)) => {
+            info!(
+                control_did = %control_did,
+                role = %entry.role,
+                "control plane DID already in ACL"
+            );
+        }
+        Ok(None) => {
+            let entry = AclEntry {
+                did: control_did.clone(),
+                role: Role::Service,
+                label: Some("control-plane".to_string()),
+                created_at: crate::auth::session::now_epoch(),
+                max_total_size: None,
+                max_did_count: None,
+            };
+            if let Err(e) = store_acl_entry(&state.acl_ks, &entry).await {
+                warn!(error = %e, "failed to add control plane DID to ACL");
+            } else {
+                info!(control_did = %control_did, "added control plane DID to ACL with service role");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to check ACL for control plane DID");
+        }
+    }
 
     let public_url = state.config.public_url.clone().unwrap_or_default();
 
