@@ -81,7 +81,7 @@ webauthn-rs = { workspace = true, optional = true }
 webauthn-rs-proto = { workspace = true, optional = true }
 
 # Prometheus metrics (optional, behind `metrics` feature)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", default-features = false, optional = true }
 
 # base64 (needed by firestore/cosmosdb store backends)
 base64 = { workspace = true }
