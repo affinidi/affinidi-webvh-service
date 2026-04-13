@@ -586,7 +586,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 4b. DIDComm service (for VTA integration via control plane)
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if config.didcomm {
+    let didcomm_service = if config.features.didcomm {
         if let Some(ref state) = control_state {
             info!(
                 server_did = ?state.config.server_did,
@@ -1534,7 +1534,7 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
     health::print_feature("witness", config.enable.witness);
     health::print_feature("watcher", config.enable.watcher);
     health::print_feature("control", config.enable.control);
-    health::print_feature("didcomm", config.didcomm);
+    health::print_feature("didcomm", config.features.didcomm);
 
     // ── Secrets ────────────────────────────────────────────────────
     health::section("Secrets");

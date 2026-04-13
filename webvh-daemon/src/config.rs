@@ -49,9 +49,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub registry: affinidi_webvh_control::config::RegistryConfig,
 
-    /// Enable DIDComm messaging (for VTA integration)
+    /// Feature flags (didcomm, rest_api).
     #[serde(default)]
-    pub didcomm: bool,
+    pub features: FeaturesConfig,
 
     /// Which services to enable
     #[serde(default)]
@@ -235,8 +235,8 @@ impl DaemonConfig {
 
     fn features_config(&self) -> FeaturesConfig {
         FeaturesConfig {
-            didcomm: self.didcomm,
-            rest_api: true,
+            didcomm: self.features.didcomm,
+            rest_api: self.features.rest_api,
             deployment_mode: "daemon".to_string(),
         }
     }
