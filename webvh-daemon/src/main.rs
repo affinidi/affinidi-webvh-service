@@ -106,6 +106,14 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// List all DIDs in the store
+    ListDids,
+    /// Remove a DID and all its data from the store
+    RemoveDid {
+        /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
+        #[arg(long)]
+        path: String,
+    },
     /// Load a DID from existing files
     LoadDid {
         /// Path to store the DID at
@@ -228,6 +236,18 @@ async fn main() {
         }
         Some(Command::RecoverDid { path }) => {
             if let Err(e) = run_recover_did(cli.config, path).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ListDids) => {
+            if let Err(e) = run_list_dids(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RemoveDid { path }) => {
+            if let Err(e) = run_remove_did(cli.config, path).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1634,4 +1654,82 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+async fn run_list_dids(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use affinidi_webvh_common::did_ops::DidRecord;
+
+    let config = DaemonConfig::load(config_path)?;
+    let store = affinidi_webvh_common::server::store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    let raw = dids_ks.prefix_iter_raw("did:").await?;
+
+    if raw.is_empty() {
+        eprintln!("  No DIDs in store.");
+        return Ok(());
+    }
+
+    eprintln!("  {:<25} {:<15} {:<60}", "PATH", "VERSIONS", "DID ID");
+    eprintln!("  {}", "-".repeat(100));
+
+    for (_key, value) in &raw {
+        if let Ok(record) = serde_json::from_slice::<DidRecord>(value) {
+            let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
+            let deleted = if record.deleted_at.is_some() {
+                " [deleted]"
+            } else {
+                ""
+            };
+            let disabled = if record.disabled { " [disabled]" } else { "" };
+            eprintln!(
+                "  {:<25} {:<15} {}{}{}",
+                record.mnemonic, record.version_count, did_id, deleted, disabled
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!("  Total: {} DIDs", raw.len());
+
+    Ok(())
+}
+
+async fn run_remove_did(
+    config_path: Option<PathBuf>,
+    path: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use affinidi_webvh_common::did_ops::{
+        DidRecord, content_log_key, content_witness_key, did_key, owner_key,
+    };
+
+    let config = DaemonConfig::load(config_path)?;
+    let store = affinidi_webvh_common::server::store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    let record: Option<DidRecord> = dids_ks.get(did_key(&path)).await?;
+    let record = match record {
+        Some(r) => r,
+        None => {
+            eprintln!("  DID not found at path '{path}'");
+            std::process::exit(1);
+        }
+    };
+
+    let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
+    eprintln!("  Removing DID at path '{path}'");
+    eprintln!("  DID ID: {did_id}");
+    eprintln!("  Owner:  {}", record.owner);
+
+    let mut batch = store.batch();
+    batch.remove(&dids_ks, did_key(&path));
+    batch.remove(&dids_ks, content_log_key(&path));
+    batch.remove(&dids_ks, content_witness_key(&path));
+    batch.remove(&dids_ks, owner_key(&record.owner, &path));
+    batch.commit().await?;
+
+    eprintln!("  DID removed.");
+    Ok(())
 }

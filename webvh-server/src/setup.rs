@@ -267,17 +267,19 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     secret_store.set(&server_secrets).await?;
     eprintln!("  Secrets stored in secret store.");
 
-    // 14. Import root DID log entry into store
+    // 14. Import DID log entry into store at the correct path
     if let Some(ref log_entry) = did_result.log_entry {
         eprintln!();
-        eprintln!("  Importing root DID into server store...");
+        eprintln!("  Importing server DID into store at path '{did_path}'...");
 
         let store = crate::store::Store::open(&config.store).await?;
         let dids_ks = store.keyspace("dids")?;
 
-        match crate::bootstrap::import_root_did(&store, &dids_ks, log_entry, None).await {
+        match crate::bootstrap::import_did_at_path(&store, &dids_ks, &did_path, log_entry, None)
+            .await
+        {
             Ok(result) => {
-                eprintln!("  Root DID imported!");
+                eprintln!("  Server DID imported!");
                 eprintln!("  DID:  {}", result.did_id);
                 eprintln!("  SCID: {}", result.scid);
 
@@ -285,8 +287,10 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
                 eprintln!("  server_did updated in {}", output_path.display());
             }
             Err(e) => {
-                eprintln!("  Warning: failed to import root DID: {e}");
-                eprintln!("  You can retry later with `webvh-server bootstrap-did`");
+                eprintln!("  Warning: failed to import server DID: {e}");
+                eprintln!(
+                    "  You can retry later with `webvh-server bootstrap-did --path {did_path}`"
+                );
             }
         }
     }
