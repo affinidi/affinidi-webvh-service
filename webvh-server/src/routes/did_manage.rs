@@ -1,64 +1,17 @@
-use crate::auth::{AdminAuth, AuthClaims};
+use crate::auth::AuthClaims;
 use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
-use crate::mnemonic::{is_path_available, validate_custom_path};
 use crate::server::AppState;
 use crate::watcher_push::{self, WatcherSyncStatus};
-use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use affinidi_webvh_common::DidListEntry;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
 /// Strip leading slash from path-extracted mnemonics.
 fn clean_mnemonic(m: &str) -> &str {
     m.trim_start_matches('/')
-}
-
-// ---------- POST /dids/check ----------
-
-#[derive(Debug, Deserialize)]
-pub struct CheckNameRequest {
-    pub path: String,
-}
-
-pub async fn check_name(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Json(req): Json<CheckNameRequest>,
-) -> Result<Json<CheckNameResponse>, AppError> {
-    validate_custom_path(&req.path)?;
-    let available = is_path_available(&state.dids_ks, &req.path).await?;
-    info!(did = %auth.did, path = %req.path, available, "name availability checked");
-    Ok(Json(CheckNameResponse {
-        available,
-        path: req.path,
-    }))
-}
-
-// ---------- POST /dids ----------
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RequestUriRequest {
-    pub path: Option<String>,
-}
-
-pub async fn request_uri(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    body: Option<Json<RequestUriRequest>>,
-) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
-    let path = body.and_then(|b| b.0.path);
-    let result = did_ops::create_did(&auth, &state, path.as_deref()).await?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(RequestUriResponse {
-            mnemonic: result.mnemonic,
-            did_url: result.did_url,
-        }),
-    ))
 }
 
 // ---------- GET /dids/{mnemonic} ----------
@@ -219,47 +172,6 @@ pub async fn enable_did(
         mnemonic.to_string(),
     );
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ---------- POST /rollback/{mnemonic} ----------
-
-pub async fn rollback_did(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Path(mnemonic): Path<String>,
-) -> Result<Json<DidDetailResponse>, AppError> {
-    let mnemonic = clean_mnemonic(&mnemonic);
-    let result = did_ops::rollback_did(&auth, &state, mnemonic).await?;
-
-    watcher_push::notify_watchers_did(
-        &state.config,
-        &state.http_client,
-        &state.dids_ks,
-        mnemonic.to_string(),
-    );
-
-    let watcher_sync: Option<Vec<WatcherSyncStatus>> = state
-        .dids_ks
-        .get(did_ops::watcher_sync_key(mnemonic))
-        .await?;
-
-    Ok(Json(DidDetailResponse::from_record(
-        result.record,
-        result.log_metadata,
-        watcher_sync,
-    )))
-}
-
-// ---------- POST /recover/{mnemonic} ----------
-
-pub async fn recover_did(
-    _auth: AdminAuth,
-    State(state): State<AppState>,
-    Path(mnemonic): Path<String>,
-) -> Result<axum::http::StatusCode, AppError> {
-    let mnemonic = clean_mnemonic(&mnemonic);
-    did_ops::recover_did(&state, mnemonic).await?;
-    Ok(axum::http::StatusCode::OK)
 }
 
 // ---------- GET /raw/{mnemonic} ----------

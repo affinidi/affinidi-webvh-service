@@ -23,28 +23,26 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         .layer(DefaultBodyLimit::max(upload_body_limit));
 
     // API routes live under /api/ so they never collide with DID serving paths.
+    //
+    // The server is a read-only edge node. DID lifecycle management (create,
+    // rollback, recover) is handled by the control plane. The server only
+    // accepts sync'd content (publish, witness, delete) and provides
+    // read-only introspection (list, get, log, stats).
     let api = Router::new()
         // Auth routes
         .route("/auth/challenge", post(auth::challenge))
         .route("/auth/", post(auth::authenticate))
         .route("/auth/refresh", post(auth::refresh))
-        // DID management (authenticated)
-        .route("/dids/check", post(did_manage::check_name))
-        .route(
-            "/dids",
-            post(did_manage::request_uri).get(did_manage::list_dids),
-        )
+        // DID introspection + sync (authenticated)
+        .route("/dids", get(did_manage::list_dids))
         .route(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
         )
         .route("/log/{*mnemonic}", get(did_manage::get_did_log))
+        .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         .route("/disable/{*mnemonic}", put(did_manage::disable_did))
         .route("/enable/{*mnemonic}", put(did_manage::enable_did))
-        // Rollback + raw log (authenticated)
-        .route("/rollback/{*mnemonic}", post(did_manage::rollback_did))
-        .route("/recover/{*mnemonic}", post(did_manage::recover_did))
-        .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
         // Services (authenticated, any role)
         .route("/services", get(config::get_services))
         // Stats (authenticated — in-memory only, authoritative stats on control plane)
