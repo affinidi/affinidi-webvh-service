@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+## 0.4.2 (2026-04-13)
+
+### Added
+- **webvh-daemon**: Full parity with standalone webvh-server + webvh-control.
+  The daemon now includes all lifecycle management that was previously only
+  available in standalone mode:
+  - Background storage task: session cleanup, DID cleanup, stats flush to
+    persistent store, and service health checks
+  - Auto-bootstrap of root DID on startup when `public_url` is configured
+  - Stats collector seeded from persisted store (stats survive restarts)
+  - Registry seeding from static config on startup
+  - DIDComm support via new `didcomm` config field — inbound listener for VTA
+    integration and outbound ATM for sync push messages
+  - Ordered shutdown: DIDComm → HTTP → storage flush → persist
+- **webvh-daemon**: New CLI commands from webvh-server: `bootstrap-did`,
+  `recreate-did`, `recover-did`, `load-did`, `import-secrets`, `backup`,
+  `restore`
+- **webvh-daemon**: DID store integrity check on startup
+
+### Fixed
+- **webvh-daemon**: fjall `Locked` error on startup — server, watcher, and
+  control all share the same store path but each opened it independently.
+  Stores are now opened once and shared.
+- **webvh-daemon**: Enrollment invite URLs returned 404 — the control plane
+  was nested at `/control` but enrollment URLs pointed to `/enroll`. Control
+  plane is now merged at root so URLs work identically in daemon and
+  standalone modes.
+- **webvh-daemon**: DID resolve stats were not recorded — the server's
+  stats collector was `None`. Now a shared `Arc<StatsCollector>` is used by
+  both server and control plane.
+- **webvh-daemon**: HTTP client had no timeouts — now uses 30s request /
+  10s connect timeouts matching standalone server.
+
+### Changed
+- **webvh-server**: `start_didcomm_service` is now `pub` for daemon reuse.
+- **webvh-control**: `flush_stats_to_store`, `run_health_checks`, and
+  `seed_registry` are now `pub` for daemon reuse.
+
 ## 0.4.1 (2026-04-13)
 
 ### Added
