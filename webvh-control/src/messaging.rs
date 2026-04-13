@@ -11,8 +11,8 @@
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
     DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
-    MessagePolicy, RequestLogging, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
-    trust_ping_handler,
+    MessagePolicy, MiddlewareResult, Next, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
+    middleware_fn, trust_ping_handler,
 };
 use affinidi_webvh_common::did_ops::did_key;
 use affinidi_webvh_common::didcomm_types::*;
@@ -64,7 +64,39 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
                 .require_encrypted(true)
                 .require_sender_did(true),
         )
-        .layer(RequestLogging))
+        .layer(middleware_fn(filtered_request_logging)))
+}
+
+/// Request logging middleware that silences noisy health/stats messages.
+async fn filtered_request_logging(
+    ctx: HandlerContext,
+    message: Message,
+    meta: affinidi_messaging_didcomm::UnpackMetadata,
+    next: Next,
+) -> MiddlewareResult {
+    const QUIET: &[&str] = &[
+        MSG_HEALTH_PING,
+        MSG_HEALTH_PONG,
+        MSG_STATS_SYNC,
+        MSG_STATS_ACK,
+        MSG_SYNC_UPDATE_ACK,
+        MSG_SYNC_DELETE_ACK,
+        MESSAGE_PICKUP_STATUS_TYPE,
+    ];
+
+    let msg_type = message.typ.clone();
+    let result = next.run(ctx, message, meta).await;
+
+    if !QUIET.iter().any(|t| msg_type == *t) {
+        let status = match &result {
+            Ok(Some(_)) => "ok(response)",
+            Ok(None) => "ok(empty)",
+            Err(_) => "error",
+        };
+        info!(message_type = %msg_type, status, "DIDComm request processed");
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
