@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
-use crate::bootstrap;
 use crate::config::{AppConfig, AuthConfig};
 use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
@@ -601,68 +600,20 @@ fn mnemonic_from_did(did: &str) -> Option<String> {
     Some(mnemonic)
 }
 
+/// Verify DIDs in the store and log their status.
+///
+/// The server is a read-only edge node — it does not auto-create DIDs.
+/// The setup wizard or `bootstrap-did` CLI command creates the server's
+/// identity DID. This function only verifies and logs what's present.
 pub async fn auto_bootstrap_dids(
-    mut config: AppConfig,
-    store: &Store,
+    config: AppConfig,
+    _store: &Store,
     dids_ks: &KeyspaceHandle,
-    secrets: &ServerSecrets,
+    _secrets: &ServerSecrets,
 ) -> AppConfig {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let public_url = match &config.public_url {
-        Some(url) => url.clone(),
-        None => return config,
-    };
-
-    let signing_secret = match Secret::from_multibase(&secrets.signing_key, None) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("auto-bootstrap: failed to decode signing key: {e}");
-            return config;
-        }
-    };
-
-    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
-
-    // Discover mediator from VTA DID (if configured) for the DID document
-    let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
-        use affinidi_webvh_common::server::didcomm_profile::resolve_mediator_did;
-        resolve_mediator_did(vta_did, None).await
-    } else {
-        None
-    };
-
-    // Bootstrap root DID (.well-known) if it doesn't exist
-    match bootstrap::root_did_exists(dids_ks).await {
-        Ok(false) => {
-            match bootstrap::bootstrap_root_did(
-                store,
-                dids_ks,
-                &signing_secret,
-                ka_secret.as_ref(),
-                mediator_uri.as_deref(),
-                &public_url,
-            )
-            .await
-            {
-                Ok(result) => {
-                    info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");
-                    if config.server_did.is_none() {
-                        info!("setting server_did to bootstrapped DID");
-                        config.server_did = Some(result.did_id);
-                    }
-                }
-                Err(e) => warn!("auto-bootstrap: failed to create root DID: {e}"),
-            }
-        }
-        Ok(true) => {}
-        Err(e) => warn!("auto-bootstrap: failed to check root DID: {e}"),
-    }
-
-    // Verify server_did exists in store (if configured and not root)
+    // Verify server_did exists in store (if configured)
     if let Some(ref server_did) = config.server_did
         && let Some(mnemonic) = mnemonic_from_did(server_did)
-        && mnemonic != ".well-known"
     {
         let exists = dids_ks
             .contains_key(format!("did:{mnemonic}"))
