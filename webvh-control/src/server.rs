@@ -39,10 +39,9 @@ pub struct AppState {
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
-    /// DIDComm service for inbound/outbound mediator messaging.
-    /// Initialized after startup via `OnceCell` since the service starts after
-    /// HTTP is serving (to allow self-hosted DID resolution).
-    pub didcomm_service: Arc<tokio::sync::OnceCell<DIDCommService>>,
+    /// DIDComm service for inbound/outbound mediator messaging (None if not configured).
+    /// Cloneable — can be shared across handlers for both receiving and proactive sending.
+    pub didcomm_service: Option<DIDCommService>,
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
@@ -169,7 +168,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    let state = AppState {
+    let mut state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -181,7 +180,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
-        didcomm_service: Arc::new(tokio::sync::OnceCell::new()),
+        didcomm_service: None,
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
             let collector = StatsCollector::new();
@@ -315,7 +314,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => {
-                let _ = state.didcomm_service.set(svc);
+                state.didcomm_service = Some(svc);
             }
             Ok(None) => {}
             Err(e) => {

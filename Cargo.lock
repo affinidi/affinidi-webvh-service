@@ -280,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-didcomm-service"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7438f3dcfc4d5b7d3cbcca24ee2b61aa8013225e68147e0fee35e1780d9945ef"
+checksum = "847fa5915e4087c30a364430694efe87f67c80df5a1fb7be2f2cb9a95117e385"
 dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-sdk",

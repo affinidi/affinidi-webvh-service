@@ -28,7 +28,7 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
     let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
-        let svc = match didcomm.get() {
+        let svc = match didcomm.as_ref() {
             Some(svc) => svc,
             None => return, // DIDComm not connected — silently skip
         };
@@ -121,7 +121,7 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
-        let svc = match didcomm.get() {
+        let svc = match didcomm.as_ref() {
             Some(svc) => svc,
             None => return,
         };

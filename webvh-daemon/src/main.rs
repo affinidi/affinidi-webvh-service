@@ -605,11 +605,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     let _ = http_ready_rx.await;
 
     // 4b. DIDComm service (for VTA integration via control plane)
-    //     Stored in the control state's OnceCell so server_push and handlers
+    //     Stored in the control state so server_push and handlers
     //     can send messages through the same connection.
     let didcomm_shutdown = CancellationToken::new();
     if config.features.didcomm {
-        if let Some(ref state) = control_state {
+        if let Some(ref mut state) = control_state {
             info!(
                 server_did = ?state.config.server_did,
                 mediator_did = ?state.config.mediator_did,
@@ -624,7 +624,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             {
                 Ok(Some(svc)) => {
                     info!("DIDComm service started successfully");
-                    let _ = state.didcomm_service.set(svc);
+                    state.didcomm_service = Some(svc);
                 }
                 Ok(None) => {
                     warn!(
@@ -647,7 +647,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
 
-    // 5a. Cancel DIDComm (the OnceCell holds the service; cancellation token stops it)
+    // 5a. Cancel DIDComm (cancellation token stops the service)
     didcomm_shutdown.cancel();
     info!("DIDComm service stopped");
 
@@ -926,7 +926,7 @@ async fn build_control(
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),
-        didcomm_service: Arc::new(tokio::sync::OnceCell::new()),
+        didcomm_service: None,
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),

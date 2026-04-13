@@ -240,9 +240,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     // 4. Start DIDComm service (single connection for both receiving and sending)
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service: Option<Arc<DIDCommService>> = if state.config.features.didcomm {
+    let didcomm_service = if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(Arc::new(svc)),
+            Ok(Some(svc)) => Some(svc),
             Ok(None) => None,
             Err(e) => {
                 warn!("failed to start DIDComm service: {e}");
@@ -271,12 +271,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut any_panic = false;
 
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        // Try to get exclusive ownership for clean shutdown; if other tasks
-        // still hold refs, the cancellation token handles stopping.
-        if let Ok(svc) = Arc::try_unwrap(svc) {
-            svc.shutdown().await;
-        }
+    if let Some(ref svc) = didcomm_service {
+        svc.shutdown().await;
         info!("DIDComm service stopped");
     }
 

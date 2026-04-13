@@ -25,7 +25,7 @@ rust-version = "1.91.0"
 
 # Affinidi Trust Development Kit
 affinidi-tdk = "0.6"
-affinidi-messaging-didcomm-service = "0.1.5"
+affinidi-messaging-didcomm-service = "0.2"
 affinidi-tdk-common = "0.5"
 affinidi-messaging-didcomm = "0.13"
 affinidi-secrets-resolver = "0.5"

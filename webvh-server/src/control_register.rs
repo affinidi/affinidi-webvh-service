@@ -67,6 +67,15 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
 
     let public_url = state.config.public_url.clone().unwrap_or_default();
 
+    // Wait for the mediator connection to be established before sending
+    if let Err(e) = didcomm_svc
+        .wait_connected("server", std::time::Duration::from_secs(30))
+        .await
+    {
+        warn!(error = %e, "timed out waiting for mediator connection — skipping registration");
+        return;
+    }
+
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         MSG_SERVER_REGISTER.to_string(),
@@ -80,39 +89,28 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     .created_time(crate::auth::session::now_epoch())
     .finalize();
 
-    // Retry with exponential backoff
-    let mut backoff = 5u64;
-    for attempt in 1..=20u32 {
-        match didcomm_svc
-            .send_message("server", msg.clone(), &control_did)
-            .await
-        {
-            Ok(_) => {
-                REGISTERED.store(true, Ordering::Relaxed);
-                info!(
-                    attempt,
-                    control_did = %control_did,
-                    "server registration message sent to control plane"
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    attempt,
-                    error = %e,
-                    backoff_secs = backoff,
-                    "failed to send registration message — retrying"
-                );
-            }
+    // Send with built-in retry (waits for reconnection between attempts)
+    match didcomm_svc
+        .send_message_with_retry(
+            "server",
+            msg,
+            &control_did,
+            10,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(()) => {
+            REGISTERED.store(true, Ordering::Relaxed);
+            info!(control_did = %control_did, "server registered with control plane");
         }
-
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(60);
+        Err(e) => {
+            warn!(
+                error = %e,
+                "server registration failed — will accept sync but may not receive pushes"
+            );
+        }
     }
-
-    warn!(
-        "server registration failed after 20 attempts — will accept sync but may not receive pushes"
-    );
 }
 
 // ---------------------------------------------------------------------------
