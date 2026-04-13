@@ -74,8 +74,8 @@ pub async fn run_list_acl(store_config: &StoreConfig) -> Result<(), Box<dyn std:
 
     eprintln!();
     eprintln!(
-        "  {:<50} {:<8} {:<15} {:<15} {}",
-        "DID", "ROLE", "MAX SIZE", "MAX DIDS", "LABEL"
+        "  {:<50} {:<8} {:<15} {:<15} LABEL",
+        "DID", "ROLE", "MAX SIZE", "MAX DIDS"
     );
     eprintln!("  {}", "-".repeat(100));
 

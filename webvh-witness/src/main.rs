@@ -176,8 +176,8 @@ async fn run_list_witnesses(
 
     eprintln!();
     eprintln!(
-        "  {:<50} {:<50} {:<10} {}",
-        "WITNESS ID", "DID", "PROOFS", "LABEL"
+        "  {:<50} {:<50} {:<10} LABEL",
+        "WITNESS ID", "DID", "PROOFS"
     );
     eprintln!("  {}", "-".repeat(120));
 
