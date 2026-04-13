@@ -62,14 +62,16 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
     eprintln!("  VTA context: {}", conn_info.context_id);
 
-    // 3. Public URL
+    // 3. DID hosting URL (determines the did:webvh identifier for this server)
     eprintln!();
-    eprintln!("  The public URL is where this server will serve DID documents.");
+    eprintln!("  The DID hosting URL determines the did:webvh identifier for this");
+    eprintln!("  server's root DID. Each server instance has its own DID identity.");
+    eprintln!("  This is typically the URL where DID documents will be served.");
     eprintln!();
-    let public_url: String = Input::new()
-        .with_prompt("Public URL (e.g. https://did.example.com)")
+    let did_hosting_url: String = Input::new()
+        .with_prompt("DID hosting URL (e.g. https://server1.example.com)")
         .interact_text()?;
-    let public_url = public_url.trim_end_matches('/').to_string();
+    let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
     // 4. Mediator selection (before DID creation so it's embedded in the DID doc)
     eprintln!();
@@ -107,7 +109,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let did_result = vta_setup::create_did(
         &client,
         &conn_info.context_id,
-        &public_url,
+        &did_hosting_url,
         ".well-known",
         Some("webvh-server"),
         mediator_did.as_deref(),
@@ -127,31 +129,17 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         eprintln!("  ---");
     }
 
-    // 6. Control plane connection
+    // 6. Public serving URL (may differ from DID hosting URL, e.g. behind a CDN)
     eprintln!();
-    eprintln!("  The control plane manages all DIDs and pushes updates to this server.");
-    eprintln!("  Enter its URL and DID so this server can register and receive sync.");
+    eprintln!("  The public URL is where this server instance will serve DID documents.");
+    eprintln!("  This is often the same as the DID hosting URL, but may differ if");
+    eprintln!("  requests are served through a CDN or load balancer.");
     eprintln!();
-
-    let control_url: String = Input::new()
-        .with_prompt("Control plane URL (e.g. http://localhost:8532)")
-        .default(String::new())
+    let public_url: String = Input::new()
+        .with_prompt("Public serving URL")
+        .default(did_hosting_url.clone())
         .interact_text()?;
-    let control_url = if control_url.is_empty() {
-        None
-    } else {
-        Some(control_url.trim_end_matches('/').to_string())
-    };
-
-    let control_did = if control_url.is_some() {
-        let cd: String = Input::new()
-            .with_prompt("Control plane DID")
-            .default(String::new())
-            .interact_text()?;
-        if cd.is_empty() { None } else { Some(cd) }
-    } else {
-        None
-    };
+    let public_url = public_url.trim_end_matches('/').to_string();
 
     // 7. Host / Port
     let host: String = Input::new()
@@ -220,8 +208,8 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         secrets: secrets_config,
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
-        control_url,
-        control_did,
+        control_url: None,
+        control_did: None,
         vta: VtaConfig {
             url: Some(conn_info.vta_url),
             did: Some(conn_info.vta_did),
@@ -280,8 +268,14 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  This server is a read-only edge node. To manage DIDs,");
     eprintln!("  use the control plane (webvh-control) or the daemon (webvh-daemon).");
     eprintln!();
-    eprintln!("  Start the server:");
-    eprintln!("    webvh-server --config {}", output_path.display());
+    eprintln!("  Next steps:");
+    eprintln!("    1. Add this server's DID to the control plane ACL:");
+    eprintln!(
+        "       webvh-control add-acl --did {} --role service",
+        did_result.did
+    );
+    eprintln!("    2. Start the server:");
+    eprintln!("       webvh-server --config {}", output_path.display());
     eprintln!();
 
     Ok(())
