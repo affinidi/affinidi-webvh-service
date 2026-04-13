@@ -49,7 +49,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 
     // 2. VTA credential — authenticate with server's VTA context
     eprintln!();
-    eprintln!("  The server needs a VTA credential to create its root DID identity.");
+    eprintln!("  The server needs a VTA credential to bootstrap its own DID identity.");
+    eprintln!("  This DID is used for DIDComm authentication with the control plane,");
+    eprintln!("  not for hosting user DIDs (that is managed by the control plane).");
     eprintln!("  This is the base64url string issued by the VTA operator.");
     eprintln!();
 

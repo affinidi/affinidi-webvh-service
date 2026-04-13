@@ -1,10 +1,13 @@
 # Affinidi WebVH Control Plane
 
-The WebVH Control Plane provides a unified management interface
-for all WebVH services. It hosts an optional web-based management
-UI, maintains a service registry, acts as a reverse proxy to
-backend service instances, and supports both DIDComm v2 and
-passkey (WebAuthn) authentication.
+The WebVH Control Plane is the authoritative source of truth for
+all DID management. It handles DID lifecycle operations (create,
+publish, delete) via DIDComm and optional REST API, and pushes
+updates to server edge nodes via DIDComm through a mediator.
+It also hosts an optional web-based management UI, maintains a
+service registry, acts as a reverse proxy to backend service
+instances, and supports DIDComm v2 and passkey (WebAuthn)
+authentication.
 
 > **IMPORTANT:**
 > affinidi-webvh-service crates are provided "as is" without any

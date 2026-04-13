@@ -1,8 +1,8 @@
-//! DIDComm message routing and handlers for the WebVH server.
+//! DIDComm sync handlers for the WebVH server edge node.
 //!
-//! In distributed mode, the server receives sync-update and sync-delete
-//! messages from the control plane via the mediator. VTA provisioning
-//! messages are handled by the control plane, not the server.
+//! The server is a read-only node that receives `sync-update` and
+//! `sync-delete` messages from the control plane via the mediator.
+//! All DID provisioning (VTA protocol) is handled by the control plane.
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{

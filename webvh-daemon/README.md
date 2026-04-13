@@ -11,10 +11,10 @@ Each service is mounted at a path prefix:
 
 | Service | Path prefix | Description |
 | ------- | ----------- | ----------- |
-| Server  | `/`         | DID hosting and management |
+| Server  | `/`         | Public DID hosting and resolution |
 | Witness | `/witness`  | Witness proof signing |
 | Watcher | `/watcher`  | Read-only DID mirror |
-| Control | `/control`  | Management UI and service registry |
+| Control | `/`         | DID management (DIDComm + REST API), management UI |
 
 > **IMPORTANT:**
 > affinidi-webvh-service crates are provided "as is" without any

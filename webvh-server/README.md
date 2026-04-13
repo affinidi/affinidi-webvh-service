@@ -1,13 +1,14 @@
 # Affinidi WebVH Server
 
-The WebVH Server hosts and manages
-[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It provides a
-REST API for DID lifecycle management (create, upload, delete),
-access control, statistics, and public DID resolution endpoints.
+The WebVH Server is a read-only DID hosting edge node for
+[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
+documents publicly and receives sync updates from the
+[control plane](../webvh-control/) via DIDComm through a mediator.
 
-When a DID is published, the server can optionally push the content
-to registered [watcher](../webvh-watcher/) instances for read-only
-replication.
+All DID lifecycle management (create, publish, delete) is handled
+by the control plane. The server's role is to host and resolve
+DIDs at its public URL. For a self-contained deployment, use the
+[daemon](../webvh-daemon/) instead.
 
 > **IMPORTANT:**
 > affinidi-webvh-service crates are provided "as is" without any

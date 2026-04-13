@@ -1,7 +1,7 @@
 //! Shared DIDComm message type constants for the WebVH protocol.
 //!
-//! Used by both server (sync reception) and control plane (VTA provisioning
-//! + sync push) to ensure consistent protocol URIs.
+//! Used by the control plane (VTA provisioning + sync push) and server
+//! (sync reception only) to ensure consistent protocol URIs.
 
 // ---------------------------------------------------------------------------
 // Authentication
