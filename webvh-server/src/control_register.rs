@@ -121,6 +121,13 @@ pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
         }
     };
 
+    // Enable websocket — required so messages route through the mediator's
+    // store-and-forward rather than attempting direct delivery.
+    if let Err(e) = atm.profile_enable_websocket(&profile).await {
+        warn!("failed to connect to mediator for registration: {e}");
+        return;
+    }
+
     // Build the register message
     let body = json!({
         "public_url": public_url,
