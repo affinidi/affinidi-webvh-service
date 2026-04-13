@@ -5,8 +5,6 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use affinidi_tdk::messaging::ATM;
-use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
@@ -41,10 +39,10 @@ pub struct AppState {
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
-    /// ATM instance for outbound mediator-based DIDComm messaging (None if not configured).
-    pub atm: Option<Arc<ATM>>,
-    /// ATM profile for the control plane's outbound mediator connection.
-    pub atm_profile: Option<Arc<ATMProfile>>,
+    /// DIDComm service for inbound/outbound mediator messaging.
+    /// Initialized after startup via `OnceCell` since the service starts after
+    /// HTTP is serving (to allow self-hosted DID resolution).
+    pub didcomm_service: Arc<tokio::sync::OnceCell<DIDCommService>>,
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
@@ -171,7 +169,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    let mut state = AppState {
+    let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -183,8 +181,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
-        atm: None,
-        atm_profile: None,
+        didcomm_service: Arc::new(tokio::sync::OnceCell::new()),
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
             let collector = StatsCollector::new();
@@ -235,20 +232,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Seed registry from static config
     seed_registry(&state).await;
 
-    // Initialize outbound ATM connection for sync push messages
-    if state.config.features.didcomm {
-        if let Some(ref control_did) = state.config.server_did {
-            if let Some((atm, profile)) =
-                messaging::init_outbound_atm(&state.config, control_did, &secrets).await
-            {
-                state.atm = Some(atm);
-                state.atm_profile = Some(profile);
-            }
-        } else {
-            warn!("DIDComm enabled but server_did not configured — messaging disabled");
-        }
-    }
-
     // Log startup configuration
     info!("--- enabled services ---");
     info!(
@@ -261,8 +244,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     );
     info!(
         "  DIDComm  : {}",
-        if state.atm.is_some() {
-            "enabled (mediator connected)"
+        if state.config.features.didcomm {
+            "enabled"
         } else {
             "disabled"
         }
@@ -327,20 +310,19 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
 
-    // 3. Start DIDComm service for inbound messages
+    // 3. Start DIDComm service for inbound + outbound messages
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm {
+    if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(svc),
-            Ok(None) => None,
+            Ok(Some(svc)) => {
+                let _ = state.didcomm_service.set(svc);
+            }
+            Ok(None) => {}
             Err(e) => {
                 warn!("failed to start DIDComm service: {e}");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
@@ -349,10 +331,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut any_panic = false;
 
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
-        info!("DIDComm service stopped");
-    }
+    // DIDCommService shutdown is handled by the cancellation token
 
     let _ = rest_shutdown_tx.send(true);
     if let Some(handle) = rest_handle {

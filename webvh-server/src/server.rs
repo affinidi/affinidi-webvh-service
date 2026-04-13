@@ -235,12 +235,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // 3. Wait for REST to be serving before starting DIDComm
+    //    (the server's own DID needs to be resolvable for mediator auth)
     let _ = rest_ready_rx.await;
 
+    // 4. Start DIDComm service (single connection for both receiving and sending)
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm {
+    let didcomm_service: Option<Arc<DIDCommService>> = if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(svc),
+            Ok(Some(svc)) => Some(Arc::new(svc)),
             Ok(None) => None,
             Err(e) => {
                 warn!("failed to start DIDComm service: {e}");
@@ -251,13 +253,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // 4. Register with control plane via DIDComm (background task)
-    if state.config.control_did.is_some() && state.config.features.didcomm {
-        let reg_state = state.clone();
-        let reg_secrets = secrets.clone();
-        tokio::spawn(async move {
-            control_register::register_via_didcomm(&reg_state, &reg_secrets).await;
-        });
+    // 5. Register with control plane via DIDComm (uses the shared connection)
+    if let Some(ref svc) = didcomm_service {
+        if state.config.control_did.is_some() {
+            let reg_state = state.clone();
+            let reg_svc = svc.clone();
+            tokio::spawn(async move {
+                control_register::register_via_didcomm(&reg_state, &reg_svc).await;
+            });
+        }
     }
 
     // Wait for shutdown signal
@@ -268,7 +272,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     didcomm_shutdown.cancel();
     if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
+        // Try to get exclusive ownership for clean shutdown; if other tasks
+        // still hold refs, the cancellation token handles stopping.
+        if let Ok(svc) = Arc::try_unwrap(svc) {
+            svc.shutdown().await;
+        }
         info!("DIDComm service stopped");
     }
 

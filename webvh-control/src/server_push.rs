@@ -2,39 +2,37 @@
 //! via the DIDComm mediator.
 //!
 //! When a DID is created, updated, or deleted on the control plane, these
-//! functions send DIDComm messages via the mediator to all active server
-//! instances. Messages are encrypted and routed through the mediator —
-//! no point-to-point connections are made.
+//! functions send DIDComm messages via the shared `DIDCommService` to all
+//! active server instances. Messages are routed through the mediator's
+//! store-and-forward — no point-to-point connections are made.
 
 use std::future::Future;
 
+use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_didcomm_service::DIDCommService;
 use affinidi_webvh_common::DidSyncUpdate;
 use affinidi_webvh_common::did_ops::{self, DidRecord};
+use affinidi_webvh_common::didcomm_types::*;
+use serde_json::json;
 use tracing::{info, warn};
 
-use crate::messaging;
+use crate::auth::session::now_epoch;
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
 
 /// Push the current state of a DID to all active server instances via the mediator.
-///
-/// Reads the DID's log and witness content from the control plane store,
-/// then sends a `did/sync-update` DIDComm message to each server's DID
-/// via `pack_encrypted` + `atm.send_message` through the mediator.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
     let registry_ks = state.registry_ks.clone();
     let dids_ks = state.dids_ks.clone();
     let config = state.config.clone();
-    let atm = match state.atm.clone() {
-        Some(atm) => atm,
-        None => return, // No mediator connection — silently skip
-    };
-    let profile = match state.atm_profile.clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
+        let svc = match didcomm.get() {
+            Some(svc) => svc,
+            None => return, // DIDComm not connected — silently skip
+        };
+
         let control_did = match &config.server_did {
             Some(did) => did.as_str(),
             None => return,
@@ -85,51 +83,29 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             version_count: record.version_count,
         };
 
-        // Get server DIDs from registry metadata
-        let instances = match registry::list_instances(&registry_ks).await {
-            Ok(instances) => instances,
-            Err(e) => {
-                warn!(error = %e, "server push: failed to list instances");
-                return;
-            }
+        // Get server DIDs from registry
+        let servers = match get_active_servers(&registry_ks).await {
+            Some(s) => s,
+            None => return,
         };
 
-        let servers: Vec<_> = instances
-            .into_iter()
-            .filter(|i| {
-                i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
-            })
-            .collect();
-
-        for server in &servers {
-            // The server's DID is stored in the instance metadata during registration
-            let server_did = match server.metadata.get("did").and_then(|v| v.as_str()) {
-                Some(did) => did,
-                None => {
-                    warn!(
-                        instance_id = %server.instance_id,
-                        url = %server.url,
-                        "server push: instance has no DID in metadata — cannot send via mediator"
-                    );
-                    continue;
-                }
-            };
-
+        for (server_did, instance_id) in &servers {
             if let Err(e) = send_with_retry(
-                || messaging::send_sync_update(&atm, &profile, control_did, server_did, &update),
+                || send_sync_update(svc, control_did, server_did, &update),
                 3,
             )
             .await
             {
                 warn!(
-                    server_did = server_did,
+                    server_did,
+                    instance_id,
                     mnemonic = %mnemonic,
                     error = %e,
                     "failed to push DID update via mediator after retries"
                 );
             } else {
                 info!(
-                    server_did = server_did,
+                    server_did,
                     mnemonic = %mnemonic,
                     "pushed DID update to server via mediator"
                 );
@@ -142,63 +118,41 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     let registry_ks = state.registry_ks.clone();
     let config = state.config.clone();
-    let atm = match state.atm.clone() {
-        Some(atm) => atm,
-        None => return,
-    };
-    let profile = match state.atm_profile.clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
+        let svc = match didcomm.get() {
+            Some(svc) => svc,
+            None => return,
+        };
+
         let control_did = match &config.server_did {
             Some(did) => did.as_str(),
             None => return,
         };
 
-        let instances = match registry::list_instances(&registry_ks).await {
-            Ok(instances) => instances,
-            Err(e) => {
-                warn!(error = %e, "server push (delete): failed to list instances");
-                return;
-            }
+        let servers = match get_active_servers(&registry_ks).await {
+            Some(s) => s,
+            None => return,
         };
 
-        let servers: Vec<_> = instances
-            .into_iter()
-            .filter(|i| {
-                i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
-            })
-            .collect();
-
-        for server in &servers {
-            let server_did = match server.metadata.get("did").and_then(|v| v.as_str()) {
-                Some(did) => did,
-                None => {
-                    warn!(
-                        instance_id = %server.instance_id,
-                        "server push (delete): instance has no DID in metadata"
-                    );
-                    continue;
-                }
-            };
-
+        for (server_did, instance_id) in &servers {
             if let Err(e) = send_with_retry(
-                || messaging::send_sync_delete(&atm, &profile, control_did, server_did, &mnemonic),
+                || send_sync_delete(svc, control_did, server_did, &mnemonic),
                 3,
             )
             .await
             {
                 warn!(
-                    server_did = server_did,
+                    server_did,
+                    instance_id,
                     mnemonic = %mnemonic,
                     error = %e,
                     "failed to push DID delete via mediator after retries"
                 );
             } else {
                 info!(
-                    server_did = server_did,
+                    server_did,
                     mnemonic = %mnemonic,
                     "pushed DID delete to server via mediator"
                 );
@@ -207,10 +161,95 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Get active server DIDs and instance IDs from the registry.
+async fn get_active_servers(
+    registry_ks: &crate::store::KeyspaceHandle,
+) -> Option<Vec<(String, String)>> {
+    let instances = match registry::list_instances(registry_ks).await {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(error = %e, "server push: failed to list instances");
+            return None;
+        }
+    };
+
+    let servers: Vec<_> = instances
+        .into_iter()
+        .filter(|i| {
+            i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
+        })
+        .filter_map(|i| {
+            let did = i.metadata.get("did")?.as_str()?.to_string();
+            Some((did, i.instance_id))
+        })
+        .collect();
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+async fn send_sync_update(
+    svc: &DIDCommService,
+    control_did: &str,
+    target_did: &str,
+    update: &DidSyncUpdate,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let body = json!({
+        "mnemonic": update.mnemonic,
+        "did_id": update.did_id,
+        "log_content": update.log_content,
+        "witness_content": update.witness_content,
+        "version_count": update.version_count,
+    });
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_SYNC_UPDATE.to_string(),
+        body,
+    )
+    .from(control_did.to_string())
+    .to(target_did.to_string())
+    .created_time(now_epoch())
+    .finalize();
+
+    svc.send_message("control", msg, target_did)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+async fn send_sync_delete(
+    svc: &DIDCommService,
+    control_did: &str,
+    target_did: &str,
+    mnemonic: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let body = json!({
+        "mnemonic": mnemonic,
+    });
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_SYNC_DELETE.to_string(),
+        body,
+    )
+    .from(control_did.to_string())
+    .to(target_did.to_string())
+    .created_time(now_epoch())
+    .finalize();
+
+    svc.send_message("control", msg, target_did)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
 /// Retry a send operation with exponential backoff.
-///
-/// Retries up to `max_retries` times with 2s, 4s, 8s... backoff.
-/// Returns the last error if all attempts fail.
 async fn send_with_retry<F, Fut, E>(make_future: F, max_retries: u32) -> Result<(), E>
 where
     F: Fn() -> Fut,

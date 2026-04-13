@@ -605,8 +605,10 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     let _ = http_ready_rx.await;
 
     // 4b. DIDComm service (for VTA integration via control plane)
+    //     Stored in the control state's OnceCell so server_push and handlers
+    //     can send messages through the same connection.
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if config.features.didcomm {
+    if config.features.didcomm {
         if let Some(ref state) = control_state {
             info!(
                 server_did = ?state.config.server_did,
@@ -622,39 +624,32 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             {
                 Ok(Some(svc)) => {
                     info!("DIDComm service started successfully");
-                    Some(svc)
+                    let _ = state.didcomm_service.set(svc);
                 }
                 Ok(None) => {
                     warn!(
                         "DIDComm service returned None — check server_did and mediator_did config"
                     );
-                    None
                 }
                 Err(e) => {
                     warn!("failed to start DIDComm service: {e}");
-                    None
                 }
             }
         } else {
             warn!("DIDComm enabled but control plane not enabled — skipping");
-            None
         }
     } else {
         info!("DIDComm disabled in config");
-        None
-    };
+    }
 
     // Wait for HTTP server to complete (shutdown signal received)
     let _ = http_handle.await;
 
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
 
-    // 5a. Cancel DIDComm
+    // 5a. Cancel DIDComm (the OnceCell holds the service; cancellation token stops it)
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
-        info!("DIDComm service stopped");
-    }
+    info!("DIDComm service stopped");
 
     // 5b. Stop storage task (includes final flush + persist main_store)
     let _ = storage_shutdown_tx.send(true);
@@ -931,8 +926,7 @@ async fn build_control(
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),
-        atm: None,
-        atm_profile: None,
+        didcomm_service: Arc::new(tokio::sync::OnceCell::new()),
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),

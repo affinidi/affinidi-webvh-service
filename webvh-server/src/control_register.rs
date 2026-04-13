@@ -1,33 +1,36 @@
 //! Control plane registration — announces this server to the control plane
-//! via DIDComm through the mediator.
+//! via DIDComm through the shared mediator connection.
 //!
 //! On startup, the server sends a `server/register` DIDComm message to the
-//! control plane's DID. The control plane validates the server's DID against
-//! its ACL (must be pre-approved with service role) and adds it to the
-//! service registry.
+//! control plane's DID using the `DIDCommService::send_message()` API.
+//! The control plane validates the server's DID against its ACL (must be
+//! pre-approved with service role) and adds it to the service registry.
 //!
 //! Also provides `apply_single_update` for applying sync'd DID content
 //! received from the control plane (used by `messaging.rs`).
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use affinidi_tdk::common::TDKSharedState;
-use affinidi_tdk::messaging::ATM;
-use affinidi_tdk::messaging::config::ATMConfig;
-use affinidi_tdk::messaging::profiles::ATMProfile;
-use affinidi_tdk::secrets_resolver::SecretsResolver;
-use affinidi_tdk::secrets_resolver::secrets::Secret;
+use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_didcomm_service::DIDCommService;
 use affinidi_webvh_common::DidSyncUpdate;
 use affinidi_webvh_common::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
 };
 use affinidi_webvh_common::didcomm_types::MSG_SERVER_REGISTER;
 use serde_json::json;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::secret_store::ServerSecrets;
 use crate::server::AppState;
 use crate::store::{KeyspaceHandle, Store};
+
+/// Tracks whether this server has successfully registered with the control plane.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if the server has successfully sent a registration message.
+pub fn is_registered() -> bool {
+    REGISTERED.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // DIDComm registration with control plane
@@ -35,12 +38,11 @@ use crate::store::{KeyspaceHandle, Store};
 
 /// Register this server with the control plane via DIDComm.
 ///
-/// Sends a `server/register` message to the control plane's DID through
-/// the mediator. The control plane must have the server's DID pre-approved
-/// in its ACL.
+/// Uses the shared `DIDCommService` connection to send a `server/register`
+/// message. Retries with exponential backoff (5s → 60s, max 20 attempts).
 ///
-/// Retries with exponential backoff (5s → 60s, max 20 attempts).
-pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
+/// The `DIDCommService` must be initialized before calling this.
+pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService) {
     let server_did = match &state.config.server_did {
         Some(did) => did.clone(),
         None => {
@@ -57,87 +59,21 @@ pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
         }
     };
 
-    let mediator_did = match &state.config.mediator_did {
-        Some(did) => did.clone(),
-        None => {
-            warn!("cannot register: mediator_did not configured");
-            return;
-        }
-    };
-
-    let public_url = state.config.public_url.clone().unwrap_or_default();
-
     info!(
         server_did = %server_did,
         control_did = %control_did,
         "registering with control plane via DIDComm"
     );
 
-    // Build a short-lived ATM connection for sending the register message
-    let tdk = TDKSharedState::default().await;
+    let public_url = state.config.public_url.clone().unwrap_or_default();
 
-    // Load secrets for signing and key agreement
-    let signing_kid = format!("{server_did}#key-0");
-    let ka_kid = format!("{server_did}#key-1");
-
-    if let Ok(secret) = Secret::from_multibase(&secrets.signing_key, Some(&signing_kid)) {
-        tdk.secrets_resolver.insert(secret).await;
-    } else {
-        warn!("failed to decode signing key — cannot register");
-        return;
-    }
-
-    if let Ok(secret) = Secret::from_multibase(&secrets.key_agreement_key, Some(&ka_kid)) {
-        tdk.secrets_resolver.insert(secret).await;
-    } else {
-        warn!("failed to decode key agreement key — cannot register");
-        return;
-    }
-
-    let atm_config = match ATMConfig::builder()
-        .with_inbound_message_channel(10)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("failed to build ATM config: {e}");
-            return;
-        }
-    };
-
-    let atm = match ATM::new(atm_config, Arc::new(tdk)).await {
-        Ok(a) => a,
-        Err(e) => {
-            warn!("failed to create ATM: {e}");
-            return;
-        }
-    };
-
-    let profile = match ATMProfile::new(&atm, None, server_did.clone(), Some(mediator_did)).await {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            warn!("failed to create ATM profile: {e}");
-            return;
-        }
-    };
-
-    // Enable websocket — required so messages route through the mediator's
-    // store-and-forward rather than attempting direct delivery.
-    if let Err(e) = atm.profile_enable_websocket(&profile).await {
-        warn!("failed to connect to mediator for registration: {e}");
-        return;
-    }
-
-    // Build the register message
-    let body = json!({
-        "public_url": public_url,
-        "label": "webvh-server",
-    });
-
-    let msg = affinidi_messaging_didcomm::Message::build(
+    let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         MSG_SERVER_REGISTER.to_string(),
-        body,
+        json!({
+            "public_url": public_url,
+            "label": "webvh-server",
+        }),
     )
     .from(server_did.clone())
     .to(control_did.clone())
@@ -147,39 +83,25 @@ pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
     // Retry with exponential backoff
     let mut backoff = 5u64;
     for attempt in 1..=20u32 {
-        match atm
-            .pack_encrypted(&msg, &control_did, Some(&server_did), Some(&server_did))
+        match didcomm_svc
+            .send_message("server", msg.clone(), &control_did)
             .await
         {
-            Ok((packed, _)) => {
-                match atm
-                    .send_message(&profile, &packed, &msg.id, false, false)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            attempt,
-                            control_did = %control_did,
-                            "server registration message sent to control plane"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(
-                            attempt,
-                            error = %e,
-                            backoff_secs = backoff,
-                            "failed to send registration message — retrying"
-                        );
-                    }
-                }
+            Ok(_) => {
+                REGISTERED.store(true, Ordering::Relaxed);
+                info!(
+                    attempt,
+                    control_did = %control_did,
+                    "server registration message sent to control plane"
+                );
+                return;
             }
             Err(e) => {
                 warn!(
                     attempt,
                     error = %e,
                     backoff_secs = backoff,
-                    "failed to pack registration message — retrying"
+                    "failed to send registration message — retrying"
                 );
             }
         }
@@ -188,7 +110,9 @@ pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
         backoff = (backoff * 2).min(60);
     }
 
-    error!("server registration failed after 20 attempts — giving up");
+    warn!(
+        "server registration failed after 20 attempts — will accept sync but may not receive pushes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +120,6 @@ pub async fn register_via_didcomm(state: &AppState, secrets: &ServerSecrets) {
 // ---------------------------------------------------------------------------
 
 /// Apply DID updates received from the control plane.
-///
-/// Each update is validated and stored atomically. Failures are logged
-/// as warnings and do not affect other updates.
 pub async fn apply_did_updates(
     dids_ks: &KeyspaceHandle,
     store: &Store,
@@ -225,7 +146,6 @@ pub async fn apply_single_update(
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
-    // Validate the JSONL content
     validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
 
     let now = now_epoch();
