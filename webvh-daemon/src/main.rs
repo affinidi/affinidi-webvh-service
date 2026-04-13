@@ -106,6 +106,14 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// List all DIDs in the store
+    ListDids,
+    /// Remove a DID and all its data from the store
+    RemoveDid {
+        /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
+        #[arg(long)]
+        path: String,
+    },
     /// Load a DID from existing files
     LoadDid {
         /// Path to store the DID at
@@ -228,6 +236,18 @@ async fn main() {
         }
         Some(Command::RecoverDid { path }) => {
             if let Err(e) = run_recover_did(cli.config, path).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ListDids) => {
+            if let Err(e) = run_list_dids(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RemoveDid { path }) => {
+            if let Err(e) = run_remove_did(cli.config, path).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -466,6 +486,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     }
 
     // 2d. Control plane — merged at root (no prefix)
+    let mut control_state: Option<affinidi_webvh_control::server::AppState> = None;
     if config.enable.control {
         match build_control(
             &config,
@@ -477,8 +498,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         )
         .await
         {
-            Ok(router) => {
+            Ok((router, state)) => {
                 combined = combined.merge(router);
+                control_state = Some(state);
                 enabled_services.push("control (/)");
             }
             Err(e) => {
@@ -536,54 +558,21 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         error!("failed to open sessions keyspace: {e}");
         std::process::exit(1);
     });
-    let registry_ks = main_store.keyspace("registry").unwrap_or_else(|e| {
-        error!("failed to open registry keyspace: {e}");
-        std::process::exit(1);
-    });
-
     let storage_handle = tokio::spawn(run_daemon_storage_task(
         DaemonStorageParams {
             store: main_store.clone(),
             sessions_ks,
             dids_ks: dids_ks.clone(),
-            registry_ks,
             stats_ks,
             auth_config: config.auth.clone(),
-            registry_config: config.registry.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
-            http: http_client,
         },
         storage_shutdown_rx,
     ));
 
-    // 3b. DIDComm service (for VTA integration)
-    let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if config.didcomm {
-        if let Some(ref state) = server_state {
-            match affinidi_webvh_server::server::start_didcomm_service(
-                state,
-                &secrets,
-                didcomm_shutdown.clone(),
-            )
-            .await
-            {
-                Ok(Some(svc)) => Some(svc),
-                Ok(None) => None,
-                Err(e) => {
-                    warn!("failed to start DIDComm service: {e}");
-                    None
-                }
-            }
-        } else {
-            warn!("DIDComm enabled but server not enabled — skipping");
-            None
-        }
-    } else {
-        None
-    };
-
-    // ── Phase 4: Serve HTTP ───────────────────────────────────────────
+    // ── Phase 4: Serve HTTP (must start before DIDComm so self-hosted
+    //    DIDs are resolvable when the mediator connection is established) ──
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -594,19 +583,65 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         });
     info!("daemon listening on {addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(init::shutdown_signal())
-        .await
-        .expect("axum serve failed");
+    let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let http_handle = tokio::spawn(async move {
+        let _ = http_ready_tx.send(());
+        axum::serve(listener, app)
+            .with_graceful_shutdown(init::shutdown_signal())
+            .await
+            .expect("axum serve failed");
+    });
+
+    // Wait for HTTP to be serving before starting DIDComm — the mediator DID
+    // may be hosted by this daemon and needs to be resolvable.
+    let _ = http_ready_rx.await;
+
+    // 4b. DIDComm service (for VTA integration via control plane)
+    //     Stored in the control state so server_push and handlers
+    //     can send messages through the same connection.
+    let didcomm_shutdown = CancellationToken::new();
+    if config.features.didcomm {
+        if let Some(ref mut state) = control_state {
+            info!(
+                server_did = ?state.config.server_did,
+                mediator_did = ?state.config.mediator_did,
+                "starting control plane DIDComm service"
+            );
+            match affinidi_webvh_control::server::start_didcomm_service(
+                state,
+                &secrets,
+                didcomm_shutdown.clone(),
+            )
+            .await
+            {
+                Ok(Some(svc)) => {
+                    info!("DIDComm service started successfully");
+                    let _ = state.didcomm_service.set(svc);
+                }
+                Ok(None) => {
+                    warn!(
+                        "DIDComm service returned None — check server_did and mediator_did config"
+                    );
+                }
+                Err(e) => {
+                    warn!("failed to start DIDComm service: {e}");
+                }
+            }
+        } else {
+            warn!("DIDComm enabled but control plane not enabled — skipping");
+        }
+    } else {
+        info!("DIDComm disabled in config");
+    }
+
+    // Wait for HTTP server to complete (shutdown signal received)
+    let _ = http_handle.await;
 
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
 
-    // 5a. Cancel DIDComm
+    // 5a. Cancel DIDComm (cancellation token stops the service)
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
-        info!("DIDComm service stopped");
-    }
+    info!("DIDComm service stopped");
 
     // 5b. Stop storage task (includes final flush + persist main_store)
     let _ = storage_shutdown_tx.send(true);
@@ -631,13 +666,10 @@ struct DaemonStorageParams {
     store: Store,
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
-    registry_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
     auth_config: affinidi_webvh_common::server::config::AuthConfig,
-    registry_config: affinidi_webvh_control::config::RegistryConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
-    http: reqwest::Client,
 }
 
 async fn run_daemon_storage_task(
@@ -649,18 +681,15 @@ async fn run_daemon_storage_task(
     let session_interval = Duration::from_secs(params.auth_config.session_cleanup_interval);
     let did_ttl_seconds = params.auth_config.cleanup_ttl_minutes * 60;
     let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-    let health_interval = Duration::from_secs(params.registry_config.health_check_interval.max(10));
     let flush_interval = Duration::from_secs(10);
 
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
-    let mut health_timer = tokio::time::interval(health_interval);
     let mut flush_timer = tokio::time::interval(flush_interval);
 
     // Skip first ticks (immediate)
     session_timer.tick().await;
     did_timer.tick().await;
-    health_timer.tick().await;
     flush_timer.tick().await;
 
     loop {
@@ -686,14 +715,6 @@ async fn run_daemon_storage_task(
                         }
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
-                }
-            }
-            _ = health_timer.tick() => {
-                if let Err(e) = affinidi_webvh_control::server::run_health_checks(
-                    &params.registry_ks,
-                    &params.http,
-                ).await {
-                    warn!("health check error: {e}");
                 }
             }
             _ = flush_timer.tick() => {
@@ -843,7 +864,7 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     stats_ks: &KeyspaceHandle,
     http_client: &reqwest::Client,
-) -> ServiceResult {
+) -> Result<(Router, affinidi_webvh_control::server::AppState), AppError> {
     use affinidi_webvh_control::server::AppState;
 
     let control_config = config.control_config();
@@ -871,7 +892,7 @@ async fn build_control(
         }
     });
 
-    let mut state = AppState {
+    let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -883,38 +904,25 @@ async fn build_control(
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),
-        atm: None,
-        atm_profile: None,
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
+        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
     };
 
     // Seed registry from static config
     affinidi_webvh_control::server::seed_registry(&state).await;
 
-    // Initialize outbound ATM for DIDComm sync push messages
-    if config.didcomm {
-        if let Some(ref control_did) = config.server_did {
-            if let Some((atm, profile)) = affinidi_webvh_control::messaging::init_outbound_atm(
-                &state.config,
-                control_did,
-                secrets,
-            )
-            .await
-            {
-                state.atm = Some(atm);
-                state.atm_profile = Some(profile);
-            }
-        } else {
-            warn!("DIDComm enabled but server_did not configured — outbound messaging disabled");
-        }
-    }
+    // In daemon mode, no outbound ATM is needed — there are no external
+    // servers to sync with.  The server_push::notify_servers_* functions
+    // gracefully no-op when state.atm is None.
 
     // Build router without UI fallback — daemon adds its own combined fallback
-    let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
+    let router =
+        affinidi_webvh_control::routes::router_without_fallback().with_state(state.clone());
     info!("control plane service initialized");
 
-    Ok(router)
+    Ok((router, state))
 }
 
 // ===========================================================================
@@ -1518,7 +1526,7 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
     health::print_feature("witness", config.enable.witness);
     health::print_feature("watcher", config.enable.watcher);
     health::print_feature("control", config.enable.control);
-    health::print_feature("didcomm", config.didcomm);
+    health::print_feature("didcomm", config.features.didcomm);
 
     // ── Secrets ────────────────────────────────────────────────────
     health::section("Secrets");
@@ -1618,4 +1626,82 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+async fn run_list_dids(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use affinidi_webvh_common::did_ops::DidRecord;
+
+    let config = DaemonConfig::load(config_path)?;
+    let store = affinidi_webvh_common::server::store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    let raw = dids_ks.prefix_iter_raw("did:").await?;
+
+    if raw.is_empty() {
+        eprintln!("  No DIDs in store.");
+        return Ok(());
+    }
+
+    eprintln!("  {:<25} {:<15} {:<60}", "PATH", "VERSIONS", "DID ID");
+    eprintln!("  {}", "-".repeat(100));
+
+    for (_key, value) in &raw {
+        if let Ok(record) = serde_json::from_slice::<DidRecord>(value) {
+            let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
+            let deleted = if record.deleted_at.is_some() {
+                " [deleted]"
+            } else {
+                ""
+            };
+            let disabled = if record.disabled { " [disabled]" } else { "" };
+            eprintln!(
+                "  {:<25} {:<15} {}{}{}",
+                record.mnemonic, record.version_count, did_id, deleted, disabled
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!("  Total: {} DIDs", raw.len());
+
+    Ok(())
+}
+
+async fn run_remove_did(
+    config_path: Option<PathBuf>,
+    path: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use affinidi_webvh_common::did_ops::{
+        DidRecord, content_log_key, content_witness_key, did_key, owner_key,
+    };
+
+    let config = DaemonConfig::load(config_path)?;
+    let store = affinidi_webvh_common::server::store::Store::open(&config.store).await?;
+    let dids_ks = store.keyspace("dids")?;
+
+    let record: Option<DidRecord> = dids_ks.get(did_key(&path)).await?;
+    let record = match record {
+        Some(r) => r,
+        None => {
+            eprintln!("  DID not found at path '{path}'");
+            std::process::exit(1);
+        }
+    };
+
+    let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
+    eprintln!("  Removing DID at path '{path}'");
+    eprintln!("  DID ID: {did_id}");
+    eprintln!("  Owner:  {}", record.owner);
+
+    let mut batch = store.batch();
+    batch.remove(&dids_ks, did_key(&path));
+    batch.remove(&dids_ks, content_log_key(&path));
+    batch.remove(&dids_ks, content_witness_key(&path));
+    batch.remove(&dids_ks, owner_key(&record.owner, &path));
+    batch.commit().await?;
+
+    eprintln!("  DID removed.");
+    Ok(())
 }

@@ -5,8 +5,6 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use affinidi_tdk::messaging::ATM;
-use affinidi_tdk::messaging::profiles::ATMProfile;
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use affinidi_webvh_common::server::auth::extractor::AuthState;
 use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
@@ -41,15 +39,17 @@ pub struct AppState {
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
-    /// ATM instance for outbound mediator-based DIDComm messaging (None if not configured).
-    pub atm: Option<Arc<ATM>>,
-    /// ATM profile for the control plane's outbound mediator connection.
-    pub atm_profile: Option<Arc<ATMProfile>>,
+    /// DIDComm service for inbound/outbound mediator messaging.
+    /// Wrapped in `OnceLock` so cloned states see it once it's initialized
+    /// (the service starts after REST + DIDComm router are already cloned).
+    pub didcomm_service: Arc<std::sync::OnceLock<DIDCommService>>,
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
     /// Stats keyspace for persistent per-DID stats.
     pub stats_ks: KeyspaceHandle,
+    /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
+    pub signing_key_bytes: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -110,6 +110,18 @@ impl PasskeyState for AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+    // Validate that at least one management interface is enabled
+    if !config.features.rest_api && !config.features.didcomm {
+        return Err(AppError::Config(
+            "at least one of 'rest_api' or 'didcomm' must be enabled in [features]".into(),
+        ));
+    }
+
+    #[cfg(feature = "ui")]
+    if !config.features.rest_api {
+        warn!("UI feature is compiled in but rest_api is disabled — UI will not be accessible");
+    }
+
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -151,13 +163,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     // Gather storage thread inputs before moving config into Arc
     let storage_sessions_ks = sessions_ks.clone();
-    let storage_registry_ks = registry_ks.clone();
     let storage_auth_config = config.auth.clone();
-    let storage_registry_config = config.registry.clone();
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    let mut state = AppState {
+    let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -169,8 +179,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
-        atm: None,
-        atm_profile: None,
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
             let collector = StatsCollector::new();
@@ -215,24 +224,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             Arc::new(collector)
         },
         stats_ks: stats_ks.clone(),
+        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
     };
 
     // Seed registry from static config
     seed_registry(&state).await;
-
-    // Initialize outbound ATM connection for sync push messages
-    if state.config.features.didcomm {
-        if let Some(ref control_did) = state.config.server_did {
-            if let Some((atm, profile)) =
-                messaging::init_outbound_atm(&state.config, control_did, &secrets).await
-            {
-                state.atm = Some(atm);
-                state.atm_profile = Some(profile);
-            }
-        } else {
-            warn!("DIDComm enabled but server_did not configured — messaging disabled");
-        }
-    }
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -246,8 +242,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     );
     info!(
         "  DIDComm  : {}",
-        if state.atm.is_some() {
-            "enabled (mediator connected)"
+        if state.config.features.didcomm {
+            "enabled"
         } else {
             "disabled"
         }
@@ -284,9 +280,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // 2. Spawn storage thread (cleanup + health checks + stats flush)
+    // 2. Spawn storage thread (cleanup + stats flush)
     let mut storage_shutdown = storage_shutdown_rx.clone();
-    let storage_http = state.http_client.clone();
     let storage_stats_ks = state.stats_ks.clone();
     let storage_dids_ks = state.dids_ks.clone();
     let storage_collector = state.stats_collector.clone();
@@ -296,13 +291,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             run_storage_thread(
                 store,
                 storage_sessions_ks,
-                storage_registry_ks,
                 storage_stats_ks,
                 storage_dids_ks,
                 storage_auth_config,
-                storage_registry_config,
                 has_auth,
-                storage_http,
                 storage_collector,
                 &mut storage_shutdown,
             )
@@ -312,32 +304,56 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
 
-    // 3. Start DIDComm service for inbound messages
+    // 3. Start DIDComm service for inbound + outbound messages
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm {
+    if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(svc),
-            Ok(None) => None,
+            Ok(Some(svc)) => {
+                let _ = state.didcomm_service.set(svc);
+            }
+            Ok(None) => {}
             Err(e) => {
                 warn!("failed to start DIDComm service: {e}");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
+
+    // 4. Spawn DIDComm health check task (runs on main tokio runtime)
+    let health_shutdown = CancellationToken::new();
+    let health_token = health_shutdown.clone();
+    let health_registry_ks = state.registry_ks.clone();
+    let health_didcomm = state.didcomm_service.clone();
+    let health_control_did = state.config.server_did.clone();
+    let health_interval_secs = state.config.registry.health_check_interval.max(10);
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(health_interval_secs));
+        timer.tick().await; // skip first tick
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    if let Err(e) = run_health_checks(
+                        &health_registry_ks,
+                        &health_didcomm,
+                        health_control_did.as_deref(),
+                        health_interval_secs,
+                    ).await {
+                        warn!("health check error: {e}");
+                    }
+                }
+                _ = health_token.cancelled() => break,
+            }
+        }
+    });
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
-    // Ordered shutdown: DIDComm → REST → Storage
+    // Ordered shutdown: health → DIDComm → REST → Storage
     let mut any_panic = false;
 
+    health_shutdown.cancel();
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
-        info!("DIDComm service stopped");
-    }
+    // DIDCommService shutdown is handled by the cancellation token
 
     let _ = rest_shutdown_tx.send(true);
     if let Some(handle) = rest_handle {
@@ -379,7 +395,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup (inbound)
 // ---------------------------------------------------------------------------
 
-async fn start_didcomm_service(
+pub async fn start_didcomm_service(
     state: &AppState,
     secrets: &ServerSecrets,
     shutdown: CancellationToken,
@@ -400,6 +416,12 @@ async fn start_didcomm_service(
         }
     };
 
+    info!(
+        control_did = control_did,
+        mediator_did = mediator_did,
+        "building TDK profile for DIDComm"
+    );
+
     let profile = build_tdk_profile(
         "control",
         control_did,
@@ -408,6 +430,8 @@ async fn start_didcomm_service(
         state.did_resolver.as_ref(),
     )
     .await?;
+
+    info!("TDK profile built, configuring DIDComm listener");
 
     let listener = ListenerConfig {
         id: "control".into(),
@@ -419,8 +443,10 @@ async fn start_didcomm_service(
         ..Default::default()
     };
 
-    let router = messaging::build_control_router()
+    let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    info!("starting DIDComm service with mediator connection");
 
     let svc = DIDCommService::start(
         DIDCommServiceConfig {
@@ -536,13 +562,10 @@ fn run_rest_thread(
 fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
-    registry_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     auth_config: AuthConfig,
-    registry_config: crate::config::RegistryConfig,
     has_auth: bool,
-    http: reqwest::Client,
     collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
@@ -555,16 +578,13 @@ fn run_storage_thread(
         info!("storage thread started");
 
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
-        let health_interval = Duration::from_secs(registry_config.health_check_interval.max(10));
         let flush_interval = Duration::from_secs(10);
 
         let mut session_timer = tokio::time::interval(session_interval);
-        let mut health_timer = tokio::time::interval(health_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
 
         // Skip first tick (immediate)
         session_timer.tick().await;
-        health_timer.tick().await;
         flush_timer.tick().await;
 
         loop {
@@ -572,11 +592,6 @@ fn run_storage_thread(
                 _ = session_timer.tick(), if has_auth => {
                     if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
                         warn!("session cleanup error: {e}");
-                    }
-                }
-                _ = health_timer.tick() => {
-                    if let Err(e) = run_health_checks(&registry_ks, &http).await {
-                        warn!("health check error: {e}");
                     }
                 }
                 _ = flush_timer.tick() => {
@@ -688,35 +703,56 @@ pub async fn flush_stats_to_store(
     Ok(())
 }
 
-/// Run health checks against all registered instances in parallel.
+/// Send DIDComm health pings to all registered instances and evaluate
+/// staleness-based status from the last received pong timestamp.
 pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
-    http: &reqwest::Client,
+    didcomm: &std::sync::OnceLock<DIDCommService>,
+    control_did: Option<&str>,
+    health_interval_secs: u64,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
-    // Run all health checks concurrently
-    let mut handles = Vec::with_capacity(instances.len());
-    for inst in instances {
-        let http = http.clone();
-        handles.push(tokio::spawn(async move {
-            let new_status = registry::health_check(&http, &inst).await;
-            (inst, new_status)
-        }));
-    }
+    // Send health pings via DIDComm (fire-and-forget — pong handler updates status)
+    if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
+        for inst in &instances {
+            let server_did = match inst.metadata.get("did").and_then(|v| v.as_str()) {
+                Some(did) => did,
+                None => continue,
+            };
 
-    for handle in handles {
-        if let Ok((inst, new_status)) = handle.await {
-            if new_status != inst.status {
-                info!(
+            let msg = affinidi_messaging_didcomm::Message::build(
+                uuid::Uuid::new_v4().to_string(),
+                affinidi_webvh_common::didcomm_types::MSG_HEALTH_PING.to_string(),
+                serde_json::json!({}),
+            )
+            .from(ctrl_did.to_string())
+            .to(server_did.to_string())
+            .created_time(now)
+            .finalize();
+
+            if let Err(e) = svc.send_message("control", msg, server_did).await {
+                debug!(
                     instance_id = %inst.instance_id,
-                    url = %inst.url,
-                    old_status = ?inst.status,
-                    new_status = ?new_status,
-                    "instance status changed"
+                    server_did,
+                    error = %e,
+                    "failed to send health ping"
                 );
             }
+        }
+    }
+
+    // Evaluate status based on last pong timestamp
+    for inst in &instances {
+        let new_status = registry::health_status_from_timestamp(inst, now, health_interval_secs);
+        if new_status != inst.status {
+            info!(
+                instance_id = %inst.instance_id,
+                old_status = ?inst.status,
+                new_status = ?new_status,
+                "instance status changed"
+            );
             registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now)
                 .await?;
         }

@@ -1,11 +1,12 @@
 mod acl;
 mod auth;
 mod did_manage;
+mod didcomm;
 pub mod health;
 mod passkey;
 mod proxy;
 mod registry;
-mod stats_sync;
+pub(crate) mod stats_sync;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -89,6 +90,8 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route("/services/overview", get(did_manage::get_services_overview))
         // Config
         .route("/config", get(did_manage::get_config))
+        // DIDComm protocol endpoint (signed message exchange)
+        .route("/didcomm", post(didcomm::handle))
         // Stats sync (server → control plane, no auth — servers self-identify by DID)
         .route("/control/stats", post(stats_sync::receive_stats))
         // Control plane

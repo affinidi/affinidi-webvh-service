@@ -2,6 +2,7 @@ mod client;
 mod control_client;
 pub mod did;
 pub mod did_ops;
+pub mod didcomm_types;
 mod error;
 mod types;
 mod watcher_client;

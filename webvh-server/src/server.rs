@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
-use crate::bootstrap;
 use crate::config::{AppConfig, AuthConfig};
 use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
@@ -105,15 +104,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Extract raw signing key bytes for pack_signed operations
     let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
-    // Bind TCP listener on the main thread for early port validation (only if REST is enabled)
-    let std_listener = if config.features.rest_api {
-        let addr = format!("{}:{}", config.server.host, config.server.port);
+    // Always bind TCP — the server must serve public DID documents even when
+    // the management REST API is disabled. The rest_api flag controls whether
+    // /api/* routes are included, not whether HTTP is served.
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let std_listener = {
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
         listener.set_nonblocking(true).map_err(AppError::Io)?;
         info!("server listening addr={addr}");
-        Some(listener)
-    } else {
-        None
+        listener
     };
 
     // Gather storage thread inputs before moving config into Arc
@@ -190,29 +189,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // REST ready signal — DIDComm waits for this before starting
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
-    // 1. Spawn REST thread first — HTTP must be available before DIDComm starts
-    let rest_handle = if let Some(listener) = std_listener {
-        let mut rest_shutdown = rest_shutdown_rx.clone();
-        let rest_state = state.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("webvh-rest".into())
-                .spawn(move || {
-                    run_rest_thread(
-                        listener,
-                        rest_state,
-                        upload_body_limit,
-                        &mut rest_shutdown,
-                        rest_ready_tx,
-                    )
-                })
-                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
-        )
-    } else {
-        // Signal ready immediately so DIDComm doesn't wait forever
-        let _ = rest_ready_tx.send(());
-        None
-    };
+    // 1. Spawn HTTP thread first — must be serving before DIDComm starts
+    //    (the server's own DID needs to be resolvable for mediator auth)
+    let mut rest_shutdown = rest_shutdown_rx.clone();
+    let rest_state = state.clone();
+    let rest_handle = std::thread::Builder::new()
+        .name("webvh-rest".into())
+        .spawn(move || {
+            run_rest_thread(
+                std_listener,
+                rest_state,
+                upload_body_limit,
+                &mut rest_shutdown,
+                rest_ready_tx,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn HTTP thread: {e}")))?;
 
     // 2. Spawn storage thread (independent cleanup, flush, sync)
     let mut storage_shutdown = storage_shutdown_rx.clone();
@@ -243,8 +235,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // 3. Wait for REST to be serving before starting DIDComm
+    //    (the server's own DID needs to be resolvable for mediator auth)
     let _ = rest_ready_rx.await;
 
+    // 4. Start DIDComm service (single connection for both receiving and sending)
     let didcomm_shutdown = CancellationToken::new();
     let didcomm_service = if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
@@ -259,52 +253,67 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // 4. Register with control plane in background (after REST is serving so our DID is resolvable)
-    if let Some(control_url) = state.config.control_url.clone() {
-        if let Some(server_did) = state.config.server_did.clone() {
-            use affinidi_tdk::secrets_resolver::secrets::Secret;
-            let kid = format!("{server_did}#key-0");
-            match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-                Ok(signing_secret) => {
-                    let public_url = state.config.public_url.clone().unwrap_or_default();
-                    let dids_ks = state.dids_ks.clone();
-                    let store_clone = state.store.clone();
-                    let cache = state.did_cache.clone();
-                    tokio::spawn(async move {
-                        let params = control_register::ControlRegistrationParams {
-                            control_url: &control_url,
-                            server_did: &server_did,
-                            signing_secret: &signing_secret,
-                            public_url: &public_url,
-                            label: None,
-                            dids_ks: &dids_ks,
-                            store: &store_clone,
-                            did_cache: &cache,
-                        };
-                        control_register::register_with_control_retry(&params).await;
-                    });
+    // 5. Register with control plane via DIDComm (uses the shared connection)
+    if let Some(ref svc) = didcomm_service
+        && state.config.control_did.is_some()
+    {
+        let reg_state = state.clone();
+        let reg_svc = svc.clone();
+        tokio::spawn(async move {
+            control_register::register_via_didcomm(&reg_state, &reg_svc).await;
+        });
+    }
+
+    // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
+    let stats_sync_shutdown = CancellationToken::new();
+    let didcomm_sync_interval = state.config.stats.sync_interval_secs;
+    if let (Some(svc), Some(control_did), Some(server_did)) = (
+        didcomm_service.as_ref(),
+        state.config.control_did.as_ref(),
+        state.config.server_did.as_ref(),
+    ) && didcomm_sync_interval > 0
+    {
+        let token = stats_sync_shutdown.clone();
+        let svc = svc.clone();
+        let control_did = control_did.clone();
+        let server_did = server_did.clone();
+        let collector = stats_collector.clone();
+        tokio::spawn(async move {
+            let mut timer =
+                tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
+            timer.tick().await; // skip first tick
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        stats::sync_to_control_didcomm(
+                            &svc,
+                            &server_did,
+                            &control_did,
+                            &collector,
+                        ).await;
+                    }
+                    _ = token.cancelled() => break,
                 }
-                Err(e) => warn!("cannot register with control: {e}"),
             }
-        } else {
-            warn!("control_url set but server_did missing — skipping registration");
-        }
+        });
     }
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
-    // Ordered shutdown: DIDComm → REST → Storage
+    // Ordered shutdown: stats sync → DIDComm → REST → Storage
     let mut any_panic = false;
 
+    stats_sync_shutdown.cancel();
     didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
+    if let Some(ref svc) = didcomm_service {
         svc.shutdown().await;
         info!("DIDComm service stopped");
     }
 
     let _ = rest_shutdown_tx.send(true);
-    if let Some(handle) = rest_handle {
+    {
+        let handle = rest_handle;
         match tokio::time::timeout(
             Duration::from_secs(30),
             tokio::task::spawn_blocking(move || handle.join()),
@@ -436,12 +445,20 @@ fn run_rest_thread(
         .expect("failed to build REST runtime");
 
     rt.block_on(async {
-        info!("REST thread started (multi-threaded, 4 workers)");
-
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
-        let app = routes::router(upload_body_limit)
+        // When rest_api is disabled, serve only public DID routes + health.
+        // When enabled, serve full management API + public DID routes.
+        let base_router = if state.config.features.rest_api {
+            info!("HTTP thread started (REST API + public DID serving)");
+            routes::router(upload_body_limit)
+        } else {
+            info!("HTTP thread started (public DID serving only, REST API disabled)");
+            routes::router_public_only().fallback(routes::did_public::serve_public)
+        };
+
+        let app = base_router
             .with_state(state)
             .layer(
                 TraceLayer::new_for_http()
@@ -601,68 +618,20 @@ fn mnemonic_from_did(did: &str) -> Option<String> {
     Some(mnemonic)
 }
 
+/// Verify DIDs in the store and log their status.
+///
+/// The server is a read-only edge node — it does not auto-create DIDs.
+/// The setup wizard or `bootstrap-did` CLI command creates the server's
+/// identity DID. This function only verifies and logs what's present.
 pub async fn auto_bootstrap_dids(
-    mut config: AppConfig,
-    store: &Store,
+    config: AppConfig,
+    _store: &Store,
     dids_ks: &KeyspaceHandle,
-    secrets: &ServerSecrets,
+    _secrets: &ServerSecrets,
 ) -> AppConfig {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-
-    let public_url = match &config.public_url {
-        Some(url) => url.clone(),
-        None => return config,
-    };
-
-    let signing_secret = match Secret::from_multibase(&secrets.signing_key, None) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("auto-bootstrap: failed to decode signing key: {e}");
-            return config;
-        }
-    };
-
-    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
-
-    // Discover mediator from VTA DID (if configured) for the DID document
-    let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
-        use affinidi_webvh_common::server::didcomm_profile::resolve_mediator_did;
-        resolve_mediator_did(vta_did, None).await
-    } else {
-        None
-    };
-
-    // Bootstrap root DID (.well-known) if it doesn't exist
-    match bootstrap::root_did_exists(dids_ks).await {
-        Ok(false) => {
-            match bootstrap::bootstrap_root_did(
-                store,
-                dids_ks,
-                &signing_secret,
-                ka_secret.as_ref(),
-                mediator_uri.as_deref(),
-                &public_url,
-            )
-            .await
-            {
-                Ok(result) => {
-                    info!(did = %result.did_id, path = ".well-known", "auto-bootstrapped root DID");
-                    if config.server_did.is_none() {
-                        info!("setting server_did to bootstrapped DID");
-                        config.server_did = Some(result.did_id);
-                    }
-                }
-                Err(e) => warn!("auto-bootstrap: failed to create root DID: {e}"),
-            }
-        }
-        Ok(true) => {}
-        Err(e) => warn!("auto-bootstrap: failed to check root DID: {e}"),
-    }
-
-    // Verify server_did exists in store (if configured and not root)
+    // Verify server_did exists in store (if configured)
     if let Some(ref server_did) = config.server_did
         && let Some(mnemonic) = mnemonic_from_did(server_did)
-        && mnemonic != ".well-known"
     {
         let exists = dids_ks
             .contains_key(format!("did:{mnemonic}"))

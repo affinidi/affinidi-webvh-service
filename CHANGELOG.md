@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+## 0.5.0 (2026-04-13)
+
+### Added
+- **webvh-server**: DIDComm-based server registration with control plane,
+  replacing HTTP-based registration. Servers now authenticate and register
+  via DIDComm messages over a persistent websocket connection.
+- **webvh-server**: DIDComm health ping/pong replaces HTTP health checks,
+  providing reliable liveness monitoring over the existing DIDComm channel.
+- **webvh-server**: `list-dids` and `remove-did` CLI commands for managing
+  DIDs directly from the server command line.
+- **webvh-control**: Consolidated VTA provisioning protocol — the control
+  plane now handles the full DIDComm VTA flow (did/request, did/publish)
+  for all registered servers.
+- **webvh-control**: Auto-adds its own DID to server ACL on registration,
+  enabling seamless DID sync without manual ACL configuration.
+- **webvh-common**: Shared DIDComm message type constants for health,
+  stats, and DID sync protocols.
+
+### Changed
+- **webvh-server**: Management routes removed from server edge nodes.
+  All DID management is now done through the control plane; servers are
+  read-only edge nodes that serve DID documents.
+- **webvh-server**: Single DIDComm connection per service using
+  `DIDCommService` v0.2.0, replacing per-operation connections.
+- **webvh-server**: Setup wizard simplified for read-only edge node role —
+  asks only for DID hosting URL instead of full server configuration.
+- **webvh-server**: DID path derived from URL instead of hardcoded
+  `.well-known`, supporting flexible DID hosting configurations.
+- **webvh-control**: DIDComm service and handlers restructured for
+  improved message routing and handler visibility.
+- **webvh-daemon**: DIDComm config flag now read from `[features]` section.
+  HTTP server starts before DIDComm to avoid self-resolution race condition.
+
+### Fixed
+- **webvh-server**: Always serve HTTP for public DID resolution regardless
+  of `rest_api` flag — DID documents must remain publicly accessible.
+- **webvh-server**: Websocket connection established before sending
+  registration message, preventing message loss.
+- **webvh-control**: DID sync and stats flow now works reliably between
+  control plane and registered servers.
+- **webvh-control**: DIDComm service properly visible to route handlers.
+- Improved DIDComm error logging across all services.
+
+### Performance
+- Suppressed noisy health-ping/pong and stats-ack request logs to reduce
+  log volume in production.
+
+### Dependencies
+- `affinidi-messaging-didcomm-service` 0.1 → 0.2
+
 ## 0.4.2 (2026-04-13)
 
 ### Added

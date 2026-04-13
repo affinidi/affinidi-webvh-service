@@ -1,179 +1,154 @@
 //! Control plane registration — announces this server to the control plane
-//! using DIDComm challenge-response authentication and reports preloaded DIDs
-//! for synchronisation.
+//! via DIDComm through the shared mediator connection.
+//!
+//! On startup, the server sends a `server/register` DIDComm message to the
+//! control plane's DID using the `DIDCommService::send_message()` API.
+//! The control plane validates the server's DID against its ACL (must be
+//! pre-approved with service role) and adds it to the service registry.
+//!
+//! Also provides `apply_single_update` for applying sync'd DID content
+//! received from the control plane (used by `messaging.rs`).
 
-use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_webvh_common::{ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest};
-use tracing::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::did_ops::{
+use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_didcomm_service::DIDCommService;
+use affinidi_webvh_common::DidSyncUpdate;
+use affinidi_webvh_common::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
 };
+use affinidi_webvh_common::didcomm_types::MSG_SERVER_REGISTER;
+use affinidi_webvh_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+use serde_json::json;
+use tracing::{info, warn};
+
+use crate::server::AppState;
 use crate::store::{KeyspaceHandle, Store};
 
-/// Parameters for control plane registration.
-pub struct ControlRegistrationParams<'a> {
-    pub control_url: &'a str,
-    pub server_did: &'a str,
-    pub signing_secret: &'a Secret,
-    pub public_url: &'a str,
-    pub label: Option<&'a str>,
-    pub dids_ks: &'a KeyspaceHandle,
-    pub store: &'a Store,
-    pub did_cache: &'a crate::cache::ContentCache,
+/// Tracks whether this server has successfully registered with the control plane.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if the server has successfully sent a registration message.
+pub fn is_registered() -> bool {
+    REGISTERED.load(Ordering::Relaxed)
 }
 
-/// Register with the control plane, retrying with exponential backoff.
+// ---------------------------------------------------------------------------
+// DIDComm registration with control plane
+// ---------------------------------------------------------------------------
+
+/// Register this server with the control plane via DIDComm.
 ///
-/// Keeps retrying until registration succeeds. Backoff starts at 5s and
-/// caps at 60s. Designed to run as a background task so the server can
-/// start serving while waiting for the control plane to become available.
-pub async fn register_with_control_retry(params: &ControlRegistrationParams<'_>) {
-    const MAX_RETRIES: u32 = 20; // ~10 minutes with exponential backoff
-    let mut backoff = 5u64;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        if register_with_control(params).await {
+/// Uses the shared `DIDCommService` connection to send a `server/register`
+/// message. Retries with exponential backoff (5s → 60s, max 20 attempts).
+///
+/// The `DIDCommService` must be initialized before calling this.
+pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService) {
+    let server_did = match &state.config.server_did {
+        Some(did) => did.clone(),
+        None => {
+            warn!("cannot register: server_did not configured");
             return;
         }
-        if attempt >= MAX_RETRIES {
-            error!("control plane registration failed after {attempt} attempts — giving up");
-            return;
-        }
-        info!(
-            attempt,
-            max = MAX_RETRIES,
-            backoff_secs = backoff,
-            "retrying control plane registration"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(60);
-    }
-}
-
-/// Register this server instance with the control plane via DIDComm auth.
-///
-/// 1. Authenticates with the control plane using DIDComm challenge-response
-/// 2. Collects preloaded (system-owned) DIDs from the store
-/// 3. Sends registration request with DID sync data
-/// 4. Applies any DID updates received from the control plane
-///
-/// Returns `true` on success, `false` on failure (logged as warnings).
-pub async fn register_with_control(params: &ControlRegistrationParams<'_>) -> bool {
-    let ControlRegistrationParams {
-        control_url,
-        server_did,
-        signing_secret,
-        public_url,
-        label,
-        dids_ks,
-        store,
-        did_cache,
-    } = params;
-
-    // 1. Authenticate with control plane via DIDComm
-    let mut client = ControlClient::new(control_url);
-    if let Err(e) = client.authenticate(server_did, signing_secret).await {
-        warn!(
-            control_url = %control_url,
-            error = %e,
-            "failed to authenticate with control plane"
-        );
-        return false;
-    }
-
-    // 2. Collect preloaded DIDs (system-owned)
-    let preloaded_dids = collect_preloaded_dids(dids_ks).await;
-
-    // 3. Register service with DID sync
-    let req = RegisterServiceRequest {
-        service_type: "server".to_string(),
-        url: public_url.to_string(),
-        label: label.map(String::from),
-        preloaded_dids,
     };
 
-    match client.register_service(&req).await {
-        Ok(resp) => {
-            if let Some(ref hosting_url) = resp.did_hosting_url {
-                info!(did_hosting_url = %hosting_url, "control plane provided DID hosting URL");
-            }
-            info!(
-                control_url = %control_url,
-                instance_id = %resp.instance_id,
-                did_updates = resp.did_updates.len(),
-                "registered with control plane"
-            );
+    let control_did = match &state.config.control_did {
+        Some(did) => did.clone(),
+        None => {
+            info!("no control_did configured — skipping registration");
+            return;
+        }
+    };
 
-            // 4. Apply any DID updates from the control plane
-            if !resp.did_updates.is_empty() {
-                apply_did_updates(dids_ks, store, &resp.did_updates, did_cache).await;
+    info!(
+        server_did = %server_did,
+        control_did = %control_did,
+        "registering with control plane via DIDComm"
+    );
+
+    // Ensure the control plane DID is in the server's ACL so it can send
+    // sync-update and sync-delete messages that pass the ACL check.
+    match get_acl_entry(&state.acl_ks, &control_did).await {
+        Ok(Some(entry)) => {
+            info!(
+                control_did = %control_did,
+                role = %entry.role,
+                "control plane DID already in ACL"
+            );
+        }
+        Ok(None) => {
+            let entry = AclEntry {
+                did: control_did.clone(),
+                role: Role::Service,
+                label: Some("control-plane".to_string()),
+                created_at: crate::auth::session::now_epoch(),
+                max_total_size: None,
+                max_did_count: None,
+            };
+            if let Err(e) = store_acl_entry(&state.acl_ks, &entry).await {
+                warn!(error = %e, "failed to add control plane DID to ACL");
+            } else {
+                info!(control_did = %control_did, "added control plane DID to ACL with service role");
             }
-            true
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to check ACL for control plane DID");
+        }
+    }
+
+    let public_url = state.config.public_url.clone().unwrap_or_default();
+
+    // Wait for the mediator connection to be established before sending
+    if let Err(e) = didcomm_svc
+        .wait_connected("server", std::time::Duration::from_secs(30))
+        .await
+    {
+        warn!(error = %e, "timed out waiting for mediator connection — skipping registration");
+        return;
+    }
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_SERVER_REGISTER.to_string(),
+        json!({
+            "public_url": public_url,
+            "label": "webvh-server",
+        }),
+    )
+    .from(server_did.clone())
+    .to(control_did.clone())
+    .created_time(crate::auth::session::now_epoch())
+    .finalize();
+
+    // Send with built-in retry (waits for reconnection between attempts)
+    match didcomm_svc
+        .send_message_with_retry(
+            "server",
+            msg,
+            &control_did,
+            10,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(()) => {
+            REGISTERED.store(true, Ordering::Relaxed);
+            info!(control_did = %control_did, "server registered with control plane");
         }
         Err(e) => {
             warn!(
-                control_url = %control_url,
                 error = %e,
-                "control plane registration failed"
+                "server registration failed — will accept sync but may not receive pushes"
             );
-            false
         }
     }
 }
 
-/// Collect all system-owned (preloaded) DIDs from the store.
-async fn collect_preloaded_dids(dids_ks: &KeyspaceHandle) -> Vec<DidSyncEntry> {
-    let entries = match dids_ks.prefix_iter_raw("owner:system:").await {
-        Ok(entries) => entries,
-        Err(e) => {
-            warn!("failed to iterate system DIDs: {e}");
-            return Vec::new();
-        }
-    };
-
-    let prefix = b"owner:system:";
-    let mut result = Vec::new();
-    for (key, _value) in &entries {
-        // Key format: "owner:system:{mnemonic}"
-        let mnemonic = if key.starts_with(prefix) {
-            match std::str::from_utf8(&key[prefix.len()..]) {
-                Ok(m) => m.to_string(),
-                Err(_) => continue,
-            }
-        } else {
-            continue;
-        };
-
-        // Look up the DidRecord to get metadata
-        match dids_ks.get::<DidRecord>(did_key(&mnemonic)).await {
-            Ok(Some(record)) => {
-                result.push(DidSyncEntry {
-                    mnemonic,
-                    did_id: record.did_id,
-                    version_count: record.version_count,
-                    updated_at: record.updated_at,
-                });
-            }
-            Ok(None) => {
-                // Orphaned owner key, skip
-                continue;
-            }
-            Err(e) => {
-                warn!(mnemonic = %mnemonic, error = %e, "failed to read DID record");
-                continue;
-            }
-        }
-    }
-
-    result
-}
+// ---------------------------------------------------------------------------
+// DID sync helpers (used by messaging.rs for sync-update handling)
+// ---------------------------------------------------------------------------
 
 /// Apply DID updates received from the control plane.
-///
-/// Each update is validated and stored atomically. Failures are logged
-/// as warnings and do not affect other updates.
 pub async fn apply_did_updates(
     dids_ks: &KeyspaceHandle,
     store: &Store,
@@ -200,8 +175,7 @@ pub async fn apply_single_update(
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
-    // Validate the JSONL content
-    validate_did_jsonl(&update.log_content)?;
+    validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
 
     let now = now_epoch();
     let record = DidRecord {

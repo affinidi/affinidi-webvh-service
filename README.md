@@ -42,11 +42,11 @@ Standalone mode:                          Daemon mode:
 
 | Crate | Binary | Description |
 | ----- | ------ | ----------- |
-| [webvh-server](webvh-server/) | `webvh-server` | DID hosting and lifecycle management — create, upload, resolve, delete DIDs with REST API and DIDComm v2 authentication |
+| [webvh-server](webvh-server/) | `webvh-server` | Read-only DID hosting edge node — serves DID documents publicly and receives sync updates from the control plane via DIDComm |
 | [webvh-witness](webvh-witness/) | `webvh-witness` | Witness node — generates and manages cryptographic witness proofs for DID integrity verification |
 | [webvh-watcher](webvh-watcher/) | `webvh-watcher` | Read-only DID mirror — receives pushed DID updates from servers and serves them publicly for redundancy |
-| [webvh-control](webvh-control/) | `webvh-control` | Control plane — unified management UI, service registry, reverse proxy to backend services, passkey authentication |
-| [webvh-daemon](webvh-daemon/) | `webvh-daemon` | Unified daemon — embeds server + witness + watcher + control plane in a single binary for simple deployments |
+| [webvh-control](webvh-control/) | `webvh-control` | Control plane — DID lifecycle management via DIDComm and REST API, management UI, service registry, passkey authentication |
+| [webvh-daemon](webvh-daemon/) | `webvh-daemon` | Unified daemon — embeds server + witness + watcher + control plane in a single binary (recommended for most deployments) |
 | [webvh-common](webvh-common/) | *(library)* | Shared types, traits, auth, ACL, storage, config, and passkey modules used by all services |
 
 ## Quick Start
@@ -90,7 +90,7 @@ See each crate's README for detailed setup instructions.
 
 The `webvh-server` crate includes an example CLI (`webvh-server/examples/client.rs`)
 that demonstrates the full flow of programmatically creating a `did:webvh` DID
-and uploading it to a running webvh-server. It handles DIDComm v2
+and uploading it to a running webvh-control or webvh-daemon. It handles DIDComm v2
 authentication, DID document construction, WebVH log entry creation, and
 upload.
 

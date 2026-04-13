@@ -1,13 +1,14 @@
 # Affinidi WebVH Server
 
-The WebVH Server hosts and manages
-[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It provides a
-REST API for DID lifecycle management (create, upload, delete),
-access control, statistics, and public DID resolution endpoints.
+The WebVH Server is a read-only DID hosting edge node for
+[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
+documents publicly and receives sync updates from the
+[control plane](../webvh-control/) via DIDComm through a mediator.
 
-When a DID is published, the server can optionally push the content
-to registered [watcher](../webvh-watcher/) instances for read-only
-replication.
+All DID lifecycle management (create, publish, delete) is handled
+by the control plane. The server's role is to host and resolve
+DIDs at its public URL. For a self-contained deployment, use the
+[daemon](../webvh-daemon/) instead.
 
 > **IMPORTANT:**
 > affinidi-webvh-service crates are provided "as is" without any
@@ -287,8 +288,18 @@ enabled by default.
 ```
 webvh-server                      # Run server (default)
 webvh-server setup                # Interactive config wizard
+webvh-server health               # Run health check diagnostics
 webvh-server add-acl              # Add ACL entry
 webvh-server list-acl             # List ACL entries
+webvh-server remove-acl           # Remove ACL entry
+webvh-server list-dids            # List all DIDs in the store
+webvh-server remove-did           # Remove a DID from the store
+webvh-server dump-did             # Dump DID log for a path
+webvh-server load-did             # Load a DID at an arbitrary path
+webvh-server bootstrap-did        # Bootstrap a DID (defaults to .well-known)
+webvh-server recreate-did         # Recreate a DID at a given path
+webvh-server recover-did          # Recover a soft-deleted DID
+webvh-server import-secrets       # Import secrets from VTA bundle or keys
 webvh-server backup               # Export data to backup file
 webvh-server restore              # Restore data from backup file
 ```
@@ -368,19 +379,20 @@ All API endpoints are under the `/api` prefix.
 | `POST` | `/api/auth/`          | Submit DIDComm auth |
 | `POST` | `/api/auth/refresh`   | Refresh token       |
 
-### DID Management (authenticated)
+### DID Sync & Introspection (authenticated)
 
 | Method   | Path                           | Description         |
 | -------- | ------------------------------ | ------------------- |
-| `GET`    | `/api/dids`                    | List your DIDs      |
-| `POST`   | `/api/dids`                    | Request new DID URI |
-| `POST`   | `/api/dids/check`              | Check name available|
+| `GET`    | `/api/dids`                    | List DIDs           |
 | `GET`    | `/api/dids/{mnemonic}`         | Get DID details     |
 | `PUT`    | `/api/dids/{mnemonic}`         | Upload DID log      |
 | `PUT`    | `/api/witness/{mnemonic}`      | Upload witness      |
 | `PUT`    | `/api/disable/{mnemonic}`      | Disable a DID       |
 | `PUT`    | `/api/enable/{mnemonic}`       | Enable a DID        |
 | `DELETE` | `/api/dids/{mnemonic}`         | Delete a DID        |
+| `GET`    | `/api/log/{mnemonic}`          | Get DID log entries |
+| `GET`    | `/api/raw/{mnemonic}`          | Get raw DID log     |
+| `GET`    | `/api/services`                | List services       |
 
 ### Statistics (authenticated)
 
