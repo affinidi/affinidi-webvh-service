@@ -621,8 +621,20 @@ pub async fn flush_stats_to_store(
         return Ok(());
     }
 
+    // Current 5-minute time-series bucket
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bucket_epoch = now / 300 * 300;
+
+    // Aggregate totals for the server-wide (_all) time-series bucket
+    let mut all_resolve_delta = 0u64;
+    let mut all_update_delta = 0u64;
+
     let mut batch = store.batch();
     for d in &deltas {
+        // Aggregate stats (totals)
         let key = format!("stats:{}", d.mnemonic);
         let mut stats: affinidi_webvh_common::DidStats =
             stats_ks.get(key.as_str()).await?.unwrap_or_default();
@@ -635,7 +647,35 @@ pub async fn flush_stats_to_store(
             stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
         }
         batch.insert(stats_ks, key, &stats)?;
+
+        // Time-series bucket (per-DID)
+        if d.resolve_delta > 0 || d.update_delta > 0 {
+            let ts_key = format!("ts:{}:{bucket_epoch}", d.mnemonic);
+            let existing: serde_json::Value = stats_ks
+                .get(ts_key.as_str())
+                .await?
+                .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+            let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + d.resolve_delta;
+            let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + d.update_delta;
+            batch.insert(stats_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
+
+            all_resolve_delta += d.resolve_delta;
+            all_update_delta += d.update_delta;
+        }
     }
+
+    // Server-wide time-series bucket (_all)
+    if all_resolve_delta > 0 || all_update_delta > 0 {
+        let all_key = format!("ts:_all:{bucket_epoch}");
+        let existing: serde_json::Value = stats_ks
+            .get(all_key.as_str())
+            .await?
+            .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+        let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + all_resolve_delta;
+        let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + all_update_delta;
+        batch.insert(stats_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
+    }
+
     batch.commit().await?;
 
     // Update total DID count (periodic reconciliation)

@@ -34,6 +34,11 @@
   both server and control plane.
 - **webvh-daemon**: HTTP client had no timeouts — now uses 30s request /
   10s connect timeouts matching standalone server.
+- **webvh-control**: Time-series graphs showed zero — `flush_stats_to_store`
+  wrote aggregate totals but never wrote time-series bucket entries
+  (`ts:{mnemonic}:{epoch}`). Now writes per-DID and server-wide (`_all`)
+  5-minute buckets on each flush cycle. This fix applies to both daemon
+  and standalone control plane modes.
 
 ### Changed
 - **webvh-server**: `start_didcomm_service` is now `pub` for daemon reuse.
