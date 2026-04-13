@@ -106,15 +106,36 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         if did.is_empty() { None } else { Some(did) }
     };
 
-    // 5. Create root DID via VTA at .well-known
+    // 5. Create root DID via VTA
+    //
+    // If the URL has a path (e.g. https://example.com/server1), the DID is
+    // hosted at that path. If it's just a domain (https://example.com), the
+    // DID goes in .well-known.
+    let did_path = {
+        // Extract path from URL: strip scheme + authority, trim slashes
+        let after_scheme = public_url
+            .find("://")
+            .map(|i| &public_url[i + 3..])
+            .unwrap_or(&public_url);
+        let path = after_scheme
+            .find('/')
+            .map(|i| after_scheme[i..].trim_matches('/'))
+            .unwrap_or("");
+        if path.is_empty() {
+            ".well-known".to_string()
+        } else {
+            path.to_string()
+        }
+    };
+
     eprintln!();
-    eprintln!("  Creating server root DID via VTA...");
+    eprintln!("  Creating server DID at path '{did_path}'...");
 
     let did_result = vta_setup::create_did(
         &client,
         &conn_info.context_id,
         &public_url,
-        ".well-known",
+        &did_path,
         Some("webvh-server"),
         mediator_did.as_deref(),
     )
