@@ -39,9 +39,10 @@ pub struct AppState {
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
-    /// DIDComm service for inbound/outbound mediator messaging (None if not configured).
-    /// Cloneable — can be shared across handlers for both receiving and proactive sending.
-    pub didcomm_service: Option<DIDCommService>,
+    /// DIDComm service for inbound/outbound mediator messaging.
+    /// Wrapped in `OnceLock` so cloned states see it once it's initialized
+    /// (the service starts after REST + DIDComm router are already cloned).
+    pub didcomm_service: Arc<std::sync::OnceLock<DIDCommService>>,
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
@@ -166,7 +167,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    let mut state = AppState {
+    let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -178,7 +179,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         jwt_keys,
         webauthn,
         http_client: reqwest::Client::new(),
-        didcomm_service: None,
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
             let collector = StatsCollector::new();
@@ -308,7 +309,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     if state.config.features.didcomm {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => {
-                state.didcomm_service = Some(svc);
+                let _ = state.didcomm_service.set(svc);
             }
             Ok(None) => {}
             Err(e) => {
@@ -706,7 +707,7 @@ pub async fn flush_stats_to_store(
 /// staleness-based status from the last received pong timestamp.
 pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
-    didcomm: &Option<DIDCommService>,
+    didcomm: &std::sync::OnceLock<DIDCommService>,
     control_did: Option<&str>,
     health_interval_secs: u64,
 ) -> Result<(), AppError> {
@@ -714,7 +715,7 @@ pub async fn run_health_checks(
     let now = crate::auth::session::now_epoch();
 
     // Send health pings via DIDComm (fire-and-forget — pong handler updates status)
-    if let (Some(svc), Some(ctrl_did)) = (didcomm, control_did) {
+    if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
         for inst in &instances {
             let server_did = match inst.metadata.get("did").and_then(|v| v.as_str()) {
                 Some(did) => did,

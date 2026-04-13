@@ -616,7 +616,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             {
                 Ok(Some(svc)) => {
                     info!("DIDComm service started successfully");
-                    state.didcomm_service = Some(svc);
+                    let _ = state.didcomm_service.set(svc);
                 }
                 Ok(None) => {
                     warn!(
@@ -904,7 +904,7 @@ async fn build_control(
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),
-        didcomm_service: None,
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),

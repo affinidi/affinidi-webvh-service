@@ -29,7 +29,7 @@ pub fn sync_all_dids_to_server(state: &AppState, server_did: String) {
     let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
-        let svc = match didcomm.as_ref() {
+        let svc = match didcomm.get() {
             Some(svc) => svc,
             None => return,
         };
@@ -125,22 +125,33 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
     let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
-        let svc = match didcomm.as_ref() {
+        let svc = match didcomm.get() {
             Some(svc) => svc,
-            None => return, // DIDComm not connected — silently skip
+            None => {
+                warn!(mnemonic = %mnemonic, "DID sync skipped: DIDComm service not connected");
+                return;
+            }
         };
 
         let control_did = match &config.server_did {
             Some(did) => did.as_str(),
-            None => return,
+            None => {
+                warn!(mnemonic = %mnemonic, "DID sync skipped: server_did not configured");
+                return;
+            }
         };
+
+        info!(mnemonic = %mnemonic, "DID changed — preparing sync to servers");
 
         // Read the DID record
         let record = match dids_ks.get::<DidRecord>(did_ops::did_key(&mnemonic)).await {
             Ok(Some(r)) => r,
-            Ok(None) => return,
+            Ok(None) => {
+                warn!(mnemonic = %mnemonic, "DID sync: record not found in store");
+                return;
+            }
             Err(e) => {
-                warn!(mnemonic = %mnemonic, error = %e, "server push: failed to read record");
+                warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to read record");
                 return;
             }
         };
@@ -150,13 +161,16 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => {
-                    warn!(mnemonic = %mnemonic, "server push: invalid UTF-8 in log content");
+                    warn!(mnemonic = %mnemonic, "DID sync: invalid UTF-8 in log content");
                     return;
                 }
             },
-            Ok(None) => return,
+            Ok(None) => {
+                warn!(mnemonic = %mnemonic, "DID sync: no log content found");
+                return;
+            }
             Err(e) => {
-                warn!(mnemonic = %mnemonic, error = %e, "server push: failed to read log");
+                warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to read log");
                 return;
             }
         };
@@ -183,8 +197,17 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
         // Get server DIDs from registry
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
-            None => return,
+            None => {
+                warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                return;
+            }
         };
+
+        info!(
+            mnemonic = %mnemonic,
+            server_count = servers.len(),
+            "pushing DID update to servers"
+        );
 
         for (server_did, instance_id) in &servers {
             if let Err(e) = send_with_retry(
@@ -198,13 +221,15 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
                     instance_id,
                     mnemonic = %mnemonic,
                     error = %e,
-                    "failed to push DID update via mediator after retries"
+                    "DID sync: failed to push update after retries"
                 );
             } else {
                 info!(
                     server_did,
+                    instance_id,
                     mnemonic = %mnemonic,
-                    "pushed DID update to server via mediator"
+                    version_count = update.version_count,
+                    "DID sync: update sent to server"
                 );
             }
         }
@@ -218,19 +243,30 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     let didcomm = state.didcomm_service.clone();
 
     tokio::spawn(async move {
-        let svc = match didcomm.as_ref() {
+        let svc = match didcomm.get() {
             Some(svc) => svc,
-            None => return,
+            None => {
+                warn!(mnemonic = %mnemonic, "DID delete sync skipped: DIDComm service not connected");
+                return;
+            }
         };
 
         let control_did = match &config.server_did {
             Some(did) => did.as_str(),
-            None => return,
+            None => {
+                warn!(mnemonic = %mnemonic, "DID delete sync skipped: server_did not configured");
+                return;
+            }
         };
+
+        info!(mnemonic = %mnemonic, "DID deleted — preparing sync to servers");
 
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
-            None => return,
+            None => {
+                warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                return;
+            }
         };
 
         for (server_did, instance_id) in &servers {
@@ -245,13 +281,14 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
                     instance_id,
                     mnemonic = %mnemonic,
                     error = %e,
-                    "failed to push DID delete via mediator after retries"
+                    "DID sync: failed to push delete after retries"
                 );
             } else {
                 info!(
                     server_did,
+                    instance_id,
                     mnemonic = %mnemonic,
-                    "pushed DID delete to server via mediator"
+                    "DID sync: delete sent to server"
                 );
             }
         }

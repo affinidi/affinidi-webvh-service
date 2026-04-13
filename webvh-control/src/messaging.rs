@@ -79,8 +79,6 @@ async fn filtered_request_logging(
         MSG_HEALTH_PONG,
         MSG_STATS_SYNC,
         MSG_STATS_ACK,
-        MSG_SYNC_UPDATE_ACK,
-        MSG_SYNC_DELETE_ACK,
         MESSAGE_PICKUP_STATUS_TYPE,
     ];
 
@@ -401,12 +399,14 @@ async fn handle_sync_ack(
         .get("mnemonic")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    debug!(
-        sender = sender,
-        mnemonic = mnemonic,
-        status = status,
-        msg_type = %message.typ,
-        "sync acknowledgement received"
+    let ack_type = if message.typ.contains("update") {
+        "update"
+    } else {
+        "delete"
+    };
+    info!(
+        sender,
+        mnemonic, status, ack_type, "DID sync: server acknowledged {ack_type}"
     );
     Ok(None)
 }
