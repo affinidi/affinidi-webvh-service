@@ -155,7 +155,21 @@ Environment variables use the `DAEMON_` prefix:
 
 ```
 webvh-daemon                      # Run daemon (default)
-webvh-daemon setup                # Interactive config wizard (coming soon)
+webvh-daemon setup                # Interactive config wizard
+webvh-daemon health               # Run health check diagnostics
+webvh-daemon add-acl              # Add ACL entry
+webvh-daemon list-acl             # List ACL entries
+webvh-daemon remove-acl           # Remove ACL entry
+webvh-daemon invite               # Create passkey enrollment invite
+webvh-daemon list-dids            # List all DIDs in the store
+webvh-daemon remove-did           # Remove a DID from the store
+webvh-daemon load-did             # Load a DID from existing files
+webvh-daemon bootstrap-did        # Bootstrap a DID (defaults to .well-known)
+webvh-daemon recreate-did         # Recreate a DID at a given path
+webvh-daemon recover-did          # Recover a soft-deleted DID
+webvh-daemon import-secrets       # Import secrets from VTA bundle or keys
+webvh-daemon backup               # Export data to backup file
+webvh-daemon restore              # Restore data from backup file
 ```
 
 ## API Path Mapping

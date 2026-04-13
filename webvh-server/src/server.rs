@@ -254,14 +254,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     // 5. Register with control plane via DIDComm (uses the shared connection)
-    if let Some(ref svc) = didcomm_service {
-        if state.config.control_did.is_some() {
-            let reg_state = state.clone();
-            let reg_svc = svc.clone();
-            tokio::spawn(async move {
-                control_register::register_via_didcomm(&reg_state, &reg_svc).await;
-            });
-        }
+    if let Some(ref svc) = didcomm_service
+        && state.config.control_did.is_some()
+    {
+        let reg_state = state.clone();
+        let reg_svc = svc.clone();
+        tokio::spawn(async move {
+            control_register::register_via_didcomm(&reg_state, &reg_svc).await;
+        });
     }
 
     // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
@@ -271,32 +271,31 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         didcomm_service.as_ref(),
         state.config.control_did.as_ref(),
         state.config.server_did.as_ref(),
-    ) {
-        if didcomm_sync_interval > 0 {
-            let token = stats_sync_shutdown.clone();
-            let svc = svc.clone();
-            let control_did = control_did.clone();
-            let server_did = server_did.clone();
-            let collector = stats_collector.clone();
-            tokio::spawn(async move {
-                let mut timer =
-                    tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
-                timer.tick().await; // skip first tick
-                loop {
-                    tokio::select! {
-                        _ = timer.tick() => {
-                            stats::sync_to_control_didcomm(
-                                &svc,
-                                &server_did,
-                                &control_did,
-                                &collector,
-                            ).await;
-                        }
-                        _ = token.cancelled() => break,
+    ) && didcomm_sync_interval > 0
+    {
+        let token = stats_sync_shutdown.clone();
+        let svc = svc.clone();
+        let control_did = control_did.clone();
+        let server_did = server_did.clone();
+        let collector = stats_collector.clone();
+        tokio::spawn(async move {
+            let mut timer =
+                tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
+            timer.tick().await; // skip first tick
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        stats::sync_to_control_didcomm(
+                            &svc,
+                            &server_did,
+                            &control_did,
+                            &collector,
+                        ).await;
                     }
+                    _ = token.cancelled() => break,
                 }
-            });
-        }
+            }
+        });
     }
 
     // Wait for shutdown signal

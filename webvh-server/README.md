@@ -288,8 +288,18 @@ enabled by default.
 ```
 webvh-server                      # Run server (default)
 webvh-server setup                # Interactive config wizard
+webvh-server health               # Run health check diagnostics
 webvh-server add-acl              # Add ACL entry
 webvh-server list-acl             # List ACL entries
+webvh-server remove-acl           # Remove ACL entry
+webvh-server list-dids            # List all DIDs in the store
+webvh-server remove-did           # Remove a DID from the store
+webvh-server dump-did             # Dump DID log for a path
+webvh-server load-did             # Load a DID at an arbitrary path
+webvh-server bootstrap-did        # Bootstrap a DID (defaults to .well-known)
+webvh-server recreate-did         # Recreate a DID at a given path
+webvh-server recover-did          # Recover a soft-deleted DID
+webvh-server import-secrets       # Import secrets from VTA bundle or keys
 webvh-server backup               # Export data to backup file
 webvh-server restore              # Restore data from backup file
 ```
@@ -369,19 +379,20 @@ All API endpoints are under the `/api` prefix.
 | `POST` | `/api/auth/`          | Submit DIDComm auth |
 | `POST` | `/api/auth/refresh`   | Refresh token       |
 
-### DID Management (authenticated)
+### DID Sync & Introspection (authenticated)
 
 | Method   | Path                           | Description         |
 | -------- | ------------------------------ | ------------------- |
-| `GET`    | `/api/dids`                    | List your DIDs      |
-| `POST`   | `/api/dids`                    | Request new DID URI |
-| `POST`   | `/api/dids/check`              | Check name available|
+| `GET`    | `/api/dids`                    | List DIDs           |
 | `GET`    | `/api/dids/{mnemonic}`         | Get DID details     |
 | `PUT`    | `/api/dids/{mnemonic}`         | Upload DID log      |
 | `PUT`    | `/api/witness/{mnemonic}`      | Upload witness      |
 | `PUT`    | `/api/disable/{mnemonic}`      | Disable a DID       |
 | `PUT`    | `/api/enable/{mnemonic}`       | Enable a DID        |
 | `DELETE` | `/api/dids/{mnemonic}`         | Delete a DID        |
+| `GET`    | `/api/log/{mnemonic}`          | Get DID log entries |
+| `GET`    | `/api/raw/{mnemonic}`          | Get raw DID log     |
+| `GET`    | `/api/services`                | List services       |
 
 ### Statistics (authenticated)
 

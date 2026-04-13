@@ -26,13 +26,12 @@ static LAST_SEQ: std::sync::LazyLock<RwLock<HashMap<String, u64>>> =
 /// if it's stale/replayed. Shared by both REST and DIDComm stats ingestion.
 pub fn accept_seq(server_did: &str, seq: u64) -> bool {
     // seq=0 means server restart — always accept
-    if seq > 0 {
-        if let Ok(map) = LAST_SEQ.read()
-            && let Some(&last) = map.get(server_did)
-            && seq <= last
-        {
-            return false;
-        }
+    if seq > 0
+        && let Ok(map) = LAST_SEQ.read()
+        && let Some(&last) = map.get(server_did)
+        && seq <= last
+    {
+        return false;
     }
 
     if let Ok(mut map) = LAST_SEQ.write() {
