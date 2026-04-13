@@ -35,6 +35,38 @@ enum Command {
     Setup,
     /// Run health check diagnostics
     Health,
+    /// Add an ACL entry
+    AddAcl {
+        /// DID to add to the ACL
+        #[arg(long)]
+        did: String,
+        /// Role (admin or owner)
+        #[arg(long, default_value = "owner")]
+        role: String,
+        /// Optional label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List all ACL entries
+    ListAcl,
+    /// Remove an ACL entry
+    RemoveAcl {
+        /// DID to remove from the ACL
+        #[arg(long)]
+        did: String,
+    },
+    /// Create a passkey enrollment invite
+    Invite {
+        /// DID to invite
+        #[arg(long)]
+        did: String,
+        /// Role (admin or owner)
+        #[arg(long, default_value = "owner")]
+        role: String,
+        /// Override enrollment TTL (in hours)
+        #[arg(long)]
+        ttl_hours: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -52,6 +84,34 @@ async fn main() {
         Some(Command::Health) => {
             if let Err(e) = run_health(cli.config).await {
                 eprintln!("Health check error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::AddAcl { did, role, label }) => {
+            if let Err(e) = run_add_acl(cli.config, did, role, label).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ListAcl) => {
+            if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::RemoveAcl { did }) => {
+            if let Err(e) = run_remove_acl(cli.config, did).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Invite {
+            did,
+            role,
+            ttl_hours,
+        }) => {
+            if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -376,6 +436,88 @@ async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
             std::process::exit(1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CLI management commands (delegated to webvh-common / webvh-control helpers)
+// ---------------------------------------------------------------------------
+
+async fn run_add_acl(
+    config_path: Option<std::path::PathBuf>,
+    did: String,
+    role_str: String,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_add_acl(
+        &config.store,
+        did,
+        role_str,
+        label,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn run_list_acl(
+    config_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_list_acl(&config.store).await
+}
+
+async fn run_remove_acl(
+    config_path: Option<std::path::PathBuf>,
+    did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    affinidi_webvh_common::server::cli_acl::run_remove_acl(&config.store, did).await
+}
+
+async fn run_invite(
+    config_path: Option<std::path::PathBuf>,
+    did: String,
+    role: String,
+    ttl_hours: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::passkey::routes::create_enrollment_invite;
+
+    let config = DaemonConfig::load(config_path)?;
+    let control_config = config.control_config();
+
+    let base_url = control_config
+        .public_url
+        .as_deref()
+        .ok_or("public_url must be set in config for enrollment invites")?;
+
+    let enrollment_ttl = match ttl_hours {
+        Some(hours) => hours * 3600,
+        None => control_config.auth.passkey_enrollment_ttl,
+    };
+
+    let store = affinidi_webvh_control::store::Store::open(&control_config.store).await?;
+    let sessions_ks = store.keyspace("sessions")?;
+
+    let resp =
+        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
+
+    eprintln!();
+    eprintln!("  Enrollment invite created!");
+    eprintln!();
+    eprintln!("  DID:     {did}");
+    eprintln!("  Role:    {role}");
+    let ttl_hours_display = enrollment_ttl / 3600;
+    eprintln!(
+        "  Expires: in {ttl_hours_display}h (epoch {})",
+        resp.expires_at
+    );
+    eprintln!();
+    eprintln!("  Enrollment URL:");
+    eprintln!("  {}", resp.enrollment_url);
+    eprintln!();
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

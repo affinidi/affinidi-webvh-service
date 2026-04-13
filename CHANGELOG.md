@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## 0.4.1 (2026-04-13)
+
+### Added
+- **webvh-daemon**: Restore unified CLI management commands (`add-acl`,
+  `list-acl`, `remove-acl`, `invite`) so operators can manage ACLs and create
+  passkey enrollment invites directly from the daemon binary without needing to
+  run `webvh-control` separately.
+
 ## 0.4.0 (2026-04-13)
 
 ### Added
