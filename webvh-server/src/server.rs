@@ -104,15 +104,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Extract raw signing key bytes for pack_signed operations
     let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
-    // Bind TCP listener on the main thread for early port validation (only if REST is enabled)
-    let std_listener = if config.features.rest_api {
-        let addr = format!("{}:{}", config.server.host, config.server.port);
+    // Always bind TCP — the server must serve public DID documents even when
+    // the management REST API is disabled. The rest_api flag controls whether
+    // /api/* routes are included, not whether HTTP is served.
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let std_listener = {
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
         listener.set_nonblocking(true).map_err(AppError::Io)?;
         info!("server listening addr={addr}");
-        Some(listener)
-    } else {
-        None
+        listener
     };
 
     // Gather storage thread inputs before moving config into Arc
@@ -189,29 +189,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // REST ready signal — DIDComm waits for this before starting
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
-    // 1. Spawn REST thread first — HTTP must be available before DIDComm starts
-    let rest_handle = if let Some(listener) = std_listener {
-        let mut rest_shutdown = rest_shutdown_rx.clone();
-        let rest_state = state.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("webvh-rest".into())
-                .spawn(move || {
-                    run_rest_thread(
-                        listener,
-                        rest_state,
-                        upload_body_limit,
-                        &mut rest_shutdown,
-                        rest_ready_tx,
-                    )
-                })
-                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
-        )
-    } else {
-        // Signal ready immediately so DIDComm doesn't wait forever
-        let _ = rest_ready_tx.send(());
-        None
-    };
+    // 1. Spawn HTTP thread first — must be serving before DIDComm starts
+    //    (the server's own DID needs to be resolvable for mediator auth)
+    let mut rest_shutdown = rest_shutdown_rx.clone();
+    let rest_state = state.clone();
+    let rest_handle = std::thread::Builder::new()
+        .name("webvh-rest".into())
+        .spawn(move || {
+            run_rest_thread(
+                std_listener,
+                rest_state,
+                upload_body_limit,
+                &mut rest_shutdown,
+                rest_ready_tx,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn HTTP thread: {e}")))?;
 
     // 2. Spawn storage thread (independent cleanup, flush, sync)
     let mut storage_shutdown = storage_shutdown_rx.clone();
@@ -303,7 +296,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     }
 
     let _ = rest_shutdown_tx.send(true);
-    if let Some(handle) = rest_handle {
+    {
+        let handle = rest_handle;
         match tokio::time::timeout(
             Duration::from_secs(30),
             tokio::task::spawn_blocking(move || handle.join()),
@@ -435,12 +429,20 @@ fn run_rest_thread(
         .expect("failed to build REST runtime");
 
     rt.block_on(async {
-        info!("REST thread started (multi-threaded, 4 workers)");
-
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
-        let app = routes::router(upload_body_limit)
+        // When rest_api is disabled, serve only public DID routes + health.
+        // When enabled, serve full management API + public DID routes.
+        let base_router = if state.config.features.rest_api {
+            info!("HTTP thread started (REST API + public DID serving)");
+            routes::router(upload_body_limit)
+        } else {
+            info!("HTTP thread started (public DID serving only, REST API disabled)");
+            routes::router_public_only().fallback(routes::did_public::serve_public)
+        };
+
+        let app = base_router
             .with_state(state)
             .layer(
                 TraceLayer::new_for_http()
