@@ -148,15 +148,17 @@ async fn handle_webvh_message(
                 Ok(result) => result,
                 Err(e) => {
                     let code = map_app_error_code(&e);
-                    warn!(code, msg_type = %message.typ, did = sender, "DIDComm protocol error");
-                    problem_report(code, &e.to_string())
+                    let comment = e.to_string();
+                    warn!(code, comment, msg_type = %message.typ, did = sender, "DIDComm protocol error");
+                    problem_report(code, &comment)
                 }
             }
         }
         Err(e) => {
             let code = map_app_error_code(&e);
-            warn!(code, msg_type = %message.typ, did = sender, "mediator: ACL denied");
-            problem_report(code, &e.to_string())
+            let comment = e.to_string();
+            warn!(code, comment, msg_type = %message.typ, did = sender, "mediator: ACL denied");
+            problem_report(code, &comment)
         }
     };
 
@@ -388,7 +390,29 @@ async fn handle_fallback(
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
-    warn!(sender = sender, msg_type = %message.typ, "inbound DIDComm: unknown message type — ignoring");
+
+    // Log problem-report bodies so errors from the remote side are visible
+    if message.typ.contains("problem-report") {
+        let code = message
+            .body
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let comment = message
+            .body
+            .get("comment")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no comment)");
+        warn!(
+            sender = sender,
+            code = code,
+            comment = comment,
+            "inbound DIDComm: problem-report from remote"
+        );
+    } else {
+        warn!(sender = sender, msg_type = %message.typ, "inbound DIDComm: unhandled message type — ignoring");
+    }
+
     Ok(None)
 }
 
