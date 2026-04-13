@@ -136,19 +136,33 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // Load secrets (shared across server, witness, control)
     let secrets = load_secrets(&config).await;
 
+    // Open each unique store path once — fjall locks the directory, so
+    // server/watcher/control must share a single Store handle.
+    let main_store = affinidi_webvh_common::server::store::Store::open(&config.store)
+        .await
+        .unwrap_or_else(|e| {
+            error!("failed to open main store: {e}");
+            std::process::exit(1);
+        });
+
+    let witness_store = affinidi_webvh_common::server::store::Store::open(&config.witness_store)
+        .await
+        .unwrap_or_else(|e| {
+            error!("failed to open witness store: {e}");
+            std::process::exit(1);
+        });
+
     // Build each enabled service's router
     let mut combined: Router = Router::new();
-    let mut stores: Vec<affinidi_webvh_common::server::store::Store> = Vec::new();
 
     // Track what's enabled for the summary
     let mut enabled_services = Vec::new();
 
     // 1. Server (mounted at root — DID serving needs /)
     if config.enable.server {
-        match build_server(&config, &secrets).await {
-            Ok((router, store)) => {
+        match build_server(&config, &secrets, &main_store).await {
+            Ok(router) => {
                 combined = combined.merge(router);
-                stores.push(store);
                 enabled_services.push("server (/)");
             }
             Err(e) => {
@@ -160,10 +174,9 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
     // 2. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &secrets).await {
-            Ok((router, store)) => {
+        match build_witness(&config, &secrets, &witness_store).await {
+            Ok(router) => {
                 combined = combined.nest("/witness", router);
-                stores.push(store);
                 enabled_services.push("witness (/witness)");
             }
             Err(e) => {
@@ -175,10 +188,9 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
     // 3. Watcher (nested at /watcher)
     if config.enable.watcher {
-        match build_watcher(&config).await {
-            Ok((router, store)) => {
+        match build_watcher(&config, &main_store).await {
+            Ok(router) => {
                 combined = combined.nest("/watcher", router);
-                stores.push(store);
                 enabled_services.push("watcher (/watcher)");
             }
             Err(e) => {
@@ -190,10 +202,9 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
     // 4. Control plane (nested at /control)
     if config.enable.control {
-        match build_control(&config, &secrets).await {
-            Ok((router, store)) => {
+        match build_control(&config, &secrets, &main_store).await {
+            Ok(router) => {
                 combined = combined.nest("/control", router);
-                stores.push(store);
                 enabled_services.push("control (/control)");
             }
             Err(e) => {
@@ -237,11 +248,12 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         .await
         .expect("axum serve failed");
 
-    // Persist all stores on shutdown
-    for store in &stores {
-        if let Err(e) = store.persist().await {
-            error!("failed to persist store: {e}");
-        }
+    // Persist stores on shutdown
+    if let Err(e) = main_store.persist().await {
+        error!("failed to persist main store: {e}");
+    }
+    if let Err(e) = witness_store.persist().await {
+        error!("failed to persist witness store: {e}");
     }
 
     info!("daemon shut down");
@@ -251,16 +263,18 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 // Service builders
 // ---------------------------------------------------------------------------
 
-type ServiceResult = Result<(Router, affinidi_webvh_common::server::store::Store), AppError>;
+type ServiceResult = Result<Router, AppError>;
 
-async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_server(
+    config: &DaemonConfig,
+    secrets: &ServerSecrets,
+    store: &affinidi_webvh_common::server::store::Store,
+) -> ServiceResult {
     use affinidi_webvh_server::server::AppState;
-    use affinidi_webvh_server::store::Store;
 
     let server_config = config.server_config();
     let upload_body_limit = server_config.limits.upload_body_limit;
 
-    let store = Store::open(&server_config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let dids_ks = store.keyspace("dids")?;
@@ -289,17 +303,19 @@ async fn build_server(config: &DaemonConfig, secrets: &ServerSecrets) -> Service
     let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);
     info!("server service initialized");
 
-    Ok((router, store))
+    Ok(router)
 }
 
-async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_witness(
+    config: &DaemonConfig,
+    secrets: &ServerSecrets,
+    store: &affinidi_webvh_common::server::store::Store,
+) -> ServiceResult {
     use affinidi_webvh_witness::server::AppState;
     use affinidi_webvh_witness::signing::LocalSigner;
-    use affinidi_webvh_witness::store::Store;
 
     let witness_config = config.witness_config();
 
-    let store = Store::open(&witness_config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let witnesses_ks = store.keyspace("witnesses")?;
@@ -323,16 +339,17 @@ async fn build_witness(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     let router = affinidi_webvh_witness::routes::router().with_state(state);
     info!("witness service initialized");
 
-    Ok((router, store))
+    Ok(router)
 }
 
-async fn build_watcher(config: &DaemonConfig) -> ServiceResult {
+async fn build_watcher(
+    config: &DaemonConfig,
+    store: &affinidi_webvh_common::server::store::Store,
+) -> ServiceResult {
     use affinidi_webvh_watcher::server::AppState;
-    use affinidi_webvh_watcher::store::Store;
 
     let watcher_config = config.watcher_config();
 
-    let store = Store::open(&watcher_config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
     let state = AppState {
@@ -344,16 +361,18 @@ async fn build_watcher(config: &DaemonConfig) -> ServiceResult {
     let router = affinidi_webvh_watcher::routes::router().with_state(state);
     info!("watcher service initialized");
 
-    Ok((router, store))
+    Ok(router)
 }
 
-async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> ServiceResult {
+async fn build_control(
+    config: &DaemonConfig,
+    secrets: &ServerSecrets,
+    store: &affinidi_webvh_common::server::store::Store,
+) -> ServiceResult {
     use affinidi_webvh_control::server::AppState;
-    use affinidi_webvh_control::store::Store;
 
     let control_config = config.control_config();
 
-    let store = Store::open(&control_config.store).await?;
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
     let registry_ks = store.keyspace("registry")?;
@@ -404,7 +423,7 @@ async fn build_control(config: &DaemonConfig, secrets: &ServerSecrets) -> Servic
     let router = affinidi_webvh_control::routes::router().with_state(state);
     info!("control plane service initialized");
 
-    Ok((router, store))
+    Ok(router)
 }
 
 // ---------------------------------------------------------------------------
