@@ -20,6 +20,27 @@ use crate::server::AppState;
 static LAST_SEQ: std::sync::LazyLock<RwLock<HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Check and update the idempotency sequence for a server.
+///
+/// Returns `true` if the payload should be accepted (new seq), or `false`
+/// if it's stale/replayed. Shared by both REST and DIDComm stats ingestion.
+pub fn accept_seq(server_did: &str, seq: u64) -> bool {
+    // seq=0 means server restart — always accept
+    if seq > 0 {
+        if let Ok(map) = LAST_SEQ.read()
+            && let Some(&last) = map.get(server_did)
+            && seq <= last
+        {
+            return false;
+        }
+    }
+
+    if let Ok(mut map) = LAST_SEQ.write() {
+        map.insert(server_did.to_string(), seq);
+    }
+    true
+}
+
 /// POST /api/control/stats — receive per-DID deltas from a server instance.
 ///
 /// Validates ACL, checks sequence for idempotency, then records deltas into
@@ -42,24 +63,14 @@ pub async fn receive_stats(
         }
     }
 
-    // Idempotency: reject replayed payloads (seq=0 means server restart)
-    if let Ok(map) = LAST_SEQ.read()
-        && let Some(&last) = map.get(&payload.server_did)
-        && payload.seq > 0
-        && payload.seq <= last
-    {
+    // Idempotency: reject replayed payloads
+    if !accept_seq(&payload.server_did, payload.seq) {
         debug!(
             server_did = %payload.server_did,
             seq = payload.seq,
-            last_seq = last,
             "stats sync: stale sequence (skipped)"
         );
         return StatusCode::NO_CONTENT;
-    }
-
-    // Update last seen sequence
-    if let Ok(mut map) = LAST_SEQ.write() {
-        map.insert(payload.server_did.clone(), payload.seq);
     }
 
     // Record deltas into in-memory collector (no I/O)

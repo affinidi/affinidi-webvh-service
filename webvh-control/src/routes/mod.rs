@@ -6,7 +6,7 @@ pub mod health;
 mod passkey;
 mod proxy;
 mod registry;
-mod stats_sync;
+pub(crate) mod stats_sync;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;

@@ -50,3 +50,10 @@ pub const MSG_SYNC_UPDATE: &str = "https://affinidi.com/webvh/1.0/did/sync-updat
 pub const MSG_SYNC_UPDATE_ACK: &str = "https://affinidi.com/webvh/1.0/did/sync-update-ack";
 pub const MSG_SYNC_DELETE: &str = "https://affinidi.com/webvh/1.0/did/sync-delete";
 pub const MSG_SYNC_DELETE_ACK: &str = "https://affinidi.com/webvh/1.0/did/sync-delete-ack";
+
+// ---------------------------------------------------------------------------
+// Stats (server → control plane)
+// ---------------------------------------------------------------------------
+
+pub const MSG_STATS_SYNC: &str = "https://affinidi.com/webvh/1.0/server/stats-sync";
+pub const MSG_STATS_ACK: &str = "https://affinidi.com/webvh/1.0/server/stats-ack";

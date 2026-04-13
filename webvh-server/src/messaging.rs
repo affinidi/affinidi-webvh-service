@@ -33,6 +33,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
         .route(MSG_SERVER_REGISTER_ACK, handler_fn(handle_register_ack))?
         .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
+        .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
         .fallback(handler_fn(handle_fallback))

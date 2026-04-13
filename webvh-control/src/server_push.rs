@@ -20,6 +20,103 @@ use crate::auth::session::now_epoch;
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
 
+/// Push all existing published DIDs to a single server via the mediator.
+///
+/// Called after a server registers via DIDComm so it receives the full DID set.
+pub fn sync_all_dids_to_server(state: &AppState, server_did: String) {
+    let dids_ks = state.dids_ks.clone();
+    let config = state.config.clone();
+    let didcomm = state.didcomm_service.clone();
+
+    tokio::spawn(async move {
+        let svc = match didcomm.as_ref() {
+            Some(svc) => svc,
+            None => return,
+        };
+
+        let control_did = match &config.server_did {
+            Some(did) => did.as_str(),
+            None => return,
+        };
+
+        // Iterate all published DIDs
+        let raw = match dids_ks.prefix_iter_raw("did:").await {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(error = %e, "sync_all_dids: failed to iterate DIDs");
+                return;
+            }
+        };
+
+        let mut count = 0u64;
+        for (_key, value) in raw {
+            let record: DidRecord = match serde_json::from_slice(&value) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Skip empty/unpublished slots
+            if record.version_count == 0 {
+                continue;
+            }
+
+            // Read log content
+            let log_content = match dids_ks
+                .get_raw(did_ops::content_log_key(&record.mnemonic))
+                .await
+            {
+                Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+
+            // Read witness content (optional)
+            let witness_content = match dids_ks
+                .get_raw(did_ops::content_witness_key(&record.mnemonic))
+                .await
+            {
+                Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+                _ => None,
+            };
+
+            let did_id = record.did_id.unwrap_or_default();
+            let update = DidSyncUpdate {
+                mnemonic: record.mnemonic.clone(),
+                did_id,
+                log_content,
+                witness_content,
+                version_count: record.version_count,
+            };
+
+            if let Err(e) = send_with_retry(
+                || send_sync_update(svc, control_did, &server_did, &update),
+                3,
+            )
+            .await
+            {
+                warn!(
+                    server_did = %server_did,
+                    mnemonic = %record.mnemonic,
+                    error = %e,
+                    "failed to push DID during initial sync"
+                );
+            } else {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            info!(
+                server_did = %server_did,
+                count,
+                "initial DID sync complete for newly registered server"
+            );
+        }
+    });
+}
+
 /// Push the current state of a DID to all active server instances via the mediator.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
     let registry_ks = state.registry_ks.clone();

@@ -122,6 +122,9 @@ pub async fn update_instance_status(
 ///
 /// Instances that responded within `timeout_secs` are Active; those that
 /// haven't responded at all (or within 2× the timeout) are Unreachable.
+///
+/// Freshly registered instances (no pong yet) stay Active for one grace
+/// period to allow the first ping/pong roundtrip to complete.
 pub fn health_status_from_timestamp(
     instance: &ServiceInstance,
     now: u64,
@@ -130,6 +133,14 @@ pub fn health_status_from_timestamp(
     match instance.last_health_check {
         Some(ts) if now.saturating_sub(ts) <= timeout_secs => ServiceStatus::Active,
         Some(ts) if now.saturating_sub(ts) <= timeout_secs * 2 => ServiceStatus::Degraded,
-        _ => ServiceStatus::Unreachable,
+        Some(_) => ServiceStatus::Unreachable,
+        // No pong received yet — give a grace period from registration time
+        None => {
+            if now.saturating_sub(instance.registered_at) <= timeout_secs * 2 {
+                ServiceStatus::Active
+            } else {
+                ServiceStatus::Unreachable
+            }
+        }
     }
 }

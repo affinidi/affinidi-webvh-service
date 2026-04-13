@@ -264,12 +264,48 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         }
     }
 
+    // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
+    let stats_sync_shutdown = CancellationToken::new();
+    let didcomm_sync_interval = state.config.stats.sync_interval_secs;
+    if let (Some(svc), Some(control_did), Some(server_did)) = (
+        didcomm_service.as_ref(),
+        state.config.control_did.as_ref(),
+        state.config.server_did.as_ref(),
+    ) {
+        if didcomm_sync_interval > 0 {
+            let token = stats_sync_shutdown.clone();
+            let svc = svc.clone();
+            let control_did = control_did.clone();
+            let server_did = server_did.clone();
+            let collector = stats_collector.clone();
+            tokio::spawn(async move {
+                let mut timer =
+                    tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
+                timer.tick().await; // skip first tick
+                loop {
+                    tokio::select! {
+                        _ = timer.tick() => {
+                            stats::sync_to_control_didcomm(
+                                &svc,
+                                &server_did,
+                                &control_did,
+                                &collector,
+                            ).await;
+                        }
+                        _ = token.cancelled() => break,
+                    }
+                }
+            });
+        }
+    }
+
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
-    // Ordered shutdown: DIDComm → REST → Storage
+    // Ordered shutdown: stats sync → DIDComm → REST → Storage
     let mut any_panic = false;
 
+    stats_sync_shutdown.cancel();
     didcomm_shutdown.cancel();
     if let Some(ref svc) = didcomm_service {
         svc.shutdown().await;

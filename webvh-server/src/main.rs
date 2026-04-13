@@ -98,6 +98,15 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Dump the DID log (did.jsonl) for a given path
+    DumpDid {
+        /// DID path/mnemonic to dump (e.g. ".well-known", "my-org")
+        #[arg(long)]
+        path: String,
+        /// Also dump the witness proof (did-witness.json)
+        #[arg(long)]
+        witness: bool,
+    },
     /// List all DIDs in the store
     ListDids,
     /// Remove a DID and all its data from the store
@@ -247,6 +256,12 @@ async fn main() {
             .await
             {
                 eprintln!("Bootstrap error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::DumpDid { path, witness }) => {
+            if let Err(e) = run_dump_did(cli.config, path, witness).await {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -633,6 +648,47 @@ async fn run_bootstrap_did(
         eprintln!("  Hint: set server_did in your config.toml:");
         eprintln!("    server_did = \"{}\"", result.did_id);
         eprintln!();
+    }
+
+    Ok(())
+}
+
+async fn run_dump_did(
+    config_path: Option<PathBuf>,
+    mnemonic: String,
+    witness: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::did_ops::{content_log_key, content_witness_key, did_key};
+
+    let config = AppConfig::load(config_path)?;
+    let store_handle = store::Store::open(&config.store).await?;
+    let dids_ks = store_handle.keyspace("dids")?;
+
+    // Verify the DID exists
+    let _: affinidi_webvh_common::did_ops::DidRecord = dids_ks
+        .get(did_key(&mnemonic))
+        .await?
+        .ok_or(format!("DID not found at path '{mnemonic}'"))?;
+
+    // Dump did.jsonl to stdout
+    let log_bytes = dids_ks
+        .get_raw(content_log_key(&mnemonic))
+        .await?
+        .ok_or(format!("no log content for path '{mnemonic}'"))?;
+    let log = String::from_utf8(log_bytes)
+        .map_err(|_| format!("invalid UTF-8 in log content for '{mnemonic}'"))?;
+    print!("{log}");
+
+    // Optionally dump witness
+    if witness {
+        if let Some(witness_bytes) = dids_ks.get_raw(content_witness_key(&mnemonic)).await? {
+            let witness_str = String::from_utf8(witness_bytes)
+                .map_err(|_| format!("invalid UTF-8 in witness content for '{mnemonic}'"))?;
+            eprintln!("--- did-witness.json ---");
+            print!("{witness_str}");
+        } else {
+            eprintln!("(no witness content)");
+        }
     }
 
     Ok(())

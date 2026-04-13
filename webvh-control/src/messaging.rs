@@ -53,6 +53,8 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
         // Health pong from servers
         .route(MSG_HEALTH_PONG, handler_fn(handle_health_pong))?
+        // Stats sync from servers
+        .route(MSG_STATS_SYNC, handler_fn(handle_stats_sync))?
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
@@ -378,6 +380,98 @@ async fn handle_sync_ack(
 }
 
 // ---------------------------------------------------------------------------
+// Stats sync handler (server → control plane via DIDComm)
+// ---------------------------------------------------------------------------
+
+async fn handle_stats_sync(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use crate::routes::stats_sync;
+
+    let sender = require_sender(&ctx)?;
+
+    // Validate ACL
+    if check_acl(&state.acl_ks, sender).await.is_err() {
+        warn!(
+            did = sender,
+            "stats sync via DIDComm rejected: DID not in ACL"
+        );
+        return Ok(Some(
+            DIDCommResponse::new(
+                MSG_PROBLEM_REPORT.to_string(),
+                json!({ "code": "e.p.stats.unauthorized", "comment": "DID not in ACL" }),
+            )
+            .thid(message.id.clone()),
+        ));
+    }
+
+    let seq = message
+        .body
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let server_did = message
+        .body
+        .get("server_did")
+        .and_then(|v| v.as_str())
+        .unwrap_or(sender);
+
+    // Idempotency check (reuse REST handler's static map)
+    if !stats_sync::accept_seq(server_did, seq) {
+        debug!(server_did, seq, "stats sync via DIDComm: stale sequence");
+        return Ok(Some(
+            DIDCommResponse::new(
+                MSG_STATS_ACK.to_string(),
+                json!({ "status": "skipped", "reason": "stale_seq" }),
+            )
+            .thid(message.id.clone()),
+        ));
+    }
+
+    // Record deltas
+    if let Some(deltas) = message.body.get("did_deltas").and_then(|v| v.as_array()) {
+        for d in deltas {
+            let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
+            if mnemonic.is_empty() {
+                continue;
+            }
+            let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
+            let update_delta = d.get("update_delta").and_then(|v| v.as_u64()).unwrap_or(0);
+            let last_resolved_at = d.get("last_resolved_at").and_then(|v| v.as_u64());
+            let last_updated_at = d.get("last_updated_at").and_then(|v| v.as_u64());
+
+            state.stats_collector.record_deltas(
+                mnemonic,
+                resolve_delta,
+                update_delta,
+                last_resolved_at,
+                last_updated_at,
+            );
+        }
+    }
+
+    let delta_count = message
+        .body
+        .get("did_deltas")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    debug!(
+        server_did,
+        seq, delta_count, "stats sync via DIDComm accepted"
+    );
+
+    Ok(Some(
+        DIDCommResponse::new(MSG_STATS_ACK.to_string(), json!({ "status": "accepted" }))
+            .thid(message.id.clone()),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Health pong handler (server → control plane)
 // ---------------------------------------------------------------------------
 
@@ -506,6 +600,9 @@ async fn handle_server_register(
         role = %role,
         "server registered via DIDComm"
     );
+
+    // Push all existing DIDs to the newly registered server
+    server_push::sync_all_dids_to_server(&state, sender.to_string());
 
     Ok(Some(
         DIDCommResponse::new(
