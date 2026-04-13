@@ -525,6 +525,8 @@ dependencies = [
 name = "affinidi-webvh-daemon"
 version = "0.4.1"
 dependencies = [
+ "affinidi-messaging-didcomm-service",
+ "affinidi-tdk",
  "affinidi-webvh-common",
  "affinidi-webvh-control",
  "affinidi-webvh-server",
@@ -536,10 +538,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "toml",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vta-sdk",
 ]
 
 [[package]]

@@ -442,7 +442,7 @@ async fn start_didcomm_service(
 // ---------------------------------------------------------------------------
 
 /// Seed the registry with statically configured instances.
-async fn seed_registry(state: &AppState) {
+pub async fn seed_registry(state: &AppState) {
     for instance_config in &state.config.registry.instances {
         let service_type = match instance_config.service_type.as_str() {
             "server" => registry::ServiceType::Server,
@@ -606,7 +606,7 @@ fn run_storage_thread(
 }
 
 /// Flush accumulated stats deltas from the in-memory collector to the store.
-async fn flush_stats_to_store(
+pub async fn flush_stats_to_store(
     collector: &affinidi_webvh_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
     dids_ks: &KeyspaceHandle,
@@ -651,7 +651,7 @@ async fn flush_stats_to_store(
 }
 
 /// Run health checks against all registered instances in parallel.
-async fn run_health_checks(
+pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     http: &reqwest::Client,
 ) -> Result<(), AppError> {

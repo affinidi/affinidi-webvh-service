@@ -361,7 +361,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup
 // ---------------------------------------------------------------------------
 
-async fn start_didcomm_service(
+pub async fn start_didcomm_service(
     state: &AppState,
     secrets: &ServerSecrets,
     shutdown: CancellationToken,
