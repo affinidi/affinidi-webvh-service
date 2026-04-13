@@ -62,16 +62,20 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
     eprintln!("  VTA context: {}", conn_info.context_id);
 
-    // 3. DID hosting URL (determines the did:webvh identifier for this server)
+    // 3. Public URL — this becomes the server's DID identifier
     eprintln!();
-    eprintln!("  The DID hosting URL determines the did:webvh identifier for this");
-    eprintln!("  server's root DID. Each server instance has its own DID identity.");
-    eprintln!("  This is typically the URL where DID documents will be served.");
+    eprintln!("  This server needs its own DID identity (did:webvh). The URL you");
+    eprintln!("  provide here determines the DID — for example, if you enter");
+    eprintln!("  https://server1.example.com, the server's DID will be:");
+    eprintln!("    did:webvh:<scid>:server1.example.com");
     eprintln!();
-    let did_hosting_url: String = Input::new()
-        .with_prompt("DID hosting URL (e.g. https://server1.example.com)")
+    eprintln!("  Each server instance in a distributed deployment should have a");
+    eprintln!("  unique URL and therefore a unique DID.");
+    eprintln!();
+    let public_url: String = Input::new()
+        .with_prompt("Server URL (e.g. https://server1.example.com)")
         .interact_text()?;
-    let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
+    let public_url = public_url.trim_end_matches('/').to_string();
 
     // 4. Mediator selection (before DID creation so it's embedded in the DID doc)
     eprintln!();
@@ -109,7 +113,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let did_result = vta_setup::create_did(
         &client,
         &conn_info.context_id,
-        &did_hosting_url,
+        &public_url,
         ".well-known",
         Some("webvh-server"),
         mediator_did.as_deref(),
@@ -129,17 +133,22 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         eprintln!("  ---");
     }
 
-    // 6. Public serving URL (may differ from DID hosting URL, e.g. behind a CDN)
+    // 6. Control plane DID (for DIDComm sync)
     eprintln!();
-    eprintln!("  The public URL is where this server instance will serve DID documents.");
-    eprintln!("  This is often the same as the DID hosting URL, but may differ if");
-    eprintln!("  requests are served through a CDN or load balancer.");
+    eprintln!("  The control plane manages all DIDs and pushes updates to this");
+    eprintln!("  server via DIDComm through the mediator. Enter the control");
+    eprintln!("  plane's DID so this server can authenticate sync messages.");
+    eprintln!("  (Leave empty to configure later in config.toml)");
     eprintln!();
-    let public_url: String = Input::new()
-        .with_prompt("Public serving URL")
-        .default(did_hosting_url.clone())
+    let control_did: String = Input::new()
+        .with_prompt("Control plane DID")
+        .default(String::new())
         .interact_text()?;
-    let public_url = public_url.trim_end_matches('/').to_string();
+    let control_did = if control_did.is_empty() {
+        None
+    } else {
+        Some(control_did)
+    };
 
     // 7. Host / Port
     let host: String = Input::new()
@@ -209,7 +218,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
         control_url: None,
-        control_did: None,
+        control_did,
         vta: VtaConfig {
             url: Some(conn_info.vta_url),
             did: Some(conn_info.vta_did),
