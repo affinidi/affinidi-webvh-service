@@ -29,6 +29,13 @@ pub const MSG_DELETE_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/delete-
 pub const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
 
 // ---------------------------------------------------------------------------
+// Server registration (server → control plane)
+// ---------------------------------------------------------------------------
+
+pub const MSG_SERVER_REGISTER: &str = "https://affinidi.com/webvh/1.0/server/register";
+pub const MSG_SERVER_REGISTER_ACK: &str = "https://affinidi.com/webvh/1.0/server/register-ack";
+
+// ---------------------------------------------------------------------------
 // Sync (control plane ↔ server)
 // ---------------------------------------------------------------------------
 

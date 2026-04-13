@@ -61,6 +61,8 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
+        // Server registration
+        .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
@@ -383,6 +385,106 @@ async fn handle_sync_ack(
         "sync acknowledgement received"
     );
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Server registration handler
+// ---------------------------------------------------------------------------
+
+async fn handle_server_register(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use crate::acl::check_acl;
+    use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
+
+    let sender = require_sender(&ctx)?;
+    info!(
+        sender = sender,
+        "inbound DIDComm: server registration request"
+    );
+
+    // Require pre-approved ACL entry — the server DID must already be in the
+    // ACL (added by an admin) before it can register.
+    let role = match check_acl(&state.acl_ks, sender).await {
+        Ok(role) => role,
+        Err(_) => {
+            warn!(
+                did = sender,
+                "server registration rejected: DID not in ACL (requires pre-approval)"
+            );
+            return Ok(Some(
+                DIDCommResponse::new(
+                    MSG_PROBLEM_REPORT.to_string(),
+                    json!({
+                        "code": "e.p.registration.unauthorized",
+                        "comment": "server DID must be pre-approved in the ACL before registering"
+                    }),
+                )
+                .thid(message.id.clone()),
+            ));
+        }
+    };
+
+    let public_url = message
+        .body
+        .get("public_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let label = message
+        .body
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Use the sender DID as a stable instance ID (one registration per DID)
+    let instance_id = sender.replace(':', "_");
+
+    let instance = ServiceInstance {
+        instance_id: instance_id.clone(),
+        service_type: ServiceType::Server,
+        label,
+        url: public_url.to_string(),
+        status: ServiceStatus::Active,
+        last_health_check: None,
+        registered_at: crate::auth::session::now_epoch(),
+        metadata: json!({ "did": sender }),
+    };
+
+    if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
+        warn!(did = sender, error = %e, "server registration failed");
+        return Ok(Some(
+            DIDCommResponse::new(
+                MSG_PROBLEM_REPORT.to_string(),
+                json!({
+                    "code": "e.p.registration.internal-error",
+                    "comment": e.to_string()
+                }),
+            )
+            .thid(message.id.clone()),
+        ));
+    }
+
+    info!(
+        did = sender,
+        instance_id = %instance_id,
+        public_url = public_url,
+        role = %role,
+        "server registered via DIDComm"
+    );
+
+    Ok(Some(
+        DIDCommResponse::new(
+            MSG_SERVER_REGISTER_ACK.to_string(),
+            json!({
+                "instance_id": instance_id,
+                "status": "registered",
+            }),
+        )
+        .thid(message.id.clone()),
+    ))
 }
 
 async fn handle_fallback(

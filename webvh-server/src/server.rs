@@ -251,36 +251,13 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // 4. Register with control plane in background (after REST is serving so our DID is resolvable)
-    if let Some(control_url) = state.config.control_url.clone() {
-        if let Some(server_did) = state.config.server_did.clone() {
-            use affinidi_tdk::secrets_resolver::secrets::Secret;
-            let kid = format!("{server_did}#key-0");
-            match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-                Ok(signing_secret) => {
-                    let public_url = state.config.public_url.clone().unwrap_or_default();
-                    let dids_ks = state.dids_ks.clone();
-                    let store_clone = state.store.clone();
-                    let cache = state.did_cache.clone();
-                    tokio::spawn(async move {
-                        let params = control_register::ControlRegistrationParams {
-                            control_url: &control_url,
-                            server_did: &server_did,
-                            signing_secret: &signing_secret,
-                            public_url: &public_url,
-                            label: None,
-                            dids_ks: &dids_ks,
-                            store: &store_clone,
-                            did_cache: &cache,
-                        };
-                        control_register::register_with_control_retry(&params).await;
-                    });
-                }
-                Err(e) => warn!("cannot register with control: {e}"),
-            }
-        } else {
-            warn!("control_url set but server_did missing — skipping registration");
-        }
+    // 4. Register with control plane via DIDComm (background task)
+    if state.config.control_did.is_some() && state.config.features.didcomm {
+        let reg_state = state.clone();
+        let reg_secrets = secrets.clone();
+        tokio::spawn(async move {
+            control_register::register_via_didcomm(&reg_state, &reg_secrets).await;
+        });
     }
 
     // Wait for shutdown signal
