@@ -1,6 +1,8 @@
 mod config;
 
 use axum::Router;
+use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -154,15 +156,18 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
     // Build each enabled service's router
     let mut combined: Router = Router::new();
+    let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
 
     // Track what's enabled for the summary
     let mut enabled_services = Vec::new();
 
-    // 1. Server (mounted at root — DID serving needs /)
+    // 1. Server — public DID-serving routes only (.well-known).
+    //    All /api management routes come from the control plane.
     if config.enable.server {
         match build_server(&config, &secrets, &main_store).await {
-            Ok(router) => {
+            Ok((router, state)) => {
                 combined = combined.merge(router);
+                server_state = Some(state);
                 enabled_services.push("server (/)");
             }
             Err(e) => {
@@ -200,12 +205,14 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
         }
     }
 
-    // 4. Control plane (nested at /control)
+    // 4. Control plane — merged at root (no /control prefix) so that
+    //    URLs like /enroll and /api/... work identically in daemon and
+    //    standalone modes.
     if config.enable.control {
         match build_control(&config, &secrets, &main_store).await {
             Ok(router) => {
-                combined = combined.nest("/control", router);
-                enabled_services.push("control (/control)");
+                combined = combined.merge(router);
+                enabled_services.push("control (/)");
             }
             Err(e) => {
                 error!("failed to initialize control plane: {e}");
@@ -213,6 +220,30 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
             }
         }
     }
+
+    // Combined fallback: try DID public serving first, then the SPA UI.
+    // This lets /{mnemonic}/did.jsonl resolve DIDs while /enroll (etc.)
+    // serves index.html for client-side routing.
+    combined = match server_state {
+        Some(state) => combined.fallback({
+            let state = state.clone();
+            move |uri: Uri| {
+                let state = state.clone();
+                async move { daemon_fallback(state, uri).await }
+            }
+        }),
+        None => {
+            // No server enabled — just use the UI fallback
+            #[cfg(feature = "ui")]
+            {
+                combined.fallback(affinidi_webvh_control::frontend::static_handler)
+            }
+            #[cfg(not(feature = "ui"))]
+            {
+                combined
+            }
+        }
+    };
 
     // Apply tracing layer, then add health route *after* so it's not traced
     let app = combined
@@ -265,15 +296,21 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
 
 type ServiceResult = Result<Router, AppError>;
 
+/// Build the server — returns both the router and the AppState.
+///
+/// In daemon mode the server only exposes public DID-serving routes
+/// (`.well-known`). All `/api/…` management routes come from the
+/// control plane, which is merged at root to avoid a `/control` prefix.
+/// The AppState is returned so the daemon can wire up the combined
+/// DID-serving + UI fallback.
 async fn build_server(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
     store: &affinidi_webvh_common::server::store::Store,
-) -> ServiceResult {
+) -> Result<(Router, affinidi_webvh_server::server::AppState), AppError> {
     use affinidi_webvh_server::server::AppState;
 
     let server_config = config.server_config();
-    let upload_body_limit = server_config.limits.upload_body_limit;
 
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -294,16 +331,17 @@ async fn build_server(
         jwt_keys,
         signing_key_bytes,
         http_client: reqwest::Client::new(),
-        stats_collector: None, // daemon mode doesn't run the storage thread; stats flush is manual
+        stats_collector: None,
         did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
             std::time::Duration::from_secs(300),
         )),
     };
 
-    let router = affinidi_webvh_server::routes::router(upload_body_limit).with_state(state);
-    info!("server service initialized");
+    // Public-only: .well-known routes, no /api (control plane provides those)
+    let router = affinidi_webvh_server::routes::router_public_only().with_state(state.clone());
+    info!("server service initialized (public-only, daemon mode)");
 
-    Ok(router)
+    Ok((router, state))
 }
 
 async fn build_witness(
@@ -420,7 +458,9 @@ async fn build_control(
             .expect("failed to open stats keyspace"),
     };
 
-    let router = affinidi_webvh_control::routes::router().with_state(state);
+    // Use router_without_fallback — the daemon sets its own combined fallback
+    // that handles both DID serving and SPA UI.
+    let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
     info!("control plane service initialized");
 
     Ok(router)
@@ -454,6 +494,39 @@ async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
             eprintln!("Error loading secrets: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined fallback: DID serving + SPA UI
+// ---------------------------------------------------------------------------
+
+/// Fallback handler for the daemon's combined router.
+///
+/// Tries DID public serving first (e.g. `/{mnemonic}/did.jsonl`).
+/// If that returns 404, falls through to the SPA static handler so that
+/// paths like `/enroll` serve `index.html` for client-side routing.
+async fn daemon_fallback(state: affinidi_webvh_server::server::AppState, uri: Uri) -> Response {
+    // Try DID public serving
+    let did_resp = affinidi_webvh_server::routes::did_public::serve_public(
+        axum::extract::State(state),
+        uri.clone(),
+    )
+    .await;
+
+    if did_resp.status() != StatusCode::NOT_FOUND {
+        return did_resp;
+    }
+
+    // Fall through to SPA UI
+    #[cfg(feature = "ui")]
+    {
+        affinidi_webvh_control::frontend::static_handler(uri).await
+    }
+
+    #[cfg(not(feature = "ui"))]
+    {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
