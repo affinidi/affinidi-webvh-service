@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+## 0.4.0 (2026-04-13)
+
+### Added
+- **webvh-server**: Restore `import-secrets` CLI command for importing server
+  secrets from a VTA secrets bundle or individual multibase-encoded keys. This
+  is required for cold-start bootstrap scenarios where no VTA service is running.
+
+## 0.3.0 (2026-04-12)
+
+### Changed
+- Simplified architecture: removed shared CLI module, VTA-cache layer, and
+  background task infrastructure from webvh-common
+- Each service binary now owns its CLI directly instead of delegating to
+  `webvh-common::server::cli`
+- Switched from local-path `vta-sdk` to crates.io published version (0.3.x)
+
+### Removed
+- `webvh-common::server::cli` module (CLI logic moved into each binary)
+- `webvh-common::server::vta_cache` module (VTA key refresh on startup removed)
+- `import-secrets` CLI command from webvh-server (restored in 0.4.0)
+
+## 0.2.0 (2026-04-08)
+
+### Changed
+- Version bump release for crates.io publishing
+
 ## 0.1.0 (2026-03-31)
 
 First production-hardened release. Major improvements across all services in

@@ -534,6 +534,7 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,

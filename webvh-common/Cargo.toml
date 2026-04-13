@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-common"
 description = "WebVH Common, Common methods and structs related to WebVH Content"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"

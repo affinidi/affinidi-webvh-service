@@ -636,10 +636,8 @@ async fn run_import_secrets(
     let secret_store = secret_store::create_secret_store(&config)?;
 
     // Check for existing secrets
-    if !force {
-        if let Ok(Some(_)) = secret_store.get().await {
-            return Err("secrets already exist — use --force to overwrite".into());
-        }
+    if !force && let Ok(Some(_)) = secret_store.get().await {
+        return Err("secrets already exist — use --force to overwrite".into());
     }
 
     let (resolved_signing, resolved_ka, resolved_vta_cred) =
