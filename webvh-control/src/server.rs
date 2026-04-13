@@ -50,6 +50,8 @@ pub struct AppState {
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
     /// Stats keyspace for persistent per-DID stats.
     pub stats_ks: KeyspaceHandle,
+    /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
+    pub signing_key_bytes: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -110,6 +112,18 @@ impl PasskeyState for AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+    // Validate that at least one management interface is enabled
+    if !config.features.rest_api && !config.features.didcomm {
+        return Err(AppError::Config(
+            "at least one of 'rest_api' or 'didcomm' must be enabled in [features]".into(),
+        ));
+    }
+
+    #[cfg(feature = "ui")]
+    if !config.features.rest_api {
+        warn!("UI feature is compiled in but rest_api is disabled — UI will not be accessible");
+    }
+
     // Open keyspace handles
     let sessions_ks = store.keyspace("sessions")?;
     let acl_ks = store.keyspace("acl")?;
@@ -215,6 +229,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             Arc::new(collector)
         },
         stats_ks: stats_ks.clone(),
+        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
     };
 
     // Seed registry from static config
@@ -379,7 +394,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup (inbound)
 // ---------------------------------------------------------------------------
 
-async fn start_didcomm_service(
+pub async fn start_didcomm_service(
     state: &AppState,
     secrets: &ServerSecrets,
     shutdown: CancellationToken,
@@ -419,7 +434,7 @@ async fn start_didcomm_service(
         ..Default::default()
     };
 
-    let router = messaging::build_control_router()
+    let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
 
     let svc = DIDCommService::start(

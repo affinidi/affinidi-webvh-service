@@ -8,6 +8,7 @@ use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::didcomm::message::pack;
 use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
 use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
+use affinidi_webvh_common::didcomm_types::*;
 use affinidi_webvh_common::server::didcomm_unpack;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -20,30 +21,10 @@ use crate::auth::session::now_epoch;
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
-use crate::watcher_push;
-
-// ---------------------------------------------------------------------------
-// Message type constants
-// ---------------------------------------------------------------------------
+use crate::server_push;
 
 const TRUST_PING_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping";
 const DISCOVER_FEATURES_QUERY_TYPE: &str = "https://didcomm.org/discover-features/2.0/queries";
-
-const MSG_DID_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/request";
-const MSG_DID_OFFER: &str = "https://affinidi.com/webvh/1.0/did/offer";
-const MSG_DID_PUBLISH: &str = "https://affinidi.com/webvh/1.0/did/publish";
-const MSG_DID_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/confirm";
-const MSG_WITNESS_PUBLISH: &str = "https://affinidi.com/webvh/1.0/did/witness-publish";
-const MSG_WITNESS_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/witness-confirm";
-const MSG_INFO_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/info-request";
-const MSG_INFO: &str = "https://affinidi.com/webvh/1.0/did/info";
-const MSG_LIST_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/list-request";
-const MSG_LIST: &str = "https://affinidi.com/webvh/1.0/did/list";
-const MSG_DELETE: &str = "https://affinidi.com/webvh/1.0/did/delete";
-const MSG_DELETE_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/delete-confirm";
-const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
-
-// Sync message types are handled via mediator in messaging.rs, not the REST endpoint
 
 // ---------------------------------------------------------------------------
 // Protocol error (maps to DIDComm problem-report)
@@ -63,25 +44,30 @@ impl ProtocolError {
     }
 }
 
-/// Convert an [`AppError`] into a [`ProtocolError`] with an appropriate DIDComm error code.
 fn map_app_error(err: AppError) -> ProtocolError {
-    use crate::error::{QuotaKind, ValidationKind};
-
     let comment = err.to_string();
     let code = match &err {
         AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
-        AppError::QuotaExceeded(_) => match err.quota_kind() {
-            QuotaKind::Size => "e.p.did.size-exceeded",
-            QuotaKind::Count => "e.p.did.quota-exceeded",
-        },
+        AppError::QuotaExceeded(msg) => {
+            if msg.contains("size") {
+                "e.p.did.size-exceeded"
+            } else {
+                "e.p.did.quota-exceeded"
+            }
+        }
         AppError::Conflict(_) => "e.p.did.path-unavailable",
         AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
-        AppError::Validation(_) => match err.validation_kind() {
-            ValidationKind::InvalidLog => "e.p.did.invalid-log",
-            ValidationKind::InvalidPath => "e.p.did.path-invalid",
-            ValidationKind::InvalidWitness => "e.p.did.witness-invalid",
-            ValidationKind::Other => "e.p.did.validation-error",
-        },
+        AppError::Validation(msg) => {
+            if msg.contains("log entry") || msg.contains("jsonl") || msg.contains("JSONL") {
+                "e.p.did.invalid-log"
+            } else if msg.contains("path") {
+                "e.p.did.path-invalid"
+            } else if msg.contains("witness") {
+                "e.p.did.witness-invalid"
+            } else {
+                "e.p.did.validation-error"
+            }
+        }
         _ => "e.p.did.internal-error",
     };
     ProtocolError::new(code, comment)
@@ -91,8 +77,6 @@ fn map_app_error(err: AppError) -> ProtocolError {
 // Main handler — POST /api/didcomm
 // ---------------------------------------------------------------------------
 
-/// Receives a DIDComm signed message, routes it by `type`, and returns a
-/// packed DIDComm response (or problem-report on business-logic errors).
 pub async fn handle(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -100,7 +84,6 @@ pub async fn handle(
 ) -> Result<Response, AppError> {
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
-    // Unpack the incoming DIDComm message
     let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver)
         .await
         .map_err(|e| AppError::Validation(format!("failed to unpack DIDComm message: {e}")))?;
@@ -123,7 +106,6 @@ pub async fn handle(
         .as_deref()
         .ok_or_else(|| AppError::Internal("server_did not configured".into()))?;
 
-    // Dispatch to sub-handler; convert business errors into problem-reports
     let (response_type, response_body) = match dispatch(&auth, &state, &msg, server_did).await {
         Ok(result) => result,
         Err(pe) => {
@@ -141,7 +123,6 @@ pub async fn handle(
         }
     };
 
-    // Build response DIDComm message
     let response_msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         response_type,
@@ -153,7 +134,6 @@ pub async fn handle(
     .created_time(now_epoch())
     .finalize();
 
-    // Sign with the server's Ed25519 key
     let signing_key = state
         .signing_key_bytes
         .as_ref()
@@ -200,9 +180,6 @@ async fn dispatch(
 // Sub-handlers
 // ---------------------------------------------------------------------------
 
-/// `trust-ping/2.0/ping` -> `trust-ping/2.0/ping-response`
-///
-/// Returns the pong message type and body directly; the caller packs it.
 fn handle_trust_ping(ping: &Message, server_did: &str) -> Result<(String, Value), ProtocolError> {
     let sender_did = ping.from.as_deref().ok_or_else(|| {
         ProtocolError::new("e.p.trust-ping.no-from", "trust-ping has no 'from' DID")
@@ -217,9 +194,6 @@ fn handle_trust_ping(ping: &Message, server_did: &str) -> Result<(String, Value)
     Ok((pong.typ.clone(), pong.body.clone()))
 }
 
-/// `discover-features/2.0/queries` -> `discover-features/2.0/disclose`
-///
-/// Returns the disclosure message type and body; the caller packs it.
 fn handle_discover_features(
     query_msg: &Message,
     server_did: &str,
@@ -233,7 +207,6 @@ fn handle_discover_features(
 
     info!(from = sender_did, "received discover-features query");
 
-    // Build a DiscoverFeatures state with our supported protocols
     let features = DiscoverFeatures {
         protocols: vec![
             "https://didcomm.org/trust-ping/2.0".into(),
@@ -251,7 +224,6 @@ fn handle_discover_features(
     Ok((disclosure.typ.clone(), disclosure.body.clone()))
 }
 
-/// `did/request` -> `did/offer`
 async fn handle_did_request(
     auth: &AuthClaims,
     state: &AppState,
@@ -275,7 +247,6 @@ async fn handle_did_request(
     ))
 }
 
-/// `did/publish` -> `did/confirm`
 async fn handle_did_publish(
     auth: &AuthClaims,
     state: &AppState,
@@ -293,29 +264,41 @@ async fn handle_did_publish(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtocolError::new("e.p.did.invalid-log", "missing 'did_log' in body"))?;
 
-    let result = did_ops::publish_did(auth, state, mnemonic, did_log)
+    did_ops::publish_did(auth, state, mnemonic, did_log)
         .await
         .map_err(map_app_error)?;
 
-    watcher_push::notify_watchers_did(
-        &state.config,
-        &state.http_client,
-        &state.dids_ks,
-        mnemonic.to_string(),
-    );
+    // Read back the record for protocol response fields
+    let record: affinidi_webvh_common::did_ops::DidRecord = state
+        .dids_ks
+        .get(affinidi_webvh_common::did_ops::did_key(mnemonic))
+        .await
+        .map_err(|e| ProtocolError::new("e.p.did.internal-error", e.to_string()))?
+        .ok_or_else(|| {
+            ProtocolError::new("e.p.did.internal-error", "record missing after publish")
+        })?;
+
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
+
+    server_push::notify_servers_did(state, mnemonic.to_string());
 
     Ok((
         MSG_DID_CONFIRM.to_string(),
         json!({
-            "did_id": result.did_id,
-            "did_url": result.did_url,
-            "version_id": result.version_id,
-            "version_count": result.version_count,
+            "did_id": record.did_id,
+            "did_url": did_url,
+            "version_id": record.did_id,
+            "version_count": record.version_count,
         }),
     ))
 }
 
-/// `did/witness-publish` -> `did/witness-confirm`
 async fn handle_witness_publish(
     auth: &AuthClaims,
     state: &AppState,
@@ -343,27 +326,29 @@ async fn handle_witness_publish(
         ));
     }
 
-    let result = did_ops::upload_witness(auth, state, mnemonic, &witness_str)
+    did_ops::upload_witness(auth, state, mnemonic, &witness_str)
         .await
         .map_err(map_app_error)?;
 
-    watcher_push::notify_watchers_did(
-        &state.config,
-        &state.http_client,
-        &state.dids_ks,
-        mnemonic.to_string(),
-    );
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
+
+    server_push::notify_servers_did(state, mnemonic.to_string());
 
     Ok((
         MSG_WITNESS_CONFIRM.to_string(),
         json!({
             "mnemonic": mnemonic,
-            "witness_url": result.witness_url,
+            "witness_url": witness_url,
         }),
     ))
 }
 
-/// `did/info-request` -> `did/info`
 async fn handle_info_request(
     auth: &AuthClaims,
     state: &AppState,
@@ -377,38 +362,52 @@ async fn handle_info_request(
             ProtocolError::new("e.p.did.mnemonic-not-found", "missing 'mnemonic' in body")
         })?;
 
-    let result = did_ops::get_did_info(auth, state, mnemonic)
+    let (record, log_metadata) = did_ops::get_did_info(auth, state, mnemonic)
         .await
         .map_err(map_app_error)?;
 
-    let log_metadata_json = result
-        .log_metadata
+    let stats_key = format!("stats:{mnemonic}");
+    let did_stats: affinidi_webvh_common::DidStats = state
+        .stats_ks
+        .get(stats_key)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+
+    let log_metadata_json = log_metadata
         .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
+
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
     Ok((
         MSG_INFO.to_string(),
         json!({
-            "mnemonic": result.record.mnemonic,
-            "did_id": result.record.did_id,
-            "did_url": result.did_url,
-            "owner": result.record.owner,
-            "created_at": result.record.created_at,
-            "updated_at": result.record.updated_at,
-            "version_count": result.record.version_count,
-            "content_size": result.record.content_size,
+            "mnemonic": record.mnemonic,
+            "did_id": record.did_id,
+            "did_url": did_url,
+            "owner": record.owner,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "version_count": record.version_count,
+            "content_size": record.content_size,
             "stats": {
-                "total_resolves": result.stats.total_resolves,
-                "total_updates": result.stats.total_updates,
-                "last_resolved_at": result.stats.last_resolved_at,
-                "last_updated_at": result.stats.last_updated_at,
+                "total_resolves": did_stats.total_resolves,
+                "total_updates": did_stats.total_updates,
+                "last_resolved_at": did_stats.last_resolved_at,
+                "last_updated_at": did_stats.last_updated_at,
             },
             "log_metadata": log_metadata_json,
         }),
     ))
 }
 
-/// `did/list-request` -> `did/list`
 async fn handle_list_request(
     auth: &AuthClaims,
     state: &AppState,
@@ -437,7 +436,6 @@ async fn handle_list_request(
     Ok((MSG_LIST.to_string(), json!({ "dids": entries_json })))
 }
 
-/// `did/delete` -> `did/delete-confirm`
 async fn handle_delete(
     auth: &AuthClaims,
     state: &AppState,
@@ -451,25 +449,17 @@ async fn handle_delete(
             ProtocolError::new("e.p.did.mnemonic-not-found", "missing 'mnemonic' in body")
         })?;
 
-    let result = did_ops::delete_did(auth, state, mnemonic)
+    let did_id = did_ops::delete_did(auth, state, mnemonic)
         .await
         .map_err(map_app_error)?;
 
-    watcher_push::notify_watchers_delete(
-        &state.config,
-        &state.http_client,
-        &state.dids_ks,
-        mnemonic.to_string(),
-    );
+    server_push::notify_servers_delete(state, mnemonic.to_string());
 
     Ok((
         MSG_DELETE_CONFIRM.to_string(),
         json!({
-            "mnemonic": result.mnemonic,
-            "did_id": result.did_id,
+            "mnemonic": mnemonic,
+            "did_id": did_id,
         }),
     ))
 }
-
-// Sync messages (did/sync-update, did/sync-delete) are handled via the mediator
-// message loop in messaging.rs, not through this REST DIDComm endpoint.

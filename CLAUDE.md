@@ -10,6 +10,6 @@ When making changes to `webvh-server` or `webvh-control`, check whether the same
 - **Background tasks**: Session cleanup, DID cleanup, stats flush, and health checks run in a unified storage task in the daemon. New periodic tasks in standalone services should be added to `run_daemon_storage_task`.
 - **Startup initialization**: Auto-bootstrap, integrity checks, stats seeding, registry seeding — any new startup-time logic in standalone services should be mirrored in `run_daemon()`.
 - **Route changes**: The daemon merges server (public-only) and control (full API + UI) at root. Server `/api` routes are NOT included — the control plane provides all management routes. Route additions to either service must be tested in daemon mode.
-- **DIDComm**: The daemon starts the server's inbound DIDComm listener and the control plane's outbound ATM when `didcomm = true`. New DIDComm message handlers or protocol changes apply to both modes.
+- **DIDComm**: The daemon starts the **control plane's** inbound DIDComm listener when `didcomm = true`. This handles the full VTA provisioning protocol (did/request, did/publish, etc.) and operates on the control plane's authoritative store. The server does **not** run its own DIDComm service in daemon mode — it only receives sync updates in distributed mode. No outbound ATM is needed in daemon mode since there are no external servers to sync with.
 
 The daemon is always self-contained — it does **not** register with an external control plane, and stats are shared in-process via `Arc<StatsCollector>` (no HTTP stats sync).

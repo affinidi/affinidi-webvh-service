@@ -466,6 +466,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     }
 
     // 2d. Control plane — merged at root (no prefix)
+    let mut control_state: Option<affinidi_webvh_control::server::AppState> = None;
     if config.enable.control {
         match build_control(
             &config,
@@ -477,8 +478,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         )
         .await
         {
-            Ok(router) => {
+            Ok((router, state)) => {
                 combined = combined.merge(router);
+                control_state = Some(state);
                 enabled_services.push("control (/)");
             }
             Err(e) => {
@@ -557,11 +559,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         storage_shutdown_rx,
     ));
 
-    // 3b. DIDComm service (for VTA integration)
+    // 3b. DIDComm service (for VTA integration via control plane)
     let didcomm_shutdown = CancellationToken::new();
     let didcomm_service = if config.didcomm {
-        if let Some(ref state) = server_state {
-            match affinidi_webvh_server::server::start_didcomm_service(
+        if let Some(ref state) = control_state {
+            match affinidi_webvh_control::server::start_didcomm_service(
                 state,
                 &secrets,
                 didcomm_shutdown.clone(),
@@ -576,7 +578,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
                 }
             }
         } else {
-            warn!("DIDComm enabled but server not enabled — skipping");
+            warn!("DIDComm enabled but control plane not enabled — skipping");
             None
         }
     } else {
@@ -843,7 +845,7 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     stats_ks: &KeyspaceHandle,
     http_client: &reqwest::Client,
-) -> ServiceResult {
+) -> Result<(Router, affinidi_webvh_control::server::AppState), AppError> {
     use affinidi_webvh_control::server::AppState;
 
     let control_config = config.control_config();
@@ -871,7 +873,7 @@ async fn build_control(
         }
     });
 
-    let mut state = AppState {
+    let state = AppState {
         store: store.clone(),
         sessions_ks,
         acl_ks,
@@ -887,34 +889,22 @@ async fn build_control(
         atm_profile: None,
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
+        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
     };
 
     // Seed registry from static config
     affinidi_webvh_control::server::seed_registry(&state).await;
 
-    // Initialize outbound ATM for DIDComm sync push messages
-    if config.didcomm {
-        if let Some(ref control_did) = config.server_did {
-            if let Some((atm, profile)) = affinidi_webvh_control::messaging::init_outbound_atm(
-                &state.config,
-                control_did,
-                secrets,
-            )
-            .await
-            {
-                state.atm = Some(atm);
-                state.atm_profile = Some(profile);
-            }
-        } else {
-            warn!("DIDComm enabled but server_did not configured — outbound messaging disabled");
-        }
-    }
+    // In daemon mode, no outbound ATM is needed — there are no external
+    // servers to sync with.  The server_push::notify_servers_* functions
+    // gracefully no-op when state.atm is None.
 
     // Build router without UI fallback — daemon adds its own combined fallback
-    let router = affinidi_webvh_control::routes::router_without_fallback().with_state(state);
+    let router =
+        affinidi_webvh_control::routes::router_without_fallback().with_state(state.clone());
     info!("control plane service initialized");
 
-    Ok(router)
+    Ok((router, state))
 }
 
 // ===========================================================================

@@ -3,7 +3,6 @@ mod auth;
 mod config;
 pub(crate) mod did_manage;
 pub mod did_public;
-mod didcomm;
 pub(crate) mod health;
 mod stats;
 
@@ -51,8 +50,6 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         // Stats (authenticated — in-memory only, authoritative stats on control plane)
         .route("/stats", get(stats::get_server_stats))
         .route("/stats/{*mnemonic}", get(stats::get_did_stats))
-        // DIDComm protocol endpoint
-        .route("/didcomm", post(didcomm::handle))
         // Server config (admin only)
         .route("/config", get(config::get_config))
         // ACL management (admin only)
