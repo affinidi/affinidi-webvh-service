@@ -31,6 +31,8 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .extension(state)
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
+        .route(MSG_SERVER_REGISTER_ACK, handler_fn(handle_register_ack))?
+        .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
         .fallback(handler_fn(handle_fallback))
@@ -40,6 +42,52 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
                 .require_sender_did(true),
         )
         .layer(RequestLogging))
+}
+
+// ---------------------------------------------------------------------------
+// Registration ack
+// ---------------------------------------------------------------------------
+
+async fn handle_register_ack(
+    _ctx: HandlerContext,
+    message: Message,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let instance_id = message
+        .body
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    info!(instance_id, "registration acknowledged by control plane");
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Health ping (control plane → server → control plane)
+// ---------------------------------------------------------------------------
+
+async fn handle_health_ping(
+    _ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let did_count = state
+        .dids_ks
+        .prefix_iter_raw("did:")
+        .await
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
+
+    Ok(Some(
+        DIDCommResponse::new(
+            MSG_HEALTH_PONG.to_string(),
+            json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "did_count": did_count,
+            }),
+        )
+        .thid(message.id.clone()),
+    ))
 }
 
 // ---------------------------------------------------------------------------

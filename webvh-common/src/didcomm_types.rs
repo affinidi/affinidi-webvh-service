@@ -36,6 +36,13 @@ pub const MSG_SERVER_REGISTER: &str = "https://affinidi.com/webvh/1.0/server/reg
 pub const MSG_SERVER_REGISTER_ACK: &str = "https://affinidi.com/webvh/1.0/server/register-ack";
 
 // ---------------------------------------------------------------------------
+// Health (control plane → server → control plane)
+// ---------------------------------------------------------------------------
+
+pub const MSG_HEALTH_PING: &str = "https://affinidi.com/webvh/1.0/server/health-ping";
+pub const MSG_HEALTH_PONG: &str = "https://affinidi.com/webvh/1.0/server/health-pong";
+
+// ---------------------------------------------------------------------------
 // Sync (control plane ↔ server)
 // ---------------------------------------------------------------------------
 

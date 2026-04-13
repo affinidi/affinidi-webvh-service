@@ -51,6 +51,8 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
         // Server registration
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
+        // Health pong from servers
+        .route(MSG_HEALTH_PONG, handler_fn(handle_health_pong))?
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
@@ -372,6 +374,48 @@ async fn handle_sync_ack(
         msg_type = %message.typ,
         "sync acknowledgement received"
     );
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Health pong handler (server → control plane)
+// ---------------------------------------------------------------------------
+
+async fn handle_health_pong(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use crate::registry::{self, ServiceStatus};
+
+    let sender = require_sender(&ctx)?;
+    let status = message
+        .body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let version = message
+        .body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    debug!(sender, status, version, "health pong received from server");
+
+    // Find the instance by sender DID and mark it active
+    let instance_id = sender.replace(':', "_");
+    let now = crate::auth::session::now_epoch();
+    if let Err(e) = registry::update_instance_status(
+        &state.registry_ks,
+        &instance_id,
+        ServiceStatus::Active,
+        now,
+    )
+    .await
+    {
+        warn!(instance_id, error = %e, "failed to update instance status from health pong");
+    }
+
     Ok(None)
 }
 

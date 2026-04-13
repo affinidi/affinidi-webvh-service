@@ -558,23 +558,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         error!("failed to open sessions keyspace: {e}");
         std::process::exit(1);
     });
-    let registry_ks = main_store.keyspace("registry").unwrap_or_else(|e| {
-        error!("failed to open registry keyspace: {e}");
-        std::process::exit(1);
-    });
-
     let storage_handle = tokio::spawn(run_daemon_storage_task(
         DaemonStorageParams {
             store: main_store.clone(),
             sessions_ks,
             dids_ks: dids_ks.clone(),
-            registry_ks,
             stats_ks,
             auth_config: config.auth.clone(),
-            registry_config: config.registry.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
-            http: http_client,
         },
         storage_shutdown_rx,
     ));
@@ -674,13 +666,10 @@ struct DaemonStorageParams {
     store: Store,
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
-    registry_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
     auth_config: affinidi_webvh_common::server::config::AuthConfig,
-    registry_config: affinidi_webvh_control::config::RegistryConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
-    http: reqwest::Client,
 }
 
 async fn run_daemon_storage_task(
@@ -692,18 +681,15 @@ async fn run_daemon_storage_task(
     let session_interval = Duration::from_secs(params.auth_config.session_cleanup_interval);
     let did_ttl_seconds = params.auth_config.cleanup_ttl_minutes * 60;
     let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-    let health_interval = Duration::from_secs(params.registry_config.health_check_interval.max(10));
     let flush_interval = Duration::from_secs(10);
 
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
-    let mut health_timer = tokio::time::interval(health_interval);
     let mut flush_timer = tokio::time::interval(flush_interval);
 
     // Skip first ticks (immediate)
     session_timer.tick().await;
     did_timer.tick().await;
-    health_timer.tick().await;
     flush_timer.tick().await;
 
     loop {
@@ -729,14 +715,6 @@ async fn run_daemon_storage_task(
                         }
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
-                }
-            }
-            _ = health_timer.tick() => {
-                if let Err(e) = affinidi_webvh_control::server::run_health_checks(
-                    &params.registry_ks,
-                    &params.http,
-                ).await {
-                    warn!("health check error: {e}");
                 }
             }
             _ = flush_timer.tick() => {

@@ -86,6 +86,11 @@ pub async fn deregister(
 
 // ---------- POST /api/control/registry/{instance_id}/health ----------
 
+/// Trigger a health check for an instance.
+///
+/// Evaluates the instance status based on the last health-pong timestamp.
+/// The actual DIDComm health pings are sent periodically by the background
+/// health check task — this endpoint just reads the current state.
 pub async fn health_check(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -95,8 +100,9 @@ pub async fn health_check(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
 
-    let status = registry::health_check(&state.http_client, &instance).await;
     let now = crate::auth::session::now_epoch();
+    let health_interval = state.config.registry.health_check_interval.max(10);
+    let status = registry::health_status_from_timestamp(&instance, now, health_interval);
     registry::update_instance_status(&state.registry_ks, &instance_id, status, now).await?;
 
     let updated = registry::get_instance(&state.registry_ks, &instance_id)
