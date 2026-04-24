@@ -1,5 +1,5 @@
 use affinidi_webvh_watcher::config::AppConfig;
-use affinidi_webvh_watcher::{health, server, store};
+use affinidi_webvh_watcher::{health, server, setup, store};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -34,9 +34,10 @@ async fn main() {
 
     match cli.command {
         Some(Command::Setup) => {
-            eprintln!("Setup wizard not yet implemented for webvh-watcher.");
-            eprintln!("Create a config.toml manually.");
-            std::process::exit(1);
+            if let Err(e) = setup::run_wizard(cli.config).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
         }
         Some(Command::Health) => {
             if let Err(e) = health::run_health(cli.config).await {

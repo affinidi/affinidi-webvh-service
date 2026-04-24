@@ -577,6 +577,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "dialoguer",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

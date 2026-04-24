@@ -1,4 +1,5 @@
 mod config;
+mod setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +43,31 @@ struct Cli {
 enum Command {
     /// Run interactive setup wizard to generate config.toml
     Setup,
+    /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
+    SetupOfflinePrepare {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        request: PathBuf,
+        /// Path for the ephemeral seed (chmod 0600 on Unix).
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Path for the pending state file (plain TOML, no secrets).
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Step 2/2 of the offline setup wizard.
+    SetupOfflineComplete {
+        /// Path to the ASCII-armored sealed bundle from the VTA admin.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest (lowercase hex) of the armored
+        /// ciphertext; communicated out-of-band.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the state file written by `setup-offline-prepare`.
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
     /// Run health check diagnostics
     Health,
     /// Add an ACL entry
@@ -169,9 +195,31 @@ async fn main() {
 
     match cli.command {
         Some(Command::Setup) => {
-            eprintln!("  Setup wizard not yet implemented for the daemon.");
-            eprintln!("  Configure each service individually, then create a combined config.toml.");
-            std::process::exit(1);
+            if let Err(e) = setup::run_wizard(cli.config).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflinePrepare {
+            request,
+            seed,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, seed, state).await
+            {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflineComplete {
+            bundle,
+            expect_digest,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
         }
         Some(Command::Health) => {
             if let Err(e) = run_health(cli.config).await {
