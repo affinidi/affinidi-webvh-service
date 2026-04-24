@@ -38,7 +38,6 @@ const formatDate = (ts: number) =>
   });
 
 const keyExtractor = (item: AclEntry) => item.did;
-const listContentStyle = { gap: spacing.sm };
 
 const AclEntryRow = memo(function AclEntryRow({
   item,
@@ -453,8 +452,8 @@ export default function AclManagement() {
     return rem === 0 ? `${hrs}h` : `${hrs}h ${rem}m`;
   };
 
-  return (
-    <View style={styles.container}>
+  const header = (
+    <View>
       <Text style={styles.title}>Access Control</Text>
 
       {/* Invite by link */}
@@ -617,32 +616,52 @@ export default function AclManagement() {
       </View>
 
       {error && <Text style={styles.errorText}>{error}</Text>}
-
-      {loading ? (
-        <ActivityIndicator
-          color={colors.accent}
-          size="large"
-          style={{ marginTop: spacing.xl }}
-        />
-      ) : entries.length === 0 ? (
-        <Text style={styles.hint}>No ACL entries configured.</Text>
-      ) : (
-        <FlatList
-          data={entries}
-          keyExtractor={keyExtractor}
-          contentContainerStyle={listContentStyle}
-          renderItem={renderEntry}
-        />
-      )}
     </View>
   );
+
+  // Render the entire page as a single scrollable FlatList — the Invite
+  // and Add Entry cards live inside ListHeaderComponent so they scroll
+  // with the entry list rather than taking up static screen real estate
+  // above it. Empty / loading states live in ListEmptyComponent.
+  return (
+    <FlatList
+      style={styles.container}
+      contentContainerStyle={styles.scrollContent}
+      data={entries}
+      keyExtractor={keyExtractor}
+      ListHeaderComponent={header}
+      renderItem={renderEntry}
+      ListEmptyComponent={
+        loading ? (
+          <ActivityIndicator
+            color={colors.accent}
+            size="large"
+            style={{ marginTop: spacing.xl }}
+          />
+        ) : (
+          <Text style={styles.hint}>No ACL entries configured.</Text>
+        )
+      }
+      ItemSeparatorComponent={EntrySeparator}
+    />
+  );
 }
+
+const EntrySeparator = () => <View style={styles.entrySeparator} />;
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: spacing.xl,
     backgroundColor: colors.bgPrimary,
+  },
+  scrollContent: {
+    padding: spacing.xl,
+    // Room at the bottom so the last ACL entry isn't flush with the
+    // viewport edge on short lists.
+    paddingBottom: spacing.xxl,
+  },
+  entrySeparator: {
+    height: spacing.sm,
   },
   containerCenter: {
     flex: 1,
