@@ -20,7 +20,12 @@ import {
   parseOptionalInt,
 } from "../../lib/format";
 import { showAlert, showConfirm } from "../../lib/alert";
-import type { AclEntry, CreateInviteResponse, DidRecord } from "../../lib/api";
+import type {
+  AclEntry,
+  CreateInviteResponse,
+  DidRecord,
+  InviteListItem,
+} from "../../lib/api";
 
 interface EditState {
   did: string;
@@ -223,6 +228,14 @@ export default function AclManagement() {
   const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
   const [inviteCopied, setInviteCopied] = useState(false);
 
+  // Pending invites (from server)
+  const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
+  const [editingInvite, setEditingInvite] = useState<
+    { token: string; role: "admin" | "owner" | "service" } | null
+  >(null);
+  const [invitesBusyToken, setInvitesBusyToken] = useState<string | null>(null);
+  const [inviteCopiedToken, setInviteCopiedToken] = useState<string | null>(null);
+
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -233,10 +246,16 @@ export default function AclManagement() {
       return;
     }
     setLoading(true);
-    api
-      .listAcl()
-      .then((data) => {
-        setEntries(data.entries);
+    // Fetch entries + pending invites in parallel. Invite failures are
+    // non-fatal — the admin can still see the ACL list if invites are
+    // broken for any reason.
+    Promise.all([
+      api.listAcl(),
+      api.listInvites().catch(() => ({ invites: [] as InviteListItem[] })),
+    ])
+      .then(([aclData, inviteData]) => {
+        setEntries(aclData.entries);
+        setPendingInvites(inviteData.invites);
         setError(null);
       })
       .catch((e) => setError(e.message))
@@ -254,6 +273,8 @@ export default function AclManagement() {
       const resp = await api.createInvite(inviteDid.trim(), inviteRole);
       setInvite(resp);
       setInviteCopied(false);
+      // Pull in the newly-created invite for the pending list too.
+      refresh();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to create invite";
       showAlert("Error", msg);
@@ -261,6 +282,62 @@ export default function AclManagement() {
       setInviting(false);
     }
   };
+
+  const handleCopyPendingInvite = useCallback(
+    async (item: InviteListItem) => {
+      await Clipboard.setStringAsync(item.enrollment_url);
+      setInviteCopiedToken(item.token);
+      setTimeout(
+        () =>
+          setInviteCopiedToken((prev) => (prev === item.token ? null : prev)),
+        2000,
+      );
+    },
+    [],
+  );
+
+  const handleRevokeInvite = useCallback(
+    (token: string) => {
+      showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
+        setInvitesBusyToken(token);
+        try {
+          await api.revokeInvite(token);
+          refresh();
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Failed to revoke";
+          showAlert("Error", msg);
+        } finally {
+          setInvitesBusyToken((prev) => (prev === token ? null : prev));
+        }
+      });
+    },
+    [api, refresh],
+  );
+
+  const startEditInviteRole = useCallback(
+    (item: InviteListItem) =>
+      setEditingInvite({ token: item.token, role: item.role }),
+    [],
+  );
+
+  const cancelEditInviteRole = useCallback(() => setEditingInvite(null), []);
+
+  const handleSaveInviteRole = useCallback(async () => {
+    if (!editingInvite) return;
+    setInvitesBusyToken(editingInvite.token);
+    try {
+      await api.updateInvite(editingInvite.token, { role: editingInvite.role });
+      setEditingInvite(null);
+      refresh();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to update invite";
+      showAlert("Error", msg);
+    } finally {
+      setInvitesBusyToken((prev) =>
+        prev === editingInvite.token ? null : prev,
+      );
+    }
+  }, [api, editingInvite, refresh]);
 
   const handleCopyInvite = async () => {
     if (!invite) return;
@@ -535,6 +612,117 @@ export default function AclManagement() {
           </View>
         )}
       </View>
+
+      {/* Pending invites — only shown when there are any */}
+      {pendingInvites.length > 0 && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>
+            Pending Invites ({pendingInvites.length})
+          </Text>
+          {pendingInvites.map((inv) => {
+            const isEditing = editingInvite?.token === inv.token;
+            const busy = invitesBusyToken === inv.token;
+            return (
+              <View key={inv.token} style={styles.pendingInviteRow}>
+                <View style={styles.pendingInviteInfo}>
+                  <Text style={styles.entryDid} numberOfLines={1}>
+                    {inv.did}
+                  </Text>
+                  <View style={styles.entryMeta}>
+                    <View
+                      style={[
+                        styles.roleBadge,
+                        inv.role === "admin" && styles.adminBadge,
+                        inv.role === "service" && styles.serviceBadge,
+                      ]}
+                    >
+                      <Text style={styles.roleBadgeText}>{inv.role}</Text>
+                    </View>
+                    <Text style={styles.entryDate}>
+                      {inv.expired
+                        ? "expired"
+                        : `expires in ${formatExpiry(inv.expires_at)}`}
+                    </Text>
+                  </View>
+                  {isEditing && (
+                    <View style={styles.editFields}>
+                      <View style={styles.roleRow}>
+                        {(["owner", "admin", "service"] as const).map((r) => (
+                          <Pressable
+                            key={r}
+                            style={[
+                              styles.roleButton,
+                              editingInvite.role === r && styles.roleActive,
+                            ]}
+                            onPress={() =>
+                              setEditingInvite({
+                                token: inv.token,
+                                role: r,
+                              })
+                            }
+                          >
+                            <Text
+                              style={[
+                                styles.roleText,
+                                editingInvite.role === r &&
+                                  styles.roleTextActive,
+                              ]}
+                            >
+                              {r.charAt(0).toUpperCase() + r.slice(1)}
+                            </Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                      <View style={styles.editActions}>
+                        <Pressable
+                          style={[styles.saveButton, busy && styles.disabled]}
+                          onPress={handleSaveInviteRole}
+                          disabled={busy}
+                        >
+                          <Text style={styles.saveText}>
+                            {busy ? "Saving..." : "Save role"}
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.cancelButton}
+                          onPress={cancelEditInviteRole}
+                        >
+                          <Text style={styles.cancelText}>Cancel</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  )}
+                </View>
+                {!isEditing && (
+                  <View style={styles.entryActions}>
+                    <Pressable
+                      style={styles.editButton}
+                      onPress={() => handleCopyPendingInvite(inv)}
+                    >
+                      <Text style={styles.editText}>
+                        {inviteCopiedToken === inv.token ? "Copied" : "Copy"}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={styles.editButton}
+                      onPress={() => startEditInviteRole(inv)}
+                    >
+                      <Text style={styles.editText}>Role</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.deleteButton, busy && styles.disabled]}
+                      onPress={() => handleRevokeInvite(inv.token)}
+                      disabled={busy}
+                    >
+                      <Text style={styles.deleteText}>Revoke</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </View>
+      )}
 
       {/* Add new entry */}
       <View style={styles.card}>
@@ -921,6 +1109,19 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     lineHeight: 19,
     marginBottom: spacing.md,
+  },
+  pendingInviteRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: spacing.md,
+    paddingVertical: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  pendingInviteInfo: {
+    flex: 1,
+    minWidth: 0,
   },
   inviteUrlBlock: {
     backgroundColor: colors.bgPrimary,

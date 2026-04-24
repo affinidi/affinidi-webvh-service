@@ -60,6 +60,14 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/auth/passkey/invite",
             post(passkey::create_invite::<AppState>),
         )
+        .route(
+            "/auth/passkey/invites",
+            get(passkey::list_invites::<AppState>),
+        )
+        .route(
+            "/auth/passkey/invite/{token}",
+            put(passkey::update_invite::<AppState>).delete(passkey::revoke_invite::<AppState>),
+        )
         // ACL
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))

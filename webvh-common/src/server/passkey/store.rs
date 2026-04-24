@@ -87,6 +87,31 @@ pub async fn take_enrollment(
     ks.take(enrollment_key(token)).await
 }
 
+/// Retrieve an enrollment by token without consuming it. Used by the
+/// admin management endpoints (list / update) where we don't want the
+/// side effect of `take_enrollment`.
+pub async fn get_enrollment(
+    ks: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<Enrollment>, AppError> {
+    ks.get(enrollment_key(token)).await
+}
+
+/// List every enrollment currently in the store. Deserialises each
+/// value; silently skips entries that fail to parse (corrupt / old
+/// schema) so a bad row can't hide the rest from admins.
+pub async fn list_enrollments(ks: &KeyspaceHandle) -> Result<Vec<Enrollment>, AppError> {
+    let pairs = ks.prefix_iter_raw(b"enroll:".to_vec()).await?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (_key, value) in pairs {
+        match serde_json::from_slice::<Enrollment>(&value) {
+            Ok(e) => out.push(e),
+            Err(e) => tracing::warn!(error = %e, "skipping unparseable enrollment entry"),
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Registration state (temporary, during WebAuthn ceremony)
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -387,4 +388,152 @@ pub async fn create_invite<S: PasskeyState>(
     .await?;
 
     Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// GET /auth/passkey/invites  (admin-only) — list pending invites
+// PUT /auth/passkey/invite/{token}  (admin-only) — change role (or extend TTL)
+// DELETE /auth/passkey/invite/{token}  (admin-only) — revoke
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct InviteListItem {
+    pub token: String,
+    pub did: String,
+    pub role: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub enrollment_url: String,
+    /// True when `expires_at < now_epoch()` — the invite can no longer
+    /// be claimed but is still in the store (the claim path deletes
+    /// atomically; expired invites only disappear after a cleanup
+    /// pass). Useful so admins see history instead of silent drop.
+    pub expired: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InviteListResponse {
+    pub invites: Vec<InviteListItem>,
+}
+
+/// List every pending enrollment invite. Admin-only.
+pub async fn list_invites<S: PasskeyState>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<Json<InviteListResponse>, AppError> {
+    let base_url = state.public_url().unwrap_or("").to_string();
+    let now = now_epoch();
+
+    let pairs = store::list_enrollments(state.sessions_ks()).await?;
+    let mut invites: Vec<InviteListItem> = pairs
+        .into_iter()
+        .map(|e| InviteListItem {
+            enrollment_url: if base_url.is_empty() {
+                format!("/enroll?token={}", e.token)
+            } else {
+                format!("{base_url}/enroll?token={}", e.token)
+            },
+            expired: e.expires_at < now,
+            token: e.token,
+            did: e.did,
+            role: e.role,
+            created_at: e.created_at,
+            expires_at: e.expires_at,
+        })
+        .collect();
+
+    // Newest first — most recently created invites are what admins
+    // want to see at the top of the list.
+    invites.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(Json(InviteListResponse { invites }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateInviteRequest {
+    /// New role to assign. If absent, role is left unchanged.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// New absolute expiry (unix seconds). Mutually exclusive with
+    /// `extend_ttl`. If both are absent, expiry is left unchanged.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Extend expiry by this many seconds from `now`. Mutually
+    /// exclusive with `expires_at`.
+    #[serde(default)]
+    pub extend_ttl: Option<u64>,
+}
+
+/// Update an existing invite's role and/or expiry. Admin-only.
+pub async fn update_invite<S: PasskeyState>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    Path(token): Path<String>,
+    Json(req): Json<UpdateInviteRequest>,
+) -> Result<Json<InviteListItem>, AppError> {
+    if req.expires_at.is_some() && req.extend_ttl.is_some() {
+        return Err(AppError::Validation(
+            "`expires_at` and `extend_ttl` are mutually exclusive".into(),
+        ));
+    }
+
+    if let Some(ref role) = req.role {
+        role.parse::<Role>()?;
+    }
+
+    let sessions_ks = state.sessions_ks();
+    let existing = store::get_enrollment(sessions_ks, &token)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("invite not found: {token}")))?;
+
+    let now = now_epoch();
+    let new_expires = match (req.expires_at, req.extend_ttl) {
+        (Some(ts), None) => ts,
+        (None, Some(seconds)) => now + seconds,
+        (None, None) => existing.expires_at,
+        (Some(_), Some(_)) => unreachable!(),
+    };
+
+    let updated = store::Enrollment {
+        token: existing.token.clone(),
+        did: existing.did.clone(),
+        role: req.role.unwrap_or(existing.role),
+        created_at: existing.created_at,
+        expires_at: new_expires,
+    };
+    store::store_enrollment(sessions_ks, &updated).await?;
+
+    let base_url = state.public_url().unwrap_or("").to_string();
+    info!(did = %updated.did, role = %updated.role, token = %token, "invite updated");
+
+    Ok(Json(InviteListItem {
+        enrollment_url: if base_url.is_empty() {
+            format!("/enroll?token={}", updated.token)
+        } else {
+            format!("{base_url}/enroll?token={}", updated.token)
+        },
+        expired: updated.expires_at < now,
+        token: updated.token,
+        did: updated.did,
+        role: updated.role,
+        created_at: updated.created_at,
+        expires_at: updated.expires_at,
+    }))
+}
+
+/// Revoke (delete) a pending invite. Admin-only. 204 on success.
+pub async fn revoke_invite<S: PasskeyState>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    Path(token): Path<String>,
+) -> Result<StatusCode, AppError> {
+    // `take_enrollment` consumes the token whether or not it exists;
+    // return 404 when there was nothing to revoke so the UI can
+    // distinguish "already gone" from "just revoked".
+    let removed = store::take_enrollment(state.sessions_ks(), &token).await?;
+    if removed.is_none() {
+        return Err(AppError::NotFound(format!("invite not found: {token}")));
+    }
+    info!(token = %token, "invite revoked");
+    Ok(StatusCode::NO_CONTENT)
 }

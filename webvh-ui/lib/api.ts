@@ -177,6 +177,20 @@ export interface CreateInviteResponse {
   expires_at: number;
 }
 
+export interface InviteListItem {
+  token: string;
+  did: string;
+  role: "admin" | "owner" | "service";
+  created_at: number;
+  expires_at: number;
+  enrollment_url: string;
+  expired: boolean;
+}
+
+export interface InviteListResponse {
+  invites: InviteListItem[];
+}
+
 export interface ControlPlaneConfig {
   controlDid: string | null;
   mediatorDid: string | null;
@@ -448,5 +462,30 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ did, role }),
+    }),
+
+  listInvites: () =>
+    request<InviteListResponse>("/api/auth/passkey/invites"),
+
+  updateInvite: (
+    token: string,
+    updates: {
+      role?: "admin" | "owner" | "service";
+      expires_at?: number;
+      extend_ttl?: number;
+    },
+  ) =>
+    request<InviteListItem>(
+      `/api/auth/passkey/invite/${encodeURIComponent(token)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      },
+    ),
+
+  revokeInvite: (token: string) =>
+    request<void>(`/api/auth/passkey/invite/${encodeURIComponent(token)}`, {
+      method: "DELETE",
     }),
 };
