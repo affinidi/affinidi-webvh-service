@@ -243,3 +243,279 @@ pub fn generate_ed25519_multibase() -> String {
         .get_private_keymultibase()
         .expect("ed25519 multibase encoding")
 }
+
+// ---------------------------------------------------------------------------
+// Offline (sealed-bundle) bootstrap
+//
+// The online flow above calls the VTA directly over DIDComm. For air-gapped
+// VTA deployments the consumer instead:
+//
+//   1. Generates an ephemeral Ed25519 keypair + nonce and writes a
+//      `bootstrap-request.json` file. The operator ferries this to the VTA
+//      admin box and runs `vta bootstrap seal --request …` against the
+//      pinned context, producing an ASCII-armored sealed bundle plus a
+//      SHA-256 digest of the ciphertext (communicated out-of-band).
+//   2. Copies the armored bundle back, and runs the open step with the
+//      expected digest. Open:
+//         - verifies the canonical digest,
+//         - opens the HPKE-sealed chunks with the persisted seed,
+//         - extracts the VTA-rendered DID document, key material, and
+//           signed-DID log from the `TemplateBootstrapPayload`.
+//
+// Same `webvh-service` template drives both the online and offline paths,
+// so the persisted DID shape is identical to what `create_did()` above
+// produces.
+// ---------------------------------------------------------------------------
+
+/// Information returned after writing an offline bootstrap request.
+///
+/// The operator uses `client_did` + `nonce` to eyeball that the request
+/// they're sealing is the one we just produced (no swapping).
+#[derive(Debug, Clone)]
+pub struct OfflineRequestInfo {
+    /// Ephemeral `did:key:z6Mk…` identifying this request.
+    pub client_did: String,
+    /// Base64url-encoded 16-byte nonce. Becomes the bundle_id after seal.
+    pub nonce: String,
+    /// Path of the written request JSON.
+    pub request_path: std::path::PathBuf,
+    /// Path of the persisted ephemeral seed. **Treat as secret.** Must
+    /// survive to the `open_offline_bootstrap_response` call (usually a
+    /// separate CLI invocation, potentially minutes or hours later).
+    pub seed_path: std::path::PathBuf,
+}
+
+/// Rich result of opening an offline bootstrap response.
+///
+/// Shaped to feed the same secret-store / DID-bootstrap plumbing the
+/// online path uses, plus the extra VTA trust material the sealed
+/// bundle carries (authorization VC, pinned VTA DID, trust bundle).
+#[derive(Debug, Clone)]
+pub struct OfflineBootstrapResult {
+    pub did: String,
+    /// Multibase-encoded Ed25519 private signing key.
+    pub signing_key_multibase: String,
+    /// Multibase-encoded X25519 private key agreement key.
+    pub key_agreement_multibase: String,
+    /// Rendered DID document (published verbatim on the webvh host).
+    pub did_document: serde_json::Value,
+    /// JSONL DID log when the template emitted a `WebvhLog` output. Most
+    /// webvh consumers will get one; `None` indicates the template did
+    /// not ask the VTA to produce a signed log.
+    pub log_entry: Option<String>,
+    /// VTA-issued authorization credential (opaque VC).
+    pub authorization_vc: serde_json::Value,
+    /// Pinned VTA DID (store for future offline VC verification).
+    pub vta_did: String,
+    /// VTA REST URL (store for future online re-auth, if we ever need it).
+    pub vta_url: Option<String>,
+}
+
+/// Write an offline bootstrap request + persist the ephemeral seed.
+///
+/// The caller hands `request_path` to the VTA operator and keeps
+/// `seed_path` locally — it's the private half needed to open the sealed
+/// response. Both parent directories are created if absent.
+///
+/// On Unix, `seed_path` is chmodded to 0600 after writing. On other
+/// platforms the file-system's default permissions apply; colocate it
+/// inside a directory under the operator's control.
+pub fn write_offline_bootstrap_request(
+    request_path: &Path,
+    seed_path: &Path,
+    label: Option<&str>,
+) -> Result<OfflineRequestInfo, Box<dyn std::error::Error>> {
+    use rand::RngExt;
+    use vta_sdk::sealed_transfer::{BootstrapRequest, generate_ed25519_keypair};
+
+    let (seed, ed_pub) = generate_ed25519_keypair();
+
+    let mut nonce = [0u8; 16];
+    rand::rng().fill(&mut nonce);
+
+    let request = BootstrapRequest::new(ed_pub, nonce, label.map(String::from));
+    let request_json = serde_json::to_string_pretty(&request)?;
+
+    if let Some(parent) = request_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = seed_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(request_path, request_json)?;
+    // Zeroizing<[u8; 32]> deref is [u8; 32]; pass as &[u8] for write().
+    std::fs::write(seed_path, &seed[..])?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(seed_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(seed_path, perms)?;
+    }
+
+    Ok(OfflineRequestInfo {
+        client_did: request.client_did.clone(),
+        nonce: request.nonce.clone(),
+        request_path: request_path.to_path_buf(),
+        seed_path: seed_path.to_path_buf(),
+    })
+}
+
+/// Open a sealed bootstrap response and extract the provisioned identity.
+///
+/// `bundle_armor` is the ASCII-armored sealed bundle the operator
+/// ferries back (contents of what `vta bootstrap seal` produced).
+/// `expect_digest` is the lowercase hex SHA-256 the operator communicated
+/// out-of-band; `open_bundle` rejects the bundle in constant time if it
+/// doesn't match, and for `PinnedOnly` producer assertions this is the
+/// only trust anchor.
+///
+/// `seed_path` must point at the file `write_offline_bootstrap_request`
+/// wrote earlier — reopening requires the persisted ephemeral seed.
+pub fn open_offline_bootstrap_response(
+    bundle_armor: &str,
+    expect_digest: &str,
+    seed_path: &Path,
+) -> Result<OfflineBootstrapResult, Box<dyn std::error::Error>> {
+    use vta_sdk::sealed_transfer::template_bootstrap::TemplateOutput;
+    use vta_sdk::sealed_transfer::{
+        SealedPayloadV1, armor, ed25519_seed_to_x25519_secret, open_bundle,
+    };
+
+    // Load + validate seed.
+    let seed_bytes = std::fs::read(seed_path).map_err(|e| {
+        format!(
+            "failed to read ephemeral seed at {}: {e}",
+            seed_path.display()
+        )
+    })?;
+    if seed_bytes.len() != 32 {
+        return Err(format!(
+            "ephemeral seed at {} has {} bytes (expected 32)",
+            seed_path.display(),
+            seed_bytes.len()
+        )
+        .into());
+    }
+    let seed: [u8; 32] = seed_bytes
+        .as_slice()
+        .try_into()
+        .expect("checked length above");
+    let recipient_secret = ed25519_seed_to_x25519_secret(&seed);
+
+    // Decode the armor. We only expect a single bundle per response.
+    let bundles = armor::decode(bundle_armor)?;
+    let bundle = match bundles.as_slice() {
+        [one] => one,
+        other => {
+            return Err(format!(
+                "expected exactly 1 sealed bundle in armor, got {}",
+                other.len()
+            )
+            .into());
+        }
+    };
+
+    // `open_bundle` handles digest check, HPKE open, chunk reassembly,
+    // and the PinnedOnly → digest-required coupling check.
+    let opened = open_bundle(&recipient_secret, bundle, Some(expect_digest))?;
+
+    let payload = match opened.payload {
+        SealedPayloadV1::TemplateBootstrap(boxed) => *boxed,
+        _ => return Err("sealed response was not a TemplateBootstrap payload".into()),
+    };
+
+    // Take the single DidKeyMaterial entry. (The payload carries a map
+    // keyed by DID for forward-compat with multi-DID templates; today
+    // the VTA provisions one per bootstrap.)
+    let (_map_key, key_material) = payload
+        .secrets
+        .into_iter()
+        .next()
+        .ok_or("sealed payload has no secrets")?;
+
+    let log_entry = payload.config.outputs.iter().find_map(|o| match o {
+        TemplateOutput::WebvhLog { log, .. } => Some(log.clone()),
+        _ => None,
+    });
+
+    Ok(OfflineBootstrapResult {
+        did: key_material.did,
+        signing_key_multibase: key_material.signing_key.private_key_multibase,
+        key_agreement_multibase: key_material.ka_key.private_key_multibase,
+        did_document: payload.config.did_document,
+        log_entry,
+        authorization_vc: payload.authorization,
+        vta_did: payload.config.vta_trust.vta_did,
+        vta_url: payload.config.vta_url,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_request_produces_valid_bootstrap_request() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request_path = tmp.path().join("bootstrap-request.json");
+        let seed_path = tmp.path().join("secrets/seed.bin");
+
+        let info =
+            write_offline_bootstrap_request(&request_path, &seed_path, Some("webvh-control-test"))
+                .expect("write request");
+
+        // Request file: valid JSON, matches vta-sdk's expected shape.
+        let raw = std::fs::read_to_string(&request_path).expect("read request");
+        let parsed: vta_sdk::sealed_transfer::BootstrapRequest =
+            serde_json::from_str(&raw).expect("parse request");
+        assert_eq!(parsed.version, 1, "version");
+        assert!(
+            parsed.client_did.starts_with("did:key:z6Mk"),
+            "client_did must be an Ed25519 did:key, got {}",
+            parsed.client_did
+        );
+        assert_eq!(parsed.label.as_deref(), Some("webvh-control-test"));
+        // Nonce is base64url(16 bytes) — 22 chars no padding.
+        assert_eq!(parsed.nonce.len(), 22, "nonce length");
+
+        // Returned info matches the written artifact.
+        assert_eq!(info.client_did, parsed.client_did);
+        assert_eq!(info.nonce, parsed.nonce);
+        assert_eq!(info.request_path, request_path);
+        assert_eq!(info.seed_path, seed_path);
+
+        // Seed file: exactly 32 bytes.
+        let seed = std::fs::read(&seed_path).expect("read seed");
+        assert_eq!(seed.len(), 32, "ephemeral seed is 32 bytes");
+
+        // On Unix, the seed is chmod 0600 so it isn't world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&seed_path)
+                .expect("stat seed")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "seed file mode");
+        }
+    }
+
+    #[test]
+    fn offline_request_unique_client_did_per_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let r1 = tmp.path().join("r1.json");
+        let s1 = tmp.path().join("s1.bin");
+        let r2 = tmp.path().join("r2.json");
+        let s2 = tmp.path().join("s2.bin");
+
+        let a = write_offline_bootstrap_request(&r1, &s1, None).unwrap();
+        let b = write_offline_bootstrap_request(&r2, &s2, None).unwrap();
+
+        // Each call mints a fresh Ed25519 seed → different did:key, different nonce.
+        assert_ne!(a.client_did, b.client_did, "new keypair per call");
+        assert_ne!(a.nonce, b.nonce, "new nonce per call");
+    }
+}
