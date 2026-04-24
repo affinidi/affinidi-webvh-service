@@ -56,6 +56,53 @@ enum Command {
         #[arg(long)]
         ttl_hours: Option<u64>,
     },
+    /// Write an offline VTA bootstrap request (for air-gapped VTAs).
+    ///
+    /// Generates an ephemeral Ed25519 keypair and writes a JSON request
+    /// the operator ferries to the VTA admin. Keep the companion seed
+    /// file safe — it's needed to open the sealed response.
+    VtaRequest {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        out: PathBuf,
+        /// Path for the ephemeral seed (keep this secret; chmod 0600 on Unix).
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Operator-visible label identifying this request.
+        #[arg(long, default_value = "webvh-control")]
+        label: String,
+    },
+    /// Open a sealed VTA bootstrap response.
+    ///
+    /// Reads the armored bundle the operator ferried back, verifies the
+    /// out-of-band digest, opens the HPKE sealed payload with the
+    /// ephemeral seed, and emits the DID document + signed DID log for
+    /// import via the webvh-server bootstrap-did / load-did commands.
+    VtaOpen {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext (from the
+        /// operator, out-of-band).
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed saved by `vta-request`.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Where to write the rendered DID document as JSON.
+        #[arg(long, default_value = "control-did.json")]
+        did_doc_out: PathBuf,
+        /// Where to write the signed DID log (JSONL). Omitted when the
+        /// template didn't emit a WebvhLog output.
+        #[arg(long, default_value = "control-did.jsonl")]
+        did_log_out: PathBuf,
+        /// Where to save the minted private signing + KA key pair plus
+        /// VTA trust material (authorization VC, pinned VTA DID) as JSON.
+        /// Feed into `webvh-control setup` to persist via the configured
+        /// secret backend.
+        #[arg(long, default_value = "control-secrets.json")]
+        secrets_out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -101,6 +148,32 @@ async fn main() {
             ttl_hours,
         }) => {
             if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaRequest { out, seed, label }) => {
+            if let Err(e) = run_vta_request(&out, &seed, &label) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaOpen {
+            bundle,
+            expect_digest,
+            seed,
+            did_doc_out,
+            did_log_out,
+            secrets_out,
+        }) => {
+            if let Err(e) = run_vta_open(
+                &bundle,
+                &expect_digest,
+                &seed,
+                &did_doc_out,
+                &did_log_out,
+                &secrets_out,
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -226,6 +299,123 @@ async fn run_invite(
     eprintln!();
     eprintln!("  Enrollment URL:");
     eprintln!("  {}", resp.enrollment_url);
+    eprintln!();
+
+    Ok(())
+}
+
+fn run_vta_request(
+    out: &PathBuf,
+    seed: &PathBuf,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::vta_setup::write_offline_bootstrap_request;
+
+    let info = write_offline_bootstrap_request(out, seed, Some(label))?;
+
+    eprintln!();
+    eprintln!("  Offline bootstrap request ready.");
+    eprintln!();
+    eprintln!("  Request file:   {}", info.request_path.display());
+    eprintln!("  Seed (secret):  {}", info.seed_path.display());
+    eprintln!();
+    eprintln!("  Consumer DID:   {}", info.client_did);
+    eprintln!("  Nonce:          {}", info.nonce);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Ferry {} to your VTA admin.",
+        info.request_path.display()
+    );
+    eprintln!("    2. Ask them to run:");
+    eprintln!(
+        "         vta bootstrap seal --request <request-file> \\\n           --template webvh-service --var MEDIATOR_DID=<mediator-did>"
+    );
+    eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
+    eprintln!("    4. Run:");
+    eprintln!("         webvh-control vta-open --bundle <bundle> --expect-digest <hex>");
+    eprintln!();
+    eprintln!("  KEEP THE SEED FILE. Losing it means you cannot open the response.");
+    eprintln!();
+
+    Ok(())
+}
+
+fn run_vta_open(
+    bundle: &PathBuf,
+    expect_digest: &str,
+    seed: &PathBuf,
+    did_doc_out: &PathBuf,
+    did_log_out: &PathBuf,
+    secrets_out: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_webvh_common::server::vta_setup::open_offline_bootstrap_response;
+
+    let armor =
+        std::fs::read_to_string(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+
+    let result = open_offline_bootstrap_response(&armor, expect_digest, seed)?;
+
+    // DID document (pretty JSON, for publishing via webvh-server bootstrap-did).
+    let did_doc_json = serde_json::to_string_pretty(&result.did_document)?;
+    std::fs::write(did_doc_out, &did_doc_json)?;
+
+    // DID log (JSONL, when the template emitted one — the usual case).
+    if let Some(ref log) = result.log_entry {
+        std::fs::write(did_log_out, log)?;
+    }
+
+    // Minimal secrets JSON for the operator to hand to the control plane's
+    // secret store (via `webvh-control setup`, which prompts for a backend
+    // and persists there). Also carries the extra VTA metadata the caller
+    // may want to keep — authorization VC, pinned VTA DID — so nothing from
+    // the sealed response is lost. Kept plaintext; colocate with the seed
+    // file under operator-controlled ACLs.
+    let secrets_payload = serde_json::json!({
+        "did": result.did,
+        "signing_key_multibase": result.signing_key_multibase,
+        "key_agreement_multibase": result.key_agreement_multibase,
+        "vta_did": result.vta_did,
+        "vta_url": result.vta_url,
+        "authorization_vc": result.authorization_vc,
+    });
+    std::fs::write(secrets_out, serde_json::to_string_pretty(&secrets_payload)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(secrets_out)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(secrets_out, perms)?;
+    }
+
+    eprintln!();
+    eprintln!("  Sealed response opened.");
+    eprintln!();
+    eprintln!("  DID:            {}", result.did);
+    eprintln!("  VTA DID:        {}", result.vta_did);
+    if let Some(ref url) = result.vta_url {
+        eprintln!("  VTA URL:        {url}");
+    }
+    eprintln!();
+    eprintln!("  Wrote {}", did_doc_out.display());
+    if result.log_entry.is_some() {
+        eprintln!("  Wrote {}", did_log_out.display());
+    } else {
+        eprintln!("  No WebvhLog output in the sealed response — did_log_out not written.");
+    }
+    eprintln!("  Wrote {} (0600)", secrets_out.display());
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!("    1. Publish the DID document at <hosting-url>/<path>/did.jsonl using");
+    eprintln!(
+        "       `webvh-server bootstrap-did --did-log {}` on the hosting server.",
+        did_log_out.display()
+    );
+    eprintln!("    2. Run `webvh-control setup` and when the wizard asks for keys,");
+    eprintln!("       feed in the `signing_key_multibase` and `key_agreement_multibase`");
+    eprintln!("       values from {}.", secrets_out.display());
+    eprintln!("       (A dedicated `import-secrets` subcommand for webvh-control is");
+    eprintln!("       planned; for now the setup wizard is the supported entry point.)");
     eprintln!();
 
     Ok(())
