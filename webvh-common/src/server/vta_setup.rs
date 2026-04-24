@@ -612,6 +612,222 @@ pub fn run_offline_open_cli(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Offline export (sealed outbound for migration / onboarding)
+//
+// The inverse of the offline bootstrap: take an already-provisioned webvh
+// identity (DID + signing + KA keys) and hand it to another party through
+// an HPKE-sealed bundle that matches the format their `open_bundle` path
+// expects. The receiver must have already produced a
+// `bootstrap-request.json` (same shape `write_offline_bootstrap_request`
+// writes), containing their ephemeral did:key + nonce.
+//
+// Interim assertion model: `PinnedOnly` — the receiver MUST verify the
+// SHA-256 digest we emit against a value communicated out-of-band. A
+// `DidSigned` variant is the eventual follow-up (requires us to sign
+// `b"vta-sealed-transfer/v1\0" || client_x25519_pub || bundle_id` with an
+// Ed25519 key dedicated to the purpose; see
+// `vta-service/src/operations/provision_integration/vta_keys.rs` for the
+// reference recipe).
+// ---------------------------------------------------------------------------
+
+/// Result of a successful export. Use `digest` as the OOB value the
+/// receiver will pass as `--expect-digest` when opening the bundle.
+#[derive(Debug, Clone)]
+pub struct SealedExportInfo {
+    /// Where the armored sealed bundle was written.
+    pub out_path: std::path::PathBuf,
+    /// SHA-256 of the bundle ciphertext, lowercase hex. Communicate
+    /// this to the receiver out-of-band (email, phone, etc.). For a
+    /// `PinnedOnly` producer assertion this is the *only* integrity
+    /// anchor protecting the seal.
+    pub digest: String,
+    /// The receiver's ephemeral did:key (for the operator to
+    /// eyeball-check which request they just sealed to).
+    pub recipient_did: String,
+    /// Hex-encoded 16-byte bundle id (same as the receiver's nonce).
+    pub bundle_id_hex: String,
+}
+
+/// Seal an existing DID + its signing and key-agreement private keys as
+/// a `DidSecrets` payload directed at the receiver described in
+/// `request_path`.
+///
+/// `producer_did` goes into the `ProducerAssertion::producer_did` field —
+/// typically the exporting service's own DID (e.g. `config.server_did`).
+/// `did` is the DID the exported keys belong to (usually the same).
+/// `signing_key_multibase` / `ka_key_multibase` are the private multibase
+/// strings from the local secret store. Key IDs are derived as
+/// `<did>#key-0` / `<did>#key-1` to match the `webvh-service` template.
+pub async fn export_sealed_did_secrets(
+    request_path: &Path,
+    out_path: &Path,
+    producer_did: &str,
+    did: &str,
+    signing_key_multibase: String,
+    ka_key_multibase: String,
+) -> Result<SealedExportInfo, Box<dyn std::error::Error>> {
+    use vta_sdk::did_secrets::{DidSecretsBundle, SecretEntry};
+    use vta_sdk::keys::KeyType;
+    use vta_sdk::sealed_transfer::bundle::{AssertionProof, ProducerAssertion};
+    use vta_sdk::sealed_transfer::{
+        BootstrapRequest, InMemoryNonceStore, SealedPayloadV1, armor, bundle_digest, seal_payload,
+    };
+
+    let req_json = std::fs::read_to_string(request_path)
+        .map_err(|e| format!("read {}: {e}", request_path.display()))?;
+    let request: BootstrapRequest = serde_json::from_str(&req_json)
+        .map_err(|e| format!("parse {}: {e}", request_path.display()))?;
+
+    let recipient_x25519 = request.decode_client_x25519_pub()?;
+    let bundle_id = request.decode_nonce()?;
+
+    let secrets = DidSecretsBundle {
+        did: did.to_string(),
+        secrets: vec![
+            SecretEntry {
+                key_id: format!("{did}#key-0"),
+                key_type: KeyType::Ed25519,
+                private_key_multibase: signing_key_multibase,
+            },
+            SecretEntry {
+                key_id: format!("{did}#key-1"),
+                key_type: KeyType::X25519,
+                private_key_multibase: ka_key_multibase,
+            },
+        ],
+    };
+    let payload = SealedPayloadV1::DidSecrets(Box::new(secrets));
+
+    let producer = ProducerAssertion {
+        producer_did: producer_did.to_string(),
+        proof: AssertionProof::PinnedOnly,
+    };
+
+    // Each export is a one-shot operation, so a fresh in-memory nonce
+    // store is sufficient — we only need the "is this bundle_id reused
+    // within this call?" check, not cross-invocation history (the
+    // receiver's nonce is a fresh 16-byte value anyway).
+    let nonce_store = InMemoryNonceStore::new();
+
+    let sealed = seal_payload(
+        &recipient_x25519,
+        bundle_id,
+        producer,
+        &payload,
+        &nonce_store,
+    )
+    .await?;
+    let digest = bundle_digest(&sealed);
+    let armored = armor::encode(&sealed);
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out_path, &armored).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    Ok(SealedExportInfo {
+        out_path: out_path.to_path_buf(),
+        digest,
+        recipient_did: request.client_did,
+        bundle_id_hex: hex::encode(bundle_id),
+    })
+}
+
+/// Result of opening a sealed `DidSecrets` migration bundle — the inverse
+/// of [`export_sealed_did_secrets`]. Carries just the DID + key material
+/// the exporter included (no DID document, no VTA trust bundle — those
+/// live in a `TemplateBootstrap` bundle, not a `DidSecrets` one).
+#[derive(Debug, Clone)]
+pub struct SealedDidSecretsResult {
+    pub did: String,
+    pub signing_key_multibase: String,
+    pub key_agreement_multibase: String,
+    /// The producer DID the sealer claimed. With `PinnedOnly` assertions
+    /// this is informational only — the OOB digest is the sole trust
+    /// anchor. Treat as untrusted until `DidSigned` assertions are
+    /// wired end-to-end.
+    pub producer_did: String,
+}
+
+/// Open a sealed migration bundle produced by
+/// [`export_sealed_did_secrets`] and surface the private key material
+/// the exporter included.
+///
+/// Reads the ephemeral seed the receiver persisted at
+/// `write_offline_bootstrap_request` time, verifies the OOB digest,
+/// opens the HPKE-sealed payload, and asserts it is the `DidSecrets`
+/// variant carrying one Ed25519 (signing) + one X25519 (key agreement)
+/// entry keyed to the same DID.
+pub fn open_sealed_did_secrets(
+    bundle_armor: &str,
+    expect_digest: &str,
+    seed_path: &Path,
+) -> Result<SealedDidSecretsResult, Box<dyn std::error::Error>> {
+    use vta_sdk::keys::KeyType;
+    use vta_sdk::sealed_transfer::{
+        SealedPayloadV1, armor, ed25519_seed_to_x25519_secret, open_bundle,
+    };
+
+    let seed_bytes = std::fs::read(seed_path).map_err(|e| {
+        format!(
+            "failed to read ephemeral seed at {}: {e}",
+            seed_path.display()
+        )
+    })?;
+    if seed_bytes.len() != 32 {
+        return Err(format!(
+            "ephemeral seed at {} has {} bytes (expected 32)",
+            seed_path.display(),
+            seed_bytes.len()
+        )
+        .into());
+    }
+    let seed: [u8; 32] = seed_bytes
+        .as_slice()
+        .try_into()
+        .expect("checked length above");
+    let recipient_secret = ed25519_seed_to_x25519_secret(&seed);
+
+    let bundles = armor::decode(bundle_armor)?;
+    let bundle = match bundles.as_slice() {
+        [one] => one,
+        other => {
+            return Err(format!(
+                "expected exactly 1 sealed bundle in armor, got {}",
+                other.len()
+            )
+            .into());
+        }
+    };
+
+    let opened = open_bundle(&recipient_secret, bundle, Some(expect_digest))?;
+
+    let did_secrets = match opened.payload {
+        SealedPayloadV1::DidSecrets(boxed) => *boxed,
+        _ => return Err("sealed bundle was not a DidSecrets payload".into()),
+    };
+
+    let mut signing = None;
+    let mut ka = None;
+    for entry in did_secrets.secrets {
+        match entry.key_type {
+            KeyType::Ed25519 if signing.is_none() => signing = Some(entry.private_key_multibase),
+            KeyType::X25519 if ka.is_none() => ka = Some(entry.private_key_multibase),
+            _ => {}
+        }
+    }
+
+    Ok(SealedDidSecretsResult {
+        did: did_secrets.did,
+        signing_key_multibase: signing
+            .ok_or("sealed DidSecrets bundle has no Ed25519 signing key")?,
+        key_agreement_multibase: ka
+            .ok_or("sealed DidSecrets bundle has no X25519 key agreement key")?,
+        producer_did: opened.producer.producer_did,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +877,61 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "seed file mode");
         }
+    }
+
+    #[tokio::test]
+    async fn sealed_did_secrets_export_open_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request_path = tmp.path().join("bootstrap-request.json");
+        let seed_path = tmp.path().join("seed.bin");
+        let bundle_path = tmp.path().join("sealed.txt");
+
+        // Receiver side: mint a bootstrap-request + seed.
+        let _info =
+            write_offline_bootstrap_request(&request_path, &seed_path, Some("roundtrip-test"))
+                .expect("write request");
+
+        // Sender side: seal a fake DidSecrets bundle to the receiver.
+        let producer_did = "did:webvh:QmPROD:producer.example.com".to_string();
+        let exported_did = "did:webvh:QmEXP:example.com:services/export".to_string();
+        let signing_mb = "z3uFakeEd25519SigningKey".to_string();
+        let ka_mb = "z3uFakeX25519KaKey".to_string();
+
+        let export = export_sealed_did_secrets(
+            &request_path,
+            &bundle_path,
+            &producer_did,
+            &exported_did,
+            signing_mb.clone(),
+            ka_mb.clone(),
+        )
+        .await
+        .expect("export");
+
+        assert_eq!(export.out_path, bundle_path);
+        assert_eq!(export.digest.len(), 64, "SHA-256 hex");
+        assert!(export.recipient_did.starts_with("did:key:z6Mk"));
+        assert_eq!(export.bundle_id_hex.len(), 32, "16 bytes hex");
+
+        // Receiver side: open the armored bundle + assert the digest
+        // coupling + extract keys.
+        let armor = std::fs::read_to_string(&bundle_path).expect("read bundle");
+        let opened = open_sealed_did_secrets(&armor, &export.digest, &seed_path).expect("open");
+
+        assert_eq!(opened.did, exported_did);
+        assert_eq!(opened.signing_key_multibase, signing_mb);
+        assert_eq!(opened.key_agreement_multibase, ka_mb);
+        assert_eq!(opened.producer_did, producer_did);
+
+        // Digest binding: a flipped digest must reject the bundle.
+        let mut bad = export.digest.clone();
+        bad.replace_range(0..1, if bad.starts_with('0') { "1" } else { "0" });
+        let err = open_sealed_did_secrets(&armor, &bad, &seed_path).expect_err("bad digest");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("digest"),
+            "expected digest mismatch error, got {msg}"
+        );
     }
 
     #[test]

@@ -115,6 +115,52 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Export this server's DID + signing/KA keys as an HPKE-sealed
+    /// migration bundle.
+    ///
+    /// Reads the receiver's `bootstrap-request.json` (same shape that
+    /// `vta-request` or `setup-offline-prepare` produces), loads the
+    /// existing server identity from the configured secret store,
+    /// wraps the keys as a `DidSecrets` payload, and seals to the
+    /// receiver's ephemeral X25519 pubkey. Prints a SHA-256 digest
+    /// that the receiver MUST verify out-of-band before opening —
+    /// the current `PinnedOnly` producer assertion has no in-band
+    /// integrity anchor.
+    ExportSealed {
+        /// Path to the receiver's bootstrap-request.json.
+        #[arg(long)]
+        request: PathBuf,
+        /// Path for the ASCII-armored sealed output.
+        #[arg(long, default_value = "sealed-export.txt")]
+        out: PathBuf,
+        /// Optional file to write the SHA-256 digest to. Always
+        /// printed to stderr regardless.
+        #[arg(long)]
+        digest_out: Option<PathBuf>,
+    },
+    /// Open a sealed `DidSecrets` migration bundle and import the
+    /// contained keys as this server's identity. Inverse of
+    /// `export-sealed` on the sending side.
+    ImportSealed {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext (from
+        /// the operator, out-of-band).
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed the receiver saved when
+        /// generating the bootstrap-request.json.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Optional Ed25519 JWT signing key (multibase-encoded,
+        /// auto-generated if omitted).
+        #[arg(long)]
+        jwt_key: Option<String>,
+        /// Overwrite existing secrets without prompting.
+        #[arg(long)]
+        force: bool,
+    },
     /// Import secrets from a VTA secrets bundle or individual keys
     ImportSecrets {
         /// Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
@@ -313,6 +359,30 @@ async fn main() {
                 force,
             )
             .await
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ExportSealed {
+            request,
+            out,
+            digest_out,
+        }) => {
+            if let Err(e) = run_export_sealed(cli.config, request, out, digest_out).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ImportSealed {
+            bundle,
+            expect_digest,
+            seed,
+            jwt_key,
+            force,
+        }) => {
+            if let Err(e) =
+                run_import_sealed(cli.config, bundle, expect_digest, seed, jwt_key, force).await
             {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -1071,6 +1141,140 @@ async fn run_server(config_path: Option<PathBuf>) {
         tracing::error!("server error: {e}");
         std::process::exit(1);
     }
+}
+
+async fn run_export_sealed(
+    config_path: Option<PathBuf>,
+    request: PathBuf,
+    out: PathBuf,
+    digest_out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+
+    let producer_did = config
+        .server_did
+        .clone()
+        .ok_or("server_did not set in config — run setup first")?;
+
+    // Load the existing signing + KA keys from the configured secret store.
+    let secret_store = secret_store::create_secret_store(&config)?;
+    let secrets = secret_store
+        .get()
+        .await?
+        .ok_or("no secrets found — run setup or import-secrets first")?;
+
+    let info = affinidi_webvh_common::server::vta_setup::export_sealed_did_secrets(
+        &request,
+        &out,
+        &producer_did,
+        &producer_did,
+        secrets.signing_key.clone(),
+        secrets.key_agreement_key.clone(),
+    )
+    .await?;
+
+    if let Some(ref digest_path) = digest_out {
+        if let Some(parent) = digest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(digest_path, format!("{}\n", info.digest))?;
+    }
+
+    eprintln!();
+    eprintln!("  Sealed export ready.");
+    eprintln!();
+    eprintln!("  Out:            {}", info.out_path.display());
+    eprintln!("  Recipient DID:  {}", info.recipient_did);
+    eprintln!("  Bundle id:      {}", info.bundle_id_hex);
+    eprintln!();
+    eprintln!("  SHA-256 digest (send OOB to receiver):");
+    eprintln!("    {}", info.digest);
+    if let Some(ref p) = digest_out {
+        eprintln!("  Digest also written to {}", p.display());
+    }
+    eprintln!();
+    eprintln!("  Producer assertion mode: PinnedOnly. The receiver MUST verify");
+    eprintln!("  the digest via a trusted channel (email + phone, signed mail,");
+    eprintln!("  etc.) before opening — there is no in-band proof.");
+    eprintln!();
+    eprintln!("  Next steps on the receiver:");
+    eprintln!(
+        "    webvh-server import-sealed --bundle {} \\\n      --expect-digest {}",
+        info.out_path.display(),
+        info.digest
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_import_sealed(
+    config_path: Option<PathBuf>,
+    bundle: PathBuf,
+    expect_digest: String,
+    seed: PathBuf,
+    jwt_key: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use affinidi_webvh_common::server::vta_setup::{
+        generate_ed25519_multibase, open_sealed_did_secrets,
+    };
+
+    let config = AppConfig::load(config_path)?;
+    let secret_store = secret_store::create_secret_store(&config)?;
+
+    if !force && let Ok(Some(_)) = secret_store.get().await {
+        return Err("secrets already exist — use --force to overwrite".into());
+    }
+
+    let armor =
+        std::fs::read_to_string(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+    let result = open_sealed_did_secrets(&armor, &expect_digest, &seed)?;
+
+    // Sanity-check the keys parse before writing anything.
+    Secret::from_multibase(&result.signing_key_multibase, None)
+        .map_err(|e| format!("invalid signing key in bundle: {e}"))?;
+    Secret::from_multibase(&result.key_agreement_multibase, None)
+        .map_err(|e| format!("invalid key-agreement key in bundle: {e}"))?;
+
+    let resolved_jwt = match jwt_key {
+        Some(key) => {
+            Secret::from_multibase(&key, None)
+                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
+            key
+        }
+        None => {
+            eprintln!("  Generated JWT signing key.");
+            generate_ed25519_multibase()
+        }
+    };
+
+    let server_secrets = secret_store::ServerSecrets {
+        signing_key: result.signing_key_multibase,
+        key_agreement_key: result.key_agreement_multibase,
+        jwt_signing_key: resolved_jwt,
+        vta_credential: None,
+    };
+
+    secret_store.set(&server_secrets).await?;
+
+    eprintln!();
+    eprintln!("  Sealed bundle opened and imported.");
+    eprintln!();
+    eprintln!("  DID:            {}", result.did);
+    eprintln!(
+        "  Producer DID:   {} (PinnedOnly — informational only)",
+        result.producer_did
+    );
+    eprintln!();
+    eprintln!(
+        "  Note: update server_did in config.toml to {} if not already set.",
+        result.did
+    );
+    eprintln!();
+
+    Ok(())
 }
 
 fn print_banner() {
