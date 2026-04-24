@@ -22,7 +22,7 @@ authentication.
 ### Prerequisites
 
 - Rust 1.94.0+ (2024 Edition)
-- Node.js 18+ (only if building with the management UI)
+- Node.js 20+ (only if building with the management UI)
 
 ### 1. Build
 

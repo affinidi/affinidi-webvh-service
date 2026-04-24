@@ -30,6 +30,16 @@
   form (`"West US 2"`) or normalized (`"westus2"`). Defaults to
   `"eastus"` when unset.
 
+### Build
+- **UI build now requires Node.js 20+.** Metro/Expo's loader uses
+  `Array.prototype.toReversed()`, which landed in Node 20 — older
+  toolchains fail deep inside `expo export` with
+  `TypeError: configs.toReversed is not a function`.
+  `webvh-control/build.rs` now preflights `node --version` and fails
+  with an actionable message when Node is missing or too old.
+  `webvh-ui/package.json` also declares `engines.node >= 20`. README
+  prerequisites updated from Node 18+ to Node 20+.
+
 ### Dependencies
 - affinidi-tdk 0.6.3 → 0.6.5
 - affinidi-tdk-common 0.5.0 → 0.5.2

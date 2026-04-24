@@ -41,7 +41,12 @@ fn main() {
 }
 
 #[cfg(feature = "ui")]
+const MIN_NODE_MAJOR: u32 = 20;
+
+#[cfg(feature = "ui")]
 fn build_ui() {
+    check_node_version();
+
     let ui_dir = Path::new("../webvh-ui");
     let dist_dir = ui_dir.join("dist");
 
@@ -87,6 +92,45 @@ fn build_ui() {
 
     // Build
     run_npm(ui_dir, &["run", "build:web"]);
+}
+
+/// Fail fast with a clear error if `node` is missing or older than the Metro
+/// / Expo floor. Otherwise a bundler failure deep in `expo export` surfaces as
+/// `TypeError: configs.toReversed is not a function` — a known ES2023 symptom
+/// of Node < 20.
+#[cfg(feature = "ui")]
+fn check_node_version() {
+    let output = match std::process::Command::new("node").arg("--version").output() {
+        Ok(o) => o,
+        Err(e) => panic!(
+            "failed to invoke `node --version`: {e}. The `ui` feature requires \
+             Node.js {MIN_NODE_MAJOR}+ to build the management UI. Install it \
+             (e.g. via nvm) or disable the `ui` feature."
+        ),
+    };
+    if !output.status.success() {
+        panic!(
+            "`node --version` exited non-zero. Install Node.js {MIN_NODE_MAJOR}+ \
+             or disable the `ui` feature."
+        );
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let version = raw.trim().trim_start_matches('v');
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("could not parse Node.js version from `node --version` output: {raw:?}")
+        });
+    if major < MIN_NODE_MAJOR {
+        panic!(
+            "Node.js {major} detected; the `ui` feature requires Node.js \
+             {MIN_NODE_MAJOR}+ (Metro/Expo depend on Array.prototype.toReversed, \
+             added in Node 20). Upgrade Node — e.g. `nvm install 22 && nvm use \
+             22` — or disable the `ui` feature."
+        );
+    }
 }
 
 #[cfg(feature = "ui")]
