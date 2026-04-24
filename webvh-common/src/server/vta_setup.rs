@@ -622,14 +622,30 @@ pub fn run_offline_open_cli(
 // `bootstrap-request.json` (same shape `write_offline_bootstrap_request`
 // writes), containing their ephemeral did:key + nonce.
 //
-// Interim assertion model: `PinnedOnly` — the receiver MUST verify the
-// SHA-256 digest we emit against a value communicated out-of-band. A
-// `DidSigned` variant is the eventual follow-up (requires us to sign
-// `b"vta-sealed-transfer/v1\0" || client_x25519_pub || bundle_id` with an
-// Ed25519 key dedicated to the purpose; see
-// `vta-service/src/operations/provision_integration/vta_keys.rs` for the
-// reference recipe).
+// Two assertion modes. `PinnedOnly` relies on the OOB digest as the
+// sole integrity anchor; `DidSigned` additionally signs a domain-tagged
+// message (`b"vta-sealed-transfer/v1\0" || client_x25519_pub ||
+// bundle_id`) with the producer's Ed25519 key so the receiver can verify
+// against the producer DID's `#key-0` pubkey. Prefer DidSigned when both
+// sides have the pubkey available; fall back to PinnedOnly for
+// pinned-digest-only deployments.
 // ---------------------------------------------------------------------------
+
+/// How the exporter builds its `ProducerAssertion`.
+#[derive(Debug, Clone)]
+pub enum ExportAssertionMode {
+    /// No in-band proof. The receiver must verify the SHA-256 digest
+    /// out-of-band — that's the only trust anchor.
+    PinnedOnly,
+    /// Sign a domain-tagged assertion with the exporter's Ed25519 key.
+    /// `signing_key_multibase` is the private key (raw seed in multibase
+    /// form, same shape we persist to the secret store). `verification_method`
+    /// goes on the assertion verbatim — typically `{producer_did}#key-0`.
+    DidSigned {
+        signing_key_multibase: String,
+        verification_method: String,
+    },
+}
 
 /// Result of a successful export. Use `digest` as the OOB value the
 /// receiver will pass as `--expect-digest` when opening the bundle.
@@ -666,10 +682,12 @@ pub async fn export_sealed_did_secrets(
     did: &str,
     signing_key_multibase: String,
     ka_key_multibase: String,
+    assertion: ExportAssertionMode,
 ) -> Result<SealedExportInfo, Box<dyn std::error::Error>> {
     use vta_sdk::did_secrets::{DidSecretsBundle, SecretEntry};
     use vta_sdk::keys::KeyType;
-    use vta_sdk::sealed_transfer::bundle::{AssertionProof, ProducerAssertion};
+    use vta_sdk::sealed_transfer::bundle::{AssertionProof, DidSignedAssertion, ProducerAssertion};
+    use vta_sdk::sealed_transfer::verify::DID_SIGNED_DOMAIN_TAG;
     use vta_sdk::sealed_transfer::{
         BootstrapRequest, InMemoryNonceStore, SealedPayloadV1, armor, bundle_digest, seal_payload,
     };
@@ -699,9 +717,50 @@ pub async fn export_sealed_did_secrets(
     };
     let payload = SealedPayloadV1::DidSecrets(Box::new(secrets));
 
+    let proof = match &assertion {
+        ExportAssertionMode::PinnedOnly => AssertionProof::PinnedOnly,
+        ExportAssertionMode::DidSigned {
+            signing_key_multibase,
+            verification_method,
+        } => {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+            use ed25519_dalek::{Signer, SigningKey};
+
+            // Extract the raw 32-byte Ed25519 seed from the multibase
+            // private key string. We go through the affinidi-tdk Secret
+            // helper so the multicodec framing matches however the key
+            // was persisted at setup time.
+            let signer_secret = Secret::from_multibase(signing_key_multibase, None)
+                .map_err(|e| format!("invalid signing key: {e}"))?;
+            let seed_bytes: [u8; 32] = signer_secret
+                .get_private_bytes()
+                .try_into()
+                .map_err(|_| "signing key is not a 32-byte Ed25519 seed")?;
+            let sk = SigningKey::from_bytes(&seed_bytes);
+
+            // Domain-tagged message — matches the producer side of the
+            // VTA's `build_did_signed_assertion` and what
+            // `verify_did_signed_assertion_with_pubkey` checks.
+            let mut msg = Vec::with_capacity(
+                DID_SIGNED_DOMAIN_TAG.len() + recipient_x25519.len() + bundle_id.len(),
+            );
+            msg.extend_from_slice(DID_SIGNED_DOMAIN_TAG);
+            msg.extend_from_slice(&recipient_x25519);
+            msg.extend_from_slice(&bundle_id);
+            let sig = sk.sign(&msg);
+
+            AssertionProof::DidSigned(DidSignedAssertion {
+                did: producer_did.to_string(),
+                signature_b64: B64URL.encode(sig.to_bytes()),
+                verification_method: verification_method.clone(),
+            })
+        }
+    };
+
     let producer = ProducerAssertion {
         producer_did: producer_did.to_string(),
-        proof: AssertionProof::PinnedOnly,
+        proof,
     };
 
     // Each export is a one-shot operation, so a fresh in-memory nonce
@@ -744,10 +803,15 @@ pub struct SealedDidSecretsResult {
     pub signing_key_multibase: String,
     pub key_agreement_multibase: String,
     /// The producer DID the sealer claimed. With `PinnedOnly` assertions
-    /// this is informational only — the OOB digest is the sole trust
-    /// anchor. Treat as untrusted until `DidSigned` assertions are
-    /// wired end-to-end.
+    /// this is informational only; with `DidSigned` + a caller-supplied
+    /// pubkey it has been cryptographically verified and `assertion_verified`
+    /// is true.
     pub producer_did: String,
+    /// True when the producer assertion was `DidSigned` and successfully
+    /// verified against `expected_producer_pubkey`. False when the
+    /// assertion was `PinnedOnly` (digest-only trust) or when no
+    /// expected pubkey was supplied and the assertion was informational.
+    pub assertion_verified: bool,
 }
 
 /// Open a sealed migration bundle produced by
@@ -759,12 +823,23 @@ pub struct SealedDidSecretsResult {
 /// opens the HPKE-sealed payload, and asserts it is the `DidSecrets`
 /// variant carrying one Ed25519 (signing) + one X25519 (key agreement)
 /// entry keyed to the same DID.
+///
+/// `expected_producer_pubkey` enables `DidSigned` verification: when
+/// supplied, the assertion MUST be `DidSigned`, its `producer_did` must
+/// match the chunk header, and its signature must verify against the
+/// given 32-byte Ed25519 pubkey. When `None`, the opener accepts both
+/// `PinnedOnly` and `DidSigned` assertions and treats the producer
+/// identity as informational (the OOB digest is the only anchor).
 pub fn open_sealed_did_secrets(
     bundle_armor: &str,
     expect_digest: &str,
     seed_path: &Path,
+    expected_producer_pubkey: Option<&[u8; 32]>,
 ) -> Result<SealedDidSecretsResult, Box<dyn std::error::Error>> {
+    use vta_sdk::didcomm_light::ed25519_pub_to_x25519_pub;
     use vta_sdk::keys::KeyType;
+    use vta_sdk::sealed_transfer::bundle::AssertionProof;
+    use vta_sdk::sealed_transfer::verify::verify_did_signed_assertion_with_pubkey;
     use vta_sdk::sealed_transfer::{
         SealedPayloadV1, armor, ed25519_seed_to_x25519_secret, open_bundle,
     };
@@ -803,6 +878,48 @@ pub fn open_sealed_did_secrets(
 
     let opened = open_bundle(&recipient_secret, bundle, Some(expect_digest))?;
 
+    // If the caller pinned the producer's Ed25519 pubkey, demand a
+    // DidSigned assertion and verify the signature. Otherwise the
+    // OOB digest stays the only anchor (matches the original behaviour).
+    let mut assertion_verified = false;
+    if let Some(expected_pubkey) = expected_producer_pubkey {
+        match &opened.producer.proof {
+            AssertionProof::DidSigned(assertion) => {
+                // Derive client_x25519_pub from our own seed (what the
+                // producer signed over). Ed25519 pub → X25519 pub is the
+                // Montgomery-form conversion of the verifying key.
+                use ed25519_dalek::SigningKey;
+                let client_ed_pub = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+                let client_x_pub = ed25519_pub_to_x25519_pub(&client_ed_pub)
+                    .map_err(|e| format!("derive client X25519 pubkey: {e}"))?;
+                verify_did_signed_assertion_with_pubkey(
+                    assertion,
+                    &opened.producer.producer_did,
+                    expected_pubkey,
+                    &client_x_pub,
+                    &opened.bundle_id,
+                )
+                .map_err(|e| format!("DidSigned verification failed: {e}"))?;
+                assertion_verified = true;
+            }
+            AssertionProof::PinnedOnly => {
+                return Err(
+                    "expected DidSigned producer assertion but bundle carries PinnedOnly — \
+                     either drop the expected pubkey to accept PinnedOnly, or ask the \
+                     exporter to sign"
+                        .into(),
+                );
+            }
+            AssertionProof::Attested(_) => {
+                return Err(
+                    "expected DidSigned producer assertion but bundle carries Attested (Nitro); \
+                     not supported in this flow"
+                        .into(),
+                );
+            }
+        }
+    }
+
     let did_secrets = match opened.payload {
         SealedPayloadV1::DidSecrets(boxed) => *boxed,
         _ => return Err("sealed bundle was not a DidSecrets payload".into()),
@@ -825,6 +942,7 @@ pub fn open_sealed_did_secrets(
         key_agreement_multibase: ka
             .ok_or("sealed DidSecrets bundle has no X25519 key agreement key")?,
         producer_did: opened.producer.producer_did,
+        assertion_verified,
     })
 }
 
@@ -880,18 +998,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_did_secrets_export_open_roundtrip() {
+    async fn sealed_did_secrets_export_open_roundtrip_pinned_only() {
+        // PinnedOnly path: exporter emits no signature, opener trusts
+        // only the OOB digest.
         let tmp = tempfile::tempdir().expect("tempdir");
         let request_path = tmp.path().join("bootstrap-request.json");
         let seed_path = tmp.path().join("seed.bin");
         let bundle_path = tmp.path().join("sealed.txt");
 
-        // Receiver side: mint a bootstrap-request + seed.
         let _info =
             write_offline_bootstrap_request(&request_path, &seed_path, Some("roundtrip-test"))
                 .expect("write request");
 
-        // Sender side: seal a fake DidSecrets bundle to the receiver.
         let producer_did = "did:webvh:QmPROD:producer.example.com".to_string();
         let exported_did = "did:webvh:QmEXP:example.com:services/export".to_string();
         let signing_mb = "z3uFakeEd25519SigningKey".to_string();
@@ -904,6 +1022,7 @@ mod tests {
             &exported_did,
             signing_mb.clone(),
             ka_mb.clone(),
+            ExportAssertionMode::PinnedOnly,
         )
         .await
         .expect("export");
@@ -913,24 +1032,96 @@ mod tests {
         assert!(export.recipient_did.starts_with("did:key:z6Mk"));
         assert_eq!(export.bundle_id_hex.len(), 32, "16 bytes hex");
 
-        // Receiver side: open the armored bundle + assert the digest
-        // coupling + extract keys.
         let armor = std::fs::read_to_string(&bundle_path).expect("read bundle");
-        let opened = open_sealed_did_secrets(&armor, &export.digest, &seed_path).expect("open");
+        let opened =
+            open_sealed_did_secrets(&armor, &export.digest, &seed_path, None).expect("open");
 
         assert_eq!(opened.did, exported_did);
         assert_eq!(opened.signing_key_multibase, signing_mb);
         assert_eq!(opened.key_agreement_multibase, ka_mb);
         assert_eq!(opened.producer_did, producer_did);
+        assert!(
+            !opened.assertion_verified,
+            "PinnedOnly should not report verified"
+        );
 
         // Digest binding: a flipped digest must reject the bundle.
         let mut bad = export.digest.clone();
         bad.replace_range(0..1, if bad.starts_with('0') { "1" } else { "0" });
-        let err = open_sealed_did_secrets(&armor, &bad, &seed_path).expect_err("bad digest");
+        let err = open_sealed_did_secrets(&armor, &bad, &seed_path, None).expect_err("bad digest");
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("digest"),
             "expected digest mismatch error, got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_did_secrets_export_open_roundtrip_did_signed() {
+        // DidSigned path: exporter signs with a real Ed25519 key; opener
+        // pins the matching pubkey and verifies the assertion.
+        use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request_path = tmp.path().join("bootstrap-request.json");
+        let seed_path = tmp.path().join("seed.bin");
+        let bundle_path = tmp.path().join("sealed.txt");
+
+        let _info = write_offline_bootstrap_request(&request_path, &seed_path, Some("ds-test"))
+            .expect("write request");
+
+        // Producer-side signing key — generate fresh so we have both
+        // halves available for the round-trip.
+        let signer = Secret::generate_ed25519(None, None);
+        let signer_priv = signer.get_private_keymultibase().expect("priv mb");
+        let signer_pub_mb = signer.get_public_keymultibase().expect("pub mb");
+
+        // Decode the pub multibase back to raw [u8; 32] for the opener.
+        let (_, pub_raw) = multibase::decode(&signer_pub_mb).expect("decode pub mb");
+        let signer_pub_bytes: [u8; 32] =
+            if pub_raw.len() == 34 && pub_raw[0] == 0xed && pub_raw[1] == 0x01 {
+                pub_raw[2..].try_into().expect("32 bytes")
+            } else {
+                pub_raw[..].try_into().expect("32 bytes")
+            };
+
+        let producer_did = "did:webvh:QmPROD:producer.example.com".to_string();
+        let exported_did = "did:webvh:QmEXP:example.com:services/export".to_string();
+        let ka_mb = "z3uFakeX25519KaKey".to_string();
+
+        let export = export_sealed_did_secrets(
+            &request_path,
+            &bundle_path,
+            &producer_did,
+            &exported_did,
+            signer_priv.clone(),
+            ka_mb.clone(),
+            ExportAssertionMode::DidSigned {
+                signing_key_multibase: signer_priv.clone(),
+                verification_method: format!("{producer_did}#key-0"),
+            },
+        )
+        .await
+        .expect("export");
+
+        let armor = std::fs::read_to_string(&bundle_path).expect("read bundle");
+
+        // With the correct pinned pubkey, verification succeeds.
+        let opened =
+            open_sealed_did_secrets(&armor, &export.digest, &seed_path, Some(&signer_pub_bytes))
+                .expect("open");
+        assert!(opened.assertion_verified, "DidSigned should verify");
+        assert_eq!(opened.producer_did, producer_did);
+
+        // With a wrong pinned pubkey, verification fails.
+        let mut wrong = signer_pub_bytes;
+        wrong[0] ^= 0x01;
+        let err = open_sealed_did_secrets(&armor, &export.digest, &seed_path, Some(&wrong))
+            .expect_err("wrong pubkey");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("didsigned") || msg.contains("signature") || msg.contains("verify"),
+            "expected signature verification failure, got {msg}"
         );
     }
 

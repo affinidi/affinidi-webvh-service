@@ -106,6 +106,49 @@ enum Command {
         #[arg(long, default_value = "setup-offline-state.toml")]
         state: PathBuf,
     },
+    /// Export this control plane's DID + signing/KA keys as an
+    /// HPKE-sealed migration bundle. See `webvh-server export-sealed`
+    /// for full semantics; the receiver opens with `import-sealed`.
+    ExportSealed {
+        /// Path to the receiver's bootstrap-request.json.
+        #[arg(long)]
+        request: PathBuf,
+        /// Path for the ASCII-armored sealed output.
+        #[arg(long, default_value = "sealed-export.txt")]
+        out: PathBuf,
+        /// Optional file to write the SHA-256 digest to. Always
+        /// printed to stderr regardless.
+        #[arg(long)]
+        digest_out: Option<PathBuf>,
+    },
+    /// Open a sealed `DidSecrets` migration bundle and import the
+    /// contained keys as this control plane's identity. Inverse of
+    /// `export-sealed` on the sending side.
+    ImportSealed {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed the receiver saved when
+        /// generating the bootstrap-request.json.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Optional Ed25519 public key of the producer (multibase-
+        /// encoded, matches `#key-0` in the producer's DID document).
+        /// When supplied, the bundle's `DidSigned` assertion is
+        /// verified against it; omit to fall back to digest-only trust.
+        #[arg(long)]
+        producer_pubkey: Option<String>,
+        /// Optional Ed25519 JWT signing key (multibase-encoded,
+        /// auto-generated if omitted).
+        #[arg(long)]
+        jwt_key: Option<String>,
+        /// Overwrite existing secrets without prompting.
+        #[arg(long)]
+        force: bool,
+    },
     /// Open a sealed VTA bootstrap response (primitive — prefer
     /// `setup-offline-complete` for a full wizard-driven finish).
     ///
@@ -204,6 +247,39 @@ async fn main() {
         }) => {
             if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
                 eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ExportSealed {
+            request,
+            out,
+            digest_out,
+        }) => {
+            if let Err(e) = run_export_sealed(cli.config, request, out, digest_out).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ImportSealed {
+            bundle,
+            expect_digest,
+            seed,
+            producer_pubkey,
+            jwt_key,
+            force,
+        }) => {
+            if let Err(e) = run_import_sealed(
+                cli.config,
+                bundle,
+                expect_digest,
+                seed,
+                producer_pubkey,
+                jwt_key,
+                force,
+            )
+            .await
+            {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -365,6 +441,183 @@ async fn run_invite(
     eprintln!();
 
     Ok(())
+}
+
+async fn run_export_sealed(
+    config_path: Option<PathBuf>,
+    request: PathBuf,
+    out: PathBuf,
+    digest_out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+
+    let producer_did = config
+        .server_did
+        .clone()
+        .ok_or("server_did not set in config — run setup first")?;
+
+    let secret_store = secret_store::create_secret_store(&config)?;
+    let secrets = secret_store
+        .get()
+        .await?
+        .ok_or("no secrets found — run setup first")?;
+
+    let info = affinidi_webvh_common::server::vta_setup::export_sealed_did_secrets(
+        &request,
+        &out,
+        &producer_did,
+        &producer_did,
+        secrets.signing_key.clone(),
+        secrets.key_agreement_key.clone(),
+        affinidi_webvh_common::server::vta_setup::ExportAssertionMode::DidSigned {
+            signing_key_multibase: secrets.signing_key.clone(),
+            verification_method: format!("{producer_did}#key-0"),
+        },
+    )
+    .await?;
+
+    if let Some(ref digest_path) = digest_out {
+        if let Some(parent) = digest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(digest_path, format!("{}\n", info.digest))?;
+    }
+
+    let producer_pub = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(
+        &secrets.signing_key,
+        None,
+    )?
+    .get_public_keymultibase()?;
+
+    eprintln!();
+    eprintln!("  Sealed export ready.");
+    eprintln!();
+    eprintln!("  Out:            {}", info.out_path.display());
+    eprintln!("  Recipient DID:  {}", info.recipient_did);
+    eprintln!("  Bundle id:      {}", info.bundle_id_hex);
+    eprintln!();
+    eprintln!("  SHA-256 digest (send OOB to receiver):");
+    eprintln!("    {}", info.digest);
+    if let Some(ref p) = digest_out {
+        eprintln!("  Digest also written to {}", p.display());
+    }
+    eprintln!();
+    eprintln!("  Producer assertion mode: DidSigned. The bundle is signed by");
+    eprintln!("  this control plane's `#key-0` Ed25519 key. Receivers who pin");
+    eprintln!("  the pubkey get cryptographic verification; without it the OOB");
+    eprintln!("  digest stays the only anchor.");
+    eprintln!();
+    eprintln!("  Producer pubkey (share with receiver — matches #key-0):");
+    eprintln!("    {producer_pub}");
+    eprintln!();
+    eprintln!("  Next on the receiver:");
+    eprintln!(
+        "    webvh-control import-sealed --bundle {} \\\n      --expect-digest {} \\\n      --producer-pubkey {producer_pub}",
+        info.out_path.display(),
+        info.digest
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_import_sealed(
+    config_path: Option<PathBuf>,
+    bundle: PathBuf,
+    expect_digest: String,
+    seed: PathBuf,
+    producer_pubkey: Option<String>,
+    jwt_key: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use affinidi_webvh_common::server::vta_setup::{
+        generate_ed25519_multibase, open_sealed_did_secrets,
+    };
+
+    let config = AppConfig::load(config_path)?;
+    let secret_store = secret_store::create_secret_store(&config)?;
+
+    if !force && let Ok(Some(_)) = secret_store.get().await {
+        return Err("secrets already exist — use --force to overwrite".into());
+    }
+
+    let expected_pubkey_bytes = match producer_pubkey.as_deref() {
+        Some(mb) => Some(decode_ed25519_pubkey_multibase(mb)?),
+        None => None,
+    };
+
+    let armor =
+        std::fs::read_to_string(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+    let result = open_sealed_did_secrets(
+        &armor,
+        &expect_digest,
+        &seed,
+        expected_pubkey_bytes.as_ref(),
+    )?;
+
+    Secret::from_multibase(&result.signing_key_multibase, None)
+        .map_err(|e| format!("invalid signing key in bundle: {e}"))?;
+    Secret::from_multibase(&result.key_agreement_multibase, None)
+        .map_err(|e| format!("invalid key-agreement key in bundle: {e}"))?;
+
+    let resolved_jwt = match jwt_key {
+        Some(key) => {
+            Secret::from_multibase(&key, None)
+                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
+            key
+        }
+        None => {
+            eprintln!("  Generated JWT signing key.");
+            generate_ed25519_multibase()
+        }
+    };
+
+    let server_secrets = secret_store::ServerSecrets {
+        signing_key: result.signing_key_multibase,
+        key_agreement_key: result.key_agreement_multibase,
+        jwt_signing_key: resolved_jwt,
+        vta_credential: None,
+    };
+
+    secret_store.set(&server_secrets).await?;
+
+    eprintln!();
+    eprintln!("  Sealed bundle opened and imported.");
+    eprintln!();
+    eprintln!("  DID:            {}", result.did);
+    if result.assertion_verified {
+        eprintln!(
+            "  Producer DID:   {} (DidSigned — signature verified)",
+            result.producer_did
+        );
+    } else {
+        eprintln!(
+            "  Producer DID:   {} (informational — no producer pubkey supplied)",
+            result.producer_did
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  Note: update server_did in config.toml to {} if not already set.",
+        result.did
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+fn decode_ed25519_pubkey_multibase(mb: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let (_, raw) =
+        multibase::decode(mb).map_err(|e| format!("invalid producer pubkey multibase: {e}"))?;
+    let pk_bytes: &[u8] = if raw.len() == 34 && raw[0] == 0xed && raw[1] == 0x01 {
+        &raw[2..]
+    } else {
+        &raw[..]
+    };
+    pk_bytes
+        .try_into()
+        .map_err(|_| "producer pubkey is not a 32-byte Ed25519 key".into())
 }
 
 fn print_banner() {

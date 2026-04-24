@@ -153,6 +153,12 @@ enum Command {
         /// generating the bootstrap-request.json.
         #[arg(long, default_value = "bootstrap-seed.bin")]
         seed: PathBuf,
+        /// Optional Ed25519 public key of the producer (multibase-
+        /// encoded, matches `#key-0` in the producer's DID document).
+        /// When supplied, the bundle's `DidSigned` assertion is
+        /// verified against it; omit to fall back to PinnedOnly trust.
+        #[arg(long)]
+        producer_pubkey: Option<String>,
         /// Optional Ed25519 JWT signing key (multibase-encoded,
         /// auto-generated if omitted).
         #[arg(long)]
@@ -378,11 +384,20 @@ async fn main() {
             bundle,
             expect_digest,
             seed,
+            producer_pubkey,
             jwt_key,
             force,
         }) => {
-            if let Err(e) =
-                run_import_sealed(cli.config, bundle, expect_digest, seed, jwt_key, force).await
+            if let Err(e) = run_import_sealed(
+                cli.config,
+                bundle,
+                expect_digest,
+                seed,
+                producer_pubkey,
+                jwt_key,
+                force,
+            )
+            .await
             {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -1170,6 +1185,10 @@ async fn run_export_sealed(
         &producer_did,
         secrets.signing_key.clone(),
         secrets.key_agreement_key.clone(),
+        affinidi_webvh_common::server::vta_setup::ExportAssertionMode::DidSigned {
+            signing_key_multibase: secrets.signing_key.clone(),
+            verification_method: format!("{producer_did}#key-0"),
+        },
     )
     .await?;
 
@@ -1193,13 +1212,25 @@ async fn run_export_sealed(
         eprintln!("  Digest also written to {}", p.display());
     }
     eprintln!();
-    eprintln!("  Producer assertion mode: PinnedOnly. The receiver MUST verify");
-    eprintln!("  the digest via a trusted channel (email + phone, signed mail,");
-    eprintln!("  etc.) before opening — there is no in-band proof.");
+    // Extract the Ed25519 public-key multibase so the operator can
+    // share it with the receiver (for DidSigned verification).
+    let producer_pub = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(
+        &secrets.signing_key,
+        None,
+    )?
+    .get_public_keymultibase()?;
+
+    eprintln!("  Producer assertion mode: DidSigned. The bundle is signed by");
+    eprintln!("  this server's `#key-0` Ed25519 key. Receivers who pin the");
+    eprintln!("  producer pubkey via --producer-pubkey get cryptographic");
+    eprintln!("  verification; without it the OOB digest stays the only anchor.");
+    eprintln!();
+    eprintln!("  Producer pubkey (share with receiver — matches #key-0):");
+    eprintln!("    {producer_pub}");
     eprintln!();
     eprintln!("  Next steps on the receiver:");
     eprintln!(
-        "    webvh-server import-sealed --bundle {} \\\n      --expect-digest {}",
+        "    webvh-server import-sealed --bundle {} \\\n      --expect-digest {} \\\n      --producer-pubkey {producer_pub}",
         info.out_path.display(),
         info.digest
     );
@@ -1213,6 +1244,7 @@ async fn run_import_sealed(
     bundle: PathBuf,
     expect_digest: String,
     seed: PathBuf,
+    producer_pubkey: Option<String>,
     jwt_key: Option<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1228,9 +1260,22 @@ async fn run_import_sealed(
         return Err("secrets already exist — use --force to overwrite".into());
     }
 
+    // Decode the optional producer pubkey (multibase-encoded Ed25519
+    // public) for DidSigned verification. None falls back to
+    // digest-only trust (accepts any assertion variant, unverified).
+    let expected_pubkey_bytes = match producer_pubkey.as_deref() {
+        Some(mb) => Some(decode_ed25519_pubkey_multibase(mb)?),
+        None => None,
+    };
+
     let armor =
         std::fs::read_to_string(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
-    let result = open_sealed_did_secrets(&armor, &expect_digest, &seed)?;
+    let result = open_sealed_did_secrets(
+        &armor,
+        &expect_digest,
+        &seed,
+        expected_pubkey_bytes.as_ref(),
+    )?;
 
     // Sanity-check the keys parse before writing anything.
     Secret::from_multibase(&result.signing_key_multibase, None)
@@ -1263,10 +1308,17 @@ async fn run_import_sealed(
     eprintln!("  Sealed bundle opened and imported.");
     eprintln!();
     eprintln!("  DID:            {}", result.did);
-    eprintln!(
-        "  Producer DID:   {} (PinnedOnly — informational only)",
-        result.producer_did
-    );
+    if result.assertion_verified {
+        eprintln!(
+            "  Producer DID:   {} (DidSigned — signature verified)",
+            result.producer_did
+        );
+    } else {
+        eprintln!(
+            "  Producer DID:   {} (informational — no producer pubkey supplied)",
+            result.producer_did
+        );
+    }
     eprintln!();
     eprintln!(
         "  Note: update server_did in config.toml to {} if not already set.",
@@ -1275,6 +1327,23 @@ async fn run_import_sealed(
     eprintln!();
 
     Ok(())
+}
+
+/// Decode a multibase-encoded Ed25519 public key into the raw 32-byte
+/// array. Accepts both the bare-key form (32 bytes after multibase
+/// decode) and the multicodec-prefixed form (34 bytes, leading
+/// 0xED 0x01).
+fn decode_ed25519_pubkey_multibase(mb: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let (_, raw) =
+        multibase::decode(mb).map_err(|e| format!("invalid producer pubkey multibase: {e}"))?;
+    let pk_bytes: &[u8] = if raw.len() == 34 && raw[0] == 0xed && raw[1] == 0x01 {
+        &raw[2..]
+    } else {
+        &raw[..]
+    };
+    pk_bytes
+        .try_into()
+        .map_err(|_| "producer pubkey is not a 32-byte Ed25519 key".into())
 }
 
 fn print_banner() {
