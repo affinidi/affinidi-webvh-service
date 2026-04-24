@@ -8,9 +8,17 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use vta_sdk::client::VtaClient;
 use vta_sdk::credentials::CredentialBundle;
 use vta_sdk::session::{SessionBackend, SessionStore};
+
+/// Name of the VTA built-in DID template we use for every webvh service
+/// (control plane, DID-hosting server, witness, watcher). The template
+/// renders the two-key Multikey shape with a `#vta-didcomm` service
+/// pointing at the mediator DID supplied in `template_vars`.
+const WEBVH_SERVICE_TEMPLATE: &str = "webvh-service";
 
 /// Metadata from a successful VTA connection.
 pub struct VtaConnectionInfo {
@@ -68,7 +76,10 @@ impl SessionBackend for InMemoryBackend {
 pub async fn connect_vta(
     credential_b64: &str,
 ) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
-    let bundle = CredentialBundle::decode(credential_b64)?;
+    // vta-sdk 0.5 dropped CredentialBundle::decode; operators still paste
+    // a base64url blob, so deserialize inline: base64url → JSON → bundle.
+    let bundle_json = BASE64.decode(credential_b64.as_bytes())?;
+    let bundle: CredentialBundle = serde_json::from_slice(&bundle_json)?;
 
     let vta_url = bundle
         .vta_url
@@ -82,7 +93,7 @@ pub async fn connect_vta(
     let store = SessionStore::with_backend(Box::new(backend));
     let session_key = "setup";
 
-    let login_result = store.login(credential_b64, &vta_url, session_key).await?;
+    let login_result = store.login(&bundle, &vta_url, session_key).await?;
 
     // Pass None so connect() resolves the VTA DID and uses DIDComm transport
     // through the VTA's mediator (required for create_did_webvh etc.)
@@ -147,19 +158,22 @@ pub async fn create_did(
 ) -> Result<VtaDidResult, Box<dyn std::error::Error>> {
     use vta_sdk::client::CreateDidWebvhRequest;
 
-    // If a mediator DID is provided, add a DIDCommMessaging service to the DID document
-    let (add_mediator, additional_services) = match mediator_did {
-        Some(did) => (
-            true,
-            Some(vec![serde_json::json!({
-                "type": "DIDCommMessaging",
-                "serviceEndpoint": {
-                    "uri": did,
-                    "accept": ["didcomm/v2"]
-                }
-            })]),
-        ),
-        None => (false, None),
+    // vta-sdk 0.5: the VTA renders the DID document server-side from the
+    // named template. When a mediator is configured, hand the template the
+    // MEDIATOR_DID var and it produces the reference shape (#key-0/#key-1
+    // Multikey verification methods + single #vta-didcomm service). When
+    // there's no mediator, leave the template unset so the VTA falls back
+    // to its default service-less DID document.
+    let (template, template_vars) = match mediator_did {
+        Some(did) => {
+            let mut vars = HashMap::new();
+            vars.insert(
+                "MEDIATOR_DID".to_string(),
+                serde_json::Value::String(did.to_string()),
+            );
+            (Some(WEBVH_SERVICE_TEMPLATE.to_string()), vars)
+        }
+        None => (None, HashMap::new()),
     };
 
     let req = CreateDidWebvhRequest {
@@ -169,14 +183,19 @@ pub async fn create_did(
         path: Some(path.to_string()),
         label: label.map(|l| l.to_string()),
         portable: true,
-        add_mediator_service: add_mediator,
-        additional_services,
+        // Template-rendered DIDs already include the mediator service;
+        // leaving these off avoids the VTA appending a duplicate.
+        add_mediator_service: false,
+        additional_services: None,
         pre_rotation_count: 0,
         did_document: None,
         did_log: None,
         set_primary: true,
         signing_key_id: None,
         ka_key_id: None,
+        template,
+        template_context: Some(context_id.to_string()),
+        template_vars,
     };
 
     let result = client.create_did_webvh(req).await?;

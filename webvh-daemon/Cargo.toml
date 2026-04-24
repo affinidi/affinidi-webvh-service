@@ -80,6 +80,7 @@ affinidi-webvh-control = { path = "../webvh-control", default-features = false }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk = { workspace = true }
 axum = "0.8"
+base64 = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

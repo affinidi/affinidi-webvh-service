@@ -794,8 +794,15 @@ async fn run_import_secrets(
 
     let (resolved_signing, resolved_ka, resolved_vta_cred) =
         if let Some(ref bundle_str) = vta_bundle {
-            // Decode VTA secrets bundle
-            let bundle = DidSecretsBundle::decode(bundle_str)
+            // vta-sdk 0.5 dropped DidSecretsBundle::decode — operators still
+            // paste a base64url blob, so deserialize inline:
+            // base64url → JSON → bundle.
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+            let bundle_json = BASE64
+                .decode(bundle_str.as_bytes())
+                .map_err(|e| format!("failed to decode VTA secrets bundle base64: {e}"))?;
+            let bundle: DidSecretsBundle = serde_json::from_slice(&bundle_json)
                 .map_err(|e| format!("failed to decode VTA secrets bundle: {e}"))?;
 
             let mut signing = None;

@@ -96,8 +96,16 @@ pub fn build_did_document(
         "publicKeyMultibase": public_key_multibase,
     })];
 
+    // @context matches the `webvh-service` VTA template output (W3C DID v1 +
+    // CID v1). Keep these two in sync: the setup wizards have the VTA render
+    // most webvh DIDs via the template, but bootstrap_did() still builds the
+    // `.well-known` root DID locally with this helper — both shapes must be
+    // identical so callers and resolvers don't see drift.
     let mut doc = json!({
-        "@context": ["https://www.w3.org/ns/did/v1"],
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://www.w3.org/ns/cid/v1",
+        ],
         "id": did_id,
         "authentication": [format!("{did_id}#key-0")],
         "assertionMethod": [format!("{did_id}#key-0")],
@@ -116,11 +124,12 @@ pub fn build_did_document(
 
     doc["verificationMethod"] = json!(vm);
 
-    // Add services
+    // Add services. Service id is `#vta-didcomm` to match the VTA
+    // `webvh-service` template — not the older `#didcomm` convention.
     let mut services = vec![];
     if let Some(mediator) = opts.mediator_endpoint {
         services.push(json!({
-            "id": format!("{did_id}#didcomm"),
+            "id": format!("{did_id}#vta-didcomm"),
             "type": "DIDCommMessaging",
             "serviceEndpoint": [{
                 "accept": ["didcomm/v2"],
@@ -268,8 +277,14 @@ mod tests {
     #[test]
     fn build_did_document_structure() {
         let doc = build_did_document("example.com", "test", "z6MkPubKey", &Default::default());
-        assert!(doc["@context"].is_array());
-        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
+        let context = doc["@context"].as_array().expect("@context is array");
+        assert_eq!(
+            context,
+            &vec![
+                serde_json::Value::String("https://www.w3.org/ns/did/v1".to_string()),
+                serde_json::Value::String("https://www.w3.org/ns/cid/v1".to_string()),
+            ]
+        );
         assert!(doc["authentication"].is_array());
         assert!(doc["verificationMethod"].is_array());
         let vm = &doc["verificationMethod"][0];
@@ -279,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn build_did_document_with_didcomm_service() {
+    fn build_did_document_with_vta_didcomm_service() {
         let doc = build_did_document(
             "example.com",
             "test",
@@ -292,9 +307,67 @@ mod tests {
         let service = &doc["service"];
         assert!(service.is_array());
         let svc = &service[0];
-        assert!(svc["id"].as_str().unwrap().ends_with("#didcomm"));
+        assert!(svc["id"].as_str().unwrap().ends_with("#vta-didcomm"));
         assert_eq!(svc["type"], "DIDCommMessaging");
         assert_eq!(svc["serviceEndpoint"][0]["uri"], "did:example:mediator");
         assert_eq!(svc["serviceEndpoint"][0]["accept"][0], "didcomm/v2");
+    }
+
+    /// Locks the local builder's output to the shape produced by the VTA
+    /// `webvh-service` template. Update both sides together if either ever
+    /// moves. Covers: contexts, key-0 and key-1 verification method IDs,
+    /// `#vta-didcomm` service ID, single-entry service array.
+    #[test]
+    fn build_did_document_matches_webvh_service_template() {
+        let doc = build_did_document(
+            "example.com",
+            "control",
+            "z6MkSigning",
+            &DidDocumentOptions {
+                key_agreement_multibase: Some("z6LSKA"),
+                mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+            },
+        );
+        let did_id = doc["id"].as_str().unwrap();
+
+        // @context
+        assert_eq!(
+            doc["@context"][0], "https://www.w3.org/ns/did/v1",
+            "first context entry"
+        );
+        assert_eq!(
+            doc["@context"][1], "https://www.w3.org/ns/cid/v1",
+            "second context entry (cid v1)"
+        );
+        assert_eq!(
+            doc["@context"].as_array().unwrap().len(),
+            2,
+            "no extra contexts"
+        );
+
+        // Verification methods
+        let vm = doc["verificationMethod"].as_array().unwrap();
+        assert_eq!(vm.len(), 2);
+        assert_eq!(vm[0]["id"], format!("{did_id}#key-0"));
+        assert_eq!(vm[0]["type"], "Multikey");
+        assert_eq!(vm[0]["controller"], did_id);
+        assert_eq!(vm[1]["id"], format!("{did_id}#key-1"));
+        assert_eq!(vm[1]["type"], "Multikey");
+
+        // Purpose relations
+        assert_eq!(doc["assertionMethod"][0], format!("{did_id}#key-0"));
+        assert_eq!(doc["authentication"][0], format!("{did_id}#key-0"));
+        assert_eq!(doc["keyAgreement"][0], format!("{did_id}#key-1"));
+
+        // Service — single entry with `#vta-didcomm`
+        let service = doc["service"].as_array().unwrap();
+        assert_eq!(service.len(), 1, "exactly one service entry");
+        assert_eq!(service[0]["id"], format!("{did_id}#vta-didcomm"));
+        assert_eq!(service[0]["type"], "DIDCommMessaging");
+        assert_eq!(
+            service[0]["serviceEndpoint"][0]["uri"],
+            "did:webvh:QmMED:mediator.example.com"
+        );
+        assert_eq!(service[0]["serviceEndpoint"][0]["accept"][0], "didcomm/v2");
     }
 }
