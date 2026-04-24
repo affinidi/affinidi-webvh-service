@@ -15,6 +15,35 @@
 - **webvh-ui**: Login page "need access?" section no longer surfaces the
   CLI command — it now instructs users to request an invite link from an
   admin, matching the new web-based flow.
+- **MSRV**: raised from 1.91.0 to 1.94.0. Required by the updated
+  affinidi-tdk / affinidi-messaging / affinidi-secrets-resolver /
+  affinidi-data-integrity stacks, all of which declared 1.94+ in their
+  latest releases.
+- **Witness proof signing**: migrated to the new async `Signer`-based API
+  in affinidi-data-integrity 0.6. The `WitnessSigner` trait is now async
+  (returns a `BoxFuture`) — any external signer implementations must be
+  updated accordingly.
+- **CosmosDB store**: migrated to azure_data_cosmos 0.32's required
+  `RoutingStrategy` parameter and the now-async `container_client()`.
+  Default routing is `ProximityTo(Region::EAST_US)`; make this
+  configurable in a follow-up if non-US deployments surface.
+
+### Dependencies
+- affinidi-tdk 0.6.3 → 0.6.5
+- affinidi-tdk-common 0.5.0 → 0.5.2
+- affinidi-messaging-didcomm 0.13.1 → 0.13.2
+- affinidi-messaging-didcomm-service 0.2.1 → 0.2.2
+- affinidi-messaging-sdk 0.16.3 → 0.16.4
+- affinidi-secrets-resolver 0.5.3 → 0.5.5
+- affinidi-did-resolver-cache-sdk 0.8.4 → 0.8.6
+- affinidi-data-integrity 0.3 → 0.6 (breaking API — see note above)
+- firestore 0.47 → 0.48
+- azure_core 0.32 → 0.34 (pinned to match azure_data_cosmos 0.32)
+- azure_data_cosmos 0.31 → 0.32 (breaking API)
+- redis 1.0 → 1.2 (breaking `AsyncIter::next_item` now returns
+  `Option<RedisResult<T>>`)
+- aws-sdk-* and aws-config patch bumps (1.8.x → 1.8.16)
+- didwebvh-rs 0.4.2 → 0.5.0 (transitive)
 
 ## 0.5.0 (2026-04-13)
 

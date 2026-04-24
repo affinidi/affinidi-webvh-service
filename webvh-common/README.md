@@ -75,7 +75,7 @@ pub use affinidi_webvh_common::server::acl::*;
 
 ## Requirements
 
-- Rust 1.91.0+ (2024 Edition)
+- Rust 1.94.0+ (2024 Edition)
 
 ## Support & feedback
 

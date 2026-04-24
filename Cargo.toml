@@ -19,7 +19,7 @@ license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "webvh"]
 repository = "https://github.com/affinidi/affinidi-webvh-service"
 publish = true
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 
 [workspace.dependencies]
 

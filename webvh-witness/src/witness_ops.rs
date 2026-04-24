@@ -120,7 +120,7 @@ pub async fn sign_witness_proof(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("witness not found: {witness_id}")))?;
 
-    let proof = signer.sign_proof(&witness, version_id)?;
+    let proof = signer.sign_proof(&witness, version_id).await?;
 
     // Increment proof counter
     let mut updated = witness;

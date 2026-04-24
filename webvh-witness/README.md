@@ -17,7 +17,7 @@ DID document was observed at a specific point in time.
 
 ### Prerequisites
 
-- Rust 1.91.0+ (2024 Edition)
+- Rust 1.94.0+ (2024 Edition)
 
 ### 1. Build
 

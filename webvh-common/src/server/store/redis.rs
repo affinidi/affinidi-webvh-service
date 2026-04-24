@@ -136,7 +136,8 @@ impl KeyspaceOps for RedisKeyspace {
                     .map_err(|e| AppError::Store(format!("redis SCAN: {e}")))?;
 
                 while let Some(key) = iter.next_item().await {
-                    collected.push(key);
+                    collected
+                        .push(key.map_err(|e| AppError::Store(format!("redis SCAN iter: {e}")))?);
                 }
                 collected
             };

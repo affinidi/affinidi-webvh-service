@@ -53,7 +53,7 @@ Standalone mode:                          Daemon mode:
 
 ### Requirements
 
-- Rust 1.91.0+ (2024 Edition)
+- Rust 1.94.0+ (2024 Edition)
 - Node.js 18+ (only if building the management UI)
 
 ### Option 1: Unified daemon (recommended for getting started)

@@ -28,7 +28,7 @@ Each service is mounted at a path prefix:
 
 ### Prerequisites
 
-- Rust 1.91.0+ (2024 Edition)
+- Rust 1.94.0+ (2024 Edition)
 - Node.js 18+ (only if building with the management UI)
 
 ### 1. Build

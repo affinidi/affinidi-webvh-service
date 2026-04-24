@@ -26,7 +26,7 @@ the interactive setup wizard.
 
 ### Prerequisites
 
-- Rust 1.91.0+ (2024 Edition)
+- Rust 1.94.0+ (2024 Edition)
 - A VTA credential (base64url string) for the server's VTA context
 
 ### 1. Clone and build
