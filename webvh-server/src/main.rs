@@ -136,6 +136,52 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Write an offline VTA bootstrap request (for air-gapped VTAs).
+    ///
+    /// Generates an ephemeral Ed25519 keypair and writes a JSON request
+    /// the operator ferries to the VTA admin. Keep the companion seed
+    /// file safe — it's needed to open the sealed response.
+    VtaRequest {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        out: PathBuf,
+        /// Path for the ephemeral seed (keep this secret; chmod 0600 on Unix).
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Operator-visible label identifying this request.
+        #[arg(long, default_value = "webvh-server")]
+        label: String,
+    },
+    /// Open a sealed VTA bootstrap response.
+    ///
+    /// Reads the armored bundle the operator ferried back, verifies the
+    /// out-of-band digest, opens the HPKE sealed payload with the
+    /// ephemeral seed, and emits the DID document + signed DID log for
+    /// import via `webvh-server bootstrap-did` / `import-secrets`.
+    VtaOpen {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext (from the
+        /// operator, out-of-band).
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed saved by `vta-request`.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Where to write the rendered DID document as JSON.
+        #[arg(long, default_value = "server-did.json")]
+        did_doc_out: PathBuf,
+        /// Where to write the signed DID log (JSONL). Omitted when the
+        /// template didn't emit a WebvhLog output.
+        #[arg(long, default_value = "server-did.jsonl")]
+        did_log_out: PathBuf,
+        /// Where to save the minted private signing + KA key pair plus
+        /// VTA trust material (authorization VC, pinned VTA DID) as JSON.
+        /// Feed the multibase keys into `webvh-server import-secrets`.
+        #[arg(long, default_value = "server-secrets.json")]
+        secrets_out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -234,6 +280,40 @@ async fn main() {
             )
             .await
             {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaRequest { out, seed, label }) => {
+            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
+                &out,
+                &seed,
+                &label,
+                "webvh-server",
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaOpen {
+            bundle,
+            expect_digest,
+            seed,
+            did_doc_out,
+            did_log_out,
+            secrets_out,
+        }) => {
+            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_open_cli(
+                &bundle,
+                &expect_digest,
+                &seed,
+                &did_doc_out,
+                &did_log_out,
+                &secrets_out,
+                affinidi_webvh_common::server::vta_setup::OfflineOpenNextStep::ImportSecrets {
+                    binary: "webvh-server",
+                },
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
