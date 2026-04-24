@@ -72,7 +72,42 @@ enum Command {
         #[arg(long, default_value = "webvh-control")]
         label: String,
     },
-    /// Open a sealed VTA bootstrap response.
+    /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
+    ///
+    /// Runs the interactive prompts, writes the bootstrap-request.json +
+    /// ephemeral seed, and serialises the operator's answers to a state
+    /// TOML file. After the VTA admin returns a sealed bundle, run
+    /// `setup-offline-complete`.
+    SetupOfflinePrepare {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        request: PathBuf,
+        /// Path for the ephemeral seed (chmod 0600 on Unix).
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Path for the pending state file (plain TOML, no secrets).
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Step 2/2 of the offline setup wizard.
+    ///
+    /// Opens the sealed bundle with the seed saved during step 1, then
+    /// persists the DID + keys + config + admin ACL per the choices
+    /// captured in the state file.
+    SetupOfflineComplete {
+        /// Path to the ASCII-armored sealed bundle from the VTA admin.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest (lowercase hex) of the armored
+        /// ciphertext; communicated out-of-band.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the state file written by `setup-offline-prepare`.
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Open a sealed VTA bootstrap response (primitive — prefer
+    /// `setup-offline-complete` for a full wizard-driven finish).
     ///
     /// Reads the armored bundle the operator ferried back, verifies the
     /// out-of-band digest, opens the HPKE sealed payload with the
@@ -149,6 +184,26 @@ async fn main() {
         }) => {
             if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
                 eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflinePrepare {
+            request,
+            seed,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_prepare(request, seed, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflineComplete {
+            bundle,
+            expect_digest,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
+                eprintln!("Setup error: {e}");
                 std::process::exit(1);
             }
         }
