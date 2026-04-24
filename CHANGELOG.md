@@ -25,8 +25,10 @@
   updated accordingly.
 - **CosmosDB store**: migrated to azure_data_cosmos 0.32's required
   `RoutingStrategy` parameter and the now-async `container_client()`.
-  Default routing is `ProximityTo(Region::EAST_US)`; make this
-  configurable in a follow-up if non-US deployments surface.
+  Region is configurable via new `store.cosmosdb_region` setting (env:
+  `*_STORE_COSMOSDB_REGION`), accepting any Azure region name — display
+  form (`"West US 2"`) or normalized (`"westus2"`). Defaults to
+  `"eastus"` when unset.
 
 ### Dependencies
 - affinidi-tdk 0.6.3 → 0.6.5

@@ -52,6 +52,11 @@ pub struct StoreConfig {
     pub cosmosdb_connection_string: Option<String>,
     /// Cosmos DB database name (default: `"webvh"`). Used by `store-cosmosdb` backend.
     pub cosmosdb_database: Option<String>,
+    /// Azure region name for Cosmos DB routing (e.g. `"eastus"`, `"westeurope"`,
+    /// or display form `"West US 2"`). Defaults to `"eastus"` when unset. The
+    /// SDK normalizes the name; see `azure_data_cosmos::Region` for the list
+    /// of well-known regions.
+    pub cosmosdb_region: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,6 +188,7 @@ impl Default for StoreConfig {
             firestore_database: None,
             cosmosdb_connection_string: None,
             cosmosdb_database: None,
+            cosmosdb_region: None,
         }
     }
 }
@@ -339,6 +345,10 @@ pub fn apply_env_overrides(
     env_opt!(
         &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
         store.cosmosdb_database
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_COSMOSDB_REGION"),
+        store.cosmosdb_region
     );
 
     // Auth

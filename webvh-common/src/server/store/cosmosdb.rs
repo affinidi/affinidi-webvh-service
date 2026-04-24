@@ -89,8 +89,16 @@ impl CosmosDbBackend {
             azure_core::credentials::Secret::new(account_key),
         );
 
+        // Cosmos DB 0.32 requires explicit routing. Accept any Azure region
+        // name (display or normalized form); default to EAST_US when unset.
+        let region = config
+            .cosmosdb_region
+            .as_deref()
+            .map(|name| Region::new(name.to_string()))
+            .unwrap_or(Region::EAST_US);
+
         let client = CosmosClient::builder()
-            .build(account, RoutingStrategy::ProximityTo(Region::EAST_US))
+            .build(account, RoutingStrategy::ProximityTo(region))
             .await
             .map_err(|e| AppError::Store(format!("cosmosdb build client: {e}")))?;
 
