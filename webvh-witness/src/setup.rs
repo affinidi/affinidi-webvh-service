@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, MultiSelect, Select};
+use serde::{Deserialize, Serialize};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
@@ -407,4 +408,399 @@ fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
     }
 
     Ok(secrets_config)
+}
+
+// ---------------------------------------------------------------------------
+// Offline setup wizard (air-gapped VTA)
+//
+// Same two-step pattern as `webvh-control setup-offline-prepare/complete`
+// and `webvh-server setup-offline-*`, adapted to witness's config:
+// feature toggles (didcomm / rest_api), admin ACL with optional label, and
+// "import this DID on the server" next-step text.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "did", rename_all = "snake_case")]
+enum AdminChoice {
+    Did { did: String, label: Option<String> },
+    Skip,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PendingWitnessSetupState {
+    config_output: PathBuf,
+    seed_path: PathBuf,
+    enable_didcomm: bool,
+    enable_rest_api: bool,
+    did_hosting_url: String,
+    did_path: String,
+    mediator_did: Option<String>,
+    did_log_output: PathBuf,
+    host: String,
+    port: u16,
+    log_level: String,
+    log_format: LogFormat,
+    data_dir: String,
+    secrets: SecretsConfig,
+    admin: AdminChoice,
+}
+
+pub async fn run_setup_offline_prepare(
+    config_path: Option<PathBuf>,
+    request_out: PathBuf,
+    seed_out: PathBuf,
+    state_out: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  WebVH Witness — Offline Setup (step 1/2)");
+    eprintln!("  =========================================");
+    eprintln!();
+    eprintln!("  Captures all witness settings and writes a sealed-bundle");
+    eprintln!("  bootstrap request. No VTA connection is made. After the");
+    eprintln!("  operator ferries the request and receives a sealed reply,");
+    eprintln!("  run `webvh-witness setup-offline-complete`.");
+    eprintln!();
+
+    let default_path = config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    let output_path: String = Input::new()
+        .with_prompt("Configuration file path")
+        .default(default_path)
+        .interact_text()?;
+    let config_output = PathBuf::from(&output_path);
+
+    if config_output.exists() {
+        let overwrite = Confirm::new()
+            .with_prompt(format!(
+                "{} already exists. Overwrite?",
+                config_output.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !overwrite {
+            eprintln!("Setup cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Feature selection (mirrors online wizard)
+    let feature_items = &["DIDComm Messaging", "REST API"];
+    let selected = MultiSelect::new()
+        .with_prompt("Which features do you want to enable? (Space to toggle, Enter to confirm)")
+        .items(feature_items)
+        .defaults(&[true, true])
+        .interact()?;
+    let enable_didcomm = selected.contains(&0);
+    let enable_rest_api = selected.contains(&1);
+
+    let did_hosting_url: String = Input::new()
+        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
+        .interact_text()?;
+    let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
+
+    let did_path: String = Input::new()
+        .with_prompt("DID path on the server")
+        .default("services/witness".into())
+        .interact_text()?;
+
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
+    eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
+    eprintln!("  so enter the mediator DID manually or skip.");
+    eprintln!();
+    let mediator_raw: String = Input::new()
+        .with_prompt("Mediator DID (leave empty to skip)")
+        .default(String::new())
+        .interact_text()?;
+    let mediator_did = if mediator_raw.trim().is_empty() {
+        None
+    } else {
+        Some(mediator_raw.trim().to_string())
+    };
+
+    let did_log_output: String = Input::new()
+        .with_prompt("DID log output file (written in step 2)")
+        .default("witness-did.jsonl".into())
+        .interact_text()?;
+    let did_log_output = PathBuf::from(did_log_output);
+
+    let host: String = Input::new()
+        .with_prompt("Listen host")
+        .default("0.0.0.0".to_string())
+        .interact_text()?;
+
+    let port: u16 = Input::new()
+        .with_prompt("Listen port")
+        .default(8102u16)
+        .interact_text()?;
+
+    let log_levels = ["info", "debug", "warn", "error", "trace"];
+    let log_level_idx = Select::new()
+        .with_prompt("Log level")
+        .items(log_levels)
+        .default(0)
+        .interact()?;
+    let log_level = log_levels[log_level_idx].to_string();
+
+    let format_options = &["text", "json"];
+    let format_idx = Select::new()
+        .with_prompt("Log format")
+        .items(format_options)
+        .default(0)
+        .interact()?;
+    let log_format = match format_idx {
+        1 => LogFormat::Json,
+        _ => LogFormat::Text,
+    };
+
+    let data_dir: String = Input::new()
+        .with_prompt("Data directory")
+        .default("data/webvh-witness".to_string())
+        .interact_text()?;
+
+    let secrets = configure_secrets()?;
+
+    // Admin ACL choice — resolve to a concrete DID now so the operator
+    // can save a generated private key immediately.
+    eprintln!();
+    eprintln!("  Admin ACL entry — the witness rejects authenticated calls");
+    eprintln!("  until at least one admin DID is enrolled. Admins create");
+    eprintln!("  and manage witness identities.");
+    eprintln!();
+    let admin_options = &[
+        "Enter an existing DID (e.g. operator or service DID)",
+        "Generate a new did:key identity for the operator",
+        "Skip (add later with webvh-witness add-acl)",
+    ];
+    let admin_idx = Select::new()
+        .with_prompt("Admin ACL entry")
+        .items(admin_options)
+        .default(0)
+        .interact()?;
+
+    let admin = match admin_idx {
+        0 => {
+            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
+            let admin_label: String = Input::new()
+                .with_prompt("Label (optional)")
+                .default(String::new())
+                .interact_text()?;
+            AdminChoice::Did {
+                did,
+                label: if admin_label.is_empty() {
+                    None
+                } else {
+                    Some(admin_label)
+                },
+            }
+        }
+        1 => {
+            let (did, sk) = vta_setup::generate_admin_did_key();
+            eprintln!("  Generated admin did:key: {did}");
+            eprintln!("  Private key (save this now — will not be re-shown): {sk}");
+            AdminChoice::Did { did, label: None }
+        }
+        _ => AdminChoice::Skip,
+    };
+
+    let info =
+        vta_setup::write_offline_bootstrap_request(&request_out, &seed_out, Some("webvh-witness"))?;
+
+    let state = PendingWitnessSetupState {
+        config_output: config_output.clone(),
+        seed_path: info.seed_path.clone(),
+        enable_didcomm,
+        enable_rest_api,
+        did_hosting_url,
+        did_path,
+        mediator_did,
+        did_log_output,
+        host,
+        port,
+        log_level,
+        log_format,
+        data_dir,
+        secrets,
+        admin,
+    };
+    let state_toml = toml::to_string_pretty(&state)?;
+    if let Some(parent) = state_out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&state_out, &state_toml)?;
+
+    eprintln!();
+    eprintln!("  Offline setup step 1/2 complete.");
+    eprintln!();
+    eprintln!("  Request file:   {}", info.request_path.display());
+    eprintln!("  Seed (secret):  {} (keep safe)", info.seed_path.display());
+    eprintln!("  State file:     {}", state_out.display());
+    eprintln!();
+    eprintln!("  Consumer DID:   {}", info.client_did);
+    eprintln!("  Nonce:          {}", info.nonce);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Ferry {} to your VTA admin.",
+        info.request_path.display()
+    );
+    eprintln!("    2. Ask them to seal a webvh-service template response:");
+    eprintln!(
+        "         vta bootstrap seal --request <request-file> \\\n           --template webvh-service --var MEDIATOR_DID=<mediator-did>"
+    );
+    eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
+    eprintln!("    4. Run:");
+    eprintln!(
+        "         webvh-witness setup-offline-complete \\\n           --bundle <bundle> --expect-digest <hex> --state {}",
+        state_out.display()
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+pub async fn run_setup_offline_complete(
+    bundle_path: PathBuf,
+    expect_digest: String,
+    state_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  WebVH Witness — Offline Setup (step 2/2)");
+    eprintln!("  =========================================");
+    eprintln!();
+
+    let state_toml = std::fs::read_to_string(&state_path)?;
+    let state: PendingWitnessSetupState = toml::from_str(&state_toml)?;
+
+    let armor = std::fs::read_to_string(&bundle_path)?;
+    let result =
+        vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &state.seed_path)?;
+
+    eprintln!("  Sealed response opened.");
+    eprintln!("  DID:          {}", result.did);
+    eprintln!("  VTA DID:      {}", result.vta_did);
+    if let Some(ref url) = result.vta_url {
+        eprintln!("  VTA URL:      {url}");
+    }
+    eprintln!();
+
+    if let Some(ref log_entry) = result.log_entry {
+        vta_setup::write_log_entry_file(log_entry, &state.did_log_output)?;
+        eprintln!(
+            "  DID log entry written to {}",
+            state.did_log_output.display()
+        );
+    } else {
+        eprintln!(
+            "  Warning: sealed response carried no WebvhLog — nothing written to {}",
+            state.did_log_output.display()
+        );
+    }
+
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!("  Generated JWT signing key.");
+
+    let config = AppConfig {
+        features: FeaturesConfig {
+            didcomm: state.enable_didcomm,
+            rest_api: state.enable_rest_api,
+            ..Default::default()
+        },
+        server_did: Some(result.did.clone()),
+        mediator_did: state.mediator_did.clone(),
+        server: ServerConfig {
+            host: state.host.clone(),
+            port: state.port,
+        },
+        log: LogConfig {
+            level: state.log_level.clone(),
+            format: state.log_format.clone(),
+        },
+        store: StoreConfig {
+            data_dir: PathBuf::from(&state.data_dir),
+            ..StoreConfig::default()
+        },
+        auth: AuthConfig::default(),
+        secrets: state.secrets.clone(),
+        vta: VtaConfig {
+            url: result.vta_url.clone(),
+            did: Some(result.vta_did.clone()),
+            context_id: None,
+        },
+        config_path: state.config_output.clone(),
+    };
+
+    let toml_str = toml::to_string_pretty(&config)?;
+    std::fs::write(&state.config_output, &toml_str)?;
+    eprintln!(
+        "  Configuration written to {}",
+        state.config_output.display()
+    );
+
+    let server_secrets = ServerSecrets {
+        signing_key: result.signing_key_multibase,
+        key_agreement_key: result.key_agreement_multibase,
+        jwt_signing_key,
+        vta_credential: None,
+    };
+
+    let secret_store = create_secret_store(&config)?;
+    secret_store.set(&server_secrets).await?;
+    eprintln!("  Secrets stored in secret store.");
+
+    if let AdminChoice::Did { ref did, ref label } = state.admin {
+        let store = Store::open(&config.store).await?;
+        let acl_ks = store.keyspace("acl")?;
+        let entry = AclEntry {
+            did: did.clone(),
+            role: Role::Admin,
+            label: label.clone(),
+            created_at: now_epoch(),
+            max_total_size: None,
+            max_did_count: None,
+        };
+        store_acl_entry(&acl_ks, &entry).await?;
+        eprintln!("  Admin ACL entry created for {did}");
+    }
+
+    cleanup_offline_artifacts(&state_path, &state.seed_path);
+
+    eprintln!();
+    eprintln!("  Setup complete!");
+    eprintln!();
+    eprintln!("  Witness DID: {}", result.did);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!("    1. Import this DID on the server:");
+    eprintln!(
+        "       webvh-server bootstrap-did --path {} --did-log {}",
+        state.did_path,
+        state.did_log_output.display()
+    );
+    eprintln!("    2. Start the witness:");
+    eprintln!(
+        "       webvh-witness --config {}",
+        state.config_output.display()
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+fn cleanup_offline_artifacts(state_path: &Path, seed_path: &Path) {
+    if let Err(e) = std::fs::remove_file(state_path) {
+        eprintln!(
+            "  Warning: failed to remove state file {}: {e}",
+            state_path.display()
+        );
+    }
+    if let Err(e) = std::fs::remove_file(seed_path) {
+        eprintln!(
+            "  Warning: failed to remove ephemeral seed {}: {e}",
+            seed_path.display()
+        );
+    }
 }

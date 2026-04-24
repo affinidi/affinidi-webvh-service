@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, Select};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
@@ -318,6 +319,380 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
 }
 
 /// Update `server_did` in the config file without clobbering other sections.
+// ---------------------------------------------------------------------------
+// Offline setup wizard (air-gapped VTA)
+//
+// Same two-step pattern as `webvh-control setup-offline-prepare/complete`,
+// with server-specific config: URL-derived DID path, control_did prompt,
+// limits, root-DID import into the local store. See that module for the
+// design rationale.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PendingServerSetupState {
+    config_output: PathBuf,
+    seed_path: PathBuf,
+    public_url: String,
+    did_path: String,
+    mediator_did: Option<String>,
+    control_did: Option<String>,
+    host: String,
+    port: u16,
+    log_level: String,
+    log_format: LogFormat,
+    data_dir: String,
+    secrets: SecretsConfig,
+}
+
+/// Interactive offline-prepare for webvh-server: prompts for every
+/// non-VTA setting, writes the bootstrap request + ephemeral seed, and
+/// serialises the choices to a state TOML.
+pub async fn run_setup_offline_prepare(
+    config_path: Option<PathBuf>,
+    request_out: PathBuf,
+    seed_out: PathBuf,
+    state_out: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  WebVH Server — Offline Setup (step 1/2)");
+    eprintln!("  ========================================");
+    eprintln!();
+    eprintln!("  Captures all server settings and writes a sealed-bundle");
+    eprintln!("  bootstrap request. No VTA connection is made. After the");
+    eprintln!("  operator ferries the request to the VTA admin and receives");
+    eprintln!("  a sealed reply, run `webvh-server setup-offline-complete`.");
+    eprintln!();
+
+    let default_path = config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    let output_path: String = Input::new()
+        .with_prompt("Configuration file path")
+        .default(default_path)
+        .interact_text()?;
+
+    let config_output = PathBuf::from(&output_path);
+
+    if config_output.exists() {
+        let overwrite = Confirm::new()
+            .with_prompt(format!(
+                "{} already exists. Overwrite?",
+                config_output.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !overwrite {
+            eprintln!("Setup cancelled.");
+            return Ok(());
+        }
+    }
+
+    eprintln!();
+    let public_url: String = Input::new()
+        .with_prompt("Server URL (e.g. https://server1.example.com)")
+        .interact_text()?;
+    let public_url = public_url.trim_end_matches('/').to_string();
+
+    // DID path derived from URL path component (matches the online wizard).
+    let did_path = derive_did_path(&public_url);
+
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes sync messages from the control plane.");
+    eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
+    eprintln!("  so enter the mediator DID manually or skip.");
+    eprintln!();
+    let mediator_raw: String = Input::new()
+        .with_prompt("Mediator DID (leave empty to skip)")
+        .default(String::new())
+        .interact_text()?;
+    let mediator_did = if mediator_raw.trim().is_empty() {
+        None
+    } else {
+        Some(mediator_raw.trim().to_string())
+    };
+
+    eprintln!();
+    let control_did: String = Input::new()
+        .with_prompt("Control plane DID (leave empty to set later)")
+        .default(String::new())
+        .interact_text()?;
+    let control_did = if control_did.is_empty() {
+        None
+    } else {
+        Some(control_did)
+    };
+
+    let host: String = Input::new()
+        .with_prompt("Listen host")
+        .default("0.0.0.0".to_string())
+        .interact_text()?;
+
+    let port: u16 = Input::new()
+        .with_prompt("Listen port")
+        .default(8530)
+        .interact_text()?;
+
+    let log_levels = ["info", "debug", "warn", "error", "trace"];
+    let log_level_idx = Select::new()
+        .with_prompt("Log level")
+        .items(log_levels)
+        .default(0)
+        .interact()?;
+    let log_level = log_levels[log_level_idx].to_string();
+
+    let format_options = &["text", "json"];
+    let format_idx = Select::new()
+        .with_prompt("Log format")
+        .items(format_options)
+        .default(0)
+        .interact()?;
+    let log_format = match format_idx {
+        1 => LogFormat::Json,
+        _ => LogFormat::Text,
+    };
+
+    let data_dir: String = Input::new()
+        .with_prompt("Data directory")
+        .default("data/webvh-server".to_string())
+        .interact_text()?;
+
+    let secrets = configure_secrets()?;
+
+    // Write bootstrap request + seed via the shared primitive.
+    let info =
+        vta_setup::write_offline_bootstrap_request(&request_out, &seed_out, Some("webvh-server"))?;
+
+    let state = PendingServerSetupState {
+        config_output: config_output.clone(),
+        seed_path: info.seed_path.clone(),
+        public_url,
+        did_path,
+        mediator_did,
+        control_did,
+        host,
+        port,
+        log_level,
+        log_format,
+        data_dir,
+        secrets,
+    };
+    let state_toml = toml::to_string_pretty(&state)?;
+    if let Some(parent) = state_out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&state_out, &state_toml)?;
+
+    eprintln!();
+    eprintln!("  Offline setup step 1/2 complete.");
+    eprintln!();
+    eprintln!("  Request file:   {}", info.request_path.display());
+    eprintln!("  Seed (secret):  {} (keep safe)", info.seed_path.display());
+    eprintln!("  State file:     {}", state_out.display());
+    eprintln!();
+    eprintln!("  Consumer DID:   {}", info.client_did);
+    eprintln!("  Nonce:          {}", info.nonce);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Ferry {} to your VTA admin.",
+        info.request_path.display()
+    );
+    eprintln!("    2. Ask them to seal a webvh-service template response:");
+    eprintln!(
+        "         vta bootstrap seal --request <request-file> \\\n           --template webvh-service --var MEDIATOR_DID=<mediator-did>"
+    );
+    eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
+    eprintln!("    4. Run:");
+    eprintln!(
+        "         webvh-server setup-offline-complete \\\n           --bundle <bundle> --expect-digest <hex> --state {}",
+        state_out.display()
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+/// Finalise offline setup: open the sealed response, persist the DID
+/// + keys + config + import the root DID per the state saved by prepare.
+pub async fn run_setup_offline_complete(
+    bundle_path: PathBuf,
+    expect_digest: String,
+    state_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  WebVH Server — Offline Setup (step 2/2)");
+    eprintln!("  ========================================");
+    eprintln!();
+
+    let state_toml = std::fs::read_to_string(&state_path)?;
+    let state: PendingServerSetupState = toml::from_str(&state_toml)?;
+
+    let armor = std::fs::read_to_string(&bundle_path)?;
+    let result =
+        vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &state.seed_path)?;
+
+    eprintln!("  Sealed response opened.");
+    eprintln!("  DID:          {}", result.did);
+    eprintln!("  VTA DID:      {}", result.vta_did);
+    if let Some(ref url) = result.vta_url {
+        eprintln!("  VTA URL:      {url}");
+    }
+    eprintln!();
+
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!("  Generated JWT signing key.");
+
+    let config = AppConfig {
+        features: FeaturesConfig {
+            didcomm: state.mediator_did.is_some(),
+            rest_api: false,
+            ..Default::default()
+        },
+        server_did: Some(result.did.clone()),
+        mediator_did: state.mediator_did.clone(),
+        public_url: Some(state.public_url.clone()),
+        server: ServerConfig {
+            host: state.host.clone(),
+            port: state.port,
+        },
+        log: LogConfig {
+            level: state.log_level.clone(),
+            format: state.log_format.clone(),
+        },
+        store: StoreConfig {
+            data_dir: PathBuf::from(&state.data_dir),
+            ..StoreConfig::default()
+        },
+        auth: AuthConfig::default(),
+        secrets: state.secrets.clone(),
+        limits: LimitsConfig::default(),
+        watchers: Vec::new(),
+        control_url: None,
+        control_did: state.control_did.clone(),
+        vta: VtaConfig {
+            url: result.vta_url.clone(),
+            did: Some(result.vta_did.clone()),
+            context_id: None,
+        },
+        stats: crate::config::StatsConfig::default(),
+        config_path: state.config_output.clone(),
+    };
+
+    let toml_str = toml::to_string_pretty(&config)?;
+    std::fs::write(&state.config_output, &toml_str)?;
+    eprintln!(
+        "  Configuration written to {}",
+        state.config_output.display()
+    );
+
+    let server_secrets = ServerSecrets {
+        signing_key: result.signing_key_multibase,
+        key_agreement_key: result.key_agreement_multibase,
+        jwt_signing_key,
+        vta_credential: None, // offline flow has no reusable VTA credential
+    };
+
+    let secret_store = create_secret_store(&config)?;
+    secret_store.set(&server_secrets).await?;
+    eprintln!("  Secrets stored in secret store.");
+
+    // Import the server's own DID into the local store at the derived path.
+    // Mirrors the online wizard's bootstrap::import_did_at_path step.
+    if let Some(ref log_entry) = result.log_entry {
+        eprintln!();
+        eprintln!(
+            "  Importing server DID into store at path '{}'...",
+            state.did_path
+        );
+
+        let store = crate::store::Store::open(&config.store).await?;
+        let dids_ks = store.keyspace("dids")?;
+
+        match crate::bootstrap::import_did_at_path(
+            &store,
+            &dids_ks,
+            &state.did_path,
+            log_entry,
+            None,
+        )
+        .await
+        {
+            Ok(import) => {
+                eprintln!("  Server DID imported!");
+                eprintln!("  DID:  {}", import.did_id);
+                eprintln!("  SCID: {}", import.scid);
+                update_server_did_in_config(&state.config_output, &import.did_id)?;
+                eprintln!("  server_did updated in {}", state.config_output.display());
+            }
+            Err(e) => {
+                eprintln!("  Warning: failed to import server DID: {e}");
+                eprintln!(
+                    "  You can retry with `webvh-server bootstrap-did --path {}`",
+                    state.did_path
+                );
+            }
+        }
+    } else {
+        eprintln!();
+        eprintln!("  Warning: sealed response carried no WebvhLog — server DID not imported.");
+    }
+
+    cleanup_offline_artifacts(&state_path, &state.seed_path);
+
+    eprintln!();
+    eprintln!("  Setup complete!");
+    eprintln!();
+    eprintln!("  Server DID: {}", result.did);
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!("    1. Add this server's DID to the control plane ACL:");
+    eprintln!(
+        "       webvh-control add-acl --did {} --role service",
+        result.did
+    );
+    eprintln!("    2. Start the server:");
+    eprintln!(
+        "       webvh-server --config {}",
+        state.config_output.display()
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+fn derive_did_path(public_url: &str) -> String {
+    let after_scheme = public_url
+        .find("://")
+        .map(|i| &public_url[i + 3..])
+        .unwrap_or(public_url);
+    let path = after_scheme
+        .find('/')
+        .map(|i| after_scheme[i..].trim_matches('/'))
+        .unwrap_or("");
+    if path.is_empty() {
+        ".well-known".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn cleanup_offline_artifacts(state_path: &Path, seed_path: &Path) {
+    if let Err(e) = std::fs::remove_file(state_path) {
+        eprintln!(
+            "  Warning: failed to remove state file {}: {e}",
+            state_path.display()
+        );
+    }
+    if let Err(e) = std::fs::remove_file(seed_path) {
+        eprintln!(
+            "  Warning: failed to remove ephemeral seed {}: {e}",
+            seed_path.display()
+        );
+    }
+}
+
 pub fn update_server_did_in_config(
     config_path: &PathBuf,
     server_did: &str,
