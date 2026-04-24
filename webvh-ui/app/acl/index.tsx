@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { Link } from "expo-router";
+import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -19,7 +20,7 @@ import {
   parseOptionalInt,
 } from "../../lib/format";
 import { showAlert, showConfirm } from "../../lib/alert";
-import type { AclEntry, DidRecord } from "../../lib/api";
+import type { AclEntry, CreateInviteResponse, DidRecord } from "../../lib/api";
 
 interface EditState {
   did: string;
@@ -215,6 +216,14 @@ export default function AclManagement() {
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
   const [creating, setCreating] = useState(false);
 
+  // Invite form
+  const [inviteDid, setInviteDid] = useState("");
+  const [inviteRole, setInviteRole] =
+    useState<"admin" | "owner" | "service">("owner");
+  const [inviting, setInviting] = useState(false);
+  const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
+  const [inviteCopied, setInviteCopied] = useState(false);
+
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -238,6 +247,33 @@ export default function AclManagement() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const handleInvite = async () => {
+    if (!inviteDid.trim()) return;
+    setInviting(true);
+    try {
+      const resp = await api.createInvite(inviteDid.trim(), inviteRole);
+      setInvite(resp);
+      setInviteCopied(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to create invite";
+      showAlert("Error", msg);
+    } finally {
+      setInviting(false);
+    }
+  };
+
+  const handleCopyInvite = async () => {
+    if (!invite) return;
+    await Clipboard.setStringAsync(invite.enrollment_url);
+    setInviteCopied(true);
+    setTimeout(() => setInviteCopied(false), 2000);
+  };
+
+  const handleClearInvite = () => {
+    setInvite(null);
+    setInviteDid("");
+  };
 
   const handleCreate = async () => {
     if (!newDid.trim()) return;
@@ -408,9 +444,98 @@ export default function AclManagement() {
     />
   );
 
+  const formatExpiry = (ts: number) => {
+    const now = Math.floor(Date.now() / 1000);
+    const mins = Math.max(0, Math.round((ts - now) / 60));
+    if (mins < 60) return `${mins} min`;
+    const hrs = Math.floor(mins / 60);
+    const rem = mins % 60;
+    return rem === 0 ? `${hrs}h` : `${hrs}h ${rem}m`;
+  };
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Access Control</Text>
+
+      {/* Invite by link */}
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Invite by Link</Text>
+        <Text style={styles.inviteHelp}>
+          Generate an enrollment link. The invitee opens it in a browser,
+          registers a passkey, and is added to the ACL with the selected role.
+        </Text>
+        {invite ? (
+          <View>
+            <Text style={styles.editFieldLabel}>Enrollment URL</Text>
+            <View style={styles.inviteUrlBlock}>
+              <Text style={styles.inviteUrlText} selectable numberOfLines={2}>
+                {invite.enrollment_url}
+              </Text>
+            </View>
+            <Text style={styles.inviteExpiry}>
+              Expires in {formatExpiry(invite.expires_at)}
+            </Text>
+            <View style={styles.editActions}>
+              <Pressable style={styles.saveButton} onPress={handleCopyInvite}>
+                <Text style={styles.saveText}>
+                  {inviteCopied ? "Copied" : "Copy Link"}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={styles.cancelButton}
+                onPress={handleClearInvite}
+              >
+                <Text style={styles.cancelText}>New Invite</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : (
+          <View>
+            <TextInput
+              style={styles.input}
+              placeholder="did:web:example.com"
+              placeholderTextColor={colors.textTertiary}
+              value={inviteDid}
+              onChangeText={setInviteDid}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <View style={styles.roleRow}>
+              {(["owner", "admin", "service"] as const).map((r) => (
+                <Pressable
+                  key={r}
+                  style={[
+                    styles.roleButton,
+                    inviteRole === r && styles.roleActive,
+                  ]}
+                  onPress={() => setInviteRole(r)}
+                >
+                  <Text
+                    style={[
+                      styles.roleText,
+                      inviteRole === r && styles.roleTextActive,
+                    ]}
+                  >
+                    {r.charAt(0).toUpperCase() + r.slice(1)}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable
+              style={[
+                styles.buttonPrimary,
+                (!inviteDid.trim() || inviting) && styles.disabled,
+              ]}
+              onPress={handleInvite}
+              disabled={!inviteDid.trim() || inviting}
+            >
+              <Text style={styles.buttonPrimaryText}>
+                {inviting ? "Generating..." : "Generate Invite"}
+              </Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
 
       {/* Add new entry */}
       <View style={styles.card}>
@@ -770,5 +895,32 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     fontSize: 12,
     fontFamily: fonts.semibold,
+  },
+  inviteHelp: {
+    fontSize: 13,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    lineHeight: 19,
+    marginBottom: spacing.md,
+  },
+  inviteUrlBlock: {
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    marginTop: 4,
+    marginBottom: spacing.sm,
+  },
+  inviteUrlText: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.teal,
+  },
+  inviteExpiry: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    marginBottom: spacing.sm,
   },
 });

@@ -84,16 +84,8 @@ export default function Login() {
         </View>
 
         <Text style={styles.cliHint}>
-          Ask a server admin to generate an enrollment link:
-        </Text>
-        <View style={styles.codeBlock}>
-          <Text style={styles.codeText} selectable>
-            webvh-control invite --did {"<"}your-did{">"} --role admin
-          </Text>
-        </View>
-        <Text style={styles.cliHint}>
-          Open the link in your browser to register a passkey, then return
-          here to log in.
+          Ask a server admin to send you an enrollment link. Open it in this
+          browser to register a passkey, then return here to log in.
         </Text>
       </View>
     </View>
@@ -189,18 +181,5 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     lineHeight: 19,
     marginBottom: spacing.sm,
-  },
-  codeBlock: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    marginBottom: spacing.md,
-  },
-  codeText: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.teal,
   },
 });

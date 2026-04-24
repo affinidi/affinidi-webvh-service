@@ -171,6 +171,12 @@ export interface LoginStartResponse {
   options: any;
 }
 
+export interface CreateInviteResponse {
+  token: string;
+  enrollment_url: string;
+  expires_at: number;
+}
+
 export interface ControlPlaneConfig {
   controlDid: string | null;
   mediatorDid: string | null;
@@ -435,5 +441,12 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ auth_id: authId, credential }),
+    }),
+
+  createInvite: (did: string, role: "admin" | "owner" | "service") =>
+    request<CreateInviteResponse>("/api/auth/passkey/invite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, role }),
     }),
 };

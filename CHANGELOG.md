@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## 0.6.0 (2026-04-24)
+
+### Added
+- **webvh-control**: Web UI for creating enrollment invites. The Access
+  Control page now has an "Invite by Link" card that generates an
+  enrollment URL for a given DID and role, removing the need to drop to
+  the `webvh-control invite` CLI to onboard new users. The invitee opens
+  the link, registers a passkey, and is added to the ACL automatically.
+
+### Changed
+- **webvh-ui**: Login page "need access?" section no longer surfaces the
+  CLI command — it now instructs users to request an invite link from an
+  admin, matching the new web-based flow.
+
 ## 0.5.0 (2026-04-13)
 
 ### Added
