@@ -11,20 +11,23 @@ use tracing::debug;
 
 use crate::server::error::AppError;
 
-use super::ServerSecrets;
+use super::{ServerSecrets, StoredSecrets};
 
-/// Suffix appended to the configured secret name for the
-/// offline-bootstrap ephemeral seed. Stored as a separate Key Vault
-/// secret so its lifecycle (created at phase 1, deleted at phase 2)
-/// is independent of the long-lived `ServerSecrets` blob.
-const BOOTSTRAP_SEED_SUFFIX: &str = "-bootstrap-seed";
+/// Legacy suffix used by 0.6.0–0.6.1 deployments to store the
+/// offline-bootstrap ephemeral seed in a sibling Key Vault secret. The
+/// current envelope-based design keeps the seed inside the same secret
+/// as `ServerSecrets`. Filtering siblings out of [`list_secret_names`]
+/// keeps the wizard tidy when stragglers exist.
+const LEGACY_BOOTSTRAP_SEED_SUFFIX: &str = "-bootstrap-seed";
 
 /// Secret store backed by Azure Key Vault.
 ///
-/// Stores a JSON-serialized `ServerSecrets` struct as the secret value.
-/// Auth is resolved via `DeveloperToolsCredential`, which chains through
-/// the standard Azure credential sources (environment vars, managed
-/// identity, az CLI, VS Code).
+/// A single Key Vault secret holds a JSON [`StoredSecrets`] envelope
+/// containing both the long-lived [`ServerSecrets`] and the optional
+/// offline-bootstrap ephemeral seed, so a single RBAC grant covers
+/// both. Auth is resolved via `DeveloperToolsCredential`, which chains
+/// through the standard Azure credential sources (environment vars,
+/// managed identity, az CLI, VS Code).
 pub struct AzureKeyVaultStore {
     vault_url: String,
     secret_name: String,
@@ -38,10 +41,6 @@ impl AzureKeyVaultStore {
         }
     }
 
-    fn bootstrap_seed_secret_name(&self) -> String {
-        format!("{}{BOOTSTRAP_SEED_SUFFIX}", self.secret_name)
-    }
-
     fn client(&self) -> Result<SecretClient, AppError> {
         let credential = DeveloperToolsCredential::new(None).map_err(|e| {
             AppError::SecretStore(format!(
@@ -50,6 +49,79 @@ impl AzureKeyVaultStore {
         })?;
         SecretClient::new(&self.vault_url, credential, None)
             .map_err(|e| AppError::SecretStore(format!("Azure Key Vault client error: {e}")))
+    }
+
+    /// Read the current envelope. Returns `None` when the secret does
+    /// not yet exist. Legacy bare-`ServerSecrets` blobs migrate
+    /// transparently on the next write.
+    async fn read_envelope(
+        &self,
+        client: &SecretClient,
+    ) -> Result<Option<StoredSecrets>, AppError> {
+        let result = client
+            .get_secret(&self.secret_name, None::<SecretClientGetSecretOptions<'_>>)
+            .await;
+
+        match result {
+            Ok(response) => {
+                let secret = response.into_model().map_err(|e| {
+                    AppError::SecretStore(format!(
+                        "failed to deserialize Azure secret response: {e}"
+                    ))
+                })?;
+                let value = secret.value.ok_or_else(|| {
+                    AppError::SecretStore(
+                        "Azure Key Vault secret exists but has no string value".into(),
+                    )
+                })?;
+                let env = StoredSecrets::parse(value.trim()).map_err(|e| {
+                    AppError::SecretStore(format!(
+                        "failed to deserialize secrets from Azure Key Vault: {e}"
+                    ))
+                })?;
+                Ok(Some(env))
+            }
+            Err(e) => {
+                if is_not_found(&e) {
+                    Ok(None)
+                } else {
+                    Err(AppError::SecretStore(format!(
+                        "failed to read secrets from Azure Key Vault: {e}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Persist the envelope by writing a new version of the secret.
+    /// Key Vault's `set_secret` creates the secret on first write and
+    /// adds a new version on subsequent writes.
+    async fn write_envelope(
+        &self,
+        client: &SecretClient,
+        env: &StoredSecrets,
+    ) -> Result<(), AppError> {
+        let json_str = env
+            .to_json()
+            .map_err(|e| AppError::Internal(format!("envelope serialization for Azure: {e}")))?;
+
+        let body = SetSecretParameters {
+            value: Some(json_str),
+            ..Default::default()
+        };
+        let request = body.try_into().map_err(|e| {
+            AppError::SecretStore(format!(
+                "failed to encode SetSecretParameters for Azure: {e}"
+            ))
+        })?;
+
+        client
+            .set_secret(&self.secret_name, request, None)
+            .await
+            .map_err(|e| {
+                AppError::SecretStore(format!("failed to store secrets in Azure Key Vault: {e}"))
+            })?;
+        Ok(())
     }
 }
 
@@ -63,42 +135,12 @@ impl super::SecretStore for AzureKeyVaultStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<ServerSecrets>, AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client()?;
-            let result = client
-                .get_secret(&self.secret_name, None::<SecretClientGetSecretOptions<'_>>)
-                .await;
-
-            match result {
-                Ok(response) => {
-                    let secret = response.into_model().map_err(|e| {
-                        AppError::SecretStore(format!(
-                            "failed to deserialize Azure secret response: {e}"
-                        ))
-                    })?;
-                    let value = secret.value.ok_or_else(|| {
-                        AppError::SecretStore(
-                            "Azure Key Vault secret exists but has no string value".into(),
-                        )
-                    })?;
-                    let secrets: ServerSecrets =
-                        serde_json::from_str(value.trim()).map_err(|e| {
-                            AppError::SecretStore(format!(
-                                "failed to deserialize secrets from Azure Key Vault: {e}"
-                            ))
-                        })?;
-                    debug!(secret = %self.secret_name, "secrets loaded from Azure Key Vault");
-                    Ok(Some(secrets))
-                }
-                Err(e) => {
-                    if is_not_found(&e) {
-                        debug!(secret = %self.secret_name, "secret not found in Azure Key Vault");
-                        Ok(None)
-                    } else {
-                        Err(AppError::SecretStore(format!(
-                            "failed to read secrets from Azure Key Vault: {e}"
-                        )))
-                    }
-                }
+            let env = self.read_envelope(&client).await?;
+            let secrets = env.and_then(|e| e.secrets);
+            if secrets.is_some() {
+                debug!(secret = %self.secret_name, "secrets loaded from Azure Key Vault");
             }
+            Ok(secrets)
         })
     }
 
@@ -106,30 +148,14 @@ impl super::SecretStore for AzureKeyVaultStore {
         &self,
         secrets: &ServerSecrets,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let json_str = serde_json::to_string(secrets)
-            .map_err(|e| AppError::Internal(format!("secrets serialization: {e}")));
+        let secrets = secrets.clone();
         Box::pin(async move {
-            let json_str = json_str?;
             let client = self.client()?;
-
-            let body = SetSecretParameters {
-                value: Some(json_str),
-                ..Default::default()
-            };
-            let request = body.try_into().map_err(|e| {
-                AppError::SecretStore(format!(
-                    "failed to encode SetSecretParameters for Azure: {e}"
-                ))
-            })?;
-
-            client
-                .set_secret(&self.secret_name, request, None)
-                .await
-                .map_err(|e| {
-                    AppError::SecretStore(format!(
-                        "failed to store secrets in Azure Key Vault: {e}"
-                    ))
-                })?;
+            // Read-modify-write so a concurrently-stored bootstrap seed
+            // (phase 1 of offline-bootstrap) survives this write.
+            let mut env = self.read_envelope(&client).await?.unwrap_or_default();
+            env.secrets = Some(secrets);
+            self.write_envelope(&client, &env).await?;
             debug!(secret = %self.secret_name, "secrets stored in Azure Key Vault");
             Ok(())
         })
@@ -140,48 +166,14 @@ impl super::SecretStore for AzureKeyVaultStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client()?;
-            let secret_id = self.bootstrap_seed_secret_name();
-            let result = client
-                .get_secret(&secret_id, None::<SecretClientGetSecretOptions<'_>>)
-                .await;
-
-            match result {
-                Ok(response) => {
-                    use base64::Engine;
-                    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-                    let secret = response.into_model().map_err(|e| {
-                        AppError::SecretStore(format!(
-                            "failed to deserialize Azure bootstrap-seed response: {e}"
-                        ))
-                    })?;
-                    let b64 = secret.value.ok_or_else(|| {
-                        AppError::SecretStore(
-                            "Azure bootstrap-seed secret exists but has no string value".into(),
-                        )
-                    })?;
-                    let bytes = B64.decode(b64.trim().as_bytes()).map_err(|e| {
-                        AppError::SecretStore(format!(
-                            "failed to base64-decode bootstrap seed from Azure: {e}"
-                        ))
-                    })?;
-                    let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                        AppError::SecretStore(format!(
-                            "Azure bootstrap seed has {} bytes, expected 32",
-                            bytes.len()
-                        ))
-                    })?;
-                    debug!(secret = %secret_id, "bootstrap seed loaded from Azure");
+            let env = self.read_envelope(&client).await?;
+            match env.and_then(|e| e.bootstrap_seed) {
+                Some(b64) => {
+                    let seed = StoredSecrets::decode_seed(&b64)?;
+                    debug!(secret = %self.secret_name, "bootstrap seed loaded from Azure");
                     Ok(Some(seed))
                 }
-                Err(e) => {
-                    if is_not_found(&e) {
-                        Ok(None)
-                    } else {
-                        Err(AppError::SecretStore(format!(
-                            "failed to read bootstrap seed from Azure Key Vault: {e}"
-                        )))
-                    }
-                }
+                None => Ok(None),
             }
         })
     }
@@ -192,31 +184,11 @@ impl super::SecretStore for AzureKeyVaultStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let seed_owned = *seed;
         Box::pin(async move {
-            use base64::Engine;
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-            let b64 = B64.encode(seed_owned);
             let client = self.client()?;
-            let secret_id = self.bootstrap_seed_secret_name();
-
-            let body = SetSecretParameters {
-                value: Some(b64),
-                ..Default::default()
-            };
-            let request = body.try_into().map_err(|e| {
-                AppError::SecretStore(format!(
-                    "failed to encode bootstrap-seed SetSecretParameters for Azure: {e}"
-                ))
-            })?;
-
-            client
-                .set_secret(&secret_id, request, None)
-                .await
-                .map_err(|e| {
-                    AppError::SecretStore(format!(
-                        "failed to store bootstrap seed in Azure Key Vault: {e}"
-                    ))
-                })?;
-            debug!(secret = %secret_id, "bootstrap seed stored in Azure");
+            let mut env = self.read_envelope(&client).await?.unwrap_or_default();
+            env.bootstrap_seed = Some(StoredSecrets::encode_seed(&seed_owned));
+            self.write_envelope(&client, &env).await?;
+            debug!(secret = %self.secret_name, "bootstrap seed stored in Azure");
             Ok(())
         })
     }
@@ -226,37 +198,24 @@ impl super::SecretStore for AzureKeyVaultStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client()?;
-            let secret_id = self.bootstrap_seed_secret_name();
-            // Key Vault delete_secret is a soft-delete (90-day retention by
-            // default at the vault level). For a one-shot ephemeral seed
-            // that's acceptable — the next phase-1 will overwrite via
-            // set_secret on the same name and supersede the soft-deleted
-            // version.
-            let result = client.delete_secret(&secret_id, None).await;
-            match result {
-                Ok(_) => {
-                    debug!(secret = %secret_id, "bootstrap seed cleared from Azure");
-                    Ok(())
-                }
-                Err(e) => {
-                    if is_not_found(&e) {
-                        Ok(())
-                    } else {
-                        Err(AppError::SecretStore(format!(
-                            "failed to clear bootstrap seed from Azure Key Vault: {e}"
-                        )))
-                    }
-                }
+            let Some(mut env) = self.read_envelope(&client).await? else {
+                return Ok(());
+            };
+            if env.bootstrap_seed.is_none() {
+                return Ok(());
             }
+            env.bootstrap_seed = None;
+            self.write_envelope(&client, &env).await?;
+            debug!(secret = %self.secret_name, "bootstrap seed cleared from Azure");
+            Ok(())
         })
     }
 }
 
 /// List all secret names in the configured Key Vault.
 ///
-/// Filters out `*-bootstrap-seed` companion entries — those are
-/// internal pairings of a `ServerSecrets` blob, not standalone
-/// candidates the operator should pick from the wizard.
+/// Filters out legacy `*-bootstrap-seed` companion entries (see
+/// [`LEGACY_BOOTSTRAP_SEED_SUFFIX`]).
 pub async fn list_secret_names(vault_url: &str) -> Result<Vec<String>, AppError> {
     use azure_security_keyvault_secrets::ResourceExt;
     use futures::TryStreamExt;
@@ -281,7 +240,7 @@ pub async fn list_secret_names(vault_url: &str) -> Result<Vec<String>, AppError>
         let id = props
             .resource_id()
             .map_err(|e| AppError::SecretStore(format!("Azure secret resource_id: {e}")))?;
-        if id.name.ends_with(BOOTSTRAP_SEED_SUFFIX) {
+        if id.name.ends_with(LEGACY_BOOTSTRAP_SEED_SUFFIX) {
             continue;
         }
         names.push(id.name);

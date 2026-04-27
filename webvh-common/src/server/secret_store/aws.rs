@@ -4,13 +4,21 @@ use std::pin::Pin;
 use crate::server::error::AppError;
 use tracing::debug;
 
-use super::ServerSecrets;
+use super::{ServerSecrets, StoredSecrets};
+
+/// Legacy suffix used by 0.6.0–0.6.1 deployments to store the
+/// offline-bootstrap ephemeral seed in a sibling secret. The current
+/// envelope-based design keeps the seed inside the same secret as
+/// `ServerSecrets`, so siblings are no longer created — but stragglers
+/// from older runs may still exist and are filtered out of
+/// [`list_secret_names`] for a tidier wizard UX.
+const LEGACY_BOOTSTRAP_SEED_SUFFIX: &str = "-bootstrap-seed";
 
 /// List secret names visible in AWS Secrets Manager for the configured region.
 ///
-/// Filters out `*-bootstrap-seed` companion entries — those are paired
-/// with a `ServerSecrets` blob, not standalone candidates the operator
-/// should pick from the wizard.
+/// Filters out legacy `*-bootstrap-seed` companion entries (see
+/// [`LEGACY_BOOTSTRAP_SEED_SUFFIX`]) so the wizard doesn't show stale
+/// ephemeral siblings as pickable candidates.
 pub async fn list_secret_names(region: Option<&str>) -> Result<Vec<String>, AppError> {
     let mut config_loader = aws_config::from_env();
     if let Some(region) = region {
@@ -32,7 +40,7 @@ pub async fn list_secret_names(region: Option<&str>) -> Result<Vec<String>, AppE
             .map_err(|e| format_aws_error("AWS list_secrets", e.into_service_error()))?;
         for entry in out.secret_list() {
             if let Some(name) = entry.name()
-                && !name.ends_with(BOOTSTRAP_SEED_SUFFIX)
+                && !name.ends_with(LEGACY_BOOTSTRAP_SEED_SUFFIX)
             {
                 names.push(name.to_string());
             }
@@ -58,18 +66,13 @@ fn format_aws_error<E: std::error::Error>(context: &str, err: E) -> AppError {
     AppError::SecretStore(msg)
 }
 
-/// Suffix appended to the configured secret name for the
-/// offline-bootstrap ephemeral seed. The seed is stored in a separate
-/// AWS Secrets Manager secret so its lifecycle (created at phase 1,
-/// deleted at phase 2) is independent of the long-lived
-/// `ServerSecrets` blob.
-const BOOTSTRAP_SEED_SUFFIX: &str = "-bootstrap-seed";
-
 /// Secret store backed by AWS Secrets Manager.
 ///
-/// Stores a JSON-serialized `ServerSecrets` struct as the secret string.
-/// AWS credentials are resolved from the environment (IAM role, env vars, etc.)
-/// via the default credential provider chain.
+/// A single secret holds a JSON [`StoredSecrets`] envelope containing
+/// both the long-lived [`ServerSecrets`] and the optional
+/// offline-bootstrap ephemeral seed, so a single IAM grant covers both.
+/// AWS credentials are resolved from the environment (IAM role, env
+/// vars, etc.) via the default credential provider chain.
 pub struct AwsSecretStore {
     secret_name: String,
     region: Option<String>,
@@ -83,10 +86,6 @@ impl AwsSecretStore {
         }
     }
 
-    fn bootstrap_seed_secret_name(&self) -> String {
-        format!("{}{BOOTSTRAP_SEED_SUFFIX}", self.secret_name)
-    }
-
     async fn client(&self) -> Result<aws_sdk_secretsmanager::Client, AppError> {
         let mut config_loader = aws_config::from_env();
         if let Some(ref region) = self.region {
@@ -94,6 +93,88 @@ impl AwsSecretStore {
         }
         let sdk_config = config_loader.load().await;
         Ok(aws_sdk_secretsmanager::Client::new(&sdk_config))
+    }
+
+    /// Read the current envelope. Returns `None` when the secret does
+    /// not yet exist. Legacy bare-`ServerSecrets` blobs from pre-envelope
+    /// deployments parse transparently and migrate on the next write.
+    async fn read_envelope(
+        &self,
+        client: &aws_sdk_secretsmanager::Client,
+    ) -> Result<Option<StoredSecrets>, AppError> {
+        match client
+            .get_secret_value()
+            .secret_id(&self.secret_name)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let json_str = output.secret_string().ok_or_else(|| {
+                    AppError::SecretStore("AWS secret exists but has no string value".into())
+                })?;
+                let env = StoredSecrets::parse(json_str).map_err(|e| {
+                    AppError::SecretStore(format!("failed to deserialize secrets from AWS: {e}"))
+                })?;
+                Ok(Some(env))
+            }
+            Err(e) => {
+                let service_error = e.into_service_error();
+                if service_error.is_resource_not_found_exception() {
+                    Ok(None)
+                } else {
+                    Err(format_aws_error(
+                        "failed to read secrets from AWS Secrets Manager",
+                        service_error,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Persist the envelope. Creates the secret on first write,
+    /// otherwise overwrites the existing value.
+    async fn write_envelope(
+        &self,
+        client: &aws_sdk_secretsmanager::Client,
+        env: &StoredSecrets,
+    ) -> Result<(), AppError> {
+        let json_str = env
+            .to_json()
+            .map_err(|e| AppError::Internal(format!("envelope serialization for AWS: {e}")))?;
+
+        let result = client
+            .put_secret_value()
+            .secret_id(&self.secret_name)
+            .secret_string(&json_str)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let service_error = e.into_service_error();
+                if service_error.is_resource_not_found_exception() {
+                    client
+                        .create_secret()
+                        .name(&self.secret_name)
+                        .secret_string(&json_str)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            format_aws_error(
+                                "failed to create secret in AWS Secrets Manager",
+                                e.into_service_error(),
+                            )
+                        })?;
+                    Ok(())
+                } else {
+                    Err(format_aws_error(
+                        "failed to store secrets in AWS Secrets Manager",
+                        service_error,
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -103,38 +184,12 @@ impl super::SecretStore for AwsSecretStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<ServerSecrets>, AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client().await?;
-            let result = client
-                .get_secret_value()
-                .secret_id(&self.secret_name)
-                .send()
-                .await;
-
-            match result {
-                Ok(output) => {
-                    let json_str = output.secret_string().ok_or_else(|| {
-                        AppError::SecretStore("AWS secret exists but has no string value".into())
-                    })?;
-                    let secrets: ServerSecrets = serde_json::from_str(json_str).map_err(|e| {
-                        AppError::SecretStore(format!(
-                            "failed to deserialize secrets from AWS: {e}"
-                        ))
-                    })?;
-                    debug!(secret_name = %self.secret_name, "secrets loaded from AWS Secrets Manager");
-                    Ok(Some(secrets))
-                }
-                Err(e) => {
-                    let service_error = e.into_service_error();
-                    if service_error.is_resource_not_found_exception() {
-                        debug!(secret_name = %self.secret_name, "secret not found in AWS Secrets Manager");
-                        Ok(None)
-                    } else {
-                        Err(format_aws_error(
-                            "failed to read secrets from AWS Secrets Manager",
-                            service_error,
-                        ))
-                    }
-                }
+            let env = self.read_envelope(&client).await?;
+            let secrets = env.and_then(|e| e.secrets);
+            if secrets.is_some() {
+                debug!(secret_name = %self.secret_name, "secrets loaded from AWS Secrets Manager");
             }
+            Ok(secrets)
         })
     }
 
@@ -142,51 +197,16 @@ impl super::SecretStore for AwsSecretStore {
         &self,
         secrets: &ServerSecrets,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let json_str = serde_json::to_string(secrets)
-            .map_err(|e| AppError::Internal(format!("secrets serialization: {e}")));
+        let secrets = secrets.clone();
         Box::pin(async move {
-            let json_str = json_str?;
             let client = self.client().await?;
-
-            // Try to update the existing secret first
-            let result = client
-                .put_secret_value()
-                .secret_id(&self.secret_name)
-                .secret_string(&json_str)
-                .send()
-                .await;
-
-            match result {
-                Ok(_) => {
-                    debug!(secret_name = %self.secret_name, "secrets stored in AWS Secrets Manager");
-                    Ok(())
-                }
-                Err(e) => {
-                    let service_error = e.into_service_error();
-                    if service_error.is_resource_not_found_exception() {
-                        // Secret doesn't exist yet, create it
-                        client
-                            .create_secret()
-                            .name(&self.secret_name)
-                            .secret_string(&json_str)
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                format_aws_error(
-                                    "failed to create secret in AWS Secrets Manager",
-                                    e.into_service_error(),
-                                )
-                            })?;
-                        debug!(secret_name = %self.secret_name, "secrets created in AWS Secrets Manager");
-                        Ok(())
-                    } else {
-                        Err(format_aws_error(
-                            "failed to store secrets in AWS Secrets Manager",
-                            service_error,
-                        ))
-                    }
-                }
-            }
+            // Read-modify-write so a concurrently-stored bootstrap seed
+            // (phase 1 of offline-bootstrap) survives this write.
+            let mut env = self.read_envelope(&client).await?.unwrap_or_default();
+            env.secrets = Some(secrets);
+            self.write_envelope(&client, &env).await?;
+            debug!(secret_name = %self.secret_name, "secrets stored in AWS Secrets Manager");
+            Ok(())
         })
     }
 
@@ -195,41 +215,14 @@ impl super::SecretStore for AwsSecretStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client().await?;
-            let secret_id = self.bootstrap_seed_secret_name();
-            match client.get_secret_value().secret_id(&secret_id).send().await {
-                Ok(output) => {
-                    use base64::Engine;
-                    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-                    let b64 = output.secret_string().ok_or_else(|| {
-                        AppError::SecretStore(
-                            "AWS bootstrap-seed secret exists but has no string value".into(),
-                        )
-                    })?;
-                    let bytes = B64.decode(b64.as_bytes()).map_err(|e| {
-                        AppError::SecretStore(format!(
-                            "failed to base64-decode bootstrap seed from AWS: {e}"
-                        ))
-                    })?;
-                    let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                        AppError::SecretStore(format!(
-                            "AWS bootstrap seed has {} bytes, expected 32",
-                            bytes.len()
-                        ))
-                    })?;
-                    debug!(secret_name = %secret_id, "bootstrap seed loaded from AWS");
+            let env = self.read_envelope(&client).await?;
+            match env.and_then(|e| e.bootstrap_seed) {
+                Some(b64) => {
+                    let seed = StoredSecrets::decode_seed(&b64)?;
+                    debug!(secret_name = %self.secret_name, "bootstrap seed loaded from AWS");
                     Ok(Some(seed))
                 }
-                Err(e) => {
-                    let service_error = e.into_service_error();
-                    if service_error.is_resource_not_found_exception() {
-                        Ok(None)
-                    } else {
-                        Err(format_aws_error(
-                            "failed to read bootstrap seed from AWS Secrets Manager",
-                            service_error,
-                        ))
-                    }
-                }
+                None => Ok(None),
             }
         })
     }
@@ -240,49 +233,12 @@ impl super::SecretStore for AwsSecretStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let seed_owned = *seed;
         Box::pin(async move {
-            use base64::Engine;
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-            let b64 = B64.encode(seed_owned);
             let client = self.client().await?;
-            let secret_id = self.bootstrap_seed_secret_name();
-
-            let result = client
-                .put_secret_value()
-                .secret_id(&secret_id)
-                .secret_string(&b64)
-                .send()
-                .await;
-
-            match result {
-                Ok(_) => {
-                    debug!(secret_name = %secret_id, "bootstrap seed stored in AWS");
-                    Ok(())
-                }
-                Err(e) => {
-                    let service_error = e.into_service_error();
-                    if service_error.is_resource_not_found_exception() {
-                        client
-                            .create_secret()
-                            .name(&secret_id)
-                            .secret_string(&b64)
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                format_aws_error(
-                                    "failed to create bootstrap-seed secret in AWS",
-                                    e.into_service_error(),
-                                )
-                            })?;
-                        debug!(secret_name = %secret_id, "bootstrap seed created in AWS");
-                        Ok(())
-                    } else {
-                        Err(format_aws_error(
-                            "failed to store bootstrap seed in AWS Secrets Manager",
-                            service_error,
-                        ))
-                    }
-                }
-            }
+            let mut env = self.read_envelope(&client).await?.unwrap_or_default();
+            env.bootstrap_seed = Some(StoredSecrets::encode_seed(&seed_owned));
+            self.write_envelope(&client, &env).await?;
+            debug!(secret_name = %self.secret_name, "bootstrap seed stored in AWS");
+            Ok(())
         })
     }
 
@@ -291,32 +247,17 @@ impl super::SecretStore for AwsSecretStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async {
             let client = self.client().await?;
-            let secret_id = self.bootstrap_seed_secret_name();
-            // `force_delete_without_recovery` skips the 7-day recovery
-            // window — appropriate for a setup-time ephemeral secret.
-            let result = client
-                .delete_secret()
-                .secret_id(&secret_id)
-                .force_delete_without_recovery(true)
-                .send()
-                .await;
-            match result {
-                Ok(_) => {
-                    debug!(secret_name = %secret_id, "bootstrap seed cleared from AWS");
-                    Ok(())
-                }
-                Err(e) => {
-                    let service_error = e.into_service_error();
-                    if service_error.is_resource_not_found_exception() {
-                        Ok(())
-                    } else {
-                        Err(format_aws_error(
-                            "failed to clear bootstrap seed from AWS Secrets Manager",
-                            service_error,
-                        ))
-                    }
-                }
+            // No envelope yet → nothing to clear.
+            let Some(mut env) = self.read_envelope(&client).await? else {
+                return Ok(());
+            };
+            if env.bootstrap_seed.is_none() {
+                return Ok(());
             }
+            env.bootstrap_seed = None;
+            self.write_envelope(&client, &env).await?;
+            debug!(secret_name = %self.secret_name, "bootstrap seed cleared from AWS");
+            Ok(())
         })
     }
 }

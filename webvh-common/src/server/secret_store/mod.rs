@@ -51,6 +51,90 @@ pub struct ServerSecrets {
     pub vta_credential: Option<String>,
 }
 
+/// On-the-wire envelope for cloud-backed secret stores (AWS, GCP, Azure).
+///
+/// Holds both the long-lived [`ServerSecrets`] and the short-lived
+/// offline-bootstrap ephemeral seed in the **same** secret entry, so a
+/// single IAM/RBAC grant covers both. Earlier 0.6.x releases stored
+/// the seed in a sibling `<name>-bootstrap-seed` secret, which forced
+/// operators to scope IAM more broadly than expected.
+///
+/// All fields are optional so phase 1 of the offline-bootstrap wizard
+/// (which writes only the seed, before any signing keys exist) and
+/// the post-phase-2 cleared state (no seed, only secrets) both
+/// serialise cleanly.
+///
+/// Wire format:
+/// ```json
+/// { "secrets": { ... } | absent, "bootstrap_seed": "base64..." | absent }
+/// ```
+#[cfg(any(
+    feature = "aws-secrets",
+    feature = "gcp-secrets",
+    feature = "azure-secrets"
+))]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct StoredSecrets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<ServerSecrets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_seed: Option<String>,
+}
+
+#[cfg(any(
+    feature = "aws-secrets",
+    feature = "gcp-secrets",
+    feature = "azure-secrets"
+))]
+impl StoredSecrets {
+    /// Parse the on-the-wire shape, accepting both the new envelope and
+    /// the legacy bare [`ServerSecrets`] blob written by 0.6.x deployments
+    /// before the envelope refactor. Legacy blobs migrate transparently
+    /// on the next write.
+    pub(crate) fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        // Bare ServerSecrets has three mandatory string fields and would
+        // never match an empty/seed-only envelope. Try it first so we
+        // fall through to envelope parsing only when this can't load.
+        if let Ok(bare) = serde_json::from_str::<ServerSecrets>(json) {
+            return Ok(Self {
+                secrets: Some(bare),
+                bootstrap_seed: None,
+            });
+        }
+        serde_json::from_str(json)
+    }
+
+    /// Serialise the envelope as JSON. Empty fields are skipped.
+    pub(crate) fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Encode a 32-byte bootstrap seed into the envelope's wire form
+    /// (URL-safe base64, no padding).
+    #[allow(dead_code)] // used only when at least one cloud backend is enabled
+    pub(crate) fn encode_seed(seed: &[u8; 32]) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        B64.encode(seed)
+    }
+
+    /// Decode a 32-byte bootstrap seed from the envelope's wire form.
+    #[allow(dead_code)] // used only when at least one cloud backend is enabled
+    pub(crate) fn decode_seed(b64: &str) -> Result<[u8; 32], AppError> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        let bytes = B64.decode(b64.trim().as_bytes()).map_err(|e| {
+            AppError::SecretStore(format!("failed to base64-decode bootstrap seed: {e}"))
+        })?;
+        bytes.as_slice().try_into().map_err(|_| {
+            AppError::SecretStore(format!(
+                "bootstrap seed has {} bytes, expected 32",
+                bytes.len()
+            ))
+        })
+    }
+}
+
 pub trait SecretStore: Send + Sync {
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>>;
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>>;
@@ -170,5 +254,79 @@ pub fn create_secret_store(
             config_path.to_path_buf(),
         );
         Ok(Box::new(store))
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "aws-secrets",
+        feature = "gcp-secrets",
+        feature = "azure-secrets"
+    )
+))]
+mod stored_secrets_tests {
+    use super::{ServerSecrets, StoredSecrets};
+
+    #[test]
+    fn parse_legacy_bare_server_secrets_blob() {
+        let legacy = r#"{
+            "signing_key": "sig",
+            "key_agreement_key": "ka",
+            "jwt_signing_key": "jwt"
+        }"#;
+        let env = StoredSecrets::parse(legacy).expect("legacy parses");
+        let secrets = env.secrets.expect("secrets present");
+        assert_eq!(secrets.signing_key, "sig");
+        assert_eq!(secrets.key_agreement_key, "ka");
+        assert_eq!(secrets.jwt_signing_key, "jwt");
+        assert!(env.bootstrap_seed.is_none());
+    }
+
+    #[test]
+    fn parse_envelope_with_seed_only() {
+        let envelope = r#"{ "bootstrap_seed": "AAAA" }"#;
+        let env = StoredSecrets::parse(envelope).expect("envelope parses");
+        assert!(env.secrets.is_none());
+        assert_eq!(env.bootstrap_seed.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn parse_envelope_with_both_fields() {
+        let envelope = r#"{
+            "secrets": {
+                "signing_key": "sig",
+                "key_agreement_key": "ka",
+                "jwt_signing_key": "jwt"
+            },
+            "bootstrap_seed": "AAAA"
+        }"#;
+        let env = StoredSecrets::parse(envelope).expect("envelope parses");
+        assert!(env.secrets.is_some());
+        assert_eq!(env.bootstrap_seed.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn roundtrip_encodes_and_decodes_seed() {
+        let seed = [42u8; 32];
+        let b64 = StoredSecrets::encode_seed(&seed);
+        let mut env = StoredSecrets::default();
+        env.bootstrap_seed = Some(b64);
+        env.secrets = Some(ServerSecrets {
+            signing_key: "s".into(),
+            key_agreement_key: "k".into(),
+            jwt_signing_key: "j".into(),
+            vta_credential: None,
+        });
+        let json = env.to_json().expect("serialises");
+        let parsed = StoredSecrets::parse(&json).expect("re-parses");
+        let decoded = StoredSecrets::decode_seed(parsed.bootstrap_seed.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded, seed);
+    }
+
+    #[test]
+    fn empty_envelope_serialises_to_empty_object() {
+        let env = StoredSecrets::default();
+        assert_eq!(env.to_json().unwrap(), "{}");
     }
 }
