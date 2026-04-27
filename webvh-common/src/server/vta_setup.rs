@@ -346,11 +346,13 @@ pub struct OfflineBootstrapResult {
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
 /// `template` and `vars` describe the target DID template (e.g.
-/// `webvh-service` + `MEDIATOR_DID`); the resulting **VP-framed**
-/// `BootstrapRequest` is what `vta bootstrap provision-integration`
-/// consumes on the producer side. The VP's `validUntil` is set to 7
-/// days from now to give operators headroom for the manual seal/return
-/// round-trip.
+/// `webvh-service` + `MEDIATOR_DID`); `context_id` is embedded as the
+/// VP's `contextHint` so the VTA admin can run `vta bootstrap
+/// provision-integration` without `--context`. The resulting
+/// **VP-framed** `BootstrapRequest` is what `vta bootstrap
+/// provision-integration` consumes on the producer side. The VP's
+/// `validUntil` is set to 7 days from now to give operators headroom
+/// for the manual seal/return round-trip.
 ///
 /// The caller hands `request_path` to the VTA operator and persists the
 /// returned `seed` in their secret store via
@@ -361,13 +363,16 @@ pub async fn write_offline_bootstrap_request(
     request_path: &Path,
     template: &str,
     vars: &[(&str, &str)],
+    context_id: &str,
     label: Option<&str>,
 ) -> Result<OfflineRequestInfo, Box<dyn std::error::Error>> {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use vta_sdk::provision_integration::ProvisionRequestBuilder;
 
-    let mut builder = ProvisionRequestBuilder::new(template).validity(chrono::Duration::days(7));
+    let mut builder = ProvisionRequestBuilder::new(template)
+        .context_hint(context_id)
+        .validity(chrono::Duration::days(7));
     for (k, v) in vars {
         builder = builder.var(*k, *v);
     }
@@ -514,11 +519,13 @@ pub async fn run_offline_request_cli(
     label: &str,
     binary: &str,
     mediator_did: &str,
+    context_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = write_offline_bootstrap_request(
         out,
         "webvh-service",
         &[("MEDIATOR_DID", mediator_did)],
+        context_id,
         Some(label),
     )
     .await?;
@@ -1037,6 +1044,7 @@ mod tests {
             &request_path,
             "webvh-service",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            "webvh-test-ctx",
             Some("webvh-control-test"),
         )
         .await
@@ -1205,6 +1213,7 @@ mod tests {
             &r1,
             "webvh-service",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            "webvh-test-ctx",
             None,
         )
         .await
@@ -1213,6 +1222,7 @@ mod tests {
             &r2,
             "webvh-service",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            "webvh-test-ctx",
             None,
         )
         .await

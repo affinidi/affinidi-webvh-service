@@ -472,6 +472,16 @@ pub async fn run_setup_offline_prepare(
     let did_path = derive_did_path(&public_url);
 
     eprintln!();
+    eprintln!("  VTA context the integration will live in. Embedded in the");
+    eprintln!("  bootstrap request as `contextHint` so the VTA admin can run");
+    eprintln!("  `vta bootstrap provision-integration` without `--context`.");
+    eprintln!();
+    let context_id: String = Input::new()
+        .with_prompt("VTA context ID")
+        .default("webvh".to_string())
+        .interact_text()?;
+
+    eprintln!();
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator.");
     eprintln!();
     let mediator_raw: String = Input::new()
@@ -532,6 +542,7 @@ pub async fn run_setup_offline_prepare(
         &request_out,
         "webvh-service",
         &[("MEDIATOR_DID", &mediator_for_template)],
+        &context_id,
         Some("webvh-daemon"),
     )
     .await?;

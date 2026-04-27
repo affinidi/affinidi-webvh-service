@@ -126,6 +126,11 @@ enum Command {
         /// the right mediator endpoint.
         #[arg(long)]
         mediator_did: String,
+        /// VTA context the integration will live in. Embedded as
+        /// `contextHint` in the request so the VTA admin can run
+        /// `vta bootstrap provision-integration` without `--context`.
+        #[arg(long, default_value = "webvh")]
+        context: String,
     },
     /// Export this witness's DID + signing/KA keys as an HPKE-sealed
     /// migration bundle. See `webvh-server export-sealed` for semantics.
@@ -319,6 +324,7 @@ async fn main() {
             seed,
             label,
             mediator_did,
+            context,
         }) => {
             if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
                 &out,
@@ -326,6 +332,7 @@ async fn main() {
                 &label,
                 "webvh-witness",
                 &mediator_did,
+                &context,
             )
             .await
             {

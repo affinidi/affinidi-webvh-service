@@ -577,6 +577,17 @@ pub async fn run_setup_offline_prepare(
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
     eprintln!();
+    eprintln!("  VTA context the integration will live in. Embedded in the");
+    eprintln!("  bootstrap request as `contextHint` so the VTA admin can run");
+    eprintln!("  `vta bootstrap provision-integration` without `--context`.");
+    eprintln!();
+    let context_id: String = Input::new()
+        .with_prompt("VTA context ID")
+        .default("webvh".to_string())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+    eprintln!();
     eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
@@ -703,6 +714,7 @@ pub async fn run_setup_offline_prepare(
         &request_out,
         "webvh-service",
         &[("MEDIATOR_DID", &mediator_for_template)],
+        &context_id,
         Some("webvh-control"),
     )
     .await
