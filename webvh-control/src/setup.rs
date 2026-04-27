@@ -196,7 +196,13 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     // 11. Secrets backend
     eprintln!();
-    let secrets_config = configure_secrets()?;
+    let secrets_config =
+        affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+            "webvh-control-secrets",
+            "webvh",
+        )
+        .await
+        .map_err(|e| AppError::Config(e.to_string()))?;
 
     // 12. JWT signing key (always generated)
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
@@ -490,100 +496,6 @@ async fn run_online_provision(
     Ok((Some(mediator_did), outcome))
 }
 
-/// Prompt for secrets backend selection and configuration.
-#[allow(clippy::vec_init_then_push)]
-fn configure_secrets() -> Result<SecretsConfig, AppError> {
-    #[allow(unused_mut)]
-    let mut backends: Vec<&str> = Vec::new();
-
-    #[cfg(feature = "keyring")]
-    backends.push("OS Keyring (default)");
-
-    #[cfg(feature = "aws-secrets")]
-    backends.push("AWS Secrets Manager");
-
-    #[cfg(feature = "gcp-secrets")]
-    backends.push("GCP Secret Manager");
-
-    if backends.is_empty() {
-        eprintln!();
-        eprintln!("  *** WARNING: No secure secrets backend is available. ***");
-        eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
-        eprintln!("  This is INSECURE and should only be used for testing/development.");
-        eprintln!("  For production, recompile with: keyring, aws-secrets, or gcp-secrets.");
-        eprintln!();
-
-        let proceed = Confirm::new()
-            .with_prompt("Continue with plaintext secrets storage?")
-            .default(false)
-            .interact()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-        if !proceed {
-            return Err(AppError::Config(
-                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, or gcp-secrets)".into(),
-            ));
-        }
-
-        return Ok(SecretsConfig::default());
-    }
-
-    let chosen = if backends.len() == 1 {
-        eprintln!("  Using {} for secrets storage.", backends[0]);
-        backends[0]
-    } else {
-        let idx = Select::new()
-            .with_prompt("Secrets storage backend")
-            .items(&backends)
-            .default(0)
-            .interact()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        backends[idx]
-    };
-
-    let mut secrets_config = SecretsConfig::default();
-
-    if chosen.starts_with("AWS") {
-        let name: String = Input::new()
-            .with_prompt("AWS secret name")
-            .default("webvh-control-secrets".to_string())
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        secrets_config.aws_secret_name = Some(name);
-
-        let region: String = Input::new()
-            .with_prompt("AWS region (leave empty for default)")
-            .default(String::new())
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        if !region.is_empty() {
-            secrets_config.aws_region = Some(region);
-        }
-    } else if chosen.starts_with("GCP") {
-        let project: String = Input::new()
-            .with_prompt("GCP project ID")
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        secrets_config.gcp_project = Some(project);
-
-        let name: String = Input::new()
-            .with_prompt("GCP secret name")
-            .default("webvh-control-secrets".to_string())
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        secrets_config.gcp_secret_name = Some(name);
-    } else {
-        let service: String = Input::new()
-            .with_prompt("Keyring service name")
-            .default("webvh".to_string())
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        secrets_config.keyring_service = service;
-    }
-
-    Ok(secrets_config)
-}
-
 // ---------------------------------------------------------------------------
 // Offline setup wizard (air-gapped VTA)
 //
@@ -737,7 +649,12 @@ pub async fn run_setup_offline_prepare(
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    let secrets = configure_secrets()?;
+    let secrets = affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+        "webvh-control-secrets",
+        "webvh",
+    )
+    .await
+    .map_err(|e| AppError::Config(e.to_string()))?;
 
     // Admin ACL choice — resolve to a concrete DID now (so the
     // operator can save a generated private key immediately). The

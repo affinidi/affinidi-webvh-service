@@ -475,9 +475,12 @@ dependencies = [
  "axum-extra",
  "azure_core",
  "azure_data_cosmos",
+ "azure_identity",
+ "azure_security_keyvault_secrets",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "dialoguer",
  "didwebvh-rs 0.4.2",
  "ed25519-dalek",
  "firestore",
@@ -528,6 +531,8 @@ dependencies = [
  "axum-extra",
  "azure_core",
  "azure_data_cosmos",
+ "azure_identity",
+ "azure_security_keyvault_secrets",
  "bip39",
  "bytes",
  "clap",
@@ -609,6 +614,8 @@ dependencies = [
  "axum-extra",
  "azure_core",
  "azure_data_cosmos",
+ "azure_identity",
+ "azure_security_keyvault_secrets",
  "base64 0.22.1",
  "bip39",
  "bytes",
@@ -1522,6 +1529,41 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "azure_identity"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be8392bbf0028c43df2f69422825721614f47e12fd601f9056df2c18d35c57e0"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core",
+ "futures",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "azure_security_keyvault_secrets"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7526cba7c53c4d8d4332e7840915d85367ed33fd95fb6dada5bf848e63f7b8d"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core",
+ "futures",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

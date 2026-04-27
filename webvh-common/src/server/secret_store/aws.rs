@@ -6,6 +6,47 @@ use tracing::debug;
 
 use super::ServerSecrets;
 
+/// List secret names visible in AWS Secrets Manager for the configured region.
+///
+/// Filters out `*-bootstrap-seed` companion entries — those are paired
+/// with a `ServerSecrets` blob, not standalone candidates the operator
+/// should pick from the wizard.
+pub async fn list_secret_names(region: Option<&str>) -> Result<Vec<String>, AppError> {
+    let mut config_loader = aws_config::from_env();
+    if let Some(region) = region {
+        config_loader = config_loader.region(aws_config::Region::new(region.to_string()));
+    }
+    let sdk_config = config_loader.load().await;
+    let client = aws_sdk_secretsmanager::Client::new(&sdk_config);
+
+    let mut names = Vec::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut req = client.list_secrets();
+        if let Some(t) = next_token.as_ref() {
+            req = req.next_token(t);
+        }
+        let out = req
+            .send()
+            .await
+            .map_err(|e| format_aws_error("AWS list_secrets", e.into_service_error()))?;
+        for entry in out.secret_list() {
+            if let Some(name) = entry.name()
+                && !name.ends_with(BOOTSTRAP_SEED_SUFFIX)
+            {
+                names.push(name.to_string());
+            }
+        }
+        match out.next_token() {
+            Some(t) if !t.is_empty() => next_token = Some(t.to_string()),
+            _ => break,
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 /// Format an AWS SDK service error with its full source chain for troubleshooting.
 fn format_aws_error<E: std::error::Error>(context: &str, err: E) -> AppError {
     let mut msg = format!("{context}: {err}");

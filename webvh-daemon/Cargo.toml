@@ -31,6 +31,11 @@ gcp-secrets = [
   "affinidi-webvh-witness/gcp-secrets",
   "affinidi-webvh-control/gcp-secrets",
 ]
+azure-secrets = [
+  "affinidi-webvh-server/azure-secrets",
+  "affinidi-webvh-witness/azure-secrets",
+  "affinidi-webvh-control/azure-secrets",
+]
 metrics = [
   "affinidi-webvh-server/metrics",
   "affinidi-webvh-control/metrics",
@@ -72,7 +77,7 @@ name = "webvh-daemon"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", default-features = false, features = ["server-core"] }
+affinidi-webvh-common = { path = "../webvh-common", default-features = false, features = ["server-core", "setup-wizard"] }
 affinidi-webvh-server = { path = "../webvh-server", default-features = false }
 affinidi-webvh-witness = { path = "../webvh-witness", default-features = false }
 affinidi-webvh-watcher = { path = "../webvh-watcher", default-features = false }

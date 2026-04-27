@@ -28,6 +28,8 @@ store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep
 keyring = ["server-core", "dep:keyring"]
 aws-secrets = ["server-core", "dep:aws-sdk-secretsmanager", "dep:aws-config"]
 gcp-secrets = ["server-core", "dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth", "dep:bytes"]
+azure-secrets = ["server-core", "dep:azure_security_keyvault_secrets", "dep:azure_identity", "dep:azure_core", "dep:futures"]
+setup-wizard = ["server-core", "dep:dialoguer"]
 passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
 
 [dependencies]
@@ -75,6 +77,11 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
+azure_security_keyvault_secrets = { version = "0.13", optional = true }
+azure_identity = { version = "0.34", optional = true }
+
+# Setup wizard helper (optional, behind `setup-wizard` feature)
+dialoguer = { workspace = true, optional = true }
 
 # passkey / WebAuthn (optional)
 webauthn-rs = { workspace = true, optional = true }

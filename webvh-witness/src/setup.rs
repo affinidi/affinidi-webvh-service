@@ -193,7 +193,12 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 13. Secrets backend selection
-    let secrets_config = configure_secrets()?;
+    let secrets_config =
+        affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+            "webvh-witness-secrets",
+            "webvh-witness",
+        )
+        .await?;
 
     // 14. Build and write config
     let config = AppConfig {
@@ -476,92 +481,6 @@ async fn run_online_provision(
     Ok((Some(mediator_did), outcome))
 }
 
-/// Prompt for secrets backend selection and configuration.
-fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
-    #[allow(unused_mut)]
-    #[cfg(feature = "keyring")]
-    let mut backends: Vec<&str> = vec!["OS Keyring (default)"];
-
-    #[allow(unused_mut)]
-    #[cfg(not(feature = "keyring"))]
-    let mut backends: Vec<&str> = Vec::new();
-
-    #[cfg(feature = "aws-secrets")]
-    backends.push("AWS Secrets Manager");
-
-    #[cfg(feature = "gcp-secrets")]
-    backends.push("GCP Secret Manager");
-
-    if backends.is_empty() {
-        eprintln!();
-        eprintln!("  *** WARNING: No secure secrets backend is available. ***");
-        eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
-        eprintln!("  This is INSECURE and should only be used for testing/development.");
-        eprintln!("  For production, recompile with: keyring, aws-secrets, or gcp-secrets.");
-        eprintln!();
-
-        let proceed = Confirm::new()
-            .with_prompt("Continue with plaintext secrets storage?")
-            .default(false)
-            .interact()?;
-
-        if !proceed {
-            return Err(
-                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, or gcp-secrets)".into(),
-            );
-        }
-
-        return Ok(SecretsConfig::default());
-    }
-
-    let chosen = if backends.len() == 1 {
-        eprintln!("  Using {} for secrets storage.", backends[0]);
-        backends[0]
-    } else {
-        let idx = Select::new()
-            .with_prompt("Secrets storage backend")
-            .items(&backends)
-            .default(0)
-            .interact()?;
-        backends[idx]
-    };
-
-    let mut secrets_config = SecretsConfig::default();
-
-    if chosen.starts_with("AWS") {
-        let name: String = Input::new()
-            .with_prompt("AWS secret name")
-            .default("webvh-witness-secrets".to_string())
-            .interact_text()?;
-        secrets_config.aws_secret_name = Some(name);
-
-        let region: String = Input::new()
-            .with_prompt("AWS region (leave empty for default)")
-            .default(String::new())
-            .interact_text()?;
-        if !region.is_empty() {
-            secrets_config.aws_region = Some(region);
-        }
-    } else if chosen.starts_with("GCP") {
-        let project: String = Input::new().with_prompt("GCP project ID").interact_text()?;
-        secrets_config.gcp_project = Some(project);
-
-        let name: String = Input::new()
-            .with_prompt("GCP secret name")
-            .default("webvh-witness-secrets".to_string())
-            .interact_text()?;
-        secrets_config.gcp_secret_name = Some(name);
-    } else {
-        let service: String = Input::new()
-            .with_prompt("Keyring service name")
-            .default("webvh-witness".to_string())
-            .interact_text()?;
-        secrets_config.keyring_service = service;
-    }
-
-    Ok(secrets_config)
-}
-
 // ---------------------------------------------------------------------------
 // Offline setup wizard (air-gapped VTA)
 //
@@ -711,7 +630,11 @@ pub async fn run_setup_offline_prepare(
         .default("data/webvh-witness".to_string())
         .interact_text()?;
 
-    let secrets = configure_secrets()?;
+    let secrets = affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+        "webvh-witness-secrets",
+        "webvh-witness",
+    )
+    .await?;
 
     // Admin ACL choice — resolve to a concrete DID now so the operator
     // can save a generated private key immediately.

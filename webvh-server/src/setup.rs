@@ -228,7 +228,12 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 11. Secrets backend selection
-    let secrets_config = configure_secrets()?;
+    let secrets_config =
+        affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+            "webvh-server-secrets",
+            "webvh",
+        )
+        .await?;
 
     // 12. Build and write config
     let config = AppConfig {
@@ -593,7 +598,11 @@ pub async fn run_setup_offline_prepare(
         .default("data/webvh-server".to_string())
         .interact_text()?;
 
-    let secrets = configure_secrets()?;
+    let secrets = affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+        "webvh-server-secrets",
+        "webvh",
+    )
+    .await?;
 
     // Write bootstrap request via the shared primitive; the seed is
     // returned in memory and persisted via the configured secret store.
@@ -858,89 +867,4 @@ pub fn update_server_did_in_config(
 
     std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
     Ok(())
-}
-
-/// Prompt for secrets backend selection and configuration.
-#[allow(clippy::vec_init_then_push)]
-fn configure_secrets() -> Result<SecretsConfig, Box<dyn std::error::Error>> {
-    #[allow(unused_mut)]
-    let mut backends: Vec<&str> = Vec::new();
-
-    #[cfg(feature = "keyring")]
-    backends.push("OS Keyring (default)");
-
-    #[cfg(feature = "aws-secrets")]
-    backends.push("AWS Secrets Manager");
-
-    #[cfg(feature = "gcp-secrets")]
-    backends.push("GCP Secret Manager");
-
-    if backends.is_empty() {
-        eprintln!();
-        eprintln!("  *** WARNING: No secure secrets backend is available. ***");
-        eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
-        eprintln!("  This is INSECURE and should only be used for testing/development.");
-        eprintln!("  For production, recompile with: keyring, aws-secrets, or gcp-secrets.");
-        eprintln!();
-
-        let proceed = Confirm::new()
-            .with_prompt("Continue with plaintext secrets storage?")
-            .default(false)
-            .interact()?;
-
-        if !proceed {
-            return Err(
-                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, or gcp-secrets)".into(),
-            );
-        }
-
-        return Ok(SecretsConfig::default());
-    }
-
-    let chosen = if backends.len() == 1 {
-        eprintln!("  Using {} for secrets storage.", backends[0]);
-        backends[0]
-    } else {
-        let idx = Select::new()
-            .with_prompt("Secrets storage backend")
-            .items(&backends)
-            .default(0)
-            .interact()?;
-        backends[idx]
-    };
-
-    let mut secrets_config = SecretsConfig::default();
-
-    if chosen.starts_with("AWS") {
-        let name: String = Input::new()
-            .with_prompt("AWS secret name")
-            .default("webvh-server-secrets".to_string())
-            .interact_text()?;
-        secrets_config.aws_secret_name = Some(name);
-
-        let region: String = Input::new()
-            .with_prompt("AWS region (leave empty for default)")
-            .default(String::new())
-            .interact_text()?;
-        if !region.is_empty() {
-            secrets_config.aws_region = Some(region);
-        }
-    } else if chosen.starts_with("GCP") {
-        let project: String = Input::new().with_prompt("GCP project ID").interact_text()?;
-        secrets_config.gcp_project = Some(project);
-
-        let name: String = Input::new()
-            .with_prompt("GCP secret name")
-            .default("webvh-server-secrets".to_string())
-            .interact_text()?;
-        secrets_config.gcp_secret_name = Some(name);
-    } else {
-        let service: String = Input::new()
-            .with_prompt("Keyring service name")
-            .default("webvh".to_string())
-            .interact_text()?;
-        secrets_config.keyring_service = service;
-    }
-
-    Ok(secrets_config)
 }

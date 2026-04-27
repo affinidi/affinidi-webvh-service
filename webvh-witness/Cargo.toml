@@ -18,6 +18,7 @@ default = ["keyring", "store-fjall"]
 keyring = ["affinidi-webvh-common/keyring"]
 aws-secrets = ["affinidi-webvh-common/aws-secrets"]
 gcp-secrets = ["affinidi-webvh-common/gcp-secrets"]
+azure-secrets = ["affinidi-webvh-common/azure-secrets"]
 store-fjall = ["affinidi-webvh-common/store-fjall"]
 store-redis = ["affinidi-webvh-common/store-redis"]
 store-dynamodb = ["affinidi-webvh-common/store-dynamodb"]
@@ -33,7 +34,7 @@ name = "webvh-witness"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core"] }
+affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }

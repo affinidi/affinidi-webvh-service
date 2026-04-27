@@ -1,13 +1,19 @@
 #[cfg(feature = "aws-secrets")]
-mod aws;
+pub mod aws;
+#[cfg(feature = "azure-secrets")]
+pub mod azure;
 #[cfg(feature = "gcp-secrets")]
-mod gcp;
+pub mod gcp;
 #[cfg(feature = "keyring")]
 mod keyring;
 mod plaintext;
+#[cfg(feature = "setup-wizard")]
+pub mod wizard;
 
 #[cfg(feature = "aws-secrets")]
 pub use aws::AwsSecretStore;
+#[cfg(feature = "azure-secrets")]
+pub use azure::AzureKeyVaultStore;
 #[cfg(feature = "gcp-secrets")]
 pub use gcp::GcpSecretStore;
 #[cfg(feature = "keyring")]
@@ -88,6 +94,11 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
         return false;
     }
 
+    #[cfg(feature = "azure-secrets")]
+    if secrets.azure_secret_name.is_some() {
+        return false;
+    }
+
     // Keyring is only used when compiled in AND no cloud backend was selected above.
     // But it is unconditionally preferred over plaintext when compiled in.
     #[cfg(feature = "keyring")]
@@ -105,8 +116,9 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
 /// Priority:
 /// 1. AWS Secrets Manager (if `aws-secrets` compiled + `secrets.aws_secret_name` set)
 /// 2. GCP Secret Manager (if `gcp-secrets` compiled + `secrets.gcp_secret_name` set)
-/// 3. OS keyring (if `keyring` compiled — the default)
-/// 4. Plaintext in config file (fallback when no secure backend is available)
+/// 3. Azure Key Vault (if `azure-secrets` compiled + `secrets.azure_secret_name` set)
+/// 4. OS keyring (if `keyring` compiled — the default)
+/// 5. Plaintext in config file (fallback when no secure backend is available)
 #[allow(unused_variables)]
 pub fn create_secret_store(
     secrets: &SecretsConfig,
@@ -129,6 +141,17 @@ pub fn create_secret_store(
             )
         })?;
         let store = GcpSecretStore::new(project, secrets.gcp_secret_name.clone().unwrap());
+        return Ok(Box::new(store));
+    }
+
+    #[cfg(feature = "azure-secrets")]
+    if secrets.azure_secret_name.is_some() {
+        let vault_url = secrets.azure_vault_url.clone().ok_or_else(|| {
+            AppError::Config(
+                "secrets.azure_vault_url is required when secrets.azure_secret_name is set".into(),
+            )
+        })?;
+        let store = AzureKeyVaultStore::new(vault_url, secrets.azure_secret_name.clone().unwrap());
         return Ok(Box::new(store));
     }
 

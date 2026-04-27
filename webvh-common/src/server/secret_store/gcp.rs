@@ -6,6 +6,53 @@ use tracing::debug;
 
 use super::ServerSecrets;
 
+/// List secret short-names visible in GCP Secret Manager for the configured
+/// project.
+///
+/// Filters out `*-bootstrap-seed` companion entries — those are paired
+/// with a `ServerSecrets` blob, not standalone candidates the operator
+/// should pick from the wizard.
+pub async fn list_secret_names(project: &str) -> Result<Vec<String>, AppError> {
+    let client = google_cloud_secretmanager_v1::client::SecretManagerService::builder()
+        .build()
+        .await
+        .map_err(|e| AppError::SecretStore(format!("GCP Secret Manager client error: {e}")))?;
+
+    let parent = format!("projects/{project}");
+    let mut names = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut req = client.list_secrets().set_parent(parent.clone());
+        if let Some(token) = page_token.as_ref() {
+            req = req.set_page_token(token.clone());
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| AppError::SecretStore(format!("GCP list_secrets: {e}")))?;
+
+        for secret in &response.secrets {
+            // `secret.name` is a fully-qualified resource path
+            // `projects/PROJECT/secrets/NAME`. Strip the prefix to get
+            // the short name the wizard prompts on.
+            if let Some(short) = secret.name.rsplit('/').next()
+                && !short.is_empty()
+                && !short.ends_with(BOOTSTRAP_SEED_SUFFIX)
+            {
+                names.push(short.to_string());
+            }
+        }
+
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        page_token = Some(response.next_page_token);
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 /// Secret store backed by GCP Secret Manager.
 ///
 /// Stores a JSON-serialized `ServerSecrets` struct in the named secret.

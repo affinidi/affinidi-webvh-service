@@ -199,6 +199,11 @@ pub struct SecretsConfig {
     pub aws_region: Option<String>,
     pub gcp_project: Option<String>,
     pub gcp_secret_name: Option<String>,
+    /// Azure Key Vault DNS URL (e.g. `https://my-vault.vault.azure.net/`).
+    /// Required when `azure_secret_name` is set.
+    pub azure_vault_url: Option<String>,
+    /// Azure Key Vault secret name. Used by `azure-secrets` backend.
+    pub azure_secret_name: Option<String>,
     #[serde(default = "default_keyring_service")]
     pub keyring_service: String,
     /// Plaintext secrets stored directly in the config file.
@@ -249,6 +254,8 @@ impl Default for SecretsConfig {
             aws_region: None,
             gcp_project: None,
             gcp_secret_name: None,
+            azure_vault_url: None,
+            azure_secret_name: None,
             keyring_service: default_keyring_service(),
             plaintext: None,
             plaintext_bootstrap_seed: None,
@@ -395,6 +402,14 @@ pub fn apply_env_overrides(
     env_opt!(
         &format!("{prefix}_SECRETS_GCP_SECRET_NAME"),
         secrets.gcp_secret_name
+    );
+    env_opt!(
+        &format!("{prefix}_SECRETS_AZURE_VAULT_URL"),
+        secrets.azure_vault_url
+    );
+    env_opt!(
+        &format!("{prefix}_SECRETS_AZURE_SECRET_NAME"),
+        secrets.azure_secret_name
     );
     env_str!(
         &format!("{prefix}_SECRETS_KEYRING_SERVICE"),
