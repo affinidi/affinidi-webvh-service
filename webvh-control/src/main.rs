@@ -91,6 +91,11 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-control")]
         label: String,
+        /// DIDComm mediator DID. Bound to the `webvh-service` template's
+        /// `MEDIATOR_DID` variable so the rendered DID document advertises
+        /// the right mediator endpoint.
+        #[arg(long)]
+        mediator_did: String,
     },
     /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
     ///
@@ -309,13 +314,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::VtaRequest { out, seed, label }) => {
+        Some(Command::VtaRequest {
+            out,
+            seed,
+            label,
+            mediator_did,
+        }) => {
             if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
                 &label,
                 "webvh-control",
-            ) {
+                &mediator_did,
+            )
+            .await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

@@ -692,11 +692,21 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // Write the bootstrap request via the shared primitive; the seed
-    // is returned in memory and persisted via the configured secret
-    // store (no on-disk seed file).
-    let info = vta_setup::write_offline_bootstrap_request(&request_out, Some("webvh-control"))
-        .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
+    // Write the VP-framed bootstrap request via the shared primitive;
+    // the seed is returned in memory and persisted via the configured
+    // secret store (no on-disk seed file). The VP names the
+    // `webvh-service` template + binds `MEDIATOR_DID` so the VTA admin
+    // can run `vta bootstrap provision-integration --request <file>`
+    // without extra flags.
+    let mediator_for_template = mediator_did.clone().unwrap_or_default();
+    let info = vta_setup::write_offline_bootstrap_request(
+        &request_out,
+        "webvh-service",
+        &[("MEDIATOR_DID", &mediator_for_template)],
+        Some("webvh-control"),
+    )
+    .await
+    .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
     let secret_store =
         affinidi_webvh_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
     secret_store.set_bootstrap_seed(&info.seed).await?;
@@ -741,7 +751,7 @@ pub async fn run_setup_offline_prepare(
     );
     eprintln!("    2. Ask them to seal a webvh-service template response:");
     eprintln!(
-        "         vta bootstrap seal --request <request-file> \\\n           --template webvh-service --var MEDIATOR_DID=<mediator-did>"
+        "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );
     eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
     eprintln!("    4. Run:");

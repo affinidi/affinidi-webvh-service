@@ -345,38 +345,53 @@ pub struct OfflineBootstrapResult {
 
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
+/// `template` and `vars` describe the target DID template (e.g.
+/// `webvh-service` + `MEDIATOR_DID`); the resulting **VP-framed**
+/// `BootstrapRequest` is what `vta bootstrap provision-integration`
+/// consumes on the producer side. The VP's `validUntil` is set to 7
+/// days from now to give operators headroom for the manual seal/return
+/// round-trip.
+///
 /// The caller hands `request_path` to the VTA operator and persists the
 /// returned `seed` in their secret store via
 /// `SecretStore::set_bootstrap_seed` — never to disk. The seed is the
 /// X25519-derivable private half needed to open the sealed response in
 /// phase 2.
-pub fn write_offline_bootstrap_request(
+pub async fn write_offline_bootstrap_request(
     request_path: &Path,
+    template: &str,
+    vars: &[(&str, &str)],
     label: Option<&str>,
 ) -> Result<OfflineRequestInfo, Box<dyn std::error::Error>> {
-    use rand::RngExt;
-    use vta_sdk::sealed_transfer::{BootstrapRequest, generate_ed25519_keypair};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use vta_sdk::provision_integration::ProvisionRequestBuilder;
 
-    let (seed, ed_pub) = generate_ed25519_keypair();
+    let mut builder = ProvisionRequestBuilder::new(template).validity(chrono::Duration::days(7));
+    for (k, v) in vars {
+        builder = builder.var(*k, *v);
+    }
+    if let Some(l) = label {
+        builder = builder.label(l);
+    }
 
-    let mut nonce = [0u8; 16];
-    rand::rng().fill(&mut nonce);
-
-    let request = BootstrapRequest::new(ed_pub, nonce, label.map(String::from));
-    let request_json = serde_json::to_string_pretty(&request)?;
+    let signed = builder.sign_ephemeral().await?;
+    let request_json = serde_json::to_string_pretty(&signed.request)?;
 
     if let Some(parent) = request_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(request_path, request_json)?;
 
-    // Copy the seed into a plain `[u8; 32]` so it can leave this fn
-    // without the Zeroizing wrapper.
-    let seed_bytes: [u8; 32] = (*seed).into();
+    // Copy the seed out of the Zeroizing wrapper so it can be persisted
+    // by the secret store — caller is responsible for handling it
+    // carefully from here on.
+    let seed_bytes: [u8; 32] = *signed.seed;
+    let nonce_b64 = B64.encode(signed.bundle_id);
 
     Ok(OfflineRequestInfo {
-        client_did: request.client_did.clone(),
-        nonce: request.nonce.clone(),
+        client_did: signed.client_did,
+        nonce: nonce_b64,
         request_path: request_path.to_path_buf(),
         seed: seed_bytes,
     })
@@ -485,19 +500,28 @@ pub enum OfflineOpenNextStep<'a> {
 }
 
 /// CLI-facing wrapper around [`write_offline_bootstrap_request`]. Writes
-/// the request file, persists the ephemeral seed to `seed_path` (chmod
-/// 0600 on Unix), and prints step-by-step operator instructions.
+/// a VP-framed bootstrap request targeting the `webvh-service` template
+/// with `MEDIATOR_DID` bound to `mediator_did`, persists the ephemeral
+/// seed to `seed_path` (chmod 0600 on Unix), and prints step-by-step
+/// operator instructions.
 ///
 /// Note: this is the **standalone-CLI** entry point (`vta-request`) for
 /// operators managing files explicitly. The wizard's `setup-offline-prepare`
 /// flow uses `SecretStore::set_bootstrap_seed` instead — no seed file.
-pub fn run_offline_request_cli(
+pub async fn run_offline_request_cli(
     out: &Path,
     seed_path: &Path,
     label: &str,
     binary: &str,
+    mediator_did: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info = write_offline_bootstrap_request(out, Some(label))?;
+    let info = write_offline_bootstrap_request(
+        out,
+        "webvh-service",
+        &[("MEDIATOR_DID", mediator_did)],
+        Some(label),
+    )
+    .await?;
 
     if let Some(parent) = seed_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -525,9 +549,9 @@ pub fn run_offline_request_cli(
         "    1. Ferry {} to your VTA admin.",
         info.request_path.display()
     );
-    eprintln!("    2. Ask them to run:");
+    eprintln!("    2. Ask them to seal a webvh-service template response:");
     eprintln!(
-        "         vta bootstrap seal --request <request-file> \\\n           --template webvh-service --var MEDIATOR_DID=<mediator-did>"
+        "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );
     eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
     eprintln!("    4. Run:");
@@ -982,23 +1006,51 @@ pub fn open_sealed_did_secrets(
 mod tests {
     use super::*;
 
-    #[test]
-    fn offline_request_produces_valid_bootstrap_request_and_in_memory_seed() {
+    /// Mint a plain `vta_sdk::sealed_transfer::BootstrapRequest` and
+    /// persist its seed to a file. Used by the export/import-migration
+    /// tests, which seal to a *plain* recipient request (not the
+    /// VP-framed shape the offline-setup wizard now produces).
+    fn write_plain_bootstrap_request_for_test(
+        request_path: &Path,
+        seed_path: &Path,
+        label: Option<&str>,
+    ) {
+        use rand::RngExt;
+        use vta_sdk::sealed_transfer::{BootstrapRequest, generate_ed25519_keypair};
+
+        let (seed, ed_pub) = generate_ed25519_keypair();
+        let mut nonce = [0u8; 16];
+        rand::rng().fill(&mut nonce);
+        let request = BootstrapRequest::new(ed_pub, nonce, label.map(String::from));
+        let request_json = serde_json::to_string_pretty(&request).expect("serialize request");
+        std::fs::write(request_path, request_json).expect("write request");
+        let seed_bytes: [u8; 32] = (*seed).into();
+        std::fs::write(seed_path, seed_bytes).expect("write seed");
+    }
+
+    #[tokio::test]
+    async fn offline_request_produces_valid_bootstrap_request_and_in_memory_seed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let request_path = tmp.path().join("bootstrap-request.json");
 
-        let info = write_offline_bootstrap_request(&request_path, Some("webvh-control-test"))
-            .expect("write request");
+        let info = write_offline_bootstrap_request(
+            &request_path,
+            "webvh-service",
+            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            Some("webvh-control-test"),
+        )
+        .await
+        .expect("write request");
 
-        // Request file: valid JSON, matches vta-sdk's expected shape.
+        // Request file: VP-framed BootstrapRequest as produced by
+        // `ProvisionRequestBuilder::sign_ephemeral`.
         let raw = std::fs::read_to_string(&request_path).expect("read request");
-        let parsed: vta_sdk::sealed_transfer::BootstrapRequest =
-            serde_json::from_str(&raw).expect("parse request");
-        assert_eq!(parsed.version, 1, "version");
+        let parsed: vta_sdk::provision_integration::BootstrapRequest =
+            serde_json::from_str(&raw).expect("parse VP request");
         assert!(
-            parsed.client_did.starts_with("did:key:z6Mk"),
-            "client_did must be an Ed25519 did:key, got {}",
-            parsed.client_did
+            parsed.holder.starts_with("did:key:z6Mk"),
+            "holder must be an Ed25519 did:key, got {}",
+            parsed.holder
         );
         assert_eq!(parsed.label.as_deref(), Some("webvh-control-test"));
         // Nonce is base64url(16 bytes) — 22 chars no padding.
@@ -1007,7 +1059,7 @@ mod tests {
         // Returned info matches the written artifact, and the seed is
         // returned in memory only — the helper doesn't touch disk for
         // it.
-        assert_eq!(info.client_did, parsed.client_did);
+        assert_eq!(info.client_did, parsed.holder);
         assert_eq!(info.nonce, parsed.nonce);
         assert_eq!(info.request_path, request_path);
         assert_ne!(info.seed, [0u8; 32], "seed must not be all zeros");
@@ -1022,12 +1074,10 @@ mod tests {
         let seed_path = tmp.path().join("seed.bin");
         let bundle_path = tmp.path().join("sealed.txt");
 
-        let info = write_offline_bootstrap_request(&request_path, Some("roundtrip-test"))
-            .expect("write request");
-        // Bridge: open_sealed_did_secrets is file-based (used by the
-        // standalone migration CLI), so write the in-memory seed to disk
-        // for this test.
-        std::fs::write(&seed_path, info.seed).expect("write seed");
+        // Migration / export-sealed seals to a *plain* BootstrapRequest
+        // (created by `pnm bootstrap request` on the recipient side),
+        // not the VP-framed shape the offline-setup wizard produces.
+        write_plain_bootstrap_request_for_test(&request_path, &seed_path, Some("roundtrip-test"));
 
         let producer_did = "did:webvh:QmPROD:producer.example.com".to_string();
         let exported_did = "did:webvh:QmEXP:example.com:services/export".to_string();
@@ -1086,9 +1136,9 @@ mod tests {
         let seed_path = tmp.path().join("seed.bin");
         let bundle_path = tmp.path().join("sealed.txt");
 
-        let info =
-            write_offline_bootstrap_request(&request_path, Some("ds-test")).expect("write request");
-        std::fs::write(&seed_path, info.seed).expect("write seed");
+        // Same migration path as the PinnedOnly test — plain
+        // BootstrapRequest, not VP-framed.
+        write_plain_bootstrap_request_for_test(&request_path, &seed_path, Some("ds-test"));
 
         // Producer-side signing key — generate fresh so we have both
         // halves available for the round-trip.
@@ -1145,14 +1195,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn offline_request_unique_client_did_per_call() {
+    #[tokio::test]
+    async fn offline_request_unique_client_did_per_call() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let r1 = tmp.path().join("r1.json");
         let r2 = tmp.path().join("r2.json");
 
-        let a = write_offline_bootstrap_request(&r1, None).unwrap();
-        let b = write_offline_bootstrap_request(&r2, None).unwrap();
+        let a = write_offline_bootstrap_request(
+            &r1,
+            "webvh-service",
+            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            None,
+        )
+        .await
+        .unwrap();
+        let b = write_offline_bootstrap_request(
+            &r2,
+            "webvh-service",
+            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            None,
+        )
+        .await
+        .unwrap();
 
         // Each call mints a fresh Ed25519 seed → different did:key,
         // different nonce, different seed.

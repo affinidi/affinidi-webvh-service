@@ -121,6 +121,11 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-witness")]
         label: String,
+        /// DIDComm mediator DID. Bound to the `webvh-service` template's
+        /// `MEDIATOR_DID` variable so the rendered DID document advertises
+        /// the right mediator endpoint.
+        #[arg(long)]
+        mediator_did: String,
     },
     /// Export this witness's DID + signing/KA keys as an HPKE-sealed
     /// migration bundle. See `webvh-server export-sealed` for semantics.
@@ -309,13 +314,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::VtaRequest { out, seed, label }) => {
+        Some(Command::VtaRequest {
+            out,
+            seed,
+            label,
+            mediator_did,
+        }) => {
             if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
                 &label,
                 "webvh-witness",
-            ) {
+                &mediator_did,
+            )
+            .await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
