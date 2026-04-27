@@ -48,6 +48,26 @@ pub struct ServerSecrets {
 pub trait SecretStore: Send + Sync {
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>>;
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// Read the persisted offline-bootstrap ephemeral seed, if any.
+    ///
+    /// Returns `None` when no seed has been stored — the typical state
+    /// at runtime, since the seed is short-lived (set during phase 1,
+    /// consumed and cleared at phase 2).
+    fn get_bootstrap_seed(&self) -> BoxFuture<'_, Result<Option<[u8; 32]>, AppError>>;
+
+    /// Persist the offline-bootstrap ephemeral seed.
+    ///
+    /// Called by phase 1 of the offline-bootstrap wizard; the seed is
+    /// the receiver-side X25519 secret needed to open the sealed
+    /// response in phase 2.
+    fn set_bootstrap_seed(&self, seed: &[u8; 32]) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// Remove the persisted offline-bootstrap ephemeral seed.
+    ///
+    /// Called by phase 2 once the sealed response has been opened
+    /// successfully.  No-op if no seed is stored.
+    fn clear_bootstrap_seed(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
 
 /// Returns `true` when the plaintext fallback backend will actually be used.
@@ -123,6 +143,7 @@ pub fn create_secret_store(
     {
         let store = plaintext::PlaintextSecretStore::new(
             secrets.plaintext.as_ref(),
+            secrets.plaintext_bootstrap_seed.clone(),
             config_path.to_path_buf(),
         );
         Ok(Box::new(store))

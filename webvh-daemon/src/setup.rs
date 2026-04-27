@@ -65,8 +65,8 @@ pub async fn run_wizard(
         match prompt_vta_mode()? {
             VtaMode::Online => {}
             VtaMode::OfflineStart => {
-                let (request, seed, state) = prompt_offline_prepare_paths()?;
-                return run_setup_offline_prepare(config_path, request, seed, state).await;
+                let (request, state) = prompt_offline_prepare_paths()?;
+                return run_setup_offline_prepare(config_path, request, state).await;
             }
             VtaMode::OfflineComplete => {
                 let (bundle, digest, state) = prompt_offline_complete_inputs()?;
@@ -292,26 +292,19 @@ fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
     })
 }
 
-/// Prompt for the three output paths the offline-prepare phase writes.
-fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>>
-{
+/// Prompt for the two output paths the offline-prepare phase writes.
+/// The ephemeral seed is no longer a file — it lives in the configured
+/// secrets backend (keyring / AWS / GCP / plaintext-in-config).
+fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let request: String = Input::new()
         .with_prompt("Bootstrap request file path")
         .default("bootstrap-request.json".into())
-        .interact_text()?;
-    let seed: String = Input::new()
-        .with_prompt("Ephemeral seed file path (chmod 0600 on Unix)")
-        .default("bootstrap-seed.bin".into())
         .interact_text()?;
     let state: String = Input::new()
         .with_prompt("Pending state file path")
         .default("setup-offline-state.toml".into())
         .interact_text()?;
-    Ok((
-        PathBuf::from(request),
-        PathBuf::from(seed),
-        PathBuf::from(state),
-    ))
+    Ok((PathBuf::from(request), PathBuf::from(state)))
 }
 
 /// Prompt for the inputs the offline-complete phase consumes.
@@ -418,7 +411,6 @@ enum AdminChoice {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PendingDaemonSetupState {
     config_output: PathBuf,
-    seed_path: PathBuf,
     enable: EnableConfig,
     features: FeaturesConfig,
     public_url: String,
@@ -436,7 +428,6 @@ struct PendingDaemonSetupState {
 pub async fn run_setup_offline_prepare(
     config_path: Option<PathBuf>,
     request_out: PathBuf,
-    seed_out: PathBuf,
     state_out: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
@@ -524,12 +515,15 @@ pub async fn run_setup_offline_prepare(
     let secrets = configure_secrets()?;
     let admin = prompt_admin_choice()?;
 
-    let info =
-        vta_setup::write_offline_bootstrap_request(&request_out, &seed_out, Some("webvh-daemon"))?;
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, Some("webvh-daemon"))?;
+
+    // Persist the ephemeral seed via the chosen secret store so it
+    // survives until phase 2 — no on-disk seed file.
+    let secret_store = create_secret_store(&secrets, &config_output)?;
+    secret_store.set_bootstrap_seed(&info.seed).await?;
 
     let state = PendingDaemonSetupState {
         config_output: config_output.clone(),
-        seed_path: info.seed_path.clone(),
         enable,
         features,
         public_url,
@@ -553,8 +547,8 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  Offline setup step 1/2 complete.");
     eprintln!();
     eprintln!("  Request file:   {}", info.request_path.display());
-    eprintln!("  Seed (secret):  {}", info.seed_path.display());
     eprintln!("  State file:     {}", state_out.display());
+    eprintln!("  Bootstrap seed: stored in the configured secrets backend");
     eprintln!();
     eprintln!("  Consumer DID:   {}", info.client_did);
     eprintln!("  Nonce:          {}", info.nonce);
@@ -593,8 +587,15 @@ pub async fn run_setup_offline_complete(
     let state: PendingDaemonSetupState = toml::from_str(&state_toml)?;
 
     let armor = std::fs::read_to_string(&bundle_path)?;
-    let result =
-        vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &state.seed_path)?;
+
+    // Read the seed back from the same secret store we wrote it to in
+    // phase 1.
+    let secret_store = create_secret_store(&state.secrets, &state.config_output)?;
+    let seed = secret_store
+        .get_bootstrap_seed()
+        .await?
+        .ok_or("bootstrap seed missing from secret store — phase 1 may not have run")?;
+    let result = vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &seed)?;
 
     eprintln!("  Sealed response opened.");
     eprintln!("  DID:          {}", result.did);
@@ -662,12 +663,17 @@ pub async fn run_setup_offline_complete(
     )
     .await?;
 
-    // Best-effort cleanup of the pending state + seed files.
+    // Drop the now-spent bootstrap seed from the secret store (the
+    // secret store post-finalize, since `finalize_daemon_setup` may
+    // rewrite the config.toml that the plaintext backend uses).
+    let post_secret_store = create_secret_store(&config.secrets, &state.config_output)?;
+    if let Err(e) = post_secret_store.clear_bootstrap_seed().await {
+        eprintln!("  Warning: failed to clear bootstrap seed: {e}");
+    }
+
+    // Best-effort cleanup of the pending state file.
     if let Err(e) = std::fs::remove_file(&state_path) {
         eprintln!("  Warning: failed to remove state file: {e}");
-    }
-    if let Err(e) = std::fs::remove_file(&state.seed_path) {
-        eprintln!("  Warning: failed to remove ephemeral seed: {e}");
     }
 
     eprintln!();

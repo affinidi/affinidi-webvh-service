@@ -204,6 +204,13 @@ pub struct SecretsConfig {
     /// Plaintext secrets stored directly in the config file.
     /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
     pub plaintext: Option<PlaintextSecrets>,
+    /// Plaintext-mode-only stash for the offline-bootstrap ephemeral
+    /// seed (base64url-no-pad, 32 raw bytes). Set during phase 1 of
+    /// the offline wizard when no secure backend is available, and
+    /// removed at the end of phase 2. Never populated when a secure
+    /// backend (keyring, AWS, GCP) is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_bootstrap_seed: Option<String>,
 }
 
 /// VTA (Verifiable Trust Architecture) connection configuration.
@@ -244,6 +251,7 @@ impl Default for SecretsConfig {
             gcp_secret_name: None,
             keyring_service: default_keyring_service(),
             plaintext: None,
+            plaintext_bootstrap_seed: None,
         }
     }
 }

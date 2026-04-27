@@ -66,13 +66,14 @@ enum Command {
         context: String,
     },
     /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
+    ///
+    /// The ephemeral bootstrap seed is persisted to the configured
+    /// secrets backend (keyring / AWS / GCP / plaintext-in-config) —
+    /// not to a file.
     SetupOfflinePrepare {
         /// Path for the bootstrap-request.json file.
         #[arg(long, default_value = "bootstrap-request.json")]
         request: PathBuf,
-        /// Path for the ephemeral seed (chmod 0600 on Unix).
-        #[arg(long, default_value = "bootstrap-seed.bin")]
-        seed: PathBuf,
         /// Path for the pending state file (plain TOML, no secrets).
         #[arg(long, default_value = "setup-offline-state.toml")]
         state: PathBuf,
@@ -231,13 +232,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::SetupOfflinePrepare {
-            request,
-            seed,
-            state,
-        }) => {
-            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, seed, state).await
-            {
+        Some(Command::SetupOfflinePrepare { request, state }) => {
+            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
                 eprintln!("Setup error: {e}");
                 std::process::exit(1);
             }

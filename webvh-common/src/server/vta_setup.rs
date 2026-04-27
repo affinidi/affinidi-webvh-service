@@ -310,10 +310,11 @@ pub struct OfflineRequestInfo {
     pub nonce: String,
     /// Path of the written request JSON.
     pub request_path: std::path::PathBuf,
-    /// Path of the persisted ephemeral seed. **Treat as secret.** Must
-    /// survive to the `open_offline_bootstrap_response` call (usually a
-    /// separate CLI invocation, potentially minutes or hours later).
-    pub seed_path: std::path::PathBuf,
+    /// Raw 32-byte ephemeral seed. **Treat as secret.** The caller is
+    /// responsible for persisting this in their secret store
+    /// (`SecretStore::set_bootstrap_seed`); it is the X25519-derivable
+    /// private half needed to open the sealed response in phase 2.
+    pub seed: [u8; 32],
 }
 
 /// Rich result of opening an offline bootstrap response.
@@ -342,18 +343,15 @@ pub struct OfflineBootstrapResult {
     pub vta_url: Option<String>,
 }
 
-/// Write an offline bootstrap request + persist the ephemeral seed.
+/// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
-/// The caller hands `request_path` to the VTA operator and keeps
-/// `seed_path` locally — it's the private half needed to open the sealed
-/// response. Both parent directories are created if absent.
-///
-/// On Unix, `seed_path` is chmodded to 0600 after writing. On other
-/// platforms the file-system's default permissions apply; colocate it
-/// inside a directory under the operator's control.
+/// The caller hands `request_path` to the VTA operator and persists the
+/// returned `seed` in their secret store via
+/// `SecretStore::set_bootstrap_seed` — never to disk. The seed is the
+/// X25519-derivable private half needed to open the sealed response in
+/// phase 2.
 pub fn write_offline_bootstrap_request(
     request_path: &Path,
-    seed_path: &Path,
     label: Option<&str>,
 ) -> Result<OfflineRequestInfo, Box<dyn std::error::Error>> {
     use rand::RngExt;
@@ -370,26 +368,17 @@ pub fn write_offline_bootstrap_request(
     if let Some(parent) = request_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = seed_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     std::fs::write(request_path, request_json)?;
-    // Zeroizing<[u8; 32]> deref is [u8; 32]; pass as &[u8] for write().
-    std::fs::write(seed_path, &seed[..])?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(seed_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(seed_path, perms)?;
-    }
+
+    // Copy the seed into a plain `[u8; 32]` so it can leave this fn
+    // without the Zeroizing wrapper.
+    let seed_bytes: [u8; 32] = (*seed).into();
 
     Ok(OfflineRequestInfo {
         client_did: request.client_did.clone(),
         nonce: request.nonce.clone(),
         request_path: request_path.to_path_buf(),
-        seed_path: seed_path.to_path_buf(),
+        seed: seed_bytes,
     })
 }
 
@@ -402,38 +391,21 @@ pub fn write_offline_bootstrap_request(
 /// doesn't match, and for `PinnedOnly` producer assertions this is the
 /// only trust anchor.
 ///
-/// `seed_path` must point at the file `write_offline_bootstrap_request`
-/// wrote earlier — reopening requires the persisted ephemeral seed.
+/// `seed` is the 32-byte ephemeral seed `write_offline_bootstrap_request`
+/// returned and the caller persisted in their secret store
+/// (`SecretStore::set_bootstrap_seed`). Phase 2 reads it back via
+/// `SecretStore::get_bootstrap_seed`.
 pub fn open_offline_bootstrap_response(
     bundle_armor: &str,
     expect_digest: &str,
-    seed_path: &Path,
+    seed: &[u8; 32],
 ) -> Result<OfflineBootstrapResult, Box<dyn std::error::Error>> {
     use vta_sdk::sealed_transfer::template_bootstrap::TemplateOutput;
     use vta_sdk::sealed_transfer::{
         SealedPayloadV1, armor, ed25519_seed_to_x25519_secret, open_bundle,
     };
 
-    // Load + validate seed.
-    let seed_bytes = std::fs::read(seed_path).map_err(|e| {
-        format!(
-            "failed to read ephemeral seed at {}: {e}",
-            seed_path.display()
-        )
-    })?;
-    if seed_bytes.len() != 32 {
-        return Err(format!(
-            "ephemeral seed at {} has {} bytes (expected 32)",
-            seed_path.display(),
-            seed_bytes.len()
-        )
-        .into());
-    }
-    let seed: [u8; 32] = seed_bytes
-        .as_slice()
-        .try_into()
-        .expect("checked length above");
-    let recipient_secret = ed25519_seed_to_x25519_secret(&seed);
+    let recipient_secret = ed25519_seed_to_x25519_secret(seed);
 
     // Decode the armor. We only expect a single bundle per response.
     let bundles = armor::decode(bundle_armor)?;
@@ -513,22 +485,37 @@ pub enum OfflineOpenNextStep<'a> {
 }
 
 /// CLI-facing wrapper around [`write_offline_bootstrap_request`]. Writes
-/// the request + seed files and prints step-by-step operator instructions
-/// on stderr. Intended for direct delegation from per-service `main.rs`
-/// subcommands so the operator UX stays consistent across binaries.
+/// the request file, persists the ephemeral seed to `seed_path` (chmod
+/// 0600 on Unix), and prints step-by-step operator instructions.
+///
+/// Note: this is the **standalone-CLI** entry point (`vta-request`) for
+/// operators managing files explicitly. The wizard's `setup-offline-prepare`
+/// flow uses `SecretStore::set_bootstrap_seed` instead — no seed file.
 pub fn run_offline_request_cli(
     out: &Path,
-    seed: &Path,
+    seed_path: &Path,
     label: &str,
     binary: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info = write_offline_bootstrap_request(out, seed, Some(label))?;
+    let info = write_offline_bootstrap_request(out, Some(label))?;
+
+    if let Some(parent) = seed_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(seed_path, info.seed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(seed_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(seed_path, perms)?;
+    }
 
     eprintln!();
     eprintln!("  Offline bootstrap request ready.");
     eprintln!();
     eprintln!("  Request file:   {}", info.request_path.display());
-    eprintln!("  Seed (secret):  {}", info.seed_path.display());
+    eprintln!("  Seed (secret):  {}", seed_path.display());
     eprintln!();
     eprintln!("  Consumer DID:   {}", info.client_did);
     eprintln!("  Nonce:          {}", info.nonce);
@@ -566,7 +553,7 @@ pub fn run_offline_request_cli(
 pub fn run_offline_open_cli(
     bundle: &Path,
     expect_digest: &str,
-    seed: &Path,
+    seed_path: &Path,
     did_doc_out: &Path,
     did_log_out: &Path,
     secrets_out: &Path,
@@ -575,7 +562,21 @@ pub fn run_offline_open_cli(
     let armor =
         std::fs::read_to_string(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
 
-    let result = open_offline_bootstrap_response(&armor, expect_digest, seed)?;
+    let seed_bytes = std::fs::read(seed_path).map_err(|e| {
+        format!(
+            "failed to read ephemeral seed at {}: {e}",
+            seed_path.display()
+        )
+    })?;
+    let seed: [u8; 32] = seed_bytes.as_slice().try_into().map_err(|_| {
+        format!(
+            "ephemeral seed at {} has {} bytes (expected 32)",
+            seed_path.display(),
+            seed_bytes.len()
+        )
+    })?;
+
+    let result = open_offline_bootstrap_response(&armor, expect_digest, &seed)?;
 
     let did_doc_json = serde_json::to_string_pretty(&result.did_document)?;
     std::fs::write(did_doc_out, &did_doc_json)?;
@@ -982,14 +983,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offline_request_produces_valid_bootstrap_request() {
+    fn offline_request_produces_valid_bootstrap_request_and_in_memory_seed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let request_path = tmp.path().join("bootstrap-request.json");
-        let seed_path = tmp.path().join("secrets/seed.bin");
 
-        let info =
-            write_offline_bootstrap_request(&request_path, &seed_path, Some("webvh-control-test"))
-                .expect("write request");
+        let info = write_offline_bootstrap_request(&request_path, Some("webvh-control-test"))
+            .expect("write request");
 
         // Request file: valid JSON, matches vta-sdk's expected shape.
         let raw = std::fs::read_to_string(&request_path).expect("read request");
@@ -1005,27 +1004,13 @@ mod tests {
         // Nonce is base64url(16 bytes) — 22 chars no padding.
         assert_eq!(parsed.nonce.len(), 22, "nonce length");
 
-        // Returned info matches the written artifact.
+        // Returned info matches the written artifact, and the seed is
+        // returned in memory only — the helper doesn't touch disk for
+        // it.
         assert_eq!(info.client_did, parsed.client_did);
         assert_eq!(info.nonce, parsed.nonce);
         assert_eq!(info.request_path, request_path);
-        assert_eq!(info.seed_path, seed_path);
-
-        // Seed file: exactly 32 bytes.
-        let seed = std::fs::read(&seed_path).expect("read seed");
-        assert_eq!(seed.len(), 32, "ephemeral seed is 32 bytes");
-
-        // On Unix, the seed is chmod 0600 so it isn't world-readable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&seed_path)
-                .expect("stat seed")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600, "seed file mode");
-        }
+        assert_ne!(info.seed, [0u8; 32], "seed must not be all zeros");
     }
 
     #[tokio::test]
@@ -1037,9 +1022,12 @@ mod tests {
         let seed_path = tmp.path().join("seed.bin");
         let bundle_path = tmp.path().join("sealed.txt");
 
-        let _info =
-            write_offline_bootstrap_request(&request_path, &seed_path, Some("roundtrip-test"))
-                .expect("write request");
+        let info = write_offline_bootstrap_request(&request_path, Some("roundtrip-test"))
+            .expect("write request");
+        // Bridge: open_sealed_did_secrets is file-based (used by the
+        // standalone migration CLI), so write the in-memory seed to disk
+        // for this test.
+        std::fs::write(&seed_path, info.seed).expect("write seed");
 
         let producer_did = "did:webvh:QmPROD:producer.example.com".to_string();
         let exported_did = "did:webvh:QmEXP:example.com:services/export".to_string();
@@ -1098,8 +1086,9 @@ mod tests {
         let seed_path = tmp.path().join("seed.bin");
         let bundle_path = tmp.path().join("sealed.txt");
 
-        let _info = write_offline_bootstrap_request(&request_path, &seed_path, Some("ds-test"))
-            .expect("write request");
+        let info =
+            write_offline_bootstrap_request(&request_path, Some("ds-test")).expect("write request");
+        std::fs::write(&seed_path, info.seed).expect("write seed");
 
         // Producer-side signing key — generate fresh so we have both
         // halves available for the round-trip.
@@ -1160,15 +1149,15 @@ mod tests {
     fn offline_request_unique_client_did_per_call() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let r1 = tmp.path().join("r1.json");
-        let s1 = tmp.path().join("s1.bin");
         let r2 = tmp.path().join("r2.json");
-        let s2 = tmp.path().join("s2.bin");
 
-        let a = write_offline_bootstrap_request(&r1, &s1, None).unwrap();
-        let b = write_offline_bootstrap_request(&r2, &s2, None).unwrap();
+        let a = write_offline_bootstrap_request(&r1, None).unwrap();
+        let b = write_offline_bootstrap_request(&r2, None).unwrap();
 
-        // Each call mints a fresh Ed25519 seed → different did:key, different nonce.
+        // Each call mints a fresh Ed25519 seed → different did:key,
+        // different nonce, different seed.
         assert_ne!(a.client_did, b.client_did, "new keypair per call");
         assert_ne!(a.nonce, b.nonce, "new nonce per call");
+        assert_ne!(a.seed, b.seed, "new seed per call");
     }
 }

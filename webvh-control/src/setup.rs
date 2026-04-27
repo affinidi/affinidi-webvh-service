@@ -55,8 +55,8 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         match prompt_vta_mode()? {
             VtaMode::Online => {}
             VtaMode::OfflineStart => {
-                let (request, seed, state) = prompt_offline_prepare_paths()?;
-                return run_setup_offline_prepare(request, seed, state).await;
+                let (request, state) = prompt_offline_prepare_paths()?;
+                return run_setup_offline_prepare(request, state).await;
             }
             VtaMode::OfflineComplete => {
                 let (bundle, digest, state) = prompt_offline_complete_inputs()?;
@@ -355,15 +355,10 @@ fn prompt_vta_mode() -> Result<VtaMode, AppError> {
     })
 }
 
-fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf, PathBuf), AppError> {
+fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf), AppError> {
     let request: String = Input::new()
         .with_prompt("Bootstrap request file path")
         .default("bootstrap-request.json".into())
-        .interact_text()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let seed: String = Input::new()
-        .with_prompt("Ephemeral seed file path (chmod 0600 on Unix)")
-        .default("bootstrap-seed.bin".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let state: String = Input::new()
@@ -371,11 +366,7 @@ fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf, PathBuf), AppErro
         .default("setup-offline-state.toml".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    Ok((
-        PathBuf::from(request),
-        PathBuf::from(seed),
-        PathBuf::from(state),
-    ))
+    Ok((PathBuf::from(request), PathBuf::from(state)))
 }
 
 fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), AppError> {
@@ -622,7 +613,6 @@ enum AdminChoice {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PendingSetupState {
     config_output: PathBuf,
-    seed_path: PathBuf,
     did_hosting_url: String,
     did_path: String,
     mediator_did: Option<String>,
@@ -638,10 +628,11 @@ struct PendingSetupState {
 }
 
 /// Interactive offline-prepare: prompt for everything except VTA
-/// credentials, write a bootstrap request + ephemeral seed + state file.
+/// credentials, write a bootstrap request file, persist the ephemeral
+/// seed in the configured secrets backend, and serialise the choices
+/// to a state TOML.
 pub async fn run_setup_offline_prepare(
     request_out: PathBuf,
-    seed_out: PathBuf,
     state_out: PathBuf,
 ) -> Result<(), AppError> {
     eprintln!();
@@ -784,15 +775,18 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // Write the bootstrap request + seed via the shared primitive.
-    let info =
-        vta_setup::write_offline_bootstrap_request(&request_out, &seed_out, Some("webvh-control"))
-            .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
+    // Write the bootstrap request via the shared primitive; the seed
+    // is returned in memory and persisted via the configured secret
+    // store (no on-disk seed file).
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, Some("webvh-control"))
+        .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
+    let secret_store =
+        affinidi_webvh_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
+    secret_store.set_bootstrap_seed(&info.seed).await?;
 
     // Persist state for `setup-offline-complete` to pick up.
     let state = PendingSetupState {
         config_output: config_output.clone(),
-        seed_path: info.seed_path.clone(),
         did_hosting_url,
         did_path,
         mediator_did,
@@ -817,8 +811,8 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  Offline setup step 1/2 complete.");
     eprintln!();
     eprintln!("  Request file:   {}", info.request_path.display());
-    eprintln!("  Seed (secret):  {} (keep safe)", info.seed_path.display());
     eprintln!("  State file:     {}", state_out.display());
+    eprintln!("  Bootstrap seed: stored in the configured secrets backend");
     eprintln!();
     eprintln!("  Consumer DID:   {}", info.client_did);
     eprintln!("  Nonce:          {}", info.nonce);
@@ -872,9 +866,20 @@ pub async fn run_setup_offline_complete(
             bundle_path.display()
         ))
     })?;
-    let result =
-        vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &state.seed_path)
-            .map_err(|e| AppError::Config(format!("failed to open sealed response: {e}")))?;
+    let pre_secret_store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        &state.secrets,
+        &state.config_output,
+    )?;
+    let seed = pre_secret_store
+        .get_bootstrap_seed()
+        .await?
+        .ok_or_else(|| {
+            AppError::Config(
+                "bootstrap seed missing from secret store — phase 1 may not have run".into(),
+            )
+        })?;
+    let result = vta_setup::open_offline_bootstrap_response(&armor, &expect_digest, &seed)
+        .map_err(|e| AppError::Config(format!("failed to open sealed response: {e}")))?;
 
     eprintln!("  Sealed response opened.");
     eprintln!("  DID:          {}", result.did);
@@ -972,9 +977,20 @@ pub async fn run_setup_offline_complete(
         eprintln!("  Admin ACL entry added for {admin_did}");
     }
 
-    // Best-effort cleanup — the operator may also want to keep these
-    // around for audit, so failure here is only a warning.
-    cleanup_offline_artifacts(&state_path, &state.seed_path);
+    // Drop the now-spent bootstrap seed from the secret store. We
+    // re-instantiate post-finalize because plaintext mode rewrites the
+    // config.toml when persisting `ServerSecrets`.
+    let post_secret_store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        &config.secrets,
+        &state.config_output,
+    )?;
+    if let Err(e) = post_secret_store.clear_bootstrap_seed().await {
+        eprintln!("  Warning: failed to clear bootstrap seed: {e}");
+    }
+
+    // Best-effort cleanup — the operator may also want to keep the
+    // state file around for audit, so failure here is only a warning.
+    cleanup_offline_artifacts(&state_path);
 
     eprintln!();
     eprintln!("  Setup complete!");
@@ -999,17 +1015,11 @@ pub async fn run_setup_offline_complete(
     Ok(())
 }
 
-fn cleanup_offline_artifacts(state_path: &Path, seed_path: &Path) {
+fn cleanup_offline_artifacts(state_path: &Path) {
     if let Err(e) = std::fs::remove_file(state_path) {
         eprintln!(
             "  Warning: failed to remove state file {}: {e}",
             state_path.display()
-        );
-    }
-    if let Err(e) = std::fs::remove_file(seed_path) {
-        eprintln!(
-            "  Warning: failed to remove ephemeral seed {}: {e}",
-            seed_path.display()
         );
     }
 }
