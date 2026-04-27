@@ -556,12 +556,23 @@ pub async fn run_offline_request_cli(
         "    1. Ferry {} to your VTA admin.",
         info.request_path.display()
     );
-    eprintln!("    2. Ask them to seal a webvh-service template response:");
+    eprintln!("    2. Ask them to create the VTA context with this DID as admin");
+    eprintln!("       (skip if the context already exists), via either:");
+    eprintln!(
+        "         pnm contexts create --context {} \\\n           --admin {}",
+        context_id, info.client_did
+    );
+    eprintln!("       or, on the VTA host directly:");
+    eprintln!(
+        "         vta context provision --context {} \\\n           --admin {}",
+        context_id, info.client_did
+    );
+    eprintln!("    3. Ask them to seal a webvh-service template response:");
     eprintln!(
         "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );
-    eprintln!("    3. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
-    eprintln!("    4. Run:");
+    eprintln!("    4. They send back an ASCII-armored sealed bundle + SHA-256 digest.");
+    eprintln!("    5. Run:");
     eprintln!("         {binary} vta-open --bundle <bundle> --expect-digest <hex>");
     eprintln!();
     eprintln!("  KEEP THE SEED FILE. Losing it means you cannot open the response.");
