@@ -10,6 +10,7 @@ pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mnemonic;
+pub mod operator_messages;
 #[cfg(feature = "passkey")]
 pub mod passkey;
 pub mod secret_store;

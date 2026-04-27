@@ -8,18 +8,47 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use affinidi_webvh_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig, VtaConfig,
 };
+use affinidi_webvh_common::server::operator_messages::WebvhDaemonMessages;
 use affinidi_webvh_common::server::secret_store::{ServerSecrets, create_secret_store};
 use affinidi_webvh_common::server::store::Store;
 use affinidi_webvh_common::server::vta_setup;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
 use crate::config::{DaemonConfig, EnableConfig};
 
-pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// Phase 1 of the headless setup flow: mint an ephemeral did:key,
+/// persist it (chmod 0600 on Unix) under `out_path`, and print the
+/// `pnm contexts create` command the operator must run before phase 2.
+pub async fn run_setup_phase1(
+    out_path: &std::path::Path,
+    context_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::stderr;
+    let messages = WebvhDaemonMessages;
+    let finalise = format!("webvh-daemon setup --setup-key-file {}", out_path.display());
+    let mut writer = stderr();
+    vta_sdk::provision_client::driver::run_phase1_init(
+        &mut writer,
+        out_path,
+        context_id,
+        &messages,
+        Some(&finalise),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn run_wizard(
+    config_path: Option<PathBuf>,
+    preloaded_setup_key_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  WebVH Daemon — Setup Wizard");
     eprintln!("  ============================");
@@ -58,18 +87,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     // 1. Enabled services
     let (enable, features) = prompt_enable_and_features()?;
 
-    // 2. VTA credential → create DID
-    eprintln!();
-    eprintln!("  The daemon needs a VTA credential to provision its DID.");
-    eprintln!();
-    let credential_b64: String = Input::new()
-        .with_prompt("VTA credential (base64url)")
-        .interact_text()?;
-    let (client, conn_info) = vta_setup::connect_vta(credential_b64.trim()).await?;
-    eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
-    eprintln!("  VTA context: {}", conn_info.context_id);
-
-    // 3. Public URL + derived DID path (server convention)
+    // 2. Public URL + derived DID path
     eprintln!();
     eprintln!("  The public URL is where the daemon is reachable. The embedded");
     eprintln!("  server hosts DID documents under this URL; the DID path is");
@@ -80,12 +98,22 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         .with_prompt("Public URL (e.g. https://webvh.example.com)")
         .interact_text()?;
     let public_url = public_url.trim_end_matches('/').to_string();
-
     let did_path = derive_did_path(&public_url);
 
-    // 4. Mediator
+    // 3. VTA DID + context, then provision via ephemeral did:key.
+    //    Headless phase 2 supplies a pre-loaded setup key, in which case
+    //    we skip the "Has the context been created?" confirmation.
+    let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhDaemonMessages);
+    let preloaded_setup_key = match preloaded_setup_key_file.as_deref() {
+        Some(path) => Some(EphemeralSetupKey::load_from(path)?),
+        None => None,
+    };
+    let outcome = run_online_provision(&public_url, messages, preloaded_setup_key).await?;
+
+    // 4. Mediator preference (runtime DIDComm — separate from the
+    //    integration DID document, which the VTA already minted).
     eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did).await;
+    let vta_mediator = vta_setup::resolve_vta_mediator(&outcome.vta_did).await;
     let mut mediator_options: Vec<String> = vec!["No mediator".into()];
     if let Some(ref did) = vta_mediator {
         mediator_options.push(format!("Use VTA's mediator ({did})"));
@@ -105,22 +133,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         if did.is_empty() { None } else { Some(did) }
     };
 
-    // 5. Create DID via VTA
-    eprintln!();
-    eprintln!("  Creating daemon DID at path '{did_path}'...");
-    let did_result = vta_setup::create_did(
-        &client,
-        &conn_info.context_id,
-        &public_url,
-        &did_path,
-        Some("webvh-daemon"),
-        mediator_did.as_deref(),
-    )
-    .await?;
-    eprintln!("  Daemon DID created: {}", did_result.did);
-    eprintln!("  SCID: {}", did_result.scid);
-
-    // 6. Host / port / log / data
+    // 5. Host / port / log / data
     let host: String = Input::new()
         .with_prompt("Listen host")
         .default("0.0.0.0".to_string())
@@ -155,17 +168,17 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     let store_path = PathBuf::from(&data_dir).join("store");
     let witness_store_path = PathBuf::from(&data_dir).join("witness");
 
-    // 7. Secrets backend
+    // 6. Secrets backend
     let secrets_config = configure_secrets()?;
 
-    // 8. Admin ACL (optional, captured as AdminChoice for reuse by offline flow)
+    // 7. Admin ACL (optional, captured as AdminChoice for reuse by offline flow)
     let admin = prompt_admin_choice()?;
 
-    // 9. JWT signing key
+    // 8. JWT signing key
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
     eprintln!("  Generated JWT signing key.");
 
-    // 10. Build + write config
+    // 9. Build + write config
     let config = DaemonConfig {
         server: ServerConfig {
             host: host.clone(),
@@ -177,7 +190,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         },
         auth: AuthConfig::default(),
         secrets: secrets_config,
-        server_did: Some(did_result.did.clone()),
+        server_did: Some(outcome.integration_did.clone()),
         mediator_did: mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
@@ -192,9 +205,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         limits: affinidi_webvh_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig {
-            url: Some(conn_info.vta_url.clone()),
-            did: Some(conn_info.vta_did.clone()),
-            context_id: Some(conn_info.context_id.clone()),
+            url: outcome.vta_url.clone(),
+            did: Some(outcome.vta_did.clone()),
+            context_id: None,
         },
         watcher_sync: affinidi_webvh_watcher::config::SyncConfig::default(),
         registry: affinidi_webvh_control::config::RegistryConfig::default(),
@@ -203,17 +216,17 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
         config_path: output_path.clone(),
     };
 
-    // 11. Persist via shared helper (same as offline flow path).
+    // 10. Persist via shared helper (same as offline flow path).
     finalize_daemon_setup(
         &config,
         &output_path,
         ServerSecrets {
-            signing_key: did_result.signing_key,
-            key_agreement_key: did_result.key_agreement_key,
+            signing_key: outcome.integration_signing_key_mb,
+            key_agreement_key: outcome.integration_ka_key_mb,
             jwt_signing_key,
-            vta_credential: Some(credential_b64.trim().to_string()),
+            vta_credential: Some(outcome.vta_credential_b64),
         },
-        did_result.log_entry.as_deref(),
+        outcome.did_log_entry.as_deref(),
         &did_path,
         admin,
     )
@@ -222,13 +235,88 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!();
     eprintln!("  Setup complete!");
     eprintln!();
-    eprintln!("  Daemon DID: {}", did_result.did);
+    eprintln!("  Daemon DID: {}", outcome.integration_did);
+    eprintln!("  Admin DID:  {}", outcome.admin_did);
     eprintln!();
     eprintln!("  Start the daemon:");
     eprintln!("    webvh-daemon --config {}", output_path.display());
     eprintln!();
 
     Ok(())
+}
+
+/// Run the online VTA provision-integration round-trip:
+///
+/// 1. Prompt for VTA DID + context.
+/// 2. Mint an ephemeral did:key.
+/// 3. Print the operator's `pnm contexts create` command and wait
+///    for them to confirm the ACL is in place.
+/// 4. Drive `vta_sdk::provision_client::run_provision`.
+async fn run_online_provision(
+    public_url: &str,
+    messages: Arc<dyn OperatorMessages>,
+    preloaded_setup_key: Option<EphemeralSetupKey>,
+) -> Result<vta_setup::OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  Authenticating to the VTA.");
+    eprintln!();
+    let vta_did: String = Input::new()
+        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
+        .interact_text()?;
+    let context_id: String = Input::new()
+        .with_prompt("Context ID")
+        .default("webvh".to_string())
+        .interact_text()?;
+
+    let setup_key = match preloaded_setup_key {
+        Some(key) => {
+            eprintln!();
+            eprintln!("  Using pre-loaded setup DID: {}", key.did);
+            key
+        }
+        None => {
+            let key = EphemeralSetupKey::generate()?;
+            eprintln!();
+            eprintln!("  Ephemeral setup DID: {}", key.did);
+            eprintln!();
+            eprintln!("  Run this on a workstation with PNM authenticated to the VTA");
+            eprintln!("  to create the context and grant the setup DID admin access:");
+            eprintln!();
+            eprintln!(
+                "    {}",
+                messages.pnm_admin_command_hint(&context_id, &key.did)
+            );
+            eprintln!();
+            eprintln!("  --admin-expires defaults to 1h. The entry is promoted to");
+            eprintln!("  permanent on first auth — this wizard does that for you.");
+            eprintln!();
+
+            let proceed = Confirm::new()
+                .with_prompt("Has the context been created?")
+                .default(true)
+                .interact()?;
+            if !proceed {
+                return Err("setup cancelled before VTA round-trip".into());
+            }
+            key
+        }
+    };
+
+    let ask = ProvisionAsk::webvh_hosting_server(&context_id, public_url)
+        .with_label(format!("webvh-daemon setup — {context_id}"));
+
+    eprintln!();
+    eprintln!("  Provisioning daemon DID via VTA...");
+    eprintln!();
+
+    vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
+        vta_did,
+        context_id,
+        ask,
+        messages,
+        setup_key,
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

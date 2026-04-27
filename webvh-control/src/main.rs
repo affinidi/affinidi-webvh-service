@@ -20,8 +20,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run interactive setup wizard to generate config.toml
-    Setup,
+    /// Run interactive setup wizard to generate config.toml.
+    ///
+    /// Headless mode (for CI / scripted setup):
+    ///
+    /// 1. Run with `--setup-key-out <path> --context <id>` to mint an
+    ///    ephemeral did:key, persist it (chmod 0600), and print the
+    ///    `pnm contexts create` command. Exits without further prompts.
+    /// 2. Run again with `--setup-key-file <path>` to drive the rest of
+    ///    the wizard reusing the persisted setup DID.
+    Setup {
+        /// Phase 1: mint an ephemeral did:key, persist to <path>, and
+        /// print the `pnm contexts create` command + exit.
+        #[arg(long, conflicts_with = "setup_key_file")]
+        setup_key_out: Option<PathBuf>,
+        /// Phase 2: reuse the setup DID persisted at <path>; skip the
+        /// interactive "Has the context been created?" confirmation.
+        #[arg(long, conflicts_with = "setup_key_out")]
+        setup_key_file: Option<PathBuf>,
+        /// Context id for phase 1's PNM command. Defaults to `webvh`.
+        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        context: String,
+    },
     /// Run health check diagnostics
     Health,
     /// Add an ACL entry
@@ -190,8 +210,17 @@ async fn main() {
     print_banner();
 
     match cli.command {
-        Some(Command::Setup) => {
-            if let Err(e) = setup::run_setup().await {
+        Some(Command::Setup {
+            setup_key_out,
+            setup_key_file,
+            context,
+        }) => {
+            if let Some(path) = setup_key_out {
+                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
+                    eprintln!("Setup error: {e}");
+                    std::process::exit(1);
+                }
+            } else if let Err(e) = setup::run_setup(setup_key_file).await {
                 eprintln!("Setup error: {e}");
                 std::process::exit(1);
             }

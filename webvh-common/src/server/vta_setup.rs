@@ -1,125 +1,17 @@
-//! Shared VTA (Verifiable Trust Architecture) setup helpers.
+//! Shared VTA (Verifiable Trust Architecture) setup helpers used by the
+//! four webvh setup wizards (daemon, server, control, witness).
 //!
-//! Used by all three service setup wizards to authenticate with VTA,
-//! create DIDs, and retrieve key material.
+//! The online flow is built on top of `vta_sdk::provision_client`
+//! ([`online_provision_setup`]); the offline flow uses HPKE-sealed
+//! transfer (`write_offline_bootstrap_request` /
+//! `open_offline_bootstrap_response`).
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
-use vta_sdk::client::VtaClient;
 use vta_sdk::credentials::CredentialBundle;
-use vta_sdk::session::{SessionBackend, SessionStore};
-
-/// Name of the VTA built-in DID template we use for every webvh service
-/// (control plane, DID-hosting server, witness, watcher). The template
-/// renders the two-key Multikey shape with a `#vta-didcomm` service
-/// pointing at the mediator DID supplied in `template_vars`.
-const WEBVH_SERVICE_TEMPLATE: &str = "webvh-service";
-
-/// Metadata from a successful VTA connection.
-pub struct VtaConnectionInfo {
-    pub vta_url: String,
-    pub vta_did: String,
-    pub context_id: String,
-    pub client_did: String,
-}
-
-/// Result of creating or retrieving a DID via VTA.
-pub struct VtaDidResult {
-    pub did: String,
-    pub scid: String,
-    /// Ed25519 private key (multibase-encoded).
-    pub signing_key: String,
-    /// X25519 private key (multibase-encoded).
-    pub key_agreement_key: String,
-    /// DID log entry (JSONL), present only for newly created DIDs.
-    pub log_entry: Option<String>,
-}
-
-/// In-memory session backend for ephemeral setup sessions.
-///
-/// The setup handshake only needs the session for the duration of the
-/// wizard — no persistence needed. This avoids touching disk or
-/// requiring any specific secrets backend to be configured.
-struct InMemoryBackend {
-    data: Mutex<HashMap<String, String>>,
-}
-
-impl SessionBackend for InMemoryBackend {
-    fn load(&self, key: &str) -> Option<String> {
-        self.data.lock().unwrap().get(key).cloned()
-    }
-    fn save(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_string());
-        Ok(())
-    }
-    fn clear(&self, key: &str) {
-        self.data.lock().unwrap().remove(key);
-    }
-}
-
-/// Decode a VTA credential, authenticate via DIDComm, and return a connected client.
-///
-/// Uses `SessionStore` to establish a full DIDComm session through the VTA's
-/// mediator. This is required for operations like `create_did_webvh` where the
-/// VTA needs to relay DIDComm messages to the webvh server.
-///
-/// An in-memory session backend is used — the session is only needed for the
-/// duration of the setup wizard.
-pub async fn connect_vta(
-    credential_b64: &str,
-) -> Result<(VtaClient, VtaConnectionInfo), Box<dyn std::error::Error>> {
-    // vta-sdk 0.5 dropped CredentialBundle::decode; operators still paste
-    // a base64url blob, so deserialize inline: base64url → JSON → bundle.
-    let bundle_json = BASE64.decode(credential_b64.as_bytes())?;
-    let bundle: CredentialBundle = serde_json::from_slice(&bundle_json)?;
-
-    let vta_url = bundle
-        .vta_url
-        .clone()
-        .ok_or("VTA credential does not contain a vta_url")?;
-
-    // Use an in-memory backend — the session is only needed for this setup run
-    let backend = InMemoryBackend {
-        data: Mutex::new(HashMap::new()),
-    };
-    let store = SessionStore::with_backend(Box::new(backend));
-    let session_key = "setup";
-
-    let login_result = store.login(&bundle, &vta_url, session_key).await?;
-
-    // Pass None so connect() resolves the VTA DID and uses DIDComm transport
-    // through the VTA's mediator (required for create_did_webvh etc.)
-    let client = store.connect(session_key, None).await?;
-
-    // Discover the context: list contexts and pick the one the credential has access to
-    let contexts = client.list_contexts().await?;
-    let context_id = if contexts.contexts.len() == 1 {
-        contexts.contexts[0].id.clone()
-    } else if contexts.contexts.is_empty() {
-        return Err("no VTA contexts found for this credential".into());
-    } else {
-        // If multiple contexts, return the first — the caller can override
-        contexts.contexts[0].id.clone()
-    };
-
-    Ok((
-        client,
-        VtaConnectionInfo {
-            vta_url,
-            vta_did: login_result.vta_did,
-            context_id,
-            client_did: login_result.client_did,
-        },
-    ))
-}
 
 /// Resolve the mediator DID from the VTA's DID document.
 ///
@@ -139,78 +31,6 @@ pub async fn resolve_vta_mediator(vta_did: &str) -> Option<String> {
         Ok(Ok(mediator)) => mediator,
         Ok(Err(_)) | Err(_) => None,
     }
-}
-
-/// Create a new did:webvh via VTA and fetch its private keys.
-///
-/// The DID is created in "serverless" mode (no VTA-managed server registration).
-/// The log entry is returned for the caller to import into webvh-server.
-///
-/// If `mediator_did` is provided, a `DIDCommMessaging` service endpoint
-/// pointing to the mediator is embedded in the DID document.
-pub async fn create_did(
-    client: &VtaClient,
-    context_id: &str,
-    hosting_url: &str,
-    path: &str,
-    label: Option<&str>,
-    mediator_did: Option<&str>,
-) -> Result<VtaDidResult, Box<dyn std::error::Error>> {
-    use vta_sdk::client::CreateDidWebvhRequest;
-
-    // vta-sdk 0.5: the VTA renders the DID document server-side from the
-    // named template. When a mediator is configured, hand the template the
-    // MEDIATOR_DID var and it produces the reference shape (#key-0/#key-1
-    // Multikey verification methods + single #vta-didcomm service). When
-    // there's no mediator, leave the template unset so the VTA falls back
-    // to its default service-less DID document.
-    let (template, template_vars) = match mediator_did {
-        Some(did) => {
-            let mut vars = HashMap::new();
-            vars.insert(
-                "MEDIATOR_DID".to_string(),
-                serde_json::Value::String(did.to_string()),
-            );
-            (Some(WEBVH_SERVICE_TEMPLATE.to_string()), vars)
-        }
-        None => (None, HashMap::new()),
-    };
-
-    let req = CreateDidWebvhRequest {
-        context_id: context_id.to_string(),
-        server_id: None,
-        url: Some(hosting_url.to_string()),
-        path: Some(path.to_string()),
-        label: label.map(|l| l.to_string()),
-        portable: true,
-        // Template-rendered DIDs already include the mediator service;
-        // leaving these off avoids the VTA appending a duplicate.
-        add_mediator_service: false,
-        additional_services: None,
-        pre_rotation_count: 0,
-        did_document: None,
-        did_log: None,
-        set_primary: true,
-        signing_key_id: None,
-        ka_key_id: None,
-        template,
-        template_context: Some(context_id.to_string()),
-        template_vars,
-    };
-
-    let result = client.create_did_webvh(req).await?;
-
-    // Fetch private keys
-    let signing_secret = client.get_key_secret(&result.signing_key_id).await?;
-    let ka_secret = client.get_key_secret(&result.ka_key_id).await?;
-
-    Ok(VtaDidResult {
-        did: result.did,
-        scid: result.scid,
-        signing_key: signing_secret.private_key_multibase,
-        key_agreement_key: ka_secret.private_key_multibase,
-        log_entry: result.log_entry,
-    })
 }
 
 /// Generate a standalone did:key admin identity (no VTA needed).
@@ -245,6 +65,217 @@ pub fn generate_ed25519_multibase() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Online provision-integration helper
+//
+// Wraps the SDK's `vta_sdk::provision_client::run_provision` for the three
+// webvh setup wizards. Each binary owns its own dialoguer prompts (config
+// path, public URL, host/port, log/data dir, secrets backend, mediator
+// choice, admin ACL) and calls into here for the VTA round-trip itself.
+// ---------------------------------------------------------------------------
+
+/// Inputs the consumer (each binary's setup wizard) gathers before
+/// invoking the online provision-integration round-trip.
+pub struct OnlineProvisionInputs {
+    /// VTA DID the integration is provisioning into.
+    pub vta_did: String,
+    /// VTA context the integration will live in.
+    pub context_id: String,
+    /// Pre-built `ProvisionAsk` (e.g. from
+    /// `ProvisionAsk::webvh_hosting_server` or `webvh_service`).
+    pub ask: vta_sdk::provision_client::ProvisionAsk,
+    /// Per-binary user-facing labels and `pnm contexts create` command
+    /// hint.
+    pub messages: std::sync::Arc<dyn vta_sdk::provision_client::OperatorMessages>,
+    /// Setup did:key the operator just enrolled at the VTA via the
+    /// printed PNM command. The wizard mints + persists this; we
+    /// consume it here.
+    pub setup_key: vta_sdk::provision_client::EphemeralSetupKey,
+}
+
+/// Result of a successful online provision-integration round-trip,
+/// flattened into the shape the wizard needs to write `ServerSecrets`,
+/// `AppConfig`, the DID document log file, and the local DID store.
+pub struct OnlineProvisionOutcome {
+    /// Integration DID minted by the VTA (the binary's own service DID).
+    pub integration_did: String,
+    /// Multibase-encoded Ed25519 signing key for the integration DID.
+    pub integration_signing_key_mb: String,
+    /// Multibase-encoded X25519 key-agreement key for the integration DID.
+    pub integration_ka_key_mb: String,
+    /// `did.jsonl` content for the integration DID. Present when the
+    /// template emitted a `WebvhLog` output (every webvh template does
+    /// today).
+    pub did_log_entry: Option<String>,
+    /// Long-term admin DID. Equals the rolled-over DID minted by the
+    /// VTA's `vta-admin` template render; the ephemeral setup DID is
+    /// throwaway after this point.
+    pub admin_did: String,
+    /// Multibase-encoded Ed25519 private key paired with `admin_did`.
+    pub admin_signing_key_mb: String,
+    /// VTA DID the integration was provisioned against. Echoed back so
+    /// the wizard can populate `config.vta.did` and run mediator lookup.
+    pub vta_did: String,
+    /// REST URL advertised by the VTA's DID document. Persisted so the
+    /// runtime can re-authenticate without re-resolving the VTA DID.
+    pub vta_url: Option<String>,
+    /// Pre-encoded `vta_credential` value for `ServerSecrets` — base64url
+    /// of a JSON `CredentialBundle` keyed to the rolled-over admin DID.
+    /// The runtime path is unchanged: it deserialises this and calls
+    /// `SessionStore::login` exactly like before.
+    pub vta_credential_b64: String,
+}
+
+/// Drive the online provision-integration round-trip end-to-end.
+///
+/// The wizard is responsible for everything around this call: minting +
+/// printing + confirming the setup DID, prompting for VTA DID / context,
+/// picking the ask, etc. This helper just runs the round-trip, drains
+/// progress events to stderr, and flattens the reply into the shape the
+/// wizard's persistence layer needs.
+pub async fn online_provision_setup(
+    inputs: OnlineProvisionInputs,
+) -> Result<OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+    use vta_sdk::provision_client::{VtaIntent, VtaReply, run_provision};
+
+    let OnlineProvisionInputs {
+        vta_did,
+        context_id: _context_id,
+        ask,
+        messages,
+        setup_key,
+    } = inputs;
+
+    let setup_did = setup_key.did.clone();
+    let setup_pk_mb = setup_key.private_key_multibase().to_string();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let drain = tokio::spawn(async move { drain_provision_events_to_stderr(&mut rx).await });
+
+    let reply = run_provision(
+        VtaIntent::FullSetup,
+        vta_did.clone(),
+        setup_did,
+        setup_pk_mb.clone(),
+        ask,
+        None,
+        messages,
+        tx,
+    )
+    .await?;
+
+    // Make sure the event drain finishes before we keep going so the
+    // operator sees the final lines before our success summary.
+    let _ = drain.await;
+
+    let result = match reply {
+        VtaReply::Full(boxed) => *boxed,
+        VtaReply::AdminOnly(_) => {
+            return Err(
+                "VTA returned an AdminOnly reply but FullSetup was requested — \
+                 this is a wiring bug; please report"
+                    .into(),
+            );
+        }
+    };
+
+    let integration_did = result.integration_did().to_string();
+    let integration_keys = result
+        .integration_key()
+        .ok_or("provision reply missing integration key material")?;
+    let integration_signing_key_mb = integration_keys.signing_key.private_key_multibase.clone();
+    let integration_ka_key_mb = integration_keys.ka_key.private_key_multibase.clone();
+
+    let did_log_entry = result.webvh_log().map(str::to_string);
+
+    let admin_did = result.admin_did().to_string();
+    let admin_signing_key_mb = match result.admin_key() {
+        Some(km) => km.signing_key.private_key_multibase.clone(),
+        // No rollover happened: the setup DID *is* the long-term admin
+        // DID. Fall back to the setup key's private half.
+        None => setup_pk_mb.clone(),
+    };
+
+    let vta_url = result.payload.config.vta_url.clone();
+
+    let vta_credential_b64 = build_vta_credential_b64(
+        &admin_did,
+        &admin_signing_key_mb,
+        &vta_did,
+        vta_url.as_deref(),
+    )?;
+
+    Ok(OnlineProvisionOutcome {
+        integration_did,
+        integration_signing_key_mb,
+        integration_ka_key_mb,
+        did_log_entry,
+        admin_did,
+        admin_signing_key_mb,
+        vta_did,
+        vta_url,
+        vta_credential_b64,
+    })
+}
+
+/// Build the `ServerSecrets.vta_credential` value (base64url of a JSON
+/// `CredentialBundle`) from the rolled-over admin DID + key, so the
+/// runtime path that calls `SessionStore::login` keeps working unchanged.
+pub fn build_vta_credential_b64(
+    admin_did: &str,
+    admin_signing_key_mb: &str,
+    vta_did: &str,
+    vta_url: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let bundle = CredentialBundle {
+        did: admin_did.to_string(),
+        private_key_multibase: admin_signing_key_mb.to_string(),
+        vta_did: vta_did.to_string(),
+        vta_url: vta_url.map(str::to_string),
+    };
+    let json = serde_json::to_vec(&bundle)?;
+    Ok(BASE64.encode(json))
+}
+
+/// Drain `VtaEvent`s emitted by the SDK and render each as a single
+/// line on stderr. Intentionally minimal — the daemon/server/control
+/// wizards are non-TUI, so the operator just sees a checklist scroll
+/// past as the round-trip progresses.
+async fn drain_provision_events_to_stderr(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<vta_sdk::provision_client::VtaEvent>,
+) {
+    use vta_sdk::provision_client::{DiagStatus, VtaEvent};
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            VtaEvent::CheckStart(check) => {
+                eprintln!("  [..] {}", check.label());
+            }
+            VtaEvent::CheckDone(check, status) => match status {
+                DiagStatus::Pending | DiagStatus::Running => {}
+                DiagStatus::Ok(detail) => eprintln!("  [OK] {}  {detail}", check.label()),
+                DiagStatus::Skipped(detail) => eprintln!("  [--] {}  {detail}", check.label()),
+                DiagStatus::Failed(detail) => eprintln!("  [!!] {}  {detail}", check.label()),
+            },
+            VtaEvent::Resolved(_)
+            | VtaEvent::AttemptCompleted { .. }
+            | VtaEvent::PreflightDone { .. } => {
+                // These are inputs to interactive UIs (recovery prompts,
+                // webvh-server pickers) that the non-TUI wizards don't
+                // surface. The runner uses 0/1-server auto-pick anyway.
+            }
+            VtaEvent::Connected { protocol, .. } => {
+                eprintln!();
+                eprintln!("  Connected via {}", protocol.label());
+            }
+            VtaEvent::Failed(reason) => {
+                eprintln!();
+                eprintln!("  ✗ {reason}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Offline (sealed-bundle) bootstrap
 //
 // The online flow above calls the VTA directly over DIDComm. For air-gapped
@@ -262,9 +293,9 @@ pub fn generate_ed25519_multibase() -> String {
 //         - extracts the VTA-rendered DID document, key material, and
 //           signed-DID log from the `TemplateBootstrapPayload`.
 //
-// Same `webvh-service` template drives both the online and offline paths,
-// so the persisted DID shape is identical to what `create_did()` above
-// produces.
+// The same template (`webvh-service`, `webvh-hosting-server`, etc.)
+// drives both the online and offline paths, so the persisted DID shape
+// is identical to what `online_provision_setup` above produces.
 // ---------------------------------------------------------------------------
 
 /// Information returned after writing an offline bootstrap request.

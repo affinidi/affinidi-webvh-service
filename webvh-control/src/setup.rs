@@ -14,12 +14,38 @@ use crate::config::{
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
+use affinidi_webvh_common::server::operator_messages::WebvhControlMessages;
 use affinidi_webvh_common::server::vta_setup;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
-pub async fn run_setup() -> Result<(), AppError> {
+/// Phase 1 of the headless setup flow: mint an ephemeral did:key,
+/// persist it (chmod 0600 on Unix) under `out_path`, and print the
+/// `pnm contexts create` command the operator must run before phase 2.
+pub async fn run_setup_phase1(out_path: &Path, context_id: &str) -> Result<(), AppError> {
+    use std::io::stderr;
+    let messages = WebvhControlMessages;
+    let finalise = format!(
+        "webvh-control setup --setup-key-file {}",
+        out_path.display()
+    );
+    let mut writer = stderr();
+    vta_sdk::provision_client::driver::run_phase1_init(
+        &mut writer,
+        out_path,
+        context_id,
+        &messages,
+        Some(&finalise),
+    )
+    .await
+    .map_err(|e| AppError::Config(format!("phase 1 failed: {e}")))?;
+    Ok(())
+}
+
+pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), AppError> {
     eprintln!();
     eprintln!("  WebVH Control Plane — Setup Wizard");
     eprintln!("  -----------------------------------");
@@ -36,26 +62,23 @@ pub async fn run_setup() -> Result<(), AppError> {
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let output_path = PathBuf::from(output_path);
 
-    // 2. VTA credential — authenticate with control's VTA context
-    eprintln!();
-    eprintln!("  The control plane needs a VTA credential to create its DID identity.");
-    eprintln!("  This is the base64url string issued by the VTA operator for the");
-    eprintln!("  control plane's context.");
-    eprintln!();
-
-    let credential_b64: String = Input::new()
-        .with_prompt("VTA credential (base64url)")
-        .interact_text()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-    let (client, conn_info) = vta_setup::connect_vta(credential_b64.trim())
+    // 2. VTA online provision: mint ephemeral did:key, print PNM
+    //    `contexts create` command, drive run_provision with the
+    //    `webvh-service` template. Headless phase 2 supplies a
+    //    pre-loaded setup key.
+    let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhControlMessages);
+    let preloaded_setup_key = match preloaded_setup_key_file.as_deref() {
+        Some(path) => Some(
+            EphemeralSetupKey::load_from(path)
+                .map_err(|e| AppError::Config(format!("load setup key: {e}")))?,
+        ),
+        None => None,
+    };
+    let (mediator_did, outcome) = run_online_provision(messages, preloaded_setup_key)
         .await
-        .map_err(|e| AppError::Config(format!("VTA authentication failed: {e}")))?;
+        .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
 
-    eprintln!("  Authenticated with VTA as {}", conn_info.client_did);
-    eprintln!("  VTA context: {}", conn_info.context_id);
-
-    // 3. DID hosting URL (where webvh-server serves DIDs)
+    // 3. DID hosting URL (where webvh-server serves DIDs).
     eprintln!();
     eprintln!("  The DID hosting URL is where your webvh-server serves DID documents.");
     eprintln!("  The control plane's DID will be published at <url>/<path>/did.jsonl.");
@@ -73,61 +96,9 @@ pub async fn run_setup() -> Result<(), AppError> {
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    // 5. Mediator selection
-    eprintln!();
-    eprintln!("  A DIDComm mediator routes encrypted messages to this service.");
-    eprintln!("  If your VTA uses a mediator, you can embed the same one in");
-    eprintln!("  the control plane's DID document.");
-    eprintln!();
-
-    // Try to discover the VTA's mediator
-    let vta_mediator = vta_setup::resolve_vta_mediator(&conn_info.vta_did).await;
-
-    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
-    if let Some(ref did) = vta_mediator {
-        mediator_options.push(format!("Use VTA's mediator ({did})"));
-    }
-    mediator_options.push("Enter a custom mediator DID".into());
-
-    let mediator_idx = Select::new()
-        .with_prompt("DIDComm mediator")
-        .items(&mediator_options)
-        .default(if vta_mediator.is_some() { 1 } else { 0 })
-        .interact()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
-        None
-    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
-        vta_mediator.clone()
-    } else {
-        let did: String = Input::new()
-            .with_prompt("Mediator DID")
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-        if did.is_empty() { None } else { Some(did) }
-    };
-
-    // 6. Create control DID via VTA
-    eprintln!();
-    eprintln!("  Creating control plane DID via VTA...");
-
-    let did_result = vta_setup::create_did(
-        &client,
-        &conn_info.context_id,
-        &did_hosting_url,
-        &did_path,
-        Some("webvh-control"),
-        mediator_did.as_deref(),
-    )
-    .await
-    .map_err(|e| AppError::Config(format!("failed to create DID: {e}")))?;
-
-    eprintln!("  Control DID created: {}", did_result.did);
-    eprintln!("  SCID: {}", did_result.scid);
-
-    // 6. Write log entry to file
-    if let Some(ref log_entry) = did_result.log_entry {
+    // 5. Persist DID log entry (if the template emitted one) so the
+    //    operator can publish it on the webvh hosting server.
+    if let Some(ref log_entry) = outcome.did_log_entry {
         let log_file = PathBuf::from("control-did.jsonl");
         let default_log_path = log_file.display().to_string();
         let log_path: String = Input::new()
@@ -139,7 +110,6 @@ pub async fn run_setup() -> Result<(), AppError> {
         vta_setup::write_log_entry_file(log_entry, &PathBuf::from(&log_path))?;
         eprintln!("  DID log entry written to {log_path}");
 
-        // Dump raw log entry
         eprintln!();
         eprintln!("  DID Log Entry:");
         eprintln!("  ---");
@@ -220,10 +190,10 @@ pub async fn run_setup() -> Result<(), AppError> {
 
     // 13. Store secrets
     let server_secrets = ServerSecrets {
-        signing_key: did_result.signing_key,
-        key_agreement_key: did_result.key_agreement_key,
+        signing_key: outcome.integration_signing_key_mb.clone(),
+        key_agreement_key: outcome.integration_ka_key_mb.clone(),
         jwt_signing_key,
-        vta_credential: Some(credential_b64.trim().to_string()),
+        vta_credential: Some(outcome.vta_credential_b64.clone()),
     };
 
     // 14. Build and write config
@@ -233,7 +203,7 @@ pub async fn run_setup() -> Result<(), AppError> {
             rest_api: true,
             ..Default::default()
         },
-        server_did: Some(did_result.did.clone()),
+        server_did: Some(outcome.integration_did.clone()),
         mediator_did,
         public_url,
         did_hosting_url: Some(did_hosting_url),
@@ -249,9 +219,9 @@ pub async fn run_setup() -> Result<(), AppError> {
         auth: AuthConfig::default(),
         secrets: secrets_config,
         vta: VtaConfig {
-            url: Some(conn_info.vta_url),
-            did: Some(conn_info.vta_did),
-            context_id: Some(conn_info.context_id),
+            url: outcome.vta_url.clone(),
+            did: Some(outcome.vta_did.clone()),
+            context_id: None,
         },
         registry: RegistryConfig::default(),
         config_path: output_path.clone(),
@@ -328,7 +298,8 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
     eprintln!("  Setup complete!");
     eprintln!();
-    eprintln!("  Control DID: {}", did_result.did);
+    eprintln!("  Control DID: {}", outcome.integration_did);
+    eprintln!("  Admin DID:   {}", outcome.admin_did);
     eprintln!();
     eprintln!("  Next steps:");
     eprintln!("    1. Set up webvh-server (if not already done)");
@@ -342,6 +313,110 @@ pub async fn run_setup() -> Result<(), AppError> {
     eprintln!();
 
     Ok(())
+}
+
+/// Run the online VTA provision-integration round-trip:
+/// prompt for VTA DID + context, resolve the VTA's mediator (since the
+/// `webvh-service` template requires `MEDIATOR_DID`), let the operator
+/// confirm or override it, mint an ephemeral did:key, print the
+/// operator's `pnm contexts create` command, wait for confirmation,
+/// then drive `vta_sdk::provision_client::run_provision`.
+///
+/// Returns the chosen mediator DID alongside the provision outcome —
+/// the caller persists it as `config.mediator_did` so the runtime
+/// DIDComm path uses the same mediator the DID document embeds.
+async fn run_online_provision(
+    messages: Arc<dyn OperatorMessages>,
+    preloaded_setup_key: Option<EphemeralSetupKey>,
+) -> Result<(Option<String>, vta_setup::OnlineProvisionOutcome), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  Authenticating to the VTA.");
+    eprintln!();
+    let vta_did: String = Input::new()
+        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
+        .interact_text()?;
+    let context_id: String = Input::new()
+        .with_prompt("Context ID")
+        .default("webvh".to_string())
+        .interact_text()?;
+
+    // The webvh-service template needs a MEDIATOR_DID up-front (it
+    // embeds a DIDComm service endpoint pointing at the mediator).
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes encrypted messages to the control plane.");
+    eprintln!("  The mediator DID is embedded in the control plane's DID document");
+    eprintln!("  and reused at runtime for outbound DIDComm.");
+    eprintln!();
+    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let mut mediator_options: Vec<String> = Vec::new();
+    if let Some(ref did) = vta_mediator {
+        mediator_options.push(format!("Use VTA's mediator ({did})"));
+    }
+    mediator_options.push("Enter a custom mediator DID".into());
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(0)
+        .interact()?;
+    let mediator_did: String = if mediator_options[mediator_idx].starts_with("Use VTA") {
+        vta_mediator
+            .clone()
+            .expect("Use VTA option only present when discovered")
+    } else {
+        Input::new().with_prompt("Mediator DID").interact_text()?
+    };
+
+    let setup_key = match preloaded_setup_key {
+        Some(key) => {
+            eprintln!();
+            eprintln!("  Using pre-loaded setup DID: {}", key.did);
+            key
+        }
+        None => {
+            let key = EphemeralSetupKey::generate()?;
+            eprintln!();
+            eprintln!("  Ephemeral setup DID: {}", key.did);
+            eprintln!();
+            eprintln!("  Run this on a workstation with PNM authenticated to the VTA");
+            eprintln!("  to create the context and grant the setup DID admin access:");
+            eprintln!();
+            eprintln!(
+                "    {}",
+                messages.pnm_admin_command_hint(&context_id, &key.did)
+            );
+            eprintln!();
+            eprintln!("  --admin-expires defaults to 1h. The entry is promoted to");
+            eprintln!("  permanent on first auth — this wizard does that for you.");
+            eprintln!();
+
+            let proceed = Confirm::new()
+                .with_prompt("Has the context been created?")
+                .default(true)
+                .interact()?;
+            if !proceed {
+                return Err("setup cancelled before VTA round-trip".into());
+            }
+            key
+        }
+    };
+
+    let ask = ProvisionAsk::webvh_service(&context_id, &mediator_did)
+        .with_label(format!("webvh-control setup — {context_id}"));
+
+    eprintln!();
+    eprintln!("  Provisioning control plane DID via VTA...");
+    eprintln!();
+
+    let outcome = vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
+        vta_did,
+        context_id,
+        ask,
+        messages,
+        setup_key,
+    })
+    .await?;
+
+    Ok((Some(mediator_did), outcome))
 }
 
 /// Prompt for secrets backend selection and configuration.

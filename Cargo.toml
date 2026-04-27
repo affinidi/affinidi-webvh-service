@@ -117,6 +117,7 @@ didwebvh-rs = "0.4"
 vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = [
   "session",
   "provision-integration",
+  "provision-client",
 ] }
 
 # Logging / tracing
