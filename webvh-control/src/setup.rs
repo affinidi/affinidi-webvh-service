@@ -51,6 +51,20 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     eprintln!("  -----------------------------------");
     eprintln!();
 
+    if preloaded_setup_key_file.is_none() {
+        match prompt_vta_mode()? {
+            VtaMode::Online => {}
+            VtaMode::OfflineStart => {
+                let (request, seed, state) = prompt_offline_prepare_paths()?;
+                return run_setup_offline_prepare(request, seed, state).await;
+            }
+            VtaMode::OfflineComplete => {
+                let (bundle, digest, state) = prompt_offline_complete_inputs()?;
+                return run_setup_offline_complete(bundle, digest, state).await;
+            }
+        }
+    }
+
     // 1. Output path
     eprintln!("  The configuration file stores all settings for the control plane.");
     eprintln!("  You can edit it later or re-run setup to regenerate it.");
@@ -313,6 +327,72 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     eprintln!();
 
     Ok(())
+}
+
+/// Choice of VTA reachability for the unified `setup` wizard.
+enum VtaMode {
+    Online,
+    OfflineStart,
+    OfflineComplete,
+}
+
+fn prompt_vta_mode() -> Result<VtaMode, AppError> {
+    let items = [
+        "Online — VTA reachable from this host",
+        "Offline — start a new sealed-bundle bootstrap (phase 1)",
+        "Offline — complete a pending sealed-bundle bootstrap (phase 2)",
+    ];
+    let idx = Select::new()
+        .with_prompt("How will the control plane reach its VTA?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    Ok(match idx {
+        0 => VtaMode::Online,
+        1 => VtaMode::OfflineStart,
+        _ => VtaMode::OfflineComplete,
+    })
+}
+
+fn prompt_offline_prepare_paths() -> Result<(PathBuf, PathBuf, PathBuf), AppError> {
+    let request: String = Input::new()
+        .with_prompt("Bootstrap request file path")
+        .default("bootstrap-request.json".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let seed: String = Input::new()
+        .with_prompt("Ephemeral seed file path (chmod 0600 on Unix)")
+        .default("bootstrap-seed.bin".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let state: String = Input::new()
+        .with_prompt("Pending state file path")
+        .default("setup-offline-state.toml".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    Ok((
+        PathBuf::from(request),
+        PathBuf::from(seed),
+        PathBuf::from(state),
+    ))
+}
+
+fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), AppError> {
+    let bundle: String = Input::new()
+        .with_prompt("ASCII-armored sealed bundle path")
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let digest: String = Input::new()
+        .with_prompt("Expected SHA-256 digest (lowercase hex)")
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let state: String = Input::new()
+        .with_prompt("Pending state file path (from phase 1)")
+        .default("setup-offline-state.toml".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    Ok((PathBuf::from(bundle), digest, PathBuf::from(state)))
 }
 
 /// Run the online VTA provision-integration round-trip:
