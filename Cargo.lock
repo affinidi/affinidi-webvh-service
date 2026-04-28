@@ -203,7 +203,7 @@ dependencies = [
  "did-pkh",
  "did-resolver-cheqd",
  "did-scid",
- "didwebvh-rs 0.5.0",
+ "didwebvh-rs",
  "highway",
  "moka",
  "rand 0.10.1",
@@ -481,7 +481,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dialoguer",
- "didwebvh-rs 0.4.2",
+ "didwebvh-rs",
  "ed25519-dalek",
  "firestore",
  "fjall",
@@ -623,7 +623,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dialoguer",
- "didwebvh-rs 0.4.2",
+ "didwebvh-rs",
  "ed25519-dalek",
  "firestore",
  "fjall",
@@ -690,7 +690,7 @@ dependencies = [
  "chrono",
  "clap",
  "dialoguer",
- "didwebvh-rs 0.4.2",
+ "didwebvh-rs",
  "ed25519-dalek",
  "hex",
  "jsonwebtoken",
@@ -2676,37 +2676,12 @@ checksum = "6f1dfba444d56016a7ba77a9f37cde55ac54f066df1aea8280fc9418695141bf"
 dependencies = [
  "affinidi-did-common",
  "did-resolver-cheqd",
- "didwebvh-rs 0.5.0",
+ "didwebvh-rs",
  "regex",
  "serde_json",
  "ssi-dids-core",
  "thiserror 2.0.18",
  "tracing",
-]
-
-[[package]]
-name = "didwebvh-rs"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b011271f55dcddd0e815d3a1d961f70dea72820918db9ace323196be618d1f2"
-dependencies = [
- "affinidi-data-integrity 0.5.4",
- "affinidi-secrets-resolver",
- "ahash 0.8.12",
- "async-trait",
- "base58",
- "chrono",
- "getrandom 0.4.2",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "serde_json_canonicalizer",
- "serde_with",
- "sha2 0.11.0",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
