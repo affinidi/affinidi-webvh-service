@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use affinidi_webvh_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig, VtaConfig,
+    AuthConfig, FeaturesConfig, IdentityConfig, LogConfig, LogFormat, ServerConfig, StoreConfig,
+    VtaConfig,
 };
 use affinidi_webvh_common::server::operator_messages::WebvhDaemonMessages;
 use affinidi_webvh_common::server::secret_store::{ServerSecrets, create_secret_store};
@@ -233,6 +234,7 @@ pub async fn run_wizard(
         watcher_sync: affinidi_webvh_watcher::config::SyncConfig::default(),
         registry: affinidi_webvh_control::config::RegistryConfig::default(),
         features,
+        identity: IdentityConfig::default(),
         enable,
         config_path: output_path.clone(),
     };
@@ -682,6 +684,7 @@ pub async fn run_setup_offline_complete(
         watcher_sync: affinidi_webvh_watcher::config::SyncConfig::default(),
         registry: affinidi_webvh_control::config::RegistryConfig::default(),
         features: state.features.clone(),
+        identity: IdentityConfig::default(),
         enable: state.enable.clone(),
         config_path: state.config_output.clone(),
     };

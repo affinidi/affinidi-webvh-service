@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use affinidi_webvh_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, SecretsConfig,
+    ServerConfig, StoreConfig,
 };
 use affinidi_webvh_common::server::error::AppError;
 
@@ -52,6 +53,10 @@ pub struct DaemonConfig {
     /// Feature flags (didcomm, rest_api).
     #[serde(default)]
     pub features: FeaturesConfig,
+
+    /// How the daemon obtains its own identity (VTA-provisioned or self-managed).
+    #[serde(default)]
+    pub identity: IdentityConfig,
 
     /// Which services to enable
     #[serde(default)]
@@ -141,6 +146,18 @@ impl DaemonConfig {
         env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
         env_opt!("DAEMON_PUBLIC_URL", config.public_url);
         env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
+
+        if let Ok(v) = std::env::var("WEBVH_IDENTITY_MODE") {
+            config.identity.mode = match v.to_ascii_lowercase().as_str() {
+                "vta" => IdentityMode::Vta,
+                "self-managed" | "selfmanaged" => IdentityMode::SelfManaged,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid WEBVH_IDENTITY_MODE '{other}' (expected 'vta' or 'self-managed')"
+                    )));
+                }
+            };
+        }
 
         if let Ok(v) = std::env::var("DAEMON_SERVER_HOST") {
             config.server.host = v;

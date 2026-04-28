@@ -231,6 +231,28 @@ pub struct VtaConfig {
     pub context_id: Option<String>,
 }
 
+/// How the service obtains its own operating identity (signing key, KA key, DID).
+///
+/// `Vta` (the default) means a parent VTA provisions and rotates the service's
+/// own keys at setup time. `SelfManaged` means the service generates its own
+/// keys and self-hosts a `did:webvh` identifier with no parent VTA — a
+/// daemon-only mode in v1. See `docs/self-managed-mode-spec.md`.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdentityMode {
+    #[default]
+    Vta,
+    SelfManaged,
+}
+
+/// Identity configuration — selects how the service's own keys and DID are
+/// produced.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IdentityConfig {
+    #[serde(default)]
+    pub mode: IdentityMode,
+}
+
 /// Plaintext secret key material stored directly in the configuration file.
 ///
 /// **WARNING**: This is insecure and should only be used for testing/development.
@@ -430,5 +452,77 @@ pub fn init_tracing(log: &LogConfig) {
     match log.format {
         LogFormat::Json => subscriber.json().init(),
         LogFormat::Text => subscriber.init(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_mode_default_is_vta() {
+        assert_eq!(IdentityMode::default(), IdentityMode::Vta);
+        assert_eq!(IdentityConfig::default().mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_mode_serializes_kebab_case() {
+        let toml_str = toml::to_string(&IdentityConfig {
+            mode: IdentityMode::SelfManaged,
+        })
+        .unwrap();
+        assert!(
+            toml_str.contains(r#"mode = "self-managed""#),
+            "expected kebab-case `self-managed`, got: {toml_str}"
+        );
+
+        let toml_str = toml::to_string(&IdentityConfig {
+            mode: IdentityMode::Vta,
+        })
+        .unwrap();
+        assert!(
+            toml_str.contains(r#"mode = "vta""#),
+            "expected `vta`, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn identity_config_deserializes_self_managed() {
+        let cfg: IdentityConfig = toml::from_str(r#"mode = "self-managed""#).unwrap();
+        assert_eq!(cfg.mode, IdentityMode::SelfManaged);
+    }
+
+    #[test]
+    fn identity_config_deserializes_vta() {
+        let cfg: IdentityConfig = toml::from_str(r#"mode = "vta""#).unwrap();
+        assert_eq!(cfg.mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_config_round_trips() {
+        let original = IdentityConfig {
+            mode: IdentityMode::SelfManaged,
+        };
+        let serialized = toml::to_string(&original).unwrap();
+        let deserialized: IdentityConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn identity_config_missing_mode_defaults_to_vta() {
+        // An empty `[identity]` table (no `mode = ...`) should default to Vta
+        // — this is the back-compat path for existing VTA-mode configs that
+        // grow an `[identity]` section but don't yet set `mode`.
+        let cfg: IdentityConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_config_unknown_mode_rejected() {
+        let result: Result<IdentityConfig, _> = toml::from_str(r#"mode = "bogus""#);
+        assert!(
+            result.is_err(),
+            "expected unknown mode to be rejected, got: {result:?}"
+        );
     }
 }
