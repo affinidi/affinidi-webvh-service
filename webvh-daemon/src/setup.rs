@@ -10,9 +10,11 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use affinidi_webvh_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use affinidi_webvh_common::server::config::{
-    AuthConfig, FeaturesConfig, IdentityConfig, LogConfig, LogFormat, ServerConfig, StoreConfig,
-    VtaConfig,
+    AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
+    StoreConfig, VtaConfig,
 };
 use affinidi_webvh_common::server::operator_messages::WebvhDaemonMessages;
 use affinidi_webvh_common::server::secret_store::{ServerSecrets, create_secret_store};
@@ -72,6 +74,9 @@ pub async fn run_wizard(
             VtaMode::OfflineComplete => {
                 let (bundle, digest, state) = prompt_offline_complete_inputs()?;
                 return run_setup_offline_complete(bundle, digest, state).await;
+            }
+            VtaMode::SelfManaged => {
+                return run_self_managed_setup(config_path).await;
             }
         }
     }
@@ -268,7 +273,12 @@ pub async fn run_wizard(
     Ok(())
 }
 
-/// Choice of VTA reachability for the unified `setup` wizard.
+/// Top-level identity-source choice for the `setup` wizard.
+///
+/// The first three variants drive a VTA-provisioned identity. `SelfManaged`
+/// skips the VTA entirely — the daemon generates its own keys and self-hosts
+/// its `did:webvh` identifier. Daemon-only in v1; see
+/// `docs/self-managed-mode-spec.md`.
 enum VtaMode {
     /// VTA reachable from this host — provision online via the SDK.
     Online,
@@ -278,6 +288,8 @@ enum VtaMode {
     /// Operator already has a sealed response back from the VTA admin
     /// — open it and finish setup (phase 2 of 2).
     OfflineComplete,
+    /// No parent VTA — the daemon generates its own keys and DID.
+    SelfManaged,
 }
 
 /// Top-level mode prompt — drives the dispatch in `run_wizard`.
@@ -286,16 +298,18 @@ fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
         "Online — VTA reachable from this host",
         "Offline — start a new sealed-bundle bootstrap (phase 1)",
         "Offline — complete a pending sealed-bundle bootstrap (phase 2)",
+        "Self-managed (no VTA — daemon manages its own DID)",
     ];
     let idx = Select::new()
-        .with_prompt("How will the daemon reach its VTA?")
+        .with_prompt("How will the daemon obtain its identity?")
         .items(&items)
         .default(0)
         .interact()?;
     Ok(match idx {
         0 => VtaMode::Online,
         1 => VtaMode::OfflineStart,
-        _ => VtaMode::OfflineComplete,
+        2 => VtaMode::OfflineComplete,
+        _ => VtaMode::SelfManaged,
     })
 }
 
@@ -402,6 +416,264 @@ async fn run_online_provision(
         setup_key,
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Self-managed setup (no VTA)
+//
+// The daemon generates its own Ed25519 + X25519 keys, builds a self-hosted
+// `did:webvh` document, and persists everything via the same
+// `finalize_daemon_setup` helper the VTA flows use. The wizard does not seed
+// any admin into the ACL — admin enrolment happens post-start via
+// `webvh-daemon invite --did <ADMIN_DID> --role admin` + passkey redemption.
+// See docs/self-managed-mode-spec.md.
+// ---------------------------------------------------------------------------
+
+async fn run_self_managed_setup(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  Self-managed mode: the daemon generates its own keys and");
+    eprintln!("  self-hosts a did:webvh identifier. No parent VTA is involved");
+    eprintln!("  in the daemon's own identity. External tenant VTAs may still");
+    eprintln!("  provision DIDs into this daemon over DIDComm at runtime.");
+    eprintln!();
+    eprintln!("  Daemon-only mode. Cannot be migrated to VTA-managed later.");
+    eprintln!();
+
+    // 0. Output config path (overwrite confirm).
+    let default_path = config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let output_path: String = Input::new()
+        .with_prompt("Configuration file path")
+        .default(default_path)
+        .interact_text()?;
+    let output_path = PathBuf::from(&output_path);
+
+    if output_path.exists() {
+        let overwrite = Confirm::new()
+            .with_prompt(format!(
+                "{} already exists. Overwrite?",
+                output_path.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !overwrite {
+            eprintln!("Setup cancelled.");
+            return Ok(());
+        }
+    }
+
+    // 1. Enabled services + features.
+    let (enable, features) = prompt_enable_and_features()?;
+
+    // 2. Public URL (drives the did:webvh identifier).
+    eprintln!();
+    eprintln!("  The public URL is where the daemon is reachable. The daemon");
+    eprintln!("  hosts its own DID document under this URL; the DID path is");
+    eprintln!("  derived from the URL's path component (`.well-known` when");
+    eprintln!("  there is no path).");
+    eprintln!();
+    let public_url: String = Input::new()
+        .with_prompt("Public URL (e.g. https://webvh.example.com)")
+        .interact_text()?;
+    let public_url = public_url.trim_end_matches('/').to_string();
+    warn_if_insecure_public_url(&public_url);
+    let did_path = derive_did_path(&public_url);
+
+    // 3. Mediator (optional — only relevant if you want inbound DIDComm).
+    eprintln!();
+    eprintln!("  DIDComm mediator (optional — required for inbound DIDComm");
+    eprintln!("  from external VTAs that want to provision tenant DIDs).");
+    eprintln!();
+    let mediator_input: String = Input::new()
+        .with_prompt("Mediator DID (leave blank for none)")
+        .allow_empty(true)
+        .default(String::new())
+        .interact_text()?;
+    let mediator_did = if mediator_input.trim().is_empty() {
+        None
+    } else {
+        Some(mediator_input.trim().to_string())
+    };
+
+    // 4. Host / port / log / data dir.
+    let host: String = Input::new()
+        .with_prompt("Listen host")
+        .default("0.0.0.0".to_string())
+        .interact_text()?;
+    let port: u16 = Input::new()
+        .with_prompt("Listen port")
+        .default(8534u16)
+        .interact_text()?;
+
+    let log_levels = ["info", "debug", "warn", "error", "trace"];
+    let log_level_idx = Select::new()
+        .with_prompt("Log level")
+        .items(log_levels)
+        .default(0)
+        .interact()?;
+    let log_level = log_levels[log_level_idx].to_string();
+    let format_options = &["text", "json"];
+    let format_idx = Select::new()
+        .with_prompt("Log format")
+        .items(format_options)
+        .default(0)
+        .interact()?;
+    let log_format = match format_idx {
+        1 => LogFormat::Json,
+        _ => LogFormat::Text,
+    };
+
+    let data_dir: String = Input::new()
+        .with_prompt("Data directory root")
+        .default("data/daemon".to_string())
+        .interact_text()?;
+    let store_path = PathBuf::from(&data_dir).join("store");
+    let witness_store_path = PathBuf::from(&data_dir).join("witness");
+
+    // 5. Secrets backend.
+    let secrets_config =
+        affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+            "webvh-daemon-secrets",
+            "webvh",
+        )
+        .await?;
+
+    // 6. Generate keys locally.
+    let signing = Secret::generate_ed25519(None, None);
+    let ka = Secret::generate_x25519(None, None)?;
+    let signing_pub_mb = signing.get_public_keymultibase()?;
+    let ka_pub_mb = ka.get_public_keymultibase()?;
+    let signing_priv_mb = signing.get_private_keymultibase()?;
+    let ka_priv_mb = ka.get_private_keymultibase()?;
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!();
+    eprintln!("  Generated Ed25519 signing key, X25519 key-agreement key, and JWT signing key.");
+
+    // 7. Build the daemon's own DID document + signed log entry.
+    let host_encoded = affinidi_webvh_common::did::encode_host(&public_url)
+        .map_err(|e| format!("failed to encode host from public URL: {e}"))?;
+    let doc = build_did_document(
+        &host_encoded,
+        &did_path,
+        &signing_pub_mb,
+        &DidDocumentOptions {
+            key_agreement_multibase: Some(&ka_pub_mb),
+            mediator_endpoint: mediator_did.as_deref(),
+        },
+    );
+    let (_scid, jsonl) = create_log_entry(&doc, &signing)
+        .await
+        .map_err(|e| format!("failed to create DID log entry: {e}"))?;
+
+    // 8. Build DaemonConfig with self-managed identity + empty VTA.
+    let config = DaemonConfig {
+        server: ServerConfig {
+            host: host.clone(),
+            port,
+        },
+        log: LogConfig {
+            level: log_level,
+            format: log_format,
+        },
+        auth: AuthConfig::default(),
+        secrets: secrets_config,
+        // server_did is populated by finalize_daemon_setup after import.
+        server_did: None,
+        mediator_did: mediator_did.clone(),
+        public_url: Some(public_url.clone()),
+        did_hosting_url: Some(public_url.clone()),
+        store: StoreConfig {
+            data_dir: store_path,
+            ..StoreConfig::default()
+        },
+        witness_store: StoreConfig {
+            data_dir: witness_store_path,
+            ..StoreConfig::default()
+        },
+        limits: affinidi_webvh_server::config::LimitsConfig::default(),
+        watchers: Vec::new(),
+        vta: VtaConfig::default(),
+        watcher_sync: affinidi_webvh_watcher::config::SyncConfig::default(),
+        registry: affinidi_webvh_control::config::RegistryConfig::default(),
+        features,
+        identity: IdentityConfig {
+            mode: IdentityMode::SelfManaged,
+        },
+        enable,
+        config_path: output_path.clone(),
+    };
+
+    // 9. Persist via the shared finalize helper. AdminChoice::Skip leaves
+    //    the ACL empty — admin enrolment is the operator's first action via
+    //    `webvh-daemon invite` after the daemon is running.
+    finalize_daemon_setup(
+        &config,
+        &output_path,
+        ServerSecrets {
+            signing_key: signing_priv_mb,
+            key_agreement_key: ka_priv_mb,
+            jwt_signing_key,
+            vta_credential: None,
+        },
+        Some(&jsonl),
+        &did_path,
+        AdminChoice::Skip,
+    )
+    .await?;
+
+    eprintln!();
+    eprintln!("  Setup complete!");
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!();
+    eprintln!("    1. Start the daemon:");
+    eprintln!("         webvh-daemon --config {}", output_path.display());
+    eprintln!();
+    eprintln!("    2. Mint your first admin enrolment invite (replace");
+    eprintln!("       <ADMIN_DID> with the DID the admin will authenticate as):");
+    eprintln!(
+        "         webvh-daemon invite --did <ADMIN_DID> --role admin \\\n           --config {}",
+        output_path.display()
+    );
+    eprintln!();
+    eprintln!("    3. Open the printed enrolment URL in a browser to bind a");
+    eprintln!("       passkey to that DID. Subsequent admin login uses the");
+    eprintln!("       passkey.");
+    eprintln!();
+
+    Ok(())
+}
+
+/// Emit a stderr warning when the operator-supplied public URL is plaintext
+/// HTTP or points at localhost/loopback. Self-managed mode is permissive —
+/// the wizard accepts these for dev workflows — but the warning makes it
+/// hard to ship one of these into production by accident.
+fn warn_if_insecure_public_url(url: &str) {
+    let lower = url.to_ascii_lowercase();
+    let is_http = lower.starts_with("http://");
+    let is_loopback = lower.contains("://localhost")
+        || lower.contains("://127.0.0.1")
+        || lower.contains("://[::1]");
+
+    if is_http || is_loopback {
+        eprintln!();
+        eprintln!("  ┌─ WARNING ──────────────────────────────────────────────");
+        if is_http {
+            eprintln!("  │ Public URL uses plaintext http://. DIDComm and DID");
+            eprintln!("  │ resolution from peers will be unauthenticated in");
+            eprintln!("  │ transit — only acceptable for development.");
+        }
+        if is_loopback {
+            eprintln!("  │ Public URL points at localhost / loopback. The DID");
+            eprintln!("  │ document will only resolve from this machine.");
+        }
+        eprintln!("  └────────────────────────────────────────────────────────");
+        eprintln!();
+    }
 }
 
 // ---------------------------------------------------------------------------

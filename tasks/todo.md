@@ -11,10 +11,10 @@ Plan: [`tasks/plan.md`](plan.md)
 > **Checkpoint**: types compile, defaults preserve back-compat. Review.
 
 ## Phase 2 — Wizard
-- [ ] **T2** Add `VtaMode::SelfManaged` variant + `run_self_managed_setup` branch + insecure-URL warning helper
-  - Files: `webvh-daemon/src/setup.rs`, `webvh-common/src/server/config.rs` (warning helper)
-  - Reuses: `bootstrap_did` / `create_log_entry` / `finalize_daemon_setup` / `derive_did_path`
-  - Verify: scripted `webvh-daemon setup` produces valid self-managed config; "Next steps" output references `webvh-daemon invite --did`
+- [x] **T2** Add `VtaMode::SelfManaged` variant + `run_self_managed_setup` branch + insecure-URL warning helper
+  - Files: `webvh-daemon/src/setup.rs` (warning helper inlined as private fn there — kept off webvh-common until a second caller exists)
+  - Reuses: `build_did_document` / `create_log_entry` / `encode_host` / `finalize_daemon_setup` / `derive_did_path`
+  - Verify: `cargo build -p affinidi-webvh-daemon` clean; manual wizard run pending (interactive)
 
 > **Checkpoint**: a self-managed `config.toml` is producible by the wizard. Review wizard UX before runtime work.
 
