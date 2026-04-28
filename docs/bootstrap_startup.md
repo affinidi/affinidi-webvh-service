@@ -203,6 +203,92 @@ webvh-daemon --config daemon-config.toml
 
 In daemon mode, inter-service communication happens in-process without network calls.
 
+## Self-Managed Mode (no VTA — daemon only)
+
+For deployments that don't have a parent VTA bootstrapping the daemon's own identity — internal-only deployments, dev/test environments, or operators who want to be their own trust root — the daemon can self-manage its keys and DID.
+
+### What "self-managed" means
+
+| | VTA mode (default) | Self-managed mode |
+|---|---|---|
+| Daemon's signing + KA keys | Provisioned by parent VTA at setup | Generated locally at setup |
+| Daemon's own DID | Minted by parent VTA | Locally-built `did:webvh`, hosted by the daemon at its own well-known URL |
+| `vta_credential` in secrets | Set, used for re-auth | Permanently `None` |
+| `[vta]` config table | Required (`url`, `did`, `context_id`) | Empty / omitted |
+| Tenant DID provisioning | External tenant VTAs DIDComm in to provision tenant DIDs | **Identical** — external tenant VTAs can still DIDComm in. Self-managed only changes how the daemon obtains *its own* identity, not how it serves tenants. |
+
+**Daemon-only.** `webvh-server`, `webvh-control`, `webvh-witness` standalone binaries reject the self-managed setup choice with a clear error in v1. If you want a no-VTA deployment, run `webvh-daemon`.
+
+**No migration path.** A self-managed daemon cannot be migrated onto a VTA later; the mode is permanent at setup time. (If you need to switch, start a fresh deployment.)
+
+### Setup walkthrough
+
+```bash
+webvh-daemon setup
+```
+
+When the wizard asks _"How will the daemon obtain its identity?"_, choose:
+
+```
+> Self-managed (no VTA — daemon manages its own DID)
+```
+
+The wizard then prompts for the same daemon settings as VTA mode (public URL, mediator, host/port, log, data dir, secrets backend) but skips every VTA-specific prompt (no VTA DID, no context ID, no PNM `contexts create` step). Keys are generated locally; the daemon's `did:webvh` is built and imported into the local store; the config is written with `[identity] mode = "self-managed"` and an empty `[vta]` table.
+
+A loud warning fires if the public URL is `http://` or points at `localhost` / `127.0.0.1` / `::1`. The wizard accepts these (useful for dev) but the warning makes it hard to ship one of these into production by accident.
+
+### After setup: enrolling an admin
+
+The wizard does **not** seed an admin DID into the ACL. Self-managed mode uses passkey-invite-only admin authentication:
+
+```bash
+# 1. Start the daemon
+webvh-daemon --config config.toml
+
+# 2. In another terminal, mint your first admin enrolment URL.
+#    <ADMIN_DID> is the DID the admin will authenticate as
+#    (typically a did:key from a wallet you control).
+webvh-daemon invite --did <ADMIN_DID> --role admin --config config.toml
+
+# 3. Open the printed enrolment URL in a browser and bind a passkey.
+#    Subsequent admin login uses the passkey.
+```
+
+The `invite` subcommand is the single source of truth for admin onboarding — re-run it any time the operator needs another admin. Lost the URL before redeeming? Just run `webvh-daemon invite` again to mint a new one.
+
+### Config shape
+
+A self-managed `config.toml` looks like:
+
+```toml
+public_url = "https://daemon.example.com"
+did_hosting_url = "https://daemon.example.com"
+server_did = "did:webvh:<scid>:daemon.example.com"
+# mediator_did = "did:webvh:..."  # optional — for inbound DIDComm
+
+[identity]
+mode = "self-managed"
+
+[vta]
+# empty — no parent VTA
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[enable]
+server = true
+control = true
+witness = true
+watcher = false
+
+# ... [auth], [log], [store], [witness_store], [secrets], [features], etc.
+```
+
+Existing VTA-mode configs without an `[identity]` block continue to load unchanged — the loader defaults `identity.mode = "vta"` for back-compat.
+
+See `docs/self-managed-mode-spec.md` for the full design spec, `tasks/runtime-audit-T3.md` for the runtime VTA-dependency audit, and `tasks/plan.md` for the implementation breakdown.
+
 ## Cold-Start Bootstrap (No Running Services)
 
 Bootstraps a complete environment from scratch — no DID resolution, no DIDComm, no running services. All DIDs are created offline on the VTA and loaded manually.

@@ -67,6 +67,11 @@ cargo build -p affinidi-webvh-daemon --release
 ./target/release/webvh-daemon
 ```
 
+The daemon supports two identity modes at setup time:
+
+- **VTA-managed** (default) — a parent VTA provisions the daemon's keys and DID. Requires VTA credentials.
+- **Self-managed** — the daemon generates its own keys and self-hosts a `did:webvh` identifier. No VTA required. Daemon-only. See [docs/bootstrap_startup.md](docs/bootstrap_startup.md#self-managed-mode-no-vta--daemon-only).
+
 See [webvh-daemon/README.md](webvh-daemon/) for configuration details.
 
 ### Option 2: Standalone services

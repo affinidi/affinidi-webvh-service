@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Added
+- **webvh-daemon**: Self-managed identity mode. The setup wizard now
+  offers a fourth choice ("Self-managed — no VTA — daemon manages its
+  own DID") that skips every VTA prompt and instead generates the
+  daemon's Ed25519 + X25519 keys locally and self-hosts a `did:webvh`
+  identifier. Config gains an `[identity] mode = "vta" | "self-managed"`
+  field (default `"vta"` for back-compat — existing configs without
+  the section continue to load unchanged). Admin enrolment in
+  self-managed mode uses passkey-invite only via the existing
+  `webvh-daemon invite --did <DID> --role admin` CLI; the wizard does
+  not seed any admin DID into the ACL. Tenant DID provisioning over
+  DIDComm is unchanged — external tenant VTAs can still provision
+  DIDs into a self-managed daemon. Daemon-only in v1; standalone
+  `webvh-server` / `webvh-control` / `webvh-witness` setup wizards
+  reject the self-managed choice with a clear "daemon-only" error
+  pointing at `webvh-daemon`. See `docs/self-managed-mode-spec.md`.
+
+### Fixed
+- **Setup wizards**: the offline-bootstrap "Next steps" output printed
+  an incorrect VTA-host CLI hint
+  (`vta context provision --context X --admin Y`). The actual command
+  is `vta context create --id X` with no `--admin` flag. Updated all
+  five wizards (common, server, control, witness, daemon).
+
+### Changed
+- **vta-sdk integration**: adapted to upstream `ProvisionAsk` builder
+  renames — `webvh_hosting_server` → `webvh_daemon`, `webvh_service`
+  → `webvh_server` for witness-style consumers, and a new
+  `webvh_control(context, host_url, mediator_did)` builder for the
+  control plane (now requires `host_url` since the upstream template
+  embeds it as the `WebVHHosting` service endpoint). The control-plane
+  wizard now collects `did_hosting_url` before the VTA round-trip.
+
 ## 0.6.0 (2026-04-24)
 
 ### Added

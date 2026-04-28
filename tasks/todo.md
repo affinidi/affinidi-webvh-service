@@ -47,8 +47,9 @@ Plan: [`tasks/plan.md`](plan.md)
 > **Checkpoint**: all spec §1 success criteria verifiably met. Review test output.
 
 ## Phase 6 — Ship
-- [ ] **T7** Update `docs/bootstrap_startup.md` (new section), `README.md`, `CHANGELOG.md`
-  - Verify: clean-clone walkthrough produces a working self-managed daemon following only the docs
+- [x] **T7** Update `docs/bootstrap_startup.md` (new "Self-Managed Mode" section), `README.md` (Quick Start identity-mode note), `CHANGELOG.md` ([Unreleased] entry)
+  - Live walkthrough deferred to a manual smoke pass before merge
+  - Verify: cargo build clean (no doc-test breakage)
 
 ## Suggested PR shape
 1. T1
