@@ -27,9 +27,10 @@ Plan: [`tasks/plan.md`](plan.md)
 > **Checkpoint**: daemon starts and serves its own DID end-to-end. Review audit report.
 
 ## Phase 4 — Reject in non-daemon binaries
-- [ ] **T4** Add `SelfManaged` variant + rejection arm to `webvh-server`, `webvh-control`, `webvh-witness` setup wizards (and `webvh-watcher` if applicable)
+- [x] **T4** Add `SelfManaged` variant + rejection arm to `webvh-server`, `webvh-control`, `webvh-witness` setup wizards (`webvh-watcher` has no `VtaMode` enum — confirmed)
   - Files: `webvh-server/src/setup.rs`, `webvh-control/src/setup.rs`, `webvh-witness/src/setup.rs`
-  - Verify: each binary's wizard refuses SelfManaged with a consistent error message
+  - Each binary defines its own `SELF_MANAGED_DAEMON_ONLY` constant with identical text — kept inline since hoisting to common would require crossing the `Box<dyn Error>` vs `AppError` divide
+  - Verify: `cargo build --workspace` clean; `cargo test --workspace --lib` clean (113 tests)
 
 ## Phase 5 — Verification
 - [ ] **T5** End-to-end test: tenant DIDComm provisioning into a self-managed daemon

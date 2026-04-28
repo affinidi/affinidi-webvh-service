@@ -62,6 +62,9 @@ pub async fn run_wizard(
                 let (bundle, digest, state) = prompt_offline_complete_inputs()?;
                 return run_setup_offline_complete(bundle, digest, state).await;
             }
+            VtaMode::SelfManaged => {
+                return Err(SELF_MANAGED_DAEMON_ONLY.into());
+            }
         }
     }
 
@@ -330,13 +333,23 @@ enum VtaMode {
     Online,
     OfflineStart,
     OfflineComplete,
+    /// Selected only to produce a clear "daemon-only" error — webvh-witness
+    /// has no self-managed implementation in v1.
+    SelfManaged,
 }
+
+/// Error message when an operator picks self-managed mode in a non-daemon
+/// binary. Kept as a single constant so all three binaries (server,
+/// control, witness) print identical text.
+const SELF_MANAGED_DAEMON_ONLY: &str = "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
+     See docs/self-managed-mode-spec.md for the full rationale.";
 
 fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
     let items = [
         "Online — VTA reachable from this host",
         "Offline — start a new sealed-bundle bootstrap (phase 1)",
         "Offline — complete a pending sealed-bundle bootstrap (phase 2)",
+        "Self-managed (no VTA — daemon-only mode, will exit with error here)",
     ];
     let idx = Select::new()
         .with_prompt("How will the witness reach its VTA?")
@@ -346,7 +359,8 @@ fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
     Ok(match idx {
         0 => VtaMode::Online,
         1 => VtaMode::OfflineStart,
-        _ => VtaMode::OfflineComplete,
+        2 => VtaMode::OfflineComplete,
+        _ => VtaMode::SelfManaged,
     })
 }
 
