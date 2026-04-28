@@ -121,7 +121,7 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-witness")]
         label: String,
-        /// DIDComm mediator DID. Bound to the `webvh-service` template's
+        /// DIDComm mediator DID. Bound to the `webvh-server` template's
         /// `MEDIATOR_DID` variable so the rendered DID document advertises
         /// the right mediator endpoint.
         #[arg(long)]
@@ -331,7 +331,8 @@ async fn main() {
                 &seed,
                 &label,
                 "webvh-witness",
-                &mediator_did,
+                "webvh-server",
+                &[("MEDIATOR_DID", mediator_did.as_str())],
                 &context,
             )
             .await

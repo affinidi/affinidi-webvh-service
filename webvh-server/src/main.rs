@@ -258,11 +258,13 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-server")]
         label: String,
-        /// DIDComm mediator DID. Bound to the `webvh-service` template's
-        /// `MEDIATOR_DID` variable so the rendered DID document advertises
-        /// the right mediator endpoint.
+        /// Public URL where this server serves DIDs. Bound to the
+        /// `webvh-daemon` template's `URL` variable so the rendered DID
+        /// exposes a `WebVHHosting` service at this URL. Runtime DIDComm
+        /// (sync from the control plane) uses the daemon's separately
+        /// configured mediator and is not embedded in this DID document.
         #[arg(long)]
-        mediator_did: String,
+        public_url: String,
         /// VTA context the integration will live in. Embedded as
         /// `contextHint` in the request so the VTA admin can run
         /// `vta bootstrap provision-integration` without `--context`.
@@ -463,7 +465,7 @@ async fn main() {
             out,
             seed,
             label,
-            mediator_did,
+            public_url,
             context,
         }) => {
             if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
@@ -471,7 +473,8 @@ async fn main() {
                 &seed,
                 &label,
                 "webvh-server",
-                &mediator_did,
+                "webvh-daemon",
+                &[("URL", public_url.as_str())],
                 &context,
             )
             .await

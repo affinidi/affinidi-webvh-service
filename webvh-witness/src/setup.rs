@@ -109,7 +109,7 @@ pub async fn run_wizard(
 
     // 3. VTA online provision: prompt for VTA DID + context + mediator,
     //    mint ephemeral did:key, print PNM `contexts create` command,
-    //    drive run_provision with the `webvh-service` template.
+    //    drive run_provision with the `webvh-server` template.
     //    Headless phase 2 supplies a pre-loaded setup key.
     let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhWitnessMessages);
     let preloaded_setup_key = match preloaded_setup_key_file.as_deref() {
@@ -393,7 +393,7 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), Box<dy
 
 /// Run the online VTA provision-integration round-trip:
 /// prompt for VTA DID + context, resolve the VTA's mediator (since the
-/// `webvh-service` template requires `MEDIATOR_DID`), let the operator
+/// `webvh-server` template requires `MEDIATOR_DID`), let the operator
 /// confirm or override it, mint an ephemeral did:key, print the
 /// operator's `pnm contexts create` command, wait for confirmation,
 /// then drive `vta_sdk::provision_client::run_provision`.
@@ -416,7 +416,7 @@ async fn run_online_provision(
         .default("webvh".to_string())
         .interact_text()?;
 
-    // The webvh-service template needs a MEDIATOR_DID up-front (it
+    // The webvh-server template needs a MEDIATOR_DID up-front (it
     // embeds a DIDComm service endpoint pointing at the mediator).
     eprintln!();
     eprintln!("  A DIDComm mediator routes encrypted messages to the witness.");
@@ -703,13 +703,14 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // VP-framed bootstrap request — names the `webvh-service` template
-    // + binds `MEDIATOR_DID` so the VTA admin can run
+    // VP-framed bootstrap request — names the `webvh-server` template
+    // (DIDComm-only — witness coordination, no HTTP hosting) + binds
+    // `MEDIATOR_DID` so the VTA admin can run
     // `vta bootstrap provision-integration --request <file>` directly.
     let mediator_for_template = mediator_did.clone().unwrap_or_default();
     let info = vta_setup::write_offline_bootstrap_request(
         &request_out,
-        "webvh-service",
+        "webvh-server",
         &[("MEDIATOR_DID", &mediator_for_template)],
         &context_id,
         Some("webvh-witness"),
@@ -767,7 +768,7 @@ pub async fn run_setup_offline_prepare(
         "         vta contexts create --id {} \\\n           --admin-did {} --admin-expires 1h",
         context_id, info.client_did
     );
-    eprintln!("    3. Ask them to seal a webvh-service template response:");
+    eprintln!("    3. Ask them to seal the response:");
     eprintln!(
         "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );

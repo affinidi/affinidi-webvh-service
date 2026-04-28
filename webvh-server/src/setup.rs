@@ -630,15 +630,14 @@ pub async fn run_setup_offline_prepare(
 
     // Write the VP-framed bootstrap request via the shared primitive;
     // the seed is returned in memory and persisted via the configured
-    // secret store. The VP names the `webvh-service` template + binds
-    // `MEDIATOR_DID` so the VTA admin can run
-    // `vta bootstrap provision-integration --request <file>` without
-    // extra flags.
-    let mediator_for_template = mediator_did.clone().unwrap_or_default();
+    // secret store. The VP names the `webvh-daemon` template (HTTP-only
+    // hosting — runtime DIDComm uses `mediator_did` separately) and
+    // binds the `URL` template variable so the rendered DID exposes a
+    // `WebVHHosting` service at the server's public URL.
     let info = vta_setup::write_offline_bootstrap_request(
         &request_out,
-        "webvh-service",
-        &[("MEDIATOR_DID", &mediator_for_template)],
+        "webvh-daemon",
+        &[("URL", &public_url)],
         &context_id,
         Some("webvh-server"),
     )
@@ -692,7 +691,7 @@ pub async fn run_setup_offline_prepare(
         "         vta contexts create --id {} \\\n           --admin-did {} --admin-expires 1h",
         context_id, info.client_did
     );
-    eprintln!("    3. Ask them to seal a webvh-service template response:");
+    eprintln!("    3. Ask them to seal the response:");
     eprintln!(
         "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );

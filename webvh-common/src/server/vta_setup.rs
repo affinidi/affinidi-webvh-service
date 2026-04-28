@@ -293,7 +293,7 @@ async fn drain_provision_events_to_stderr(
 //         - extracts the VTA-rendered DID document, key material, and
 //           signed-DID log from the `TemplateBootstrapPayload`.
 //
-// The same template (`webvh-service`, `webvh-hosting-server`, etc.)
+// The same template (`webvh-daemon`, `webvh-control`, `webvh-server`)
 // drives both the online and offline paths, so the persisted DID shape
 // is identical to what `online_provision_setup` above produces.
 // ---------------------------------------------------------------------------
@@ -346,7 +346,8 @@ pub struct OfflineBootstrapResult {
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
 /// `template` and `vars` describe the target DID template (e.g.
-/// `webvh-service` + `MEDIATOR_DID`); `context_id` is embedded as the
+/// `webvh-server` + `MEDIATOR_DID`, or `webvh-control` + `URL` +
+/// `MEDIATOR_DID`); `context_id` is embedded as the
 /// VP's `contextHint` so the VTA admin can run `vta bootstrap
 /// provision-integration` without `--context`. The resulting
 /// **VP-framed** `BootstrapRequest` is what `vta bootstrap
@@ -505,10 +506,14 @@ pub enum OfflineOpenNextStep<'a> {
 }
 
 /// CLI-facing wrapper around [`write_offline_bootstrap_request`]. Writes
-/// a VP-framed bootstrap request targeting the `webvh-service` template
-/// with `MEDIATOR_DID` bound to `mediator_did`, persists the ephemeral
-/// seed to `seed_path` (chmod 0600 on Unix), and prints step-by-step
-/// operator instructions.
+/// a VP-framed bootstrap request targeting `template` with the supplied
+/// `vars` bindings, persists the ephemeral seed to `seed_path`
+/// (chmod 0600 on Unix), and prints step-by-step operator instructions.
+///
+/// Each binary picks its own template + vars:
+/// - `webvh-witness` → `"webvh-server"` + `[("MEDIATOR_DID", ...)]`
+/// - `webvh-server`  → `"webvh-daemon"` + `[("URL", ...)]`
+/// - `webvh-control` → `"webvh-control"` + `[("URL", ...), ("MEDIATOR_DID", ...)]`
 ///
 /// Note: this is the **standalone-CLI** entry point (`vta-request`) for
 /// operators managing files explicitly. The wizard's `setup-offline-prepare`
@@ -518,17 +523,12 @@ pub async fn run_offline_request_cli(
     seed_path: &Path,
     label: &str,
     binary: &str,
-    mediator_did: &str,
+    template: &str,
+    vars: &[(&str, &str)],
     context_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info = write_offline_bootstrap_request(
-        out,
-        "webvh-service",
-        &[("MEDIATOR_DID", mediator_did)],
-        context_id,
-        Some(label),
-    )
-    .await?;
+    let info =
+        write_offline_bootstrap_request(out, template, vars, context_id, Some(label)).await?;
 
     if let Some(parent) = seed_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -567,7 +567,7 @@ pub async fn run_offline_request_cli(
         "         vta contexts create --id {} \\\n           --admin-did {} --admin-expires 1h",
         context_id, info.client_did
     );
-    eprintln!("    3. Ask them to seal a webvh-service template response:");
+    eprintln!("    3. Ask them to seal the response:");
     eprintln!(
         "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
     );
@@ -748,7 +748,7 @@ pub struct SealedExportInfo {
 /// `did` is the DID the exported keys belong to (usually the same).
 /// `signing_key_multibase` / `ka_key_multibase` are the private multibase
 /// strings from the local secret store. Key IDs are derived as
-/// `<did>#key-0` / `<did>#key-1` to match the `webvh-service` template.
+/// `<did>#key-0` / `<did>#key-1` to match the upstream webvh templates.
 pub async fn export_sealed_did_secrets(
     request_path: &Path,
     out_path: &Path,
@@ -1053,7 +1053,7 @@ mod tests {
 
         let info = write_offline_bootstrap_request(
             &request_path,
-            "webvh-service",
+            "webvh-server",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
             "webvh-test-ctx",
             Some("webvh-control-test"),
@@ -1222,7 +1222,7 @@ mod tests {
 
         let a = write_offline_bootstrap_request(
             &r1,
-            "webvh-service",
+            "webvh-server",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
             "webvh-test-ctx",
             None,
@@ -1231,7 +1231,7 @@ mod tests {
         .unwrap();
         let b = write_offline_bootstrap_request(
             &r2,
-            "webvh-service",
+            "webvh-server",
             &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
             "webvh-test-ctx",
             None,

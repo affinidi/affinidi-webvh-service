@@ -91,7 +91,12 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-control")]
         label: String,
-        /// DIDComm mediator DID. Bound to the `webvh-service` template's
+        /// DID hosting URL. Bound to the `webvh-control` template's
+        /// `URL` variable so the rendered DID exposes a `WebVHHosting`
+        /// service at this URL.
+        #[arg(long)]
+        did_hosting_url: String,
+        /// DIDComm mediator DID. Bound to the `webvh-control` template's
         /// `MEDIATOR_DID` variable so the rendered DID document advertises
         /// the right mediator endpoint.
         #[arg(long)]
@@ -323,6 +328,7 @@ async fn main() {
             out,
             seed,
             label,
+            did_hosting_url,
             mediator_did,
             context,
         }) => {
@@ -331,7 +337,11 @@ async fn main() {
                 &seed,
                 &label,
                 "webvh-control",
-                &mediator_did,
+                "webvh-control",
+                &[
+                    ("URL", did_hosting_url.as_str()),
+                    ("MEDIATOR_DID", mediator_did.as_str()),
+                ],
                 &context,
             )
             .await

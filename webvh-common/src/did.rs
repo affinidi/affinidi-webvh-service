@@ -96,7 +96,7 @@ pub fn build_did_document(
         "publicKeyMultibase": public_key_multibase,
     })];
 
-    // @context matches the `webvh-service` VTA template output (W3C DID v1 +
+    // @context matches the upstream webvh VTA templates' output (W3C DID v1 +
     // CID v1). Keep these two in sync: the setup wizards have the VTA render
     // most webvh DIDs via the template, but bootstrap_did() still builds the
     // `.well-known` root DID locally with this helper — both shapes must be
@@ -125,7 +125,7 @@ pub fn build_did_document(
     doc["verificationMethod"] = json!(vm);
 
     // Add services. Service id is `#vta-didcomm` to match the VTA
-    // `webvh-service` template — not the older `#didcomm` convention.
+    // webvh VTA templates — not the older `#didcomm` convention.
     let mut services = vec![];
     if let Some(mediator) = opts.mediator_endpoint {
         services.push(json!({
@@ -314,7 +314,7 @@ mod tests {
     }
 
     /// Locks the local builder's output to the shape produced by the VTA
-    /// `webvh-service` template. Update both sides together if either ever
+    /// webvh VTA templates. Update both sides together if either ever
     /// moves. Covers: contexts, key-0 and key-1 verification method IDs,
     /// `#vta-didcomm` service ID, single-entry service array.
     #[test]
