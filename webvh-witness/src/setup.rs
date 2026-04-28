@@ -749,10 +749,7 @@ pub async fn run_setup_offline_prepare(
         context_id, info.client_did
     );
     eprintln!("       or, on the VTA host directly:");
-    eprintln!(
-        "         vta context provision --context {} \\\n           --admin {}",
-        context_id, info.client_did
-    );
+    eprintln!("         vta context create --id {}", context_id);
     eprintln!("    3. Ask them to seal a webvh-service template response:");
     eprintln!(
         "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
