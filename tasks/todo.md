@@ -19,9 +19,10 @@ Plan: [`tasks/plan.md`](plan.md)
 > **Checkpoint**: a self-managed `config.toml` is producible by the wizard. Review wizard UX before runtime work.
 
 ## Phase 3 — Runtime
-- [ ] **T3** Audit + guard VTA-bound runtime paths in `webvh-daemon`; produce written audit of every `vta.*` / `vta_credential` read site
-  - Files: `webvh-daemon/src/main.rs`, `webvh-control/src/server.rs`, `webvh-control/src/messaging.rs` (likely), audit doc in `tasks/runtime-audit-T3.md`
-  - Verify: self-managed daemon starts cleanly and `curl <public_url>/.well-known/did.jsonl` returns valid did.jsonl
+- [x] **T3** Audit + guard VTA-bound runtime paths in `webvh-daemon`; produce written audit of every `vta.*` / `vta_credential` read site
+  - Files: `tasks/runtime-audit-T3.md` (no code changes — audit found zero guards needed)
+  - Result: all VTA fields are already `Option<String>` and only consumed in setup / CLI-subcommand paths. Runtime is self-managed-clean by construction.
+  - Live HTTP smoke (curl `<public_url>/.well-known/did.jsonl` against a running daemon) deferred to T5's e2e test, which exercises the same path plus tenant DIDComm provisioning
 
 > **Checkpoint**: daemon starts and serves its own DID end-to-end. Review audit report.
 
