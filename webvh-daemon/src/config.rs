@@ -258,3 +258,119 @@ impl DaemonConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Minimal self-managed config: `[identity] mode = "self-managed"`,
+    /// no `[vta]` block at all (back-compat with existing parsers).
+    const SELF_MANAGED_TOML: &str = r#"
+public_url = "https://daemon.example.com"
+did_hosting_url = "https://daemon.example.com"
+
+[identity]
+mode = "self-managed"
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[log]
+level = "info"
+format = "text"
+
+[store]
+data_dir = "data/daemon/store"
+
+[witness_store]
+data_dir = "data/daemon/witness"
+
+[auth]
+
+[secrets]
+plaintext = { signing_key = "z3uABC", key_agreement_key = "z3uDEF", jwt_signing_key = "z3uGHI" }
+"#;
+
+    /// Minimal VTA-mode config (the back-compat case — no `[identity]`
+    /// block at all, so the loader must default `identity.mode` to `Vta`).
+    const VTA_DEFAULT_TOML: &str = r#"
+public_url = "https://daemon.example.com"
+did_hosting_url = "https://daemon.example.com"
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[log]
+level = "info"
+format = "text"
+
+[store]
+data_dir = "data/daemon/store"
+
+[witness_store]
+data_dir = "data/daemon/witness"
+
+[auth]
+
+[secrets]
+plaintext = { signing_key = "z3uABC", key_agreement_key = "z3uDEF", jwt_signing_key = "z3uGHI" }
+
+[vta]
+url = "https://vta.example.com"
+did = "did:webvh:vta.example.com"
+context_id = "webvh"
+"#;
+
+    fn write_temp_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).expect("create config");
+        f.write_all(contents.as_bytes()).expect("write config");
+        (dir, path)
+    }
+
+    #[test]
+    fn loads_self_managed_config_with_empty_vta() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+
+        let cfg = DaemonConfig::load(Some(path)).expect("load self-managed config");
+
+        assert_eq!(cfg.identity.mode, IdentityMode::SelfManaged);
+        assert!(cfg.vta.url.is_none(), "vta.url should be None");
+        assert!(cfg.vta.did.is_none(), "vta.did should be None");
+        assert!(
+            cfg.vta.context_id.is_none(),
+            "vta.context_id should be None"
+        );
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://daemon.example.com")
+        );
+    }
+
+    #[test]
+    fn loads_vta_config_without_identity_block_defaults_to_vta() {
+        // Back-compat: existing VTA-mode configs don't have an `[identity]`
+        // block. The loader must default `identity.mode = Vta`.
+        let (_dir, path) = write_temp_config(VTA_DEFAULT_TOML);
+
+        let cfg = DaemonConfig::load(Some(path)).expect("load VTA-default config");
+
+        assert_eq!(
+            cfg.identity.mode,
+            IdentityMode::Vta,
+            "missing [identity] block should default to Vta"
+        );
+        assert_eq!(cfg.vta.url.as_deref(), Some("https://vta.example.com"));
+        assert_eq!(cfg.vta.did.as_deref(), Some("did:webvh:vta.example.com"));
+    }
+
+    // WEBVH_IDENTITY_MODE env-override coverage lives in webvh-common's
+    // IdentityMode parsing tests. A daemon-level env test would race
+    // against parallel tests in the same process (env vars are
+    // process-wide), and the daemon's override code is just a 3-arm
+    // match — not worth a serialised mutex harness.
+}
