@@ -387,7 +387,7 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::webvh_hosting_server(&context_id, public_url)
+    let ask = ProvisionAsk::webvh_daemon(&context_id, public_url)
         .with_label(format!("webvh-daemon setup — {context_id}"));
 
     eprintln!();

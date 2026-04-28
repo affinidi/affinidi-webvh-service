@@ -81,7 +81,7 @@ pub struct OnlineProvisionInputs {
     /// VTA context the integration will live in.
     pub context_id: String,
     /// Pre-built `ProvisionAsk` (e.g. from
-    /// `ProvisionAsk::webvh_hosting_server` or `webvh_service`).
+    /// `ProvisionAsk::webvh_daemon` or `webvh_server`).
     pub ask: vta_sdk::provision_client::ProvisionAsk,
     /// Per-binary user-facing labels and `pnm contexts create` command
     /// hint.

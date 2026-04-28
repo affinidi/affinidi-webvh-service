@@ -88,11 +88,10 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         ),
         None => None,
     };
-    let (mediator_did, outcome) = run_online_provision(messages, preloaded_setup_key)
-        .await
-        .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
 
-    // 3. DID hosting URL (where webvh-server serves DIDs).
+    // DID hosting URL must be collected BEFORE the VTA round-trip because
+    // upstream `ProvisionAsk::webvh_control` embeds it as the
+    // `WebVHHosting` service endpoint in the resulting DID document.
     eprintln!();
     eprintln!("  The DID hosting URL is where your webvh-server serves DID documents.");
     eprintln!("  The control plane's DID will be published at <url>/<path>/did.jsonl.");
@@ -102,6 +101,11 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
+
+    let (mediator_did, outcome) =
+        run_online_provision(messages, preloaded_setup_key, &did_hosting_url)
+            .await
+            .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
 
     // 4. DID path
     let did_path: String = Input::new()
@@ -405,6 +409,7 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), AppErr
 async fn run_online_provision(
     messages: Arc<dyn OperatorMessages>,
     preloaded_setup_key: Option<EphemeralSetupKey>,
+    did_hosting_url: &str,
 ) -> Result<(Option<String>, vta_setup::OnlineProvisionOutcome), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
@@ -477,7 +482,7 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::webvh_service(&context_id, &mediator_did)
+    let ask = ProvisionAsk::webvh_control(&context_id, did_hosting_url, &mediator_did)
         .with_label(format!("webvh-control setup — {context_id}"));
 
     eprintln!();

@@ -462,7 +462,7 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::webvh_service(&context_id, &mediator_did)
+    let ask = ProvisionAsk::webvh_server(&context_id, &mediator_did)
         .with_label(format!("webvh-witness setup — {context_id}"));
 
     eprintln!();
