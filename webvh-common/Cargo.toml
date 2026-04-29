@@ -17,7 +17,7 @@ default = []
 metrics = ["server-core", "dep:prometheus"]
 server-core = [
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
-    "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio",
+    "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
 ]
 store-fjall = ["server-core", "dep:fjall"]
@@ -56,6 +56,7 @@ multibase = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 tower-http = { version = "0.6", features = ["trace"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }

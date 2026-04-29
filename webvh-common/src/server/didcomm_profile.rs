@@ -5,9 +5,12 @@
 //! the `affinidi-messaging-didcomm-service` framework to establish mediator
 //! connections.
 
+use std::time::Duration;
+
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_secrets_resolver::secrets::Secret;
 use affinidi_tdk_common::profiles::TDKProfile;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::error::AppError;
@@ -134,6 +137,65 @@ pub async fn resolve_mediator_did(
 
     info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
     Some(mediator)
+}
+
+/// Wait until a DID resolves, retrying with exponential backoff.
+///
+/// Used at DIDComm startup to block until the mediator DID document is
+/// reachable. This avoids the situation where the listener spins up against
+/// an unreachable mediator and the SDK reports the cryptic "No Mediator is
+/// configured for this Profile" error after silently dropping the underlying
+/// network failure.
+///
+/// Returns `Ok(())` on first successful resolution, or `Err` if the shutdown
+/// token is cancelled while waiting.
+///
+/// Backoff: 2s, 4s, 8s, … capped at 60s.
+pub async fn wait_for_did_resolution(
+    did: &str,
+    label: &str,
+    did_resolver: &DIDCacheClient,
+    shutdown: &CancellationToken,
+) -> Result<(), AppError> {
+    const INITIAL_BACKOFF_SECS: u64 = 2;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    let mut backoff_secs = INITIAL_BACKOFF_SECS;
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+        match did_resolver.resolve(did).await {
+            Ok(_) => {
+                if attempt == 1 {
+                    info!(did, label, "DID resolved");
+                } else {
+                    info!(did, label, attempt, "DID resolved after retries");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    did,
+                    label,
+                    attempt,
+                    error = %e,
+                    "DID not yet resolvable — retrying in {backoff_secs}s"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+            _ = shutdown.cancelled() => {
+                return Err(AppError::Internal(format!(
+                    "shutdown signalled while waiting for {label} DID {did} to resolve"
+                )));
+            }
+        }
+
+        backoff_secs = (backoff_secs.saturating_mul(2)).min(MAX_BACKOFF_SECS);
+    }
 }
 
 /// Build a `TDKProfile` suitable for use with `DIDCommService`.
