@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use affinidi_webvh_common::didcomm_types::*;
+use affinidi_webvh_common::server::problem_report::log_problem_report;
 
 use crate::acl::{Role, check_acl};
 use crate::server::AppState;
@@ -159,10 +160,18 @@ async fn handle_sync_delete(
 }
 
 async fn handle_fallback(
-    _ctx: HandlerContext,
+    ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    warn!(msg_type = %message.typ, "unknown message type — ignoring");
+    let sender = ctx.sender_did.as_deref();
+    if log_problem_report("server", sender, &message) {
+        return Ok(None);
+    }
+    warn!(
+        sender = sender.unwrap_or("unknown"),
+        msg_type = %message.typ,
+        "unknown message type — ignoring"
+    );
     Ok(None)
 }
 

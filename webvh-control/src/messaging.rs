@@ -16,6 +16,7 @@ use affinidi_messaging_didcomm_service::{
 };
 use affinidi_webvh_common::did_ops::did_key;
 use affinidi_webvh_common::didcomm_types::*;
+use affinidi_webvh_common::server::problem_report::log_problem_report;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -652,30 +653,15 @@ async fn handle_fallback(
     ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
-
-    // Log problem-report bodies so errors from the remote side are visible
-    if message.typ.contains("problem-report") {
-        let code = message
-            .body
-            .get("code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let comment = message
-            .body
-            .get("comment")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no comment)");
-        warn!(
-            sender = sender,
-            code = code,
-            comment = comment,
-            "inbound DIDComm: problem-report from remote"
-        );
-    } else {
-        warn!(sender = sender, msg_type = %message.typ, "inbound DIDComm: unhandled message type — ignoring");
+    let sender = ctx.sender_did.as_deref();
+    if log_problem_report("control", sender, &message) {
+        return Ok(None);
     }
-
+    warn!(
+        sender = sender.unwrap_or("unknown"),
+        msg_type = %message.typ,
+        "inbound DIDComm: unhandled message type — ignoring"
+    );
     Ok(None)
 }
 

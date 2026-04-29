@@ -13,6 +13,7 @@ pub mod mnemonic;
 pub mod operator_messages;
 #[cfg(feature = "passkey")]
 pub mod passkey;
+pub mod problem_report;
 pub mod secret_store;
 pub mod stats_collector;
 pub mod store;

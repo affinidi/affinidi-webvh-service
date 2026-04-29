@@ -12,6 +12,8 @@ use affinidi_messaging_didcomm_service::{
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use affinidi_webvh_common::server::problem_report::log_problem_report;
+
 use crate::acl::check_acl;
 use crate::auth::session::create_authenticated_session;
 use crate::error::AppError;
@@ -106,10 +108,23 @@ async fn handle_list_request(
 }
 
 async fn handle_fallback(
-    _ctx: HandlerContext,
+    ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    warn!(type_ = %message.typ, "unknown DIDComm message type");
+    let sender = ctx.sender_did.as_deref();
+
+    // Inbound problem-reports describe failures on the remote side; log
+    // them with full context and don't echo another problem-report back
+    // (that would create a ping-pong loop).
+    if log_problem_report("witness", sender, &message) {
+        return Ok(None);
+    }
+
+    warn!(
+        sender = sender.unwrap_or("unknown"),
+        msg_type = %message.typ,
+        "unknown DIDComm message type"
+    );
     Ok(Some(
         DIDCommResponse::new(
             MSG_WITNESS_PROBLEM_REPORT,
