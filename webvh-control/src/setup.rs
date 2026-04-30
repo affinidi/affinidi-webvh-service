@@ -226,7 +226,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     // 14. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: false,
+            didcomm: true,
             rest_api: true,
             ..Default::default()
         },
@@ -891,7 +891,7 @@ pub async fn run_setup_offline_complete(
     // Build and write config.toml.
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: false,
+            didcomm: true,
             rest_api: true,
             ..Default::default()
         },
