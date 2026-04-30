@@ -107,7 +107,7 @@ pub async fn run_wizard(
     }
 
     // 1. Enabled services
-    let (enable, features) = prompt_enable_and_features()?;
+    let (enable, mut features) = prompt_enable_and_features()?;
 
     // 2. Public URL + derived DID path
     eprintln!();
@@ -130,30 +130,12 @@ pub async fn run_wizard(
         Some(path) => Some(EphemeralSetupKey::load_from(path)?),
         None => None,
     };
-    let outcome = run_online_provision(&public_url, messages, preloaded_setup_key).await?;
-
-    // 4. Mediator preference (runtime DIDComm — separate from the
-    //    integration DID document, which the VTA already minted).
-    eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&outcome.vta_did).await;
-    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
-    if let Some(ref did) = vta_mediator {
-        mediator_options.push(format!("Use VTA's mediator ({did})"));
-    }
-    mediator_options.push("Enter a custom mediator DID".into());
-    let mediator_idx = Select::new()
-        .with_prompt("DIDComm mediator")
-        .items(&mediator_options)
-        .default(if vta_mediator.is_some() { 1 } else { 0 })
-        .interact()?;
-    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
-        None
-    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
-        vta_mediator.clone()
-    } else {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
-        if did.is_empty() { None } else { Some(did) }
-    };
+    // The mediator selection happens inside `run_online_provision` so
+    // it can drive the VTA template choice (webvh-control with mediator,
+    // webvh-daemon without). DIDComm is enabled iff a mediator was set.
+    let (outcome, mediator_did) =
+        run_online_provision(&public_url, messages, preloaded_setup_key).await?;
+    features.didcomm = mediator_did.is_some();
 
     // 5. Host / port / log / data
     let host: String = Input::new()
@@ -350,12 +332,17 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), Box<dy
 /// 2. Mint an ephemeral did:key.
 /// 3. Print the operator's `pnm contexts create` command and wait
 ///    for them to confirm the ACL is in place.
-/// 4. Drive `vta_sdk::provision_client::run_provision`.
+/// 4. Resolve the VTA's recommended mediator and let the operator pick
+///    one. The choice drives the VTA template: with a mediator we mint
+///    via `webvh-control` so the integration DID document carries a
+///    `DIDCommMessaging` service entry; without one we mint via
+///    `webvh-daemon` (HTTP-only).
+/// 5. Drive `vta_sdk::provision_client::run_provision`.
 async fn run_online_provision(
     public_url: &str,
     messages: Arc<dyn OperatorMessages>,
     preloaded_setup_key: Option<EphemeralSetupKey>,
-) -> Result<vta_setup::OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+) -> Result<(vta_setup::OnlineProvisionOutcome, Option<String>), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
@@ -401,21 +388,46 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::webvh_daemon(&context_id, public_url)
-        .with_label(format!("webvh-daemon setup — {context_id}"));
+    eprintln!();
+    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
+    if let Some(ref did) = vta_mediator {
+        mediator_options.push(format!("Use VTA's mediator ({did})"));
+    }
+    mediator_options.push("Enter a custom mediator DID".into());
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()?;
+    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
+        None
+    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
+        vta_mediator.clone()
+    } else {
+        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
+        if did.is_empty() { None } else { Some(did) }
+    };
+
+    let ask = match mediator_did.as_deref() {
+        Some(med) => ProvisionAsk::webvh_control(&context_id, public_url, med),
+        None => ProvisionAsk::webvh_daemon(&context_id, public_url),
+    }
+    .with_label(format!("webvh-daemon setup — {context_id}"));
 
     eprintln!();
     eprintln!("  Provisioning daemon DID via VTA...");
     eprintln!();
 
-    vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
+    let outcome = vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
         vta_did,
         context_id,
         ask,
         messages,
         setup_key,
     })
-    .await
+    .await?;
+    Ok((outcome, mediator_did))
 }
 
 // ---------------------------------------------------------------------------
@@ -737,7 +749,7 @@ pub async fn run_setup_offline_prepare(
         }
     }
 
-    let (enable, features) = prompt_enable_and_features()?;
+    let (enable, mut features) = prompt_enable_and_features()?;
 
     let public_url: String = Input::new()
         .with_prompt("Public URL (e.g. https://webvh.example.com)")
@@ -768,6 +780,7 @@ pub async fn run_setup_offline_prepare(
     } else {
         Some(mediator_raw.trim().to_string())
     };
+    features.didcomm = mediator_did.is_some();
 
     let host: String = Input::new()
         .with_prompt("Listen host")
@@ -808,15 +821,21 @@ pub async fn run_setup_offline_prepare(
     .await?;
     let admin = prompt_admin_choice()?;
 
-    // VP-framed bootstrap request — names the `webvh-daemon` template
-    // (HTTP-only hosting; runtime DIDComm uses `mediator_did` separately
-    // and is not embedded in the rendered DID document) + binds the
-    // `URL` template variable so the rendered DID exposes a
-    // `WebVHHosting` service at our public URL.
+    // VP-framed bootstrap request. With a mediator we name the
+    // `webvh-control` template so the rendered DID document carries
+    // both `WebVHHosting` and `DIDCommMessaging` services; without one
+    // we fall back to `webvh-daemon` (HTTP-only).
+    let (template_name, template_vars): (&str, Vec<(&str, &str)>) = match mediator_did.as_deref() {
+        Some(med) => (
+            "webvh-control",
+            vec![("URL", public_url.as_str()), ("MEDIATOR_DID", med)],
+        ),
+        None => ("webvh-daemon", vec![("URL", public_url.as_str())]),
+    };
     let info = vta_setup::write_offline_bootstrap_request(
         &request_out,
-        "webvh-daemon",
-        &[("URL", &public_url)],
+        template_name,
+        &template_vars,
         &context_id,
         Some("webvh-daemon"),
     )
@@ -1041,8 +1060,7 @@ fn prompt_enable_and_features() -> Result<(EnableConfig, FeaturesConfig), Box<dy
         // the server is enabled, REST is still useful for health / stats
         // endpoints, so default it on.
         rest_api: enable.control || enable.server,
-        // DIDComm is turned on by `finalize_daemon_setup` if a mediator
-        // is configured; the seed value here is informational only.
+        // The caller flips this to true once a mediator has been chosen.
         didcomm: false,
         ..Default::default()
     };
