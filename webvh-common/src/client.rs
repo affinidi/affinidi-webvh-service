@@ -14,6 +14,13 @@ use crate::types::*;
 pub struct WebVHClient {
     http: reqwest::Client,
     server_url: String,
+    /// Public hosting URL used as the `host` segment of newly minted
+    /// `did:webvh:` identifiers. When `None`, the host is derived from
+    /// `server_url` — correct for standalone webvh-server deployments
+    /// where management and hosting share an origin. Control-plane
+    /// deployments must set this to the public hosting URL since the
+    /// control plane's URL is not where DID logs are served from.
+    hosting_url: Option<String>,
     access_token: Option<String>,
 }
 
@@ -23,8 +30,19 @@ impl WebVHClient {
         Self {
             http: reqwest::Client::new(),
             server_url: server_url.trim_end_matches('/').to_string(),
+            hosting_url: None,
             access_token: None,
         }
+    }
+
+    /// Set a separate public hosting URL to embed in DIDs created via
+    /// [`create_did`](Self::create_did). Use this when management
+    /// (`server_url`) and hosting are at different origins, e.g. a
+    /// control plane at `admin.example.com` minting DIDs that resolve
+    /// at `webvh.example.com`.
+    pub fn with_hosting_url(mut self, hosting_url: impl Into<String>) -> Self {
+        self.hosting_url = Some(hosting_url.into().trim_end_matches('/').to_string());
+        self
     }
 
     /// Authenticate with the server using DIDComm challenge-response.
@@ -196,7 +214,11 @@ impl WebVHClient {
     pub async fn create_did(&self, secret: &Secret, path: Option<&str>) -> Result<CreateDidResult> {
         let create_resp = self.request_uri(path).await?;
 
-        let host = encode_host(&self.server_url)?;
+        // The host segment must match where the DID log will actually
+        // be served — the public hosting URL when management is split
+        // off onto a separate control plane, otherwise just server_url.
+        let host_url = self.hosting_url.as_deref().unwrap_or(&self.server_url);
+        let host = encode_host(host_url)?;
         let public_key_multibase = secret
             .get_public_keymultibase()
             .map_err(|e| WebVHError::DIDComm(format!("failed to get public key: {e}")))?;
