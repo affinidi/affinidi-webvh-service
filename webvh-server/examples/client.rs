@@ -16,6 +16,11 @@ struct Cli {
     #[arg(long)]
     server_url: String,
 
+    /// DID of the WebVH service. Used as the DIDComm `to` field of the
+    /// signed authenticate message.
+    #[arg(long)]
+    webvh_did: String,
+
     /// Optional custom path (e.g. "my-org"). If omitted, a random path is generated.
     #[arg(long)]
     path: Option<String>,
@@ -52,7 +57,7 @@ async fn main() -> Result<()> {
 
     let mut client = WebVHClient::new(server_url);
     client
-        .authenticate(&my_did, &my_secret)
+        .authenticate(&my_did, &my_secret, &cli.webvh_did)
         .await
         .context("authentication failed")?;
 

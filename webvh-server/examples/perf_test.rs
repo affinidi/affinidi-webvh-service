@@ -4,7 +4,8 @@
 //!
 //! Supports two modes:
 //! - **Server mode** (default): authenticates with a WebVH server via DIDComm,
-//!   discovers active DIDs, and benchmarks resolution.
+//!   discovers active DIDs, and benchmarks resolution. Requires `--webvh-did`
+//!   so the auth message can be addressed to the service.
 //! - **File mode** (`--did-file`): reads `did:webvh:...` identifiers from a
 //!   file and derives resolution URLs directly. No authentication needed —
 //!   works against any hosted WebVH DID.
@@ -14,7 +15,9 @@
 //! ```bash
 //! # Server mode: authenticate and discover DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
-//!   --server-url http://localhost:8530 --rate 100
+//!   --server-url http://localhost:8530 \
+//!   --webvh-did did:webvh:<scid>:localhost%3A8530 \
+//!   --rate 100
 //!
 //! # File mode: test against any hosted DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
@@ -72,7 +75,8 @@ struct Args {
     #[arg(long, default_value = "4")]
     create_parallel: usize,
 
-    /// Mediator DID (reserved for future DIDComm-via-mediator testing)
+    /// Mediator DID. Currently unused; will route the DIDComm auth
+    /// message through a mediator when full DIDComm transport lands.
     #[arg(long)]
     mediator_did: Option<String>,
 
@@ -88,7 +92,9 @@ struct Args {
     #[arg(long, short = 'f')]
     did_file: Option<String>,
 
-    /// WebVH server DID (reserved for future DIDComm-via-mediator testing)
+    /// DID of the WebVH service we're authenticating against. Used as the
+    /// DIDComm `to` field of the signed authenticate message. Required
+    /// in server mode (when `--did-file` is not set).
     #[arg(long)]
     webvh_did: Option<String>,
 }
@@ -1135,6 +1141,17 @@ async fn main() -> Result<()> {
         (urls, format!("File: {did_file}"))
     } else {
         // ----- Server mode: authenticate, optionally create, then list -----
+        let webvh_did = args
+            .webvh_did
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--webvh-did is required in server mode (the DID the auth \
+                     message is addressed to). Use `--did-file` to skip auth."
+                )
+            })?
+            .to_string();
+
         let (my_did, my_secret) = if let Some(ref seed_hex) = args.seed {
             let seed = decode_hex_seed(seed_hex)?;
             let secret = Secret::generate_ed25519(None, Some(&seed));
@@ -1148,13 +1165,17 @@ async fn main() -> Result<()> {
         };
 
         eprintln!();
-        eprintln!("  Identity:  {my_did}");
-        eprintln!("  Server:    {server_url}");
+        eprintln!("  Identity:    {my_did}");
+        eprintln!("  WebVH DID:   {webvh_did}");
+        eprintln!("  Server URL:  {server_url}");
         eprintln!();
 
         if args.seed.is_none() {
-            eprintln!("  (Generated fresh identity. Ensure this DID is in the server ACL:)");
-            eprintln!("    webvh-server add-acl --did {my_did}");
+            eprintln!("  Fresh did:key generated for this run. Add it to the WebVH");
+            eprintln!("  service's ACL before continuing — e.g.:");
+            eprintln!("    webvh-server  add-acl --did {my_did}");
+            eprintln!("    webvh-control add-acl --did {my_did}");
+            eprintln!("    webvh-daemon  add-acl --did {my_did}");
             eprintln!();
             eprint!("  Press Enter to continue after adding to ACL...");
             io::stderr().flush()?;
@@ -1166,7 +1187,7 @@ async fn main() -> Result<()> {
         eprintln!("  Authenticating via DIDComm...");
         let mut client = WebVHClient::new(&server_url);
         client
-            .authenticate(&my_did, &my_secret)
+            .authenticate(&my_did, &my_secret, &webvh_did)
             .await
             .context("DIDComm authentication failed")?;
         eprintln!("  Authenticated!");

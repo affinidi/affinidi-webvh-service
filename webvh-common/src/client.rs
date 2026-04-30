@@ -29,12 +29,20 @@ impl WebVHClient {
 
     /// Authenticate with the server using DIDComm challenge-response.
     ///
+    /// `webvh_did` is the DID of the WebVH service the client is talking
+    /// to; it becomes the DIDComm `to` field of the signed authenticate
+    /// message. Today the server only verifies the message signature
+    /// against the `from` DID, but addressing the message to the service
+    /// keeps the wire shape correct and lets the same flow drop straight
+    /// into a fully encrypted DIDComm transport later.
+    ///
     /// On success the client stores the access token internally so that
     /// subsequent calls to authenticated endpoints will work automatically.
     pub async fn authenticate(
         &mut self,
         did: &str,
         secret: &Secret,
+        webvh_did: &str,
     ) -> Result<AuthenticateResponse> {
         // 1. Extract private key bytes for signing
         let private_key_bytes: [u8; 32] = secret
@@ -72,6 +80,7 @@ impl WebVHClient {
             }),
         )
         .from(did.to_string())
+        .to(webvh_did.to_string())
         .created_time(created_time)
         .finalize();
 
