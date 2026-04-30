@@ -106,3 +106,4 @@ http-body-util = "0.1"
 ratatui = "0.30"
 crossterm = "0.29"
 reqwest = { workspace = true }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
