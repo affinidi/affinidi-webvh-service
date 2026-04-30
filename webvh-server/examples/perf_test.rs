@@ -3,9 +3,13 @@
 //! A rich TUI benchmarking tool for load-testing WebVH DID resolution.
 //!
 //! Supports two modes:
-//! - **Server mode** (default): authenticates with a WebVH server via DIDComm,
-//!   discovers active DIDs, and benchmarks resolution. Requires `--webvh-did`
-//!   so the auth message can be addressed to the service.
+//! - **Server mode** (default): authenticates with a WebVH control plane
+//!   (`webvh-control` or the `webvh-daemon`'s embedded control plane)
+//!   via DIDComm, lists active DIDs, and benchmarks resolution against
+//!   each DID's own hosting URL. The management endpoint
+//!   (`--server-url`) and the public hosting URL embedded in the DID
+//!   are typically different hosts. Requires `--webvh-did` (the
+//!   service's DID, used as the DIDComm `to` field of the auth message).
 //! - **File mode** (`--did-file`): reads `did:webvh:...` identifiers from a
 //!   file and derives resolution URLs directly. No authentication needed —
 //!   works against any hosted WebVH DID.
@@ -13,10 +17,10 @@
 //! # Usage
 //!
 //! ```bash
-//! # Server mode: authenticate and discover DIDs
+//! # Server mode: authenticate via the control plane and discover DIDs
 //! cargo run -p affinidi-webvh-server --example perf_test -- \
-//!   --server-url http://localhost:8530 \
-//!   --webvh-did did:webvh:<scid>:localhost%3A8530 \
+//!   --server-url https://admin.example.com \
+//!   --webvh-did did:webvh:<scid>:webvh.example.com \
 //!   --rate 100
 //!
 //! # File mode: test against any hosted DIDs
@@ -1172,8 +1176,7 @@ async fn main() -> Result<()> {
 
         if args.seed.is_none() {
             eprintln!("  Fresh did:key generated for this run. Add it to the WebVH");
-            eprintln!("  service's ACL before continuing — e.g.:");
-            eprintln!("    webvh-server  add-acl --did {my_did}");
+            eprintln!("  control plane's ACL before continuing — e.g.:");
             eprintln!("    webvh-control add-acl --did {my_did}");
             eprintln!("    webvh-daemon  add-acl --did {my_did}");
             eprintln!();
@@ -1249,37 +1252,41 @@ async fn main() -> Result<()> {
             (client, my_secret)
         };
 
-        // Fetch active DIDs
+        // Fetch active DIDs. Resolution targets are derived from each
+        // DID's embedded host, not from `--server-url` — the management
+        // endpoint (control plane) is often on a different host than
+        // the public hosting URL the DID itself advertises.
         eprintln!("  Fetching DID list...");
         let all_dids = client.list_dids().await.context("failed to list DIDs")?;
 
-        let active_mnemonics: Vec<String> = all_dids
+        let urls: Vec<String> = all_dids
             .iter()
             .filter(|d| d.version_count > 0 && !d.disabled)
-            .map(|d| d.mnemonic.clone())
+            .filter_map(|d| d.did_id.as_deref())
+            .filter_map(|did| match did_webvh_to_url(did) {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    eprintln!("  skipping unparseable DID '{did}': {e}");
+                    None
+                }
+            })
             .collect();
 
         eprintln!(
             "  Found {} active DIDs (of {} total)",
-            active_mnemonics.len(),
+            urls.len(),
             all_dids.len()
         );
 
-        if active_mnemonics.is_empty() {
+        if urls.is_empty() {
             eprintln!();
             eprintln!("  No active (published & enabled) DIDs found.");
             eprintln!("  Create and publish DIDs first, e.g.:");
             eprintln!(
-                "    cargo run -p affinidi-webvh-server --example client -- --server-url {server_url}"
+                "    cargo run -p affinidi-webvh-server --example client -- \\\n      --server-url {server_url} --webvh-did {webvh_did}"
             );
             bail!("no active DIDs to test against");
         }
-
-        // Convert mnemonics to full resolution URLs
-        let urls: Vec<String> = active_mnemonics
-            .iter()
-            .map(|m| format!("{server_url}/{m}/did.jsonl"))
-            .collect();
 
         (urls, server_url.clone())
     };
