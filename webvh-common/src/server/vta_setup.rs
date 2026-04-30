@@ -178,7 +178,10 @@ pub async fn online_provision_setup(
         }
     };
 
-    let integration_did = result.integration_did().to_string();
+    let integration_did = result
+        .integration_did()
+        .ok_or("provision reply missing integration DID")?
+        .to_string();
     let integration_keys = result
         .integration_key()
         .ok_or("provision reply missing integration key material")?;
