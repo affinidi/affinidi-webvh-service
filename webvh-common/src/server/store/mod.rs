@@ -67,6 +67,23 @@ pub trait KeyspaceOps: Send + Sync {
     fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>>;
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>>;
+
+    /// Atomically read a key's value and remove it in one operation.
+    ///
+    /// Returns `Some(value)` if the key existed and was removed; `None` if
+    /// the key was already absent. The semantics are the same as Redis
+    /// `GETDEL` — exactly one concurrent caller observes `Some` for any
+    /// given key, and all others observe `None`.
+    ///
+    /// **Required for refresh-token rotation.** A leaked refresh token must
+    /// not be usable from two replicas simultaneously; this primitive is
+    /// the cross-replica claim the rotation handlers depend on.
+    ///
+    /// Backends are expected to use a native atomic primitive
+    /// (Redis `GETDEL`, DynamoDB `DeleteItem` + `ReturnValues=ALL_OLD`,
+    /// SQL transaction, etc.). Single-replica backends (fjall) wrap the
+    /// non-atomic `get + remove` in a process-local mutex.
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
 }
 
 /// Atomic multi-key write batch identified by keyspace name.
@@ -197,27 +214,29 @@ impl KeyspaceHandle {
         }
     }
 
-    /// Get and remove a key.
-    /// Returns the deserialized value if the key existed, or `None`.
+    /// Atomically get-and-remove a key, returning the deserialized value.
     ///
-    /// **Note:** This is not truly atomic — the get and remove are two
-    /// separate operations. Under concurrent access, two callers could
-    /// both read the value before either removes it (TOCTOU race).
-    /// For single-threaded runtimes this is safe; for multi-worker or
-    /// distributed deployments, consider backend-specific atomic
-    /// delete-and-return operations.
+    /// Backed by `KeyspaceOps::take_raw_atomic` — exactly one concurrent
+    /// caller observes `Some` for a given key. Suitable for refresh-token
+    /// rotation, single-use enrolment tokens, and any other "consume
+    /// exactly once" pattern across multiple webvh replicas.
     pub async fn take<V: DeserializeOwned + Send + 'static>(
         &self,
         key: impl Into<Vec<u8>>,
     ) -> Result<Option<V>, AppError> {
-        let key = key.into();
-        match self.inner.get_raw(key.clone()).await? {
-            Some(bytes) => {
-                self.inner.remove(key).await?;
-                Ok(Some(serde_json::from_slice(&bytes)?))
-            }
+        match self.inner.take_raw_atomic(key.into()).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    /// Atomically get-and-remove a key's raw bytes.
+    ///
+    /// See [`Self::take`] for the deserialised version. Use this when the
+    /// stored value is not JSON (e.g. a raw session_id under a refresh-
+    /// token index).
+    pub async fn take_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
+        self.inner.take_raw_atomic(key.into()).await
     }
 
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put,
+    AttributeValue, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put, ReturnValue,
     ScalarAttributeType, TransactWriteItem,
 };
 use tokio::sync::RwLock;
@@ -208,6 +208,35 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .await
                 .map_err(|e| AppError::Store(format!("dynamodb get: {e}")))?;
             Ok(result.item.is_some())
+        })
+    }
+
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            ensure_table(&self.client, &self.table, &self.verified).await?;
+            // DeleteItem with ReturnValues=ALL_OLD atomically removes the
+            // item and returns the previous attributes — exactly the
+            // get-and-remove primitive we need. DynamoDB serialises the
+            // operation per partition key, so two concurrent callers see
+            // exactly one non-empty response.
+            let response = self
+                .client
+                .delete_item()
+                .table_name(&self.table)
+                .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .return_values(ReturnValue::AllOld)
+                .send()
+                .await
+                .map_err(|e| AppError::Store(format!("dynamodb delete (atomic take): {e}")))?;
+            Ok(response.attributes.and_then(|attrs| {
+                attrs.get(VAL_ATTR).and_then(|attr| {
+                    if let AttributeValue::B(blob) = attr {
+                        Some(blob.as_ref().to_vec())
+                    } else {
+                        None
+                    }
+                })
+            }))
         })
     }
 

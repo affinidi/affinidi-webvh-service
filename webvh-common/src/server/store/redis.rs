@@ -121,6 +121,23 @@ impl KeyspaceOps for RedisKeyspace {
         })
     }
 
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            // Redis 6.2+ provides GETDEL: atomic get-and-remove in a single
+            // command, returning the previous value (or nil if absent).
+            // Cross-replica safe — exactly one concurrent caller observes
+            // a non-nil result for any given key.
+            let fk = self.full_key(&key);
+            let mut conn = self.conn.clone();
+            let result: Option<Vec<u8>> = redis::cmd("GETDEL")
+                .arg(fk)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| AppError::Store(format!("redis GETDEL: {e}")))?;
+            Ok(result)
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
             let mut pattern = self.full_key(&prefix);

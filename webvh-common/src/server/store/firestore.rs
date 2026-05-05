@@ -5,6 +5,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use firestore::*;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -58,6 +59,7 @@ impl StorageBackend for FirestoreBackend {
             Arc::new(FirestoreKeyspace {
                 db: self.db.clone(),
                 collection: name.to_string(),
+                take_lock: Mutex::new(()),
             }),
         ))
     }
@@ -82,6 +84,9 @@ impl StorageBackend for FirestoreBackend {
 struct FirestoreKeyspace {
     db: FirestoreDb,
     collection: String,
+    /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
+    /// single-replica-only caveat.
+    take_lock: Mutex<()>,
 }
 
 /// Encode raw key bytes to a Firestore-safe document ID (base64url, no pad).
@@ -148,6 +153,27 @@ impl KeyspaceOps for FirestoreKeyspace {
                 .await
                 .map_err(|e| AppError::Store(format!("firestore get: {e}")))?;
             Ok(result.is_some())
+        })
+    }
+
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        // Firestore does not expose a single-call atomic get-and-remove;
+        // doing it correctly cross-replica would require a transaction
+        // with optimistic concurrency (`run_transaction`). The current
+        // implementation serialises the get-then-remove with a per-
+        // keyspace mutex, which is correct for **single-replica** webvh
+        // deployments backed by Firestore. Multi-replica deployments
+        // wanting refresh-token rotation atomicity should pick the
+        // `store-redis` or `store-dynamodb` backend (both have native
+        // single-call primitives), or upgrade this method to a Firestore
+        // transaction in a follow-up.
+        Box::pin(async move {
+            let _guard = self.take_lock.lock().await;
+            let value = self.get_raw(key.clone()).await?;
+            if value.is_some() {
+                self.remove(key).await?;
+            }
+            Ok(value)
         })
     }
 

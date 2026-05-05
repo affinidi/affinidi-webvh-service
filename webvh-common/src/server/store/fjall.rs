@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use fjall::{KeyspaceCreateOptions, PersistMode};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -36,7 +37,13 @@ impl StorageBackend for FjallBackend {
             .db
             .keyspace(name, KeyspaceCreateOptions::default)
             .map_err(|e| AppError::Store(e.to_string()))?;
-        Ok((name.to_string(), Arc::new(FjallKeyspace { keyspace: ks })))
+        Ok((
+            name.to_string(),
+            Arc::new(FjallKeyspace {
+                keyspace: ks,
+                take_lock: Mutex::new(()),
+            }),
+        ))
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -64,6 +71,11 @@ impl StorageBackend for FjallBackend {
 
 struct FjallKeyspace {
     keyspace: fjall::Keyspace,
+    /// Per-keyspace mutex held across the get-then-remove of
+    /// `take_raw_atomic`. fjall is a single-process embedded store so
+    /// process-local mutual exclusion is sufficient — no cross-replica
+    /// coordination is required.
+    take_lock: Mutex<()>,
 }
 
 impl KeyspaceOps for FjallKeyspace {
@@ -125,6 +137,31 @@ impl KeyspaceOps for FjallKeyspace {
             })
             .await
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+        })
+    }
+
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            // Per-keyspace mutex serialises the get-then-remove so two
+            // concurrent callers cannot both observe the value before
+            // one of them removes it. fjall is single-process, so
+            // process-local mutual exclusion is the correct primitive.
+            let _guard = self.take_lock.lock().await;
+            let ks = self.keyspace.clone();
+            let key2 = key.clone();
+            let value = tokio::task::spawn_blocking(move || ks.get(key2))
+                .await
+                .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                .map_err(|e| AppError::Store(e.to_string()))?
+                .map(|v| v.to_vec());
+            if value.is_some() {
+                let ks = self.keyspace.clone();
+                tokio::task::spawn_blocking(move || ks.remove(key))
+                    .await
+                    .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                    .map_err(|e| AppError::Store(e.to_string()))?;
+            }
+            Ok(value)
         })
     }
 }
@@ -191,6 +228,34 @@ mod tests {
         ks.insert("key1", &"hello").await.unwrap();
         let val: Option<String> = ks.get("key1").await.unwrap();
         assert_eq!(val, Some("hello".to_string()));
+    }
+
+    /// Two concurrent `take_raw` calls on the same key must observe exactly
+    /// one `Some(_)` and one `None`. This is the contract refresh-token
+    /// rotation depends on.
+    #[tokio::test]
+    async fn take_raw_atomic_serialises_concurrent_claims() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        ks.insert_raw(b"refresh:abc".to_vec(), b"session-X".to_vec())
+            .await
+            .unwrap();
+
+        let ks_a = ks.clone();
+        let ks_b = ks.clone();
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { ks_a.take_raw(b"refresh:abc".to_vec()).await.unwrap() }),
+            tokio::spawn(async move { ks_b.take_raw(b"refresh:abc".to_vec()).await.unwrap() }),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+
+        // Exactly one winner: one observed Some, the other None.
+        let winners = [a.is_some(), b.is_some()].iter().filter(|x| **x).count();
+        assert_eq!(winners, 1, "exactly one concurrent take_raw must win");
+
+        // Key is gone from the store.
+        assert!(ks.get_raw(b"refresh:abc".to_vec()).await.unwrap().is_none());
     }
 
     #[tokio::test]

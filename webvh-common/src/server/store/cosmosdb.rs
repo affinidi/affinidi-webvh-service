@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -114,6 +115,7 @@ impl StorageBackend for CosmosDbBackend {
                 client: self.client.clone(),
                 database: self.database.clone(),
                 container_name: name.to_string(),
+                take_lock: Mutex::new(()),
             }),
         ))
     }
@@ -140,6 +142,9 @@ struct CosmosDbKeyspace {
     client: CosmosClient,
     database: String,
     container_name: String,
+    /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
+    /// single-replica-only caveat.
+    take_lock: Mutex<()>,
 }
 
 fn encode_doc_id(key: &[u8]) -> String {
@@ -160,13 +165,14 @@ impl KeyspaceOps for CosmosDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
             let container = self.container().await?;
+            let doc_id = encode_doc_id(&key);
             let doc = KvDoc {
-                id: encode_doc_id(&key),
+                id: doc_id.clone(),
                 pk: PARTITION_VALUE.to_string(),
                 data: BASE64.encode(&value),
             };
             container
-                .upsert_item(PARTITION_VALUE, doc, None)
+                .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
                 .await
                 .map_err(|e| AppError::Store(format!("cosmosdb upsert: {e}")))?;
             Ok(())
@@ -220,6 +226,27 @@ impl KeyspaceOps for CosmosDbKeyspace {
                 Err(e) if is_not_found(&e) => Ok(false),
                 Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
             }
+        })
+    }
+
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        // Cosmos DB does not expose a single-call atomic get-and-remove
+        // primitive; transactional batches are container-bounded and
+        // would require a transactional batch with a read followed by
+        // a delete, which is heavyweight for the refresh-token rotation
+        // path. The current implementation serialises the get-then-
+        // remove with a per-keyspace mutex — correct for **single-
+        // replica** webvh deployments backed by Cosmos DB. Multi-replica
+        // deployments wanting refresh-token rotation atomicity should
+        // pick `store-redis` or `store-dynamodb`, or upgrade this to
+        // a transactional batch in a follow-up.
+        Box::pin(async move {
+            let _guard = self.take_lock.lock().await;
+            let value = self.get_raw(key.clone()).await?;
+            if value.is_some() {
+                self.remove(key).await?;
+            }
+            Ok(value)
         })
     }
 
@@ -328,13 +355,14 @@ impl BatchOps for CosmosDbBatch {
 
                 match op {
                     CosmosDbBatchOp::Insert { key, value, .. } => {
+                        let doc_id = encode_doc_id(key);
                         let doc = KvDoc {
-                            id: encode_doc_id(key),
+                            id: doc_id.clone(),
                             pk: PARTITION_VALUE.to_string(),
                             data: BASE64.encode(value),
                         };
                         container_client
-                            .upsert_item(PARTITION_VALUE, doc, None)
+                            .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
                             .await
                             .map_err(|e| AppError::Store(format!("cosmosdb batch upsert: {e}")))?;
                     }
