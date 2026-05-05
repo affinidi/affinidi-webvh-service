@@ -120,6 +120,58 @@ jobs:
       # being explicitly bumped in Cargo.toml.
       - run: cargo test --workspace --locked
 
+  keyring-required:
+    name: keyring round-trip (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both targets where the workspace claims first-class keyring
+        # support. macOS has Keychain; Linux gets a session bus + gnome-
+        # keyring spun up explicitly so the test exercises a real Secret
+        # Service implementation rather than silently skipping. Without
+        # the explicit infrastructure the Linux runner has neither, so
+        # the test would skip and a regression would land unnoticed.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      KEYRING_TEST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux Secret Service
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-x11 gnome-keyring libsecret-1-0 libsecret-1-dev
+      - name: Run keyring round-trip on macOS
+        if: matrix.os == 'macos-latest'
+        run: >
+          cargo test -p affinidi-webvh-common --lib
+          --features server-core,store-fjall,keyring
+          server::secret_store::keyring::tests::keyring_round_trip_when_backend_available
+          --
+          --nocapture
+      - name: Run keyring round-trip on Linux (under dbus + gnome-keyring)
+        if: matrix.os == 'ubuntu-latest'
+        # `dbus-run-session` spins up a fresh session bus, then
+        # `gnome-keyring-daemon --unlock` boots the keyring and prints the
+        # `DBUS_SESSION_BUS_ADDRESS` and `GNOME_KEYRING_CONTROL` exports
+        # the test process consumes via env. The unlock password is
+        # piped via stdin per gnome-keyring-daemon's `--unlock` contract.
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            echo -n "ci-test-password" | gnome-keyring-daemon --unlock
+            eval "$(echo -n "ci-test-password" | gnome-keyring-daemon --start)"
+            export GNOME_KEYRING_CONTROL DBUS_SESSION_BUS_ADDRESS
+            cargo test -p affinidi-webvh-common --lib \
+              --features server-core,store-fjall,keyring \
+              server::secret_store::keyring::tests::keyring_round_trip_when_backend_available \
+              -- --nocapture
+          '
+
   cloud-secrets-build:
     name: cargo build (cloud secret backends)
     runs-on: ubuntu-latest

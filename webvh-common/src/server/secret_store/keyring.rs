@@ -251,15 +251,26 @@ mod tests {
     use crate::server::secret_store::SecretStore;
 
     /// Round-trip ServerSecrets through the OS keychain. Skipped if the host
-    /// keychain is not reachable (CI containers without a Secret Service
-    /// implementation will hit this branch and exit clean rather than fail).
+    /// keychain is not reachable.
+    ///
+    /// CI behaviour: when `KEYRING_TEST_REQUIRED=1` is set, the skip path
+    /// panics rather than passes. CI legs on macOS/Windows (which always
+    /// have a credential store) and Linux legs that bring up
+    /// `dbus-run-session` + a Secret Service implementation should set the
+    /// var so a regression in the keyring backend can't silently disappear
+    /// behind a "test ran and passed" CI line. Developer machines without
+    /// the env var still get the polite skip.
     #[tokio::test]
     async fn keyring_round_trip_when_backend_available() {
+        let required = std::env::var("KEYRING_TEST_REQUIRED").ok().as_deref() == Some("1");
         let service = format!("affinidi-webvh-test-{}", uuid::Uuid::new_v4());
         let user = "round_trip";
         let store = match KeyringSecretStore::try_new(&service, user) {
             Ok(s) => s,
             Err(e) => {
+                if required {
+                    panic!("KEYRING_TEST_REQUIRED=1 but backend unavailable: {e}");
+                }
                 eprintln!("skipping keyring test — backend unavailable: {e}");
                 return;
             }
@@ -273,10 +284,13 @@ mod tests {
         };
 
         // Probe the backend with a write+delete; if the OS denies access in
-        // this environment (sandboxed CI, no D-Bus session, etc.) we still
-        // skip the round-trip rather than failing.
-        if store.set(&secrets).await.is_err() {
-            eprintln!("skipping keyring test — backend refused write");
+        // this environment (sandboxed CI, no D-Bus session, etc.) we either
+        // panic (CI with KEYRING_TEST_REQUIRED=1) or skip cleanly (dev box).
+        if let Err(e) = store.set(&secrets).await {
+            if required {
+                panic!("KEYRING_TEST_REQUIRED=1 but backend refused write: {e}");
+            }
+            eprintln!("skipping keyring test — backend refused write: {e}");
             return;
         }
 
