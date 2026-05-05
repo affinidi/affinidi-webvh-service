@@ -683,6 +683,13 @@ fn problem_report(code: &str, comment: &str) -> (String, Value) {
     )
 }
 
+/// Map an internal `AppError` to its DIDComm protocol error code.
+///
+/// **Stability:** the substring matches against `Validation` / `QuotaExceeded`
+/// messages are intentionally narrow — they live next to a table-driven test
+/// (see `mod tests` below) so a wording change in `AppError(...)` literals
+/// elsewhere in the workspace fails the test rather than silently re-routes
+/// to a different protocol code.
 fn map_app_error_code(err: &AppError) -> &'static str {
     match err {
         AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
@@ -707,5 +714,69 @@ fn map_app_error_code(err: &AppError) -> &'static str {
             }
         }
         _ => "e.p.did.internal-error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the AppError → DIDComm protocol-code mapping. The handler set is
+    /// the wire-level contract for every external VTA, and the substring
+    /// matches inside this function are easy to break with a wording change
+    /// in any `AppError::*` literal elsewhere.
+    #[test]
+    fn map_app_error_code_pinned_table() {
+        let cases: &[(AppError, &str)] = &[
+            (
+                AppError::Unauthorized("nope".into()),
+                "e.p.did.unauthorized",
+            ),
+            (AppError::Forbidden("nope".into()), "e.p.did.unauthorized"),
+            (
+                AppError::QuotaExceeded("upload size cap exceeded".into()),
+                "e.p.did.size-exceeded",
+            ),
+            (
+                AppError::QuotaExceeded("monthly quota reached".into()),
+                "e.p.did.quota-exceeded",
+            ),
+            (
+                AppError::Conflict("path already in use".into()),
+                "e.p.did.path-unavailable",
+            ),
+            (
+                AppError::NotFound("did not found".into()),
+                "e.p.did.mnemonic-not-found",
+            ),
+            (
+                AppError::Validation("invalid log entry on line 3".into()),
+                "e.p.did.invalid-log",
+            ),
+            (
+                AppError::Validation("malformed JSONL body".into()),
+                "e.p.did.invalid-log",
+            ),
+            (
+                AppError::Validation("path component reserved".into()),
+                "e.p.did.path-invalid",
+            ),
+            (
+                AppError::Validation("witness signature failed".into()),
+                "e.p.did.witness-invalid",
+            ),
+            (
+                AppError::Validation("something else broke".into()),
+                "e.p.did.validation-error",
+            ),
+            (AppError::Internal("oops".into()), "e.p.did.internal-error"),
+        ];
+        for (err, expected) in cases {
+            let got = map_app_error_code(err);
+            assert_eq!(
+                got, *expected,
+                "map_app_error_code({err:?}) = {got}, expected {expected}",
+            );
+        }
     }
 }

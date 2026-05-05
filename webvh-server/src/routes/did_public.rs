@@ -53,9 +53,16 @@ async fn serve_content(
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
+    // DID logs are content-addressed (the SCID prevents content drift) and
+    // safe to cache aggressively. Setting an explicit `Cache-Control` here
+    // overrides the global `no-store` security middleware so CDNs and
+    // browsers can serve hot DIDs without round-tripping the origin.
     Ok((
         StatusCode::OK,
-        [("content-type", content_type)],
+        [
+            ("content-type", content_type),
+            ("cache-control", "public, max-age=300"),
+        ],
         (*content).clone(),
     )
         .into_response())

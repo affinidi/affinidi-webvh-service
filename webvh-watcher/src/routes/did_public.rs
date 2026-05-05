@@ -34,7 +34,19 @@ async fn serve_content(
 
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
-    Ok((StatusCode::OK, [("content-type", content_type)], content).into_response())
+    // Public DID resolution is cacheable (content-addressed via the SCID).
+    // Setting Cache-Control here overrides the global `no-store` security
+    // middleware so CDNs / browsers can serve mirrored DIDs without
+    // hitting the watcher origin every time.
+    Ok((
+        StatusCode::OK,
+        [
+            ("content-type", content_type),
+            ("cache-control", "public, max-age=300"),
+        ],
+        content,
+    )
+        .into_response())
 }
 
 /// GET /.well-known/did.jsonl — serve the root DID log

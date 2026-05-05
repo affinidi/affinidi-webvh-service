@@ -18,14 +18,27 @@ use base64::Engine;
 use super::error::AppError;
 
 /// Extract the signer's key ID from a JWS protected header without verifying the signature.
+///
+/// Rejects multi-signature JWS envelopes outright — the threat model assumes a
+/// single signer and accepting additional signatures silently would create
+/// surprising states (which signature did we verify? which one bound the
+/// `from` field?). If multi-sig becomes a real requirement, the decision
+/// belongs in a separate, deliberate API.
 fn extract_signer_kid(jws_str: &str) -> Result<String, AppError> {
     let jws: Jws = serde_json::from_str(jws_str)
         .map_err(|e| AppError::Authentication(format!("invalid JWS JSON: {e}")))?;
 
-    let sig = jws
-        .signatures
-        .first()
-        .ok_or_else(|| AppError::Authentication("JWS has no signatures".into()))?;
+    if jws.signatures.is_empty() {
+        return Err(AppError::Authentication("JWS has no signatures".into()));
+    }
+    if jws.signatures.len() > 1 {
+        return Err(AppError::Authentication(format!(
+            "JWS has {} signatures; only single-signer envelopes are accepted",
+            jws.signatures.len()
+        )));
+    }
+
+    let sig = &jws.signatures[0];
 
     let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&sig.protected)
@@ -40,6 +53,15 @@ fn extract_signer_kid(jws_str: &str) -> Result<String, AppError> {
 }
 
 /// Resolve an Ed25519 verifying key from a DID document given a key ID (DID URL fragment).
+///
+/// Rejects verification methods whose `type` declares them as X25519
+/// key-agreement keys. Ed25519 (signing) and X25519 (DH) keys are both 32
+/// bytes, so the length check below would not catch a kid that points at
+/// the wrong key type — the operator would just see a mysterious "unpack
+/// failed" downstream. An explicit type-class check produces a precise
+/// error and avoids confusing-key-purpose attacks where a DID document
+/// publishes both signing and key-agreement keys under predictable
+/// fragments.
 async fn resolve_verifying_key(
     did_resolver: &DIDCacheClient,
     kid: &str,
@@ -56,6 +78,21 @@ async fn resolve_verifying_key(
             "verification method {kid} not found in DID document"
         ))
     })?;
+
+    // Reject obvious key-agreement (X25519) types. We don't whitelist Ed25519
+    // types because the spec admits several names (Ed25519VerificationKey2018,
+    // Ed25519VerificationKey2020, Multikey with a z6Mk… prefix, JsonWebKey2020
+    // with crv:Ed25519) — but X25519 has narrow, well-known type names that
+    // are unambiguous to refuse.
+    let vm_type = vm.type_.as_str();
+    if matches!(
+        vm_type,
+        "X25519KeyAgreementKey2020" | "X25519KeyAgreementKey2019"
+    ) {
+        return Err(AppError::Authentication(format!(
+            "verification method {kid} is an X25519 key-agreement key; expected an Ed25519 signing key"
+        )));
+    }
 
     let pk_bytes = vm
         .get_public_key_bytes()
@@ -205,5 +242,29 @@ mod tests {
     #[test]
     fn extract_signer_kid_rejects_invalid_json() {
         assert!(extract_signer_kid("not-json").is_err());
+    }
+
+    #[test]
+    fn extract_signer_kid_rejects_multi_signature_envelope() {
+        let header_json = serde_json::json!({ "kid": "did:example:123#key-1", "alg": "EdDSA" });
+        let protected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&header_json).unwrap(),
+        );
+        let jws = serde_json::json!({
+            "payload": "ignored",
+            "signatures": [
+                { "protected": protected_b64.clone(), "signature": "ignored" },
+                { "protected": protected_b64, "signature": "second" },
+            ],
+        });
+        let err = extract_signer_kid(&jws.to_string()).unwrap_err();
+        match err {
+            AppError::Authentication(msg) => assert!(
+                msg.contains("only single-signer"),
+                "expected multi-sig rejection message, got: {msg}",
+            ),
+            other => panic!("expected Authentication, got {other:?}"),
+        }
     }
 }

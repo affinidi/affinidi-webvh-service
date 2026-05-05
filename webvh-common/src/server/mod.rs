@@ -40,7 +40,10 @@ pub mod vta_setup;
 ///   any caller that has reached us over HTTPS. Browsers ignore this header
 ///   when delivered over plaintext HTTP, so it is harmless on plain-HTTP
 ///   deployments.
-/// - `Cache-Control: no-store` — never cache API/UI responses by default.
+/// - `Cache-Control: no-store` — applied only when the handler hasn't set its
+///   own `Cache-Control`. Public DID-resolution endpoints set
+///   `Cache-Control: public, max-age=…` explicitly so CDNs and browsers can
+///   cache them; admin/API responses fall through to `no-store`.
 pub async fn security_headers(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -75,9 +78,15 @@ pub async fn security_headers(
         axum::http::header::STRICT_TRANSPORT_SECURITY,
         axum::http::HeaderValue::from_static("max-age=31536000"),
     );
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
+    // Default to `no-store` for API / UI responses. Public DID-resolution
+    // handlers set `Cache-Control: public, max-age=…` explicitly so this
+    // middleware leaves their value untouched — DID logs are content-
+    // addressed and cacheable.
+    if !headers.contains_key(axum::http::header::CACHE_CONTROL) {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
     resp
 }
