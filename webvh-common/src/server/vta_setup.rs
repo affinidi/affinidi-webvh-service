@@ -398,10 +398,11 @@ pub struct OfflineRequestInfo {
 /// bundle carries (authorization VC, pinned VTA DID, trust bundle).
 #[derive(Debug, Clone)]
 pub struct OfflineBootstrapResult {
+    /// Integration DID — the service's own `did:webvh:…` identifier.
     pub did: String,
-    /// Multibase-encoded Ed25519 private signing key.
+    /// Multibase-encoded Ed25519 private signing key for the integration DID.
     pub signing_key_multibase: String,
-    /// Multibase-encoded X25519 private key agreement key.
+    /// Multibase-encoded X25519 private key agreement key for the integration DID.
     pub key_agreement_multibase: String,
     /// Rendered DID document (published verbatim on the webvh host).
     pub did_document: serde_json::Value,
@@ -415,6 +416,17 @@ pub struct OfflineBootstrapResult {
     pub vta_did: String,
     /// VTA REST URL (store for future online re-auth, if we ever need it).
     pub vta_url: Option<String>,
+    /// Admin DID — the long-term operator DID the VTA rolled over to.
+    /// Present when the VTA's `vta-admin` template ran during provision-
+    /// integration; absent when the VTA disabled rollover and the
+    /// integration DID is also the admin identity. Use for seeding the
+    /// service's ACL with the operator's long-term identity.
+    pub admin_did: Option<String>,
+    /// Multibase-encoded Ed25519 private signing key for the admin DID.
+    /// Present iff `admin_did` is. Use for downstream operations that
+    /// need to authenticate as the admin (passkey enrolment, manual
+    /// DIDComm flows, etc.).
+    pub admin_signing_key_multibase: Option<String>,
 }
 
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
@@ -539,7 +551,7 @@ pub fn open_offline_bootstrap_response(
         .ok_or("sealed payload missing config.did_document.id")?
         .to_string();
     let mut secrets_map = payload.secrets;
-    let key_material = secrets_map
+    let integration_key_material = secrets_map
         .remove(&integration_did)
         .or_else(|| {
             // Forward-compat fallback: if the payload doesn't carry a
@@ -550,9 +562,25 @@ pub fn open_offline_bootstrap_response(
                 integration_did = %integration_did,
                 "sealed payload secrets map does not contain integration DID; falling back to first entry",
             );
-            secrets_map.into_iter().next().map(|(_, v)| v)
+            // Take the first remaining entry without consuming the whole
+            // map — the next block needs the leftover entries to find
+            // the admin material.
+            let key = secrets_map.keys().next().cloned()?;
+            secrets_map.remove(&key)
         })
         .ok_or("sealed payload has no secrets")?;
+
+    // Any remaining entry is the admin DID rolled over by the VTA's
+    // `vta-admin` template. Surface it so the wizard can seed the
+    // service's ACL with the operator's long-term identity. The VTA
+    // emits at most one rolled-over admin per provision-integration; if
+    // future templates emit more we'd surface only the first and log,
+    // matching the integration DID fallback.
+    let admin_entry = secrets_map.into_iter().next();
+    let (admin_did, admin_signing_key_multibase) = match admin_entry {
+        Some((_did, mat)) => (Some(mat.did), Some(mat.signing_key.private_key_multibase)),
+        None => (None, None),
+    };
 
     let log_entry = payload.config.outputs.iter().find_map(|o| match o {
         TemplateOutput::WebvhLog { log, .. } => Some(log.clone()),
@@ -560,14 +588,16 @@ pub fn open_offline_bootstrap_response(
     });
 
     Ok(OfflineBootstrapResult {
-        did: key_material.did,
-        signing_key_multibase: key_material.signing_key.private_key_multibase,
-        key_agreement_multibase: key_material.ka_key.private_key_multibase,
+        did: integration_key_material.did,
+        signing_key_multibase: integration_key_material.signing_key.private_key_multibase,
+        key_agreement_multibase: integration_key_material.ka_key.private_key_multibase,
         did_document: payload.config.did_document,
         log_entry,
         authorization_vc: payload.authorization,
         vta_did: payload.config.vta_trust.vta_did,
         vta_url: payload.config.vta_url,
+        admin_did,
+        admin_signing_key_multibase,
     })
 }
 
@@ -716,6 +746,8 @@ pub fn run_offline_open_cli(
         "did": result.did,
         "signing_key_multibase": result.signing_key_multibase,
         "key_agreement_multibase": result.key_agreement_multibase,
+        "admin_did": result.admin_did,
+        "admin_signing_key_multibase": result.admin_signing_key_multibase,
         "vta_did": result.vta_did,
         "vta_url": result.vta_url,
         "authorization_vc": result.authorization_vc,
@@ -1328,6 +1360,14 @@ mod tests {
         assert_eq!(
             result.log_entry.as_deref(),
             Some("{\"versionId\":\"1-roundtrip\"}\n")
+        );
+        // Admin rollover material — the original bug silently dropped
+        // these on the floor. The wizard needs them to seed the ACL
+        // with the operator's long-term identity.
+        assert_eq!(result.admin_did.as_deref(), Some(admin_did));
+        assert_eq!(
+            result.admin_signing_key_multibase.as_deref(),
+            Some("zAdminPriv")
         );
 
         // Bad digest must reject in constant time. Flip the first hex
