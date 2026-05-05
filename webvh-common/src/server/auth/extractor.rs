@@ -69,13 +69,22 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
             return Err(AppError::Unauthorized("session not authenticated".into()));
         }
 
-        // Validate token_id matches — prevents use of old tokens after refresh
-        if let Some(ref session_token_id) = session.token_id
-            && !claims.jti.is_empty()
-            && claims.jti != *session_token_id
-        {
-            warn!(session_id = %claims.session_id, "auth rejected: token revoked (stale jti)");
-            return Err(AppError::Unauthorized("token has been revoked".into()));
+        // Validate token_id matches — prevents use of old tokens after refresh.
+        //
+        // The empty-jti branch is closed: when the session has a `token_id`,
+        // the JWT's `jti` MUST be present and equal. Allowing a missing jti to
+        // pass would let any future code path that emits jti-less tokens
+        // bypass rotation entirely. New code must always include `jti`; any
+        // such token is treated as revoked.
+        if let Some(ref session_token_id) = session.token_id {
+            if claims.jti.is_empty() {
+                warn!(session_id = %claims.session_id, "auth rejected: token has empty jti while session has token_id");
+                return Err(AppError::Unauthorized("token has been revoked".into()));
+            }
+            if claims.jti != *session_token_id {
+                warn!(session_id = %claims.session_id, "auth rejected: token revoked (stale jti)");
+                return Err(AppError::Unauthorized("token has been revoked".into()));
+            }
         }
 
         let role = claims.role.parse::<Role>()?;
@@ -316,6 +325,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin.0.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn auth_claims_rejects_empty_jti_when_session_has_token_id() {
+        // Regression: empty jti must not bypass rotation. If a future bug
+        // emitted tokens without a jti, the rotation check used to short-
+        // circuit and accept the token. Now any session with a token_id
+        // requires a non-empty matching jti.
+        let (state, _dir) = make_state().await;
+        let session_id = seed_session(&state, Role::Owner, "expected-jti").await;
+        let token = issue(&state, &session_id, "owner", "");
+        let mut parts = parts_with_bearer(&token);
+        let err = AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn service_auth_accepts_service_role() {
+        // Positive path for ServiceAuth — the previous round only had a
+        // negative case, so a regression that broke Service-role acceptance
+        // would not fail any test.
+        let (state, _dir) = make_state().await;
+        let session_id = seed_session(&state, Role::Service, "tok").await;
+        let token = issue(&state, &session_id, "service", "tok");
+        let mut parts = parts_with_bearer(&token);
+        let svc = ServiceAuth::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(svc.0.role, Role::Service);
     }
 
     #[tokio::test]

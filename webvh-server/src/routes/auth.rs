@@ -208,7 +208,7 @@ pub async fn refresh(
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
     // sender_base is JWS-verified; refresh requires the holder's signed envelope.
-    let (msg, _sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
@@ -231,6 +231,22 @@ pub async fn refresh(
     let session = get_session(&state.sessions_ks, &session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    // Bind the JWS signer to the session DID. Without this check, a leaked
+    // refresh token plus any attacker-controlled DID is enough to rotate the
+    // victim's tokens — the signed envelope alone proves possession of *some*
+    // signing key, not the right one.
+    if sender_base != session.did {
+        warn!(
+            session_id = %session.session_id,
+            session_did = %session.did,
+            sender = %sender_base,
+            "refresh rejected: signer DID does not match session DID",
+        );
+        return Err(AppError::Authentication(
+            "signer DID does not match session DID".into(),
+        ));
+    }
 
     if session.state != SessionState::Authenticated {
         warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: session not authenticated");
