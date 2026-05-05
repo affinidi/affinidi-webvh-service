@@ -1,3 +1,18 @@
+//! WebVH Witness — generates and signs cryptographic witness proofs for
+//! DID integrity verification.
+//!
+//! # Stability
+//!
+//! Pre-1.0 — the public-module surface is intentionally wide so that
+//! `webvh-daemon` can compose this crate as a library. Treat every `pub`
+//! module as **unstable**; breaking changes can land in any minor version.
+//! Pin internal deps with `major.minor` (`= "0.6"`).
+//!
+//! Notably stable: the [`signing::WitnessSigner`] trait is the documented
+//! extension point for plugging in remote-signing backends (HSM, KMS,
+//! VTA-managed keys). Its signature is async (returns a `BoxFuture`) and
+//! intended to remain stable across the 0.6 series.
+
 pub mod acl;
 pub mod auth;
 pub mod config;

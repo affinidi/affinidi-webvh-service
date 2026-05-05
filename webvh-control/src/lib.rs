@@ -1,3 +1,14 @@
+//! WebVH Control Plane — DID lifecycle management, ACL, registry, and UI.
+//!
+//! # Stability
+//!
+//! Pre-1.0 — the public-module surface is intentionally wide so that
+//! `webvh-daemon` can compose this crate as a library. Treat every `pub`
+//! module as **unstable**; breaking changes can land in any minor version.
+//! Pin internal deps with `major.minor` (`= "0.6"`). The semver-stable
+//! shapes consumers should rely on (request/response types, DID shapes,
+//! auth primitives) live in `affinidi-webvh-common`.
+
 pub mod acl;
 pub mod auth;
 pub mod config;
