@@ -11,21 +11,22 @@ use super::{BoxFuture, SecretStore, ServerSecrets};
 /// **WARNING**: This is insecure — secrets are stored unencrypted on disk.
 /// Only use for testing and development. For production, compile with a secure
 /// backend: `keyring`, `aws-secrets`, or `gcp-secrets`.
+///
+/// Both bootstrap-seed reads and writes go through the on-disk config file
+/// — there is no in-memory cache of the seed. Earlier revisions cached the
+/// seed at construction, which made phase 2 of the offline-bootstrap
+/// wizard fail: phase 1 wrote the seed to disk but the `SecretsConfig`
+/// snapshot the wizard saved into `setup-offline-state.toml` still had
+/// `plaintext_bootstrap_seed = None`, so phase 2 reconstructed the store
+/// against a stale snapshot and reported "bootstrap seed missing from
+/// secret store — phase 1 may not have run".
 pub struct PlaintextSecretStore {
     secrets: Option<ServerSecrets>,
-    /// Initial seed value lifted from `[secrets.plaintext_bootstrap_seed]`
-    /// at construction. Phase 2 reads it via `get_bootstrap_seed`; later
-    /// `clear_bootstrap_seed` rewrites the config.toml without the field.
-    bootstrap_seed_b64: Option<String>,
     config_path: PathBuf,
 }
 
 impl PlaintextSecretStore {
-    pub fn new(
-        plaintext: Option<&PlaintextSecrets>,
-        bootstrap_seed_b64: Option<String>,
-        config_path: PathBuf,
-    ) -> Self {
+    pub fn new(plaintext: Option<&PlaintextSecrets>, config_path: PathBuf) -> Self {
         warn!(
             "plaintext secret store is insecure — use keyring, aws-secrets, or gcp-secrets in production"
         );
@@ -36,7 +37,6 @@ impl PlaintextSecretStore {
                 jwt_signing_key: p.jwt_signing_key.clone(),
                 vta_credential: p.vta_credential.clone(),
             }),
-            bootstrap_seed_b64,
             config_path,
         }
     }
@@ -108,24 +108,12 @@ impl SecretStore for PlaintextSecretStore {
     }
 
     fn get_bootstrap_seed(&self) -> super::BoxFuture<'_, Result<Option<[u8; 32]>, AppError>> {
-        let b64 = self.bootstrap_seed_b64.clone();
-        Box::pin(async move {
-            let Some(b64) = b64 else { return Ok(None) };
-            use base64::Engine;
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-            let bytes = B64.decode(b64.as_bytes()).map_err(|e| {
-                AppError::SecretStore(format!(
-                    "failed to base64-decode plaintext bootstrap seed: {e}"
-                ))
-            })?;
-            let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                AppError::SecretStore(format!(
-                    "plaintext bootstrap seed has {} bytes, expected 32",
-                    bytes.len()
-                ))
-            })?;
-            Ok(Some(seed))
-        })
+        // Always re-read the config file. The wizard's phase-1/phase-2
+        // split serialises a `SecretsConfig` snapshot before writing the
+        // seed, so any in-memory cache here would be stale by phase 2.
+        // The on-disk file is the source of truth for plaintext mode.
+        let config_path = self.config_path.clone();
+        Box::pin(async move { read_plaintext_seed_field(&config_path).await })
     }
 
     fn set_bootstrap_seed(&self, seed: &[u8; 32]) -> super::BoxFuture<'_, Result<(), AppError>> {
@@ -140,6 +128,59 @@ impl SecretStore for PlaintextSecretStore {
         let config_path = self.config_path.clone();
         Box::pin(async move { write_plaintext_seed_field(&config_path, None).await })
     }
+}
+
+/// Read `[secrets].plaintext_bootstrap_seed` from `config_path`. Returns
+/// `None` when the file is missing (e.g. phase 1 hasn't run yet) or the
+/// field is absent. Errors only on malformed TOML or seed bytes.
+///
+/// This is the read counterpart to [`write_plaintext_seed_field`]: the
+/// pair forms the round-trip `set` / `get` for the bootstrap seed in
+/// plaintext mode. Reading directly from disk (rather than caching at
+/// construction) is what closes the offline-wizard staleness bug —
+/// phase 1's `set_bootstrap_seed` writes to the same file phase 2's
+/// `get_bootstrap_seed` will read from, regardless of what
+/// `SecretsConfig` snapshot the wizard happened to serialise.
+async fn read_plaintext_seed_field(
+    config_path: &std::path::Path,
+) -> Result<Option<[u8; 32]>, AppError> {
+    let contents = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Config(format!(
+                "failed to read config file {}: {e}",
+                config_path.display()
+            )));
+        }
+    };
+    let doc: toml::Value = toml::from_str(&contents).map_err(|e| {
+        AppError::Config(format!(
+            "failed to parse config file {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let Some(b64) = doc
+        .get("secrets")
+        .and_then(|s| s.get("plaintext_bootstrap_seed"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    let bytes = B64.decode(b64.as_bytes()).map_err(|e| {
+        AppError::SecretStore(format!(
+            "failed to base64-decode plaintext bootstrap seed: {e}"
+        ))
+    })?;
+    let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        AppError::SecretStore(format!(
+            "plaintext bootstrap seed has {} bytes, expected 32",
+            bytes.len()
+        ))
+    })?;
+    Ok(Some(seed))
 }
 
 /// Rewrite `[secrets].plaintext_bootstrap_seed` in `config_path`
@@ -236,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_none_when_no_plaintext_configured() {
-        let store = PlaintextSecretStore::new(None, None, PathBuf::from("nonexistent.toml"));
+        let store = PlaintextSecretStore::new(None, PathBuf::from("nonexistent.toml"));
         let result = store.get().await.unwrap();
         assert!(result.is_none());
     }
@@ -244,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn get_returns_secrets_when_plaintext_configured() {
         let pt = sample_plaintext();
-        let store = PlaintextSecretStore::new(Some(&pt), None, PathBuf::from("unused.toml"));
+        let store = PlaintextSecretStore::new(Some(&pt), PathBuf::from("unused.toml"));
         let result = store.get().await.unwrap().expect("should have secrets");
         assert_eq!(result.signing_key, "z6Mktest_signing");
         assert_eq!(result.key_agreement_key, "z6LStest_agreement");
@@ -261,7 +302,7 @@ mod tests {
             .await
             .unwrap();
 
-        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        let store = PlaintextSecretStore::new(None, config_path.clone());
         store.set(&sample_secrets()).await.unwrap();
 
         // Read back and verify [secrets.plaintext] was added
@@ -298,7 +339,7 @@ keyring_service = "my-service"
 "#;
         tokio::fs::write(&config_path, initial).await.unwrap();
 
-        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        let store = PlaintextSecretStore::new(None, config_path.clone());
         store.set(&sample_secrets()).await.unwrap();
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
@@ -330,7 +371,7 @@ rest_api = true
         tokio::fs::write(&config_path, initial).await.unwrap();
 
         // Store secrets via set()
-        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        let store = PlaintextSecretStore::new(None, config_path.clone());
         store.set(&sample_secrets()).await.unwrap();
 
         // Read the file back and parse the plaintext section
@@ -343,7 +384,7 @@ rest_api = true
             .expect("should deserialize PlaintextSecrets");
 
         // Create a new store from the reloaded data and verify get() works
-        let store2 = PlaintextSecretStore::new(Some(&reloaded), None, config_path);
+        let store2 = PlaintextSecretStore::new(Some(&reloaded), config_path);
         let result = store2.get().await.unwrap().expect("should have secrets");
         assert_eq!(result.signing_key, "z6Mktest_signing");
         assert_eq!(result.key_agreement_key, "z6LStest_agreement");
@@ -352,12 +393,19 @@ rest_api = true
 
     #[tokio::test]
     async fn set_errors_on_missing_config_file() {
-        let store =
-            PlaintextSecretStore::new(None, None, PathBuf::from("/nonexistent/path/config.toml"));
+        let store = PlaintextSecretStore::new(None, PathBuf::from("/nonexistent/path/config.toml"));
         let result = store.set(&sample_secrets()).await;
         assert!(result.is_err());
     }
 
+    /// Regression for the offline-bootstrap wizard bug. Phase 1 writes the
+    /// seed to disk and serialises a `SecretsConfig` snapshot into
+    /// `setup-offline-state.toml` — but the snapshot was captured *before*
+    /// the seed was written, so phase 2 reconstructs the store with no
+    /// in-memory seed. Earlier revisions cached the seed at construction
+    /// and would report "bootstrap seed missing from secret store —
+    /// phase 1 may not have run" here. The store must read the seed
+    /// directly from the config file.
     #[tokio::test]
     async fn bootstrap_seed_set_get_clear_roundtrip_via_config_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -366,22 +414,21 @@ rest_api = true
             .await
             .unwrap();
 
-        // Phase 1 perspective: store is built fresh (no preloaded seed).
-        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        // Phase 1: write the seed.
+        let phase1 = PlaintextSecretStore::new(None, config_path.clone());
         let seed = [42u8; 32];
-        store.set_bootstrap_seed(&seed).await.unwrap();
+        phase1.set_bootstrap_seed(&seed).await.unwrap();
 
-        // Re-construct to mimic phase 2 reading from disk after a
-        // restart — load the b64 from `[secrets].plaintext_bootstrap_seed`.
-        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
-        let doc: toml::Value = toml::from_str(&contents).unwrap();
-        let b64 = doc["secrets"]["plaintext_bootstrap_seed"]
-            .as_str()
+        // Phase 2: a fresh store, *without* a preloaded seed — exactly
+        // what `create_secret_store` constructs after deserialising
+        // `state.secrets` from `setup-offline-state.toml`. Must still
+        // surface the seed.
+        let phase2 = PlaintextSecretStore::new(None, config_path.clone());
+        let read = phase2
+            .get_bootstrap_seed()
+            .await
             .unwrap()
-            .to_string();
-
-        let phase2 = PlaintextSecretStore::new(None, Some(b64), config_path.clone());
-        let read = phase2.get_bootstrap_seed().await.unwrap().unwrap();
+            .expect("phase 2 must read the seed phase 1 wrote, even with a stale snapshot");
         assert_eq!(read, seed);
 
         // Clear removes the field from the config.toml.
@@ -389,6 +436,76 @@ rest_api = true
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let doc: toml::Value = toml::from_str(&contents).unwrap();
         assert!(doc["secrets"].get("plaintext_bootstrap_seed").is_none());
+
+        // After clearing, get returns None on the same store — the file
+        // is the source of truth.
+        assert!(phase2.get_bootstrap_seed().await.unwrap().is_none());
+    }
+
+    /// Same regression, but driven through `create_secret_store` — the
+    /// public entry point both wizards and runtime callers go through.
+    /// Mimics the wizard's exact flow: serialise `SecretsConfig` after
+    /// phase 1, deserialise in phase 2, then look up the seed.
+    #[tokio::test]
+    #[cfg(not(feature = "keyring"))]
+    async fn create_secret_store_bootstrap_seed_survives_wizard_serialisation() {
+        use crate::server::config::SecretsConfig;
+        use crate::server::secret_store::create_secret_store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "[server]\nhost = \"0.0.0.0\"\n")
+            .await
+            .unwrap();
+
+        // Phase 1: wizard captures the SecretsConfig (no seed yet) and
+        // then writes the seed via the freshly-built store.
+        let secrets = SecretsConfig::default();
+        let phase1 = create_secret_store(&secrets, &config_path).unwrap();
+        let seed = [7u8; 32];
+        phase1.set_bootstrap_seed(&seed).await.unwrap();
+
+        // Phase 1 then serialises `secrets` into `setup-offline-state.toml`
+        // — the snapshot is stale (still has plaintext_bootstrap_seed: None).
+        let state_toml = toml::to_string_pretty(&secrets).unwrap();
+        let snapshot: SecretsConfig = toml::from_str(&state_toml).unwrap();
+        assert!(
+            snapshot.plaintext_bootstrap_seed.is_none(),
+            "snapshot is stale by design — fix must not depend on it being populated"
+        );
+
+        // Phase 2: rebuild the store from the stale snapshot and the
+        // same config_path. Must still find the seed phase 1 wrote.
+        let phase2 = create_secret_store(&snapshot, &config_path).unwrap();
+        let read = phase2
+            .get_bootstrap_seed()
+            .await
+            .unwrap()
+            .expect("phase 2 must read the seed regardless of SecretsConfig staleness");
+        assert_eq!(read, seed);
+    }
+
+    /// Malformed seed bytes surface as `SecretStore` errors, not silent
+    /// `None`. Operator-edited config files with hand-typed seeds need a
+    /// loud failure so the typo is fixable, not silently retried as
+    /// "phase 1 didn't run".
+    #[tokio::test]
+    async fn bootstrap_seed_get_errors_on_malformed_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // Valid base64url-no-pad, but only 3 bytes — not 32.
+        tokio::fs::write(
+            &config_path,
+            "[secrets]\nplaintext_bootstrap_seed = \"AAAA\"\n",
+        )
+        .await
+        .unwrap();
+        let store = PlaintextSecretStore::new(None, config_path);
+        let err = store.get_bootstrap_seed().await.unwrap_err();
+        assert!(
+            matches!(err, AppError::SecretStore(_)),
+            "expected SecretStore, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -401,7 +518,7 @@ rest_api = true
             .await
             .unwrap();
 
-        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        let store = PlaintextSecretStore::new(None, config_path.clone());
         let mut s = sample_secrets();
         s.vta_credential = Some("opaque-vta-credential-blob".into());
         store.set(&s).await.unwrap();
@@ -417,7 +534,7 @@ rest_api = true
         );
 
         // Verify a fresh store loads it back via get().
-        let store2 = PlaintextSecretStore::new(Some(&reloaded), None, config_path);
+        let store2 = PlaintextSecretStore::new(Some(&reloaded), config_path);
         let read = store2.get().await.unwrap().expect("secrets present");
         assert_eq!(
             read.vta_credential.as_deref(),
@@ -427,7 +544,7 @@ rest_api = true
 
     #[tokio::test]
     async fn bootstrap_seed_get_returns_none_when_unset() {
-        let store = PlaintextSecretStore::new(None, None, PathBuf::from("nonexistent.toml"));
+        let store = PlaintextSecretStore::new(None, PathBuf::from("nonexistent.toml"));
         assert!(store.get_bootstrap_seed().await.unwrap().is_none());
     }
 }

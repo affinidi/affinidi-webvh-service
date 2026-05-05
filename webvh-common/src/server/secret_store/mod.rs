@@ -286,7 +286,6 @@ pub fn create_secret_store(
     {
         let store = plaintext::PlaintextSecretStore::new(
             secrets.plaintext.as_ref(),
-            secrets.plaintext_bootstrap_seed.clone(),
             config_path.to_path_buf(),
         );
         Ok(Box::new(store))

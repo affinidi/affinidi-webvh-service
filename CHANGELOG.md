@@ -131,6 +131,21 @@
   the link, registers a passkey, and is added to the ACL automatically.
 
 ### Fixed
+- **Offline-bootstrap phase 2 fails with "bootstrap seed missing from
+  secret store" in plaintext mode.** Phase 1 wrote the seed to
+  `[secrets].plaintext_bootstrap_seed` in `config.toml` and serialised
+  the wizard's `SecretsConfig` snapshot — captured *before* the seed was
+  written — into `setup-offline-state.toml`. Phase 2 reconstructed the
+  store from that stale snapshot and reported the seed missing even
+  though it was sitting on disk. Affected all four wizards (daemon,
+  control, server, witness) when built without a secure secrets backend
+  (no `keyring` / `aws-secrets` / `gcp-secrets` / `azure-secrets`
+  feature). `PlaintextSecretStore::get_bootstrap_seed` now reads
+  directly from the config file rather than caching at construction;
+  the file is the source of truth, matching how the cloud and keyring
+  backends already worked. Regression tests cover the wizard's exact
+  serialise-snapshot-then-reload flow plus the malformed-seed
+  operator-edit case.
 - **Setup wizards**: the offline-bootstrap "Next steps" output printed
   an incorrect VTA-host CLI hint
   (`vta context provision --context X --admin Y`). The actual command
