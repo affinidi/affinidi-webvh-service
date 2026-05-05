@@ -166,12 +166,32 @@ pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<affinidi_webvh_common::RefreshResponse>, AppError> {
-    let jwt_keys = state
-        .jwt_keys
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+    use affinidi_webvh_common::server::didcomm_unpack;
 
-    let refresh_token = body.trim().trim_matches('"');
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+
+    // Parity with server/witness: refresh requires a JWS-signed DIDComm
+    // envelope addressed by the holder of the session DID. Proves
+    // possession of the signing key, not just the bearer refresh token,
+    // so a leaked refresh token alone cannot rotate a victim's tokens.
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    let refresh_token = msg
+        .body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
+
+    // Claim exclusive rotation rights on this refresh token. Two concurrent
+    // requests with the same token race here; the loser sees Conflict.
+    let _rotation_claim = session::try_claim_refresh_rotation(refresh_token)?;
 
     let session_id = session::get_session_by_refresh(&state.sessions_ks, refresh_token)
         .await?
@@ -180,6 +200,21 @@ pub async fn refresh(
     let session = session::get_session(&state.sessions_ks, &session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    // Bind the JWS signer to the session DID. Same invariant as server/witness:
+    // signing proves possession of the right key for *this* session, not just
+    // some key for some DID.
+    if sender_base != session.did {
+        warn!(
+            session_id = %session.session_id,
+            session_did = %session.did,
+            sender = %sender_base,
+            "refresh rejected: signer DID does not match session DID",
+        );
+        return Err(AppError::Authentication(
+            "signer DID does not match session DID".into(),
+        ));
+    }
 
     // Verify session is in Authenticated state
     if session.state != SessionState::Authenticated {
