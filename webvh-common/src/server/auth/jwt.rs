@@ -93,3 +93,131 @@ impl JwtKeys {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> JwtKeys {
+        JwtKeys::from_ed25519_bytes(&[7u8; 32]).expect("test key")
+    }
+
+    fn other_keys() -> JwtKeys {
+        JwtKeys::from_ed25519_bytes(&[42u8; 32]).expect("other test key")
+    }
+
+    fn make_claims(role: &str, expiry_secs: u64) -> Claims {
+        JwtKeys::new_claims(
+            "did:example:caller".into(),
+            "session-abc".into(),
+            role.into(),
+            expiry_secs,
+        )
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let keys = keys();
+        let claims = make_claims("admin", 60);
+        let token = keys.encode(&claims).unwrap();
+        let decoded = keys.decode(&token).unwrap();
+        assert_eq!(decoded.aud, "WebVH");
+        assert_eq!(decoded.sub, "did:example:caller");
+        assert_eq!(decoded.session_id, "session-abc");
+        assert_eq!(decoded.role, "admin");
+        assert_eq!(decoded.exp, claims.exp);
+        assert_eq!(decoded.jti, claims.jti);
+    }
+
+    #[test]
+    fn decode_rejects_token_signed_by_different_key() {
+        let issuer = keys();
+        let attacker = other_keys();
+        let claims = make_claims("admin", 60);
+        let token = attacker.encode(&claims).unwrap();
+        assert!(issuer.decode(&token).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_expired_token() {
+        let keys = keys();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // jsonwebtoken's default leeway is 60s, so put expiry well past it.
+        let claims = Claims {
+            aud: "WebVH".into(),
+            sub: "did:example:expired".into(),
+            session_id: "s".into(),
+            role: "owner".into(),
+            exp: now - 3600,
+            iat: now - 7200,
+            jti: "j".into(),
+        };
+        let token = keys.encode(&claims).unwrap();
+        let err = keys.decode(&token).unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_audience() {
+        let keys = keys();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = Claims {
+            aud: "OtherAudience".into(),
+            sub: "did:example:wrong-aud".into(),
+            session_id: "s".into(),
+            role: "owner".into(),
+            exp: now + 60,
+            iat: now,
+            jti: "j".into(),
+        };
+        let token = keys.encode(&claims).unwrap();
+        assert!(keys.decode(&token).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_garbage_token() {
+        let keys = keys();
+        assert!(keys.decode("not-a-jwt").is_err());
+        assert!(keys.decode("ey.ey.ey").is_err());
+        assert!(keys.decode("").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_alg_none_attempt() {
+        // Manually construct a JWT with `alg: none`. Decoder must refuse.
+        // Header `{"alg":"none","typ":"JWT"}` base64url = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+        let header_b64 = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
+        // Payload with valid claim shape so the only failure is the alg check
+        let payload = serde_json::json!({
+            "aud": "WebVH",
+            "sub": "did:attacker",
+            "session_id": "s",
+            "role": "admin",
+            "exp": 9999999999u64,
+            "iat": 0u64,
+            "jti": "j",
+        });
+        let payload_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&payload).unwrap(),
+        );
+        let unsigned = format!("{header_b64}.{payload_b64}.");
+        assert!(keys().decode(&unsigned).is_err());
+    }
+
+    #[test]
+    fn new_claims_populates_fresh_jti_and_iat_each_call() {
+        let a = JwtKeys::new_claims("did:s".into(), "s".into(), "owner".into(), 60);
+        let b = JwtKeys::new_claims("did:s".into(), "s".into(), "owner".into(), 60);
+        assert_ne!(a.jti, b.jti);
+        assert!(a.iat > 0);
+        assert!(a.exp > a.iat);
+        assert_eq!(a.exp - a.iat, 60);
+    }
+}

@@ -148,3 +148,62 @@ pub async fn unpack_signed(
 
     Ok((message, signer_base))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `extract_signer_kid` must return the kid embedded in the JWS protected
+    /// header. This is the input to the signer-verification flow; if it
+    /// regressed to "the first available kid" or similar, the bypass would
+    /// reopen.
+    #[test]
+    fn extract_signer_kid_reads_protected_header_kid() {
+        // Build a synthetic JWS envelope with a known kid.
+        // protected = base64url({"kid":"did:example:123#key-1","alg":"EdDSA"})
+        let header_json = serde_json::json!({
+            "kid": "did:example:123#key-1",
+            "alg": "EdDSA",
+        });
+        let protected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&header_json).unwrap(),
+        );
+        let jws = serde_json::json!({
+            "payload": "ignored",
+            "signatures": [
+                {
+                    "protected": protected_b64,
+                    "signature": "ignored",
+                }
+            ],
+        });
+        let kid = extract_signer_kid(&jws.to_string()).unwrap();
+        assert_eq!(kid, "did:example:123#key-1");
+    }
+
+    #[test]
+    fn extract_signer_kid_rejects_envelope_without_signatures() {
+        let jws = serde_json::json!({ "payload": "ignored", "signatures": [] });
+        assert!(extract_signer_kid(&jws.to_string()).is_err());
+    }
+
+    #[test]
+    fn extract_signer_kid_rejects_envelope_with_no_kid() {
+        let header_json = serde_json::json!({ "alg": "EdDSA" });
+        let protected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&header_json).unwrap(),
+        );
+        let jws = serde_json::json!({
+            "payload": "ignored",
+            "signatures": [{ "protected": protected_b64, "signature": "ignored" }],
+        });
+        assert!(extract_signer_kid(&jws.to_string()).is_err());
+    }
+
+    #[test]
+    fn extract_signer_kid_rejects_invalid_json() {
+        assert!(extract_signer_kid("not-json").is_err());
+    }
+}
