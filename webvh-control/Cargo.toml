@@ -92,12 +92,12 @@ redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
 firestore = { version = "0.48", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.32", features = [
+azure_data_cosmos = { version = "0.33", features = [
   "key_auth",
 ], optional = true }
-azure_core = { version = "0.34", optional = true }
-azure_security_keyvault_secrets = { version = "0.13", optional = true }
-azure_identity = { version = "0.34", optional = true }
+azure_core = { version = "0.35", optional = true }
+azure_security_keyvault_secrets = { version = "0.14", optional = true }
+azure_identity = { version = "0.35", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

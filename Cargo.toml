@@ -24,9 +24,9 @@ rust-version = "1.94.0"
 [workspace.dependencies]
 
 # Affinidi Trust Development Kit
-affinidi-tdk = "0.6"
-affinidi-messaging-didcomm-service = "0.2"
-affinidi-tdk-common = "0.5"
+affinidi-tdk = "0.7"
+affinidi-messaging-didcomm-service = "0.3"
+affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.13"
 affinidi-secrets-resolver = "0.5"
 
@@ -104,17 +104,8 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK — TEMPORARY LOCAL PATH DEP.
-#
-# Required until verifiable-trust-infrastructure publishes vta-sdk 0.5.x
-# to crates.io. The 0.5 release adds the new template-driven provisioning
-# flow (ProvisionRequestBuilder, TemplateBootstrapPayload, sealed-transfer)
-# and the `webvh-service` built-in DID template that this workspace targets.
-#
-# Before publishing any webvh crate, revert this to:
-#   vta-sdk = { version = "0.5", features = ["session", "provision-integration"] }
-# and delete the workspace-level `[patch.crates-io]` section if one was added.
-vta-sdk = { path = "../../fpp/verifiable-trust-infrastructure/vta-sdk", features = [
+# VTA SDK
+vta-sdk = { version = "0.5", features = [
   "session",
   "provision-integration",
   "provision-client",
