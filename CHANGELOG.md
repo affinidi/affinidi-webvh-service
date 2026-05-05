@@ -4,6 +4,17 @@
 
 ### Security
 
+- **All three refresh handlers (control, server, witness) now require a
+  JWS-signed DIDComm envelope and bind the signer to the session DID.**
+  webvh-control was the last hold-out — it accepted a raw refresh-token
+  string in the body. Refresh now requires possession of both the refresh
+  token *and* the session-DID's signing key on every service.
+- **Refresh-token rotation TOCTOU closed.** Two concurrent requests with
+  the same leaked refresh token used to both pass the lookup before either
+  deleted the session, defeating the rotation invariant. A new
+  `RefreshClaim` RAII guard (process-local Mutex on the refresh token)
+  serialises the lookup-then-delete-then-create sequence on all three
+  refresh handlers; the second concurrent request gets a clean Conflict.
 - **Refresh handlers (server, witness) now bind the JWS signer to the session
   DID.** Previously a leaked refresh token plus any attacker-controlled DID
   could rotate the victim's tokens — the signed envelope only proved
