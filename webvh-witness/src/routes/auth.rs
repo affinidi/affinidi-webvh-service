@@ -211,6 +211,12 @@ pub async fn refresh(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Authentication("missing refresh_token".into()))?;
 
+    // Claim exclusive rotation rights on this refresh token. Closes a TOCTOU
+    // between get_session_by_refresh and delete_session under concurrent
+    // requests with the same token.
+    let _rotation_claim =
+        affinidi_webvh_common::server::auth::session::try_claim_refresh_rotation(refresh_token)?;
+
     // get_session_by_refresh returns Option<String> (session_id)
     let session_id = get_session_by_refresh(&state.sessions_ks, refresh_token)
         .await?

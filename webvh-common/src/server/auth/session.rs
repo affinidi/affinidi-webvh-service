@@ -5,8 +5,92 @@ use crate::server::auth::jwt::JwtKeys;
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
+
+// ---------------------------------------------------------------------------
+// Refresh-rotation in-process lock
+// ---------------------------------------------------------------------------
+//
+// Closes a TOCTOU between `get_session_by_refresh` and `delete_session`.
+// Without this guard, two concurrent requests with the same leaked refresh
+// token both pass the lookup before either deletes — both would rotate the
+// session and mint two parallel valid token streams from a single refresh
+// token.
+//
+// Backend-level atomic remove-and-return primitives (Redis GETDEL,
+// DynamoDB DeleteItem with ReturnValues=ALL_OLD, etc.) would be the
+// principled fix for distributed deployments. For the default single-
+// process daemon this in-process lock is sufficient and adds no
+// cross-node coordination cost.
+
+fn refresh_rotation_locks() -> &'static Mutex<HashSet<String>> {
+    static LOCKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Exclusive lease on a single refresh token's rotation. Released on drop.
+#[derive(Debug)]
+pub struct RefreshClaim {
+    token: String,
+}
+
+/// Attempt to claim exclusive use of `refresh_token` for the duration of
+/// a rotation. Returns `Err(AppError::Conflict)` if another worker is
+/// already rotating the same token in this process — the caller should
+/// treat that as "race lost; refresh already consumed by a parallel
+/// request" and reject without rotating again.
+pub fn try_claim_refresh_rotation(refresh_token: &str) -> Result<RefreshClaim, AppError> {
+    let mut locks = refresh_rotation_locks()
+        .lock()
+        .map_err(|e| AppError::Internal(format!("refresh lock poisoned: {e}")))?;
+    if !locks.insert(refresh_token.to_string()) {
+        return Err(AppError::Conflict(
+            "refresh token rotation already in progress".into(),
+        ));
+    }
+    Ok(RefreshClaim {
+        token: refresh_token.to_string(),
+    })
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        if let Ok(mut locks) = refresh_rotation_locks().lock() {
+            locks.remove(&self.token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod refresh_claim_tests {
+    use super::*;
+
+    #[test]
+    fn second_concurrent_claim_for_same_token_is_rejected() {
+        let token = "test-refresh-token-A";
+        let claim = try_claim_refresh_rotation(token).expect("first claim succeeds");
+
+        let err = try_claim_refresh_rotation(token).unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "expected Conflict for second concurrent claim, got {err:?}"
+        );
+
+        // Drop the first claim and the token becomes claimable again.
+        drop(claim);
+        let _again = try_claim_refresh_rotation(token).expect("released claim is reusable");
+    }
+
+    #[test]
+    fn distinct_tokens_can_be_claimed_independently() {
+        let _a = try_claim_refresh_rotation("token-A").unwrap();
+        let _b = try_claim_refresh_rotation("token-B").unwrap();
+        // Both succeeded — distinct tokens don't contend.
+    }
+}
 
 /// Session lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
