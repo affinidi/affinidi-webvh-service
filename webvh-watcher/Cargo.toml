@@ -30,7 +30,7 @@ name = "webvh-watcher"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core"] }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core"] }
 axum = "0.8"
 axum-extra = { workspace = true }
 clap = { workspace = true }

@@ -77,11 +77,11 @@ name = "webvh-daemon"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", default-features = false, features = ["server-core", "setup-wizard"] }
-affinidi-webvh-server = { path = "../webvh-server", default-features = false }
-affinidi-webvh-witness = { path = "../webvh-witness", default-features = false }
-affinidi-webvh-watcher = { path = "../webvh-watcher", default-features = false }
-affinidi-webvh-control = { path = "../webvh-control", default-features = false }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", default-features = false, features = ["server-core", "setup-wizard"] }
+affinidi-webvh-server = { version = "0.6", path = "../webvh-server", default-features = false }
+affinidi-webvh-witness = { version = "0.6", path = "../webvh-witness", default-features = false }
+affinidi-webvh-watcher = { version = "0.6", path = "../webvh-watcher", default-features = false }
+affinidi-webvh-control = { version = "0.6", path = "../webvh-control", default-features = false }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk = { workspace = true }
 axum = "0.8"

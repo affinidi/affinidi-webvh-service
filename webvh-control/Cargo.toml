@@ -48,7 +48,7 @@ name = "webvh-control"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall", "passkey", "setup-wizard"] }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "store-fjall", "passkey", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }

@@ -1,7 +1,8 @@
 [advisories]
 version = 2
 ignore = [
-  { id = "RUSTSEC-2022-0092", reason = "askalono always provides valid utf-8 files from a cache, this is not relevant" },
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained but build-time-only — pulled in transitively via linked-data-derive (ssi-json-ld). No runtime exposure; no safe upgrade available upstream." },
+  { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on the `rsa` crate. Pulled in transitively by jsonwebtoken, but webvh JWTs use Ed25519 (EdDSA), so the RSA timing sidechannel is not on any code path we exercise." },
 ]
 
 [bans]
@@ -22,6 +23,7 @@ allow = [
   "MIT-0",
   "MIT",
   "NCSA",
+  "Unicode-3.0",
   "Unlicense",
   "Zlib",
   # As stated here https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html#spdx-identifiers
@@ -46,88 +48,16 @@ allow = [
 ]
 
 exceptions = [
-  # changed from: { allow = ["MPL-2.0"], crate = "webpki-root-certs" },
-  { allow = [
-    "CDLA-Permissive-2.0",
-  ], crate = "webpki-root-certs" },
-  { allow = [
-    "OpenSSL",
-  ], crate = "aws-lc-sys" },
-  { allow = [
-    "MPL-2.0",
-  ], crate = "bitmaps" },
-  { allow = [
-    "MPL-2.0",
-  ], crate = "im" },
-  { allow = [
-    "MPL-2.0",
-  ], crate = "webpki-roots" },
-  { allow = [
-    "CC-BY-SA-3.0",
-    "MPL-2.0",
-  ], crate = "sized-chunks" },
-  # TODO: align
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_collections" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_locale_core" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_normalizer" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_normalizer_data" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_properties" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_properties_data" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "icu_provider" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "litemap" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "potential_utf" },
-  { allow = [
-    "Apache-2.0 WITH LLVM-exception",
-    "Unicode-3.0",
-  ], crate = "target-lexicon" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "tinystr" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "unicode-ident" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "writeable" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "yoke" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "yoke-derive" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "zerofrom" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "zerofrom-derive" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "zerotrie" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "zerovec" },
-  { allow = [
-    "Unicode-3.0",
-  ], crate = "zerovec-derive" },
+  { allow = ["MPL-2.0"], crate = "bitmaps" },
+  { allow = ["MPL-2.0"], crate = "im" },
+  { allow = ["CC-BY-SA-3.0", "MPL-2.0"], crate = "sized-chunks" },
+  { allow = ["MPL-2.0"], crate = "webauthn-rs" },
+  { allow = ["MPL-2.0"], crate = "webauthn-rs-core" },
+  { allow = ["MPL-2.0"], crate = "webauthn-rs-proto" },
+  { allow = ["MPL-2.0"], crate = "webauthn-attestation-ca" },
+  { allow = ["MPL-2.0"], crate = "base64urlsafedata" },
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
 ]
 
 # Sigh

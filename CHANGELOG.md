@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.6.0 (2026-05-05)
 
 ### Added
 - **webvh-daemon**: Self-managed identity mode. The setup wizard now
@@ -18,6 +18,11 @@
   `webvh-server` / `webvh-control` / `webvh-witness` setup wizards
   reject the self-managed choice with a clear "daemon-only" error
   pointing at `webvh-daemon`. See `docs/self-managed-mode-spec.md`.
+- **webvh-control**: Web UI for creating enrollment invites. The Access
+  Control page now has an "Invite by Link" card that generates an
+  enrollment URL for a given DID and role, removing the need to drop to
+  the `webvh-control invite` CLI to onboard new users. The invitee opens
+  the link, registers a passkey, and is added to the ACL automatically.
 
 ### Fixed
 - **Setup wizards**: the offline-bootstrap "Next steps" output printed
@@ -27,6 +32,13 @@
   five wizards (common, server, control, witness, daemon).
 
 ### Changed
+- **Keyring backend**: migrated from the `keyring` 3.x facade crate to
+  `keyring-core` 1.x with platform-specific backend stores
+  (`apple-native-keyring-store`, `windows-native-keyring-store`,
+  `dbus-secret-service-keyring-store`) selected by target cfg. The
+  default credential store is registered once at first
+  `KeyringSecretStore::new()` call. No on-disk format changes — entries
+  written by the previous build are still readable.
 - **vta-sdk integration**: adapted to upstream `ProvisionAsk` builder
   renames — `webvh_hosting_server` → `webvh_daemon`, `webvh_service`
   → `webvh_server` for witness-style consumers, and a new
@@ -34,17 +46,6 @@
   control plane (now requires `host_url` since the upstream template
   embeds it as the `WebVHHosting` service endpoint). The control-plane
   wizard now collects `did_hosting_url` before the VTA round-trip.
-
-## 0.6.0 (2026-04-24)
-
-### Added
-- **webvh-control**: Web UI for creating enrollment invites. The Access
-  Control page now has an "Invite by Link" card that generates an
-  enrollment URL for a given DID and role, removing the need to drop to
-  the `webvh-control invite` CLI to onboard new users. The invitee opens
-  the link, registers a passkey, and is added to the ACL automatically.
-
-### Changed
 - **webvh-ui**: Login page "need access?" section no longer surfaces the
   CLI command — it now instructs users to request an invite link from an
   admin, matching the new web-based flow.
@@ -56,7 +57,7 @@
   in affinidi-data-integrity 0.6. The `WitnessSigner` trait is now async
   (returns a `BoxFuture`) — any external signer implementations must be
   updated accordingly.
-- **CosmosDB store**: migrated to azure_data_cosmos 0.32's required
+- **CosmosDB store**: migrated to azure_data_cosmos's required
   `RoutingStrategy` parameter and the now-async `container_client()`.
   Region is configurable via new `store.cosmosdb_region` setting (env:
   `*_STORE_COSMOSDB_REGION`), accepting any Azure region name — display
@@ -74,21 +75,25 @@
   prerequisites updated from Node 18+ to Node 20+.
 
 ### Dependencies
-- affinidi-tdk 0.6.3 → 0.6.5
-- affinidi-tdk-common 0.5.0 → 0.5.2
+- affinidi-tdk 0.5 → 0.7
+- affinidi-tdk-common 0.4 → 0.6
 - affinidi-messaging-didcomm 0.13.1 → 0.13.2
-- affinidi-messaging-didcomm-service 0.2.1 → 0.2.2
-- affinidi-messaging-sdk 0.16.3 → 0.16.4
+- affinidi-messaging-didcomm-service 0.2 → 0.3
+- affinidi-messaging-sdk 0.16 → 0.17
 - affinidi-secrets-resolver 0.5.3 → 0.5.5
 - affinidi-did-resolver-cache-sdk 0.8.4 → 0.8.6
 - affinidi-data-integrity 0.3 → 0.6 (breaking API — see note above)
+- vta-sdk 0.4 → 0.5 (template-driven provisioning)
+- didwebvh-rs 0.4 → 0.5 (transitive)
 - firestore 0.47 → 0.48
-- azure_core 0.32 → 0.34 (pinned to match azure_data_cosmos 0.32)
-- azure_data_cosmos 0.31 → 0.32 (breaking API)
+- azure_core 0.32 → 0.35
+- azure_data_cosmos 0.31 → 0.33 (breaking API)
+- azure_security_keyvault_secrets 0.13 → 0.14
+- azure_identity 0.34 → 0.35
 - redis 1.0 → 1.2 (breaking `AsyncIter::next_item` now returns
   `Option<RedisResult<T>>`)
-- aws-sdk-* and aws-config patch bumps (1.8.x → 1.8.16)
-- didwebvh-rs 0.4.2 → 0.5.0 (transitive)
+- aws-sdk-* and aws-config patch bumps
+- keyring 3 → keyring-core 1 (see Changed)
 
 ## 0.5.0 (2026-04-13)
 
