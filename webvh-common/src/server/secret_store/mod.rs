@@ -89,12 +89,32 @@ impl std::fmt::Debug for ServerSecrets {
     feature = "gcp-secrets",
     feature = "azure-secrets"
 ))]
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSecrets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<ServerSecrets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_seed: Option<String>,
+}
+
+// `bootstrap_seed` is base64 of a 32-byte HPKE seed used to open sealed
+// VTA bundles. Treat it as secret material and redact in `Debug`. The inner
+// `ServerSecrets` already redacts itself.
+#[cfg(any(
+    feature = "aws-secrets",
+    feature = "gcp-secrets",
+    feature = "azure-secrets"
+))]
+impl std::fmt::Debug for StoredSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredSecrets")
+            .field("secrets", &self.secrets)
+            .field(
+                "bootstrap_seed",
+                &self.bootstrap_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(any(

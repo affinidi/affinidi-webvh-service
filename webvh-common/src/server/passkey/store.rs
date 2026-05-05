@@ -10,13 +10,29 @@ use crate::server::store::KeyspaceHandle;
 // ---------------------------------------------------------------------------
 
 /// One-time enrollment invitation created by the CLI `invite` subcommand.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Enrollment {
     pub token: String,
     pub did: String,
     pub role: String,
     pub created_at: u64,
     pub expires_at: u64,
+}
+
+// Manual `Debug` keeps the diagnostic fields visible while redacting the
+// invite token. The token is the bearer credential — leaking it via a stray
+// `tracing::debug!(?enrollment, …)` is exactly the regression class the
+// rest of the workspace's manual-Debug pattern is set up to prevent.
+impl std::fmt::Debug for Enrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrollment")
+            .field("token", &"<redacted>")
+            .field("did", &self.did)
+            .field("role", &self.role)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Maps a credential ID (hex-encoded) to a user UUID.

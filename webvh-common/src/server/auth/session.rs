@@ -16,7 +16,7 @@ pub enum SessionState {
 }
 
 /// A session record stored under `session:{session_id}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
     pub did: String,
@@ -29,6 +29,28 @@ pub struct Session {
     /// each token issue/refresh so old tokens are immediately invalidated.
     #[serde(default)]
     pub token_id: Option<String>,
+}
+
+// Manual `Debug` redacts the secret fields (challenge, refresh_token, token_id)
+// so a casual `tracing::debug!(?session, …)` does not leak material a leak-
+// detector would flag. Non-secret fields (session_id, did, state, timestamps)
+// stay visible for diagnostics.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("session_id", &self.session_id)
+            .field("did", &self.did)
+            .field("challenge", &"<redacted>")
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("token_id", &self.token_id.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 fn session_key(session_id: &str) -> String {

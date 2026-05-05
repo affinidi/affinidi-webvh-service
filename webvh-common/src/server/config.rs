@@ -193,7 +193,7 @@ impl Default for StoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SecretsConfig {
     pub aws_secret_name: Option<String>,
     pub aws_region: Option<String>,
@@ -216,6 +216,29 @@ pub struct SecretsConfig {
     /// backend (keyring, AWS, GCP) is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_bootstrap_seed: Option<String>,
+}
+
+// Manual `Debug` redacts the only secret-bearing field
+// (`plaintext_bootstrap_seed`) and delegates to `PlaintextSecrets`'s own
+// redacted Debug for the inline secrets. Cloud-secret-name fields are
+// non-secret references (operators paste them into config) so they stay.
+impl std::fmt::Debug for SecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretsConfig")
+            .field("aws_secret_name", &self.aws_secret_name)
+            .field("aws_region", &self.aws_region)
+            .field("gcp_project", &self.gcp_project)
+            .field("gcp_secret_name", &self.gcp_secret_name)
+            .field("azure_vault_url", &self.azure_vault_url)
+            .field("azure_secret_name", &self.azure_secret_name)
+            .field("keyring_service", &self.keyring_service)
+            .field("plaintext", &self.plaintext)
+            .field(
+                "plaintext_bootstrap_seed",
+                &self.plaintext_bootstrap_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// VTA (Verifiable Trust Architecture) connection configuration.
