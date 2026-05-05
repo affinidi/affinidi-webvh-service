@@ -170,6 +170,26 @@
   form (`"West US 2"`) or normalized (`"westus2"`). Defaults to
   `"eastus"` when unset.
 
+### Tests
+- **DIDComm dispatcher coverage** in `webvh-control`. Added 22 unit tests
+  exercising the wire-level contract: every `dispatch_did_op` arm
+  (validation, success, conflict, not-found, cross-owner forbidden), the
+  authenticate flow end-to-end with JWT decode-back assertions, and the
+  ACL gate at the dispatcher level. Refactored `handle_authenticate` and
+  `handle_webvh_message` to delegate to `(String, Value)`-returning
+  helpers (`run_authenticate`, `run_webvh_dispatch`) so the wire-level
+  responses are testable without an `ATM`-backed `HandlerContext`. Also
+  added `affinidi-messaging-test-mediator` as a dev-dep for in-process
+  embedded mediator tests, with a smoke test validating the fixture
+  spawns and provisions distinct DIDs.
+- **JWT crypto provider unification fix.** `JwtKeys::from_ed25519_bytes`
+  now idempotently installs `jsonwebtoken::crypto::rust_crypto` as the
+  process-level provider before encode/decode. Required because
+  workspace-feature unification (e.g. when a dev-dep transitively pulls
+  in `aws_lc_rs`) made `jsonwebtoken` 10.x refuse to auto-pick a
+  provider and panic on first use. The install is a no-op on subsequent
+  calls so it's safe across any thread.
+
 ### Build
 - **UI build now requires Node.js 20+.** Metro/Expo's loader uses
   `Array.prototype.toReversed()`, which landed in Node 20 — older
