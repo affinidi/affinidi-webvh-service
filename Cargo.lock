@@ -472,6 +472,7 @@ dependencies = [
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
+ "apple-native-keyring-store",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
@@ -484,6 +485,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "dbus-secret-service-keyring-store",
  "dialoguer",
  "didwebvh-rs",
  "ed25519-dalek",
@@ -494,7 +496,7 @@ dependencies = [
  "google-cloud-secretmanager-v1",
  "hex",
  "jsonwebtoken",
- "keyring",
+ "keyring-core",
  "multibase",
  "prometheus",
  "rand 0.10.1",
@@ -515,6 +517,7 @@ dependencies = [
  "vta-sdk",
  "webauthn-rs",
  "webauthn-rs-proto",
+ "windows-native-keyring-store",
 ]
 
 [[package]]
@@ -550,7 +553,6 @@ dependencies = [
  "google-cloud-secretmanager-v1",
  "http-body-util",
  "jsonwebtoken",
- "keyring",
  "mime_guess",
  "multibase",
  "rand 0.10.1",
@@ -639,7 +641,6 @@ dependencies = [
  "hex",
  "http-body-util",
  "jsonwebtoken",
- "keyring",
  "multibase",
  "rand 0.10.1",
  "ratatui",
@@ -4638,16 +4639,6 @@ checksum = "ae0386ec98c26dd721aaa3412bf3a817156ff3ee7cb6959503f8d1095f4ccc51"
 dependencies = [
  "primitive-types",
  "tiny-keccak",
-]
-
-[[package]]
-name = "keyring"
-version = "3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
-dependencies = [
- "log",
- "zeroize",
 ]
 
 [[package]]

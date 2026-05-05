@@ -16,7 +16,7 @@ build = "build.rs"
 [features]
 default = ["keyring", "store-fjall"]
 metrics = ["affinidi-webvh-common/metrics"]
-keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
+keyring = ["affinidi-webvh-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
@@ -79,7 +79,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-keyring = { version = "3", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",

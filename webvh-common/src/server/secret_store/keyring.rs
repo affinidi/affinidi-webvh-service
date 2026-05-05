@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Once;
 
 use crate::server::error::AppError;
 use tracing::debug;
@@ -12,6 +13,44 @@ use super::ServerSecrets;
 /// independent lifecycles.
 const BOOTSTRAP_SEED_USER_SUFFIX: &str = "::bootstrap_seed";
 
+static REGISTER_DEFAULT_STORE: Once = Once::new();
+
+fn ensure_default_store() {
+    REGISTER_DEFAULT_STORE.call_once(|| {
+        if let Err(e) = register_default_store() {
+            tracing::warn!("failed to register keyring default store: {e}");
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn register_default_store() -> Result<(), keyring_core::Error> {
+    use apple_native_keyring_store::keychain::Store;
+    keyring_core::set_default_store(Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn register_default_store() -> Result<(), keyring_core::Error> {
+    use windows_native_keyring_store::store::Store;
+    keyring_core::set_default_store(Store::new()?);
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn register_default_store() -> Result<(), keyring_core::Error> {
+    use dbus_secret_service_keyring_store::store::Store;
+    keyring_core::set_default_store(Store::new()?);
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+fn register_default_store() -> Result<(), keyring_core::Error> {
+    Err(keyring_core::Error::NotSupportedByStore(
+        "no native keyring backend available for this platform".to_string(),
+    ))
+}
+
 pub struct KeyringSecretStore {
     service: String,
     user: String,
@@ -19,6 +58,7 @@ pub struct KeyringSecretStore {
 
 impl KeyringSecretStore {
     pub fn new(service: impl Into<String>, user: impl Into<String>) -> Self {
+        ensure_default_store();
         Self {
             service: service.into(),
             user: user.into(),
@@ -38,7 +78,7 @@ impl super::SecretStore for KeyringSecretStore {
         let user = self.user.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                let entry = keyring_core::Entry::new(&service, &user).map_err(|e| {
                     AppError::SecretStore(format!("failed to create keyring entry: {e}"))
                 })?;
                 match entry.get_password() {
@@ -52,7 +92,7 @@ impl super::SecretStore for KeyringSecretStore {
                         debug!("secrets loaded from keyring");
                         Ok(Some(secrets))
                     }
-                    Err(keyring::Error::NoEntry) => {
+                    Err(keyring_core::Error::NoEntry) => {
                         debug!("no secrets found in keyring");
                         Ok(None)
                     }
@@ -82,7 +122,7 @@ impl super::SecretStore for KeyringSecretStore {
         };
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                let entry = keyring_core::Entry::new(&service, &user).map_err(|e| {
                     AppError::SecretStore(format!("failed to create keyring entry: {e}"))
                 })?;
                 entry.set_password(&json_str).map_err(|e| {
@@ -103,7 +143,7 @@ impl super::SecretStore for KeyringSecretStore {
         let user = self.bootstrap_seed_user();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                let entry = keyring_core::Entry::new(&service, &user).map_err(|e| {
                     AppError::SecretStore(format!("failed to create keyring entry: {e}"))
                 })?;
                 match entry.get_password() {
@@ -124,7 +164,7 @@ impl super::SecretStore for KeyringSecretStore {
                         debug!("bootstrap seed loaded from keyring");
                         Ok(Some(seed))
                     }
-                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(keyring_core::Error::NoEntry) => Ok(None),
                     Err(e) => Err(AppError::SecretStore(format!(
                         "failed to read bootstrap seed from keyring: {e}"
                     ))),
@@ -147,7 +187,7 @@ impl super::SecretStore for KeyringSecretStore {
                 use base64::Engine;
                 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
                 let b64 = B64.encode(seed_owned);
-                let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                let entry = keyring_core::Entry::new(&service, &user).map_err(|e| {
                     AppError::SecretStore(format!("failed to create keyring entry: {e}"))
                 })?;
                 entry.set_password(&b64).map_err(|e| {
@@ -168,11 +208,11 @@ impl super::SecretStore for KeyringSecretStore {
         let user = self.bootstrap_seed_user();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                let entry = keyring_core::Entry::new(&service, &user).map_err(|e| {
                     AppError::SecretStore(format!("failed to create keyring entry: {e}"))
                 })?;
                 match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
                     Err(e) => Err(AppError::SecretStore(format!(
                         "failed to clear bootstrap seed from keyring: {e}"
                     ))),
