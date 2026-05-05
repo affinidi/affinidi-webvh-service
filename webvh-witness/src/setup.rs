@@ -349,7 +349,7 @@ fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
     ];
     let idx = Select::new()
         .with_prompt("How will the witness reach its VTA?")
-        .items(&items)
+        .items(items)
         .default(0)
         .interact()?;
     Ok(match idx {

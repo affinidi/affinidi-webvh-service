@@ -1500,15 +1500,11 @@ async fn run_import_secrets(
 
             for entry in &bundle.secrets {
                 match entry.key_type {
-                    KeyType::Ed25519 => {
-                        if signing.is_none() {
-                            signing = Some(entry.private_key_multibase.clone());
-                        }
+                    KeyType::Ed25519 if signing.is_none() => {
+                        signing = Some(entry.private_key_multibase.clone());
                     }
-                    KeyType::X25519 => {
-                        if ka.is_none() {
-                            ka = Some(entry.private_key_multibase.clone());
-                        }
+                    KeyType::X25519 if ka.is_none() => {
+                        ka = Some(entry.private_key_multibase.clone());
                     }
                     _ => {}
                 }

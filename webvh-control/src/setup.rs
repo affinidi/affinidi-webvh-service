@@ -363,7 +363,7 @@ fn prompt_vta_mode() -> Result<VtaMode, AppError> {
     ];
     let idx = Select::new()
         .with_prompt("How will the control plane reach its VTA?")
-        .items(&items)
+        .items(items)
         .default(0)
         .interact()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;

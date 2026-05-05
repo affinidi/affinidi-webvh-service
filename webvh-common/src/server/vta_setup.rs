@@ -1075,7 +1075,7 @@ mod tests {
         let request = BootstrapRequest::new(ed_pub, nonce, label.map(String::from));
         let request_json = serde_json::to_string_pretty(&request).expect("serialize request");
         std::fs::write(request_path, request_json).expect("write request");
-        let seed_bytes: [u8; 32] = (*seed).into();
+        let seed_bytes: [u8; 32] = *seed;
         std::fs::write(seed_path, seed_bytes).expect("write seed");
     }
 

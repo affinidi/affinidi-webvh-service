@@ -452,7 +452,7 @@ pub async fn list_invites<S: PasskeyState>(
 
     // Newest first — most recently created invites are what admins
     // want to see at the top of the list.
-    invites.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    invites.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     Ok(Json(InviteListResponse { invites }))
 }

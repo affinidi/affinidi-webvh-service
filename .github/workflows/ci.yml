@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+  # Pinned MSRV — must equal `rust-version` in the workspace Cargo.toml.
+  # Bumping one without the other causes silent drift.
+  MSRV: "1.94.0"
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV ${{ env.MSRV }} build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Cargo.toml `rust-version` matches MSRV env var
+        run: |
+          declared=$(grep '^rust-version' Cargo.toml | head -n1 | sed -E 's/rust-version *= *"([^"]+)"/\1/')
+          if [ "$declared" != "${{ env.MSRV }}" ]; then
+            echo "::error::workspace rust-version ($declared) does not match CI MSRV (${{ env.MSRV }})"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +${{ env.MSRV }} build --workspace --locked
+
+  test:
+    name: cargo test (${{ matrix.store }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Storage backends are mutually exclusive at the build-script level,
+        # so each one needs its own job. Cloud backends (dynamodb, firestore,
+        # cosmosdb) compile but don't run integration tests in CI — they need
+        # external infra.
+        include:
+          - store: store-fjall
+            features: "server-core,store-fjall,keyring,passkey,setup-wizard"
+          - store: store-redis
+            features: "server-core,store-redis"
+          - store: store-dynamodb
+            features: "server-core,store-dynamodb"
+          - store: store-firestore
+            features: "server-core,store-firestore"
+          - store: store-cosmosdb
+            features: "server-core,store-cosmosdb"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build webvh-common with ${{ matrix.store }}
+        run: >
+          cargo build -p affinidi-webvh-common --no-default-features
+          --features "${{ matrix.features }}"
+      - name: Test webvh-common with ${{ matrix.store }}
+        # Default-feature test runs catch the bulk of the suite; here we just
+        # confirm the alternate-store build compiles + its small unit slice
+        # still passes.
+        run: >
+          cargo test -p affinidi-webvh-common --lib --no-default-features
+          --features "${{ matrix.features }}"
+
+  test-default:
+    name: cargo test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  cloud-secrets-build:
+    name: cargo build (cloud secret backends)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - aws-secrets
+          - gcp-secrets
+          - azure-secrets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo build -p affinidi-webvh-common --no-default-features
+          --features "server-core,${{ matrix.backend }}"
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  publish-dry-run:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # webvh-common is publishable on its own. The other crates depend on
+      # it via `version = "0.6"` + path, so cargo refuses to dry-run them
+      # until common is on crates.io. Verifying the leaf is enough to catch
+      # packaging mistakes (manifests, exclude/include, missing files) on
+      # every PR; the actual publish sequence happens manually after a tag.
+      - name: cargo package --list (sanity)
+        run: cargo package --list -p affinidi-webvh-common
+      - name: cargo publish --dry-run (webvh-common)
+        run: cargo publish --dry-run --allow-dirty -p affinidi-webvh-common
