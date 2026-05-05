@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use crate::server::error::AppError;
 use tracing::debug;
@@ -13,14 +13,24 @@ use super::ServerSecrets;
 /// independent lifecycles.
 const BOOTSTRAP_SEED_USER_SUFFIX: &str = "::bootstrap_seed";
 
-static REGISTER_DEFAULT_STORE: Once = Once::new();
+/// Caches the result of the first call to `register_default_store()` so the
+/// failure mode is surfaced consistently to every later caller (rather than
+/// silently swallowed at warn-level on the first call and turning into a
+/// confusing "no entry" later).
+static REGISTER_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
-fn ensure_default_store() {
-    REGISTER_DEFAULT_STORE.call_once(|| {
-        if let Err(e) = register_default_store() {
-            tracing::warn!("failed to register keyring default store: {e}");
-        }
-    });
+fn ensure_default_store() -> Result<(), AppError> {
+    let outcome =
+        REGISTER_RESULT.get_or_init(|| register_default_store().map_err(|e| e.to_string()));
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(AppError::SecretStore(format!(
+            "keyring default store could not be registered on this platform: {msg}. \
+             Either install the native credential store (macOS Keychain, Windows Credential Manager, \
+             or a Secret Service implementation on Linux), or pick a different secret backend \
+             (aws-secrets / gcp-secrets / azure-secrets / plaintext for testing)."
+        ))),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -57,12 +67,25 @@ pub struct KeyringSecretStore {
 }
 
 impl KeyringSecretStore {
-    pub fn new(service: impl Into<String>, user: impl Into<String>) -> Self {
-        ensure_default_store();
-        Self {
+    /// Initialise the keyring secret store and register the platform default
+    /// credential store on first call. Returns an error (rather than panicking
+    /// or silently degrading) when the backend is unavailable, so that the
+    /// failure surfaces clearly at process startup instead of as a
+    /// "secrets not found" misdirection later.
+    pub fn try_new(service: impl Into<String>, user: impl Into<String>) -> Result<Self, AppError> {
+        ensure_default_store()?;
+        Ok(Self {
             service: service.into(),
             user: user.into(),
-        }
+        })
+    }
+
+    /// Convenience constructor that panics on backend-registration failure.
+    /// Prefer [`Self::try_new`] in production code so the failure is reported
+    /// to the operator with context. Retained for tests and ad-hoc callers
+    /// that have already validated the backend is available.
+    pub fn new(service: impl Into<String>, user: impl Into<String>) -> Self {
+        Self::try_new(service, user).expect("keyring backend registration failed")
     }
 
     fn bootstrap_seed_user(&self) -> String {
@@ -221,5 +244,61 @@ impl super::SecretStore for KeyringSecretStore {
             .await
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::secret_store::SecretStore;
+
+    /// Round-trip ServerSecrets through the OS keychain. Skipped if the host
+    /// keychain is not reachable (CI containers without a Secret Service
+    /// implementation will hit this branch and exit clean rather than fail).
+    #[tokio::test]
+    async fn keyring_round_trip_when_backend_available() {
+        let service = format!("affinidi-webvh-test-{}", uuid::Uuid::new_v4());
+        let user = "round_trip";
+        let store = match KeyringSecretStore::try_new(&service, user) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping keyring test — backend unavailable: {e}");
+                return;
+            }
+        };
+
+        let secrets = ServerSecrets {
+            signing_key: "z6Mksigning_test".into(),
+            key_agreement_key: "z6LSagreement_test".into(),
+            jwt_signing_key: "z6Mkjwt_test".into(),
+            vta_credential: Some("test-vta-blob".into()),
+        };
+
+        // Probe the backend with a write+delete; if the OS denies access in
+        // this environment (sandboxed CI, no D-Bus session, etc.) we still
+        // skip the round-trip rather than failing.
+        if store.set(&secrets).await.is_err() {
+            eprintln!("skipping keyring test — backend refused write");
+            return;
+        }
+
+        let loaded = store.get().await.unwrap().expect("secrets present");
+        assert_eq!(loaded.signing_key, secrets.signing_key);
+        assert_eq!(loaded.key_agreement_key, secrets.key_agreement_key);
+        assert_eq!(loaded.jwt_signing_key, secrets.jwt_signing_key);
+        assert_eq!(loaded.vta_credential, secrets.vta_credential);
+
+        // Bootstrap-seed lives in a separate entry under the same service.
+        let seed = [7u8; 32];
+        store.set_bootstrap_seed(&seed).await.unwrap();
+        let read = store.get_bootstrap_seed().await.unwrap().unwrap();
+        assert_eq!(read, seed);
+
+        // Clean up the entries we just wrote so the test doesn't leave
+        // long-lived items in the operator's keyring.
+        store.clear_bootstrap_seed().await.unwrap();
+
+        let entry = keyring_core::Entry::new(&service, user).unwrap();
+        let _ = entry.delete_credential();
     }
 }

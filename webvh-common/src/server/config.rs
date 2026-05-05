@@ -258,11 +258,29 @@ pub struct IdentityConfig {
 /// **WARNING**: This is insecure and should only be used for testing/development.
 /// For production deployments, compile with a secure backend feature:
 /// `keyring`, `aws-secrets`, or `gcp-secrets`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PlaintextSecrets {
     pub signing_key: String,
     pub key_agreement_key: String,
     pub jwt_signing_key: String,
+    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
+    /// Optional — only present when the deployment integrates with a VTA host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_credential: Option<String>,
+}
+
+impl std::fmt::Debug for PlaintextSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaintextSecrets")
+            .field("signing_key", &"<redacted>")
+            .field("key_agreement_key", &"<redacted>")
+            .field("jwt_signing_key", &"<redacted>")
+            .field(
+                "vta_credential",
+                &self.vta_credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 fn default_keyring_service() -> String {
@@ -441,7 +459,14 @@ pub fn apply_env_overrides(
     Ok(())
 }
 
-/// Initialize the tracing subscriber based on config.
+/// Initialize the global tracing subscriber based on config.
+///
+/// Uses `try_init` so that callers embedded inside a host process that has
+/// already installed a global subscriber (e.g. when this crate is consumed
+/// as a library, or when a test harness has set one up) get a no-op rather
+/// than a panic. The first installer wins; later attempts log a debug line
+/// and continue. Most production callers run as the daemon binary and are
+/// the first installer; the no-op path is for embedded use cases.
 pub fn init_tracing(log: &LogConfig) {
     use tracing_subscriber::EnvFilter;
 
@@ -449,9 +474,15 @@ pub fn init_tracing(log: &LogConfig) {
 
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
 
-    match log.format {
-        LogFormat::Json => subscriber.json().init(),
-        LogFormat::Text => subscriber.init(),
+    let result = match log.format {
+        LogFormat::Json => subscriber.json().try_init(),
+        LogFormat::Text => subscriber.try_init(),
+    };
+    if let Err(e) = result {
+        // Best-effort message — we may have no subscriber to deliver it. Print
+        // to stderr as a fallback so the operator at least sees a hint when
+        // the embedding host's subscriber is silent.
+        eprintln!("tracing subscriber already initialised; continuing ({e})");
     }
 }
 

@@ -38,7 +38,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// This encoding is self-describing: the multicodec prefix identifies the key
 /// type (Ed25519, X25519, etc.), so a `Secret` can be reconstructed directly
 /// via `Secret::from_multibase(key, kid)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerSecrets {
     /// Ed25519 private key for server DID signing (multibase-encoded).
     pub signing_key: String,
@@ -49,6 +49,22 @@ pub struct ServerSecrets {
     /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
     #[serde(default)]
     pub vta_credential: Option<String>,
+}
+
+// `Debug` is implemented manually to redact key material — derived `Debug`
+// would print private keys verbatim if a caller ever wrote `tracing::debug!(?secrets)`.
+impl std::fmt::Debug for ServerSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSecrets")
+            .field("signing_key", &"<redacted>")
+            .field("key_agreement_key", &"<redacted>")
+            .field("jwt_signing_key", &"<redacted>")
+            .field(
+                "vta_credential",
+                &self.vta_credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// On-the-wire envelope for cloud-backed secret stores (AWS, GCP, Azure).
@@ -241,7 +257,7 @@ pub fn create_secret_store(
 
     #[cfg(feature = "keyring")]
     {
-        let store = KeyringSecretStore::new(&secrets.keyring_service, "server_secrets");
+        let store = KeyringSecretStore::try_new(&secrets.keyring_service, "server_secrets")?;
         return Ok(Box::new(store));
     }
 

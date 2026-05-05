@@ -16,6 +16,14 @@ use crate::server::error::AppError;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// First-8-character prefix of a token, for log correlation without exposing the
+/// full secret. Tokens are 32 bytes hex-encoded (64 chars), so 8 chars give an
+/// adversary 32 bits of identifier — useful for correlation but not enough to
+/// guess the remaining 56 chars.
+fn token_prefix(token: &str) -> &str {
+    &token[..token.len().min(8)]
+}
+
 fn require_webauthn<S: PasskeyState>(state: &S) -> Result<&Webauthn, AppError> {
     state.webauthn().map(|w| w.as_ref()).ok_or_else(|| {
         warn!("passkey request rejected: WebAuthn not configured (set public_url)");
@@ -504,7 +512,12 @@ pub async fn update_invite<S: PasskeyState>(
     store::store_enrollment(sessions_ks, &updated).await?;
 
     let base_url = state.public_url().unwrap_or("").to_string();
-    info!(did = %updated.did, role = %updated.role, token = %token, "invite updated");
+    info!(
+        did = %updated.did,
+        role = %updated.role,
+        token_prefix = %token_prefix(&token),
+        "invite updated",
+    );
 
     Ok(Json(InviteListItem {
         enrollment_url: if base_url.is_empty() {
@@ -534,6 +547,6 @@ pub async fn revoke_invite<S: PasskeyState>(
     if removed.is_none() {
         return Err(AppError::NotFound(format!("invite not found: {token}")));
     }
-    info!(token = %token, "invite revoked");
+    info!(token_prefix = %token_prefix(&token), "invite revoked");
     Ok(StatusCode::NO_CONTENT)
 }

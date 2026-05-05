@@ -7,7 +7,7 @@ use crate::signing::WitnessSigner;
 use crate::store::KeyspaceHandle;
 
 /// A witness identity managed by this service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WitnessRecord {
     /// Multibase-encoded public key (z6Mk...) — used as the primary identifier.
     pub witness_id: String,
@@ -25,6 +25,23 @@ pub struct WitnessRecord {
     pub created_at: u64,
     /// Number of proofs signed by this witness.
     pub proofs_signed: u64,
+}
+
+// `Debug` redacts `private_key_multibase` so that a careless
+// `tracing::debug!(?record)` does not leak the witness's signing key.
+impl std::fmt::Debug for WitnessRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WitnessRecord")
+            .field("witness_id", &self.witness_id)
+            .field("did", &self.did)
+            .field("vta_key_id", &self.vta_key_id)
+            .field("private_key_multibase", &"<redacted>")
+            .field("public_key_multibase", &self.public_key_multibase)
+            .field("label", &self.label)
+            .field("created_at", &self.created_at)
+            .field("proofs_signed", &self.proofs_signed)
+            .finish()
+    }
 }
 
 /// Create a new witness identity and store it.

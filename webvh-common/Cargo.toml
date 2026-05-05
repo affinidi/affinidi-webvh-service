@@ -25,6 +25,13 @@ store-redis = ["server-core", "dep:redis"]
 store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
 store-firestore = ["server-core", "dep:firestore", "dep:futures"]
 store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+# Native OS keyring secret backend.
+#
+# Supported targets: macOS, Windows, Linux (and any other Unix with a Secret
+# Service implementation reachable over D-Bus). Each backend dep is declared
+# under a `[target.'cfg(...)']` block, so on any *unsupported* target the
+# feature is harmless to enable but `KeyringSecretStore::try_new` returns
+# `AppError::SecretStore("...no native keyring backend available...")`.
 keyring = [
     "server-core",
     "dep:keyring-core",

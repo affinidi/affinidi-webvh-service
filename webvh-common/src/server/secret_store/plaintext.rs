@@ -34,7 +34,7 @@ impl PlaintextSecretStore {
                 signing_key: p.signing_key.clone(),
                 key_agreement_key: p.key_agreement_key.clone(),
                 jwt_signing_key: p.jwt_signing_key.clone(),
-                vta_credential: None,
+                vta_credential: p.vta_credential.clone(),
             }),
             bootstrap_seed_b64,
             config_path,
@@ -67,11 +67,12 @@ impl SecretStore for PlaintextSecretStore {
                 ))
             })?;
 
-            // Build the plaintext secrets value
+            // Build the plaintext secrets value (preserving vta_credential).
             let plaintext = PlaintextSecrets {
                 signing_key: secrets.signing_key,
                 key_agreement_key: secrets.key_agreement_key,
                 jwt_signing_key: secrets.jwt_signing_key,
+                vta_credential: secrets.vta_credential,
             };
 
             let plaintext_value = toml::Value::try_from(&plaintext).map_err(|e| {
@@ -229,6 +230,7 @@ mod tests {
             signing_key: "z6Mktest_signing".into(),
             key_agreement_key: "z6LStest_agreement".into(),
             jwt_signing_key: "z6Mktest_jwt".into(),
+            vta_credential: None,
         }
     }
 
@@ -387,6 +389,40 @@ rest_api = true
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let doc: toml::Value = toml::from_str(&contents).unwrap();
         assert!(doc["secrets"].get("plaintext_bootstrap_seed").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_persists_vta_credential_and_round_trips_via_get() {
+        // Regression: PlaintextSecretStore::set used to drop secrets.vta_credential.
+        // After 0.6.0, the credential must round-trip through the on-disk config.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "[server]\nhost = \"0.0.0.0\"\n")
+            .await
+            .unwrap();
+
+        let store = PlaintextSecretStore::new(None, None, config_path.clone());
+        let mut s = sample_secrets();
+        s.vta_credential = Some("opaque-vta-credential-blob".into());
+        store.set(&s).await.unwrap();
+
+        // Verify the credential is on disk.
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let doc: toml::Value = toml::from_str(&contents).unwrap();
+        let pt_value = &doc["secrets"]["plaintext"];
+        let reloaded: PlaintextSecrets = pt_value.clone().try_into().unwrap();
+        assert_eq!(
+            reloaded.vta_credential.as_deref(),
+            Some("opaque-vta-credential-blob")
+        );
+
+        // Verify a fresh store loads it back via get().
+        let store2 = PlaintextSecretStore::new(Some(&reloaded), None, config_path);
+        let read = store2.get().await.unwrap().expect("secrets present");
+        assert_eq!(
+            read.vta_credential.as_deref(),
+            Some("opaque-vta-credential-blob")
+        );
     }
 
     #[tokio::test]

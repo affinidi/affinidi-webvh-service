@@ -13,6 +13,51 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use vta_sdk::credentials::CredentialBundle;
 
+/// Error message rendered when an operator picks self-managed mode in a
+/// non-daemon binary (server / control / witness). Kept as a single shared
+/// constant so all three setup wizards print identical text — it's the
+/// canonical "you wanted webvh-daemon, not this one" pointer.
+pub const SELF_MANAGED_DAEMON_ONLY: &str =
+    "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
+     See docs/self-managed-mode-spec.md for the full rationale.";
+
+/// Atomically create a file with mode 0600 on Unix and write `bytes` into it.
+///
+/// Closes the TOCTOU window between `fs::write` and `chmod 0o600`: a separate
+/// `fs::write + set_permissions` pair leaves the file at the process umask
+/// (typically 0644) for a brief window, during which a local attacker can read
+/// the contents. `create_new` also refuses to overwrite an existing file, which
+/// matches the "freshly minted material" semantics of the offline-bootstrap
+/// flow — the caller is expected to write to a path that does not yet exist.
+///
+/// On non-Unix targets, falls back to standard `fs::write` (file ACLs are
+/// outside our control on Windows; the wizard prints the path so the operator
+/// can lock it down).
+fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 /// Resolve the mediator DID from the VTA's DID document.
 ///
 /// Looks for a `DIDCommMessaging` service endpoint in the VTA DID document
@@ -533,17 +578,7 @@ pub async fn run_offline_request_cli(
     let info =
         write_offline_bootstrap_request(out, template, vars, context_id, Some(label)).await?;
 
-    if let Some(parent) = seed_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(seed_path, info.seed)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(seed_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(seed_path, perms)?;
-    }
+    write_secret_file_0600(seed_path, &info.seed)?;
 
     eprintln!();
     eprintln!("  Offline bootstrap request ready.");
@@ -638,14 +673,10 @@ pub fn run_offline_open_cli(
         "vta_url": result.vta_url,
         "authorization_vc": result.authorization_vc,
     });
-    std::fs::write(secrets_out, serde_json::to_string_pretty(&secrets_payload)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(secrets_out)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(secrets_out, perms)?;
-    }
+    write_secret_file_0600(
+        secrets_out,
+        serde_json::to_string_pretty(&secrets_payload)?.as_bytes(),
+    )?;
 
     eprintln!();
     eprintln!("  Sealed response opened.");
