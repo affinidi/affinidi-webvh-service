@@ -5,9 +5,29 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::{AdminAuth, ServiceAuth};
+
+/// Returns `true` when `url`'s host (case-insensitive) appears in `allowlist`.
+///
+/// Allowlist entries match exact hosts only — no glob, no suffix matching —
+/// so an entry of `example.com` does **not** match `evil.example.com`. This is
+/// the conservative default for a proxy-trust gate; if operators need
+/// suffix or wildcard rules they can extend it later.
+fn registered_url_is_allowed(url: &str, allowlist: &[String]) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false, // malformed URL is rejected as a category
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+    allowlist
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(&host))
+}
 use crate::error::AppError;
 use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
 use crate::server::AppState;
@@ -139,6 +159,24 @@ pub async fn register_service(
     State(state): State<AppState>,
     Json(req): Json<RegisterServiceWithSyncRequest>,
 ) -> Result<(StatusCode, Json<RegisterServiceResponse>), AppError> {
+    // Validate the registered URL against the operator-configured allowlist
+    // before accepting it. Without this gate, any holder of a Service-role
+    // JWT can register an attacker-controlled URL, and the proxy at
+    // `/api/server/{id}/{*path}` will then forward an Admin caller's
+    // Authorization header to that URL on the next proxy hit.
+    if !state.config.registry.url_allowlist.is_empty()
+        && !registered_url_is_allowed(&req.url, &state.config.registry.url_allowlist)
+    {
+        warn!(
+            requested = %req.url,
+            did = %auth.0.did,
+            "service registration rejected: URL host not in registry.url_allowlist",
+        );
+        return Err(AppError::Forbidden(
+            "registered URL host is not in the operator-configured allowlist".into(),
+        ));
+    }
+
     // Dedup check: look for existing instance with same URL + service_type
     let existing = registry::list_instances(&state.registry_ks).await?;
     if let Some(instance) = existing

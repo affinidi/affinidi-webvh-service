@@ -67,6 +67,7 @@ multibase = { workspace = true }
 rand = { workspace = true }
 bip39 = "2"
 reqwest = { workspace = true }
+url = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 webauthn-rs = { workspace = true }
 mime_guess = { workspace = true, optional = true }

@@ -178,7 +178,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         secrets_resolver,
         jwt_keys,
         webauthn,
-        http_client: reqwest::Client::new(),
+        // Disable redirect-following: combined with the proxy's
+        // Authorization-header passthrough, an attacker-registered backend
+        // URL must not be able to redirect the proxy onto a third-party host
+        // and harvest the forwarded JWT.
+        http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client construction must succeed"),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};

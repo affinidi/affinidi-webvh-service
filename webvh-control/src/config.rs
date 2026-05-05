@@ -54,6 +54,16 @@ pub struct RegistryConfig {
     pub instances: Vec<InstanceConfig>,
     #[serde(default = "default_health_check_interval")]
     pub health_check_interval: u64,
+    /// Hostname allowlist for service registration via the API.
+    ///
+    /// When non-empty, `register_service` rejects URLs whose host is not in
+    /// this list. The proxy at `/api/server/{instance}/{*path}` only
+    /// forwards to URLs that have been registered, so the allowlist
+    /// transitively bounds where the proxy can reach. When empty, registry
+    /// URLs are accepted unrestricted (back-compat default for trusted
+    /// internal deployments).
+    #[serde(default)]
+    pub url_allowlist: Vec<String>,
 }
 
 impl Default for RegistryConfig {
@@ -61,6 +71,7 @@ impl Default for RegistryConfig {
         Self {
             instances: Vec::new(),
             health_check_interval: default_health_check_interval(),
+            url_allowlist: Vec::new(),
         }
     }
 }
