@@ -9,12 +9,17 @@
   webvh-control was the last hold-out — it accepted a raw refresh-token
   string in the body. Refresh now requires possession of both the refresh
   token *and* the session-DID's signing key on every service.
-- **Refresh-token rotation TOCTOU closed.** Two concurrent requests with
-  the same leaked refresh token used to both pass the lookup before either
-  deleted the session, defeating the rotation invariant. A new
-  `RefreshClaim` RAII guard (process-local Mutex on the refresh token)
-  serialises the lookup-then-delete-then-create sequence on all three
-  refresh handlers; the second concurrent request gets a clean Conflict.
+- **Refresh-token rotation TOCTOU closed end-to-end.** Two concurrent
+  requests with the same leaked refresh token used to both pass the
+  lookup before either deleted the session. The fix is a new
+  `KeyspaceOps::take_raw_atomic` primitive — Redis `GETDEL` /
+  DynamoDB `DeleteItem` with `ReturnValues=ALL_OLD` / fjall mutex /
+  per-keyspace mutex on Firestore + Cosmos DB. All three refresh
+  handlers (control, server, witness) now atomically consume the
+  refresh-index entry as part of the lookup, so exactly one concurrent
+  caller wins — even across multiple webvh replicas backed by Redis
+  or DynamoDB. The previous in-process `RefreshClaim` workaround is
+  removed.
 - **Refresh handlers (server, witness) now bind the JWS signer to the session
   DID.** Previously a leaked refresh token plus any attacker-controlled DID
   could rotate the victim's tokens — the signed envelope only proved
