@@ -1,8 +1,34 @@
 use crate::server::error::AppError;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
+
+/// Idempotently install the process-level `jsonwebtoken::CryptoProvider`.
+///
+/// `jsonwebtoken` 10.x supports two providers (`rust_crypto` + `aws_lc_rs`)
+/// and refuses to auto-pick when both features are compiled in. That state
+/// is reachable when this crate is built alongside another that pulls in
+/// `aws_lc_rs` — feature unification turns on both — for example
+/// `affinidi-messaging-test-mediator` in dev-deps. We always pick
+/// `rust_crypto` (matches our workspace dep declaration), and the
+/// `OnceLock` makes the install a no-op on subsequent calls.
+///
+/// Safe to call from any thread, any number of times. Always called
+/// before encode/decode so JWT operations work regardless of which
+/// downstream crate enables which feature.
+fn ensure_jwt_crypto_provider() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // When both providers are unified by cargo (e.g. when our build
+        // also pulls in `aws_lc_rs` via test-mediator dev-deps), install
+        // `rust_crypto` explicitly to match the workspace dep declaration.
+        // When only one provider is active the call is redundant —
+        // `install_default` returns `Err(already installed)` and we ignore.
+        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+    });
+}
 
 /// JWT claims for WebVH access tokens.
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +58,7 @@ impl JwtKeys {
     /// Computes the public key and wraps both in DER format as required
     /// by `jsonwebtoken`'s `from_ed_der()` methods.
     pub fn from_ed25519_bytes(private_bytes: &[u8; 32]) -> Result<Self, AppError> {
+        ensure_jwt_crypto_provider();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(private_bytes);
         let public_bytes = signing_key.verifying_key().to_bytes();
 

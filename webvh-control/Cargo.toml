@@ -104,3 +104,6 @@ tempfile = "3"
 anyhow.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Embedded mediator fixture for in-process DIDComm flow tests.
+# Defaults to MemoryStore (no Redis required); spawns on 127.0.0.1:0.
+affinidi-messaging-test-mediator = "0.1"
