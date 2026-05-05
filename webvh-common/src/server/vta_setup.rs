@@ -524,13 +524,34 @@ pub fn open_offline_bootstrap_response(
         _ => return Err("sealed response was not a TemplateBootstrap payload".into()),
     };
 
-    // Take the single DidKeyMaterial entry. (The payload carries a map
-    // keyed by DID for forward-compat with multi-DID templates; today
-    // the VTA provisions one per bootstrap.)
-    let (_map_key, key_material) = payload
-        .secrets
-        .into_iter()
-        .next()
+    // Pick the integration DID's key material by matching against
+    // `config.did_document.id`. The payload carries a map keyed by DID
+    // and may include both an integration entry and an admin-rolled-over
+    // entry when the VTA enabled admin rollover; relying on the BTreeMap
+    // iteration order would silently pick the alphabetically-first DID
+    // (typically the admin did:key, since "did:key:..." sorts before
+    // "did:webvh:...").
+    let integration_did = payload
+        .config
+        .did_document
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("sealed payload missing config.did_document.id")?
+        .to_string();
+    let mut secrets_map = payload.secrets;
+    let key_material = secrets_map
+        .remove(&integration_did)
+        .or_else(|| {
+            // Forward-compat fallback: if the payload doesn't carry a
+            // matching entry (e.g. because a future template renames the
+            // canonical DID field), accept the first secret as a last
+            // resort. Logged so an operator can correlate with the wire.
+            tracing::warn!(
+                integration_did = %integration_did,
+                "sealed payload secrets map does not contain integration DID; falling back to first entry",
+            );
+            secrets_map.into_iter().next().map(|(_, v)| v)
+        })
         .ok_or("sealed payload has no secrets")?;
 
     let log_entry = payload.config.outputs.iter().find_map(|o| match o {
@@ -1142,6 +1163,185 @@ mod tests {
         assert_eq!(info.nonce, parsed.nonce);
         assert_eq!(info.request_path, request_path);
         assert_ne!(info.seed, [0u8; 32], "seed must not be all zeros");
+    }
+
+    /// Full webvh ↔ VTA sealed-bootstrap roundtrip in-process.
+    ///
+    /// Phase 1 (webvh): `write_offline_bootstrap_request` produces the
+    /// VP-framed BootstrapRequest the operator hands to the VTA admin.
+    /// Phase 2 (simulated VTA): we verify that VP, build a synthetic
+    /// `TemplateBootstrapPayload`, and seal it with `seal_payload` —
+    /// the same primitive `vta bootstrap provision-integration` uses on
+    /// the VTA side. Phase 3 (webvh): `open_offline_bootstrap_response`
+    /// opens the armored bundle, verifies the OOB digest, and surfaces
+    /// the integration DID + signing keys + key-agreement keys + admin
+    /// material + VTA trust bundle.
+    ///
+    /// This is the contract test for the end-to-end offline-bootstrap
+    /// shape webvh-server, webvh-control, and webvh-witness setup
+    /// wizards depend on. A regression in any of:
+    /// - the VP-framed request sign/verify path (provision_integration);
+    /// - HPKE seal / open (sealed_transfer);
+    /// - `TemplateBootstrapPayload` field shape;
+    /// - SHA-256 digest binding;
+    /// - Ed25519→X25519 derivation symmetry between consumer and
+    ///   producer;
+    /// would surface here rather than the next time an operator runs
+    /// the wizard against a real VTA.
+    #[tokio::test]
+    async fn offline_bootstrap_full_webvh_to_vta_roundtrip() {
+        use std::collections::BTreeMap;
+        use vta_sdk::provision_integration::payload::{
+            DidKeyMaterial, KeyPair, TemplateBootstrapConfig, TemplateBootstrapPayload,
+            TemplateOutput, VtaTrustBundle,
+        };
+        use vta_sdk::sealed_transfer::bundle::AssertionProof;
+        use vta_sdk::sealed_transfer::{
+            InMemoryNonceStore, ProducerAssertion, SealedPayloadV1, armor, bundle_digest,
+            seal_payload,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let request_path = tmp.path().join("bootstrap-request.json");
+
+        // -------- Phase 1: webvh produces the VP-framed request ----------
+        let info = write_offline_bootstrap_request(
+            &request_path,
+            "webvh-server",
+            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+            "webvh-roundtrip-ctx",
+            Some("roundtrip-full"),
+        )
+        .await
+        .expect("write request");
+
+        // -------- Phase 2: simulated VTA opens, builds, seals ------------
+        // Verify the VP exactly as a real VTA would, surfacing the holder
+        // and the recipient X25519 pubkey for HPKE.
+        let raw_vp = std::fs::read_to_string(&request_path).expect("read request");
+        let request: vta_sdk::provision_integration::BootstrapRequest =
+            serde_json::from_str(&raw_vp).expect("parse VP");
+        let verified = request.verify().expect("VP verifies");
+        let recipient_x25519_pub = verified
+            .decode_client_x25519_pub()
+            .expect("derive X25519 pub");
+        let bundle_id = verified.decode_nonce().expect("decode nonce");
+        // Sanity: the consumer-side info matches what the VTA would see.
+        assert_eq!(verified.holder(), info.client_did);
+
+        // Synthetic VTA-issued material. Keys are placeholders — the
+        // sealing flow doesn't crypto-verify the inner secrets, only the
+        // envelope. The webvh-side consumer is responsible for using the
+        // returned multibase strings to reconstruct working `Secret`s.
+        let integration_did = "did:webvh:roundtrip:integration.example.com";
+        let admin_did = "did:key:z6MkAdminRotated";
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            integration_did.to_string(),
+            DidKeyMaterial {
+                did: integration_did.into(),
+                signing_key: KeyPair {
+                    key_id: format!("{integration_did}#key-0"),
+                    public_key_multibase: "z6MkSigningPub".into(),
+                    private_key_multibase: "zSigningPriv".into(),
+                },
+                ka_key: KeyPair {
+                    key_id: format!("{integration_did}#key-1"),
+                    public_key_multibase: "z6LSKaPub".into(),
+                    private_key_multibase: "zKaPriv".into(),
+                },
+            },
+        );
+        secrets.insert(
+            admin_did.to_string(),
+            DidKeyMaterial {
+                did: admin_did.into(),
+                signing_key: KeyPair {
+                    key_id: format!("{admin_did}#key-0"),
+                    public_key_multibase: "z6MkAdminPub".into(),
+                    private_key_multibase: "zAdminPriv".into(),
+                },
+                ka_key: KeyPair {
+                    key_id: format!("{admin_did}#key-1"),
+                    public_key_multibase: "z6LSAdminKa".into(),
+                    private_key_multibase: "zAdminKaPriv".into(),
+                },
+            },
+        );
+        let payload = TemplateBootstrapPayload {
+            authorization: serde_json::json!({
+                "type": ["VerifiableCredential", "VtaAuthorizationCredential"],
+                "credentialSubject": { "id": admin_did, "vtaContext": "webvh-roundtrip-ctx" },
+            }),
+            secrets,
+            config: TemplateBootstrapConfig {
+                template_name: "webvh-server".into(),
+                template_kind: "integration".into(),
+                did_document: serde_json::json!({ "id": integration_did }),
+                outputs: vec![TemplateOutput::WebvhLog {
+                    did: integration_did.into(),
+                    log: "{\"versionId\":\"1-roundtrip\"}\n".into(),
+                }],
+                vta_url: Some("https://vta.example.com".into()),
+                vta_trust: VtaTrustBundle {
+                    vta_did: "did:webvh:vta.example.com".into(),
+                    vta_did_document: serde_json::json!({ "id": "did:webvh:vta.example.com" }),
+                    vta_did_log: None,
+                },
+            },
+        };
+        let sealed_payload = SealedPayloadV1::TemplateBootstrap(Box::new(payload));
+
+        // PinnedOnly producer assertion: the consumer trusts the
+        // out-of-band digest as the integrity anchor. Mirrors the
+        // simplest VTA configuration.
+        let producer = ProducerAssertion {
+            producer_did: "did:key:z6MkProducerSyntheticForTest".into(),
+            proof: AssertionProof::PinnedOnly,
+        };
+        let nonce_store = InMemoryNonceStore::default();
+        let bundle = seal_payload(
+            &recipient_x25519_pub,
+            bundle_id,
+            producer,
+            &sealed_payload,
+            &nonce_store,
+        )
+        .await
+        .expect("seal");
+        let digest = bundle_digest(&bundle);
+        let armored = armor::encode(&bundle);
+
+        // -------- Phase 3: webvh opens the bundle ------------------------
+        let result = open_offline_bootstrap_response(&armored, &digest, &info.seed)
+            .expect("open sealed response");
+
+        // Round-trip assertions: every operator-facing field must survive
+        // the seal/open trip intact.
+        assert_eq!(result.did, integration_did);
+        assert_eq!(result.signing_key_multibase, "zSigningPriv");
+        assert_eq!(result.key_agreement_multibase, "zKaPriv");
+        assert_eq!(result.vta_did, "did:webvh:vta.example.com");
+        assert_eq!(result.vta_url.as_deref(), Some("https://vta.example.com"));
+        // `WebvhLog` output → log entry surfaces under `log_entry` for
+        // the webvh wizard to write to disk.
+        assert_eq!(
+            result.log_entry.as_deref(),
+            Some("{\"versionId\":\"1-roundtrip\"}\n")
+        );
+
+        // Bad digest must reject in constant time. Flip the first hex
+        // character; constant-time-eq still rejects, and the failure
+        // path is what the operator sees if the OOB digest was tampered.
+        let mut bad = digest.clone();
+        bad.replace_range(0..1, if bad.starts_with('0') { "1" } else { "0" });
+        let err = open_offline_bootstrap_response(&armored, &bad, &info.seed)
+            .expect_err("bad digest must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("digest") || msg.contains("Digest"),
+            "expected digest-mismatch error, got: {msg}"
+        );
     }
 
     #[tokio::test]
