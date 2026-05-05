@@ -495,10 +495,18 @@ async fn run_self_managed_setup(
     warn_if_insecure_public_url(&public_url);
     let did_path = derive_did_path(&public_url);
 
-    // 3. Mediator (optional — only relevant if you want inbound DIDComm).
+    // 3. Mediator. Optional in name, but skipping it means the daemon's DID
+    //    document will not advertise a DIDCommMessaging service — and the
+    //    daemon then cannot be registered as a VTA-hosting webvh server
+    //    (`vta webvh add-server` rejects DIDs with no DIDComm endpoint).
+    //    Warn explicitly on the empty path and require a confirmation so
+    //    operators don't end up with a DID that fails downstream VTA
+    //    integration silently.
     eprintln!();
-    eprintln!("  DIDComm mediator (optional — required for inbound DIDComm");
-    eprintln!("  from external VTAs that want to provision tenant DIDs).");
+    eprintln!("  DIDComm mediator. Required if you want this daemon to:");
+    eprintln!("    - receive inbound DIDComm from external VTAs (tenant DID provisioning), or");
+    eprintln!("    - be registered as a webvh hosting server with a VTA");
+    eprintln!("      (`vta webvh add-server` requires a DIDCommMessaging endpoint).");
     eprintln!();
     let mediator_input: String = Input::new()
         .with_prompt("Mediator DID (leave blank for none)")
@@ -506,6 +514,21 @@ async fn run_self_managed_setup(
         .default(String::new())
         .interact_text()?;
     let mediator_did = if mediator_input.trim().is_empty() {
+        eprintln!();
+        eprintln!("  No mediator configured. Without a mediator, the generated DID");
+        eprintln!("  document will not include a DIDCommMessaging service. This");
+        eprintln!("  daemon will not be usable as a VTA hosting server, and external");
+        eprintln!("  VTAs will not be able to send DIDComm messages to it.");
+        eprintln!();
+        let proceed = Confirm::new()
+            .with_prompt("Continue without a mediator?")
+            .default(false)
+            .interact()?;
+        if !proceed {
+            eprintln!();
+            eprintln!("  Setup cancelled. Re-run and supply a mediator DID when prompted.");
+            return Ok(());
+        }
         None
     } else {
         Some(mediator_input.trim().to_string())
