@@ -54,8 +54,15 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("failed to convert TcpListener");
 
+                // Cap pushed bodies. Sync push is the only ingest path on
+                // the watcher and a leaked push token must not let an
+                // attacker exhaust the watcher's storage with arbitrarily
+                // large JSONL payloads. 4 MiB is conservative for legitimate
+                // DID logs (each entry is sub-kB).
+                const MAX_SYNC_BODY: usize = 4 * 1024 * 1024;
                 let app = routes::router()
                     .with_state(rest_state)
+                    .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_SYNC_BODY))
                     .layer(
                         TraceLayer::new_for_http()
                             .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))

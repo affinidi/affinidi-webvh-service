@@ -91,12 +91,18 @@ pub fn watcher_sync_key(mnemonic: &str) -> String {
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 ///
+/// In addition to structural shape, the *last* entry's `state.id` must start
+/// with `did:webvh:`. This rules out leaked-push-token attackers republishing
+/// arbitrary JSON that happens to deserialise into the LogEntry shape but
+/// targets a different DID method.
+///
 /// Returns an error string on failure (caller wraps in their own error type).
 pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
     if content.is_empty() {
         return Err("did.jsonl content cannot be empty".into());
     }
 
+    let mut had_entry = false;
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -104,15 +110,27 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         }
         LogEntry::deserialize_string(line, None)
             .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
+        had_entry = true;
     }
 
-    Ok(())
+    if !had_entry {
+        return Err("did.jsonl content has no entries".into());
+    }
+
+    // Must encode a did:webvh identifier on the latest entry.
+    match extract_did_id(content) {
+        Some(id) if id.starts_with("did:webvh:") => Ok(()),
+        Some(other) => Err(format!(
+            "did.jsonl latest entry must encode a did:webvh identifier (got {other})",
+        )),
+        None => Err("did.jsonl latest entry has no resolvable state.id".into()),
+    }
 }
 
-/// Extract the `did:webvh:...` identifier from the last line of JSONL content
-/// via the `state.id` field.
+/// Extract the `did:webvh:...` identifier from the last non-blank line of
+/// JSONL content via the `state.id` field. Trailing blank lines are skipped.
 pub fn extract_did_id(jsonl_content: &str) -> Option<String> {
-    let last_line = jsonl_content.lines().last()?;
+    let last_line = jsonl_content.lines().rfind(|l| !l.trim().is_empty())?;
     let value: serde_json::Value = serde_json::from_str(last_line).ok()?;
     value
         .get("state")
