@@ -189,11 +189,13 @@ pub async fn refresh(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
 
-    // Claim exclusive rotation rights on this refresh token. Two concurrent
-    // requests with the same token race here; the loser sees Conflict.
-    let _rotation_claim = session::try_claim_refresh_rotation(refresh_token)?;
-
-    let session_id = session::get_session_by_refresh(&state.sessions_ks, refresh_token)
+    // Atomically claim and consume the refresh-token → session_id index in
+    // a single backend operation (Redis GETDEL / DynamoDB DeleteItem with
+    // ReturnValues=ALL_OLD / fjall mutex). Exactly one concurrent request
+    // with the same token sees `Some` here, even across replicas. Losers
+    // see `None` and reject as if the token were invalid — which it now
+    // is, having been consumed by the winner.
+    let session_id = session::take_session_id_by_refresh(&state.sessions_ks, refresh_token)
         .await?
         .ok_or_else(|| AppError::Authentication("invalid refresh token".into()))?;
 

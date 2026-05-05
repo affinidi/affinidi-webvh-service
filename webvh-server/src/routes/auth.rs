@@ -12,7 +12,7 @@ use affinidi_webvh_common::{
 use crate::acl::check_acl;
 use crate::auth::session::{
     Session, SessionState, create_authenticated_session, delete_session,
-    finalize_challenge_session, get_session, get_session_by_refresh, now_epoch, store_session,
+    finalize_challenge_session, get_session, now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -223,16 +223,15 @@ pub async fn refresh(
         .as_str()
         .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
 
-    // Claim exclusive rotation rights on this refresh token. Closes a TOCTOU
-    // between get_session_by_refresh and delete_session under concurrent
-    // requests with the same token.
-    let _rotation_claim =
-        affinidi_webvh_common::server::auth::session::try_claim_refresh_rotation(refresh_token)?;
-
-    // Look up session by refresh token
-    let session_id = get_session_by_refresh(&state.sessions_ks, refresh_token)
-        .await?
-        .ok_or_else(|| AppError::Authentication("refresh token not found".into()))?;
+    // Atomically claim and consume the refresh-token → session_id index.
+    // Cross-replica safe via Redis GETDEL / DynamoDB DeleteItem
+    // ReturnValues=ALL_OLD / fjall mutex. Closes the rotation TOCTOU.
+    let session_id = affinidi_webvh_common::server::auth::session::take_session_id_by_refresh(
+        &state.sessions_ks,
+        refresh_token,
+    )
+    .await?
+    .ok_or_else(|| AppError::Authentication("refresh token not found".into()))?;
 
     let session = get_session(&state.sessions_ks, &session_id)
         .await?
