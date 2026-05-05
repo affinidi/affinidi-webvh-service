@@ -58,18 +58,16 @@ pub async fn receive_did(
     // Validate mnemonic format to prevent store key injection
     validate_mnemonic(&req.mnemonic)?;
 
-    // Validate log content is well-formed JSONL
+    // Validate log content is a well-formed WebVH log (rejects arbitrary JSON
+    // that happens to parse — a leaked push token must not let attackers
+    // republish bogus DID documents on the watcher's hostname).
     if req.log_content.is_empty() {
         return Err(AppError::Validation("log_content cannot be empty".into()));
     }
-    for line in req.log_content.lines() {
-        if !line.is_empty() {
-            serde_json::from_str::<serde_json::Value>(line).map_err(|e| {
-                warn!(mnemonic = %req.mnemonic, error = %e, "invalid JSONL in sync push");
-                AppError::Validation(format!("invalid JSONL line: {e}"))
-            })?;
-        }
-    }
+    affinidi_webvh_common::did_ops::validate_did_jsonl(&req.log_content).map_err(|e| {
+        warn!(mnemonic = %req.mnemonic, error = %e, "invalid WebVH JSONL in sync push");
+        AppError::Validation(format!("invalid WebVH log content: {e}"))
+    })?;
 
     let record = WatcherRecord {
         mnemonic: req.mnemonic.clone(),

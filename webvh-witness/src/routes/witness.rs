@@ -3,7 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AdminAuth, AuthClaims};
+use crate::auth::AdminAuth;
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::witness_ops;
@@ -99,11 +99,14 @@ pub async fn delete_witness(
 }
 
 pub async fn sign_proof(
-    _auth: AuthClaims,
+    auth: AdminAuth,
     State(state): State<AppState>,
     Path(witness_id): Path<String>,
     Json(req): Json<SignProofRequest>,
 ) -> Result<Json<SignProofResponse>, AppError> {
+    // Witness signing is an Admin-only operation: a signed witness proof is the
+    // attestation that downstream resolvers rely on, so the signer key must
+    // only be exercised by an operator-trusted caller.
     let (version_id, proof) = witness_ops::sign_witness_proof(
         &state.witnesses_ks,
         state.signer.as_ref(),
@@ -111,6 +114,14 @@ pub async fn sign_proof(
         &req.version_id,
     )
     .await?;
+
+    tracing::info!(
+        audit = true,
+        admin_did = %auth.0.did,
+        witness_id,
+        version_id = %version_id,
+        "witness proof signed",
+    );
 
     // Serialize the DataIntegrityProof to JSON
     let proof_json = serde_json::to_value(&proof)?;

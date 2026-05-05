@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use tracing::debug;
 
-use crate::auth::AuthClaims;
+use crate::auth::AdminAuth;
 use crate::error::AppError;
 use crate::registry;
 use crate::server::AppState;
@@ -13,10 +13,13 @@ use crate::server::AppState;
 /// ANY /api/server/{instance_id}/{*path}
 /// ANY /api/witness/{instance_id}/{*path}
 ///
-/// Requires authentication to prevent SSRF via the proxy.
+/// Restricted to Admin role. The proxy forwards the caller's `Authorization`
+/// header to the backend, and the control plane and backends typically share
+/// JWT keys; gating on Admin keeps Owner-role JWTs from probing arbitrary
+/// backend routes via the proxy.
 pub async fn proxy_to_service(
     State(state): State<AppState>,
-    _auth: AuthClaims,
+    _auth: AdminAuth,
     Path((instance_id, path)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Result<Response, AppError> {

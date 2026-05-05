@@ -66,45 +66,85 @@ async fn resolve_verifying_key(
         .map_err(|_| AppError::Authentication("public key must be 32 bytes".into()))
 }
 
-/// Unpack a DIDComm signed (JWS) message by resolving the signer's public key from their DID.
+/// Unpack a DIDComm signed (JWS) message and verify the JWS signer matches `msg.from`.
 ///
-/// Returns the unpacked `Message` and the signer's key ID (if present in the JWS header).
+/// Resolves the signer's public key from the JWS protected-header `kid`, verifies
+/// the signature, then asserts that the verified signer's DID equals the message's
+/// `from` DID (compared on base, ignoring `#fragment`). Returns the unpacked `Message`
+/// and the *verified* signer base DID.
+///
+/// **Security:** Callers must use the returned base DID for sender identification.
+/// Trusting `msg.from` directly allows an attacker who controls any DID to forge the
+/// `from` field while signing with their own key.
+///
+/// The message must:
+/// - Be signed (plaintext and encrypted-only payloads are rejected — those would not
+///   carry a verified signer identity).
+/// - Carry a `from` field whose base DID matches the JWS signer.
+/// - Have a `created_time` inside the 5-minute freshness window (with 60s future tolerance).
 pub async fn unpack_signed(
     input: &str,
     did_resolver: &DIDCacheClient,
-) -> Result<(Message, Option<String>), AppError> {
+) -> Result<(Message, String), AppError> {
     let kid = extract_signer_kid(input)?;
     let verifying_key = resolve_verifying_key(did_resolver, &kid).await?;
 
     let result = unpack::unpack(input, None, None, None, Some(&verifying_key))
         .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
 
-    match result {
+    let (message, signer_kid) = match result {
         UnpackResult::Signed {
             message,
             signer_kid,
-        } => {
-            // Validate message freshness — reject messages older than 5 minutes
-            if let Some(created_time) = message.created_time {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let max_age = 300; // 5 minutes
-                if now.saturating_sub(created_time) > max_age {
-                    return Err(AppError::Authentication(
-                        "message too old (created_time exceeds 5-minute window)".into(),
-                    ));
-                }
-                if created_time > now + 60 {
-                    return Err(AppError::Authentication(
-                        "message created_time is in the future".into(),
-                    ));
-                }
-            }
-            Ok((message, signer_kid))
+        } => (message, signer_kid),
+        UnpackResult::Plaintext(_) => {
+            return Err(AppError::Authentication(
+                "message is not signed; refusing to authenticate plaintext".into(),
+            ));
         }
-        UnpackResult::Plaintext(message) => Ok((message, None)),
-        UnpackResult::Encrypted { message, .. } => Ok((message, None)),
+        UnpackResult::Encrypted { .. } => {
+            return Err(AppError::Authentication(
+                "message is encrypted-only; expected JWS-signed envelope".into(),
+            ));
+        }
+    };
+
+    // Signer kid is always present for Signed results; the resolver already used it.
+    let signer_kid = signer_kid.unwrap_or(kid);
+    let signer_base = signer_kid
+        .split('#')
+        .next()
+        .unwrap_or(&signer_kid)
+        .to_string();
+
+    let claimed_from = message
+        .from
+        .as_deref()
+        .ok_or_else(|| AppError::Authentication("signed message is missing `from` field".into()))?;
+    let claimed_base = claimed_from.split('#').next().unwrap_or(claimed_from);
+    if signer_base != claimed_base {
+        return Err(AppError::Authentication(
+            "JWS signer does not match message `from` DID".into(),
+        ));
     }
+
+    if let Some(created_time) = message.created_time {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let max_age = 300; // 5 minutes
+        if now.saturating_sub(created_time) > max_age {
+            return Err(AppError::Authentication(
+                "message too old (created_time exceeds 5-minute window)".into(),
+            ));
+        }
+        if created_time > now + 60 {
+            return Err(AppError::Authentication(
+                "message created_time is in the future".into(),
+            ));
+        }
+    }
+
+    Ok((message, signer_base))
 }

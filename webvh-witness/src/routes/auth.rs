@@ -80,7 +80,8 @@ pub async fn authenticate(
 ) -> Result<Json<AuthenticateResponse>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (msg, _signer_kid) =
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
+    let (msg, sender_base) =
         affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
@@ -120,13 +121,7 @@ pub async fn authenticate(
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
 
-    // Validate DID matches (compare base DID without fragment)
-    let sender_did = msg
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Authentication("missing sender DID".into()))?;
-    let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
-
+    // sender_base is JWS-verified by unpack_signed.
     if sender_base != session.did {
         warn!(session_id, sender = %sender_base, expected = %session.did, "authentication rejected: DID mismatch");
         return Err(AppError::Authentication("DID mismatch".into()));
@@ -199,7 +194,8 @@ pub async fn refresh(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (msg, _signer_kid) =
+    // sender_base is JWS-verified; refresh requires the holder's signed envelope.
+    let (msg, _sender_base) =
         affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
@@ -256,6 +252,8 @@ pub async fn refresh(
         "data": {
             "access_token": token_response.access_token,
             "access_expires_at": token_response.access_expires_at,
+            "refresh_token": token_response.refresh_token,
+            "refresh_expires_at": token_response.refresh_expires_at,
         }
     })))
 }

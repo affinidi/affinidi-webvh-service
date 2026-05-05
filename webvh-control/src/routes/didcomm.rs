@@ -84,16 +84,11 @@ pub async fn handle(
 ) -> Result<Response, AppError> {
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
-    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver)
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver)
         .await
         .map_err(|e| AppError::Validation(format!("failed to unpack DIDComm message: {e}")))?;
 
-    // Verify the DIDComm sender matches the authenticated DID
-    let sender_did = msg
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Validation("DIDComm message missing 'from' field".into()))?;
-    let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
     if sender_base != auth.did {
         return Err(AppError::Forbidden(
             "DIDComm 'from' does not match authenticated DID".into(),

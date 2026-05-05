@@ -10,10 +10,9 @@ use affinidi_webvh_common::{
 };
 
 use crate::acl::check_acl;
-use crate::auth::jwt::JwtKeys;
 use crate::auth::session::{
-    Session, SessionState, delete_session, finalize_challenge_session, get_session,
-    get_session_by_refresh, now_epoch, store_session,
+    Session, SessionState, create_authenticated_session, delete_session,
+    finalize_challenge_session, get_session, get_session_by_refresh, now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -96,8 +95,8 @@ pub async fn authenticate(
 ) -> Result<Json<AuthenticateResponse>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    // Unpack the DIDComm message
-    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
@@ -115,12 +114,6 @@ pub async fn authenticate(
         .as_str()
         .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?;
 
-    // Validate sender DID
-    let sender_did = msg
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Authentication("message has no sender (from)".into()))?;
-
     // Look up session and validate
     let mut session = get_session(&state.sessions_ks, session_id)
         .await?
@@ -136,8 +129,6 @@ pub async fn authenticate(
         warn!(session_id, "authentication rejected: challenge mismatch");
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
-    // Match the DID (compare base DID, ignoring any fragment)
-    let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
     if session.did != sender_base {
         warn!(session_id, sender = %sender_base, expected = %session.did, "authentication rejected: DID mismatch");
         return Err(AppError::Authentication("DID mismatch".into()));
@@ -216,8 +207,8 @@ pub async fn refresh(
 ) -> Result<Json<RefreshResponse>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    // Unpack the DIDComm message
-    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+    // sender_base is JWS-verified; refresh requires the holder's signed envelope.
+    let (msg, _sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
@@ -254,29 +245,40 @@ pub async fn refresh(
         return Err(AppError::Authentication("refresh token expired".into()));
     }
 
-    // Invalidate the old session to prevent refresh token reuse
+    // Refresh rotates everything: a brand-new session id, access token, and
+    // refresh token. The old session is deleted atomically so a leaked
+    // refresh token cannot be reused.
     delete_session(&state.sessions_ks, &session.session_id).await?;
 
     // Look up current ACL role (propagates changes at refresh time)
     let role = check_acl(&state.acl_ks, &session.did).await?;
 
-    // Generate new access token
-    let claims = JwtKeys::new_claims(
-        session.did.clone(),
-        session.session_id.clone(),
-        role.to_string(),
+    let token_response = create_authenticated_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &session.did,
+        &role,
         state.config.auth.access_token_expiry,
-    );
-    let access_expires_at = claims.exp;
-    let access_token = jwt_keys.encode(&claims)?;
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
 
-    info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "token refreshed");
+    info!(
+        audit = true,
+        did = %session.did,
+        role = %role,
+        old_session_id = %session.session_id,
+        new_session_id = %token_response.session_id,
+        "token refreshed",
+    );
 
     Ok(Json(RefreshResponse {
-        session_id: session.session_id,
+        session_id: token_response.session_id,
         data: RefreshData {
-            access_token,
-            access_expires_at,
+            access_token: token_response.access_token,
+            access_expires_at: token_response.access_expires_at,
+            refresh_token: token_response.refresh_token,
+            refresh_expires_at: token_response.refresh_expires_at,
         },
     }))
 }

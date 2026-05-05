@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 
 use affinidi_webvh_common::StatsSyncPayload;
 use affinidi_webvh_common::server::acl;
+use affinidi_webvh_common::server::auth::ServiceAuth;
 use tracing::{debug, warn};
 
 use crate::server::AppState;
@@ -42,14 +43,32 @@ pub fn accept_seq(server_did: &str, seq: u64) -> bool {
 
 /// POST /api/control/stats — receive per-DID deltas from a server instance.
 ///
+/// Requires the Service-role JWT issued to the registered server, and rejects
+/// payloads whose `server_did` does not match the authenticated caller. The
+/// Service role is a separate role from Admin/Owner; only servers that have
+/// completed registration receive a Service JWT.
+///
 /// Validates ACL, checks sequence for idempotency, then records deltas into
 /// the in-memory collector. Zero I/O — everything is flushed to store by
 /// the periodic flush cycle in the storage thread.
 pub async fn receive_stats(
+    auth: ServiceAuth,
     State(state): State<AppState>,
     Json(payload): Json<StatsSyncPayload>,
 ) -> StatusCode {
-    // Validate the server DID is in the ACL
+    // Bind the payload to the JWT-authenticated server. Without this check,
+    // any holder of a Service-role JWT could falsify counters for any server.
+    if auth.0.did != payload.server_did {
+        warn!(
+            authenticated = %auth.0.did,
+            claimed = %payload.server_did,
+            "stats sync rejected: payload server_did does not match authenticated DID",
+        );
+        return StatusCode::FORBIDDEN;
+    }
+
+    // Belt-and-braces: re-check ACL membership at request time so a yanked
+    // ACL entry takes effect immediately even if the JWT hasn't expired.
     match acl::get_acl_entry(&state.acl_ks, &payload.server_did).await {
         Ok(Some(_)) => {}
         Ok(None) => {

@@ -2,7 +2,7 @@ pub mod extractor;
 pub mod jwt;
 pub mod session;
 
-pub use extractor::{AdminAuth, AuthClaims};
+pub use extractor::{AdminAuth, AuthClaims, ServiceAuth};
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
 ///
