@@ -194,9 +194,13 @@
   `handle_webvh_message` to delegate to `(String, Value)`-returning
   helpers (`run_authenticate`, `run_webvh_dispatch`) so the wire-level
   responses are testable without an `ATM`-backed `HandlerContext`. Also
-  added `affinidi-messaging-test-mediator` as a dev-dep for in-process
-  embedded mediator tests, with a smoke test validating the fixture
-  spawns and provisions distinct DIDs.
+  added `affinidi-messaging-test-mediator` (0.2) as a dev-dep for
+  in-process embedded mediator tests. Smoke tests validate the
+  fixture spawns, provisions distinct DIDs via the new
+  `TestMediator::with_users` helper, and supports incremental
+  `TestMediatorHandle::add_user` post-spawn — the lighter-weight
+  alternative to `TestEnvironment` for handler-level scenarios that
+  don't need an ATM-bound profile.
 - **JWT crypto provider unification fix.** `JwtKeys::from_ed25519_bytes`
   now idempotently installs `jsonwebtoken::crypto::rust_crypto` as the
   process-level provider before encode/decode. Required because

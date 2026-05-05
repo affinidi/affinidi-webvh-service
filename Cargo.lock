@@ -314,7 +314,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d587ab2b2c982d9f5de4c2bbb78c1c1453e837ceb6837acf8cc7beaa51a864b"
 dependencies = [
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk",
+ "affinidi-messaging-sdk 0.17.0",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "async-trait",
@@ -332,16 +332,16 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faa61f5cbd099b3986ffcefe524f78b14fc82b593564ff625721f1968655ab4d"
+checksum = "41c730596a858bf36acc8ed2127e5175ba8fae328f719bccf551a31bdd4bda1d"
 dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-encoding",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk",
+ "affinidi-messaging-sdk 0.18.0",
  "affinidi-secrets-resolver",
  "ahash 0.8.12",
  "async-convert",
@@ -390,12 +390,11 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-common"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da34b5693b0489f38ce94d0a71fcac9e1753969df5dc3a7ae7ae0fc3fc041ef"
+checksum = "6faadc81a450189b68640e5da379ee49f86d190845499b254ec46b4ed9fdae7c"
 dependencies = [
  "aes-gcm",
- "affinidi-messaging-sdk",
  "ahash 0.8.12",
  "argon2",
  "async-trait",
@@ -411,6 +410,7 @@ dependencies = [
  "num-format",
  "rand 0.10.1",
  "redis",
+ "regex",
  "reqwest 0.13.2",
  "rustls 0.23.39",
  "semver",
@@ -458,15 +458,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "affinidi-messaging-test-mediator"
-version = "0.1.0"
+name = "affinidi-messaging-sdk"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e8503e0eac797f071a397a9192d0d3a60bc584e5bcb10b7a2f00fbeb1598651"
+checksum = "9269b5c55e8fd580a399464d9919e04ce5ffb2854d64f3ccea015a47a74a0243"
+dependencies = [
+ "affinidi-did-authentication",
+ "affinidi-did-common",
+ "affinidi-encoding",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-mediator-common",
+ "affinidi-secrets-resolver",
+ "affinidi-tdk-common",
+ "ahash 0.8.12",
+ "base64 0.22.1",
+ "futures-util",
+ "regex",
+ "rustls 0.23.39",
+ "rustls-pemfile 2.2.0",
+ "serde",
+ "serde_json",
+ "sha256",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "affinidi-messaging-test-mediator"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c15008eff3383a46c1c7b725456ace0d07e94397b3f4715641fce20827ed59c7"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-mediator",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk",
+ "affinidi-messaging-sdk 0.18.0",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "async-trait",
@@ -533,7 +562,7 @@ dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-meeting-place",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk",
+ "affinidi-messaging-sdk 0.17.0",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "clap",
