@@ -52,7 +52,24 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +${{ env.MSRV }} build --workspace --locked
+      - name: MSRV — build workspace (default features)
+        run: cargo +${{ env.MSRV }} build --workspace --locked
+      - name: MSRV — build webvh-common with every feature combination
+        # Cloud-secret backends and non-default storage backends are gated
+        # behind feature flags. They must also build at MSRV; otherwise a
+        # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
+        # the default-features build and break operator-driven feature
+        # selections at the next minor release.
+        run: |
+          for feat in keyring aws-secrets gcp-secrets azure-secrets \
+                     store-fjall store-redis store-dynamodb \
+                     store-firestore store-cosmosdb passkey \
+                     setup-wizard metrics; do
+            echo "::group::MSRV build affinidi-webvh-common --features server-core,$feat"
+            cargo +${{ env.MSRV }} build -p affinidi-webvh-common --locked \
+              --no-default-features --features "server-core,$feat"
+            echo "::endgroup::"
+          done
 
   test:
     name: cargo test (${{ matrix.store }})
@@ -98,7 +115,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # `--locked` ensures Cargo.lock matches the workspace manifest exactly,
+      # so a transitive dep bump cannot quietly land via the test job before
+      # being explicitly bumped in Cargo.toml.
+      - run: cargo test --workspace --locked
 
   cloud-secrets-build:
     name: cargo build (cloud secret backends)

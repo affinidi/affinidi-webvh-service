@@ -20,14 +20,19 @@ use vta_sdk::credentials::CredentialBundle;
 pub const SELF_MANAGED_DAEMON_ONLY: &str = "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
      See docs/self-managed-mode-spec.md for the full rationale.";
 
-/// Atomically create a file with mode 0600 on Unix and write `bytes` into it.
+/// Atomically write `bytes` to `path` with mode 0600 on Unix.
 ///
-/// Closes the TOCTOU window between `fs::write` and `chmod 0o600`: a separate
-/// `fs::write + set_permissions` pair leaves the file at the process umask
-/// (typically 0644) for a brief window, during which a local attacker can read
-/// the contents. `create_new` also refuses to overwrite an existing file, which
-/// matches the "freshly minted material" semantics of the offline-bootstrap
-/// flow — the caller is expected to write to a path that does not yet exist.
+/// Implementation: write to a sibling `<path>.tmp.<rand>` file with
+/// `O_CREAT | O_EXCL` (so a concurrent attacker cannot trick us into reusing
+/// a file they pre-created), `fchmod 0600` before any data lands, fsync,
+/// then `rename` into place. The rename is atomic on Unix, so:
+///
+/// - There is no window where `path` exists at the process umask.
+/// - Re-running the offline-bootstrap CLI over an existing seed file
+///   succeeds rather than failing with `EEXIST` (the previous file is
+///   replaced atomically).
+/// - The temp file's permissions are set before the data is written, so
+///   the bytes are never readable to any other UID.
 ///
 /// On non-Unix targets, falls back to standard `fs::write` (file ACLs are
 /// outside our control on Windows; the wizard prints the path so the operator
@@ -42,14 +47,36 @@ fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+
+        let mut tmp_path = path.to_path_buf();
+        // 128-bit random suffix gives a collision-free name across concurrent
+        // wizard runs in the same directory.
+        let suffix: u128 = rand::random::<u128>();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "secret".to_string());
+        tmp_path.set_file_name(format!(".{file_name}.tmp.{suffix:032x}"));
+
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(path)?;
+            .open(&tmp_path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        Ok(())
+        drop(f);
+
+        // Atomic replace. On any error before this point we leave behind
+        // the tmp file, which is locked to the running user — acceptable
+        // and recoverable (the operator can re-run; the tmp name is unique).
+        match std::fs::rename(&tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
     #[cfg(not(unix))]
     {

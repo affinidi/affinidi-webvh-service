@@ -13,24 +13,29 @@ use super::ServerSecrets;
 /// independent lifecycles.
 const BOOTSTRAP_SEED_USER_SUFFIX: &str = "::bootstrap_seed";
 
-/// Caches the result of the first call to `register_default_store()` so the
-/// failure mode is surfaced consistently to every later caller (rather than
-/// silently swallowed at warn-level on the first call and turning into a
-/// confusing "no entry" later).
-static REGISTER_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+/// Set once the default credential store registration has succeeded. Failures
+/// are *not* cached — a transient init error (e.g. dbus not yet up at boot)
+/// is allowed to retry on the next `try_new` call rather than poisoning the
+/// process for the rest of its lifetime. Successful registration is sticky:
+/// subsequent calls observe the `OnceLock` and skip the work.
+static REGISTERED: OnceLock<()> = OnceLock::new();
 
 fn ensure_default_store() -> Result<(), AppError> {
-    let outcome =
-        REGISTER_RESULT.get_or_init(|| register_default_store().map_err(|e| e.to_string()));
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(msg) => Err(AppError::SecretStore(format!(
-            "keyring default store could not be registered on this platform: {msg}. \
+    if REGISTERED.get().is_some() {
+        return Ok(());
+    }
+    register_default_store().map_err(|e| {
+        AppError::SecretStore(format!(
+            "keyring default store could not be registered on this platform: {e}. \
              Either install the native credential store (macOS Keychain, Windows Credential Manager, \
              or a Secret Service implementation on Linux), or pick a different secret backend \
              (aws-secrets / gcp-secrets / azure-secrets / plaintext for testing)."
-        ))),
-    }
+        ))
+    })?;
+    // Race-safe: if two threads both reach this point, `set` succeeds for
+    // exactly one of them and the other observes a no-op `Err` (already set).
+    let _ = REGISTERED.set(());
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -71,21 +76,14 @@ impl KeyringSecretStore {
     /// credential store on first call. Returns an error (rather than panicking
     /// or silently degrading) when the backend is unavailable, so that the
     /// failure surfaces clearly at process startup instead of as a
-    /// "secrets not found" misdirection later.
+    /// "secrets not found" misdirection later. This is the only constructor —
+    /// callers must handle the `Err` arm rather than panicking via `.unwrap()`.
     pub fn try_new(service: impl Into<String>, user: impl Into<String>) -> Result<Self, AppError> {
         ensure_default_store()?;
         Ok(Self {
             service: service.into(),
             user: user.into(),
         })
-    }
-
-    /// Convenience constructor that panics on backend-registration failure.
-    /// Prefer [`Self::try_new`] in production code so the failure is reported
-    /// to the operator with context. Retained for tests and ad-hoc callers
-    /// that have already validated the backend is available.
-    pub fn new(service: impl Into<String>, user: impl Into<String>) -> Self {
-        Self::try_new(service, user).expect("keyring backend registration failed")
     }
 
     fn bootstrap_seed_user(&self) -> String {
