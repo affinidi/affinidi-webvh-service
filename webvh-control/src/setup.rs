@@ -352,11 +352,7 @@ enum VtaMode {
     SelfManaged,
 }
 
-/// Error message when an operator picks self-managed mode in a non-daemon
-/// binary. Kept as a single constant so all three binaries (server,
-/// control, witness) print identical text.
-const SELF_MANAGED_DAEMON_ONLY: &str = "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
-     See docs/self-managed-mode-spec.md for the full rationale.";
+use affinidi_webvh_common::server::vta_setup::SELF_MANAGED_DAEMON_ONLY;
 
 fn prompt_vta_mode() -> Result<VtaMode, AppError> {
     let items = [
