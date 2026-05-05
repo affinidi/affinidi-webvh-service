@@ -9,6 +9,17 @@
   webvh-control was the last hold-out — it accepted a raw refresh-token
   string in the body. Refresh now requires possession of both the refresh
   token *and* the session-DID's signing key on every service.
+- **Offline-bootstrap latent-bug fix.** `open_offline_bootstrap_response`
+  used `BTreeMap::iter().next()` to pick "the" DidKeyMaterial entry from
+  the sealed payload's secrets map. With admin rollover enabled (the
+  production-recommended VTA config), payloads carry two entries —
+  integration and admin — and the alphabetical iteration order silently
+  picked the wrong one (`did:key:...` admin sorts before `did:webvh:...`
+  integration). The open path now matches by `config.did_document.id`
+  with a logged forward-compat fallback. New
+  `offline_bootstrap_full_webvh_to_vta_roundtrip` integration test
+  exercises the full webvh ↔ VTA seal/open path in-process and would
+  have caught this regression before publish.
 - **Refresh-token rotation TOCTOU closed end-to-end.** Two concurrent
   requests with the same leaked refresh token used to both pass the
   lookup before either deleted the session. The fix is a new
