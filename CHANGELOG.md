@@ -4,6 +4,45 @@
 
 ### Security
 
+- **Refresh handlers (server, witness) now bind the JWS signer to the session
+  DID.** Previously a leaked refresh token plus any attacker-controlled DID
+  could rotate the victim's tokens — the signed envelope only proved
+  possession of *some* key. Both handlers now reject when the verified
+  signer DID does not equal `session.did`.
+- **Empty-`jti` rotation bypass closed.** The extractor used to short-circuit
+  the rotation check when `claims.jti.is_empty()`. Any session with a
+  `token_id` now requires a non-empty matching `jti`, regardless of how
+  the token was minted.
+- **Registry / proxy trust chain hardened in webvh-control.** The audit
+  found a Service-role JWT could register an attacker URL as a backend
+  instance, and the proxy would then forward an Admin caller's
+  Authorization header to it on the next proxy hit:
+  - `RegistryConfig` gains an optional `url_allowlist` for backend hostnames.
+  - `webvh-control`'s reqwest client is built with `Policy::none()` so
+    a malicious backend cannot redirect the proxy onto a third-party host.
+  - The proxy strips RFC 7230 §6.1 hop-by-hop headers and `Set-Cookie`
+    from upstream responses before forwarding.
+- **Watcher `/api/sync/did` body limited to 4 MiB** via a tower-http
+  `RequestBodyLimitLayer`, and `validate_did_jsonl` now requires the
+  latest entry's `state.id` to start with `did:webvh:`. Closes a leaked-
+  push-token DoS / arbitrary-content republish vector.
+- **Manual `Debug` redaction extended** to `Session` (refresh_token,
+  token_id, challenge), `Enrollment` (invite token), `StoredSecrets`
+  (bootstrap_seed), and `SecretsConfig` (plaintext_bootstrap_seed).
+- **Multi-signature JWS envelopes are rejected** by `unpack_signed`. The
+  threat model assumes single-signer messages; accepting additional
+  signatures silently created surprising states.
+- **X25519 verification methods rejected** by `resolve_verifying_key` —
+  Ed25519 signing keys and X25519 key-agreement keys are both 32 bytes,
+  so the previous length check would not catch a kid pointing at the
+  wrong key class.
+- **Keyring init no longer poisons the process** on transient failures.
+  Only the success case is cached; transient failures (dbus not yet up,
+  etc.) are allowed to retry on the next constructor call.
+- **`write_secret_file_0600` is now atomic-rename safe** — uses a
+  sibling tempfile with mode 0600 set before data is written, then
+  rename. Re-runs of the offline-bootstrap CLI no longer fail with
+  EEXIST when the seed file already exists.
 - **DIDComm authentication closed an auth-bypass on every REST `/api/auth/`
   endpoint.** `unpack_signed` now returns the JWS-verified signer DID and
   rejects envelopes whose `from` field disagrees. Previously an attacker
