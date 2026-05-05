@@ -48,14 +48,26 @@ HTTP client for communicating with webvh-witness instances.
 
 ## Feature Flags
 
-| Feature | Description |
-| ------- | ----------- |
-| `server-core` | Server infrastructure (auth, ACL, store, config, secrets) |
-| `store-fjall` | Fjall embedded key-value store backend |
-| `keyring` | OS keyring secrets backend |
-| `aws-secrets` | AWS Secrets Manager backend |
-| `gcp-secrets` | GCP Secret Manager backend |
-| `passkey` | WebAuthn passkey authentication |
+| Feature | Default | Description |
+| ------- | ------- | ----------- |
+| `server-core` | off | Server infrastructure (auth, ACL, config, secret-store framework, security headers). Enables every other server-side feature below. |
+| `metrics` | off | Prometheus metrics emitters (requires `server-core`). |
+| `setup-wizard` | off | Interactive `dialoguer` prompts used by binary setup commands (requires `server-core`). |
+| `passkey` | off | WebAuthn passkey enrolment + login (requires `server-core`). |
+| `store-fjall` | off | Fjall embedded key-value store. |
+| `store-redis` | off | Redis store backend. |
+| `store-dynamodb` | off | AWS DynamoDB store backend. |
+| `store-firestore` | off | Google Cloud Firestore store backend. |
+| `store-cosmosdb` | off | Azure Cosmos DB (`key_auth`) store backend. |
+| `keyring` | off | OS keyring secret backend (`keyring-core` 1.x). Supported targets: macOS, Windows, Linux. |
+| `aws-secrets` | off | AWS Secrets Manager secret backend. |
+| `gcp-secrets` | off | GCP Secret Manager secret backend. |
+| `azure-secrets` | off | Azure Key Vault secret backend. |
+
+> **Storage backends are mutually exclusive.** Only one of `store-fjall`,
+> `store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
+> may be active at a time — the binaries' `build.rs` panics at compile
+> time if more than one is selected.
 
 ## Usage
 

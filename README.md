@@ -109,10 +109,15 @@ cargo build -p affinidi-webvh-server --example client
 
 1. Start the webvh-server with DIDComm authentication configured.
 
-2. Run the example, pointing it at the server:
+2. Run the example, pointing it at the server. `--webvh-did` is the
+   service's own DID — it's printed by `webvh-server setup` and
+   `webvh-daemon setup` on completion. Re-print it any time with
+   `webvh-server show-did` (or `webvh-daemon show-did`):
 
    ```sh
-   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8530
+   cargo run -p affinidi-webvh-server --example client -- \
+     --server-url http://localhost:8530 \
+     --webvh-did did:webvh:...:localhost%3A8530:server
    ```
 
 3. The example will generate a `did:key` identity and pause, printing the DID:

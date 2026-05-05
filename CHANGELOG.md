@@ -2,6 +2,46 @@
 
 ## 0.6.0 (2026-05-05)
 
+### Security
+
+- **DIDComm authentication closed an auth-bypass on every REST `/api/auth/`
+  endpoint.** `unpack_signed` now returns the JWS-verified signer DID and
+  rejects envelopes whose `from` field disagrees. Previously an attacker
+  controlling any DID could mint a JWT for any ACL'd DID on the server,
+  control plane, or witness REST surface. The mediator-driven inbound DIDComm
+  path was unaffected.
+- **Stats-sync endpoint requires Service-role auth** and binds the payload's
+  `server_did` to the JWT-authenticated caller. Closes a counter-poisoning
+  vector on the public control-plane surface.
+- **Watcher sync now runs `validate_did_jsonl`** before storing pushed log
+  content. A leaked push token can no longer republish arbitrary JSON
+  masquerading as a DID document.
+- **Witness `sign_proof` is now Admin-only** and emits an audit log on every
+  signed proof. Previously any authenticated caller could request a witness
+  proof for any version_id.
+- **Reverse proxy in webvh-control requires Admin role** rather than any
+  authenticated user.
+- **Refresh handlers rotate everything.** The control / server / witness
+  refresh endpoints now mint a fresh `session_id`, access token and refresh
+  token on every refresh; the old session is deleted atomically. The
+  `RefreshData` response shape gains `refresh_token` + `refresh_expires_at`
+  so callers can drive the next refresh.
+- **Private key files are written atomically** with mode 0600 using
+  `OpenOptions::create_new`. Closes a TOCTOU window between `fs::write` and
+  `set_permissions`.
+- **`ServerSecrets`, `WitnessRecord`, `PlaintextSecrets` redact `Debug`** so
+  `tracing::debug!(?secrets, …)` no longer leaks key material.
+- **`PlaintextSecretStore::set` now persists `vta_credential`** instead of
+  silently dropping it. Plaintext-backed deployments could previously lose
+  their VTA credential on any wizard-driven config rewrite.
+- **HTTP responses carry CSP, Referrer-Policy, HSTS** in addition to the
+  existing X-Frame-Options / X-Content-Type-Options / Cache-Control.
+- **Invite tokens** are now logged as a token-prefix only (revoke / update
+  handlers in the passkey module). The token itself is no longer committed
+  to operator log streams.
+- **`KeyringSecretStore::try_new`** surfaces backend-registration failure as
+  a structured `AppError::SecretStore` instead of warning-then-mystery-error.
+
 ### Added
 - **webvh-daemon**: Self-managed identity mode. The setup wizard now
   offers a fourth choice ("Self-managed — no VTA — daemon manages its

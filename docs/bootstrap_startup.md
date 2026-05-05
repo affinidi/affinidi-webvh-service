@@ -459,3 +459,43 @@ webvh-control list-acl
 | `WITNESS_VTA_URL` | VTA REST URL |
 | `WITNESS_VTA_DID` | VTA DID for DIDComm |
 | `WITNESS_VTA_CONTEXT_ID` | VTA context ID |
+
+### Cloud secret backends (all binaries)
+
+The same env-var prefix that scopes `WEBVH_*` / `CONTROL_*` / `WITNESS_*`
+also scopes the cloud secret backends. Replace `<PREFIX>` below with
+`WEBVH`, `CONTROL`, `WITNESS`, or `DAEMON`.
+
+| Variable | Description |
+|----------|-------------|
+| `<PREFIX>_SECRETS_KEYRING_SERVICE` | OS keyring service name (default backend) |
+| `<PREFIX>_SECRETS_AWS_SECRET_NAME` | AWS Secrets Manager secret name |
+| `<PREFIX>_SECRETS_AWS_REGION` | AWS region (e.g. `us-east-1`) |
+| `<PREFIX>_SECRETS_GCP_PROJECT` | GCP project ID |
+| `<PREFIX>_SECRETS_GCP_SECRET_NAME` | GCP Secret Manager secret name |
+| `<PREFIX>_SECRETS_AZURE_VAULT_URL` | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
+| `<PREFIX>_SECRETS_AZURE_SECRET_NAME` | Azure Key Vault secret name |
+
+Selection precedence at runtime: AWS → GCP → Azure → keyring → plaintext.
+Compile-time feature gates (`aws-secrets`, `gcp-secrets`, `azure-secrets`,
+`keyring`) decide which backends are even compiled in. Only compile in the
+backends you'll use — they each pull a sizable cloud SDK.
+
+### Storage backends (all binaries)
+
+| Variable | Description |
+|----------|-------------|
+| `<PREFIX>_STORE_DATA_DIR` | Fjall on-disk path (default backend) |
+| `<PREFIX>_STORE_REDIS_URL` | Redis connection URL |
+| `<PREFIX>_STORE_DYNAMODB_TABLE` | DynamoDB table name |
+| `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB |
+| `<PREFIX>_STORE_FIRESTORE_PROJECT` | GCP project ID for Firestore |
+| `<PREFIX>_STORE_FIRESTORE_DATABASE` | Firestore database id |
+| `<PREFIX>_STORE_COSMOSDB_ENDPOINT` | Cosmos DB account endpoint |
+| `<PREFIX>_STORE_COSMOSDB_DATABASE` | Cosmos DB database name |
+| `<PREFIX>_STORE_COSMOSDB_CONTAINER` | Cosmos DB container name |
+| `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
+
+Storage backends are mutually exclusive — exactly one of `store-fjall`,
+`store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
+must be enabled at build time.

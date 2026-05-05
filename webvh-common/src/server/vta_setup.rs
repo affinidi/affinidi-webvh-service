@@ -17,8 +17,7 @@ use vta_sdk::credentials::CredentialBundle;
 /// non-daemon binary (server / control / witness). Kept as a single shared
 /// constant so all three setup wizards print identical text — it's the
 /// canonical "you wanted webvh-daemon, not this one" pointer.
-pub const SELF_MANAGED_DAEMON_ONLY: &str =
-    "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
+pub const SELF_MANAGED_DAEMON_ONLY: &str = "self-managed mode is daemon-only in v1 — re-run setup with webvh-daemon. \
      See docs/self-managed-mode-spec.md for the full rationale.";
 
 /// Atomically create a file with mode 0600 on Unix and write `bytes` into it.

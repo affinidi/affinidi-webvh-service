@@ -46,12 +46,20 @@ The binary is produced at `target/release/webvh-daemon`.
 
 ### 2. Configure
 
-Create a `config.toml`:
+The fastest way to produce a working `config.toml` is to run
+`webvh-daemon setup`, which prompts for the values below and emits a
+file you can hand-edit later. A worked example follows for reference:
 
 ```toml
 server_did = "did:webvh:example.com"
 mediator_did = "did:webvh:mediator.example.com"
 public_url = "https://example.com"
+
+# Identity mode. Default: "vta". Set to "self-managed" to skip the
+# VTA round-trip and have the daemon self-host its own did:webvh
+# identifier. See docs/self-managed-mode-spec.md for the trade-offs.
+[identity]
+mode = "vta"
 
 [server]
 host = "0.0.0.0"
@@ -64,6 +72,10 @@ level = "info"
 access_token_expiry = 900
 refresh_token_expiry = 86400
 
+# Secret backend. Pick one — features are mutually exclusive at compile
+# time. The daemon's default features include `keyring`; cloud secret
+# backends require recompiling with `--features aws-secrets|gcp-secrets|
+# azure-secrets` and a corresponding [secrets.<backend>] section.
 [secrets]
 keyring_service = "webvh-daemon"
 
@@ -83,20 +95,30 @@ watcher = false
 control = true
 ```
 
+For self-managed mode (no VTA), set `[identity] mode = "self-managed"`
+and omit the `[vta]` section entirely. The daemon will mint its own
+Ed25519 + X25519 keys at first run, host its own `did:webvh`
+identifier on `public_url`, and seed an empty ACL — admin enrolment is
+done through `webvh-daemon invite --did <DID> --role admin` and the
+passkey enrolment flow. See [docs/self-managed-mode-spec.md](../docs/self-managed-mode-spec.md)
+for the full walkthrough.
+
 ### 3. Start the daemon
 
 ```bash
 webvh-daemon --config config.toml
 ```
 
-The daemon starts all enabled services on a single port and
-logs which services are active:
+The daemon starts all enabled services on a single port and logs which
+services are active. The control plane and `webvh-server` (public DID
+resolver) both merge at root; `webvh-witness` and `webvh-watcher` nest
+under their own prefixes:
 
 ```
 --- daemon services ---
   server (/)
   witness (/witness)
-  control (/control)
+  control (/)
 daemon listening on 0.0.0.0:8534
 ```
 
@@ -175,19 +197,29 @@ webvh-daemon restore              # Restore data from backup file
 ## API Path Mapping
 
 When all services are enabled, the daemon exposes endpoints
-at the following paths:
+at the following paths. `webvh-server` (the public-DID-resolver edge
+node) and `webvh-control` (the management API + UI) both merge at
+root — the daemon is a unified front door rather than a multiplexer.
+Witness and watcher are nested under their own prefixes because their
+APIs are operator-facing and benefit from a clean URL boundary.
 
-### Server (root)
+### Server + Control plane (root, merged)
 
-| Path | Description |
-| ---- | ----------- |
-| `/api/health` | Server health |
-| `/api/auth/*` | Server authentication |
-| `/api/dids/*` | DID management |
-| `/api/acl/*` | Server ACL |
-| `/{mnemonic}/did.jsonl` | DID resolution |
+| Path | Description | Source |
+| ---- | ----------- | ------ |
+| `/api/health` | Combined health endpoint | server / control |
+| `/api/auth/*` | DIDComm auth + passkey auth | control plane |
+| `/api/dids/*` | DID lifecycle management | control plane |
+| `/api/acl/*` | ACL management | control plane |
+| `/api/server/{instance_id}/*` | Reverse proxy to a registered server | control plane |
+| `/api/witness/{instance_id}/*` | Reverse proxy to a registered witness | control plane |
+| `/api/control/registry/*` | Service registry CRUD | control plane |
+| `/api/control/stats` | Service-role stats sync ingest | control plane |
+| `/{mnemonic}/did.jsonl` | Public DID resolution | server |
+| `/.well-known/did.jsonl` | Service-DID resolution | server |
+| `/`, `/assets/*` | Management UI (when `ui` feature enabled) | control plane |
 
-### Witness (`/witness`)
+### Witness (nested at `/witness`)
 
 | Path | Description |
 | ---- | ----------- |
@@ -196,21 +228,13 @@ at the following paths:
 | `/witness/api/witnesses/*` | Witness management |
 | `/witness/api/proof/*` | Proof signing |
 
-### Watcher (`/watcher`)
+### Watcher (nested at `/watcher`)
 
 | Path | Description |
 | ---- | ----------- |
 | `/watcher/api/health` | Watcher health |
-| `/watcher/api/sync/*` | Sync endpoints |
-
-### Control (`/control`)
-
-| Path | Description |
-| ---- | ----------- |
-| `/control/api/health` | Control plane health |
-| `/control/api/auth/*` | Control plane auth (DIDComm + passkey) |
-| `/control/api/acl/*` | Control plane ACL |
-| `/control/api/control/registry/*` | Service registry |
+| `/watcher/api/sync/*` | Server → watcher sync endpoints |
+| `/watcher/{mnemonic}/did.jsonl` | Mirrored public DID resolution |
 
 ### Daemon
 

@@ -185,11 +185,13 @@ Private key material is stored outside the config file in a
 pluggable secrets backend. The backend is selected at compile
 time via feature flags and at runtime via config/env vars.
 
-| Backend              | Feature flag  | Config fields                                    |
-| -------------------- | ------------- | ------------------------------------------------ |
-| OS Keyring (default) | `keyring`     | `secrets.keyring_service`                        |
-| AWS Secrets Manager  | `aws-secrets` | `secrets.aws_secret_name`, `secrets.aws_region`  |
-| GCP Secret Manager   | `gcp-secrets` | `secrets.gcp_project`, `secrets.gcp_secret_name` |
+| Backend              | Feature flag    | Config fields                                                                  |
+| -------------------- | --------------- | ------------------------------------------------------------------------------ |
+| OS Keyring (default) | `keyring`       | `secrets.keyring_service`                                                      |
+| AWS Secrets Manager  | `aws-secrets`   | `secrets.aws_secret_name`, `secrets.aws_region`                                |
+| GCP Secret Manager   | `gcp-secrets`   | `secrets.gcp_project`, `secrets.gcp_secret_name`                               |
+| Azure Key Vault      | `azure-secrets` | `secrets.azure_vault_url`, `secrets.azure_secret_name`                         |
+| Plaintext (testing)  | *(default)*     | `[secrets.plaintext]` — **do not use in production**, secrets land on disk    |
 
 The server stores its key material as a JSON-serialized record
 in the backend:
@@ -226,19 +228,24 @@ selected at compile time via feature flags. The default backend
 is **fjall**, an embedded key-value store that requires no
 external services.
 
-| Backend                   | Feature flag     | Config fields                                                  |
-| ------------------------- | ---------------- | -------------------------------------------------------------- |
-| Fjall (default, embedded) | `store-fjall`    | `store.data_dir`                                               |
+| Backend                   | Feature flag      | Config fields                                                                                                |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| Fjall (default, embedded) | `store-fjall`     | `store.data_dir`                                                                                             |
+| Redis                     | `store-redis`     | `store.redis_url`                                                                                            |
+| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table`, `store.dynamodb_region`                                                              |
+| Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
+| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
 
 To build with a non-default storage backend:
 
 ```bash
 cargo build -p affinidi-webvh-server --release \
-  --no-default-features --features "keyring,store-fjall"
+  --no-default-features --features "keyring,store-redis"
 ```
 
 > **Note:** Enabling more than one `store-*` feature or zero
-> `store-*` features will produce a compile error.
+> `store-*` features will produce a compile error (enforced by
+> `webvh-server/build.rs`).
 
 ### Environment Variable Overrides
 
