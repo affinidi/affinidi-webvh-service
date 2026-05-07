@@ -32,11 +32,11 @@ azure-secrets = [
   "dep:futures",
   "affinidi-webvh-common/azure-secrets",
 ]
-store-fjall = ["dep:fjall"]
-store-redis = ["dep:redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
-store-firestore = ["dep:firestore", "dep:futures"]
-store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+store-fjall = ["dep:fjall", "affinidi-webvh-common/store-fjall"]
+store-redis = ["dep:redis", "affinidi-webvh-common/store-redis"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "affinidi-webvh-common/store-dynamodb"]
+store-firestore = ["dep:firestore", "dep:futures", "affinidi-webvh-common/store-firestore"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "affinidi-webvh-common/store-cosmosdb"]
 passkey = ["affinidi-webvh-common/passkey"]
 
 [lib]
@@ -48,7 +48,7 @@ name = "webvh-control"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "store-fjall", "passkey", "setup-wizard"] }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "passkey", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
