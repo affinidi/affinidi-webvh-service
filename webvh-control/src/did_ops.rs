@@ -86,15 +86,82 @@ async fn get_authorized_record(
     Ok(record)
 }
 
+/// Resolve a custom path during create, applying force-replace semantics.
+///
+/// If the path is free, returns it unchanged. If taken and `force` is false,
+/// returns `Conflict(conflict_msg)`. If taken and `force` is true, the caller
+/// must be an admin or the current owner of that path; the existing log
+/// content, witness, and owner-index are removed so the slot can be
+/// reused. Stats are left intact (separate keyspace).
+async fn resolve_path_for_create(
+    state: &AppState,
+    custom_path: &str,
+    auth: &AuthClaims,
+    force: bool,
+    conflict_msg: &str,
+) -> Result<String, AppError> {
+    use crate::acl::Role;
+
+    if is_path_available(&state.dids_ks, custom_path).await? {
+        return Ok(custom_path.to_string());
+    }
+
+    if !force {
+        return Err(AppError::Conflict(conflict_msg.to_string()));
+    }
+
+    let existing: DidRecord = state
+        .dids_ks
+        .get(did_key(custom_path))
+        .await?
+        .ok_or_else(|| AppError::Internal("path conflict but record missing".into()))?;
+
+    if existing.owner != auth.did && auth.role != Role::Admin {
+        warn!(
+            caller = %auth.did,
+            owner = %existing.owner,
+            mnemonic = %custom_path,
+            "force replace denied: not the owner or admin"
+        );
+        return Err(AppError::Forbidden(
+            "force replace requires admin or current owner".into(),
+        ));
+    }
+
+    let mut batch = state.store.batch();
+    batch.remove(&state.dids_ks, content_log_key(custom_path));
+    batch.remove(&state.dids_ks, content_witness_key(custom_path));
+    if existing.owner != auth.did {
+        batch.remove(&state.dids_ks, owner_key(&existing.owner, custom_path));
+    }
+    batch.commit().await?;
+
+    info!(
+        caller = %auth.did,
+        prev_owner = %existing.owner,
+        mnemonic = %custom_path,
+        "force-replacing existing DID"
+    );
+
+    Ok(custom_path.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Core operations
 // ---------------------------------------------------------------------------
 
 /// Create a new DID slot (reserve a mnemonic/path).
+///
+/// When `force` is true and the requested path already exists, the caller
+/// (admin or current owner of that path) replaces the existing slot — the
+/// old DID's log content, witness, and owner-index are removed and the
+/// caller becomes the new owner. Without `force`, a path collision returns
+/// `Conflict` as before.
 pub async fn create_did(
     auth: &AuthClaims,
     state: &AppState,
     path: Option<&str>,
+    force: bool,
 ) -> Result<RequestUriResponse, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
@@ -106,21 +173,19 @@ pub async fn create_did(
                     "only admins can create the root DID".into(),
                 ));
             }
-            if !is_path_available(&state.dids_ks, custom_path).await? {
-                return Err(AppError::Conflict(
-                    "root DID (.well-known) already exists".into(),
-                ));
-            }
-            custom_path.to_string()
+            resolve_path_for_create(
+                state,
+                custom_path,
+                auth,
+                force,
+                "root DID (.well-known) already exists",
+            )
+            .await?
         }
         Some(custom_path) => {
             validate_custom_path(custom_path)?;
-            if !is_path_available(&state.dids_ks, custom_path).await? {
-                return Err(AppError::Conflict(format!(
-                    "path '{custom_path}' is already taken"
-                )));
-            }
-            custom_path.to_string()
+            let conflict_msg = format!("path '{custom_path}' is already taken");
+            resolve_path_for_create(state, custom_path, auth, force, &conflict_msg).await?
         }
         None => generate_unique_mnemonic(&state.dids_ks).await?,
     };
@@ -406,6 +471,73 @@ pub async fn delete_did(
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
     Ok(did_id)
+}
+
+/// Transfer ownership of a DID to a different DID.
+///
+/// The caller must be the current owner or an admin. The new owner must
+/// already exist in the ACL — this prevents transferring a DID to an
+/// identity that can never authenticate to claim it.
+pub async fn change_did_owner(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    new_owner: &str,
+) -> Result<DidRecord, AppError> {
+    use affinidi_webvh_common::server::acl::get_acl_entry;
+
+    use crate::auth::session::now_epoch;
+
+    validate_mnemonic(mnemonic)?;
+
+    // Authorize the caller against the existing record first — keeps the
+    // error class stable (Forbidden, not Validation) when an unauthorized
+    // caller submits a malformed target. Any new-owner format check after
+    // this point only runs for authorized callers.
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let new_owner = new_owner.trim();
+    if new_owner.is_empty() {
+        return Err(AppError::Validation("new owner DID cannot be empty".into()));
+    }
+    if !new_owner.starts_with("did:") {
+        return Err(AppError::Validation(
+            "new owner must be a DID (must start with 'did:')".into(),
+        ));
+    }
+
+    if record.owner == new_owner {
+        return Ok(record);
+    }
+
+    if get_acl_entry(&state.acl_ks, new_owner).await?.is_none() {
+        return Err(AppError::Validation(format!(
+            "new owner '{new_owner}' is not in the ACL — add them first"
+        )));
+    }
+
+    let prev_owner = std::mem::replace(&mut record.owner, new_owner.to_string());
+    record.updated_at = now_epoch();
+
+    let mut batch = state.store.batch();
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.remove(&state.dids_ks, owner_key(&prev_owner, mnemonic));
+    batch.insert_raw(
+        &state.dids_ks,
+        owner_key(new_owner, mnemonic),
+        mnemonic.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
+
+    info!(
+        caller = %auth.did,
+        prev_owner = %prev_owner,
+        new_owner = %new_owner,
+        mnemonic = %mnemonic,
+        "DID owner changed on control plane"
+    );
+
+    Ok(record)
 }
 
 /// Toggle the `disabled` flag on a DID record.

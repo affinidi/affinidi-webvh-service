@@ -82,6 +82,7 @@ pub fn router_without_fallback() -> Router<AppState> {
             get(did_manage::get_did).delete(did_manage::delete_did),
         )
         .route("/log/{*mnemonic}", get(did_manage::get_did_log))
+        .route("/owner/{*mnemonic}", put(did_manage::change_owner))
         .route("/disable/{*mnemonic}", put(did_manage::disable_did))
         .route("/enable/{*mnemonic}", put(did_manage::enable_did))
         .route("/rollback/{*mnemonic}", post(did_manage::rollback_did))

@@ -67,6 +67,12 @@ export interface CreateDidResponse {
   didUrl: string;
 }
 
+export interface ChangeOwnerResponse {
+  mnemonic: string;
+  owner: string;
+  updatedAt: number;
+}
+
 export interface CheckNameResponse {
   available: boolean;
   path: string;
@@ -329,15 +335,22 @@ export const api = {
   getDidLog: (mnemonic: string) =>
     request<LogEntryInfo[]>(`/api/log/${mnemonic}`),
 
-  createDid: (path?: string) =>
+  createDid: (path?: string, force?: boolean) =>
     request<CreateDidResponse>("/api/dids", {
       method: "POST",
-      ...(path
+      ...(path || force
         ? {
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path }),
+            body: JSON.stringify({ path, force: force ?? false }),
           }
         : {}),
+    }),
+
+  changeOwner: (mnemonic: string, newOwner: string) =>
+    request<ChangeOwnerResponse>(`/api/owner/${mnemonic}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_owner: newOwner }),
     }),
 
   checkName: (path: string) =>

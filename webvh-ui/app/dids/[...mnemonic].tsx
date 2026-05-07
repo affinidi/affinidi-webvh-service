@@ -26,7 +26,7 @@ export default function DidDetail() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
   const mnemonic = Array.isArray(rawMnemonic) ? rawMnemonic.join("/") : rawMnemonic;
   const api = useApi();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, role, did: callerDid } = useAuth();
   const router = useRouter();
 
   const [stats, setStats] = useState<DidStats | null>(null);
@@ -41,6 +41,9 @@ export default function DidDetail() {
   const [deleting, setDeleting] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [loadingRaw, setLoadingRaw] = useState(false);
+  const [showChangeOwner, setShowChangeOwner] = useState(false);
+  const [newOwnerInput, setNewOwnerInput] = useState("");
+  const [changingOwner, setChangingOwner] = useState(false);
   const [editingDoc, setEditingDoc] = useState(false);
   const [docEditValue, setDocEditValue] = useState("");
   const [editingParams, setEditingParams] = useState(false);
@@ -197,6 +200,33 @@ export default function DidDetail() {
           const msg = e instanceof Error ? e.message : "Delete failed";
           showAlert("Error", msg);
           setDeleting(false);
+        }
+      },
+    );
+  };
+
+  const handleChangeOwner = async () => {
+    if (!mnemonic) return;
+    const newOwner = newOwnerInput.trim();
+    if (!newOwner) return;
+    showConfirm(
+      "Change Owner",
+      `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must already exist in the ACL.`,
+      async () => {
+        setChangingOwner(true);
+        try {
+          const result = await api.changeOwner(mnemonic, newOwner);
+          setDidDetail((prev) =>
+            prev ? { ...prev, owner: result.owner, updatedAt: result.updatedAt } : prev,
+          );
+          setNewOwnerInput("");
+          setShowChangeOwner(false);
+          showAlert("Success", "DID owner changed");
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Change owner failed";
+          showAlert("Error", msg);
+        } finally {
+          setChangingOwner(false);
         }
       },
     );
@@ -709,6 +739,56 @@ export default function DidDetail() {
           </Pressable>
         </View>
 
+        {/* Change Owner — visible to admins or the current owner */}
+        {didDetail &&
+          (role === "admin" || (callerDid && callerDid === didDetail.owner)) && (
+            <View style={styles.card}>
+              <View style={styles.sectionTitleRow}>
+                <Text style={styles.sectionTitle}>Ownership</Text>
+                <Pressable
+                  style={styles.smallButton}
+                  onPress={() => {
+                    setShowChangeOwner(!showChangeOwner);
+                    if (showChangeOwner) setNewOwnerInput("");
+                  }}
+                >
+                  <Text style={styles.smallButtonText}>
+                    {showChangeOwner ? "Cancel" : "Change Owner"}
+                  </Text>
+                </Pressable>
+              </View>
+              <Text style={styles.hint}>
+                Transfer this DID to a different identity. The new owner must
+                already be in the ACL.
+              </Text>
+              {showChangeOwner && (
+                <>
+                  <TextInput
+                    style={styles.ownerInput}
+                    placeholder="did:webvh:..."
+                    placeholderTextColor={colors.textTertiary}
+                    value={newOwnerInput}
+                    onChangeText={setNewOwnerInput}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                  <Pressable
+                    style={[
+                      styles.button,
+                      (!newOwnerInput.trim() || changingOwner) && styles.disabled,
+                    ]}
+                    onPress={handleChangeOwner}
+                    disabled={!newOwnerInput.trim() || changingOwner}
+                  >
+                    <Text style={styles.buttonText}>
+                      {changingOwner ? "Transferring..." : "Transfer Ownership"}
+                    </Text>
+                  </Pressable>
+                </>
+              )}
+            </View>
+          )}
+
         {/* Danger Zone */}
         <View style={[styles.card, styles.dangerCard]}>
           <Text style={styles.sectionTitle}>Danger Zone</Text>
@@ -947,6 +1027,17 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     color: colors.textSecondary,
     marginBottom: spacing.lg,
+  },
+  ownerInput: {
+    backgroundColor: colors.bgPrimary,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    color: colors.textPrimary,
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    marginBottom: spacing.md,
   },
   detailsGrid: {
     gap: spacing.sm,

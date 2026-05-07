@@ -42,6 +42,10 @@ pub async fn check_name(
 #[derive(Debug, Deserialize, Default)]
 pub struct RequestUriRequest {
     pub path: Option<String>,
+    /// When true and `path` already exists, replaces the existing DID slot
+    /// (caller must be admin or current owner of that path).
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn request_uri(
@@ -49,8 +53,15 @@ pub async fn request_uri(
     State(state): State<AppState>,
     body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
-    let path = body.and_then(|b| b.0.path);
-    let result = did_ops::create_did(&auth, &state, path.as_deref()).await?;
+    let (path, force) = match body {
+        Some(Json(b)) => (b.path, b.force),
+        None => (None, false),
+    };
+    let result = did_ops::create_did(&auth, &state, path.as_deref(), force).await?;
+
+    if force && let Some(ref p) = path {
+        server_push::notify_servers_delete(&state, p.clone());
+    }
 
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -141,6 +152,36 @@ pub async fn delete_did(
     did_ops::delete_did(&auth, &state, mnemonic).await?;
     server_push::notify_servers_delete(&state, mnemonic.to_string());
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /api/owner/{mnemonic} ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ChangeOwnerRequest {
+    pub new_owner: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnerResponse {
+    pub mnemonic: String,
+    pub owner: String,
+    pub updated_at: u64,
+}
+
+pub async fn change_owner(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    Json(req): Json<ChangeOwnerRequest>,
+) -> Result<Json<ChangeOwnerResponse>, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    let record = did_ops::change_did_owner(&auth, &state, mnemonic, &req.new_owner).await?;
+    Ok(Json(ChangeOwnerResponse {
+        mnemonic: record.mnemonic,
+        owner: record.owner,
+        updated_at: record.updated_at,
+    }))
 }
 
 // ---------- PUT /api/disable/{mnemonic} ----------

@@ -26,6 +26,9 @@ pub const MSG_LIST_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/list-requ
 pub const MSG_LIST: &str = "https://affinidi.com/webvh/1.0/did/list";
 pub const MSG_DELETE: &str = "https://affinidi.com/webvh/1.0/did/delete";
 pub const MSG_DELETE_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/delete-confirm";
+pub const MSG_DID_CHANGE_OWNER: &str = "https://affinidi.com/webvh/1.0/did/change-owner";
+pub const MSG_DID_CHANGE_OWNER_CONFIRM: &str =
+    "https://affinidi.com/webvh/1.0/did/change-owner-confirm";
 pub const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
 
 // ---------------------------------------------------------------------------

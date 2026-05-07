@@ -50,6 +50,7 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
+        .route(MSG_DID_CHANGE_OWNER, handler_fn(handle_webvh_message))?
         // Server registration
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
         // Health pong from servers
@@ -229,7 +230,15 @@ async fn dispatch_did_op(
     match msg.typ.as_str() {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
-            let result = did_ops::create_did(auth, state, path).await?;
+            let force = msg
+                .body
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let result = did_ops::create_did(auth, state, path, force).await?;
+            if force && let Some(p) = path {
+                server_push::notify_servers_delete(state, p.to_string());
+            }
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
                 MSG_DID_OFFER.to_string(),
@@ -397,6 +406,27 @@ async fn dispatch_did_op(
                 json!({
                     "mnemonic": mnemonic,
                     "did_id": did_id,
+                }),
+            ))
+        }
+        MSG_DID_CHANGE_OWNER => {
+            let mnemonic = msg
+                .body
+                .get("mnemonic")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
+            let new_owner = msg
+                .body
+                .get("new_owner")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'new_owner' in body".into()))?;
+            let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
+            Ok((
+                MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
+                json!({
+                    "mnemonic": record.mnemonic,
+                    "owner": record.owner,
+                    "updated_at": record.updated_at,
                 }),
             ))
         }
@@ -1373,5 +1403,221 @@ mod tests {
                 "map_app_error_code({err:?}) = {got}, expected {expected}",
             );
         }
+    }
+
+    /// `MSG_DID_CHANGE_OWNER` with no `mnemonic` body field is a validation
+    /// error — wire-level contract for malformed clients.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_missing_mnemonic_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "new_owner": "did:example:new" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
+    }
+
+    /// `MSG_DID_CHANGE_OWNER` with no `new_owner` body field is a validation
+    /// error.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_missing_new_owner_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(MSG_DID_CHANGE_OWNER, json!({ "mnemonic": "alpha-beta" }));
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("new_owner")));
+    }
+
+    /// Owner can transfer their own DID to another ACL'd DID. Confirms the
+    /// success path and the wire-level confirm body shape.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_success() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        let new_owner = "did:example:owner-b";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        // Both old and new owners must be in the ACL for change-owner to
+        // succeed — defense-in-depth.
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: new_owner.into(),
+                role: Role::Owner,
+                label: None,
+                created_at: 0,
+                max_total_size: None,
+                max_did_count: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": new_owner }),
+        );
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_CHANGE_OWNER_CONFIRM);
+        assert_eq!(body.get("owner").and_then(|v| v.as_str()), Some(new_owner));
+
+        // Owner index swapped: old owner has none, new owner has one.
+        let old_idx = state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{owner}:"))
+            .await
+            .unwrap();
+        assert!(old_idx.is_empty(), "old owner index should be cleared");
+        let new_idx = state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{new_owner}:"))
+            .await
+            .unwrap();
+        assert_eq!(new_idx.len(), 1, "new owner should have one entry");
+    }
+
+    /// Cross-owner change-owner is forbidden — only the current owner or an
+    /// admin may transfer.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_cross_owner_forbidden() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: "did:example:target".into(),
+                role: Role::Owner,
+                label: None,
+                created_at: 0,
+                max_total_size: None,
+                max_did_count: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:target" }),
+        );
+        let attacker = owner_auth("did:example:attacker");
+
+        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
+    }
+
+    /// New owner must be in the ACL — prevents transferring a DID to an
+    /// identity that can never authenticate to claim it.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_unknown_new_owner_validation() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:not-in-acl" }),
+        );
+        let auth = owner_auth(owner);
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("not in the ACL")));
+    }
+
+    /// Force-replace via `MSG_DID_REQUEST` with `force: true` succeeds when
+    /// the requester is the current owner, replacing the existing slot.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_replaces_when_owner() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "shared-path").await;
+        // Seed log content so we can verify it gets cleared.
+        state
+            .dids_ks
+            .insert_raw(
+                affinidi_webvh_common::did_ops::content_log_key("shared-path"),
+                b"old log".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_OFFER);
+        assert_eq!(
+            body.get("mnemonic").and_then(|v| v.as_str()),
+            Some("shared-path")
+        );
+
+        // Old log content has been wiped; new record has version_count 0.
+        let log = state
+            .dids_ks
+            .get_raw(affinidi_webvh_common::did_ops::content_log_key(
+                "shared-path",
+            ))
+            .await
+            .unwrap();
+        assert!(log.is_none(), "old log content should be wiped");
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key("shared-path"))
+            .await
+            .unwrap()
+            .expect("record present");
+        assert_eq!(record.version_count, 0);
+        assert_eq!(record.owner, owner);
+    }
+
+    /// Force-replace by a different owner is forbidden — `force` only works
+    /// for admin or current owner of the existing path.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_forbidden_for_other_owner() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "shared-path").await;
+
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+        let auth = owner_auth("did:example:owner-b");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// Admins can force-replace any DID — the caller becomes the new owner.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_admin_takes_ownership() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "shared-path").await;
+
+        let admin = admin_auth("did:example:admin");
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+
+        let (typ, _body) = dispatch_did_op(&admin, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_OFFER);
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key("shared-path"))
+            .await
+            .unwrap()
+            .expect("record present");
+        assert_eq!(record.owner, "did:example:admin");
     }
 }

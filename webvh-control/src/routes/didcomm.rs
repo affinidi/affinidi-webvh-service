@@ -164,6 +164,7 @@ async fn dispatch(
         MSG_INFO_REQUEST => handle_info_request(auth, state, msg).await,
         MSG_LIST_REQUEST => handle_list_request(auth, state, msg).await,
         MSG_DELETE => handle_delete(auth, state, msg).await,
+        MSG_DID_CHANGE_OWNER => handle_change_owner(auth, state, msg).await,
         other => Err(ProtocolError::new(
             "e.p.did.unknown-type",
             format!("unknown message type: {other}"),
@@ -225,10 +226,19 @@ async fn handle_did_request(
     msg: &Message,
 ) -> Result<(String, Value), ProtocolError> {
     let path = msg.body.get("path").and_then(|v| v.as_str());
+    let force = msg
+        .body
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let result = did_ops::create_did(auth, state, path)
+    let result = did_ops::create_did(auth, state, path, force)
         .await
         .map_err(map_app_error)?;
+
+    if force && let Some(p) = path {
+        server_push::notify_servers_delete(state, p.to_string());
+    }
 
     let server_did = state.config.server_did.as_deref().unwrap_or_default();
 
@@ -455,6 +465,41 @@ async fn handle_delete(
         json!({
             "mnemonic": mnemonic,
             "did_id": did_id,
+        }),
+    ))
+}
+
+async fn handle_change_owner(
+    auth: &AuthClaims,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), ProtocolError> {
+    let mnemonic = msg
+        .body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ProtocolError::new("e.p.did.validation-error", "missing 'mnemonic' in body")
+        })?;
+
+    let new_owner = msg
+        .body
+        .get("new_owner")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ProtocolError::new("e.p.did.validation-error", "missing 'new_owner' in body")
+        })?;
+
+    let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner)
+        .await
+        .map_err(map_app_error)?;
+
+    Ok((
+        MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
+        json!({
+            "mnemonic": record.mnemonic,
+            "owner": record.owner,
+            "updated_at": record.updated_at,
         }),
     ))
 }
