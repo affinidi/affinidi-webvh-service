@@ -31,7 +31,7 @@ azure-secrets = [
   "dep:futures",
   "affinidi-webvh-common/azure-secrets",
 ]
-store-fjall = ["dep:fjall"]
+store-fjall = ["dep:fjall", "affinidi-webvh-common/store-fjall"]
 store-redis = ["dep:redis", "affinidi-webvh-common/store-redis"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "affinidi-webvh-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "affinidi-webvh-common/store-firestore"]
@@ -46,7 +46,7 @@ name = "webvh-server"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { version = "0.7", path = "../webvh-common", features = ["server-core", "store-fjall", "setup-wizard"] }
+affinidi-webvh-common = { version = "0.7", path = "../webvh-common", features = ["server-core", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
