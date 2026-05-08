@@ -32,7 +32,9 @@
     "typescript": "~5.9.2"
   },
   "overrides": {
-    "minimatch": ">=10.2.1"
+    "minimatch": ">=10.2.1",
+    "postcss": ">=8.5.10",
+    "@xmldom/xmldom": ">=0.8.13"
   },
   "engines": {
     "node": ">=20"
