@@ -286,12 +286,12 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-didcomm-service"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d587ab2b2c982d9f5de4c2bbb78c1c1453e837ceb6837acf8cc7beaa51a864b"
+checksum = "036decd259540cf6495c074f2432cf4e295ff30e190b28653dffd79ad1103007"
 dependencies = [
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.17.0",
+ "affinidi-messaging-sdk 0.18.2",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "async-trait",
@@ -318,7 +318,7 @@ dependencies = [
  "affinidi-encoding",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.18.1",
+ "affinidi-messaging-sdk 0.18.2",
  "affinidi-secrets-resolver",
  "ahash 0.8.12",
  "async-convert",
@@ -432,9 +432,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56599a8ab5e2f459e70abbed941a06de2844d24a4eb10ba52e178dfd5970baeb"
+checksum = "7a31e90f7f5451f3408f51f6b27ecc7576ff86e79b1439eadf287675087e5a41"
 dependencies = [
  "affinidi-did-authentication",
  "affinidi-did-common",
@@ -468,7 +468,7 @@ dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-mediator",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.18.1",
+ "affinidi-messaging-sdk 0.18.2",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "async-trait",
@@ -2080,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.61"
+version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
+checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -3915,9 +3915,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "headers"
@@ -4465,7 +4465,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.0",
+ "hashbrown 0.17.1",
  "serde",
  "serde_core",
 ]
@@ -8309,9 +8309,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.2"
+version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
  "bytes",
  "libc",
