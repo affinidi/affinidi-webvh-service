@@ -104,9 +104,12 @@ impl JwtKeys {
 
     /// Create claims for a new access token.
     pub fn new_claims(sub: String, session_id: String, role: String, expiry_secs: u64) -> Claims {
+        // `unwrap_or_default()` mirrors `now_epoch()` — a system clock
+        // set before 1970 yields 0 here rather than panicking the JWT
+        // issue path.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Claims {

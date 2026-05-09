@@ -49,6 +49,13 @@ pub struct AppState {
     /// Stats keyspace for persistent per-DID stats.
     pub stats_ks: KeyspaceHandle,
     /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
+    ///
+    /// SECURITY: this is a raw 32-byte seed. `AppState` deliberately does
+    /// NOT derive `Debug` — adding it would format this field via the
+    /// default tuple printer and the seed would land in any subsequent
+    /// `tracing::*` macro that takes `?state` or `state = ?state`. If a
+    /// `Debug` derive is added later, wrap this in a redacting newtype
+    /// (or `secrecy::SecretBox`) at the same time.
     pub signing_key_bytes: Option<[u8; 32]>,
 }
 

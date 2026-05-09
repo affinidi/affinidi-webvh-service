@@ -131,10 +131,15 @@ pub async fn take_session_id_by_refresh(
 }
 
 /// Returns the current UNIX epoch timestamp in seconds.
+///
+/// Uses `unwrap_or_default()` so a system clock set before 1970 yields
+/// 0 rather than panicking — every caller (JWT issue, session create,
+/// log ingest) would otherwise propagate the panic and fail the
+/// request with a 500 instead of a sensible error.
 pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
