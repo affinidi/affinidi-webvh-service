@@ -1150,7 +1150,7 @@ pub async fn change_did_owner(
     mnemonic: &str,
     new_owner: &str,
 ) -> Result<DidRecord, AppError> {
-    use affinidi_webvh_common::server::acl::get_acl_entry;
+    use affinidi_webvh_common::server::acl::{get_acl_entry, validate_did_format};
 
     use crate::auth::session::now_epoch;
 
@@ -1162,27 +1162,22 @@ pub async fn change_did_owner(
     // this point only runs for authorized callers.
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    let new_owner = new_owner.trim();
-    if new_owner.is_empty() {
-        return Err(AppError::Validation("new owner DID cannot be empty".into()));
-    }
-    if !new_owner.starts_with("did:") {
-        return Err(AppError::Validation(
-            "new owner must be a DID (must start with 'did:')".into(),
-        ));
-    }
+    // Canonicalise (trim + format check) before any storage I/O so a
+    // typo in the new-owner DID can't silently mismatch later
+    // `check_acl` lookups. Same validator the ACL routes use.
+    let new_owner = validate_did_format(new_owner)?;
 
     if record.owner == new_owner {
         return Ok(record);
     }
 
-    if get_acl_entry(&state.acl_ks, new_owner).await?.is_none() {
+    if get_acl_entry(&state.acl_ks, &new_owner).await?.is_none() {
         return Err(AppError::Validation(format!(
             "new owner '{new_owner}' is not in the ACL — add them first"
         )));
     }
 
-    let prev_owner = std::mem::replace(&mut record.owner, new_owner.to_string());
+    let prev_owner = std::mem::replace(&mut record.owner, new_owner.clone());
     record.updated_at = now_epoch();
 
     let mut batch = state.store.batch();
@@ -1190,7 +1185,7 @@ pub async fn change_did_owner(
     batch.remove(&state.dids_ks, owner_key(&prev_owner, mnemonic));
     batch.insert_raw(
         &state.dids_ks,
-        owner_key(new_owner, mnemonic),
+        owner_key(&new_owner, mnemonic),
         mnemonic.as_bytes().to_vec(),
     );
     batch.commit().await?;

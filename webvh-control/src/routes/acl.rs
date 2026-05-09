@@ -11,7 +11,7 @@ use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
 use affinidi_webvh_common::server::acl::{
-    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest,
+    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest, validate_did_format,
 };
 
 // ---------- GET /api/acl ----------
@@ -33,16 +33,21 @@ pub async fn create_acl(
     State(state): State<AppState>,
     Json(req): Json<CreateAclRequest>,
 ) -> Result<(StatusCode, Json<AclEntryResponse>), AppError> {
+    // Canonicalise + validate before any storage I/O so a typo-bearing DID
+    // (e.g. trailing whitespace, control chars, missing `did:` prefix)
+    // never lands as a key — silent mismatches with `check_acl` would
+    // otherwise lock the operator out of the system they just configured.
+    let did = validate_did_format(&req.did)?;
+
     // Check if entry already exists
-    if acl::get_acl_entry(&state.acl_ks, &req.did).await?.is_some() {
-        warn!(caller = %auth.0.did, target_did = %req.did, "ACL create rejected: entry already exists");
+    if acl::get_acl_entry(&state.acl_ks, &did).await?.is_some() {
+        warn!(caller = %auth.0.did, target_did = %did, "ACL create rejected: entry already exists");
         return Err(AppError::Conflict(format!(
-            "ACL entry already exists for {}",
-            req.did
+            "ACL entry already exists for {did}"
         )));
     }
     let entry = AclEntry {
-        did: req.did,
+        did,
         role: req.role,
         label: req.label,
         created_at: now_epoch(),
@@ -62,6 +67,7 @@ pub async fn update_acl(
     Path(did): Path<String>,
     Json(updates): Json<UpdateAclRequest>,
 ) -> Result<Json<AclEntryResponse>, AppError> {
+    let did = validate_did_format(&did)?;
     let mut entry = acl::get_acl_entry(&state.acl_ks, &did)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
@@ -91,6 +97,8 @@ pub async fn delete_acl(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    let did = validate_did_format(&did)?;
+
     // Prevent self-deletion
     if auth.0.did == did {
         warn!(caller = %auth.0.did, "ACL delete rejected: attempted self-deletion");

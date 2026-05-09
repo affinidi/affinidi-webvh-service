@@ -124,6 +124,48 @@ fn acl_key(did: &str) -> String {
     format!("acl:{did}")
 }
 
+/// Maximum DID-string length we accept anywhere a DID is written by a
+/// caller — ACL entries, ownership transfers, etc. 2048 fits a
+/// `did:peer:2.*` with multiple inline keys (typical 600–1500 bytes)
+/// plus headroom; tighter bounds are enforced elsewhere where needed
+/// (e.g. `check_acl`'s 512-byte cap on the hot auth path).
+pub const MAX_DID_LEN: usize = 2048;
+
+/// Validate a DID-string supplied by an admin/owner before it lands in
+/// storage.
+///
+/// Trims surrounding whitespace and checks: not empty, does not exceed
+/// `MAX_DID_LEN`, starts with `did:`, contains no ASCII control chars.
+/// Returns the trimmed string on success so the caller stores the
+/// canonical form (a typo-trailing-space DID would otherwise silently
+/// mismatch all later `check_acl` lookups).
+///
+/// Used by ACL create/update routes and by the ownership-transfer path
+/// in `did_ops::change_did_owner` to guarantee the same shape of DIDs
+/// across all admin-facing write surfaces.
+pub fn validate_did_format(did: &str) -> Result<String, AppError> {
+    let trimmed = did.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation("DID must not be empty".into()));
+    }
+    if trimmed.len() > MAX_DID_LEN {
+        return Err(AppError::Validation(format!(
+            "DID exceeds maximum length of {MAX_DID_LEN} characters"
+        )));
+    }
+    if !trimmed.starts_with("did:") {
+        return Err(AppError::Validation(
+            "DID must start with 'did:' scheme".into(),
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_ascii_control()) {
+        return Err(AppError::Validation(
+            "DID must not contain ASCII control characters".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Retrieve an ACL entry by DID.
 pub async fn get_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<Option<AclEntry>, AppError> {
     acl.get(acl_key(did)).await
@@ -278,5 +320,69 @@ mod tests {
         let deserialized: AclEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.max_total_size, Some(1_000_000));
         assert_eq!(deserialized.max_did_count, Some(50));
+    }
+
+    // --- validate_did_format ---
+
+    #[test]
+    fn validate_did_format_accepts_canonical() {
+        let did = "did:webvh:scid:host.example:tenant";
+        assert_eq!(validate_did_format(did).unwrap(), did);
+    }
+
+    #[test]
+    fn validate_did_format_trims_whitespace() {
+        // The bug this prevents: an admin pastes `"  did:web:tenant  "`,
+        // it lands as the storage key with whitespace, and every later
+        // `check_acl("did:web:tenant")` returns Forbidden.
+        let trimmed = validate_did_format("  did:web:tenant\n").unwrap();
+        assert_eq!(trimmed, "did:web:tenant");
+    }
+
+    #[test]
+    fn validate_did_format_rejects_empty() {
+        assert!(validate_did_format("").is_err());
+        assert!(validate_did_format("   ").is_err());
+    }
+
+    #[test]
+    fn validate_did_format_rejects_missing_did_prefix() {
+        let err = validate_did_format("example.com").unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn validate_did_format_rejects_oversized() {
+        // MAX_DID_LEN bytes after "did:web:" prefix => well over the cap.
+        let did = format!("did:web:{}", "a".repeat(MAX_DID_LEN));
+        assert!(validate_did_format(&did).is_err());
+    }
+
+    #[test]
+    fn validate_did_format_accepts_realistic_did_peer() {
+        // A typical `did:peer:2.*` with two inline keys is ~700 bytes —
+        // pin that the cap accommodates them. Synthetic but representative.
+        let did = format!(
+            "did:peer:2.Vz6Mk{}.Ez6LS{}",
+            "x".repeat(300),
+            "y".repeat(300)
+        );
+        assert!(did.len() < MAX_DID_LEN);
+        assert!(validate_did_format(&did).is_ok());
+    }
+
+    #[test]
+    fn validate_did_format_rejects_control_chars() {
+        // Newline, tab, NUL, and BEL all rejected — protects against log-
+        // injection in the warning lines that include the DID, and against
+        // sneaky storage keys.
+        for ch in ["\n", "\t", "\0", "\x07"] {
+            let did = format!("did:web:tenant{ch}rest");
+            assert!(
+                validate_did_format(&did).is_err(),
+                "control char {:?} should be rejected",
+                ch
+            );
+        }
     }
 }
