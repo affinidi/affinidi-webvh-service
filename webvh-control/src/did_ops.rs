@@ -1045,6 +1045,17 @@ pub async fn list_dids(
         let mnemonic = String::from_utf8(value)
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            // Owner-index keys are `owner:{did}:{mnemonic}`. DIDs naturally
+            // contain colons (e.g. `did:webvh:scid:host:path`), so a DID
+            // that is a string-prefix of another (e.g. `did:web:tenant`
+            // vs `did:web:tenant:server`) shares the prefix and the
+            // iterator returns rows belonging to the longer DID. Re-check
+            // the record's owner to filter those out — without this, a
+            // tenant whose DID is a prefix of another would see the
+            // other tenant's mnemonics in their dashboard.
+            if record.owner != target_owner {
+                continue;
+            }
             let stats_key = format!("stats:{mnemonic}");
             let did_stats: affinidi_webvh_common::DidStats =
                 state.stats_ks.get(stats_key).await?.unwrap_or_default();

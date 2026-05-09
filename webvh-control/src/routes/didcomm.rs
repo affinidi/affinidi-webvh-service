@@ -236,9 +236,7 @@ async fn handle_did_request(
         .await
         .map_err(map_app_error)?;
 
-    if force && let Some(p) = path {
-        server_push::notify_servers_delete(state, p.to_string());
-    }
+    // No fan-out on force-replace: see `routes/did_manage::request_uri`.
 
     let server_did = state.config.server_did.as_deref().unwrap_or_default();
 

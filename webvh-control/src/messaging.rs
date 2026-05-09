@@ -237,9 +237,7 @@ async fn dispatch_did_op(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let result = did_ops::create_did(auth, state, path, force).await?;
-            if force && let Some(p) = path {
-                server_push::notify_servers_delete(state, p.to_string());
-            }
+            // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
                 MSG_DID_OFFER.to_string(),
@@ -1065,6 +1063,39 @@ mod tests {
         assert!(entry.get("did_id").is_some());
         assert_eq!(entry.get("version_count").and_then(|v| v.as_u64()), Some(1));
         assert!(entry.get("total_resolves").is_some());
+    }
+
+    /// IDOR regression: an owner whose DID is a string-prefix of another
+    /// owner's DID must NOT see the longer-DID owner's mnemonics. Owner-
+    /// index keys are `owner:{did}:{mnemonic}` and DIDs naturally contain
+    /// colons, so the prefix iteration is ambiguous between
+    /// `did:web:tenant` and `did:web:tenant:server`. `list_dids` must
+    /// re-check `record.owner == target_owner` after the iteration.
+    #[tokio::test]
+    async fn dispatch_did_op_list_request_filters_did_prefix_collision() {
+        let (state, _dir) = test_state().await;
+        let short = "did:example:tenant";
+        let long = "did:example:tenant:server";
+        seed_did(&state, short, "short-mn").await;
+        seed_did(&state, long, "long-mn").await;
+
+        // Caller is the SHORT-DID owner. Without the fix, the iterator
+        // returns both `owner:did:example:tenant:short-mn` and
+        // `owner:did:example:tenant:server:long-mn`.
+        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
+        let auth = owner_auth(short);
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_LIST);
+        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
+        assert_eq!(
+            dids.len(),
+            1,
+            "prefix collision must not leak the longer-DID owner's records: {dids:?}"
+        );
+        assert_eq!(
+            dids[0].get("mnemonic").and_then(|v| v.as_str()),
+            Some("short-mn")
+        );
     }
 
     /// Admin role with no `owner` filter sees every DID across owners —

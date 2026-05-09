@@ -61,9 +61,11 @@ pub async fn request_uri(
     };
     let result = did_ops::create_did(&auth, &state, path.as_deref(), force).await?;
 
-    if force && let Some(ref p) = path {
-        server_push::notify_servers_delete(&state, p.clone());
-    }
+    // No `notify_servers_delete` on force-replace: `create_did` only
+    // reserves the mnemonic, so a delete fan-out would make downstream
+    // resolvers serve 404 until the caller's follow-up `publish_did`
+    // arrives. Atomic ownership-takeover with no resolvability gap is
+    // `POST /api/dids/register` (`register_did_atomic`).
 
     Ok((StatusCode::CREATED, Json(result)))
 }
