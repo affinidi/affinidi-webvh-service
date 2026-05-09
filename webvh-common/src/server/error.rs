@@ -103,6 +103,54 @@ impl AppError {
     }
 }
 
+/// Maximum length of a user-facing error message in an HTTP response
+/// body. Prevents accidental reflection of unbounded user input
+/// (long DIDs, large pasted blobs) into logs and headers.
+const MAX_USER_MESSAGE_LEN: usize = 256;
+
+/// Strip ASCII control characters and cap length. Used for variants
+/// whose `Display` includes user-supplied input — Validation, Conflict,
+/// QuotaExceeded — to prevent log injection / response splitting via a
+/// caller-controlled string and to bound response-body size.
+fn sanitize_user_message(s: &str) -> String {
+    let mut out: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
+    if out.len() > MAX_USER_MESSAGE_LEN {
+        out.truncate(MAX_USER_MESSAGE_LEN);
+        out.push('…');
+    }
+    out
+}
+
+impl AppError {
+    /// Stable public message intended for HTTP responses. Decoupled from
+    /// `Display` (which tracing/logging uses) so the wire-level contract
+    /// doesn't drift when an `AppError(...)` literal's wording changes
+    /// elsewhere.
+    ///
+    /// Variants that name internal identifiers (`Forbidden` may carry a
+    /// DID or ACL reason; `NotFound` may include a mnemonic) collapse
+    /// to a fixed string. Variants that are user-input-shaped
+    /// (`Validation`, `Conflict`, `QuotaExceeded`) pass the message
+    /// through `sanitize_user_message` so a caller can't get arbitrary
+    /// control characters echoed back. 5xx variants never reach this
+    /// path (the response builder short-circuits to a generic body).
+    pub fn user_message(&self) -> String {
+        match self {
+            AppError::NotFound(_) => "not found".into(),
+            AppError::Authentication(_) => "authentication failed".into(),
+            AppError::Unauthorized(_) => "unauthorized".into(),
+            AppError::Forbidden(_) => "forbidden".into(),
+            AppError::Validation(msg) => sanitize_user_message(msg),
+            AppError::Conflict(msg) => sanitize_user_message(msg),
+            AppError::QuotaExceeded(msg) => sanitize_user_message(msg),
+            // 5xx variants — covered by the server-error branch in
+            // into_response — but return a stable string here too in
+            // case anyone calls `user_message()` directly.
+            _ => "internal error".into(),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {
@@ -123,30 +171,60 @@ impl IntoResponse for AppError {
 
         if status.is_server_error() {
             warn!(status = %status.as_u16(), error = %self, "server error");
-            // Do not leak internal details to clients for 5xx errors
             let body = serde_json::json!({ "error": "internal server error" });
             return (status, axum::Json(body)).into_response();
         }
 
         debug!(status = %status.as_u16(), error = %self, "client error");
 
-        // Sanitize client-facing error messages — avoid leaking internal paths/IDs
-        let message = match &self {
-            AppError::NotFound(_) => "not found".to_string(),
-            AppError::Authentication(_) => "authentication failed".to_string(),
-            AppError::Unauthorized(_) => "unauthorized".to_string(),
-            AppError::Forbidden(msg) => {
-                if msg.contains("ACL") || msg.contains("did:") {
-                    "forbidden".to_string()
-                } else {
-                    msg.clone()
-                }
-            }
-            // Validation and conflict errors are safe — they describe user input issues
-            other => other.to_string(),
-        };
-
-        let body = serde_json::json!({ "error": message });
+        let body = serde_json::json!({ "error": self.user_message() });
         (status, axum::Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn forbidden_always_collapses_to_fixed_string() {
+        // Pre-fix behaviour: substring `"ACL"` redacted, but
+        // "not the owner of this DID" leaked through. Now both collapse.
+        let leaky = AppError::Forbidden("not the owner of this DID".into());
+        assert_eq!(leaky.user_message(), "forbidden");
+        let acl = AppError::Forbidden("DID not in the ACL: did:web:bob".into());
+        assert_eq!(acl.user_message(), "forbidden");
+    }
+
+    #[test]
+    fn validation_strips_control_chars() {
+        // Caller submits `did:web:tenant\nrest` as new_owner; the
+        // resulting Validation message would otherwise reflect the
+        // newline back into the response body.
+        let err = AppError::Validation("bad input: did:web:t\nrest".into());
+        let msg = err.user_message();
+        assert!(!msg.contains('\n'));
+        assert!(!msg.contains('\r'));
+    }
+
+    #[test]
+    fn validation_caps_length() {
+        let huge = "x".repeat(MAX_USER_MESSAGE_LEN + 100);
+        let err = AppError::Validation(huge);
+        let msg = err.user_message();
+        assert!(msg.chars().count() <= MAX_USER_MESSAGE_LEN + 1); // +1 for '…'
+        assert!(msg.ends_with('…'));
+    }
+
+    #[test]
+    fn validation_preserves_short_messages_unchanged() {
+        let err = AppError::Validation("path 'foo' is already taken".into());
+        assert_eq!(err.user_message(), "path 'foo' is already taken");
+    }
+
+    #[test]
+    fn not_found_does_not_leak_mnemonic() {
+        let err = AppError::NotFound("DID not found: super-secret-mnemonic".into());
+        assert_eq!(err.user_message(), "not found");
     }
 }
