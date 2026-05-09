@@ -368,6 +368,11 @@ pub async fn register_did_atomic(
     );
     batch.commit().await?;
 
+    // Same rationale as `publish_did`: the atomic register path commits
+    // a new log entry, so it must advance the update counters when the
+    // control plane is authoritative for stats.
+    state.stats_collector.record_update(path);
+
     let did_url = format!("{}/{path}/did.jsonl", server_base_url.trim_end_matches('/'));
 
     info!(
@@ -388,7 +393,10 @@ pub async fn register_did_atomic(
 // Tests for register_did_atomic
 // ---------------------------------------------------------------------------
 
+// Tests are intentionally co-located with `register_did_atomic` for
+// readability; the rest of the module's public API follows below.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests_atomic {
     use super::*;
     use std::path::PathBuf;
@@ -743,6 +751,127 @@ mod tests_atomic {
         assert_eq!(req.did_log, "line");
         assert!(!req.force, "force must default to false");
     }
+
+    /// Pin the stats-counter behaviour: every successful
+    /// `register_did_atomic` advances the aggregate `total_updates` and the
+    /// per-DID `last_updated_at`. Without this the dashboards / `MSG_INFO`
+    /// response will report zero updates in self-hosted (control-plane-as-
+    /// authoritative) deployments. Mirrors webvh-server::publish_did's
+    /// `record_update` call.
+    #[tokio::test]
+    async fn register_did_atomic_records_update_stats() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "stats-fresh";
+        let did_log = build_test_did_log("scid-stats", "control.test", path);
+
+        let before = state.stats_collector.get_aggregate().total_updates;
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+            .await
+            .unwrap();
+        let after = state.stats_collector.get_aggregate().total_updates;
+        assert_eq!(
+            after,
+            before + 1,
+            "fresh atomic register must advance total_updates by 1"
+        );
+
+        // A second register by the same owner advances again — the counter
+        // tracks log-write operations, not unique DIDs.
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+            .await
+            .unwrap();
+        let after_two = state.stats_collector.get_aggregate().total_updates;
+        assert_eq!(
+            after_two,
+            after + 1,
+            "idempotent re-register must also advance total_updates"
+        );
+    }
+
+    /// Mirror coverage for the `publish_did` path. Pre-create a slot via
+    /// `create_did` (which does NOT bump update stats — it only reserves
+    /// the mnemonic), then publish a log against it and assert the counter
+    /// only moves on the publish.
+    #[tokio::test]
+    async fn publish_did_records_update_stats() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "stats-publish";
+        let did_log = build_test_did_log("scid-publish", "control.test", path);
+
+        // Reserve the slot. create_did is the "request URI" step — it
+        // doesn't write log content and shouldn't bump update counters.
+        let baseline = state.stats_collector.get_aggregate().total_updates;
+        create_did(&owner_auth(owner), &state, Some(path), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.stats_collector.get_aggregate().total_updates,
+            baseline,
+            "create_did is a slot reservation; must NOT count as an update"
+        );
+
+        // Publish flips the counter.
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.stats_collector.get_aggregate().total_updates,
+            baseline + 1,
+            "publish_did must record an update on success"
+        );
+
+        // Republishing advances again.
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.stats_collector.get_aggregate().total_updates,
+            baseline + 2,
+            "subsequent publishes must keep advancing total_updates"
+        );
+    }
+
+    /// Failed publishes (auth denied, validation error, missing slot) must
+    /// NOT bump the counter — `record_update` runs only after the storage
+    /// commit returns Ok. Pinning this prevents drift if someone moves the
+    /// call earlier in the function.
+    #[tokio::test]
+    async fn failed_publish_does_not_record_update() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:owner-a";
+        let owner_b = "did:example:owner-b";
+        let path = "stats-fail";
+        let did_log = build_test_did_log("scid-fail", "control.test", path);
+
+        // Reserve as owner-a, then have owner-b try to publish.
+        create_did(&owner_auth(owner_a), &state, Some(path), false)
+            .await
+            .unwrap();
+
+        let baseline = state.stats_collector.get_aggregate().total_updates;
+        let err = publish_did(&owner_auth(owner_b), &state, path, &did_log)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(
+            state.stats_collector.get_aggregate().total_updates,
+            baseline,
+            "auth-denied publish must NOT record an update"
+        );
+
+        // Validation failure on the JSONL body — still no counter movement.
+        let err = publish_did(&owner_auth(owner_a), &state, path, "not-jsonl")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+        assert_eq!(
+            state.stats_collector.get_aggregate().total_updates,
+            baseline,
+            "validation-failed publish must NOT record an update"
+        );
+    }
 }
 
 /// Publish (upload) a did.jsonl log for an existing DID slot.
@@ -775,6 +904,13 @@ pub async fn publish_did(
     );
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.commit().await?;
+
+    // Mirror webvh-server's `record_update` call so total_updates /
+    // last_updated_at advance when the control plane is the authoritative
+    // store (standalone or daemon mode). Without this, updates only
+    // surface via stats-sync from a remote server, so they sit at zero
+    // in self-hosted deployments.
+    state.stats_collector.record_update(mnemonic);
 
     info!(
         did = %auth.did,
