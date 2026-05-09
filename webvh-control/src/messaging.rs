@@ -45,6 +45,7 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // VTA provisioning protocol
         .route(MSG_AUTHENTICATE, handler_fn(handle_authenticate))?
         .route(MSG_DID_REQUEST, handler_fn(handle_webvh_message))?
+        .route(MSG_DID_REGISTER, handler_fn(handle_webvh_message))?
         .route(MSG_DID_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_WITNESS_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
@@ -242,6 +243,38 @@ async fn dispatch_did_op(
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
                 MSG_DID_OFFER.to_string(),
+                json!({
+                    "mnemonic": result.mnemonic,
+                    "did_url": result.did_url,
+                    "server_did": server_did,
+                }),
+            ))
+        }
+        MSG_DID_REGISTER => {
+            // Atomic claim-and-publish — see did_ops::register_did_atomic.
+            // Body shape mirrors `DidRegisterRequest` from webvh-common.
+            let path = msg
+                .body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'path' in body".into()))?;
+            let did_log = msg
+                .body
+                .get("did_log")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'did_log' in body".into()))?;
+            let force = msg
+                .body
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let result = did_ops::register_did_atomic(auth, state, path, did_log, force).await?;
+            server_push::notify_servers_did(state, result.mnemonic.clone());
+
+            let server_did = state.config.server_did.as_deref().unwrap_or_default();
+            Ok((
+                MSG_DID_REGISTER_CONFIRM.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,

@@ -84,6 +84,36 @@ pub struct RequestUriResponse {
     pub did_url: String,
 }
 
+/// Atomic claim-and-publish request — see `MSG_DID_REGISTER` for the
+/// motivation. Both `path` and `did_log` are required; `force` is only
+/// honoured when the caller is an admin taking over a slot owned by a
+/// different DID (no force needed when the caller is already the owner;
+/// the operation is idempotent in that case).
+///
+/// Server-side validation rejects `did_log` whose embedded DID identifier
+/// does not name this host or does not name `path`, so an admin can't
+/// upload arbitrary `did.jsonl` content under a path they happen to own.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DidRegisterRequest {
+    pub path: String,
+    pub did_log: String,
+    /// Required when admin is replacing a slot they don't own; ignored
+    /// when caller is already the owner or the slot is free. Defaults
+    /// to false.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Atomic register response. `mnemonic` equals `path` (custom paths are
+/// their own mnemonic on the server side); included for symmetry with
+/// `RequestUriResponse`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidRegisterResponse {
+    pub mnemonic: String,
+    pub did_url: String,
+}
+
 // ---------------------------------------------------------------------------
 // DID list / stats types
 // ---------------------------------------------------------------------------

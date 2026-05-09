@@ -18,6 +18,15 @@ pub const MSG_DID_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/request";
 pub const MSG_DID_OFFER: &str = "https://affinidi.com/webvh/1.0/did/offer";
 pub const MSG_DID_PUBLISH: &str = "https://affinidi.com/webvh/1.0/did/publish";
 pub const MSG_DID_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/confirm";
+/// Atomic claim-and-publish in a single call. Use when the caller already has
+/// a complete `did.jsonl` for a known path and needs slot allocation +
+/// content upload to land in one transaction (e.g. registering an existing
+/// serverless DID with this server). The two-step
+/// `MSG_DID_REQUEST` + `MSG_DID_PUBLISH` flow has a window where the slot
+/// is allocated but empty; this flow has no such gap, so existing
+/// resolvers never see a 404 between the two calls.
+pub const MSG_DID_REGISTER: &str = "https://affinidi.com/webvh/1.0/did/register";
+pub const MSG_DID_REGISTER_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/register-confirm";
 pub const MSG_WITNESS_PUBLISH: &str = "https://affinidi.com/webvh/1.0/did/witness-publish";
 pub const MSG_WITNESS_CONFIRM: &str = "https://affinidi.com/webvh/1.0/did/witness-confirm";
 pub const MSG_INFO_REQUEST: &str = "https://affinidi.com/webvh/1.0/did/info-request";

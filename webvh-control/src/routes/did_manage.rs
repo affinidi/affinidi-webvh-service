@@ -8,7 +8,9 @@ use crate::error::AppError;
 use crate::server::AppState;
 use crate::server_push;
 use affinidi_webvh_common::did_ops::LogMetadata;
-use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use affinidi_webvh_common::{
+    CheckNameResponse, DidListEntry, DidRegisterRequest, DidRegisterResponse, RequestUriResponse,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -64,6 +66,37 @@ pub async fn request_uri(
     }
 
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ---------- POST /api/dids/register ----------
+
+/// Atomic claim-and-publish — see [`did_ops::register_did_atomic`] for the
+/// full contract. The handler returns 200 (not 201) because the operation
+/// is intentionally idempotent for the slot's owner; second-and-subsequent
+/// calls just bump `version_count` and replace content.
+pub async fn register_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<DidRegisterRequest>,
+) -> Result<Json<DidRegisterResponse>, AppError> {
+    let result =
+        did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force).await?;
+
+    // Push the (potentially replaced) log to downstream servers so their
+    // resolvers see the new content right away. Same as `upload_did`.
+    server_push::notify_servers_did(&state, result.mnemonic.clone());
+
+    info!(
+        did = %auth.did,
+        path = %result.mnemonic,
+        force = req.force,
+        "DID atomically registered via REST"
+    );
+
+    Ok(Json(DidRegisterResponse {
+        mnemonic: result.mnemonic,
+        did_url: result.did_url,
+    }))
 }
 
 // ---------- GET /api/dids/{mnemonic} ----------

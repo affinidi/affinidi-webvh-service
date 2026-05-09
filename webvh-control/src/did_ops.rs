@@ -226,6 +226,525 @@ pub async fn create_did(
     Ok(RequestUriResponse { mnemonic, did_url })
 }
 
+/// Atomic claim-and-publish for a DID at a known path.
+///
+/// Solves the resolvability gap in the two-step
+/// `request_uri` → `publish_did` flow: between those two calls a
+/// previously-resolvable slot is empty, so any in-flight resolver hits
+/// 404. This op writes the new mnemonic record + log content + owner
+/// index in a single batch, so a resolver's GET returns either the old
+/// content or the new content — never absent.
+///
+/// Auth model:
+/// - Slot does not exist → caller becomes owner (same as
+///   `request_uri` for a fresh path).
+/// - Slot exists, caller is current owner → idempotent re-publish.
+///   Witness is preserved (it's the owner's own).
+/// - Slot exists, caller is admin AND `force == true` AND owner
+///   differs → admin takeover. Old witness is cleared (it was
+///   signed for the prior DID/owner). Old owner-index entry is
+///   removed.
+/// - Slot exists, any other case → `Forbidden`.
+///
+/// Content validation:
+/// - `did_log` must parse as valid did.jsonl whose latest entry
+///   resolves to a `did:webvh:` identifier.
+/// - That identifier's host (and optional port) must match this
+///   server's hosting URL, AND its path component must match the
+///   requested `path`. This stops an admin from uploading
+///   arbitrary `did.jsonl` content under a path they happen to own
+///   that names a different host or path — claim-jumping.
+pub async fn register_did_atomic(
+    auth: &AuthClaims,
+    state: &AppState,
+    path: &str,
+    did_log: &str,
+    force: bool,
+) -> Result<RequestUriResponse, AppError> {
+    use crate::acl::Role;
+    use crate::auth::session::now_epoch;
+
+    // 1. Cheap validations first — bail out before any storage I/O.
+    validate_custom_path(path)?;
+    validate_did_jsonl(did_log)?;
+
+    let server_base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .ok_or_else(|| {
+            AppError::Internal(
+                "server has neither did_hosting_url nor public_url configured; cannot validate DID host"
+                    .into(),
+            )
+        })?;
+
+    let did_id = extract_did_id(did_log).ok_or_else(|| {
+        AppError::Validation("did_log's latest entry has no resolvable did:webvh state.id".into())
+    })?;
+
+    did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
+        .map_err(AppError::Validation)?;
+
+    // 2. Owner check (and admin-takeover gating).
+    let existing: Option<DidRecord> = state.dids_ks.get(did_key(path)).await?;
+
+    let owner_changed = match &existing {
+        Some(rec) if rec.owner == auth.did => false,
+        Some(rec) => {
+            // Slot owned by someone else.
+            if auth.role != Role::Admin {
+                warn!(
+                    caller = %auth.did,
+                    owner = %rec.owner,
+                    path = %path,
+                    "atomic-register denied: not the owner of this slot"
+                );
+                return Err(AppError::Forbidden(
+                    "slot is owned by a different DID".into(),
+                ));
+            }
+            if !force {
+                warn!(
+                    caller = %auth.did,
+                    owner = %rec.owner,
+                    path = %path,
+                    "atomic-register denied: admin takeover requires force=true"
+                );
+                return Err(AppError::Forbidden(
+                    "admin takeover of a slot owned by another DID requires force=true".into(),
+                ));
+            }
+            true
+        }
+        None => false,
+    };
+
+    // 3. Build the new record. Preserve created_at when the same owner
+    //    is re-publishing; reset on takeover or fresh allocation.
+    let now = now_epoch();
+    let (created_at, version_count) = match (&existing, owner_changed) {
+        (Some(rec), false) => (rec.created_at, rec.version_count + 1),
+        _ => (now, 1),
+    };
+
+    let new_record = DidRecord {
+        owner: auth.did.clone(),
+        mnemonic: path.to_string(),
+        created_at,
+        updated_at: now,
+        version_count,
+        did_id: Some(did_id.clone()),
+        content_size: did_log.len() as u64,
+        disabled: false,
+        deleted_at: None,
+    };
+
+    // 4. Single-batch atomic write: record, log content, owner index;
+    //    plus old-owner cleanup on takeover. From a resolver's
+    //    perspective there is no point at which the slot is
+    //    half-updated — either old-content/old-record or
+    //    new-content/new-record.
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_log_key(path),
+        did_log.as_bytes().to_vec(),
+    );
+    if owner_changed {
+        let prev = existing
+            .as_ref()
+            .expect("owner_changed => existing record present");
+        // Stale witness; signed for the prior DID identifier.
+        batch.remove(&state.dids_ks, content_witness_key(path));
+        batch.remove(&state.dids_ks, owner_key(&prev.owner, path));
+    }
+    batch.insert(&state.dids_ks, did_key(path), &new_record)?;
+    batch.insert_raw(
+        &state.dids_ks,
+        owner_key(&auth.did, path),
+        path.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
+
+    let did_url = format!("{}/{path}/did.jsonl", server_base_url.trim_end_matches('/'));
+
+    info!(
+        did = %auth.did,
+        path = %path,
+        version = version_count,
+        owner_changed,
+        "DID atomically registered on control plane"
+    );
+
+    Ok(RequestUriResponse {
+        mnemonic: path.to_string(),
+        did_url,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests for register_did_atomic
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests_atomic {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Arc, OnceLock};
+
+    use affinidi_webvh_common::DidRegisterRequest;
+    use affinidi_webvh_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use affinidi_webvh_common::server::stats_collector::StatsCollector;
+    use affinidi_webvh_common::server::store::Store;
+
+    use crate::acl::Role;
+    use crate::config::{AppConfig, RegistryConfig};
+    use crate::server::AppState;
+
+    /// Build a structurally-valid did.jsonl whose latest entry's
+    /// `state.id` is `did:webvh:<scid>:<host_encoded>[:<path>]`. The
+    /// proof is real but signs a different identifier — fine for these
+    /// tests because `validate_did_jsonl` is structural-only (no
+    /// signature verification at the storage layer).
+    fn build_test_did_log(scid: &str, host_encoded: &str, path: &str) -> String {
+        let did_id = if path.is_empty() {
+            format!("did:webvh:{scid}:{host_encoded}")
+        } else {
+            format!("did:webvh:{scid}:{host_encoded}:{path}")
+        };
+        // Re-target the upstream fixture by string-replacing the
+        // baked-in DID identifier. Keeps `parameters`, `proof`, and
+        // verificationMethod shape intact so LogEntry deserialization
+        // accepts it.
+        const FIXTURE: &str = r#"{"versionId":"1-QmRiFdWdyckg8HETNgZWEXP3LGhEZD9pJBVqFRCRWpUrKh","versionTime":"2025-07-09T21:32:15Z","parameters":{"method":"did:webvh:1.0","scid":"QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia","updateKeys":["z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR"],"portable":true,"nextKeyHashes":["QmUSYM6seDvKtYpSEsr7Y5bmM5owYVGV3EhZ5BCUexrAcR"],"ttl":300},"state":{"@context":["https://www.w3.org/ns/did/v1","https://www.w3.org/ns/cid/v1"],"assertionMethod":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"authentication":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"capabilityDelegation":[],"capabilityInvocation":[],"id":"PLACEHOLDER_ID","keyAgreement":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"service":[],"verificationMethod":[{"controller":"did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000","id":"did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0","publicKeyMultibase":"z6MkizY3BLE8VwADPdzuhRcsTVDnakfGRNMjWxhk1WJYTjRg","type":"Multikey"}]},"proof":[{"type":"DataIntegrityProof","cryptosuite":"eddsa-jcs-2022","created":"2025-07-09T21:32:15Z","verificationMethod":"did:key:z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR#z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR","proofPurpose":"assertionMethod","proofValue":"z64Ney14a8BVM5XWQ9qHchnmNH2EKwsRpp7y972sxoGc84mDu56Vq8pJHpymZPpcPmcrDPtqKJs1CkapXxc14ZGeM"}]}"#;
+        FIXTURE.replace("PLACEHOLDER_ID", &did_id)
+    }
+
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.expect("open store");
+        let sessions_ks = store.keyspace("sessions").expect("sessions ks");
+        let acl_ks = store.keyspace("acl").expect("acl ks");
+        let registry_ks = store.keyspace("registry").expect("registry ks");
+        let dids_ks = store.keyspace("dids").expect("dids ks");
+        let stats_ks = store.keyspace("stats").expect("stats ks");
+
+        let config = AppConfig {
+            features: FeaturesConfig::default(),
+            server_did: Some("did:webvh:test:control.example.com".into()),
+            mediator_did: None,
+            public_url: Some("http://control.test".into()),
+            did_hosting_url: Some("http://control.test".into()),
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            secrets: SecretsConfig::default(),
+            vta: VtaConfig::default(),
+            registry: RegistryConfig::default(),
+            config_path: PathBuf::new(),
+        };
+
+        let state = AppState {
+            store: store.clone(),
+            sessions_ks,
+            acl_ks,
+            registry_ks,
+            dids_ks,
+            config: Arc::new(config),
+            did_resolver: None,
+            secrets_resolver: None,
+            jwt_keys: None,
+            webauthn: None,
+            http_client: reqwest::Client::new(),
+            didcomm_service: Arc::new(OnceLock::new()),
+            stats_collector: Arc::new(StatsCollector::new()),
+            stats_ks,
+            signing_key_bytes: None,
+        };
+
+        (state, dir)
+    }
+
+    fn owner_auth(did: &str) -> AuthClaims {
+        AuthClaims {
+            did: did.to_string(),
+            role: Role::Owner,
+        }
+    }
+
+    fn admin_auth(did: &str) -> AuthClaims {
+        AuthClaims {
+            did: did.to_string(),
+            role: Role::Admin,
+        }
+    }
+
+    /// Fresh slot, well-formed did.jsonl, caller becomes owner.
+    #[tokio::test]
+    async fn fresh_slot_succeeds_and_writes_atomically() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha";
+        let did_log = build_test_did_log("scid-alpha", "control.test", path);
+
+        let result = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+            .await
+            .expect("fresh-slot register should succeed");
+        assert_eq!(result.mnemonic, path);
+        assert_eq!(result.did_url, "http://control.test/alpha/did.jsonl");
+
+        // Record + log + owner-index all present after the single batch commit.
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.version_count, 1);
+        assert_eq!(
+            record.did_id.as_deref(),
+            Some("did:webvh:scid-alpha:control.test:alpha")
+        );
+
+        let log = state
+            .dids_ks
+            .get_raw(content_log_key(path))
+            .await
+            .unwrap()
+            .expect("log");
+        assert_eq!(log, did_log.as_bytes());
+
+        let owner_idx = state.dids_ks.get_raw(owner_key(owner, path)).await.unwrap();
+        assert!(owner_idx.is_some(), "owner index must be written");
+    }
+
+    /// Same owner re-registering: idempotent path. Slot stays owned by the
+    /// same DID; version_count bumps; created_at preserved; new content
+    /// replaces old without ever leaving the slot empty.
+    #[tokio::test]
+    async fn owner_re_register_is_idempotent() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "beta";
+
+        let log_v1 = build_test_did_log("scid-beta", "control.test", path);
+        let r1 = register_did_atomic(&owner_auth(owner), &state, path, &log_v1, false)
+            .await
+            .unwrap();
+        let rec_v1: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+
+        // Same owner re-registers (potentially with new log content). No
+        // intermediate empty state — old content is replaced in-batch.
+        let log_v2 = build_test_did_log("scid-beta", "control.test", path);
+        let r2 = register_did_atomic(&owner_auth(owner), &state, path, &log_v2, false)
+            .await
+            .expect("idempotent re-register should succeed without force");
+        assert_eq!(r1.mnemonic, r2.mnemonic);
+
+        let rec_v2: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert_eq!(rec_v2.owner, owner);
+        assert_eq!(rec_v2.version_count, rec_v1.version_count + 1);
+        assert_eq!(
+            rec_v2.created_at, rec_v1.created_at,
+            "owner re-register must preserve created_at"
+        );
+    }
+
+    /// A different non-admin caller hitting an existing slot is forbidden,
+    /// regardless of force.
+    #[tokio::test]
+    async fn other_owner_without_admin_forbidden() {
+        let (state, _dir) = test_state().await;
+        let path = "gamma";
+        let owner_a = "did:example:owner-a";
+        let owner_b = "did:example:owner-b";
+        let log = build_test_did_log("scid-gamma", "control.test", path);
+
+        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
+            .await
+            .unwrap();
+
+        // Without force.
+        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+
+        // With force — still 403, since caller is not admin.
+        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// Admin without force on a slot owned by someone else is forbidden —
+    /// `force` is the explicit "yes really take this from the previous
+    /// owner" gate.
+    #[tokio::test]
+    async fn admin_takeover_requires_force() {
+        let (state, _dir) = test_state().await;
+        let path = "delta";
+        let log = build_test_did_log("scid-delta", "control.test", path);
+
+        register_did_atomic(
+            &owner_auth("did:example:owner-a"),
+            &state,
+            path,
+            &log,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = register_did_atomic(&admin_auth("did:example:admin"), &state, path, &log, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(ref m) if m.contains("force")));
+    }
+
+    /// Admin with force succeeds; caller becomes the new owner; old
+    /// owner-index entry is removed; old witness is cleared (was signed
+    /// for the prior DID identifier).
+    #[tokio::test]
+    async fn admin_takeover_with_force_succeeds() {
+        let (state, _dir) = test_state().await;
+        let path = "epsilon";
+        let owner_a = "did:example:owner-a";
+        let admin = "did:example:admin";
+        let log = build_test_did_log("scid-epsilon", "control.test", path);
+
+        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
+            .await
+            .unwrap();
+        // Seed a witness file as if the original owner had uploaded one.
+        state
+            .dids_ks
+            .insert_raw(content_witness_key(path), b"prior-witness".to_vec())
+            .await
+            .unwrap();
+
+        register_did_atomic(&admin_auth(admin), &state, path, &log, true)
+            .await
+            .expect("admin force takeover should succeed");
+
+        let rec: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert_eq!(rec.owner, admin);
+        assert_eq!(rec.version_count, 1, "takeover resets version_count");
+
+        // Old owner-index entry removed; new one present.
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key(owner_a, path))
+                .await
+                .unwrap()
+                .is_none(),
+            "old owner-index entry must be removed on takeover"
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key(admin, path))
+                .await
+                .unwrap()
+                .is_some(),
+            "new owner-index entry must be present after takeover"
+        );
+
+        // Stale witness cleared.
+        assert!(
+            state
+                .dids_ks
+                .get_raw(content_witness_key(path))
+                .await
+                .unwrap()
+                .is_none(),
+            "prior witness must be cleared on takeover (signed for prior DID)"
+        );
+    }
+
+    /// did_log's path component doesn't match the requested slot — rejected
+    /// before any storage write.
+    #[tokio::test]
+    async fn mismatched_did_path_rejected() {
+        let (state, _dir) = test_state().await;
+        // Log claims path "wrong-path" but request is for path "right-path".
+        let log = build_test_did_log("scid-x", "control.test", "wrong-path");
+        let err = register_did_atomic(
+            &owner_auth("did:example:owner"),
+            &state,
+            "right-path",
+            &log,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("path")));
+        assert!(
+            state
+                .dids_ks
+                .get_raw(did_key("right-path"))
+                .await
+                .unwrap()
+                .is_none(),
+            "no record must be written when validation fails"
+        );
+    }
+
+    /// did_log claims a different host — claim-jumping prevention.
+    #[tokio::test]
+    async fn mismatched_did_host_rejected() {
+        let (state, _dir) = test_state().await;
+        let log = build_test_did_log("scid-x", "other-host.example", "valid-path");
+        let err = register_did_atomic(
+            &owner_auth("did:example:owner"),
+            &state,
+            "valid-path",
+            &log,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("host")));
+    }
+
+    /// Malformed did.jsonl is rejected by `validate_did_jsonl`.
+    #[tokio::test]
+    async fn invalid_did_log_rejected() {
+        let (state, _dir) = test_state().await;
+        let err = register_did_atomic(
+            &owner_auth("did:example:owner"),
+            &state,
+            "any-path",
+            "not valid jsonl",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// Smoke test: the wire request type round-trips with default `force`.
+    #[test]
+    fn did_register_request_round_trip_defaults_force_false() {
+        let raw = r#"{"path":"alpha","did_log":"line"}"#;
+        let req: DidRegisterRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.path, "alpha");
+        assert_eq!(req.did_log, "line");
+        assert!(!req.force, "force must default to false");
+    }
+}
+
 /// Publish (upload) a did.jsonl log for an existing DID slot.
 pub async fn publish_did(
     auth: &AuthClaims,

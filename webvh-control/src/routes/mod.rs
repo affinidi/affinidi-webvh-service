@@ -28,10 +28,13 @@ pub fn router_without_fallback() -> Router<AppState> {
         )
         .route("/register-service", post(registry::register_service));
 
-    // Upload routes with a custom body-size limit (DID log + witness)
+    // Upload routes with a custom body-size limit (DID log + witness).
+    // `/dids/register` carries the full did.jsonl in the body too — same
+    // ceiling, same router so the limit applies uniformly.
     let upload_routes = Router::new()
         .route("/dids/{*mnemonic}", put(did_manage::upload_did))
         .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
+        .route("/dids/register", post(did_manage::register_did))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
 
     let api = Router::new()
