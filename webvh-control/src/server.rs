@@ -57,6 +57,10 @@ pub struct AppState {
     /// `Debug` derive is added later, wrap this in a redacting newtype
     /// (or `secrecy::SecretBox`) at the same time.
     pub signing_key_bytes: Option<[u8; 32]>,
+    /// Anti-replay cache for inbound DIDComm `(sender, msg.id)` pairs.
+    /// Both transports gate through it before dispatch to reject
+    /// captured-and-resubmitted envelopes within the freshness window.
+    pub replay_cache: Arc<crate::replay::ReplayCache>,
 }
 
 impl AppState {
@@ -239,6 +243,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         },
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        replay_cache: Arc::new(crate::replay::ReplayCache::new()),
     };
 
     // Seed registry from static config

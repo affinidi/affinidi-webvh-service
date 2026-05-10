@@ -17,6 +17,12 @@ use base64::Engine;
 
 use super::error::AppError;
 
+/// Maximum age of a DIDComm message accepted by `unpack_signed`, in
+/// seconds. Messages older than this are rejected as stale; replay
+/// caches use the same window as their TTL so a message that's still
+/// fresh enough to accept is still tracked for replay detection.
+pub const FRESHNESS_WINDOW_SECS: u64 = 300;
+
 /// Extract the signer's key ID from a JWS protected header without verifying the signature.
 ///
 /// Rejects multi-signature JWS envelopes outright — the threat model assumes a
@@ -170,8 +176,7 @@ pub async fn unpack_signed(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let max_age = 300; // 5 minutes
-        if now.saturating_sub(created_time) > max_age {
+        if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
             return Err(AppError::Authentication(
                 "message too old (created_time exceeds 5-minute window)".into(),
             ));

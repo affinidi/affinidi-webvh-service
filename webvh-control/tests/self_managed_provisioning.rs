@@ -81,6 +81,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         stats_collector: Arc::new(StatsCollector::new()),
         stats_ks,
         signing_key_bytes: None,
+        replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA

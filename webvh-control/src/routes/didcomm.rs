@@ -78,6 +78,43 @@ pub async fn handle(
         .as_deref()
         .ok_or_else(|| AppError::Internal("server_did not configured".into()))?;
 
+    // Replay gate: same `(sender, msg.id)` cache the framework router
+    // checks. A captured signed envelope replayed within the freshness
+    // window would otherwise re-trigger state-changing operations (the
+    // signature is still valid; the freshness check still passes).
+    if let Err(e) = state.replay_cache.check_and_insert(&auth.did, &msg.id) {
+        let code = e.didcomm_code();
+        let comment = e.user_message();
+        warn!(code, comment = %comment, msg_id = %msg.id, did = %auth.did, "DIDComm replay rejected");
+        // Build a problem-report response in-line, since we don't want
+        // to surface a generic AppError 4xx for a replay (it's a
+        // DIDComm-protocol-level rejection, the wire body should be
+        // a packed DIDComm message).
+        let response_msg = Message::build(
+            uuid::Uuid::new_v4().to_string(),
+            MSG_PROBLEM_REPORT.to_string(),
+            json!({ "code": code, "comment": comment }),
+        )
+        .from(server_did.to_string())
+        .to(sender_base.to_string())
+        .thid(msg.id.clone())
+        .created_time(now_epoch())
+        .finalize();
+        let signing_key = state
+            .signing_key_bytes
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("server signing key not configured".into()))?;
+        let kid = format!("{server_did}#key-0");
+        let packed = pack::pack_signed(&response_msg, &kid, signing_key)
+            .map_err(|e| AppError::Internal(format!("failed to pack DIDComm response: {e}")))?;
+        return Ok((
+            StatusCode::OK,
+            [("content-type", "application/didcomm-signed+json")],
+            packed,
+        )
+            .into_response());
+    }
+
     let (response_type, response_body) = match dispatch(&auth, &state, &msg, server_did).await {
         Ok(result) => result,
         Err(err) => {

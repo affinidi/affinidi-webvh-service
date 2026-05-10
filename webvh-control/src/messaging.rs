@@ -189,13 +189,22 @@ async fn handle_webvh_message(
 }
 
 /// Compute the wire-level (response_type, response_body) for any inbound
-/// VTA management message — wraps the ACL check and `dispatch_did_op` so
-/// the auth + dispatch pipeline is testable as a single unit, without an
-/// `ATM`-backed `HandlerContext`. Always returns a tuple; ACL denials and
-/// dispatch errors surface as problem-report bodies.
+/// VTA management message — wraps the ACL check, replay-cache gate, and
+/// `dispatch_did_op` so the auth + dispatch pipeline is testable as a
+/// single unit, without an `ATM`-backed `HandlerContext`. Always
+/// returns a tuple; ACL denials, replay rejections, and dispatch
+/// errors surface as problem-report bodies.
 async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -> (String, Value) {
+    // Replay gate: reject any (sender, msg.id) we've seen within the
+    // freshness window. Runs after ACL so an unauthenticated flood
+    // can't poison the cache for legitimate senders.
     match check_acl(&state.acl_ks, sender).await {
         Ok(role) => {
+            if let Err(e) = state.replay_cache.check_and_insert(sender, &message.id) {
+                let code = map_app_error_code(&e);
+                warn!(code, msg_type = %message.typ, did = sender, msg_id = %message.id, "DIDComm replay rejected");
+                return problem_report(code, &e.to_string());
+            }
             let auth = AuthClaims {
                 did: sender.to_string(),
                 role,
@@ -888,6 +897,7 @@ mod tests {
             stats_collector: Arc::new(StatsCollector::new()),
             stats_ks,
             signing_key_bytes: None,
+            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         };
 
         (state, dir)
@@ -1389,6 +1399,36 @@ mod tests {
         assert_eq!(
             body.get("code").and_then(|v| v.as_str()),
             Some("e.p.did.unauthorized")
+        );
+    }
+
+    /// Replay gate: re-submitting the same `(sender, msg.id)` after a
+    /// successful dispatch surfaces as `e.p.did.validation-error` with
+    /// a "replay-detected" comment. Pinning this at the wrapper level
+    /// catches a regression where the replay cache is not consulted
+    /// before dispatch (e.g. a future refactor that moves the cache
+    /// check into a per-arm handler).
+    #[tokio::test]
+    async fn run_webvh_dispatch_replay_rejected() {
+        let sender = "did:example:authorized";
+        let (state, _dir, _keys) = auth_ready_state(sender, Role::Owner).await;
+        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
+
+        // First call goes through.
+        let (typ, _) = run_webvh_dispatch(&state, sender, &msg).await;
+        assert_eq!(typ, MSG_LIST);
+
+        // Same `(sender, msg.id)` — replay.
+        let (typ, body) = run_webvh_dispatch(&state, sender, &msg).await;
+        assert_eq!(typ, MSG_PROBLEM_REPORT);
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("e.p.did.validation-error")
+        );
+        let comment = body.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            comment.contains("replay-detected"),
+            "replay rejection should mention 'replay-detected', got: {comment}"
         );
     }
 

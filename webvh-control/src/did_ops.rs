@@ -898,6 +898,7 @@ mod tests_atomic {
             stats_collector: Arc::new(StatsCollector::new()),
             stats_ks,
             signing_key_bytes: None,
+            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         };
 
         (state, dir)

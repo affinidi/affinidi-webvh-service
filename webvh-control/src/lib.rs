@@ -19,6 +19,7 @@ pub mod frontend;
 pub mod health;
 pub mod messaging;
 pub mod registry;
+pub mod replay;
 pub mod routes;
 pub mod secret_store;
 pub mod server;

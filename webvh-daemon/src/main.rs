@@ -983,6 +983,7 @@ async fn build_control(
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
     };
 
     // Seed registry from static config
