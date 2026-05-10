@@ -234,7 +234,11 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         mediator_did,
         public_url,
         did_hosting_url: Some(did_hosting_url),
-        server: ServerConfig { host, port },
+        server: ServerConfig {
+            host,
+            port,
+            trusted_proxies: Vec::new(),
+        },
         log: LogConfig {
             level: log_level,
             format: log_format,
@@ -898,6 +902,7 @@ pub async fn run_setup_offline_complete(
         server: ServerConfig {
             host: state.host.clone(),
             port: state.port,
+            trusted_proxies: Vec::new(),
         },
         log: LogConfig {
             level: state.log_level.clone(),

@@ -24,6 +24,16 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Trusted reverse-proxy IPs whose `X-Forwarded-For` header is
+    /// honoured for client-IP attribution. Empty (default) =
+    /// X-Forwarded-For is ignored and the direct TCP peer is used —
+    /// safe behind nothing or behind a CDN that strips XFF, but
+    /// wrong behind a load balancer (every request appears to come
+    /// from the LB, so per-IP rate limits become a global cap).
+    /// Configure with the IPs of your reverse proxies (e.g.
+    /// `["10.0.0.1", "10.0.0.2"]`) to opt in.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,6 +174,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            trusted_proxies: Vec::new(),
         }
     }
 }

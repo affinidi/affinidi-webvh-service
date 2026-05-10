@@ -87,6 +87,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         pending_challenges: Arc::new(
             affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
         ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA

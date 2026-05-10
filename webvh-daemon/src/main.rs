@@ -667,10 +667,13 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let http_handle = tokio::spawn(async move {
         let _ = http_ready_tx.send(());
-        axum::serve(listener, app)
-            .with_graceful_shutdown(init::shutdown_signal())
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(init::shutdown_signal())
+        .await
+        .expect("axum serve failed");
     });
 
     // Wait for HTTP to be serving before starting DIDComm — the mediator DID
@@ -999,6 +1002,7 @@ async fn build_control(
         pending_challenges: Arc::new(
             affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
         ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     // Seed registry from static config

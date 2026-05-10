@@ -192,6 +192,7 @@ pub async fn run_wizard(
         server: ServerConfig {
             host: host.clone(),
             port,
+            trusted_proxies: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -609,6 +610,7 @@ async fn run_self_managed_setup(
         server: ServerConfig {
             host: host.clone(),
             port,
+            trusted_proxies: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -973,6 +975,7 @@ pub async fn run_setup_offline_complete(
         server: ServerConfig {
             host: state.host.clone(),
             port: state.port,
+            trusted_proxies: Vec::new(),
         },
         log: LogConfig {
             level: state.log_level.clone(),

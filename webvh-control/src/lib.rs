@@ -20,6 +20,7 @@ pub mod health;
 pub mod messaging;
 pub mod path_locks;
 pub mod pending_challenges;
+pub mod rate_limit;
 pub mod registry;
 pub mod replay;
 pub mod routes;

@@ -139,7 +139,11 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     }
 
     let config = AppConfig {
-        server: ServerConfig { host, port },
+        server: ServerConfig {
+            host,
+            port,
+            trusted_proxies: Vec::new(),
+        },
         log: crate::config::LogConfig {
             level: log_level,
             format: log_format,

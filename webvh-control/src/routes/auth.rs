@@ -1,7 +1,10 @@
 //! DIDComm challenge-response authentication routes.
 
+use std::net::SocketAddr;
+
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use tracing::{info, warn};
 
 use affinidi_webvh_common::server::auth::constant_time_eq;
@@ -9,6 +12,7 @@ use affinidi_webvh_common::{ChallengeData, ChallengeRequest, ChallengeResponse};
 
 use crate::auth::session::{self, Session, SessionState, now_epoch};
 use crate::error::AppError;
+use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;
 
 /// Maximum concurrent pending challenges per DID. Combined with the
@@ -19,18 +23,36 @@ const MAX_PENDING_CHALLENGES_PER_DID: u64 = 10;
 
 /// POST /api/auth/challenge — request a challenge nonce.
 ///
-/// Replaced an O(N) `prefix_iter_raw("session:")` scan with the
-/// O(1) in-memory `PendingChallengeTracker`. The previous shape
-/// amplified attacker effort: each unauthenticated challenge cost
-/// the server an O(N) scan over the entire session keyspace.
+/// Two layers of rate-limit defence:
+/// 1. Per-IP fixed-window counter (`IpRateLimiter`) — caps requests
+///    from any single IP regardless of which DID they're issuing
+///    challenges for. Trusted-proxy XFF resolution per
+///    `server.trusted_proxies` config.
+/// 2. Per-DID + global pending-challenge cap (`PendingChallengeTracker`)
+///    — caps the active session population.
+///
+/// Replaced an earlier O(N) `prefix_iter_raw("session:")` scan with
+/// the O(1) in-memory tracker (review SM3).
 pub async fn challenge(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
     // Input validation
     if req.did.len() > 512 {
         return Err(AppError::Validation("DID exceeds maximum length".into()));
     }
+
+    // IP rate limit (defence in depth before any session-storage I/O).
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_ip = resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    state
+        .ip_rate_limiter
+        .try_consume(client_ip, now_epoch())
+        .inspect_err(|e| {
+            warn!(ip = %client_ip, error = %e, "challenge IP rate limited");
+        })?;
 
     // Reserve a pending-challenge slot. Rejects on per-DID cap or
     // global cap; the global cap is the defence against an attacker

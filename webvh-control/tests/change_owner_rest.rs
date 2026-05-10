@@ -102,6 +102,7 @@ async fn make_harness() -> Harness {
         pending_challenges: Arc::new(
             affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
         ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     Harness { state, _dir: dir }

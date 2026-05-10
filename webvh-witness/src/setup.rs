@@ -212,7 +212,11 @@ pub async fn run_wizard(
         },
         server_did: Some(outcome.integration_did.clone()),
         mediator_did,
-        server: ServerConfig { host, port },
+        server: ServerConfig {
+            host,
+            port,
+            trusted_proxies: Vec::new(),
+        },
         log: LogConfig {
             level: log_level,
             format: log_format,
@@ -838,6 +842,7 @@ pub async fn run_setup_offline_complete(
         server: ServerConfig {
             host: state.host.clone(),
             port: state.port,
+            trusted_proxies: Vec::new(),
         },
         log: LogConfig {
             level: state.log_level.clone(),

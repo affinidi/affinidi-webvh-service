@@ -82,6 +82,11 @@ pub struct AppState {
     /// challenge-endpoint storage-exhaustion + CPU-amplification
     /// surface (review SM3).
     pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
+    /// Per-IP rate limiter for the unauthenticated challenge endpoint.
+    /// Network-layer defence-in-depth that complements the per-DID +
+    /// global counters above. See `crate::rate_limit` for the
+    /// trusted-proxy / X-Forwarded-For policy.
+    pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
 }
 
 impl AppState {
@@ -271,6 +276,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+        ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
     };
 
     // Seed registry from static config
@@ -600,12 +606,15 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let mut rx = shutdown_rx.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = rx.changed().await;
-            })
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
 
         info!("REST thread shutting down");
     });

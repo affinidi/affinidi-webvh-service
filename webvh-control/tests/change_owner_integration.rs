@@ -96,6 +96,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         pending_challenges: Arc::new(
             affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
         ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     (state, dir)

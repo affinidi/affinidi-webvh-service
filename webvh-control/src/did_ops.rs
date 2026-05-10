@@ -948,6 +948,7 @@ mod tests_atomic {
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+            ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         };
 
         (state, dir)
