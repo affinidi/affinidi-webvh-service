@@ -230,6 +230,44 @@ All API endpoints are under the `/api` prefix.
 | `PUT`    | `/api/acl/{did}` | Update ACL entry |
 | `DELETE` | `/api/acl/{did}` | Remove ACL entry |
 
+### DID Management
+
+All routes require Bearer-token authentication; ownership and admin
+gating is enforced per-handler.
+
+| Method   | Path                            | Description |
+| -------- | ------------------------------- | ----------- |
+| `GET`    | `/api/dids`                     | List DIDs (owners see their own; admins see all, or filter by `?owner=did:...`). |
+| `POST`   | `/api/dids`                     | Reserve a DID slot (mnemonic + URL). Body: `{ "path"?: string, "force"?: bool }`. |
+| `POST`   | `/api/dids/check`               | Check whether a custom path is available. Body: `{ "path": string }`. |
+| `POST`   | `/api/dids/register`            | Atomic claim-and-publish (closes the resolvability gap of `POST /api/dids` + `PUT /api/dids/{m}`). Body: `{ "path": string, "did_log": string, "force"?: bool }`. |
+| `GET`    | `/api/dids/{*mnemonic}`         | Get DID record + log metadata. |
+| `PUT`    | `/api/dids/{*mnemonic}`         | Publish a signed `did.jsonl` log. Body: `text/plain` JSONL. |
+| `DELETE` | `/api/dids/{*mnemonic}`         | Delete a DID and its associated content. |
+| `PUT`    | `/api/owner/{*mnemonic}`        | Transfer ownership. Body: `{ "new_owner": string }`. New owner must be in the ACL. |
+| `PUT`    | `/api/disable/{*mnemonic}`      | Toggle `disabled = true` on the record (resolvers serve gone). |
+| `PUT`    | `/api/enable/{*mnemonic}`       | Toggle `disabled = false`. |
+| `POST`   | `/api/rollback/{*mnemonic}`     | Remove the last log entry (decrements `version_count`). |
+| `GET`    | `/api/log/{*mnemonic}`          | Parsed log entries as structured JSON. |
+| `GET`    | `/api/raw/{*mnemonic}`          | Raw `did.jsonl` content as `text/plain`. |
+| `PUT`    | `/api/witness/{*mnemonic}`      | Upload a witness proof file. Body: `application/json`. |
+
+### Statistics & Time-series
+
+| Method | Path                              | Description |
+| ------ | --------------------------------- | ----------- |
+| `GET`  | `/api/stats`                      | Aggregate stats across the control plane. |
+| `GET`  | `/api/stats/{*mnemonic}`          | Per-DID stats. |
+| `GET`  | `/api/timeseries`                 | Server-wide time-series buckets. Query: `?range=1h\|24h\|7d\|30d` (default `24h`). |
+| `GET`  | `/api/timeseries/{*mnemonic}`     | Per-DID time-series. Same `range` query. |
+
+### Service Topology & Configuration
+
+| Method | Path                       | Description |
+| ------ | -------------------------- | ----------- |
+| `GET`  | `/api/services/overview`   | Full topology: control plane info + every registered service + aggregate stats. |
+| `GET`  | `/api/config`              | Non-sensitive control-plane configuration (DIDs, URLs, feature flags). |
+
 ### Service Registry (admin only)
 
 | Method   | Path                                         | Description          |

@@ -28,10 +28,19 @@ The protocol covers:
 
 | Message Type | Direction | Description |
 |---|---|---|
-| `https://affinidi.com/webvh/1.0/did/request` | Client -> Server | Request a new DID URI reservation |
+| `https://affinidi.com/webvh/1.0/did/request` | Client -> Server | Request a new DID URI reservation. Optional `force` field lets the current owner or an admin re-claim an existing path (see [Force-replace](#force-replace-on-did-request)). |
 | `https://affinidi.com/webvh/1.0/did/offer` | Server -> Client | Provide the reserved mnemonic and DID URL |
 | `https://affinidi.com/webvh/1.0/did/publish` | Client -> Server | Submit the signed DID log entry for publication |
 | `https://affinidi.com/webvh/1.0/did/confirm` | Server -> Client | Confirm successful publication |
+| `https://affinidi.com/webvh/1.0/did/register` | Client -> Server | Atomic claim-and-publish — reserves a path AND publishes the first signed log entry in a single round-trip. Closes the resolvability gap of the two-step `did/request` + `did/publish` flow. |
+| `https://affinidi.com/webvh/1.0/did/register-confirm` | Server -> Client | Confirm successful atomic registration |
+
+### DID Ownership
+
+| Message Type | Direction | Description |
+|---|---|---|
+| `https://affinidi.com/webvh/1.0/did/change-owner` | Client -> Server | Transfer ownership of an existing DID to another DID. Requester must be the current owner or an admin; the new owner must already be in the ACL. |
+| `https://affinidi.com/webvh/1.0/did/change-owner-confirm` | Server -> Client | Confirm successful ownership transfer |
 
 ### Witness Management
 
@@ -231,16 +240,32 @@ The client initiates DID creation by requesting a URI reservation from the serve
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | No | Custom path/mnemonic for the DID. If omitted, the server generates a random mnemonic. Must be URL-safe and not already reserved. |
+| `force` | bool | No | When `true` and `path` is taken, replace the existing slot. The caller must be an admin or the current owner of that path; otherwise the server replies with `e.p.did.unauthorized`. The old log content, witness, and owner-index entry are wiped; the caller becomes the new owner. Defaults to `false` (existing-path collisions return `e.p.did.path-unavailable`). See [Force-replace](#force-replace-on-did-request). |
 
 **Server Processing:**
 
 1. Verify the sender's DID is in the ACL.
 2. Check the sender's DID count quota (admins are exempt).
-3. If `path` is provided, validate it is URL-safe and available.
-4. If `path` is omitted, generate a random mnemonic.
-5. Create a `DidRecord` with owner, mnemonic, and timestamps.
-6. Store the record and owner index atomically.
-7. Respond with `did/offer` or `did/problem-report`.
+3. If `path` is provided, validate it is URL-safe.
+4. If `path` is provided and the path exists:
+   - if `force` is `false` → respond `e.p.did.path-unavailable`.
+   - if `force` is `true` and the caller is admin-or-current-owner → wipe old content/witness/owner-index, then proceed.
+   - otherwise → respond `e.p.did.unauthorized`.
+5. If `path` is omitted, generate a random mnemonic.
+6. Create a `DidRecord` with owner, mnemonic, and timestamps.
+7. Store the record and owner index atomically.
+8. Respond with `did/offer` or `did/problem-report`.
+
+#### Force-replace on DID Request
+
+`force=true` lets an admin or the current owner of an existing path
+re-claim it. After the wipe, the path's `did/offer` reservation is
+fresh — *no log content has been published yet*. Downstream
+resolvers retain their previous copy of the DID document until the
+caller follows up with `did/publish`. If you need an atomic
+ownership-takeover with no resolvability gap, use [`did/register`](#3-did-register)
+instead — it claims and publishes in a single message and triggers a
+single fan-out to downstream servers.
 
 ### 2. DID Offer
 
@@ -789,6 +814,162 @@ Used to report errors at any stage of the protocol. Follows the [DIDComm v2 Prob
 | `e.p.did.witness-invalid` | Witness Publish | The witness content is empty or malformed. |
 | `e.p.did.not-published` | Witness Publish, Info | The DID log has not been published yet. |
 | `e.p.did.internal-error` | Any | Unexpected server-side error. |
+
+---
+
+### 14. DID Register
+
+**Type:** `https://affinidi.com/webvh/1.0/did/register`
+**Direction:** Client -> Server
+
+Atomic claim-and-publish — reserves a path AND publishes the first
+signed log entry in a single round-trip. Equivalent to `did/request`
++ `did/publish` but with no resolvability gap between path
+reservation and first publish.
+
+Use this when a client already has the signed log entry ready (the
+common case for tooling that builds the log locally from a
+known-good identity) and wants the slot's content visible to
+downstream resolvers as soon as the registration confirms.
+
+**Message Structure:**
+
+```json
+{
+  "id": "urn:uuid:1c2b3a4d-5e6f-7081-92a3-b4c5d6e7f809",
+  "type": "https://affinidi.com/webvh/1.0/did/register",
+  "from": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+  "to": ["did:web:webvh.example.com"],
+  "created_time": 1700000010,
+  "body": {
+    "path": "tenant/alice",
+    "did_log": "{\"versionId\":\"1-Qm…\",\"versionTime\":\"…\",\"parameters\":{…},\"state\":{\"id\":\"did:webvh:scid:host:tenant:alice\",…},\"proof\":[…]}",
+    "force": false
+  }
+}
+```
+
+**Body Fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | Yes | Custom path/mnemonic for the DID. Must be URL-safe and pass `validate_custom_path`. |
+| `did_log` | string | Yes | The signed JSONL DID log (one entry minimum). The latest entry's `state.id` MUST encode the same `(host, path)` the server hosts; mismatched DIDs are rejected with `e.p.did.path-invalid`. |
+| `force` | bool | No | Same semantics as `did/request`'s `force`: when `true` and the path is owned by someone else, requires admin role to take over; the slot's prior log/witness/owner-index are wiped before the new content lands. Defaults to `false`. |
+
+**Server Processing:**
+
+1. Verify the sender's DID is in the ACL.
+2. Validate `path` and structural shape of `did_log`.
+3. Verify the `did_log`'s latest `state.id` matches `(host, path)`.
+4. If the slot exists and is owned by the same DID → idempotent re-publish: bump `version_count`, replace content.
+5. If the slot exists and is owned by a different DID → require `auth.role == Admin && force == true`; otherwise reply `e.p.did.unauthorized`.
+6. Single-batch atomic write: `DidRecord`, log content, owner index (plus old-owner cleanup on takeover).
+7. Fan out the new content to downstream servers via `did/sync-update`.
+8. Respond with `did/register-confirm` or `did/problem-report`.
+
+### 15. DID Register Confirm
+
+**Type:** `https://affinidi.com/webvh/1.0/did/register-confirm`
+**Direction:** Server -> Client
+
+**Message Structure:**
+
+```json
+{
+  "id": "urn:uuid:2d3c4b5a-6f70-8192-a3b4-c5d6e7f80910",
+  "type": "https://affinidi.com/webvh/1.0/did/register-confirm",
+  "from": "did:web:webvh.example.com",
+  "to": ["did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"],
+  "created_time": 1700000011,
+  "thid": "urn:uuid:1c2b3a4d-5e6f-7081-92a3-b4c5d6e7f809",
+  "body": {
+    "mnemonic": "tenant/alice",
+    "did_url": "https://webvh.example.com/tenant/alice/did.jsonl"
+  }
+}
+```
+
+**Body Fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `mnemonic` | string | Yes | The reserved path (echoes the request's `path`). |
+| `did_url` | string | Yes | The HTTPS URL where the DID is now resolvable. |
+
+### 16. DID Change Owner
+
+**Type:** `https://affinidi.com/webvh/1.0/did/change-owner`
+**Direction:** Client -> Server
+
+Transfer ownership of an existing DID to a different DID. Use cases:
+re-keying an organisation, decommissioning an old controller,
+admin-driven re-assignment.
+
+**Message Structure:**
+
+```json
+{
+  "id": "urn:uuid:3e4d5c6b-7a89-90b1-c2d3-e4f50617f829",
+  "type": "https://affinidi.com/webvh/1.0/did/change-owner",
+  "from": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+  "to": ["did:web:webvh.example.com"],
+  "created_time": 1700000020,
+  "body": {
+    "mnemonic": "tenant/alice",
+    "new_owner": "did:key:z6Mk…NewOwnerDid"
+  }
+}
+```
+
+**Body Fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `mnemonic` | string | Yes | The DID slot being transferred. |
+| `new_owner` | string | Yes | The DID receiving ownership. Must be in the ACL. Validated via `validate_did_format` (trim, `did:` prefix, no control chars, ≤ 2048 bytes). |
+
+**Server Processing:**
+
+1. Authorize the sender against the existing record's owner (must be the current owner, or have `Admin` role).
+2. Validate `new_owner`'s format.
+3. If `new_owner == current_owner`: no-op, return success.
+4. Verify `new_owner` is in the ACL — otherwise reject with `e.p.did.validation-error` (transferring to an identity that can never authenticate would lose the slot).
+5. Atomic batch write: update `DidRecord.owner` and `updated_at`; remove `owner:{prev}:{mnemonic}` index entry; insert `owner:{new}:{mnemonic}` index entry.
+6. Respond with `did/change-owner-confirm` or `did/problem-report`.
+
+Authorization order is deliberate: caller-authorization runs *before* `new_owner` format validation so a cross-owner attacker submitting a malformed `new_owner` gets `e.p.did.unauthorized` (correct error class), not `e.p.did.validation-error`.
+
+### 17. DID Change Owner Confirm
+
+**Type:** `https://affinidi.com/webvh/1.0/did/change-owner-confirm`
+**Direction:** Server -> Client
+
+**Message Structure:**
+
+```json
+{
+  "id": "urn:uuid:4f5e6d7c-8b9a-01c2-d3e4-f5061728394a",
+  "type": "https://affinidi.com/webvh/1.0/did/change-owner-confirm",
+  "from": "did:web:webvh.example.com",
+  "to": ["did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"],
+  "created_time": 1700000021,
+  "thid": "urn:uuid:3e4d5c6b-7a89-90b1-c2d3-e4f50617f829",
+  "body": {
+    "mnemonic": "tenant/alice",
+    "owner": "did:key:z6Mk…NewOwnerDid",
+    "updated_at": 1700000021
+  }
+}
+```
+
+**Body Fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `mnemonic` | string | Yes | The DID slot whose ownership changed. |
+| `owner` | string | Yes | The new owner DID (canonicalised — trimmed of surrounding whitespace). |
+| `updated_at` | u64 | Yes | UNIX epoch seconds at which the transfer committed. |
 
 ---
 
