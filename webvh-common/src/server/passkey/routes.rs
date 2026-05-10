@@ -63,21 +63,44 @@ pub async fn enroll_start<S: PasskeyState>(
     let sessions_ks = state.sessions_ks();
     let acl_ks = state.acl_ks();
 
-    // Atomically retrieve and consume enrollment (prevents race conditions)
-    let enrollment = store::take_enrollment(sessions_ks, &req.token)
+    // Read (don't consume) the enrollment. The actual `take` happens
+    // in `enroll_finish` after the WebAuthn ceremony succeeds — that
+    // way a failed ceremony (browser closed, key not present, RP
+    // mismatch, attacker decline-after-clicking) leaves the invite
+    // intact for the legitimate user to retry. To prevent the race
+    // where two concurrent `enroll_start` calls both proceed past
+    // this point, we record `claimed_at` and refuse a second
+    // start within the claim window.
+    let mut enrollment = store::get_enrollment(sessions_ks, &req.token)
         .await?
         .ok_or_else(|| {
             warn!("passkey enrollment rejected: token not found or already used");
             AppError::Authentication("enrollment not found or already used".into())
         })?;
 
-    // Check expiry
-    if now_epoch() > enrollment.expires_at {
+    let now = now_epoch();
+
+    // Expiry runs first — an expired claim is moot.
+    if now > enrollment.expires_at {
         warn!(did = %enrollment.did, "passkey enrollment rejected: link expired");
         return Err(AppError::Authentication(
             "enrollment link has expired".into(),
         ));
     }
+
+    // Concurrent-claim check. Within the window, reject; outside the
+    // window, the previous claim is stale (failed ceremony) and we
+    // overwrite.
+    if let Some(claimed_at) = enrollment.claimed_at
+        && now.saturating_sub(claimed_at) < store::ENROLLMENT_CLAIM_WINDOW_SECS
+    {
+        warn!(did = %enrollment.did, "passkey enrollment rejected: ceremony already in progress");
+        return Err(AppError::Authentication(
+            "enrollment is already in progress; retry after the current ceremony completes or expires".into(),
+        ));
+    }
+    enrollment.claimed_at = Some(now);
+    store::store_enrollment(sessions_ks, &enrollment).await?;
 
     // Ensure DID is in ACL — the enrollment itself is the admin's authorization,
     // so create the ACL entry if it doesn't already exist.
@@ -129,6 +152,9 @@ pub async fn enroll_start<S: PasskeyState>(
     let reg_id = Uuid::new_v4().to_string();
     store::store_registration_state(sessions_ks, &reg_id, &reg_state).await?;
     store::store_registration_user(sessions_ks, &reg_id, &user.user_uuid).await?;
+    // Carry the enrollment token forward so `enroll_finish` can
+    // consume it after the WebAuthn ceremony succeeds.
+    store::store_registration_enrollment(sessions_ks, &reg_id, &req.token).await?;
 
     info!(did = %user.did, reg_id = %reg_id, "passkey enrollment started");
 
@@ -164,13 +190,28 @@ pub async fn enroll_finish<S: PasskeyState>(
             AppError::Authentication("registration state not found or expired".into())
         })?;
 
-    // Complete registration ceremony
+    // Complete registration ceremony. If this fails, the enrollment
+    // token is NOT consumed — the legitimate user can retry once the
+    // claim window expires.
     let passkey = webauthn
         .finish_passkey_registration(&req.credential, &reg_state)
         .map_err(|e| {
             warn!(reg_id = %req.registration_id, error = %e, "passkey registration ceremony failed");
             AppError::Authentication(format!("passkey registration failed: {e}"))
         })?;
+
+    // Now consume the enrollment token. The take is atomic across
+    // replicas (refresh-token rotation pattern); a second concurrent
+    // finish that races us sees None and would already have failed
+    // the registration-state take above.
+    if let Some(token) =
+        store::take_registration_enrollment(sessions_ks, &req.registration_id).await?
+    {
+        let _ = store::take_enrollment(sessions_ks, &token).await?;
+    }
+    // Backwards-compat path: no mapping found (e.g. an in-flight
+    // ceremony that started before this version was deployed) — fall
+    // through; the next `enroll_start` will re-take it.
 
     // Load user UUID from registration-to-user mapping
     let user_uuid = store::get_registration_user(sessions_ks, &req.registration_id)
@@ -361,6 +402,7 @@ pub async fn create_enrollment_invite(
         role: role.to_string(),
         created_at: now,
         expires_at: now + enrollment_ttl,
+        claimed_at: None,
     };
 
     store::store_enrollment(sessions_ks, &enrollment).await?;
@@ -508,6 +550,7 @@ pub async fn update_invite<S: PasskeyState>(
         role: req.role.unwrap_or(existing.role),
         created_at: existing.created_at,
         expires_at: new_expires,
+        claimed_at: existing.claimed_at,
     };
     store::store_enrollment(sessions_ks, &updated).await?;
 

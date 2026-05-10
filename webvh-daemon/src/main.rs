@@ -420,6 +420,10 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         error!("failed to open stats keyspace: {e}");
         std::process::exit(1);
     });
+    let timeseries_ks = main_store.keyspace("timeseries").unwrap_or_else(|e| {
+        error!("failed to open timeseries keyspace: {e}");
+        std::process::exit(1);
+    });
 
     // ── Phase 1: Pre-serve initialization ─────────────────────────────
 
@@ -569,6 +573,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &main_store,
             &stats_collector,
             &stats_ks,
+            &timeseries_ks,
             &http_client,
         )
         .await
@@ -639,6 +644,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             sessions_ks,
             dids_ks: dids_ks.clone(),
             stats_ks,
+            timeseries_ks: timeseries_ks.clone(),
             auth_config: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
@@ -742,6 +748,7 @@ struct DaemonStorageParams {
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
+    timeseries_ks: KeyspaceHandle,
     auth_config: affinidi_webvh_common::server::config::AuthConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
@@ -796,6 +803,7 @@ async fn run_daemon_storage_task(
                 if let Err(e) = affinidi_webvh_control::server::flush_stats_to_store(
                     &params.collector,
                     &params.stats_ks,
+                    &params.timeseries_ks,
                     &params.dids_ks,
                     &params.store,
                 ).await {
@@ -813,6 +821,7 @@ async fn run_daemon_storage_task(
     let _ = affinidi_webvh_control::server::flush_stats_to_store(
         &params.collector,
         &params.stats_ks,
+        &params.timeseries_ks,
         &params.dids_ks,
         &params.store,
     )
@@ -938,6 +947,7 @@ async fn build_control(
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
     stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
     http_client: &reqwest::Client,
 ) -> Result<(Router, affinidi_webvh_control::server::AppState), AppError> {
     use affinidi_webvh_control::server::AppState;
@@ -982,6 +992,7 @@ async fn build_control(
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
+        timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
         path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),

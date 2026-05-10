@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-server"
 description = "WebVH Server, handles management and serving of WebVH Content"
-version = "0.6.1"
+version = "0.7.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -46,7 +46,7 @@ name = "webvh-server"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "store-fjall", "setup-wizard"] }
+affinidi-webvh-common = { version = "0.7", path = "../webvh-common", features = ["server-core", "store-fjall", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }

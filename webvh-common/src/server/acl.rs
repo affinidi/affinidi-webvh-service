@@ -8,14 +8,31 @@ use super::error::AppError;
 use super::store::KeyspaceHandle;
 
 /// Roles that determine endpoint access permissions.
+///
+/// The role of a JWT-authenticated request gates which `*Auth`
+/// extractor will accept it:
+/// - `Admin` → `AdminAuth` (and `AuthClaims`).
+/// - `Owner` → `AuthClaims` only; admin-only routes reject.
+/// - `Service` → `ServiceAuth` (and `AuthClaims`); admin-only routes
+///   reject.
+///
+/// `Service` is for backend service accounts that register with the
+/// control plane and push sync data. As of v0.7 it is required by
+/// `POST /api/control/register-service` (a service registering its
+/// public URL) and `POST /api/control/stats` (a service pushing
+/// stats deltas). A token minted for a `Service`-role DID will
+/// neither be accepted by admin-only routes nor by the public DID-
+/// management routes a tenant would use — service accounts are
+/// deliberately scoped down.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Admin,
     Owner,
     /// Service accounts (e.g. webvh-server registering with the control plane).
-    /// Can authenticate and manage DIDs they own, plus send/receive DIDComm
-    /// sync messages. Cannot access admin management endpoints.
+    /// Can authenticate and use the service-only endpoints
+    /// (`register-service`, `stats`); cannot access admin management
+    /// endpoints or tenant DID-management routes.
     Service,
 }
 

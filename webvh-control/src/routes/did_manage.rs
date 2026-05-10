@@ -384,7 +384,7 @@ pub async fn get_server_timeseries(
     State(state): State<AppState>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
-    let points = query_timeseries(&state.stats_ks, "_all", &params.range).await?;
+    let points = query_timeseries(&state.timeseries_ks, "_all", &params.range).await?;
     Ok(Json(points))
 }
 
@@ -396,13 +396,18 @@ pub async fn get_did_timeseries(
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
-    let points = query_timeseries(&state.stats_ks, mnemonic, &params.range).await?;
+    let points = query_timeseries(&state.timeseries_ks, mnemonic, &params.range).await?;
     Ok(Json(points))
 }
 
 /// Query time-series buckets for a given mnemonic and range.
+///
+/// Reads from the `timeseries_ks` keyspace (split out from
+/// `stats_ks` in v0.7); the rows have shape
+/// `ts:{mnemonic}:{bucket_epoch} -> {r,u}`. The literal `mnemonic`
+/// `_all` is the server-wide aggregate.
 async fn query_timeseries(
-    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    timeseries_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
     mnemonic: &str,
     range: &str,
 ) -> Result<Vec<TimeSeriesPoint>, AppError> {
@@ -431,7 +436,7 @@ async fn query_timeseries(
     let end = now / 300 * 300;
 
     let prefix = format!("ts:{mnemonic}:");
-    let raw = stats_ks.prefix_iter_raw(prefix.as_str()).await?;
+    let raw = timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
 
     // Collect raw buckets within range
     let prefix_len = prefix.len();

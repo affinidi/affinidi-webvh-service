@@ -46,8 +46,17 @@ pub struct AppState {
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
-    /// Stats keyspace for persistent per-DID stats.
+    /// Stats keyspace for persistent per-DID **aggregate** stats —
+    /// `stats:{mnemonic}` rows. Schema is `DidStats` (totals +
+    /// last_resolved_at + last_updated_at).
     pub stats_ks: KeyspaceHandle,
+    /// Time-series keyspace for 5-minute aggregate buckets —
+    /// `ts:{mnemonic}:{bucket_epoch}` rows for per-DID buckets and
+    /// `ts:_all:{bucket_epoch}` for server-wide. Schema is
+    /// `{r: u64, u: u64}`. Split out from `stats_ks` in v0.7 so a
+    /// future `prefix_iter_raw("")` over either keyspace returns
+    /// homogeneous-shaped values rather than two different schemas.
+    pub timeseries_ks: KeyspaceHandle,
     /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
     ///
     /// SECURITY: this is a raw 32-byte seed. `AppState` deliberately does
@@ -151,6 +160,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let registry_ks = store.keyspace("registry")?;
     let dids_ks = store.keyspace("dids")?;
     let stats_ks = store.keyspace("stats")?;
+    // Time-series buckets live in their own keyspace from v0.7 — see
+    // the `timeseries_ks` field doc on `AppState`.
+    let timeseries_ks = store.keyspace("timeseries")?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) =
@@ -254,6 +266,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             Arc::new(collector)
         },
         stats_ks: stats_ks.clone(),
+        timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
@@ -316,6 +329,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 2. Spawn storage thread (cleanup + stats flush)
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_stats_ks = state.stats_ks.clone();
+    let storage_timeseries_ks = state.timeseries_ks.clone();
     let storage_dids_ks = state.dids_ks.clone();
     let storage_collector = state.stats_collector.clone();
     let storage_handle = std::thread::Builder::new()
@@ -325,6 +339,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                 store,
                 storage_sessions_ks,
                 storage_stats_ks,
+                storage_timeseries_ks,
                 storage_dids_ks,
                 storage_auth_config,
                 has_auth,
@@ -605,6 +620,7 @@ fn run_storage_thread(
     store: Store,
     sessions_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
+    timeseries_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     auth_config: AuthConfig,
     has_auth: bool,
@@ -638,7 +654,7 @@ fn run_storage_thread(
                 }
                 _ = flush_timer.tick() => {
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await {
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await {
                         warn!("stats flush error: {e}");
                     }
                 }
@@ -650,7 +666,7 @@ fn run_storage_thread(
         }
 
         // Final flush before shutdown
-        let _ = flush_stats_to_store(&collector, &stats_ks, &dids_ks, &store).await;
+        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await;
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -661,9 +677,16 @@ fn run_storage_thread(
 }
 
 /// Flush accumulated stats deltas from the in-memory collector to the store.
+///
+/// `stats_ks` receives `stats:{mnemonic}` aggregate rows;
+/// `timeseries_ks` receives `ts:{mnemonic}:{bucket}` and
+/// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
+/// future scan over either keyspace returns homogeneous-shaped values.
+/// fjall batches span keyspaces, so atomicity is preserved.
 pub async fn flush_stats_to_store(
     collector: &affinidi_webvh_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
     dids_ks: &KeyspaceHandle,
     store: &Store,
 ) -> Result<(), AppError> {
@@ -689,7 +712,7 @@ pub async fn flush_stats_to_store(
 
     let mut batch = store.batch();
     for d in &deltas {
-        // Aggregate stats (totals)
+        // Aggregate stats (totals) — stats_ks
         let key = format!("stats:{}", d.mnemonic);
         let mut stats: affinidi_webvh_common::DidStats =
             stats_ks.get(key.as_str()).await?.unwrap_or_default();
@@ -703,32 +726,32 @@ pub async fn flush_stats_to_store(
         }
         batch.insert(stats_ks, key, &stats)?;
 
-        // Time-series bucket (per-DID)
+        // Time-series bucket (per-DID) — timeseries_ks
         if d.resolve_delta > 0 || d.update_delta > 0 {
             let ts_key = format!("ts:{}:{bucket_epoch}", d.mnemonic);
-            let existing: serde_json::Value = stats_ks
+            let existing: serde_json::Value = timeseries_ks
                 .get(ts_key.as_str())
                 .await?
                 .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
             let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + d.resolve_delta;
             let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + d.update_delta;
-            batch.insert(stats_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
+            batch.insert(timeseries_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
 
             all_resolve_delta += d.resolve_delta;
             all_update_delta += d.update_delta;
         }
     }
 
-    // Server-wide time-series bucket (_all)
+    // Server-wide time-series bucket (_all) — timeseries_ks
     if all_resolve_delta > 0 || all_update_delta > 0 {
         let all_key = format!("ts:_all:{bucket_epoch}");
-        let existing: serde_json::Value = stats_ks
+        let existing: serde_json::Value = timeseries_ks
             .get(all_key.as_str())
             .await?
             .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
         let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + all_resolve_delta;
         let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + all_update_delta;
-        batch.insert(stats_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
+        batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
     }
 
     batch.commit().await?;

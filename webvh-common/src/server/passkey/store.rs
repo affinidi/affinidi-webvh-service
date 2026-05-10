@@ -17,7 +17,26 @@ pub struct Enrollment {
     pub role: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Set when an `enroll_start` call has begun the WebAuthn ceremony
+    /// for this token. Within `ENROLLMENT_CLAIM_WINDOW_SECS` of this
+    /// timestamp, a second concurrent `enroll_start` is rejected as
+    /// "in progress" — without this, an attacker who steals the
+    /// invite link can open it, decline the ceremony, and effectively
+    /// deny the legitimate invitee from enrolling. After the window
+    /// expires the legitimate user may retry. Only consumed
+    /// (`take_enrollment`) once the WebAuthn ceremony successfully
+    /// completes in `enroll_finish`. `#[serde(default)]` for
+    /// backwards-compat with v0.6 enrollments persisted before this
+    /// field existed.
+    #[serde(default)]
+    pub claimed_at: Option<u64>,
 }
+
+/// How long an in-progress enrollment claim blocks others. Sized for
+/// a generous WebAuthn ceremony (browser dialog + key tap); legitimate
+/// users retrying after a failed ceremony only wait this long before
+/// the claim expires.
+pub const ENROLLMENT_CLAIM_WINDOW_SECS: u64 = 300;
 
 // Manual `Debug` keeps the diagnostic fields visible while redacting the
 // invite token. The token is the bearer credential — leaking it via a stray
@@ -31,6 +50,7 @@ impl std::fmt::Debug for Enrollment {
             .field("role", &self.role)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
+            .field("claimed_at", &self.claimed_at)
             .finish()
     }
 }
@@ -68,6 +88,15 @@ fn auth_state_key(id: &str) -> String {
 
 fn registration_user_key(reg_id: &str) -> String {
     format!("pk_reg_user:{reg_id}")
+}
+
+/// Maps a registration_id to the enrollment token that authorised it.
+/// Used by `enroll_finish` to find and consume the enrollment after the
+/// WebAuthn ceremony succeeds — without it, the consume would have to
+/// happen at `enroll_start` time and a failed ceremony would orphan the
+/// invite.
+fn registration_enrollment_key(reg_id: &str) -> String {
+    format!("pk_reg_enroll:{reg_id}")
 }
 
 fn credential_mapping_key(cred_id_hex: &str) -> String {
@@ -202,6 +231,40 @@ pub async fn get_registration_user(
 
 pub async fn delete_registration_user(ks: &KeyspaceHandle, reg_id: &str) -> Result<(), AppError> {
     ks.remove(registration_user_key(reg_id)).await
+}
+
+// ---------------------------------------------------------------------------
+// Registration-to-enrollment-token mapping (defer-take)
+// ---------------------------------------------------------------------------
+
+/// Persist the enrollment token that authorised a registration ceremony.
+/// `enroll_finish` uses it to consume the enrollment after the WebAuthn
+/// ceremony succeeds — so a ceremony that fails (browser closed, key
+/// not present, RP mismatch) leaves the invite intact for the
+/// legitimate user to retry.
+pub async fn store_registration_enrollment(
+    ks: &KeyspaceHandle,
+    reg_id: &str,
+    enrollment_token: &str,
+) -> Result<(), AppError> {
+    ks.insert_raw(
+        registration_enrollment_key(reg_id),
+        enrollment_token.as_bytes().to_vec(),
+    )
+    .await
+}
+
+/// Atomically read and remove the registration-to-enrollment mapping.
+pub async fn take_registration_enrollment(
+    ks: &KeyspaceHandle,
+    reg_id: &str,
+) -> Result<Option<String>, AppError> {
+    match ks.take_raw(registration_enrollment_key(reg_id)).await? {
+        Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
+            AppError::Internal(format!("invalid enrollment token bytes: {e}"))
+        })?)),
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
