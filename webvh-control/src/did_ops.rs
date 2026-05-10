@@ -289,6 +289,15 @@ pub async fn register_did_atomic(
     did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
         .map_err(AppError::Validation)?;
 
+    // Hold the per-path write lock for the read + build + commit
+    // window. Without this, two concurrent fresh-slot calls could both
+    // observe `existing == None`, both build records, and both commit
+    // — fjall batches are atomic per-commit but not conditional, so
+    // the second would silently overwrite the first. The lock is held
+    // until this function returns; dropped automatically on `?` early
+    // exit too.
+    let _path_guard = state.path_locks.guard(path).await;
+
     let existing: Option<DidRecord> = state.dids_ks.get(did_key(path)).await?;
 
     let owner_changed = match &existing {
@@ -678,6 +687,12 @@ pub async fn change_did_owner(
 
     validate_mnemonic(mnemonic)?;
 
+    // Same per-path write lock as `register_did_atomic` — owner-change
+    // is also a read-modify-write on the same key, so concurrent
+    // transfers from the same caller could otherwise race the
+    // updated_at / owner-index update.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
+
     // Authorize the caller against the existing record first — keeps the
     // error class stable (Forbidden, not Validation) when an unauthorized
     // caller submits a malformed target. Any new-owner format check after
@@ -899,6 +914,7 @@ mod tests_atomic {
             stats_ks,
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+            path_locks: crate::path_locks::PathLocks::new(),
         };
 
         (state, dir)
@@ -1292,6 +1308,68 @@ mod tests_atomic {
             state.stats_collector.get_aggregate().total_updates,
             baseline,
             "validation-failed publish must NOT record an update"
+        );
+    }
+
+    /// Concurrency: two parallel `register_did_atomic` calls on the same
+    /// fresh path serialise via the per-path write lock — exactly one
+    /// wins, the other races the lock. Without the lock both could
+    /// observe `existing == None`, both build version_count=1 records,
+    /// and both commit; the second silently overwrites the first.
+    ///
+    /// We can't deterministically pick which caller wins (the loser
+    /// could be either), but we CAN assert (a) both calls succeed
+    /// without panicking, (b) the on-disk record reflects exactly one
+    /// of the two callers (not a mash-up), (c) the version_count is 2
+    /// (the second call's idempotent re-register bumps it from the
+    /// first call's 1).
+    #[tokio::test]
+    async fn concurrent_register_serialises() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:owner-a".to_string();
+        let path = "race-path";
+        let log_a = build_test_did_log("scid-race", "control.test", path);
+        let log_b = log_a.clone();
+
+        let auth_a = owner_auth(&owner_a);
+        let auth_b = owner_auth(&owner_a); // same owner, different concurrent attempts
+
+        let state_a = state.clone();
+        let state_b = state.clone();
+        let path_a = path.to_string();
+        let path_b = path.to_string();
+
+        let task_a = tokio::spawn(async move {
+            register_did_atomic(&auth_a, &state_a, &path_a, &log_a, false).await
+        });
+        let task_b = tokio::spawn(async move {
+            register_did_atomic(&auth_b, &state_b, &path_b, &log_b, false).await
+        });
+
+        let r_a = task_a.await.unwrap();
+        let r_b = task_b.await.unwrap();
+        // Both calls succeed because they're from the same owner — the
+        // second is treated as an idempotent re-publish and bumps
+        // version_count.
+        assert!(
+            r_a.is_ok() && r_b.is_ok(),
+            "both same-owner registers should succeed; got a={r_a:?}, b={r_b:?}"
+        );
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record present after race");
+        assert_eq!(record.owner, owner_a);
+        // Two sequential commits via the lock => version_count == 2.
+        // Without the lock, the race could land on 1 (both observe
+        // None and both write version_count=1).
+        assert_eq!(
+            record.version_count, 2,
+            "both register calls must have committed in sequence; got version_count={}",
+            record.version_count
         );
     }
 }

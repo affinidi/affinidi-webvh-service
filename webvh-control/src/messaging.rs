@@ -898,6 +898,7 @@ mod tests {
             stats_ks,
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+            path_locks: crate::path_locks::PathLocks::new(),
         };
 
         (state, dir)

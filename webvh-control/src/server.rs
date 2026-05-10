@@ -61,6 +61,12 @@ pub struct AppState {
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
     pub replay_cache: Arc<crate::replay::ReplayCache>,
+    /// Per-mnemonic write lock. `register_did_atomic` (and any other
+    /// read-then-write operation on the same path) holds the lock for
+    /// the duration of its read + build + commit window so two
+    /// concurrent calls on the same path can't both observe
+    /// `existing == None` and both commit.
+    pub path_locks: crate::path_locks::PathLocks,
 }
 
 impl AppState {
@@ -244,6 +250,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+        path_locks: crate::path_locks::PathLocks::new(),
     };
 
     // Seed registry from static config

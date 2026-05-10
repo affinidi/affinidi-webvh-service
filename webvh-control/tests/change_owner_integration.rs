@@ -91,6 +91,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         stats_ks,
         signing_key_bytes: None,
         replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
+        path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),
     };
 
     (state, dir)
