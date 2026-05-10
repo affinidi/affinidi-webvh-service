@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.6.1 (unreleased)
+
+### Security
+
+- **DIDComm `MSG_SERVER_REGISTER` now applies the registry URL allowlist.**
+  The REST `POST /api/control/register-service` route already enforced
+  `registry.url_allowlist`, but the DIDComm handler did not — any
+  Service-role caller could register an attacker-controlled URL,
+  including cloud-metadata / loopback / RFC1918 addresses. When an
+  admin then hit `/api/proxy/server/{instance_id}/...`, the proxy
+  forwarded the admin's bearer token to the registered URL (SSRF +
+  token exfil). The allowlist gate is now lifted into a shared
+  `registry::validate_registered_url` helper called by both transports.
+  Empty allowlists preserve the prior "operator opted out" behaviour;
+  any operator running the proxy route should configure one.
+- **List-DIDs DID-prefix-collision IDOR closed.** Owner-index keys are
+  `owner:{did}:{mnemonic}` and DIDs naturally contain colons. A DID
+  that was a string-prefix of another (e.g. `did:web:tenant` vs
+  `did:web:tenant:server`) leaked the longer-DID owner's mnemonics,
+  did_id, timestamps, and resolve counts via prefix iteration in
+  `list_dids`. Fixed by re-checking `record.owner == target_owner`
+  after the iteration. Read-only — no write paths were affected.
+- **Error sanitisation rebuilt on stable per-variant messages.** The
+  prior `IntoResponse for AppError` used substring matches
+  (`msg.contains("ACL") || msg.contains("did:")`) to decide whether to
+  redact `Forbidden`, leaving brittle gaps (`"not the owner of this
+  DID"` leaked through; `"is not in the ACL"` got caught) and ignored
+  `Validation` entirely. Replaced with `AppError::user_message()` per
+  variant: `Forbidden` always collapses to `"forbidden"`, and
+  `Validation`/`Conflict`/`QuotaExceeded` strip ASCII control chars
+  and cap at 256 bytes to prevent reflection of caller-supplied
+  newlines/control bytes.
+- **`now_epoch` and JWT issue path no longer panic on clock skew.** A
+  system clock set before 1970 (e.g. a misconfigured embedded host)
+  used to panic in `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()`.
+  Switched to `unwrap_or_default()` to match `didcomm_unpack`'s
+  existing pattern.
+- **Stricter DID-format validation on admin write surfaces.** New
+  `validate_did_format` helper used by ACL create/update/delete and
+  by `change_did_owner::new_owner`. Trims surrounding whitespace,
+  rejects empty / oversized (>2048 bytes) / missing-`did:`-prefix /
+  contains-control-character. The most common failure mode this
+  prevents is silent: a typo with trailing whitespace lands as a
+  storage key that no later `check_acl` lookup will match.
+
+### Added
+
+- **DID ownership transfer.** New `PUT /api/owner/{*mnemonic}` REST
+  endpoint and `MSG_DID_CHANGE_OWNER` / `MSG_DID_CHANGE_OWNER_CONFIRM`
+  DIDComm message types let an admin or the current owner re-assign a
+  DID slot to another identity. New owner must already be in the ACL.
+  Web UI exposes the transfer flow on the DID detail screen, gated to
+  admins or the current owner.
+- **Atomic claim-and-publish.** New `POST /api/dids/register` route
+  and `register_did_atomic` operation that claims a path and publishes
+  the first signed log entry in a single fjall batch — closes the
+  resolvability gap between path reservation and first publish that
+  the previous two-step `request_uri` + `publish_did` flow exposed.
+  Idempotent for same-owner re-publish; admin force-takeover requires
+  an explicit `force=true` flag.
+- **`force` flag on `MSG_DID_REQUEST` / `POST /api/dids`.** Lets the
+  current owner or an admin override the "DID already exists" error
+  to claim the slot. Wipes prior log/witness/owner-index in a single
+  batch.
+
+### Fixed
+
+- **Stats counter advances on control-plane writes.** Previously
+  `total_updates` and `last_updated_at` only moved via stats-sync
+  messages from remote `webvh-server` instances; in self-hosted /
+  daemon deployments where the control plane is authoritative, the
+  counters never advanced. Added `record_update` calls to
+  `publish_did` and `register_did_atomic` after the storage commit
+  succeeds.
+- **`force=true` create no longer fans out a stale delete.** All three
+  create call sites (REST `request_uri`, framework DIDComm dispatcher,
+  signed-HTTP DIDComm dispatcher) used to push `notify_servers_delete`
+  on force-replace, which made downstream resolvers serve 404 until
+  the operator's follow-up `publish_did` arrived. Removed; the
+  publish step's own `notify_servers_did` fans out the new content.
+  Operators wanting an atomic ownership-takeover should use
+  `register_did_atomic`.
+- **`webvh-daemon::run_recreate_did`** now removes the owner-index
+  entry under the *actual* owner DID rather than the hard-coded
+  literal `"system"` (which only worked because `auto_bootstrap_dids`
+  happened to use that owner string).
+
+### Changed
+
+- **Bumped `affinidi-messaging-didcomm-service` 0.3.0 → 0.3.1 and
+  `affinidi-messaging-sdk` 0.17/0.18 → 0.18.2.** Picks up the
+  upstream fix for the orphaned `WebSocketTransport` task bug
+  diagnosed during testing: when the mediator's HTTP auth endpoint
+  was briefly unreachable at startup, prior versions leaked one
+  transport task per failed `Listener::connect()` attempt via a
+  self-sustaining `Arc` cycle, producing a duplicate-channel storm
+  once the mediator recovered.
+- **CLAUDE.md daemon-parity rules clarified.** Restructured into
+  three explicit sections: positioning, what the daemon mirrors, and
+  what it intentionally does NOT mirror. Calls out registry health-
+  check loop, HTTP stats sync, server's own DIDComm listener, and
+  outbound ATM as deliberate omissions in the all-in-one model.
+
+### Documentation
+
+- npm `overrides` for `postcss` (≥8.5.10) and `@xmldom/xmldom`
+  (≥0.8.13) close 5 dependabot alerts on the UI side.
+- `cargo update` plus the SDK upgrade close the high-severity
+  `openssl 0.10.79` and `rustls-webpki 0.103.13` advisories on the
+  default-features Rust build.
+
 ## 0.6.0 (2026-05-05)
 
 ### Security
