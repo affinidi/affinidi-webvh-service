@@ -19,6 +19,7 @@ pub mod frontend;
 pub mod health;
 pub mod messaging;
 pub mod path_locks;
+pub mod pending_challenges;
 pub mod registry;
 pub mod replay;
 pub mod routes;

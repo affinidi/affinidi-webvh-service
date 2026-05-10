@@ -985,6 +985,9 @@ async fn build_control(
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
         path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(
+            affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
+        ),
     };
 
     // Seed registry from static config

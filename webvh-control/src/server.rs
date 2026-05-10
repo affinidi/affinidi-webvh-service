@@ -67,6 +67,12 @@ pub struct AppState {
     /// concurrent calls on the same path can't both observe
     /// `existing == None` and both commit.
     pub path_locks: crate::path_locks::PathLocks,
+    /// Bounded counter for pending DIDComm authentication challenges.
+    /// Replaces an O(N) prefix scan in `routes::auth::challenge` with
+    /// O(1) per-DID and global counters; closes the unauthenticated
+    /// challenge-endpoint storage-exhaustion + CPU-amplification
+    /// surface (review SM3).
+    pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
 }
 
 impl AppState {
@@ -251,6 +257,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
     };
 
     // Seed registry from static config

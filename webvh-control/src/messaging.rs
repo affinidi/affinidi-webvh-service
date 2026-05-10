@@ -899,6 +899,7 @@ mod tests {
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
+            pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         };
 
         (state, dir)

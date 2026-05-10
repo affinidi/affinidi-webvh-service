@@ -98,6 +98,9 @@ async fn make_harness() -> Harness {
         signing_key_bytes: None,
         replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
         path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(
+            affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
+        ),
     };
 
     Harness { state, _dir: dir }
