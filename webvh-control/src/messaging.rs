@@ -678,6 +678,32 @@ async fn handle_server_register(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
+    // Apply the same URL allowlist that the REST `register_service`
+    // route enforces. Without this gate, an ACL'd Service-role caller
+    // could register an arbitrary URL (cloud-metadata IP, RFC1918,
+    // attacker-controlled host) and then wait for an Admin to hit
+    // `/api/proxy/server/{instance_id}/...` — `proxy_to_service` would
+    // forward the Admin's `Authorization: Bearer ...` to that URL.
+    if let Err(e) =
+        registry::validate_registered_url(public_url, &state.config.registry.url_allowlist)
+    {
+        warn!(
+            did = sender,
+            requested = public_url,
+            "DIDComm server registration rejected: URL host not in registry.url_allowlist",
+        );
+        return Ok(Some(
+            DIDCommResponse::new(
+                MSG_PROBLEM_REPORT.to_string(),
+                json!({
+                    "code": "e.p.registration.unauthorized",
+                    "comment": e.user_message(),
+                }),
+            )
+            .thid(message.id.clone()),
+        ));
+    }
+
     let label = message
         .body
         .get("label")
