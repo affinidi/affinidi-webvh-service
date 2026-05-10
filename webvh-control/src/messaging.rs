@@ -223,7 +223,17 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
 // DID operation dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_did_op(
+/// Single transport-agnostic dispatch table for VTA DID-management
+/// `MSG_*` types.
+///
+/// Both DIDComm transports — the framework router (mediator-routed,
+/// E2E-encrypted) and the HTTP-signed `POST /api/didcomm` route
+/// (signed-but-not-encrypted) — call this. Without it, the two had
+/// drifted: the HTTP-signed dispatcher was missing `MSG_DID_REGISTER`
+/// entirely, and the two emitted different protocol error codes for
+/// identical wire conditions. See
+/// `docs/dispatcher-consolidation-design.md` for the rationale.
+pub async fn dispatch_did_op(
     auth: &AuthClaims,
     state: &AppState,
     msg: &Message,
@@ -797,36 +807,16 @@ fn problem_report(code: &str, comment: &str) -> (String, Value) {
 
 /// Map an internal `AppError` to its DIDComm protocol error code.
 ///
-/// **Stability:** the substring matches against `Validation` / `QuotaExceeded`
-/// messages are intentionally narrow — they live next to a table-driven test
-/// (see `mod tests` below) so a wording change in `AppError(...)` literals
-/// elsewhere in the workspace fails the test rather than silently re-routes
-/// to a different protocol code.
+/// Thin wrapper around `AppError::didcomm_code()` — kept as a function
+/// alias so the existing call sites (and the
+/// `map_app_error_code_pinned_table` test) don't need to chase the
+/// rename. The shared implementation in `webvh-common::server::error`
+/// is backed by `ValidationKind` / `QuotaKind` tags rather than
+/// substring sniffing, so a wording change in any
+/// `AppError::Validation("...")` literal can no longer silently
+/// re-route the protocol code.
 fn map_app_error_code(err: &AppError) -> &'static str {
-    match err {
-        AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
-        AppError::QuotaExceeded(msg) => {
-            if msg.contains("size") {
-                "e.p.did.size-exceeded"
-            } else {
-                "e.p.did.quota-exceeded"
-            }
-        }
-        AppError::Conflict(_) => "e.p.did.path-unavailable",
-        AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
-        AppError::Validation(msg) => {
-            if msg.contains("log entry") || msg.contains("jsonl") || msg.contains("JSONL") {
-                "e.p.did.invalid-log"
-            } else if msg.contains("path") {
-                "e.p.did.path-invalid"
-            } else if msg.contains("witness") {
-                "e.p.did.witness-invalid"
-            } else {
-                "e.p.did.validation-error"
-            }
-        }
-        _ => "e.p.did.internal-error",
-    }
+    err.didcomm_code()
 }
 
 #[cfg(test)]
@@ -1464,24 +1454,49 @@ mod tests {
                 AppError::NotFound("did not found".into()),
                 "e.p.did.mnemonic-not-found",
             ),
+            // Tagged validations route via `ValidationKind`, not by
+            // sniffing the message text — pinning these via the
+            // `AppError::validation()` constructor ensures the tag is
+            // the load-bearing input.
             (
-                AppError::Validation("invalid log entry on line 3".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidLog,
+                    "invalid log entry on line 3",
+                ),
                 "e.p.did.invalid-log",
             ),
             (
-                AppError::Validation("malformed JSONL body".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidLog,
+                    "malformed JSONL body",
+                ),
                 "e.p.did.invalid-log",
             ),
             (
-                AppError::Validation("path component reserved".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidPath,
+                    "path component reserved",
+                ),
                 "e.p.did.path-invalid",
             ),
             (
-                AppError::Validation("witness signature failed".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidWitness,
+                    "witness signature failed",
+                ),
                 "e.p.did.witness-invalid",
             ),
             (
-                AppError::Validation("something else broke".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::Other,
+                    "something else broke",
+                ),
+                "e.p.did.validation-error",
+            ),
+            // An untagged Validation (no `[tag]` prefix) falls through to
+            // the generic code rather than re-routing based on wording.
+            (
+                AppError::Validation("missing 'mnemonic' in body".into()),
                 "e.p.did.validation-error",
             ),
             (AppError::Internal("oops".into()), "e.p.did.internal-error"),

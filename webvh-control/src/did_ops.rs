@@ -27,7 +27,9 @@ pub use affinidi_webvh_common::did_ops::{extract_did_id, extract_log_metadata};
 // ---------------------------------------------------------------------------
 
 fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
-    did_ops::validate_did_jsonl(content).map_err(AppError::Validation)
+    use affinidi_webvh_common::server::error::ValidationKind;
+    did_ops::validate_did_jsonl(content)
+        .map_err(|m| AppError::validation(ValidationKind::InvalidLog, m))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,14 +449,20 @@ pub async fn upload_witness(
     validate_mnemonic(mnemonic)?;
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
+    use affinidi_webvh_common::server::error::ValidationKind;
     if witness_content.is_empty() {
-        return Err(AppError::Validation(
-            "did-witness.json content cannot be empty".into(),
+        return Err(AppError::validation(
+            ValidationKind::InvalidWitness,
+            "did-witness.json content cannot be empty",
         ));
     }
 
-    serde_json::from_str::<serde_json::Value>(witness_content)
-        .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
+    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
+        AppError::validation(
+            ValidationKind::InvalidWitness,
+            format!("did-witness.json must be valid JSON: {e}"),
+        )
+    })?;
 
     state
         .dids_ks

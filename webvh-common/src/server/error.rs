@@ -122,6 +122,46 @@ fn sanitize_user_message(s: &str) -> String {
 }
 
 impl AppError {
+    /// Stable wire-level DIDComm protocol-error code for this `AppError`.
+    ///
+    /// Backed by `ValidationKind` tags rather than substring sniffing on
+    /// the `Display` message, so a wording change in any
+    /// `AppError::Validation("...")` literal doesn't silently re-route
+    /// the protocol code. Both DIDComm dispatchers
+    /// (`messaging::dispatch_did_op` and `routes/didcomm.rs::dispatch`)
+    /// call this so the same error always produces the same wire code
+    /// regardless of transport.
+    ///
+    /// The mapping:
+    /// - `Unauthorized` / `Forbidden` → `e.p.did.unauthorized`
+    /// - `QuotaExceeded(Size)` → `e.p.did.size-exceeded`
+    /// - `QuotaExceeded(Count)` → `e.p.did.quota-exceeded`
+    /// - `Conflict` → `e.p.did.path-unavailable`
+    /// - `NotFound` → `e.p.did.mnemonic-not-found`
+    /// - `Validation(InvalidLog)` → `e.p.did.invalid-log`
+    /// - `Validation(InvalidPath)` → `e.p.did.path-invalid`
+    /// - `Validation(InvalidWitness)` → `e.p.did.witness-invalid`
+    /// - `Validation(Other)` → `e.p.did.validation-error`
+    /// - everything else (5xx-shaped) → `e.p.did.internal-error`
+    pub fn didcomm_code(&self) -> &'static str {
+        match self {
+            AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
+            AppError::QuotaExceeded(_) => match self.quota_kind() {
+                QuotaKind::Size => "e.p.did.size-exceeded",
+                QuotaKind::Count => "e.p.did.quota-exceeded",
+            },
+            AppError::Conflict(_) => "e.p.did.path-unavailable",
+            AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
+            AppError::Validation(_) => match self.validation_kind() {
+                ValidationKind::InvalidLog => "e.p.did.invalid-log",
+                ValidationKind::InvalidPath => "e.p.did.path-invalid",
+                ValidationKind::InvalidWitness => "e.p.did.witness-invalid",
+                ValidationKind::Other => "e.p.did.validation-error",
+            },
+            _ => "e.p.did.internal-error",
+        }
+    }
+
     /// Stable public message intended for HTTP responses. Decoupled from
     /// `Display` (which tracing/logging uses) so the wire-level contract
     /// doesn't drift when an `AppError(...)` literal's wording changes
