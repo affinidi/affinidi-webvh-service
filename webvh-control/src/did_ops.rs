@@ -287,7 +287,6 @@ pub async fn register_did_atomic(
     did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
         .map_err(AppError::Validation)?;
 
-    // 2. Owner check (and admin-takeover gating).
     let existing: Option<DidRecord> = state.dids_ks.get(did_key(path)).await?;
 
     let owner_changed = match &existing {
@@ -321,8 +320,8 @@ pub async fn register_did_atomic(
         None => false,
     };
 
-    // 3. Build the new record. Preserve created_at when the same owner
-    //    is re-publishing; reset on takeover or fresh allocation.
+    // Preserve created_at when the same owner is re-publishing; reset
+    // on takeover or fresh allocation.
     let now = now_epoch();
     let (created_at, version_count) = match (&existing, owner_changed) {
         (Some(rec), false) => (rec.created_at, rec.version_count + 1),
@@ -389,14 +388,428 @@ pub async fn register_did_atomic(
     })
 }
 
+/// Publish (upload) a did.jsonl log for an existing DID slot.
+pub async fn publish_did(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    did_log: &str,
+) -> Result<(), AppError> {
+    use crate::auth::session::now_epoch;
+
+    validate_mnemonic(mnemonic)?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    validate_did_jsonl(did_log)?;
+
+    let new_size = did_log.len() as u64;
+    let did_id_val = extract_did_id(did_log);
+
+    record.updated_at = now_epoch();
+    record.version_count += 1;
+    record.did_id = did_id_val;
+    record.content_size = new_size;
+
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_log_key(mnemonic),
+        did_log.as_bytes().to_vec(),
+    );
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.commit().await?;
+
+    // Mirror webvh-server's `record_update` call so total_updates /
+    // last_updated_at advance when the control plane is the authoritative
+    // store (standalone or daemon mode). Without this, updates only
+    // surface via stats-sync from a remote server, so they sit at zero
+    // in self-hosted deployments.
+    state.stats_collector.record_update(mnemonic);
+
+    info!(
+        did = %auth.did,
+        mnemonic = %mnemonic,
+        size = new_size,
+        version = record.version_count,
+        "did.jsonl published on control plane"
+    );
+
+    Ok(())
+}
+
+/// Upload witness content for a DID.
+pub async fn upload_witness(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    witness_content: &str,
+) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    if witness_content.is_empty() {
+        return Err(AppError::Validation(
+            "did-witness.json content cannot be empty".into(),
+        ));
+    }
+
+    serde_json::from_str::<serde_json::Value>(witness_content)
+        .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
+
+    state
+        .dids_ks
+        .insert_raw(
+            content_witness_key(mnemonic),
+            witness_content.as_bytes().to_vec(),
+        )
+        .await?;
+
+    info!(did = %auth.did, mnemonic = %mnemonic, "did-witness.json uploaded on control plane");
+
+    Ok(())
+}
+
+/// Get detailed information about a DID.
+pub async fn get_did_info(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
+    validate_mnemonic(mnemonic)?;
+    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let log_metadata = match state.dids_ks.get_raw(content_log_key(mnemonic)).await? {
+        Some(bytes) => {
+            let content = String::from_utf8(bytes).unwrap_or_default();
+            Some(extract_log_metadata(&content))
+        }
+        None => None,
+    };
+
+    debug!(did = %auth.did, mnemonic = %mnemonic, "DID info retrieved from control plane");
+
+    Ok((record, log_metadata))
+}
+
+/// Get parsed log entries for a DID.
+pub async fn get_did_log(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<Vec<LogEntryInfo>, AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    let content = String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+
+    Ok(did_ops::parse_log_entries(&content))
+}
+
+/// Get the raw JSONL content for a DID log as a plain string.
+pub async fn get_raw_log(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<String, AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    String::from_utf8(bytes).map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
+}
+
+/// List DIDs owned by the caller (or by a specific owner if admin).
+/// When the caller is admin and no `requested_owner` is provided, returns all DIDs.
+pub async fn list_dids(
+    auth: &AuthClaims,
+    state: &AppState,
+    requested_owner: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<DidListEntry>, AppError> {
+    use crate::acl::Role;
+
+    if auth.role == Role::Admin && requested_owner.is_none() {
+        return list_all_dids(state).await;
+    }
+
+    let target_owner = if auth.role == Role::Admin {
+        requested_owner.unwrap_or(&auth.did)
+    } else {
+        &auth.did
+    };
+
+    let prefix = format!("owner:{target_owner}:");
+    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
+
+    let mut entries = Vec::with_capacity(raw.len());
+    for (_key, value) in raw {
+        let mnemonic = String::from_utf8(value)
+            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            // Owner-index keys are `owner:{did}:{mnemonic}`. DIDs naturally
+            // contain colons (e.g. `did:webvh:scid:host:path`), so a DID
+            // that is a string-prefix of another (e.g. `did:web:tenant`
+            // vs `did:web:tenant:server`) shares the prefix and the
+            // iterator returns rows belonging to the longer DID. Re-check
+            // the record's owner to filter those out — without this, a
+            // tenant whose DID is a prefix of another would see the
+            // other tenant's mnemonics in their dashboard.
+            if record.owner != target_owner {
+                continue;
+            }
+            let stats_key = format!("stats:{mnemonic}");
+            let did_stats: affinidi_webvh_common::DidStats =
+                state.stats_ks.get(stats_key).await?.unwrap_or_default();
+            entries.push(DidListEntry {
+                mnemonic: record.mnemonic,
+                owner: record.owner,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+                version_count: record.version_count,
+                did_id: record.did_id,
+                total_resolves: did_stats.total_resolves,
+                disabled: record.disabled,
+            });
+        }
+    }
+
+    // Apply pagination
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(1000);
+    let total = entries.len();
+    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+
+    info!(did = %auth.did, owner = %target_owner, total, returned = entries.len(), "DIDs listed on control plane");
+
+    Ok(entries)
+}
+
+/// List all DIDs in the store (admin only).
+async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> {
+    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+
+    let mut entries = Vec::with_capacity(raw.len());
+    for (_key, value) in raw {
+        let record: DidRecord = match serde_json::from_slice(&value) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let stats_key = format!("stats:{}", record.mnemonic);
+        let did_stats: affinidi_webvh_common::DidStats =
+            state.stats_ks.get(stats_key).await?.unwrap_or_default();
+        entries.push(DidListEntry {
+            mnemonic: record.mnemonic,
+            owner: record.owner,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            version_count: record.version_count,
+            did_id: record.did_id,
+            total_resolves: did_stats.total_resolves,
+            disabled: record.disabled,
+        });
+    }
+
+    info!(
+        count = entries.len(),
+        "all DIDs listed (admin) on control plane"
+    );
+
+    Ok(entries)
+}
+
+/// Delete a DID and all its associated data.
+pub async fn delete_did(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<Option<String>, AppError> {
+    validate_mnemonic(mnemonic)?;
+    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let did_id = record.did_id.clone();
+
+    let mut batch = state.store.batch();
+    batch.remove(&state.dids_ks, did_key(mnemonic));
+    batch.remove(&state.dids_ks, content_log_key(mnemonic));
+    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
+    batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
+    batch.commit().await?;
+
+    info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
+
+    Ok(did_id)
+}
+
+/// Transfer ownership of a DID to a different DID.
+///
+/// The caller must be the current owner or an admin. The new owner must
+/// already exist in the ACL — this prevents transferring a DID to an
+/// identity that can never authenticate to claim it.
+pub async fn change_did_owner(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    new_owner: &str,
+) -> Result<DidRecord, AppError> {
+    use affinidi_webvh_common::server::acl::{get_acl_entry, validate_did_format};
+
+    use crate::auth::session::now_epoch;
+
+    validate_mnemonic(mnemonic)?;
+
+    // Authorize the caller against the existing record first — keeps the
+    // error class stable (Forbidden, not Validation) when an unauthorized
+    // caller submits a malformed target. Any new-owner format check after
+    // this point only runs for authorized callers.
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Canonicalise (trim + format check) before any storage I/O so a
+    // typo in the new-owner DID can't silently mismatch later
+    // `check_acl` lookups. Same validator the ACL routes use.
+    let new_owner = validate_did_format(new_owner)?;
+
+    if record.owner == new_owner {
+        return Ok(record);
+    }
+
+    if get_acl_entry(&state.acl_ks, &new_owner).await?.is_none() {
+        return Err(AppError::Validation(format!(
+            "new owner '{new_owner}' is not in the ACL — add them first"
+        )));
+    }
+
+    let prev_owner = std::mem::replace(&mut record.owner, new_owner.clone());
+    record.updated_at = now_epoch();
+
+    let mut batch = state.store.batch();
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.remove(&state.dids_ks, owner_key(&prev_owner, mnemonic));
+    batch.insert_raw(
+        &state.dids_ks,
+        owner_key(&new_owner, mnemonic),
+        mnemonic.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
+
+    info!(
+        caller = %auth.did,
+        prev_owner = %prev_owner,
+        new_owner = %new_owner,
+        mnemonic = %mnemonic,
+        "DID owner changed on control plane"
+    );
+
+    Ok(record)
+}
+
+/// Toggle the `disabled` flag on a DID record.
+pub async fn set_did_disabled(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    disabled: bool,
+) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic)?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    record.disabled = disabled;
+    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+    info!(
+        did = %auth.did,
+        mnemonic = %mnemonic,
+        disabled,
+        "DID disabled state updated on control plane"
+    );
+    Ok(())
+}
+
+/// Roll back (remove) the last log entry from a DID's JSONL content.
+pub async fn rollback_did(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
+    use crate::auth::session::now_epoch;
+
+    validate_mnemonic(mnemonic)?;
+    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    let bytes = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
+
+    let content = String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < 2 {
+        return Err(AppError::Validation(
+            "cannot rollback: DID log must have at least 2 entries".into(),
+        ));
+    }
+
+    let truncated_lines = &lines[..lines.len() - 1];
+    let truncated = truncated_lines.join("\n");
+
+    let new_did_id = extract_did_id(&truncated);
+    let new_size = truncated.len() as u64;
+
+    record.version_count = truncated_lines.len() as u64;
+    record.did_id = new_did_id;
+    record.content_size = new_size;
+    record.updated_at = now_epoch();
+
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_log_key(mnemonic),
+        truncated.as_bytes().to_vec(),
+    );
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
+    batch.commit().await?;
+
+    let log_metadata = Some(extract_log_metadata(&truncated));
+
+    info!(
+        did = %auth.did,
+        mnemonic = %mnemonic,
+        remaining = truncated_lines.len(),
+        "DID log entry rolled back on control plane"
+    );
+
+    Ok((record, log_metadata))
+}
+
+/// Check if a custom path is available.
+pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameResponse, AppError> {
+    validate_custom_path(path)?;
+    let available = is_path_available(&state.dids_ks, path).await?;
+    Ok(CheckNameResponse {
+        available,
+        path: path.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Tests for register_did_atomic
+// Tests for register_did_atomic, publish_did stats counters, etc.
 // ---------------------------------------------------------------------------
 
-// Tests are intentionally co-located with `register_did_atomic` for
-// readability; the rest of the module's public API follows below.
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests_atomic {
     use super::*;
     use std::path::PathBuf;
@@ -872,421 +1285,4 @@ mod tests_atomic {
             "validation-failed publish must NOT record an update"
         );
     }
-}
-
-/// Publish (upload) a did.jsonl log for an existing DID slot.
-pub async fn publish_did(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    did_log: &str,
-) -> Result<(), AppError> {
-    use crate::auth::session::now_epoch;
-
-    validate_mnemonic(mnemonic)?;
-    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    validate_did_jsonl(did_log)?;
-
-    let new_size = did_log.len() as u64;
-    let did_id_val = extract_did_id(did_log);
-
-    record.updated_at = now_epoch();
-    record.version_count += 1;
-    record.did_id = did_id_val;
-    record.content_size = new_size;
-
-    let mut batch = state.store.batch();
-    batch.insert_raw(
-        &state.dids_ks,
-        content_log_key(mnemonic),
-        did_log.as_bytes().to_vec(),
-    );
-    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
-    batch.commit().await?;
-
-    // Mirror webvh-server's `record_update` call so total_updates /
-    // last_updated_at advance when the control plane is the authoritative
-    // store (standalone or daemon mode). Without this, updates only
-    // surface via stats-sync from a remote server, so they sit at zero
-    // in self-hosted deployments.
-    state.stats_collector.record_update(mnemonic);
-
-    info!(
-        did = %auth.did,
-        mnemonic = %mnemonic,
-        size = new_size,
-        version = record.version_count,
-        "did.jsonl published on control plane"
-    );
-
-    Ok(())
-}
-
-/// Upload witness content for a DID.
-pub async fn upload_witness(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    witness_content: &str,
-) -> Result<(), AppError> {
-    validate_mnemonic(mnemonic)?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    if witness_content.is_empty() {
-        return Err(AppError::Validation(
-            "did-witness.json content cannot be empty".into(),
-        ));
-    }
-
-    serde_json::from_str::<serde_json::Value>(witness_content)
-        .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
-
-    state
-        .dids_ks
-        .insert_raw(
-            content_witness_key(mnemonic),
-            witness_content.as_bytes().to_vec(),
-        )
-        .await?;
-
-    info!(did = %auth.did, mnemonic = %mnemonic, "did-witness.json uploaded on control plane");
-
-    Ok(())
-}
-
-/// Get detailed information about a DID.
-pub async fn get_did_info(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
-    validate_mnemonic(mnemonic)?;
-    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let log_metadata = match state.dids_ks.get_raw(content_log_key(mnemonic)).await? {
-        Some(bytes) => {
-            let content = String::from_utf8(bytes).unwrap_or_default();
-            Some(extract_log_metadata(&content))
-        }
-        None => None,
-    };
-
-    debug!(did = %auth.did, mnemonic = %mnemonic, "DID info retrieved from control plane");
-
-    Ok((record, log_metadata))
-}
-
-/// Get parsed log entries for a DID.
-pub async fn get_did_log(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<Vec<LogEntryInfo>, AppError> {
-    validate_mnemonic(mnemonic)?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let bytes = state
-        .dids_ks
-        .get_raw(content_log_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
-
-    let content = String::from_utf8(bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
-
-    Ok(did_ops::parse_log_entries(&content))
-}
-
-/// Get the raw JSONL content for a DID log as a plain string.
-pub async fn get_raw_log(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<String, AppError> {
-    validate_mnemonic(mnemonic)?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let bytes = state
-        .dids_ks
-        .get_raw(content_log_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
-
-    String::from_utf8(bytes).map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
-}
-
-/// List DIDs owned by the caller (or by a specific owner if admin).
-/// When the caller is admin and no `requested_owner` is provided, returns all DIDs.
-pub async fn list_dids(
-    auth: &AuthClaims,
-    state: &AppState,
-    requested_owner: Option<&str>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<Vec<DidListEntry>, AppError> {
-    use crate::acl::Role;
-
-    if auth.role == Role::Admin && requested_owner.is_none() {
-        return list_all_dids(state).await;
-    }
-
-    let target_owner = if auth.role == Role::Admin {
-        requested_owner.unwrap_or(&auth.did)
-    } else {
-        &auth.did
-    };
-
-    let prefix = format!("owner:{target_owner}:");
-    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
-
-    let mut entries = Vec::with_capacity(raw.len());
-    for (_key, value) in raw {
-        let mnemonic = String::from_utf8(value)
-            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            // Owner-index keys are `owner:{did}:{mnemonic}`. DIDs naturally
-            // contain colons (e.g. `did:webvh:scid:host:path`), so a DID
-            // that is a string-prefix of another (e.g. `did:web:tenant`
-            // vs `did:web:tenant:server`) shares the prefix and the
-            // iterator returns rows belonging to the longer DID. Re-check
-            // the record's owner to filter those out — without this, a
-            // tenant whose DID is a prefix of another would see the
-            // other tenant's mnemonics in their dashboard.
-            if record.owner != target_owner {
-                continue;
-            }
-            let stats_key = format!("stats:{mnemonic}");
-            let did_stats: affinidi_webvh_common::DidStats =
-                state.stats_ks.get(stats_key).await?.unwrap_or_default();
-            entries.push(DidListEntry {
-                mnemonic: record.mnemonic,
-                owner: record.owner,
-                created_at: record.created_at,
-                updated_at: record.updated_at,
-                version_count: record.version_count,
-                did_id: record.did_id,
-                total_resolves: did_stats.total_resolves,
-                disabled: record.disabled,
-            });
-        }
-    }
-
-    // Apply pagination
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(1000);
-    let total = entries.len();
-    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
-
-    info!(did = %auth.did, owner = %target_owner, total, returned = entries.len(), "DIDs listed on control plane");
-
-    Ok(entries)
-}
-
-/// List all DIDs in the store (admin only).
-async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> {
-    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
-
-    let mut entries = Vec::with_capacity(raw.len());
-    for (_key, value) in raw {
-        let record: DidRecord = match serde_json::from_slice(&value) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let stats_key = format!("stats:{}", record.mnemonic);
-        let did_stats: affinidi_webvh_common::DidStats =
-            state.stats_ks.get(stats_key).await?.unwrap_or_default();
-        entries.push(DidListEntry {
-            mnemonic: record.mnemonic,
-            owner: record.owner,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            version_count: record.version_count,
-            did_id: record.did_id,
-            total_resolves: did_stats.total_resolves,
-            disabled: record.disabled,
-        });
-    }
-
-    info!(
-        count = entries.len(),
-        "all DIDs listed (admin) on control plane"
-    );
-
-    Ok(entries)
-}
-
-/// Delete a DID and all its associated data.
-pub async fn delete_did(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<Option<String>, AppError> {
-    validate_mnemonic(mnemonic)?;
-    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let did_id = record.did_id.clone();
-
-    let mut batch = state.store.batch();
-    batch.remove(&state.dids_ks, did_key(mnemonic));
-    batch.remove(&state.dids_ks, content_log_key(mnemonic));
-    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
-    batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
-    batch.commit().await?;
-
-    info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
-
-    Ok(did_id)
-}
-
-/// Transfer ownership of a DID to a different DID.
-///
-/// The caller must be the current owner or an admin. The new owner must
-/// already exist in the ACL — this prevents transferring a DID to an
-/// identity that can never authenticate to claim it.
-pub async fn change_did_owner(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    new_owner: &str,
-) -> Result<DidRecord, AppError> {
-    use affinidi_webvh_common::server::acl::{get_acl_entry, validate_did_format};
-
-    use crate::auth::session::now_epoch;
-
-    validate_mnemonic(mnemonic)?;
-
-    // Authorize the caller against the existing record first — keeps the
-    // error class stable (Forbidden, not Validation) when an unauthorized
-    // caller submits a malformed target. Any new-owner format check after
-    // this point only runs for authorized callers.
-    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    // Canonicalise (trim + format check) before any storage I/O so a
-    // typo in the new-owner DID can't silently mismatch later
-    // `check_acl` lookups. Same validator the ACL routes use.
-    let new_owner = validate_did_format(new_owner)?;
-
-    if record.owner == new_owner {
-        return Ok(record);
-    }
-
-    if get_acl_entry(&state.acl_ks, &new_owner).await?.is_none() {
-        return Err(AppError::Validation(format!(
-            "new owner '{new_owner}' is not in the ACL — add them first"
-        )));
-    }
-
-    let prev_owner = std::mem::replace(&mut record.owner, new_owner.clone());
-    record.updated_at = now_epoch();
-
-    let mut batch = state.store.batch();
-    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
-    batch.remove(&state.dids_ks, owner_key(&prev_owner, mnemonic));
-    batch.insert_raw(
-        &state.dids_ks,
-        owner_key(&new_owner, mnemonic),
-        mnemonic.as_bytes().to_vec(),
-    );
-    batch.commit().await?;
-
-    info!(
-        caller = %auth.did,
-        prev_owner = %prev_owner,
-        new_owner = %new_owner,
-        mnemonic = %mnemonic,
-        "DID owner changed on control plane"
-    );
-
-    Ok(record)
-}
-
-/// Toggle the `disabled` flag on a DID record.
-pub async fn set_did_disabled(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    disabled: bool,
-) -> Result<(), AppError> {
-    validate_mnemonic(mnemonic)?;
-    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-    record.disabled = disabled;
-    state.dids_ks.insert(did_key(mnemonic), &record).await?;
-    info!(
-        did = %auth.did,
-        mnemonic = %mnemonic,
-        disabled,
-        "DID disabled state updated on control plane"
-    );
-    Ok(())
-}
-
-/// Roll back (remove) the last log entry from a DID's JSONL content.
-pub async fn rollback_did(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
-    use crate::auth::session::now_epoch;
-
-    validate_mnemonic(mnemonic)?;
-    let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let bytes = state
-        .dids_ks
-        .get_raw(content_log_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
-
-    let content = String::from_utf8(bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
-
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() < 2 {
-        return Err(AppError::Validation(
-            "cannot rollback: DID log must have at least 2 entries".into(),
-        ));
-    }
-
-    let truncated_lines = &lines[..lines.len() - 1];
-    let truncated = truncated_lines.join("\n");
-
-    let new_did_id = extract_did_id(&truncated);
-    let new_size = truncated.len() as u64;
-
-    record.version_count = truncated_lines.len() as u64;
-    record.did_id = new_did_id;
-    record.content_size = new_size;
-    record.updated_at = now_epoch();
-
-    let mut batch = state.store.batch();
-    batch.insert_raw(
-        &state.dids_ks,
-        content_log_key(mnemonic),
-        truncated.as_bytes().to_vec(),
-    );
-    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
-    batch.remove(&state.dids_ks, content_witness_key(mnemonic));
-    batch.commit().await?;
-
-    let log_metadata = Some(extract_log_metadata(&truncated));
-
-    info!(
-        did = %auth.did,
-        mnemonic = %mnemonic,
-        remaining = truncated_lines.len(),
-        "DID log entry rolled back on control plane"
-    );
-
-    Ok((record, log_metadata))
-}
-
-/// Check if a custom path is available.
-pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameResponse, AppError> {
-    validate_custom_path(path)?;
-    let available = is_path_available(&state.dids_ks, path).await?;
-    Ok(CheckNameResponse {
-        available,
-        path: path.to_string(),
-    })
 }

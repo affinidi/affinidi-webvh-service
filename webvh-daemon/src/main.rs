@@ -1314,9 +1314,16 @@ async fn run_recreate_did(
     let store = Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
-    // Delete existing DID at this path
+    // Delete existing DID at this path. Read the record first so we can
+    // remove the correct `owner:{owner}:{mnemonic}` reverse-index entry —
+    // hard-coding `"system"` (the owner string used by the auto-bootstrap
+    // path) would leak the index for any DID that was created with a
+    // different owner.
     let did_key = affinidi_webvh_server::did_ops::did_key(&mnemonic);
-    if dids_ks.contains_key(did_key.clone()).await? {
+    if let Some(existing) = dids_ks
+        .get::<affinidi_webvh_common::did_ops::DidRecord>(did_key.clone())
+        .await?
+    {
         dids_ks.remove(did_key).await?;
         dids_ks
             .remove(affinidi_webvh_server::did_ops::content_log_key(&mnemonic))
@@ -1328,7 +1335,8 @@ async fn run_recreate_did(
             .await?;
         dids_ks
             .remove(affinidi_webvh_server::did_ops::owner_key(
-                "system", &mnemonic,
+                &existing.owner,
+                &mnemonic,
             ))
             .await?;
         eprintln!("  Removed existing DID at path '{mnemonic}'");
@@ -1390,7 +1398,7 @@ async fn run_recover_did(
     let store = Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
-    let did_key = format!("did:{mnemonic}");
+    let did_key = affinidi_webvh_common::did_ops::did_key(&mnemonic);
     let mut record: DidRecord = dids_ks
         .get(did_key.as_str())
         .await?
