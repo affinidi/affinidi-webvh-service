@@ -26,9 +26,19 @@ pub use affinidi_webvh_common::did_ops::{extract_did_id, extract_log_metadata};
 // JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
-fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
+/// Run the structural + cryptographic-proof validation pipeline on a
+/// `did.jsonl` body before commit. Wraps
+/// `webvh-common::did_ops::verify_did_log_proofs` with the local
+/// `AppError::Validation(InvalidLog)` tag so the dispatcher emits
+/// `e.p.did.invalid-log` on any chain failure (parse, signature,
+/// parameter-transition, post-deactivation tamper).
+///
+/// Replaces the previous structural-only `validate_did_jsonl` — proof
+/// verification subsumes the parse check, so callers only need this
+/// one function before commit.
+fn verify_did_log_proofs(content: &str) -> Result<(), AppError> {
     use affinidi_webvh_common::server::error::ValidationKind;
-    did_ops::validate_did_jsonl(content)
+    did_ops::verify_did_log_proofs(content)
         .map_err(|m| AppError::validation(ValidationKind::InvalidLog, m))
 }
 
@@ -267,8 +277,10 @@ pub async fn register_did_atomic(
     use crate::auth::session::now_epoch;
 
     // 1. Cheap validations first — bail out before any storage I/O.
+    //    Proof verification subsumes structural validation; a single
+    //    pass catches both parse errors and signature failures.
     validate_custom_path(path)?;
-    validate_did_jsonl(did_log)?;
+    verify_did_log_proofs(did_log)?;
 
     let server_base_url = state
         .config
@@ -411,7 +423,11 @@ pub async fn publish_did(
     validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    validate_did_jsonl(did_log)?;
+    // Proof verification subsumes the structural check. The
+    // didwebvh-rs verifier walks the chain, validates each entry's
+    // signature against `parameters.updateKeys`, and rejects any
+    // tampered or post-deactivation entries.
+    verify_did_log_proofs(did_log)?;
 
     let new_size = did_log.len() as u64;
     let did_id_val = extract_did_id(did_log);
@@ -838,7 +854,9 @@ mod tests_atomic {
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
     use affinidi_webvh_common::DidRegisterRequest;
+    use affinidi_webvh_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
     use affinidi_webvh_common::server::config::{
         AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
     };
@@ -849,23 +867,36 @@ mod tests_atomic {
     use crate::config::{AppConfig, RegistryConfig};
     use crate::server::AppState;
 
-    /// Build a structurally-valid did.jsonl whose latest entry's
-    /// `state.id` is `did:webvh:<scid>:<host_encoded>[:<path>]`. The
-    /// proof is real but signs a different identifier — fine for these
-    /// tests because `validate_did_jsonl` is structural-only (no
-    /// signature verification at the storage layer).
-    fn build_test_did_log(scid: &str, host_encoded: &str, path: &str) -> String {
-        let did_id = if path.is_empty() {
-            format!("did:webvh:{scid}:{host_encoded}")
-        } else {
-            format!("did:webvh:{scid}:{host_encoded}:{path}")
-        };
-        // Re-target the upstream fixture by string-replacing the
-        // baked-in DID identifier. Keeps `parameters`, `proof`, and
-        // verificationMethod shape intact so LogEntry deserialization
-        // accepts it.
-        const FIXTURE: &str = r#"{"versionId":"1-QmRiFdWdyckg8HETNgZWEXP3LGhEZD9pJBVqFRCRWpUrKh","versionTime":"2025-07-09T21:32:15Z","parameters":{"method":"did:webvh:1.0","scid":"QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia","updateKeys":["z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR"],"portable":true,"nextKeyHashes":["QmUSYM6seDvKtYpSEsr7Y5bmM5owYVGV3EhZ5BCUexrAcR"],"ttl":300},"state":{"@context":["https://www.w3.org/ns/did/v1","https://www.w3.org/ns/cid/v1"],"assertionMethod":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"authentication":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"capabilityDelegation":[],"capabilityInvocation":[],"id":"PLACEHOLDER_ID","keyAgreement":["did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0"],"service":[],"verificationMethod":[{"controller":"did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000","id":"did:webvh:QmP7NForSYfNsLYSibwCNLv46NeHR8e8JNW4BgMDhB5qia:localhost%3A8000#key-0","publicKeyMultibase":"z6MkizY3BLE8VwADPdzuhRcsTVDnakfGRNMjWxhk1WJYTjRg","type":"Multikey"}]},"proof":[{"type":"DataIntegrityProof","cryptosuite":"eddsa-jcs-2022","created":"2025-07-09T21:32:15Z","verificationMethod":"did:key:z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR#z6Mkg7jJzawE4bCvZ4bNEcXCv77gQb6cWoKS7vR6WvZC91YR","proofPurpose":"assertionMethod","proofValue":"z64Ney14a8BVM5XWQ9qHchnmNH2EKwsRpp7y972sxoGc84mDu56Vq8pJHpymZPpcPmcrDPtqKJs1CkapXxc14ZGeM"}]}"#;
-        FIXTURE.replace("PLACEHOLDER_ID", &did_id)
+    /// Build a real signed did:webvh log entry for testing.
+    ///
+    /// Generates a fresh Ed25519 signing key per call, builds the DID
+    /// document via the same `build_did_document` helper production
+    /// uses, and signs the log entry via `create_log_entry` — the
+    /// resulting jsonl passes the cryptographic-proof verifier in
+    /// `verify_did_log_proofs`. Replaces an earlier static fixture
+    /// that string-replaced `state.id` and so produced an entry whose
+    /// proof was correctly-formed but signed for a different DID.
+    ///
+    /// `scid` parameter is ignored — the SCID is derived from the
+    /// signed log entry. Kept in the signature for call-site
+    /// compatibility with the prior helper; tests that asserted a
+    /// specific scid have been updated to read it from the resulting
+    /// record's `did_id`.
+    async fn build_test_did_log(_scid: &str, host_encoded: &str, path: &str) -> String {
+        let signing = Secret::generate_ed25519(None, None);
+        let signing_pub_mb = signing
+            .get_public_keymultibase()
+            .expect("signing public key multibase");
+        let doc = build_did_document(
+            host_encoded,
+            path,
+            &signing_pub_mb,
+            &DidDocumentOptions::default(),
+        );
+        let (_scid, jsonl) = create_log_entry(&doc, &signing)
+            .await
+            .expect("create_log_entry");
+        jsonl
     }
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
@@ -940,7 +971,7 @@ mod tests_atomic {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "alpha";
-        let did_log = build_test_did_log("scid-alpha", "control.test", path);
+        let did_log = build_test_did_log("scid-alpha", "control.test", path).await;
 
         let result = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
             .await
@@ -957,9 +988,13 @@ mod tests_atomic {
             .expect("record");
         assert_eq!(record.owner, owner);
         assert_eq!(record.version_count, 1);
-        assert_eq!(
-            record.did_id.as_deref(),
-            Some("did:webvh:scid-alpha:control.test:alpha")
+        // SCID is derived from the signed log entry, so its exact
+        // value depends on the freshly-generated signing key. Pin
+        // the prefix and the host:path suffix instead.
+        let did_id = record.did_id.as_deref().expect("did_id present");
+        assert!(
+            did_id.starts_with("did:webvh:") && did_id.ends_with(":control.test:alpha"),
+            "did_id must be did:webvh:<scid>:control.test:alpha; got {did_id}"
         );
 
         let log = state
@@ -983,7 +1018,7 @@ mod tests_atomic {
         let owner = "did:example:owner";
         let path = "beta";
 
-        let log_v1 = build_test_did_log("scid-beta", "control.test", path);
+        let log_v1 = build_test_did_log("scid-beta", "control.test", path).await;
         let r1 = register_did_atomic(&owner_auth(owner), &state, path, &log_v1, false)
             .await
             .unwrap();
@@ -991,7 +1026,7 @@ mod tests_atomic {
 
         // Same owner re-registers (potentially with new log content). No
         // intermediate empty state — old content is replaced in-batch.
-        let log_v2 = build_test_did_log("scid-beta", "control.test", path);
+        let log_v2 = build_test_did_log("scid-beta", "control.test", path).await;
         let r2 = register_did_atomic(&owner_auth(owner), &state, path, &log_v2, false)
             .await
             .expect("idempotent re-register should succeed without force");
@@ -1014,7 +1049,7 @@ mod tests_atomic {
         let path = "gamma";
         let owner_a = "did:example:owner-a";
         let owner_b = "did:example:owner-b";
-        let log = build_test_did_log("scid-gamma", "control.test", path);
+        let log = build_test_did_log("scid-gamma", "control.test", path).await;
 
         register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
             .await
@@ -1040,7 +1075,7 @@ mod tests_atomic {
     async fn admin_takeover_requires_force() {
         let (state, _dir) = test_state().await;
         let path = "delta";
-        let log = build_test_did_log("scid-delta", "control.test", path);
+        let log = build_test_did_log("scid-delta", "control.test", path).await;
 
         register_did_atomic(
             &owner_auth("did:example:owner-a"),
@@ -1067,7 +1102,7 @@ mod tests_atomic {
         let path = "epsilon";
         let owner_a = "did:example:owner-a";
         let admin = "did:example:admin";
-        let log = build_test_did_log("scid-epsilon", "control.test", path);
+        let log = build_test_did_log("scid-epsilon", "control.test", path).await;
 
         register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
             .await
@@ -1125,7 +1160,7 @@ mod tests_atomic {
     async fn mismatched_did_path_rejected() {
         let (state, _dir) = test_state().await;
         // Log claims path "wrong-path" but request is for path "right-path".
-        let log = build_test_did_log("scid-x", "control.test", "wrong-path");
+        let log = build_test_did_log("scid-x", "control.test", "wrong-path").await;
         let err = register_did_atomic(
             &owner_auth("did:example:owner"),
             &state,
@@ -1151,7 +1186,7 @@ mod tests_atomic {
     #[tokio::test]
     async fn mismatched_did_host_rejected() {
         let (state, _dir) = test_state().await;
-        let log = build_test_did_log("scid-x", "other-host.example", "valid-path");
+        let log = build_test_did_log("scid-x", "other-host.example", "valid-path").await;
         let err = register_did_atomic(
             &owner_auth("did:example:owner"),
             &state,
@@ -1201,7 +1236,7 @@ mod tests_atomic {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "stats-fresh";
-        let did_log = build_test_did_log("scid-stats", "control.test", path);
+        let did_log = build_test_did_log("scid-stats", "control.test", path).await;
 
         let before = state.stats_collector.get_aggregate().total_updates;
         register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
@@ -1236,7 +1271,7 @@ mod tests_atomic {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "stats-publish";
-        let did_log = build_test_did_log("scid-publish", "control.test", path);
+        let did_log = build_test_did_log("scid-publish", "control.test", path).await;
 
         // Reserve the slot. create_did is the "request URI" step — it
         // doesn't write log content and shouldn't bump update counters.
@@ -1281,7 +1316,7 @@ mod tests_atomic {
         let owner_a = "did:example:owner-a";
         let owner_b = "did:example:owner-b";
         let path = "stats-fail";
-        let did_log = build_test_did_log("scid-fail", "control.test", path);
+        let did_log = build_test_did_log("scid-fail", "control.test", path).await;
 
         // Reserve as owner-a, then have owner-b try to publish.
         create_did(&owner_auth(owner_a), &state, Some(path), false)
@@ -1328,7 +1363,7 @@ mod tests_atomic {
         let (state, _dir) = test_state().await;
         let owner_a = "did:example:owner-a".to_string();
         let path = "race-path";
-        let log_a = build_test_did_log("scid-race", "control.test", path);
+        let log_a = build_test_did_log("scid-race", "control.test", path).await;
         let log_b = log_a.clone();
 
         let auth_a = owner_auth(&owner_a);
