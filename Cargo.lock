@@ -309,9 +309,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4a23a2ed1a1c12fc71c87803f1c32146f8a0c0ce235ef25edd246ca2ad38fa"
+checksum = "0bf259e6125089547a106034ee0cb47af7cbe37a3dbe74f42442391d976c6b46"
 dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
@@ -362,14 +362,14 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.5.0",
 ]
 
 [[package]]
 name = "affinidi-messaging-mediator-common"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14f8ba8045dc08a5813c21025e35a7bf9408eae5cc2b9260d457e114972329a9"
+checksum = "37bce90b6f71b9509a6d683a1574e65c48bb7d5b00601ecb6836e8bfcdde50a0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -640,7 +640,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.6.0",
  "webauthn-rs",
  "webauthn-rs-proto",
  "windows-native-keyring-store",
@@ -699,7 +699,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.6.0",
  "webauthn-rs",
 ]
 
@@ -728,7 +728,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "vta-sdk",
+ "vta-sdk 0.6.0",
 ]
 
 [[package]]
@@ -787,7 +787,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.6.0",
 ]
 
 [[package]]
@@ -842,7 +842,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.6.0",
 ]
 
 [[package]]
@@ -4110,9 +4110,9 @@ checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.11"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d46837a0ed51fe95bd3b05de33cd64a1ee88fc797477ca48446872504507c5"
+checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
 dependencies = [
  "typenum",
 ]
@@ -7370,11 +7370,12 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.19.0"
+version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05839ce67618e14a09b286535c0d9c94e85ef25469b0e13cb4f844e5593eb19"
+checksum = "e72c1c2cb7b223fafb600a619537a871c2818583d619401b785e7c0b746ccde2"
 dependencies = [
  "base64 0.22.1",
+ "bs58 0.5.1",
  "chrono",
  "hex",
  "indexmap 1.9.3",
@@ -7389,9 +7390,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.19.0"
+version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
+checksum = "b90c488738ecb4fb0262f41f43bc40efc5868d9fb744319ddf5f5317f417bfac"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -8055,9 +8056,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.39.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd9f9fe3d2b7b75cf4f2805e5b9926e8ac47146667b16b86298c4a8bf08cc469"
+checksum = "a4deba334e1190ba7cb498327affa11e5ece10d26a30ab2f27fcf09504b8d8b6"
 dependencies = [
  "libc",
  "memchr",
@@ -8959,6 +8960,33 @@ checksum = "fba075fc5275473109af54d96e91d3828d1f3c10a77d3089e672efa103f7dbfd"
 dependencies = [
  "aes 0.9.0",
  "aes-gcm",
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-tdk",
+ "base64 0.22.1",
+ "chrono",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.4.2",
+ "multibase",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "vta-sdk"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bff1e0c2c00bc1ccdc85d380f8f3a63b1f1a420ea9e8bda3da871aa5cb108e9"
+dependencies = [
+ "aes 0.9.0",
+ "aes-gcm",
  "affinidi-crypto",
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -8980,6 +9008,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "x25519-dalek",
  "zeroize",
