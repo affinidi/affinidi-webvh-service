@@ -12,7 +12,7 @@ env:
   RUSTDOCFLAGS: -D warnings
   # Pinned MSRV — must equal `rust-version` in the workspace Cargo.toml.
   # Bumping one without the other causes silent drift.
-  MSRV: "1.94.0"
+  MSRV: "1.95.0"
 
 jobs:
   fmt:
