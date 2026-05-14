@@ -119,6 +119,15 @@ jobs:
       # so a transitive dep bump cannot quietly land via the test job before
       # being explicitly bumped in Cargo.toml.
       - run: cargo test --workspace --locked
+      # The setup-recipe example files (`examples/webvh-*-build.toml`) are
+      # the operator-facing contract for non-interactive setup. The smoke
+      # test loads each one, validates it, and fails the build on schema
+      # drift. Gated on `server-core` because the recipe module lives
+      # under `affinidi_webvh_common::server`.
+      - name: setup-recipe examples parse + validate
+        run: >
+          cargo test -p affinidi-webvh-common --locked
+          --features server-core --test recipe_examples
 
   keyring-required:
     name: keyring round-trip (${{ matrix.os }})

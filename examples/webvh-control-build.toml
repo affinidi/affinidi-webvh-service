@@ -1,0 +1,57 @@
+# ============================================================================
+# WebVH Control Plane Build Recipe
+# ============================================================================
+#
+# Drives `webvh-control setup --from <this-file>` non-interactively. The
+# control plane manages service registration, ACLs, and DID sync. Its
+# own DID is hosted on a webvh-server (set `did_hosting_url` to that
+# server's public URL).
+#
+# SECURITY: This file contains NO secrets.
+# ============================================================================
+
+[deployment]
+service = "control"
+vta_mode = "online"
+
+[output]
+config_path = "config.toml"
+
+[server]
+host = "0.0.0.0"
+port = 8532
+log_level = "info"
+log_format = "text"
+data_dir = "data/webvh-control"
+
+[identity]
+# Where webvh-server hosts DIDs. The control plane's DID will be
+# published at <did_hosting_url>/<did_path>/did.jsonl.
+did_hosting_url = "https://did.example.com"
+did_path = "services/control"
+
+# Public-facing URL (for WebAuthn/passkey origin). MUST match the URL
+# users see in their browser when authenticating.
+public_url = "https://control.example.com"
+
+# DIDComm mediator. Required for the control plane (it accepts inbound
+# server-register / sync messages over DIDComm).
+mediator_did = "did:webvh:mediator.example.com"
+
+[vta]
+did = "did:webvh:vta.example.com"
+context_id = "webvh"
+
+[secrets]
+backend = "keyring"
+keyring_service = "webvh"
+
+[admin]
+# For the control plane the operator usually wants an admin DID seeded
+# at setup time — without one, every API call is rejected on startup.
+# mode = "did"
+# did  = "did:key:z6Mk..."
+mode = "skip"
+
+[reprovision]
+force = false

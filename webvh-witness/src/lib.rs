@@ -23,6 +23,7 @@ pub mod routes;
 pub mod secret_store;
 pub mod server;
 pub mod setup;
+pub mod setup_recipe;
 pub mod signing;
 pub mod store;
 pub mod witness_ops;

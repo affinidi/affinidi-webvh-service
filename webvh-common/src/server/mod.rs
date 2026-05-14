@@ -15,6 +15,7 @@ pub mod operator_messages;
 pub mod passkey;
 pub mod problem_report;
 pub mod secret_store;
+pub mod setup_recipe;
 pub mod stats_collector;
 pub mod store;
 pub mod vta_setup;

@@ -1,5 +1,7 @@
 use affinidi_webvh_server::config::AppConfig;
-use affinidi_webvh_server::{backup, bootstrap, health, secret_store, server, setup, store};
+use affinidi_webvh_server::{
+    backup, bootstrap, health, secret_store, server, setup, setup_recipe, store,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -37,6 +39,30 @@ enum Command {
         /// Context id for phase 1's PNM command. Defaults to `webvh`.
         #[arg(long, default_value = "webvh", requires = "setup_key_out")]
         context: String,
+        /// Path to a declarative setup recipe TOML. Drives the wizard
+        /// non-interactively — see `examples/webvh-server-build.toml`.
+        /// For `vta_mode = "online"` also pass `--setup-key-file <path>`
+        /// (Phase 2). For `offline-complete`, the recipe carries the
+        /// bundle path + digest.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// Refuse to run when an existing setup is detected, unless this
+        /// flag is set. Without it, the wizard exits 4 to protect issued
+        /// JWTs and active VTA sessions.
+        #[arg(long)]
+        force_reprovision: bool,
+        /// Explicit "no TTY available" flag. Requires `--from`. With this
+        /// set, missing required recipe fields fail fast instead of
+        /// dropping into prompts (which would hang in CI).
+        #[arg(long, requires = "from")]
+        non_interactive: bool,
+    },
+    /// Teardown a server install: clears managed secrets from the
+    /// configured backend, removes the config file (and `.bak`).
+    Uninstall {
+        /// Skip the typed "DELETE" confirmation prompt. CI use only.
+        #[arg(long)]
+        yes: bool,
     },
     /// Run health check diagnostics
     Health,
@@ -314,15 +340,41 @@ async fn main() {
             setup_key_out,
             setup_key_file,
             context,
+            from,
+            force_reprovision,
+            non_interactive: _,
         }) => {
             if let Some(path) = setup_key_out {
                 if let Err(e) = setup::run_setup_phase1(&path, &context).await {
                     eprintln!("Setup error: {e}");
                     std::process::exit(1);
                 }
+            } else if let Some(recipe_path) = from {
+                match setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("Setup error: {e}");
+                        std::process::exit(setup_recipe::map_exit_code(&e));
+                    }
+                }
             } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
                 eprintln!("Setup error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::Uninstall { yes }) => {
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("config.toml"));
+            match setup_recipe::run_uninstall(&config_path, yes).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Uninstall error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Health) => {

@@ -1,5 +1,7 @@
 use affinidi_webvh_witness::config::AppConfig;
-use affinidi_webvh_witness::{health, secret_store, server, setup, store, witness_ops};
+use affinidi_webvh_witness::{
+    health, secret_store, server, setup, setup_recipe, store, witness_ops,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -37,6 +39,22 @@ enum Command {
         /// Context id for phase 1's PNM command. Defaults to `webvh`.
         #[arg(long, default_value = "webvh", requires = "setup_key_out")]
         context: String,
+        /// Path to a declarative setup recipe TOML.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// Refuse to run when an existing setup is detected, unless set.
+        #[arg(long)]
+        force_reprovision: bool,
+        /// Explicit "no TTY available" flag. Requires `--from`.
+        #[arg(long, requires = "from")]
+        non_interactive: bool,
+    },
+    /// Teardown a witness install: clears managed secrets and removes
+    /// the config file (+ `.bak`, + `witness-did.jsonl`).
+    Uninstall {
+        /// Skip the typed "DELETE" confirmation prompt. CI use only.
+        #[arg(long)]
+        yes: bool,
     },
     /// Run health check diagnostics
     Health,
@@ -217,14 +235,37 @@ async fn main() {
             setup_key_out,
             setup_key_file,
             context,
+            from,
+            force_reprovision,
+            non_interactive: _,
         }) => {
             if let Some(path) = setup_key_out {
                 if let Err(e) = setup::run_setup_phase1(&path, &context).await {
                     eprintln!("Setup error: {e}");
                     std::process::exit(1);
                 }
+            } else if let Some(recipe_path) = from {
+                match setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("Setup error: {e}");
+                        std::process::exit(setup_recipe::map_exit_code(&e));
+                    }
+                }
             } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
                 eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Uninstall { yes }) => {
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("config.toml"));
+            if let Err(e) = setup_recipe::run_uninstall(&config_path, yes).await {
+                eprintln!("Uninstall error: {e}");
                 std::process::exit(1);
             }
         }

@@ -5,8 +5,11 @@
 //! pushes from source servers and optionally reconciles on a timer. The
 //! wizard is therefore pure config-generation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use affinidi_webvh_common::server::setup_recipe::{
+    ServiceKind, SetupRecipe, load_recipe, require_service, to_log_format,
+};
 use dialoguer::{Confirm, Input, Select};
 
 use crate::config::{AppConfig, LogFormat, ServerConfig, SourceConfig, StoreConfig, SyncConfig};
@@ -169,5 +172,116 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
     eprintln!("    webvh-watcher --config {}", output_path.display());
     eprintln!();
 
+    Ok(())
+}
+
+/// Non-interactive setup driven by a [`SetupRecipe`] TOML file.
+///
+/// The watcher has no VTA / no secrets backend, so the recipe only needs
+/// `[deployment]`, `[output]`, `[server]`, and `[watcher]` sections.
+/// `force_reprovision` is accepted for parity with the other binaries
+/// but the watcher only ever has a local config file at stake — we still
+/// honour it for the `config.toml.bak` backup on overwrite.
+pub async fn run_from_recipe(
+    recipe_path: &Path,
+    force_reprovision: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let recipe = load_recipe(recipe_path)?;
+    require_service(&recipe, ServiceKind::Watcher)?;
+    affinidi_webvh_common::server::setup_recipe::print_recipe_banner("webvh-watcher", &recipe);
+    apply_recipe(&recipe, force_reprovision).await
+}
+
+/// Apply an in-memory [`SetupRecipe`]. Split out so a future
+/// `--non-interactive` CLI flag (with shortcut args) can populate the
+/// recipe in memory and reuse this path.
+pub async fn apply_recipe(
+    recipe: &SetupRecipe,
+    force_reprovision: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output_path = recipe.output.config_path.clone();
+
+    if output_path.exists() {
+        if !force_reprovision {
+            eprintln!(
+                "  Refusing to overwrite {} — re-run with --force-reprovision \
+                 to back up and replace.",
+                output_path.display()
+            );
+            return Err("watcher config already exists".into());
+        }
+        // Back up before overwriting so the previous push tokens aren't
+        // silently lost.
+        affinidi_webvh_common::server::setup_recipe::back_up_config(&output_path)?;
+    }
+
+    let host = recipe
+        .server
+        .host
+        .clone()
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = recipe
+        .server
+        .port
+        .unwrap_or(SetupRecipe::default_port(ServiceKind::Watcher));
+    let log_level = recipe
+        .server
+        .log_level
+        .clone()
+        .unwrap_or_else(|| "info".to_string());
+    let log_format = recipe
+        .server
+        .log_format
+        .map(to_log_format)
+        .unwrap_or(LogFormat::Text);
+    let data_dir = recipe
+        .server
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Watcher));
+
+    let sources: Vec<SourceConfig> = recipe
+        .watcher
+        .sources
+        .iter()
+        .map(|s| SourceConfig {
+            url: s.url.trim_end_matches('/').to_string(),
+            token: s.token.clone(),
+        })
+        .collect();
+
+    let config = AppConfig {
+        server: ServerConfig {
+            host,
+            port,
+            trusted_proxies: Vec::new(),
+        },
+        log: crate::config::LogConfig {
+            level: log_level,
+            format: log_format,
+        },
+        store: StoreConfig {
+            data_dir,
+            ..StoreConfig::default()
+        },
+        sync: SyncConfig {
+            push_tokens: recipe.watcher.push_tokens.clone(),
+            sources,
+            reconcile_interval: recipe.watcher.reconcile_interval,
+        },
+        config_path: output_path.clone(),
+    };
+
+    let toml_str = toml::to_string_pretty(&config)?;
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, &toml_str)?;
+    eprintln!(
+        "  [setup-recipe] watcher config written to {}",
+        output_path.display()
+    );
     Ok(())
 }

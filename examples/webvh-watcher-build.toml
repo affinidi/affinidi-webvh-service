@@ -1,0 +1,33 @@
+# ============================================================================
+# WebVH Watcher Build Recipe
+# ============================================================================
+#
+# Drives `webvh-watcher setup --from <this-file>` non-interactively. The
+# watcher is a read-only DID mirror — no VTA, no identity, no secrets
+# backend. Pure config generation.
+# ============================================================================
+
+[deployment]
+service = "watcher"
+vta_mode = "online"  # ignored for watcher; recipe schema requires a value
+
+[output]
+config_path = "config.toml"
+
+[server]
+host = "0.0.0.0"
+port = 8533
+log_level = "info"
+log_format = "text"
+data_dir = "data/webvh-watcher"
+
+[watcher]
+# Bearer tokens that source servers must present on push.
+# Empty disables auth — only safe on a trusted private network.
+push_tokens = ["change-me-token-1"]
+
+# Source servers for outbound reconciliation. Zero interval disables.
+sources = [
+  # { url = "https://source1.example.com", token = "..." },
+]
+reconcile_interval = 0

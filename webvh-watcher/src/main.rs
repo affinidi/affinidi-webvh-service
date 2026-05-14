@@ -20,8 +20,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run interactive setup wizard to generate config.toml
-    Setup,
+    /// Run interactive setup wizard to generate config.toml.
+    ///
+    /// For non-interactive / scripted setup, pass `--from <recipe.toml>`.
+    /// The watcher has no VTA / no secrets, so the recipe only needs
+    /// `[deployment]`, `[output]`, `[server]`, and `[watcher]`.
+    Setup {
+        /// Path to a declarative setup recipe TOML. Skips every prompt.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// Allow overwriting an existing config.toml. The previous file
+        /// is moved to config.toml.bak.
+        #[arg(long)]
+        force_reprovision: bool,
+    },
     /// Run health check diagnostics
     Health,
 }
@@ -33,8 +45,16 @@ async fn main() {
     print_banner();
 
     match cli.command {
-        Some(Command::Setup) => {
-            if let Err(e) = setup::run_wizard(cli.config).await {
+        Some(Command::Setup {
+            from,
+            force_reprovision,
+        }) => {
+            let result = if let Some(path) = from {
+                setup::run_from_recipe(&path, force_reprovision).await
+            } else {
+                setup::run_wizard(cli.config).await
+            };
+            if let Err(e) = result {
                 eprintln!("Setup error: {e}");
                 std::process::exit(1);
             }
