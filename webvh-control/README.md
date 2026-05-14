@@ -40,10 +40,18 @@ The binary is produced at `target/release/webvh-control`.
 ### 2. Run the setup wizard
 
 ```bash
-webvh-control setup
+webvh-control setup                          # interactive
+webvh-control setup --from <recipe.toml>     # non-interactive (CI / scripted)
 ```
 
-The wizard configures:
+For non-interactive runs see
+[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
+and the example recipe at `examples/webvh-control-build.toml`. The
+recipe handles online VTA flow (with `--setup-key-file`), the
+air-gapped `offline-prepare` / `offline-complete` pair, env-var
+overlays, and reprovision safety.
+
+The interactive wizard configures:
 
 - **Configuration file path** — where to write `config.toml`
 - **Server DID identity** — for DIDComm authentication

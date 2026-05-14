@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.1 (unreleased)
+
+### Added
+
+- **Non-interactive setup for every service.** Every `setup` subcommand
+  on `webvh-{daemon,server,control,witness,watcher}` accepts a
+  declarative `--from <recipe.toml>` recipe — drives the wizard with
+  zero TTY interaction. The recipe contains no secrets; cloud creds
+  come from the environment and crypto material is generated at setup
+  time.
+- **Full air-gapped install runs both phases non-interactively.** The
+  same recipe file drives `offline-prepare` (writes the sealed-bundle
+  request + persists the ephemeral seed in the configured secret
+  backend) and `offline-complete` (opens the VTA admin's sealed reply).
+  The recipe is the only state file — no separate state TOML needed.
+- **`--force-reprovision` flag + reprovision-refusal scan.** Before
+  any non-interactive run rotates credentials, the wizard probes the
+  configured secret backend for an existing `ServerSecrets` entry. If
+  one is present it refuses with exit 4 unless `--force-reprovision`
+  is set. Backs up `config.toml` to `config.toml.bak` on overwrite.
+- **`uninstall` subcommand** on `webvh-{daemon,server,control,witness}`
+  — clears managed secrets from the configured backend and removes the
+  config file plus companion DID-log files. Prompts for a typed
+  `DELETE` confirmation; CI passes `--yes` to skip.
+- **Env-var overlay on recipes.** `DAEMON_*` / `WEBVH_*` / `CONTROL_*`
+  / `WITNESS_*` / `WATCHER_*` env vars override recipe values at load
+  time — one recipe template can ship across dev/staging/prod.
+- **Stable exit codes for headless mode.** 0 success, 2 no-transport
+  (VTA), 3 post-auth body rejected, 4 reprovision refused, 5 recipe
+  parse/validation failed. Matches the mediator-setup wizard.
+- **Example recipes** in `examples/` for every service, plus CI smoke
+  tests that load + validate each one.
+
+### Changed
+
+- **Patch-bumped every workspace crate 0.7.0 → 0.7.1.** Public Rust
+  APIs are additive (new `setup_recipe` module + new CLI flags);
+  internal deps remain pinned to `version = "0.7"` (major.minor) per
+  `CLAUDE.md`.
+
 ## 0.7.0 (unreleased)
 
 ### Security

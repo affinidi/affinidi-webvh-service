@@ -112,9 +112,15 @@ different path with the `--config` flag or the
 ## CLI Commands
 
 ```
-webvh-watcher                     # Run watcher (default)
-webvh-watcher setup               # Interactive config wizard (coming soon)
+webvh-watcher                                  # Run watcher (default)
+webvh-watcher setup                            # Interactive config wizard
+webvh-watcher setup --from <recipe.toml>       # Non-interactive (see examples/)
+webvh-watcher setup --from <recipe.toml> --force-reprovision  # overwrite existing
 ```
+
+The watcher has no VTA / no secret store, so the recipe is just
+`[deployment]`, `[output]`, `[server]`, and `[watcher]` — see
+`examples/webvh-watcher-build.toml`.
 
 ## API Endpoints
 

@@ -30,10 +30,15 @@ The binary is produced at `target/release/webvh-witness`.
 ### 2. Run the setup wizard
 
 ```bash
-webvh-witness setup
+webvh-witness setup                          # interactive
+webvh-witness setup --from <recipe.toml>     # non-interactive (CI / scripted)
 ```
 
-The wizard walks you through configuration:
+For non-interactive runs see
+[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
+and the example recipe at `examples/webvh-witness-build.toml`.
+
+The interactive wizard walks you through configuration:
 
 - **VTA credential** — authenticates with the witness's VTA
   context and creates the witness DID automatically

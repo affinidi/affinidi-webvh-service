@@ -103,6 +103,32 @@ done through `webvh-daemon invite --did <DID> --role admin` and the
 passkey enrolment flow. See [docs/self-managed-mode-spec.md](../docs/self-managed-mode-spec.md)
 for the full walkthrough.
 
+### Non-interactive setup (CI / scripted)
+
+`webvh-daemon setup --from <recipe.toml>` drives the wizard with no
+TTY. Recipe is declarative TOML; no secrets inside. Example:
+
+```bash
+# VTA-managed (after `--setup-key-out` enrolment elsewhere):
+webvh-daemon setup --from examples/webvh-daemon-build.toml \
+                   --setup-key-file setup.key
+
+# Self-managed (no VTA, no phase-1 needed):
+webvh-daemon setup --from examples/webvh-daemon-build.toml
+# → recipe has [deployment].vta_mode = "self-managed"
+
+# Air-gapped (no VTA network access from CI):
+webvh-daemon setup --from recipe.toml   # phase 1: writes request file
+# (operator ferries to VTA admin, gets sealed bundle back)
+webvh-daemon setup --from recipe.toml   # phase 2: opens sealed bundle
+```
+
+Other flags: `--force-reprovision` rotates an existing install (backs
+up `config.toml` first), `webvh-daemon uninstall` tears down (clears
+managed secrets + removes config). See
+[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
+for the recipe schema and exit codes.
+
 ### 3. Start the daemon
 
 ```bash

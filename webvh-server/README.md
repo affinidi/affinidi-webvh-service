@@ -51,6 +51,25 @@ cargo install affinidi-webvh-server
 webvh-server setup
 ```
 
+For CI / scripted deployments, drop the wizard prompts and use a
+declarative recipe:
+
+```bash
+# Online (after `setup --setup-key-out` enrolment of an ephemeral did:key):
+webvh-server setup --from examples/webvh-server-build.toml \
+                   --setup-key-file setup.key
+
+# Air-gapped (both phases non-interactive):
+webvh-server setup --from recipe.toml   # phase 1: writes bootstrap-request.json
+# (operator ferries to VTA admin, gets sealed bundle back)
+webvh-server setup --from recipe.toml   # phase 2 (vta_mode = "offline-complete"
+                                        # + bundle_path + expect_digest set)
+```
+
+See [docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
+for the recipe schema, env-var overlay, exit codes, and reprovision
+safety.
+
 The wizard walks you through all required configuration:
 
 - **VTA credential** — authenticates with the server's VTA
@@ -295,6 +314,8 @@ enabled by default.
 ```
 webvh-server                      # Run server (default)
 webvh-server setup                # Interactive config wizard
+webvh-server setup --from <recipe.toml>  # Non-interactive — see below
+webvh-server uninstall            # Teardown: clear secrets + remove config
 webvh-server health               # Run health check diagnostics
 webvh-server add-acl              # Add ACL entry
 webvh-server list-acl             # List ACL entries
