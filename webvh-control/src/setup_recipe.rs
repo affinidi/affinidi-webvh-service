@@ -170,13 +170,9 @@ pub async fn apply_recipe(
             None,
             o.log_entry,
         ),
-        VtaSetupOutcome::OfflinePreparedOnly(_) => {
-            return Err(AppError::Config(
-                "vta_mode = \"offline-prepare\" with --from is not yet supported. \
-                 Use `webvh-control setup-offline-prepare` for phase 1, then \
-                 --from with vta_mode = \"offline-complete\" for phase 2."
-                    .into(),
-            ));
+        VtaSetupOutcome::OfflinePreparedOnly(info) => {
+            persist_offline_prepare(&recipe, &info, &secrets_config).await?;
+            return Ok(());
         }
         VtaSetupOutcome::SelfManaged(_) => {
             return Err(AppError::Config(
@@ -336,6 +332,58 @@ pub async fn apply_recipe(
     eprintln!();
 
     Ok(())
+}
+
+/// Phase 1 of the offline flow: persist the ephemeral seed in the
+/// configured secret backend so phase 2 can open the sealed response.
+async fn persist_offline_prepare(
+    recipe: &SetupRecipe,
+    info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
+    secrets_config: &affinidi_webvh_common::server::config::SecretsConfig,
+) -> Result<(), AppError> {
+    let store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        secrets_config,
+        &recipe.output.config_path,
+    )?;
+    store.set_bootstrap_seed(&info.seed).await?;
+    print_offline_prepare_recap("webvh-control", recipe, info);
+    Ok(())
+}
+
+fn print_offline_prepare_recap(
+    binary: &str,
+    recipe: &SetupRecipe,
+    info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
+) {
+    eprintln!();
+    eprintln!("  [setup-recipe:offline-prepare] phase 1 complete");
+    eprintln!(
+        "  [setup-recipe:offline-prepare] request_path = {}",
+        info.request_path.display()
+    );
+    eprintln!(
+        "  [setup-recipe:offline-prepare] client_did   = {}",
+        info.client_did
+    );
+    eprintln!(
+        "  [setup-recipe:offline-prepare] nonce        = {}",
+        info.nonce
+    );
+    eprintln!("  [setup-recipe:offline-prepare] seed stored in configured secret backend");
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Ferry {} to your VTA admin.",
+        info.request_path.display()
+    );
+    eprintln!("    2. Ask them to seal the response and communicate the SHA-256 digest OOB.");
+    eprintln!(
+        "    3. Edit your recipe ({}): set vta_mode = \"offline-complete\",",
+        recipe.output.config_path.display()
+    );
+    eprintln!("       [vta].bundle_path, [vta].expect_digest.");
+    eprintln!("    4. Re-run phase 2: {binary} setup --from <recipe>");
+    eprintln!();
 }
 
 pub async fn run_uninstall(config_path: &Path, yes: bool) -> Result<(), AppError> {

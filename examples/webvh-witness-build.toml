@@ -34,6 +34,8 @@ did_path = "services/witness"
 did = "did:webvh:vta.example.com"
 context_id = "webvh"
 
+# Air-gapped flow — see webvh-server-build.toml for the full pattern.
+
 [secrets]
 backend = "keyring"
 keyring_service = "webvh-witness"

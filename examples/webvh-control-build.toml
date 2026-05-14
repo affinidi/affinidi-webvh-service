@@ -42,6 +42,10 @@ mediator_did = "did:webvh:mediator.example.com"
 did = "did:webvh:vta.example.com"
 context_id = "webvh"
 
+# Air-gapped flow — see webvh-server-build.toml for the full pattern.
+# Phase 1:  vta_mode = "offline-prepare",   request_path = "..."
+# Phase 2:  vta_mode = "offline-complete",  bundle_path + expect_digest
+
 [secrets]
 backend = "keyring"
 keyring_service = "webvh"

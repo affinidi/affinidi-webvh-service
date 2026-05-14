@@ -384,11 +384,22 @@ impl SetupRecipe {
         // VTA section — required for any mode that talks to the VTA.
         match (service, mode) {
             (Watcher, _) | (_, SelfManaged) => {}
-            (_, Online) | (_, OfflinePrepare) => {
-                if self.vta.did.is_none() && mode == Online {
+            (_, Online) => {
+                if self.vta.did.is_none() {
                     return Err(RecipeError::MissingField {
                         service,
                         field: "vta.did (required for vta_mode = \"online\")",
+                    });
+                }
+            }
+            (_, OfflinePrepare) => {
+                // The VTA DID isn't required here — phase 1 only writes
+                // a request; the VTA's identity gets pinned when phase
+                // 2 opens the sealed response.
+                if self.vta.request_path.is_none() {
+                    return Err(RecipeError::MissingField {
+                        service,
+                        field: "vta.request_path (required for vta_mode = \"offline-prepare\")",
                     });
                 }
             }
@@ -405,12 +416,11 @@ impl SetupRecipe {
                         field: "vta.expect_digest (required for vta_mode = \"offline-complete\")",
                     });
                 }
-                if self.vta.state_path.is_none() {
-                    return Err(RecipeError::MissingField {
-                        service,
-                        field: "vta.state_path (required for vta_mode = \"offline-complete\")",
-                    });
-                }
+                // state_path is intentionally NOT required: the recipe
+                // is the state. Operators re-run with the SAME recipe
+                // file (vta_mode flipped + bundle_path/expect_digest
+                // filled in) and the bootstrap seed comes back out of
+                // the configured secret store keyed by the same backend.
             }
         }
 
@@ -562,19 +572,37 @@ mod tests {
     }
 
     #[test]
-    fn offline_complete_requires_bundle_digest_state() {
+    fn offline_complete_requires_bundle_and_digest() {
         let mut r = minimal(ServiceKind::Server);
         r.deployment.vta_mode = VtaMode::OfflineComplete;
         // public_url not required in offline-complete (the sealed reply carries the DID).
         r.identity.public_url = None;
-        // Missing all three offline-complete fields → first one wins.
+        // Missing bundle_path → bundle_path complaint wins.
         let err = r.validate().unwrap_err();
         assert!(
             matches!(err, RecipeError::MissingField { field, .. } if field.contains("bundle_path"))
         );
         r.vta.bundle_path = Some(PathBuf::from("b.txt"));
+        // Now expect_digest is the next required field.
+        let err = r.validate().unwrap_err();
+        assert!(
+            matches!(err, RecipeError::MissingField { field, .. } if field.contains("expect_digest"))
+        );
         r.vta.expect_digest = Some("deadbeef".into());
-        r.vta.state_path = Some(PathBuf::from("s.toml"));
+        // state_path is intentionally NOT required — recipe is the state.
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn offline_prepare_requires_request_path() {
+        let mut r = minimal(ServiceKind::Server);
+        r.deployment.vta_mode = VtaMode::OfflinePrepare;
+        // Default fixture has no request_path → first check fires.
+        let err = r.validate().unwrap_err();
+        assert!(
+            matches!(err, RecipeError::MissingField { field, .. } if field.contains("request_path"))
+        );
+        r.vta.request_path = Some(PathBuf::from("bootstrap-request.json"));
         r.validate().unwrap();
     }
 

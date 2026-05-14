@@ -312,6 +312,32 @@ For VTA-less deployments the daemon supports `vta_mode = "self-managed"`:
 webvh-daemon setup --from examples/webvh-daemon-build.toml
 ```
 
+For fully **air-gapped** deployments — where the CI runner has no VTA
+network access at all — both phases of the sealed-bundle flow run
+non-interactively from the same recipe file:
+
+```bash
+# Phase 1: write a sealed bootstrap request. Persists the ephemeral
+# seed to the configured secret backend. Exits.
+webvh-server setup --from recipe.toml
+#   ▶ recipe.toml has  [deployment].vta_mode = "offline-prepare"
+#                      [vta].request_path    = "bootstrap-request.json"
+
+# Operator ferries bootstrap-request.json to the VTA admin, receives
+# bundle.armor + SHA-256 digest back out-of-band.
+
+# Phase 2: same recipe, switched to offline-complete + bundle fields.
+# The seed comes back out of the same secret backend automatically.
+webvh-server setup --from recipe.toml
+#   ▶ recipe.toml now has  [deployment].vta_mode = "offline-complete"
+#                          [vta].bundle_path     = "bundle.armor"
+#                          [vta].expect_digest   = "<hex-sha256>"
+```
+
+The recipe is the only state file — no separate state TOML is needed.
+The same secret backend keys both phases; if you rotate `[secrets]`
+between calls phase 2 cannot find the seed and exits with an error.
+
 Recipes are shipped under `examples/`:
 
 | Recipe | Drives |

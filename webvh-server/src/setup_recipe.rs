@@ -340,46 +340,73 @@ pub async fn apply_recipe(
     Ok(())
 }
 
-/// Phase 1 of the offline flow: bootstrap-request was written by
-/// `run_vta_for_recipe`; we now serialise the recipe to the state TOML
-/// (so phase 2 can rebuild the config) and persist the seed in the
-/// configured secrets backend.
+/// Phase 1 of the offline flow: the bootstrap request was written by
+/// `run_vta_for_recipe`; we persist the ephemeral seed in the configured
+/// secret backend so phase 2 can open the sealed response, then print
+/// operator-facing next-steps.
+///
+/// Phase 2 is driven by re-running the wizard with the SAME recipe file
+/// edited to `vta_mode = "offline-complete"` and `[vta].bundle_path` /
+/// `[vta].expect_digest` filled in. The seed comes back out of the same
+/// secret backend automatically.
 async fn persist_offline_prepare(
     recipe: &SetupRecipe,
     info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
     secrets_config: &affinidi_webvh_common::server::config::SecretsConfig,
 ) -> Result<(), AppError> {
-    // The seed was emitted via run_vta_for_recipe's internal call to
-    // write_offline_bootstrap_request — but we lost it (the apply
-    // helper didn't surface it through OfflinePreparedInfo to keep the
-    // shared API simple). For now, re-issue: run write_offline_bootstrap_request
-    // once more would mint a fresh seed and request which is wrong. So
-    // we redirect operators using offline-prepare to invoke
-    // `setup-offline-prepare` instead — the existing subcommand which
-    // already handles seed persistence + state save correctly.
-    //
-    // This branch keeps the recipe schema honest (offline-prepare is a
-    // documented mode) but emits a pointer rather than silently
-    // duplicating logic.
-    let _ = (info, secrets_config);
-    Err(AppError::Config(format!(
-        "vta_mode = \"offline-prepare\" with --from is not yet supported for webvh-server. \
-         Use `webvh-server setup-offline-prepare --request {request} --state {state}` \
-         (interactive prompts) for phase 1, then run `--from <recipe.toml>` with \
-         vta_mode = \"offline-complete\" once the VTA admin returns the sealed bundle.",
-        request = recipe
-            .vta
-            .request_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "bootstrap-request.json".to_string()),
-        state = recipe
-            .vta
-            .state_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "setup-offline-state.toml".to_string()),
-    )))
+    let store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        secrets_config,
+        &recipe.output.config_path,
+    )?;
+    store.set_bootstrap_seed(&info.seed).await?;
+    print_offline_prepare_recap("webvh-server", recipe, info);
+    Ok(())
+}
+
+/// Stable, scriptable next-steps recap for offline-prepare. CI scripts
+/// can grep for `[setup-recipe:offline-prepare]` to confirm phase 1
+/// succeeded and pick up the printed values.
+fn print_offline_prepare_recap(
+    binary: &str,
+    recipe: &SetupRecipe,
+    info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
+) {
+    eprintln!();
+    eprintln!("  [setup-recipe:offline-prepare] phase 1 complete");
+    eprintln!(
+        "  [setup-recipe:offline-prepare] request_path = {}",
+        info.request_path.display()
+    );
+    eprintln!(
+        "  [setup-recipe:offline-prepare] client_did   = {}",
+        info.client_did
+    );
+    eprintln!(
+        "  [setup-recipe:offline-prepare] nonce        = {}",
+        info.nonce
+    );
+    eprintln!("  [setup-recipe:offline-prepare] seed stored in configured secret backend");
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!(
+        "    1. Ferry {} to your VTA admin.",
+        info.request_path.display()
+    );
+    eprintln!("    2. Ask them to seal the response:");
+    eprintln!(
+        "         vta bootstrap provision-integration --request <request-file> \\\n           --out <bundle-file>"
+    );
+    eprintln!("       and to communicate the SHA-256 digest out-of-band.");
+    eprintln!(
+        "    3. Edit your recipe ({}):",
+        recipe.output.config_path.display()
+    );
+    eprintln!("         - set [deployment].vta_mode = \"offline-complete\"");
+    eprintln!("         - set [vta].bundle_path    = \"<bundle-path>\"");
+    eprintln!("         - set [vta].expect_digest  = \"<hex-digest>\"");
+    eprintln!("    4. Re-run phase 2 (no TTY required):");
+    eprintln!("         {binary} setup --from <recipe>");
+    eprintln!();
 }
 
 /// Uninstall: list webvh-server-managed entries, prompt for typed DELETE,

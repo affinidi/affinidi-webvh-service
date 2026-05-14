@@ -85,9 +85,21 @@ pub struct SelfManagedKeys {
 }
 
 pub struct OfflinePreparedInfo {
+    /// Path of the bootstrap-request.json the caller (or recipe) asked
+    /// us to write.
     pub request_path: PathBuf,
-    pub state_path: PathBuf,
+    /// Ephemeral X25519-derivable private seed. Treat as secret. The
+    /// caller MUST persist this via [`SecretStore::set_bootstrap_seed`]
+    /// before returning, otherwise phase 2 cannot open the sealed
+    /// response.
+    pub seed: [u8; 32],
+    /// Public ephemeral did:key embedded in the bootstrap request. The
+    /// VTA admin uses this to grant the request context-create
+    /// permission. Printed in operator-facing next-steps.
     pub client_did: String,
+    /// Base64url-encoded 16-byte nonce. Becomes the bundle_id once the
+    /// VTA admin seals the response — printed so the operator can
+    /// eyeball-match the returned bundle.
     pub nonce: String,
 }
 
@@ -159,11 +171,6 @@ pub async fn run_vta_for_recipe<'a>(
                     "recipe vta.request_path is required for vta_mode = \"offline-prepare\"".into(),
                 )
             })?;
-            let state_path = recipe.vta.state_path.clone().ok_or_else(|| {
-                AppError::Config(
-                    "recipe vta.state_path is required for vta_mode = \"offline-prepare\"".into(),
-                )
-            })?;
             let context_id = recipe
                 .vta
                 .context_id
@@ -180,16 +187,15 @@ pub async fn run_vta_for_recipe<'a>(
             .map_err(|e| {
                 AppError::Config(format!("offline bootstrap-request write failed: {e}"))
             })?;
-            // Persist the seed elsewhere — the caller has the secret
-            // store. We hand the seed back via the return type so the
-            // caller can do it on the same code path.
-            //
-            // Note: we don't drop `info.seed` here; the apply path is
-            // expected to persist it via `SecretStore::set_bootstrap_seed`
-            // immediately on return.
+            // Surface the seed to the caller — they own the secret
+            // store and persist it via `set_bootstrap_seed` so phase 2
+            // can open the sealed reply. Phase 2 reads the *same*
+            // recipe (with vta_mode flipped to "offline-complete" and
+            // bundle_path + expect_digest populated) and pulls the
+            // seed back out of the same backend.
             Ok(VtaSetupOutcome::OfflinePreparedOnly(OfflinePreparedInfo {
                 request_path: info.request_path,
-                state_path,
+                seed: info.seed,
                 client_did: info.client_did,
                 nonce: info.nonce,
             }))

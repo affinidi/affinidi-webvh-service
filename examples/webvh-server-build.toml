@@ -39,6 +39,20 @@ public_url = "https://server1.example.com"
 did = "did:webvh:vta.example.com"
 context_id = "webvh"
 
+# ── Air-gapped (offline) setup ──────────────────────────────────────────────
+# Both phases of the sealed-bundle flow run non-interactively from this
+# same recipe file. Phase 1 writes a request + persists the ephemeral
+# seed in the configured secret backend; phase 2 opens the sealed reply
+# the VTA admin returned.
+#
+# Phase 1 (uncomment, set vta_mode = "offline-prepare" above):
+# request_path = "bootstrap-request.json"
+#
+# Phase 2 (after the VTA admin returns the sealed bundle; switch
+# vta_mode = "offline-complete" above):
+# bundle_path   = "bundle.armor"
+# expect_digest = "<lowercase-hex-sha256>"
+
 [secrets]
 backend = "keyring"
 keyring_service = "webvh"

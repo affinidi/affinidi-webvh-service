@@ -56,10 +56,12 @@ public_url = "https://daemon.example.com"
 did = "did:webvh:vta.example.com"
 context_id = "webvh"
 
+# vta_mode = "offline-prepare" requires this:
+# request_path  = "bootstrap-request.json"
+#
 # vta_mode = "offline-complete" requires these:
 # bundle_path   = "bundle.armor"
 # expect_digest = "<lowercase-hex-sha256>"
-# state_path    = "setup-offline-state.toml"
 
 [daemon]
 # Which embedded services run. Defaults match the interactive wizard.
