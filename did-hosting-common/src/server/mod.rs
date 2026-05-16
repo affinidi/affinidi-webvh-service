@@ -9,6 +9,7 @@ pub mod health;
 pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod migrations;
 pub mod mnemonic;
 pub mod operator_messages;
 #[cfg(feature = "passkey")]
