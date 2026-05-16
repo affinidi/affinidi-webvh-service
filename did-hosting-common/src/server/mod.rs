@@ -16,6 +16,8 @@ pub mod operator_messages;
 pub mod passkey;
 pub mod problem_report;
 pub mod secret_store;
+#[cfg(feature = "setup-wizard")]
+pub mod setup_prompts;
 pub mod setup_recipe;
 pub mod stats_collector;
 pub mod store;

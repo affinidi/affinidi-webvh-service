@@ -19,6 +19,7 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
+use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::store::Store;
 use did_hosting_common::server::vta_setup;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
@@ -139,14 +140,8 @@ pub async fn run_wizard(
     features.didcomm = mediator_did.is_some();
 
     // 5. Host / port / log / data
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8534u16)
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
+    let port = setup_prompts::prompt_listen_port(8534)?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -155,16 +150,7 @@ pub async fn run_wizard(
         .default(0)
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
-    let format_options = &["text", "json"];
-    let format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(format_options)
-        .default(0)
-        .interact()?;
-    let log_format = match format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
+    let log_format = setup_prompts::prompt_log_format()?;
 
     let data_dir: String = Input::new()
         .with_prompt("Data directory root")
@@ -537,14 +523,8 @@ async fn run_self_managed_setup(
     };
 
     // 4. Host / port / log / data dir.
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8534u16)
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
+    let port = setup_prompts::prompt_listen_port(8534)?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -553,16 +533,7 @@ async fn run_self_managed_setup(
         .default(0)
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
-    let format_options = &["text", "json"];
-    let format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(format_options)
-        .default(0)
-        .interact()?;
-    let log_format = match format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
+    let log_format = setup_prompts::prompt_log_format()?;
 
     let data_dir: String = Input::new()
         .with_prompt("Data directory root")
@@ -808,14 +779,8 @@ pub async fn run_setup_offline_prepare(
     };
     features.didcomm = mediator_did.is_some();
 
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8534u16)
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
+    let port = setup_prompts::prompt_listen_port(8534)?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -824,16 +789,7 @@ pub async fn run_setup_offline_prepare(
         .default(0)
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
-    let format_options = &["text", "json"];
-    let format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(format_options)
-        .default(0)
-        .interact()?;
-    let log_format = match format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
+    let log_format = setup_prompts::prompt_log_format()?;
 
     let data_dir: String = Input::new()
         .with_prompt("Data directory root")

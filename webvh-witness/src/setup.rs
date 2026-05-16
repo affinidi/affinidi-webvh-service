@@ -15,6 +15,7 @@ use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
 use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
+use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
@@ -156,15 +157,8 @@ pub async fn run_wizard(
     }
 
     // 9. Host / Port
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
-
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8102u16)
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
+    let port = setup_prompts::prompt_listen_port(8102)?;
 
     // 10. Log level / format
     let log_levels = ["info", "debug", "warn", "error", "trace"];
@@ -175,16 +169,7 @@ pub async fn run_wizard(
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
 
-    let format_options = &["text", "json"];
-    let format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(format_options)
-        .default(0)
-        .interact()?;
-    let log_format = match format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
+    let log_format = setup_prompts::prompt_log_format()?;
 
     // 11. Data directory
     let data_dir: String = Input::new()
@@ -621,15 +606,8 @@ pub async fn run_setup_offline_prepare(
         .interact_text()?;
     let did_log_output = PathBuf::from(did_log_output);
 
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
-
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8102u16)
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
+    let port = setup_prompts::prompt_listen_port(8102)?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -639,16 +617,7 @@ pub async fn run_setup_offline_prepare(
         .interact()?;
     let log_level = log_levels[log_level_idx].to_string();
 
-    let format_options = &["text", "json"];
-    let format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(format_options)
-        .default(0)
-        .interact()?;
-    let log_format = match format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
+    let log_format = setup_prompts::prompt_log_format()?;
 
     let data_dir: String = Input::new()
         .with_prompt("Data directory")

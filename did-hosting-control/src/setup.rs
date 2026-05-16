@@ -16,6 +16,7 @@ use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 use did_hosting_common::server::operator_messages::WebvhControlMessages;
+use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::vta_setup;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
@@ -159,16 +160,9 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     // 8. Host & Port
     eprintln!();
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".into())
-        .interact_text()
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8532)
-        .interact()
+    let port = setup_prompts::prompt_listen_port(8532)
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
     // 9. Log level & format
@@ -182,17 +176,8 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let log_level = log_levels[log_level_idx].to_string();
 
-    let log_formats = ["text", "json"];
-    let log_format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(log_formats)
-        .default(0)
-        .interact()
+    let log_format = setup_prompts::prompt_log_format()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let log_format = match log_format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
 
     // 10. Data directory
     eprintln!();
@@ -641,16 +626,9 @@ pub async fn run_setup_offline_prepare(
         Some(public_url)
     };
 
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".into())
-        .interact_text()
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-    let port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(8532)
-        .interact()
+    let port = setup_prompts::prompt_listen_port(8532)
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
@@ -662,17 +640,8 @@ pub async fn run_setup_offline_prepare(
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let log_level = log_levels[log_level_idx].to_string();
 
-    let log_formats = ["text", "json"];
-    let log_format_idx = Select::new()
-        .with_prompt("Log format")
-        .items(log_formats)
-        .default(0)
-        .interact()
+    let log_format = setup_prompts::prompt_log_format()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let log_format = match log_format_idx {
-        1 => LogFormat::Json,
-        _ => LogFormat::Text,
-    };
 
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
