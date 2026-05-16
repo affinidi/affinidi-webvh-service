@@ -74,6 +74,12 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# CIDR matching for the multi-domain `trusted_proxy_cidrs` allowlist
+# (see `super::domain::detect`). Single-purpose dep; `cidr` and
+# hand-rolled were alternatives — ipnetwork is the most-used in the
+# ecosystem and parses RFC-style strings (`10.0.0.0/8`, `2001:db8::/32`)
+# without further plumbing.
+ipnetwork = "0.21"
 vta-sdk = { workspace = true }
 
 # server-core dependencies (optional)
