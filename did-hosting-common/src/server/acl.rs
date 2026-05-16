@@ -70,6 +70,17 @@ pub struct AclEntry {
     pub max_total_size: Option<u64>,
     #[serde(default)]
     pub max_did_count: Option<u64>,
+    /// Which domains this caller is authorised to operate on. Per
+    /// `docs/multi-domain-spec.md` §3, `Admin` and `Service` roles
+    /// short-circuit this check upstream — `domains` is the per-Owner
+    /// authorisation rule.
+    ///
+    /// `#[serde(default)]` keeps backwards-compat: v0.6-vintage ACL
+    /// entries lacking this field deserialise as `DomainScope::All`.
+    /// T22 flips the default for **newly-created** Owner entries to
+    /// `AllowedWithDefault([system_default], system_default)`.
+    #[serde(default)]
+    pub domains: super::domain::DomainScope,
 }
 
 // -- Shared API request/response types for ACL routes --
@@ -84,6 +95,12 @@ pub struct CreateAclRequest {
     pub max_total_size: Option<u64>,
     #[serde(default)]
     pub max_did_count: Option<u64>,
+    /// Optional on create — missing field defaults to
+    /// `DomainScope::All`. T22 changes the handler to substitute
+    /// `AllowedWithDefault([system_default], system_default)` for new
+    /// `Owner` entries when this field is omitted.
+    #[serde(default)]
+    pub domains: Option<super::domain::DomainScope>,
 }
 
 /// Request body for updating an existing ACL entry (PUT /acl/{did}).
@@ -93,6 +110,9 @@ pub struct UpdateAclRequest {
     pub label: Option<String>,
     pub max_total_size: Option<u64>,
     pub max_did_count: Option<u64>,
+    /// `None` → don't change. `Some(scope)` → replace.
+    #[serde(default)]
+    pub domains: Option<super::domain::DomainScope>,
 }
 
 /// Serializable ACL entry returned in API responses.
@@ -104,6 +124,7 @@ pub struct AclEntryResponse {
     pub created_at: u64,
     pub max_total_size: Option<u64>,
     pub max_did_count: Option<u64>,
+    pub domains: super::domain::DomainScope,
 }
 
 impl From<AclEntry> for AclEntryResponse {
@@ -115,6 +136,7 @@ impl From<AclEntry> for AclEntryResponse {
             created_at: e.created_at,
             max_total_size: e.max_total_size,
             max_did_count: e.max_did_count,
+            domains: e.domains,
         }
     }
 }
@@ -238,7 +260,55 @@ mod tests {
             created_at: 0,
             max_total_size,
             max_did_count,
+            domains: crate::server::domain::DomainScope::All,
         }
+    }
+
+    // --- Backwards-compat: v0.6-vintage AclEntry (no `domains` field) ---
+
+    #[test]
+    fn legacy_acl_entry_deserialises_with_domains_default_all() {
+        // A pre-T16 stored entry has no `domains` field. The
+        // `#[serde(default)]` on `AclEntry::domains` must accept it
+        // and populate `DomainScope::All`. This invariant is load-
+        // bearing — operators with v0.6.0 stores must upgrade without
+        // their existing ACL entries becoming unreadable.
+        let legacy = r#"{
+            "did": "did:example:legacy",
+            "role": "owner",
+            "label": null,
+            "created_at": 1700000000,
+            "max_total_size": null,
+            "max_did_count": null
+        }"#;
+        let entry: AclEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(entry.did, "did:example:legacy");
+        assert!(matches!(
+            entry.domains,
+            crate::server::domain::DomainScope::All
+        ));
+    }
+
+    #[test]
+    fn entry_with_explicit_allowed_scope_round_trips() {
+        let original = AclEntry {
+            did: "did:example:scoped".into(),
+            role: Role::Owner,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: crate::server::domain::DomainScope::Allowed {
+                domains: vec!["a.example".into(), "b.example".into()],
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: AclEntry = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.domains,
+            crate::server::domain::DomainScope::Allowed { ref domains }
+                if domains == &["a.example", "b.example"]
+        ));
     }
 
     // --- Role parsing ---

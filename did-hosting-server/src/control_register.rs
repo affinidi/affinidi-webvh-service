@@ -84,7 +84,8 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
                 created_at: crate::auth::session::now_epoch(),
                 max_total_size: None,
                 max_did_count: None,
-            };
+            
+                domains: did_hosting_common::server::domain::DomainScope::All,};
             if let Err(e) = store_acl_entry(&state.acl_ks, &entry).await {
                 warn!(error = %e, "failed to add control plane DID to ACL");
             } else {

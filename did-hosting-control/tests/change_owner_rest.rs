@@ -119,7 +119,8 @@ async fn add_acl(state: &AppState, did: &str, role: Role) {
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        },
+        
+            domains: did_hosting_common::server::domain::DomainScope::All,},
     )
     .await
     .expect("store acl");

@@ -39,7 +39,8 @@ pub async fn run_add_acl(
         created_at: now_epoch(),
         max_total_size,
         max_did_count,
-    };
+    
+        domains: crate::server::domain::DomainScope::All,};
 
     store_acl_entry(&acl_ks, &entry).await?;
 

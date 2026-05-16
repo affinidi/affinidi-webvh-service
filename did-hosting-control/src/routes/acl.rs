@@ -53,7 +53,8 @@ pub async fn create_acl(
         created_at: now_epoch(),
         max_total_size: req.max_total_size,
         max_did_count: req.max_did_count,
-    };
+    
+        domains: did_hosting_common::server::domain::DomainScope::All,};
     acl::store_acl_entry(&state.acl_ks, &entry).await?;
     info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))

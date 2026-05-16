@@ -345,7 +345,8 @@ pub async fn apply_recipe(
             created_at: did_hosting_common::server::auth::session::now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        };
+        
+            domains: did_hosting_common::server::domain::DomainScope::All,};
         did_hosting_common::server::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  [setup-recipe] admin ACL entry added for {admin_did}");

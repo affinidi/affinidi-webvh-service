@@ -1296,7 +1296,8 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            },
+            
+                domains: did_hosting_common::server::domain::DomainScope::All,},
         )
         .await
         .unwrap();
@@ -1330,7 +1331,8 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            },
+            
+                domains: did_hosting_common::server::domain::DomainScope::All,},
         )
         .await
         .unwrap();
@@ -1612,7 +1614,8 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            },
+            
+                domains: did_hosting_common::server::domain::DomainScope::All,},
         )
         .await
         .unwrap();
@@ -1657,7 +1660,8 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            },
+            
+                domains: did_hosting_common::server::domain::DomainScope::All,},
         )
         .await
         .unwrap();

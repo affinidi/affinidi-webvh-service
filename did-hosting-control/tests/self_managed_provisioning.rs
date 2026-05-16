@@ -102,7 +102,8 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         created_at: now_epoch(),
         max_total_size: None,
         max_did_count: None,
-    };
+    
+        domains: did_hosting_common::server::domain::DomainScope::All,};
     store_acl_entry(&acl_ks, &acl_entry)
         .await
         .expect("store ACL entry");

@@ -303,7 +303,8 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        };
+        
+            domains: did_hosting_common::server::domain::DomainScope::All,};
 
         crate::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
@@ -916,7 +917,8 @@ pub async fn run_setup_offline_complete(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        };
+        
+            domains: did_hosting_common::server::domain::DomainScope::All,};
         crate::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  Admin ACL entry added for {admin_did}");

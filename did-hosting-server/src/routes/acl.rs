@@ -50,7 +50,8 @@ pub async fn create_acl(
         created_at: now_epoch(),
         max_total_size: req.max_total_size,
         max_did_count: req.max_did_count,
-    };
+    
+        domains: did_hosting_common::server::domain::DomainScope::All,};
 
     store_acl_entry(&state.acl_ks, &entry).await?;
 
