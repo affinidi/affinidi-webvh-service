@@ -28,9 +28,11 @@
 //! next to the handler in source, and `cargo doc` surfaces it on the
 //! route without any procedural-macro indirection.
 
+pub mod didcomm;
 pub mod extractor;
 pub mod router;
 
+pub use didcomm::{assert_matches, parse_message_type};
 pub use extractor::TrustTaskHeader;
 pub use router::TrustTaskRouter;
 
