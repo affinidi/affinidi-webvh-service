@@ -13,7 +13,23 @@ publish.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["method-webvh", "method-web"]
+
+# ---- DID method support ----
+#
+# Each `method-*` feature gates a single `DidMethod` impl in
+# `src/method/`. The dispatcher (`method_by_name`) is compile-time —
+# disabling a feature removes its arm from the dispatcher AND its
+# resolution-endpoint route from the router (T25). The default build
+# enables `webvh` + `web`; `webs` / `webplus` are scaffolded for future
+# work and ship as stubs that fail compile with a clear pointer
+# (T31 + T38, gated by `method-webs` / `method-webplus`).
+
+method-webvh = []
+method-web = []
+method-webs = []
+method-webplus = []
+
 metrics = ["server-core", "dep:prometheus"]
 server-core = [
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",

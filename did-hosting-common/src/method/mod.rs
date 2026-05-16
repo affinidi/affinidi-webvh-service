@@ -39,6 +39,8 @@
 //! as small additions.
 
 pub mod parse;
+#[cfg(feature = "method-webvh")]
+pub mod webvh;
 
 pub use parse::parse_did_method;
 
@@ -160,14 +162,17 @@ pub enum MethodError {
 /// arm; T24 adds the web arm.
 #[allow(clippy::needless_return)] // future arms make this expression-form
 pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
+    // Static refs to zero-size unit-struct impls. `dyn DidMethod`
+    // dispatch is via `&self`, so a single static instance per method
+    // is enough — there's no per-call state.
+    #[cfg(feature = "method-webvh")]
+    static WEBVH: webvh::Webvh = webvh::Webvh;
+    // T24 will add: #[cfg(feature = "method-web")] static WEB: web::Web = web::Web;
+
     match name {
-        // T11 will add:
-        //   #[cfg(feature = "method-webvh")]
-        //   "webvh" => Some(&methods::webvh::Webvh),
-        //
-        // T24 will add:
-        //   #[cfg(feature = "method-web")]
-        //   "web" => Some(&methods::web::Web),
+        #[cfg(feature = "method-webvh")]
+        "webvh" => Some(&WEBVH),
+        // T24: #[cfg(feature = "method-web")] "web" => Some(&WEB),
         _ => None,
     }
 }
@@ -179,9 +184,13 @@ pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
 /// Compile-time-constructed via const-fn-style match arms — disabling a
 /// feature removes its entry without runtime cost.
 pub fn enabled_methods() -> &'static [&'static str] {
+    // The compiler concatenates `#[cfg]`-gated array entries at compile
+    // time, so disabling a feature literally removes its element from
+    // the slice.
     &[
-        // T11: `#[cfg(feature = "method-webvh")] "webvh"`
-        // T24: `#[cfg(feature = "method-web")] "web"`
+        #[cfg(feature = "method-webvh")]
+        "webvh",
+        // T24: #[cfg(feature = "method-web")] "web",
     ]
 }
 
@@ -245,16 +254,36 @@ mod tests {
         assert!(matches!(err, MethodError::Malformed(_)));
     }
 
+    #[cfg(feature = "method-webvh")]
     #[test]
-    fn dispatcher_is_empty_in_t10() {
-        // Nothing is registered yet; T11 (webvh) + T24 (web) populate.
-        assert!(method_by_name("webvh").is_none());
-        assert!(method_by_name("web").is_none());
-        assert!(method_by_name("anything").is_none());
+    fn dispatcher_routes_webvh() {
+        let m = method_by_name("webvh").expect("webvh feature enabled in default build");
+        assert_eq!(m.name(), "webvh");
     }
 
     #[test]
-    fn enabled_methods_is_empty_in_t10() {
+    fn dispatcher_returns_none_for_unknown() {
+        assert!(method_by_name("anything-not-a-method").is_none());
+    }
+
+    #[cfg(not(feature = "method-web"))]
+    #[test]
+    fn dispatcher_returns_none_for_web_when_feature_off() {
+        // T24 wires the "web" arm. Until then, method-web is feature-
+        // scaffolded but unimplemented — method_by_name returns None
+        // regardless of whether the feature is enabled or not.
+        assert!(method_by_name("web").is_none());
+    }
+
+    #[cfg(feature = "method-webvh")]
+    #[test]
+    fn enabled_methods_contains_webvh() {
+        assert!(enabled_methods().contains(&"webvh"));
+    }
+
+    #[cfg(not(any(feature = "method-webvh", feature = "method-web")))]
+    #[test]
+    fn enabled_methods_is_empty_when_no_method_feature() {
         assert!(enabled_methods().is_empty());
     }
 
