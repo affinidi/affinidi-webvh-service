@@ -3,6 +3,8 @@ mod control_client;
 pub mod did;
 pub mod did_ops;
 pub mod didcomm_types;
+#[cfg(feature = "server-core")]
+pub mod did_hosting_tasks;
 mod error;
 mod types;
 mod watcher_client;
