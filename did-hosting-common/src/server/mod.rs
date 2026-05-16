@@ -21,6 +21,7 @@ pub mod setup_prompts;
 pub mod setup_recipe;
 pub mod stats_collector;
 pub mod store;
+pub mod trust_task;
 pub mod vta_setup;
 
 /// Axum middleware that sets security response headers on every response.

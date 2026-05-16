@@ -42,6 +42,35 @@ pub enum AppError {
 
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
+
+    // ---- Trust-Tasks transport errors (REST `Trust-Task:` header) ----
+    //
+    // Surfaced by `super::trust_task` (router + extractor). The router
+    // enforces exact-match at attach time; the response body for these
+    // variants is structured (`{ "error": "<VariantName>", ... }`) so
+    // callers can switch on the discriminant without parsing prose.
+
+    /// `Trust-Task` header was absent on a route that requires it.
+    /// Renders to 400 Bad Request with body `{ "error": "TrustTaskMissing" }`.
+    #[error("Trust-Task header missing")]
+    TrustTaskMissing,
+
+    /// `Trust-Task` header was present but malformed (non-HTTPS, empty,
+    /// or contained control characters). Carries the offending value so
+    /// callers can debug. Renders to 400 with body
+    /// `{ "error": "TrustTaskMalformed", "received": "..." }`.
+    #[error("Trust-Task header malformed: {0}")]
+    TrustTaskMalformed(String),
+
+    /// `Trust-Task` header was well-formed but did not exact-match the
+    /// route's registered task. Renders to 415 Unsupported Media Type
+    /// with body `{ "error": "TrustTaskMismatch", "expected": "...",
+    /// "received": "..." }`.
+    #[error("Trust-Task header mismatch: expected {expected}, got {received:?}")]
+    TrustTaskMismatch {
+        expected: String,
+        received: Option<String>,
+    },
 }
 
 /// Semantic tags for finer-grained error classification without string matching.
@@ -207,6 +236,9 @@ impl IntoResponse for AppError {
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
+            AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
+            AppError::TrustTaskMalformed(_) => StatusCode::BAD_REQUEST,
+            AppError::TrustTaskMismatch { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         };
 
         if status.is_server_error() {
@@ -217,7 +249,22 @@ impl IntoResponse for AppError {
 
         debug!(status = %status.as_u16(), error = %self, "client error");
 
-        let body = serde_json::json!({ "error": self.user_message() });
+        // Trust-Task variants use a structured body so callers can switch
+        // on the discriminant. Match the VTI canonical impl's shape so
+        // the parity harness in T9 can assert byte-equivalent responses.
+        let body = match &self {
+            AppError::TrustTaskMissing => serde_json::json!({ "error": "TrustTaskMissing" }),
+            AppError::TrustTaskMalformed(received) => serde_json::json!({
+                "error": "TrustTaskMalformed",
+                "received": received,
+            }),
+            AppError::TrustTaskMismatch { expected, received } => serde_json::json!({
+                "error": "TrustTaskMismatch",
+                "expected": expected,
+                "received": received,
+            }),
+            _ => serde_json::json!({ "error": self.user_message() }),
+        };
         (status, axum::Json(body)).into_response()
     }
 }
