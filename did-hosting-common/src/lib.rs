@@ -5,6 +5,7 @@ pub mod did_ops;
 pub mod didcomm_types;
 #[cfg(feature = "server-core")]
 pub mod did_hosting_tasks;
+pub mod method;
 #[cfg(feature = "server-core")]
 pub mod v1_aliases;
 mod error;
