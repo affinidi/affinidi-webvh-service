@@ -4,6 +4,7 @@ pub mod cli_acl;
 pub mod config;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;
+pub mod domain;
 pub mod error;
 pub mod health;
 pub mod init;
