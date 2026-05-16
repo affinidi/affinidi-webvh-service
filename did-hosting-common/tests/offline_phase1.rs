@@ -133,7 +133,7 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
     // Persist via the plaintext store the recipe's [secrets] section
     // resolves to. This is the same code path the per-binary
     // `persist_offline_prepare` helper takes.
-    let secrets_cfg = secrets_for_test();
+    let secrets_cfg = secrets_for_test("phase1");
     let store = create_secret_store(&secrets_cfg, &config_path).expect("plaintext store");
     store
         .set_bootstrap_seed(&info.seed)
@@ -150,15 +150,33 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
         .expect("get_bootstrap_seed must succeed")
         .expect("seed should be present after phase 1 set");
     assert_eq!(recovered, info.seed, "seed round-trip failed");
+
+    // Leave the keyring tidy. Per-invocation UUID scope means a leaked
+    // entry would never collide with another test, but cleanup keeps
+    // `security dump-keychain` honest.
+    let _ = store2.clear_bootstrap_seed().await;
 }
 
-/// Helper: matches the SecretsConfig the recipe resolver would produce
-/// for `backend = "plaintext"` in this test process. Built explicitly
-/// here so the test doesn't depend on which `[secrets]` defaults the
-/// schema chooses.
-fn secrets_for_test() -> SecretsConfig {
+/// Helper: per-test-invocation SecretsConfig with a unique `keyring_service`
+/// scope.
+///
+/// Why unique-per-invocation: with the `keyring` feature compiled in (the
+/// default on dev hosts), `create_secret_store` always returns the keyring
+/// backend regardless of `SecretsConfig` shape. The OS keyring is process-
+/// global, so two `#[tokio::test]` cases sharing a fixed scope name see
+/// each other's entries — phase 1 writes a seed, phase 2 expects no seed,
+/// and parallel execution leaks state between them.
+///
+/// UUID per invocation also handles re-runs cleanly: a previous crashed
+/// run leaves stale keyring entries under its own UUID, and the next
+/// run gets a fresh scope.
+///
+/// The caller is responsible for `clear_bootstrap_seed()` at end-of-test
+/// to leave the keyring tidy. Tests that don't write a seed can skip the
+/// cleanup (clearing an absent entry is a no-op).
+fn secrets_for_test(scope: &str) -> SecretsConfig {
     SecretsConfig {
-        keyring_service: "webvh-test".to_string(),
+        keyring_service: format!("did-hosting-test-{}-{}", scope, uuid::Uuid::new_v4()),
         ..SecretsConfig::default()
     }
 }
@@ -172,10 +190,12 @@ async fn phase2_seed_missing_when_phase1_not_run_yields_none() {
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, "").unwrap();
 
-    let secrets_cfg = secrets_for_test();
+    let secrets_cfg = secrets_for_test("phase2");
     let store = create_secret_store(&secrets_cfg, &config_path).expect("plaintext store");
     assert!(
         store.get_bootstrap_seed().await.unwrap().is_none(),
         "no phase 1 ran — seed must be absent"
     );
+    // No seed was written; cleanup is a no-op but keeps the pattern uniform.
+    let _ = store.clear_bootstrap_seed().await;
 }
