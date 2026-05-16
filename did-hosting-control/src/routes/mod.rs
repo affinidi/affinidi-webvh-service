@@ -2,6 +2,7 @@ mod acl;
 mod auth;
 mod did_manage;
 mod didcomm;
+mod domain;
 pub mod health;
 mod passkey;
 mod proxy;
@@ -74,6 +75,15 @@ pub fn router_without_fallback() -> Router<AppState> {
         // ACL
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
+        // Domains (multi-domain)
+        //
+        // T17 lands the two read endpoints. Mutating routes (create /
+        // update / disable / set-default / purge) come in T33 as
+        // Trust-Task-bound endpoints. T8b wraps these in
+        // TrustTaskRouter::route_with_task(... TASK_DOMAIN_LIST_1_0 /
+        // TASK_ME_DOMAINS_1_0).
+        .route("/domains", get(domain::list_domains))
+        .route("/me/domains", get(domain::list_my_domains))
         // DID management (authenticated)
         .route("/dids/check", post(did_manage::check_name))
         .route(
