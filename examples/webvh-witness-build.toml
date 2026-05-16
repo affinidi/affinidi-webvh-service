@@ -4,7 +4,7 @@
 #
 # Drives `webvh-witness setup --from <this-file>` non-interactively.
 # The witness signs DID-log integrity proofs. Its DID is hosted on a
-# webvh-server (set `did_hosting_url`).
+# did-hosting-server (set `did_hosting_url`).
 #
 # SECURITY: This file contains NO secrets.
 # ============================================================================
@@ -34,7 +34,7 @@ did_path = "services/witness"
 did = "did:webvh:vta.example.com"
 context_id = "webvh"
 
-# Air-gapped flow — see webvh-server-build.toml for the full pattern.
+# Air-gapped flow — see did-hosting-server-build.toml for the full pattern.
 
 [secrets]
 backend = "keyring"

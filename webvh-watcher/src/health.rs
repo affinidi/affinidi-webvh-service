@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use affinidi_webvh_common::server::health;
+use did_hosting_common::server::health;
 
 use crate::config::AppConfig;
 

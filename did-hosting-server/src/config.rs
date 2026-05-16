@@ -1,0 +1,234 @@
+use crate::error::AppError;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+// Re-export shared config types so existing code can still use `crate::config::*`
+pub use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
+    VtaConfig,
+};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub features: FeaturesConfig,
+    pub server_did: Option<String>,
+    pub mediator_did: Option<String>,
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default)]
+    pub store: StoreConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
+    pub watchers: Vec<WatcherEndpoint>,
+    /// URL of the control plane for service registration.
+    pub control_url: Option<String>,
+    /// DID of the control plane service (for DIDComm authentication).
+    pub control_did: Option<String>,
+    #[serde(default)]
+    pub vta: VtaConfig,
+    #[serde(skip)]
+    pub config_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WatcherEndpoint {
+    pub url: String,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LimitsConfig {
+    /// Maximum body size (bytes) for did.jsonl / witness uploads. Default: 100KB.
+    #[serde(default = "default_upload_body_limit")]
+    pub upload_body_limit: usize,
+    /// Default per-account total DID document size (bytes). Default: 1MB.
+    #[serde(default = "default_max_total_size")]
+    pub default_max_total_size: u64,
+    /// Default per-account maximum number of DIDs. Default: 20.
+    #[serde(default = "default_max_did_count")]
+    pub default_max_did_count: u64,
+}
+
+fn default_upload_body_limit() -> usize {
+    102_400
+}
+
+fn default_max_total_size() -> u64 {
+    1_048_576
+}
+
+fn default_max_did_count() -> u64 {
+    20
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            upload_body_limit: default_upload_body_limit(),
+            default_max_total_size: default_max_total_size(),
+            default_max_did_count: default_max_did_count(),
+        }
+    }
+}
+
+/// Stats collection and sync configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StatsConfig {
+    /// How often (seconds) to flush in-memory counters to storage. Default: 5.
+    #[serde(default = "default_stats_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// How often (seconds) to push aggregate stats to the control plane. Default: 1.
+    /// Set to 0 to disable sync.
+    #[serde(default = "default_stats_sync_interval")]
+    pub sync_interval_secs: u64,
+}
+
+fn default_stats_flush_interval() -> u64 {
+    5
+}
+
+fn default_stats_sync_interval() -> u64 {
+    1
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: default_stats_flush_interval(),
+            sync_interval_secs: default_stats_sync_interval(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Return the public-facing base URL for this server.
+    pub fn public_base_url(&self) -> String {
+        self.public_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:{}", self.server.host, self.server.port))
+    }
+
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = config_path
+            .or_else(|| std::env::var("DID_HOSTING_CONFIG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("config.toml"));
+
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "configuration file not found: {}",
+                path.display()
+            )));
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(AppError::Io)?;
+        let mut config = toml::from_str::<AppConfig>(&contents)
+            .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
+
+        config.config_path = path.clone();
+
+        // Apply shared env overrides for common config fields
+        did_hosting_common::server::config::apply_env_overrides(
+            "WEBVH",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            &mut config.auth,
+            &mut config.secrets,
+        )?;
+
+        // Server identity (did-hosting-server specific env vars)
+        macro_rules! env_opt {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = Some(v);
+                }
+            };
+        }
+        macro_rules! env_parse {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = v
+                        .parse()
+                        .map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
+                }
+            };
+        }
+
+        env_opt!("DID_HOSTING_SERVER_DID", config.server_did);
+        env_opt!("DID_HOSTING_MEDIATOR_DID", config.mediator_did);
+        env_opt!("DID_HOSTING_PUBLIC_URL", config.public_url);
+        env_opt!("DID_HOSTING_CONTROL_URL", config.control_url);
+        env_opt!("DID_HOSTING_CONTROL_DID", config.control_did);
+
+        // VTA config
+        env_opt!("DID_HOSTING_VTA_URL", config.vta.url);
+        env_opt!("DID_HOSTING_VTA_DID", config.vta.did);
+        env_opt!("DID_HOSTING_VTA_CONTEXT_ID", config.vta.context_id);
+
+        // Limits
+        env_parse!(
+            "DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT",
+            config.limits.upload_body_limit
+        );
+        env_parse!(
+            "DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE",
+            config.limits.default_max_total_size
+        );
+        env_parse!(
+            "DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT",
+            config.limits.default_max_did_count
+        );
+
+        // Stats
+        env_parse!(
+            "DID_HOSTING_STATS_FLUSH_INTERVAL_SECS",
+            config.stats.flush_interval_secs
+        );
+        env_parse!(
+            "DID_HOSTING_STATS_SYNC_INTERVAL_SECS",
+            config.stats.sync_interval_secs
+        );
+
+        // Validate configuration
+        config.auth.validate()?;
+        if let Some(ref did) = config.server_did
+            && !did.starts_with("did:")
+        {
+            return Err(AppError::Config(format!(
+                "server_did must start with 'did:': {did}"
+            )));
+        }
+        if let Some(ref url) = config.public_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            return Err(AppError::Config(format!(
+                "public_url must start with http:// or https://: {url}"
+            )));
+        }
+
+        // Normalize: strip trailing slashes from URLs
+        if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+        if let Some(ref mut url) = config.control_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+
+        Ok(config)
+    }
+}

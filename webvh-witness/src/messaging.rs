@@ -12,7 +12,7 @@ use affinidi_messaging_didcomm_service::{
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use affinidi_webvh_common::server::problem_report::log_problem_report;
+use did_hosting_common::server::problem_report::log_problem_report;
 
 use crate::acl::check_acl;
 use crate::auth::session::create_authenticated_session;

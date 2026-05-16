@@ -1,5 +1,5 @@
-use affinidi_webvh_witness::config::AppConfig;
-use affinidi_webvh_witness::{
+use webvh_witness::config::AppConfig;
+use webvh_witness::{
     health, secret_store, server, setup, setup_recipe, store, witness_ops,
 };
 use clap::{Parser, Subcommand};
@@ -139,7 +139,7 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "webvh-witness")]
         label: String,
-        /// DIDComm mediator DID. Bound to the `webvh-server` template's
+        /// DIDComm mediator DID. Bound to the `did-hosting-server` template's
         /// `MEDIATOR_DID` variable so the rendered DID document advertises
         /// the right mediator endpoint.
         #[arg(long)]
@@ -151,7 +151,7 @@ enum Command {
         context: String,
     },
     /// Export this witness's DID + signing/KA keys as an HPKE-sealed
-    /// migration bundle. See `webvh-server export-sealed` for semantics.
+    /// migration bundle. See `did-hosting-server export-sealed` for semantics.
     ExportSealed {
         /// Path to the receiver's bootstrap-request.json.
         #[arg(long)]
@@ -196,7 +196,7 @@ enum Command {
     /// Reads the armored bundle the operator ferried back, verifies the
     /// out-of-band digest, opens the HPKE sealed payload with the
     /// ephemeral seed, and emits the DID document + signed DID log for
-    /// import via `webvh-server bootstrap-did` on the hosting server.
+    /// import via `did-hosting-server bootstrap-did` on the hosting server.
     VtaOpen {
         /// Path to the ASCII-armored sealed bundle.
         #[arg(long)]
@@ -367,12 +367,12 @@ async fn main() {
             mediator_did,
             context,
         }) => {
-            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
+            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
                 &label,
                 "webvh-witness",
-                "webvh-server",
+                "did-hosting-server",
                 &[("MEDIATOR_DID", mediator_did.as_str())],
                 &context,
             )
@@ -390,14 +390,14 @@ async fn main() {
             did_log_out,
             secrets_out,
         }) => {
-            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_open_cli(
+            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_open_cli(
                 &bundle,
                 &expect_digest,
                 &seed,
                 &did_doc_out,
                 &did_log_out,
                 &secrets_out,
-                affinidi_webvh_common::server::vta_setup::OfflineOpenNextStep::Setup {
+                did_hosting_common::server::vta_setup::OfflineOpenNextStep::Setup {
                     binary: "webvh-witness",
                 },
             ) {
@@ -415,13 +415,13 @@ async fn run_add_acl(
     role: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    affinidi_webvh_common::server::cli_acl::run_add_acl(&config.store, did, role, None, None, None)
+    did_hosting_common::server::cli_acl::run_add_acl(&config.store, did, role, None, None, None)
         .await
 }
 
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    affinidi_webvh_common::server::cli_acl::run_list_acl(&config.store).await
+    did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
 }
 
 async fn run_remove_acl(
@@ -429,7 +429,7 @@ async fn run_remove_acl(
     did: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    affinidi_webvh_common::server::cli_acl::run_remove_acl(&config.store, did).await
+    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }
 
 async fn run_create_witness(
@@ -533,7 +533,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         }
     };
 
-    affinidi_webvh_common::server::config::init_tracing(&config.log);
+    did_hosting_common::server::config::init_tracing(&config.log);
 
     // Load secrets from the configured backend
     let secret_store = match secret_store::create_secret_store(&config) {
@@ -596,14 +596,14 @@ async fn run_export_sealed(
         .await?
         .ok_or("no secrets found — run setup first")?;
 
-    let info = affinidi_webvh_common::server::vta_setup::export_sealed_did_secrets(
+    let info = did_hosting_common::server::vta_setup::export_sealed_did_secrets(
         &request,
         &out,
         &producer_did,
         &producer_did,
         secrets.signing_key.clone(),
         secrets.key_agreement_key.clone(),
-        affinidi_webvh_common::server::vta_setup::ExportAssertionMode::DidSigned {
+        did_hosting_common::server::vta_setup::ExportAssertionMode::DidSigned {
             signing_key_multibase: secrets.signing_key.clone(),
             verification_method: format!("{producer_did}#key-0"),
         },
@@ -665,7 +665,7 @@ async fn run_import_sealed(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use affinidi_webvh_common::server::vta_setup::{
+    use did_hosting_common::server::vta_setup::{
         generate_ed25519_multibase, open_sealed_did_secrets,
     };
 

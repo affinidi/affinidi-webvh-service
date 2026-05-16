@@ -7,15 +7,15 @@ This document explains how to set up a complete WebVH environment with DIDComm-b
 - VTA (Verifiable Trust Agent) credentials for each service's context
   - Each service gets its own isolated VTA context
   - Credentials are base64url-encoded strings issued by the VTA operator
-- Compiled WebVH binaries: `webvh-server`, `webvh-control`, `webvh-witness`
+- Compiled WebVH binaries: `did-hosting-server`, `did-hosting-control`, `webvh-witness`
 - A public URL where the server will serve DIDs (e.g., `https://did.example.com`)
 
 ## Architecture Overview
 
 Services authenticate with each other using DIDComm challenge-response:
 
-- **webvh-control** — manages service registration, ACLs, and DID sync (set up first)
-- **webvh-server** — hosts DID documents at public URLs (set up second)
+- **did-hosting-control** — manages service registration, ACLs, and DID sync (set up first)
+- **did-hosting-server** — hosts DID documents at public URLs (set up second)
 - **webvh-witness** — provides witness proofs for DID log entries (optional, set up last)
 
 Each service connects to its own VTA context during setup, creates its own DID, retrieves keys, and stores them locally. No external PNM CLI is needed.
@@ -26,13 +26,13 @@ Each service connects to its own VTA context during setup, creates its own DID, 
 sequenceDiagram
     participant Admin
     participant VTA
-    participant Control as webvh-control
-    participant Server as webvh-server
+    participant Control as did-hosting-control
+    participant Server as did-hosting-server
     participant Witness as webvh-witness
 
     rect rgb(230, 240, 255)
         Note over Admin,VTA: Phase 1 — Control Plane Setup (first)
-        Admin->>Control: webvh-control setup
+        Admin->>Control: did-hosting-control setup
         Control->>VTA: Authenticate with VTA credential
         VTA->>Control: Session established
         Control->>VTA: Create control DID
@@ -42,7 +42,7 @@ sequenceDiagram
 
     rect rgb(235, 245, 255)
         Note over Admin,Server: Phase 2 — Server Setup
-        Admin->>Server: webvh-server setup
+        Admin->>Server: did-hosting-server setup
         Server->>VTA: Authenticate with VTA credential
         VTA->>Server: Session established
         Server->>VTA: Create server root DID
@@ -53,8 +53,8 @@ sequenceDiagram
 
     rect rgb(240, 248, 255)
         Note over Admin,Server: Phase 2b — Bootstrap Control DID on Server
-        Admin->>Server: webvh-server bootstrap-did<br/>--path services/control<br/>--did-log control-did.jsonl
-        Admin->>Control: webvh-control add-acl<br/>--did <server-did> --role admin
+        Admin->>Server: did-hosting-server bootstrap-did<br/>--path services/control<br/>--did-log control-did.jsonl
+        Admin->>Control: did-hosting-control add-acl<br/>--did <server-did> --role admin
     end
 
     rect rgb(245, 255, 245)
@@ -65,13 +65,13 @@ sequenceDiagram
         Witness->>VTA: Create witness DID
         VTA->>Witness: DID + signing key + KA key + log entry
         Witness->>Admin: Writes witness-did.jsonl
-        Admin->>Server: webvh-server bootstrap-did<br/>--path services/witness<br/>--did-log witness-did.jsonl
+        Admin->>Server: did-hosting-server bootstrap-did<br/>--path services/witness<br/>--did-log witness-did.jsonl
     end
 
     rect rgb(255, 248, 240)
         Note over Server,Control: Phase 4 — Start Services
-        Admin->>Server: Start webvh-server
-        Admin->>Control: Start webvh-control
+        Admin->>Server: Start did-hosting-server
+        Admin->>Control: Start did-hosting-control
         Admin->>Witness: Start webvh-witness
         Server->>Control: DIDComm challenge-response auth
         Control->>Server: JWT access token
@@ -84,12 +84,12 @@ sequenceDiagram
 ### Phase 1: Control Plane (set up first — other services need its DID)
 
 ```bash
-webvh-control setup
+did-hosting-control setup
 ```
 
 The wizard prompts for:
 1. **VTA credential** — base64url string for the control plane's VTA context
-2. **DID hosting URL** — where webvh-server will serve DIDs (e.g., `https://did.example.com`)
+2. **DID hosting URL** — where did-hosting-server will serve DIDs (e.g., `https://did.example.com`)
 3. **DID path** — path on the server (default: `services/control`)
 4. **Public URL** — control plane's own URL for WebAuthn (e.g., `http://localhost:8532`)
 5. Host, port, log level, data directory, secrets backend
@@ -105,7 +105,7 @@ Output:
 ### Phase 2: Server (set up second — hosts all DIDs)
 
 ```bash
-webvh-server setup
+did-hosting-server setup
 ```
 
 The wizard prompts for:
@@ -124,7 +124,7 @@ The wizard automatically creates the root DID and imports it at `.well-known`.
 Import the control plane's DID log entry onto the server:
 
 ```bash
-webvh-server bootstrap-did \
+did-hosting-server bootstrap-did \
   --path services/control \
   --did-log control-did.jsonl
 ```
@@ -132,7 +132,7 @@ webvh-server bootstrap-did \
 Grant the server admin access to the control plane:
 
 ```bash
-webvh-control add-acl --did <server-DID> --role admin
+did-hosting-control add-acl --did <server-DID> --role admin
 ```
 
 Replace `<server-DID>` with the DID printed during server setup.
@@ -153,7 +153,7 @@ The wizard prompts for:
 Import the witness DID on the server:
 
 ```bash
-webvh-server bootstrap-did \
+did-hosting-server bootstrap-did \
   --path services/witness \
   --did-log witness-did.jsonl
 ```
@@ -162,10 +162,10 @@ webvh-server bootstrap-did \
 
 ```bash
 # Terminal 1
-webvh-server --config config.toml
+did-hosting-server --config config.toml
 
 # Terminal 2
-webvh-control --config config.toml
+did-hosting-control --config config.toml
 
 # Terminal 3 (if witness is configured)
 webvh-witness --config config.toml
@@ -178,7 +178,7 @@ On startup, the server will:
 
 ## Daemon Mode (All-in-One)
 
-For development or simple deployments, use `webvh-daemon` which runs all services in a single process:
+For development or simple deployments, use `did-hosting-daemon` which runs all services in a single process:
 
 ```toml
 # daemon-config.toml
@@ -198,7 +198,7 @@ watcher = false
 ```
 
 ```bash
-webvh-daemon --config daemon-config.toml
+did-hosting-daemon --config daemon-config.toml
 ```
 
 In daemon mode, inter-service communication happens in-process without network calls.
@@ -217,14 +217,14 @@ For deployments that don't have a parent VTA bootstrapping the daemon's own iden
 | `[vta]` config table | Required (`url`, `did`, `context_id`) | Empty / omitted |
 | Tenant DID provisioning | External tenant VTAs DIDComm in to provision tenant DIDs | **Identical** — external tenant VTAs can still DIDComm in. Self-managed only changes how the daemon obtains *its own* identity, not how it serves tenants. |
 
-**Daemon-only.** `webvh-server`, `webvh-control`, `webvh-witness` standalone binaries reject the self-managed setup choice with a clear error in v1. If you want a no-VTA deployment, run `webvh-daemon`.
+**Daemon-only.** `did-hosting-server`, `did-hosting-control`, `webvh-witness` standalone binaries reject the self-managed setup choice with a clear error in v1. If you want a no-VTA deployment, run `did-hosting-daemon`.
 
 **No migration path.** A self-managed daemon cannot be migrated onto a VTA later; the mode is permanent at setup time. (If you need to switch, start a fresh deployment.)
 
 ### Setup walkthrough
 
 ```bash
-webvh-daemon setup
+did-hosting-daemon setup
 ```
 
 When the wizard asks _"How will the daemon obtain its identity?"_, choose:
@@ -243,18 +243,18 @@ The wizard does **not** seed an admin DID into the ACL. Self-managed mode uses p
 
 ```bash
 # 1. Start the daemon
-webvh-daemon --config config.toml
+did-hosting-daemon --config config.toml
 
 # 2. In another terminal, mint your first admin enrolment URL.
 #    <ADMIN_DID> is the DID the admin will authenticate as
 #    (typically a did:key from a wallet you control).
-webvh-daemon invite --did <ADMIN_DID> --role admin --config config.toml
+did-hosting-daemon invite --did <ADMIN_DID> --role admin --config config.toml
 
 # 3. Open the printed enrolment URL in a browser and bind a passkey.
 #    Subsequent admin login uses the passkey.
 ```
 
-The `invite` subcommand is the single source of truth for admin onboarding — re-run it any time the operator needs another admin. Lost the URL before redeeming? Just run `webvh-daemon invite` again to mint a new one.
+The `invite` subcommand is the single source of truth for admin onboarding — re-run it any time the operator needs another admin. Lost the URL before redeeming? Just run `did-hosting-daemon invite` again to mint a new one.
 
 ### Config shape
 
@@ -299,9 +299,9 @@ setup, cloud credentials come from the environment.
 ```bash
 # Run setup with no prompts. For online VTA mode, phase 1 still mints
 # the ephemeral did:key separately; the recipe drives phase 2.
-webvh-server setup --setup-key-out setup.key --context webvh
+did-hosting-server setup --setup-key-out setup.key --context webvh
 # (operator enrols the printed did:key at the VTA)
-webvh-server setup --from examples/webvh-server-build.toml \
+did-hosting-server setup --from examples/did-hosting-server-build.toml \
                    --setup-key-file setup.key
 ```
 
@@ -309,7 +309,7 @@ For VTA-less deployments the daemon supports `vta_mode = "self-managed"`:
 
 ```bash
 # No phase-1 / phase-2; the daemon generates its own keys.
-webvh-daemon setup --from examples/webvh-daemon-build.toml
+did-hosting-daemon setup --from examples/did-hosting-daemon-build.toml
 ```
 
 For fully **air-gapped** deployments — where the CI runner has no VTA
@@ -319,7 +319,7 @@ non-interactively from the same recipe file:
 ```bash
 # Phase 1: write a sealed bootstrap request. Persists the ephemeral
 # seed to the configured secret backend. Exits.
-webvh-server setup --from recipe.toml
+did-hosting-server setup --from recipe.toml
 #   ▶ recipe.toml has  [deployment].vta_mode = "offline-prepare"
 #                      [vta].request_path    = "bootstrap-request.json"
 
@@ -328,7 +328,7 @@ webvh-server setup --from recipe.toml
 
 # Phase 2: same recipe, switched to offline-complete + bundle fields.
 # The seed comes back out of the same secret backend automatically.
-webvh-server setup --from recipe.toml
+did-hosting-server setup --from recipe.toml
 #   ▶ recipe.toml now has  [deployment].vta_mode = "offline-complete"
 #                          [vta].bundle_path     = "bundle.armor"
 #                          [vta].expect_digest   = "<hex-sha256>"
@@ -342,9 +342,9 @@ Recipes are shipped under `examples/`:
 
 | Recipe | Drives |
 |---|---|
-| `webvh-daemon-build.toml`  | `webvh-daemon setup --from` |
-| `webvh-server-build.toml`  | `webvh-server setup --from` |
-| `webvh-control-build.toml` | `webvh-control setup --from` |
+| `did-hosting-daemon-build.toml`  | `did-hosting-daemon setup --from` |
+| `did-hosting-server-build.toml`  | `did-hosting-server setup --from` |
+| `did-hosting-control-build.toml` | `did-hosting-control setup --from` |
 | `webvh-witness-build.toml` | `webvh-witness setup --from` |
 | `webvh-watcher-build.toml` | `webvh-watcher setup --from` |
 
@@ -397,8 +397,8 @@ Bootstraps a complete environment from scratch — no DID resolution, no DIDComm
 
 ### Prerequisites
 
-- Compiled binaries: `vta`, `webvh-server`, `mediator-setup-vta`, `mediator`
-- A minimal `config.toml` for the webvh-server (`public_url`, `[server]`, `[store]`, `[secrets]`)
+- Compiled binaries: `vta`, `did-hosting-server`, `mediator-setup-vta`, `mediator`
+- A minimal `config.toml` for the did-hosting-server (`public_url`, `[server]`, `[store]`, `[secrets]`)
 - A `mediator.toml` for the mediator (use the template in `conf/mediator.toml`)
 - Redis running (required by the mediator)
 
@@ -428,19 +428,19 @@ You should now have:
 
 ```bash
 # Import the server's keys
-webvh-server import-secrets --config config.toml \
+did-hosting-server import-secrets --config config.toml \
   --vta-bundle <server-secrets-bundle>
 
 # Load all three DIDs
-webvh-server load-did --path .well-known --did-log did-server.jsonl
-webvh-server load-did --path <vta-path> --did-log did-vta.jsonl
-webvh-server load-did --path <mediator-path> --did-log did-mediator.jsonl
+did-hosting-server load-did --path .well-known --did-log did-server.jsonl
+did-hosting-server load-did --path <vta-path> --did-log did-vta.jsonl
+did-hosting-server load-did --path <mediator-path> --did-log did-mediator.jsonl
 ```
 
 ### Step 4: Start the WebVH Server
 
 ```bash
-webvh-server --config config.toml
+did-hosting-server --config config.toml
 ```
 
 All three DIDs are now resolvable via HTTP.
@@ -455,7 +455,7 @@ When prompted:
 1. Paste the **mediator secrets bundle**
 2. Paste the **VTA credential**
 3. Choose a storage backend (string/AWS/keyring)
-4. Provide `did-mediator.jsonl` path — enables the mediator to resolve its own DID locally, so it can restart independently of the webvh-server
+4. Provide `did-mediator.jsonl` path — enables the mediator to resolve its own DID locally, so it can restart independently of the did-hosting-server
 5. Enter the VTA context ID (e.g., `mediator`)
 
 ### Step 6: Start the Mediator
@@ -478,19 +478,19 @@ All services can now resolve each other. DIDComm is fully operational.
 
 After all services are running:
 
-- **Register the webvh-server with the VTA** (required for creating new DIDs via VTA):
+- **Register the did-hosting-server with the VTA** (required for creating new DIDs via VTA):
   ```bash
   vta webvh add-server --id <server-id> --did <server-did>
   ```
 - **Change the mediator JWT key** for production — update `jwt_authorization_secret` in `mediator.toml`
-- **Optional:** Pass `--vta-credential` to `webvh-server import-secrets` if you want the server to refresh keys from the VTA automatically on restart
+- **Optional:** Pass `--vta-credential` to `did-hosting-server import-secrets` if you want the server to refresh keys from the VTA automatically on restart
 
 ### Restart Behavior
 
 All services restart cleanly during normal operations:
 
 - **WebVH server** — loads DIDs from persistent store, re-registers with control plane in background
-- **Mediator** — fetches fresh secrets from VTA if available, falls back to cache if VTA is down. Resolves own DID from local document (no webvh-server dependency)
+- **Mediator** — fetches fresh secrets from VTA if available, falls back to cache if VTA is down. Resolves own DID from local document (no did-hosting-server dependency)
 - **VTA** — DIDComm retries mediator connection with backoff. REST API works immediately
 
 ### Cold-Start Summary
@@ -499,8 +499,8 @@ All services restart cleanly during normal operations:
 |------|--------|----------|------------------|
 | 1 | `vta setup` | No | None |
 | 2 | `vta create-did-webvh` (×2) | No | None |
-| 3 | `webvh-server import-secrets` + `load-did` (×3) | No | None |
-| 4 | Start webvh-server | No | WebVH |
+| 3 | `did-hosting-server import-secrets` + `load-did` (×3) | No | None |
+| 4 | Start did-hosting-server | No | WebVH |
 | 5 | `mediator-setup-vta --import-bundle` | No | WebVH |
 | 6 | Start mediator | Yes (DID resolution) | WebVH, Mediator |
 | 7 | Start VTA | Yes (DID resolution) | All |
@@ -527,24 +527,24 @@ curl -H "Authorization: Bearer <token>" \
 
 ### Check ACL entries
 ```bash
-webvh-server list-acl
-webvh-control list-acl
+did-hosting-server list-acl
+did-hosting-control list-acl
 ```
 
 ## Environment Variables
 
-### webvh-server
+### did-hosting-server
 | Variable | Description |
 |----------|-------------|
-| `WEBVH_SERVER_DID` | Server's DID |
-| `WEBVH_PUBLIC_URL` | Public-facing URL |
-| `WEBVH_CONTROL_URL` | Control plane URL |
-| `WEBVH_CONTROL_DID` | Control plane's DID |
-| `WEBVH_VTA_URL` | VTA REST URL |
-| `WEBVH_VTA_DID` | VTA DID for DIDComm |
-| `WEBVH_VTA_CONTEXT_ID` | VTA context ID |
+| `DID_HOSTING_SERVER_DID` | Server's DID |
+| `DID_HOSTING_PUBLIC_URL` | Public-facing URL |
+| `DID_HOSTING_CONTROL_URL` | Control plane URL |
+| `DID_HOSTING_CONTROL_DID` | Control plane's DID |
+| `DID_HOSTING_VTA_URL` | VTA REST URL |
+| `DID_HOSTING_VTA_DID` | VTA DID for DIDComm |
+| `DID_HOSTING_VTA_CONTEXT_ID` | VTA context ID |
 
-### webvh-control
+### did-hosting-control
 | Variable | Description |
 |----------|-------------|
 | `CONTROL_SERVER_DID` | Control plane's DID |
@@ -564,7 +564,7 @@ webvh-control list-acl
 
 ### Cloud secret backends (all binaries)
 
-The same env-var prefix that scopes `WEBVH_*` / `CONTROL_*` / `WITNESS_*`
+The same env-var prefix that scopes `DID_HOSTING_*` / `CONTROL_*` / `WITNESS_*`
 also scopes the cloud secret backends. Replace `<PREFIX>` below with
 `WEBVH`, `CONTROL`, `WITNESS`, or `DAEMON`.
 

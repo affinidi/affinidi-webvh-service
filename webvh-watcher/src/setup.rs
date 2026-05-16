@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use affinidi_webvh_common::server::setup_recipe::{
+use did_hosting_common::server::setup_recipe::{
     ServiceKind, SetupRecipe, load_recipe, require_service, to_log_format,
 };
 use dialoguer::{Confirm, Input, Select};
@@ -188,7 +188,7 @@ pub async fn run_from_recipe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let recipe = load_recipe(recipe_path)?;
     require_service(&recipe, ServiceKind::Watcher)?;
-    affinidi_webvh_common::server::setup_recipe::print_recipe_banner("webvh-watcher", &recipe);
+    did_hosting_common::server::setup_recipe::print_recipe_banner("webvh-watcher", &recipe);
     apply_recipe(&recipe, force_reprovision).await
 }
 
@@ -212,7 +212,7 @@ pub async fn apply_recipe(
         }
         // Back up before overwriting so the previous push tokens aren't
         // silently lost.
-        affinidi_webvh_common::server::setup_recipe::back_up_config(&output_path)?;
+        did_hosting_common::server::setup_recipe::back_up_config(&output_path)?;
     }
 
     let host = recipe

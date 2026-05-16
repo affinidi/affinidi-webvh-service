@@ -1,0 +1,226 @@
+use crate::auth::AuthClaims;
+use crate::did_ops::{self, LogEntryInfo, LogMetadata};
+use crate::error::AppError;
+use crate::server::AppState;
+use crate::watcher_push::{self, WatcherSyncStatus};
+use did_hosting_common::DidListEntry;
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use serde::{Deserialize, Serialize};
+
+/// Strip leading slash from path-extracted mnemonics.
+fn clean_mnemonic(m: &str) -> &str {
+    m.trim_start_matches('/')
+}
+
+// ---------- GET /dids/{mnemonic} ----------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidDetailResponse {
+    pub mnemonic: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version_count: u64,
+    pub did_id: Option<String>,
+    pub owner: String,
+    pub disabled: bool,
+    pub log: Option<LogMetadata>,
+    pub watcher_sync: Option<Vec<WatcherSyncStatus>>,
+}
+
+impl DidDetailResponse {
+    fn from_record(
+        record: did_ops::DidRecord,
+        log: Option<LogMetadata>,
+        watcher_sync: Option<Vec<WatcherSyncStatus>>,
+    ) -> Self {
+        Self {
+            mnemonic: record.mnemonic,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            version_count: record.version_count,
+            did_id: record.did_id,
+            owner: record.owner,
+            disabled: record.disabled,
+            log,
+            watcher_sync,
+        }
+    }
+}
+
+pub async fn get_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<Json<DidDetailResponse>, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    let result = did_ops::get_did_info(&auth, &state, mnemonic).await?;
+
+    let watcher_sync: Option<Vec<WatcherSyncStatus>> = state
+        .dids_ks
+        .get(did_ops::watcher_sync_key(mnemonic))
+        .await?;
+
+    Ok(Json(DidDetailResponse::from_record(
+        result.record,
+        result.log_metadata,
+        watcher_sync,
+    )))
+}
+
+// ---------- GET /dids/{mnemonic}/log ----------
+
+pub async fn get_did_log(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<Json<Vec<LogEntryInfo>>, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    let entries = did_ops::get_did_log(&auth, &state, mnemonic).await?;
+    Ok(Json(entries))
+}
+
+// ---------- PUT /dids/{mnemonic} ----------
+
+pub async fn upload_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    body: String,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::publish_did(&auth, &state, mnemonic, &body).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /dids/{mnemonic}/witness ----------
+
+pub async fn upload_witness(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    body: String,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::upload_witness(&auth, &state, mnemonic, &body).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- DELETE /dids/{mnemonic} ----------
+
+pub async fn delete_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::delete_did(&auth, &state, mnemonic).await?;
+    watcher_push::notify_watchers_delete(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /dids/{mnemonic}/disable ----------
+
+pub async fn disable_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::set_did_disabled(&auth, &state, mnemonic, true).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /dids/{mnemonic}/enable ----------
+
+pub async fn enable_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    did_ops::set_did_disabled(&auth, &state, mnemonic, false).await?;
+    watcher_push::notify_watchers_did(
+        &state.config,
+        &state.http_client,
+        &state.dids_ks,
+        mnemonic.to_string(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- GET /raw/{mnemonic} ----------
+
+pub async fn get_raw_log(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        String,
+    ),
+    AppError,
+> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    let content = did_ops::get_raw_log(&auth, &state, mnemonic).await?;
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        content,
+    ))
+}
+
+// ---------- GET /dids ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ListDidsQuery {
+    pub owner: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+pub async fn list_dids(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Query(query): Query<ListDidsQuery>,
+) -> Result<Json<Vec<DidListEntry>>, AppError> {
+    let entries = did_ops::list_dids(
+        &auth,
+        &state,
+        query.owner.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
+    Ok(Json(entries))
+}

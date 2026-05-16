@@ -1,0 +1,835 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+};
+use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
+use did_hosting_common::server::auth::extractor::AuthState;
+use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
+use did_hosting_common::server::init;
+use did_hosting_common::server::passkey::PasskeyState;
+use tokio_util::sync::CancellationToken;
+use webauthn_rs::prelude::Webauthn;
+
+use crate::auth::jwt::JwtKeys;
+use crate::auth::session::cleanup_expired_sessions;
+use crate::config::{AppConfig, AuthConfig};
+use crate::error::AppError;
+use crate::messaging;
+use crate::registry::{self, ServiceStatus};
+use crate::routes;
+use crate::secret_store::ServerSecrets;
+use crate::store::{KeyspaceHandle, Store};
+use tokio::sync::{oneshot, watch};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{Level, debug, error, info, warn};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Store,
+    pub sessions_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub registry_ks: KeyspaceHandle,
+    pub dids_ks: KeyspaceHandle,
+    pub config: Arc<AppConfig>,
+    pub did_resolver: Option<DIDCacheClient>,
+    pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub webauthn: Option<Arc<Webauthn>>,
+    pub http_client: reqwest::Client,
+    /// DIDComm service for inbound/outbound mediator messaging.
+    /// Wrapped in `OnceLock` so cloned states see it once it's initialized
+    /// (the service starts after REST + DIDComm router are already cloned).
+    pub didcomm_service: Arc<std::sync::OnceLock<DIDCommService>>,
+    /// In-memory stats collector — accumulates per-DID deltas from servers,
+    /// flushed periodically to the stats keyspace.
+    pub stats_collector: Arc<did_hosting_common::server::stats_collector::StatsCollector>,
+    /// Stats keyspace for persistent per-DID **aggregate** stats —
+    /// `stats:{mnemonic}` rows. Schema is `DidStats` (totals +
+    /// last_resolved_at + last_updated_at).
+    pub stats_ks: KeyspaceHandle,
+    /// Time-series keyspace for 5-minute aggregate buckets —
+    /// `ts:{mnemonic}:{bucket_epoch}` rows for per-DID buckets and
+    /// `ts:_all:{bucket_epoch}` for server-wide. Schema is
+    /// `{r: u64, u: u64}`. Split out from `stats_ks` in v0.7 so a
+    /// future `prefix_iter_raw("")` over either keyspace returns
+    /// homogeneous-shaped values rather than two different schemas.
+    pub timeseries_ks: KeyspaceHandle,
+    /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
+    ///
+    /// SECURITY: this is a raw 32-byte seed. `AppState` deliberately does
+    /// NOT derive `Debug` — adding it would format this field via the
+    /// default tuple printer and the seed would land in any subsequent
+    /// `tracing::*` macro that takes `?state` or `state = ?state`. If a
+    /// `Debug` derive is added later, wrap this in a redacting newtype
+    /// (or `secrecy::SecretBox`) at the same time.
+    pub signing_key_bytes: Option<[u8; 32]>,
+    /// Anti-replay cache for inbound DIDComm `(sender, msg.id)` pairs.
+    /// Both transports gate through it before dispatch to reject
+    /// captured-and-resubmitted envelopes within the freshness window.
+    pub replay_cache: Arc<crate::replay::ReplayCache>,
+    /// Per-mnemonic write lock. `register_did_atomic` (and any other
+    /// read-then-write operation on the same path) holds the lock for
+    /// the duration of its read + build + commit window so two
+    /// concurrent calls on the same path can't both observe
+    /// `existing == None` and both commit.
+    pub path_locks: crate::path_locks::PathLocks,
+    /// Bounded counter for pending DIDComm authentication challenges.
+    /// Replaces an O(N) prefix scan in `routes::auth::challenge` with
+    /// O(1) per-DID and global counters; closes the unauthenticated
+    /// challenge-endpoint storage-exhaustion + CPU-amplification
+    /// surface (review SM3).
+    pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
+    /// Per-IP rate limiter for the unauthenticated challenge endpoint.
+    /// Network-layer defence-in-depth that complements the per-DID +
+    /// global counters above. See `crate::rate_limit` for the
+    /// trusted-proxy / X-Forwarded-For policy.
+    pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
+}
+
+impl AppState {
+    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
+    pub fn require_didcomm_auth(
+        &self,
+    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
+        let did_resolver = self
+            .did_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
+        let secrets_resolver = self
+            .secrets_resolver
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
+        let jwt_keys = self
+            .jwt_keys
+            .as_ref()
+            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
+    }
+}
+
+impl AuthState for AppState {
+    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
+        self.jwt_keys.as_ref()
+    }
+
+    fn sessions_ks(&self) -> &KeyspaceHandle {
+        &self.sessions_ks
+    }
+}
+
+impl PasskeyState for AppState {
+    fn webauthn(&self) -> Option<&Arc<Webauthn>> {
+        self.webauthn.as_ref()
+    }
+
+    fn acl_ks(&self) -> &KeyspaceHandle {
+        &self.acl_ks
+    }
+
+    fn access_token_expiry(&self) -> u64 {
+        self.config.auth.access_token_expiry
+    }
+
+    fn refresh_token_expiry(&self) -> u64 {
+        self.config.auth.refresh_token_expiry
+    }
+
+    fn public_url(&self) -> Option<&str> {
+        self.config.public_url.as_deref()
+    }
+
+    fn enrollment_ttl(&self) -> u64 {
+        self.config.auth.passkey_enrollment_ttl
+    }
+}
+
+pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+    // Validate that at least one management interface is enabled
+    if !config.features.rest_api && !config.features.didcomm {
+        return Err(AppError::Config(
+            "at least one of 'rest_api' or 'didcomm' must be enabled in [features]".into(),
+        ));
+    }
+
+    #[cfg(feature = "ui")]
+    if !config.features.rest_api {
+        warn!("UI feature is compiled in but rest_api is disabled — UI will not be accessible");
+    }
+
+    // Open keyspace handles
+    let sessions_ks = store.keyspace("sessions")?;
+    let acl_ks = store.keyspace("acl")?;
+    let registry_ks = store.keyspace("registry")?;
+    let dids_ks = store.keyspace("dids")?;
+    let stats_ks = store.keyspace("stats")?;
+    // Time-series buckets live in their own keyspace from v0.7 — see
+    // the `timeseries_ks` field doc on `AppState`.
+    let timeseries_ks = store.keyspace("timeseries")?;
+
+    // Initialize DIDComm auth infrastructure (requires server_did)
+    let (did_resolver, secrets_resolver) =
+        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
+
+    // Initialize JWT keys
+    let jwt_keys = init::init_jwt_keys(&secrets);
+
+    // Initialize WebAuthn for passkeys
+    let webauthn = config.public_url.as_ref().and_then(|url| {
+        match did_hosting_common::server::passkey::build_webauthn(url) {
+            Ok(w) => {
+                info!("WebAuthn (passkey) auth enabled");
+                Some(Arc::new(w))
+            }
+            Err(e) => {
+                warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
+                None
+            }
+        }
+    });
+
+    // Bind TCP listener on the main thread
+    let std_listener = if config.features.rest_api {
+        let addr = format!("{}:{}", config.server.host, config.server.port);
+        let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
+        listener.set_nonblocking(true).map_err(AppError::Io)?;
+        info!("control plane listening addr={addr}");
+        Some(listener)
+    } else {
+        None
+    };
+
+    // Gather storage thread inputs before moving config into Arc
+    let storage_sessions_ks = sessions_ks.clone();
+    let storage_auth_config = config.auth.clone();
+    let has_auth = jwt_keys.is_some();
+
+    let stats_dids_ks = dids_ks.clone();
+    let state = AppState {
+        store: store.clone(),
+        sessions_ks,
+        acl_ks,
+        registry_ks,
+        dids_ks,
+        config: Arc::new(config),
+        did_resolver,
+        secrets_resolver,
+        jwt_keys,
+        webauthn,
+        // Disable redirect-following: combined with the proxy's
+        // Authorization-header passthrough, an attacker-registered backend
+        // URL must not be able to redirect the proxy onto a third-party host
+        // and harvest the forwarded JWT.
+        http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client construction must succeed"),
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
+        stats_collector: {
+            use did_hosting_common::server::stats_collector::{StatsAggregate, StatsCollector};
+            let collector = StatsCollector::new();
+            // Seed aggregate from stored per-DID stats
+            let mut total_resolves = 0u64;
+            let mut total_updates = 0u64;
+            let mut last_resolved_at: Option<u64> = None;
+            let mut last_updated_at: Option<u64> = None;
+            if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
+                for (_key, value) in raw {
+                    if let Ok(s) = serde_json::from_slice::<did_hosting_common::DidStats>(&value)
+                    {
+                        total_resolves += s.total_resolves;
+                        total_updates += s.total_updates;
+                        last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                        last_updated_at = match (last_updated_at, s.last_updated_at) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                }
+            }
+            let total_dids = stats_dids_ks
+                .prefix_iter_raw("did:")
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0) as u64;
+            collector.seed_aggregate(&StatsAggregate {
+                total_dids,
+                total_resolves,
+                total_updates,
+                last_resolved_at,
+                last_updated_at,
+            });
+            info!(
+                total_dids,
+                total_resolves, total_updates, "stats collector seeded from store"
+            );
+            Arc::new(collector)
+        },
+        stats_ks: stats_ks.clone(),
+        timeseries_ks: timeseries_ks.clone(),
+        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+        path_locks: crate::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+        ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+    };
+
+    // Seed registry from static config
+    seed_registry(&state).await;
+
+    // Log startup configuration
+    info!("--- enabled services ---");
+    info!(
+        "  REST API : {}",
+        if state.config.features.rest_api {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    info!(
+        "  DIDComm  : {}",
+        if state.config.features.didcomm {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(ref url) = state.config.public_url {
+        info!("  public URL   : {url}");
+    }
+    if let Some(ref did) = state.config.server_did {
+        info!("  control DID  : {did}");
+    }
+    if let Some(ref did) = state.config.mediator_did {
+        info!("  mediator DID : {did}");
+    }
+
+    // Shutdown channels
+    let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
+    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
+    let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
+
+    // 1. Spawn REST thread
+    let rest_handle = if let Some(listener) = std_listener {
+        let mut rest_shutdown = rest_shutdown_rx.clone();
+        let rest_state = state.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("control-rest".into())
+                .spawn(move || {
+                    run_rest_thread(listener, rest_state, &mut rest_shutdown, rest_ready_tx)
+                })
+                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
+        )
+    } else {
+        let _ = rest_ready_tx.send(());
+        None
+    };
+
+    // 2. Spawn storage thread (cleanup + stats flush)
+    let mut storage_shutdown = storage_shutdown_rx.clone();
+    let storage_stats_ks = state.stats_ks.clone();
+    let storage_timeseries_ks = state.timeseries_ks.clone();
+    let storage_dids_ks = state.dids_ks.clone();
+    let storage_collector = state.stats_collector.clone();
+    let storage_handle = std::thread::Builder::new()
+        .name("control-storage".into())
+        .spawn(move || {
+            run_storage_thread(
+                store,
+                storage_sessions_ks,
+                storage_stats_ks,
+                storage_timeseries_ks,
+                storage_dids_ks,
+                storage_auth_config,
+                has_auth,
+                storage_collector,
+                &mut storage_shutdown,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+
+    // Wait for REST to be ready before starting DIDComm
+    let _ = rest_ready_rx.await;
+
+    // 3. Start DIDComm service for inbound + outbound messages
+    let didcomm_shutdown = CancellationToken::new();
+    if state.config.features.didcomm {
+        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => {
+                let _ = state.didcomm_service.set(svc);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("failed to start DIDComm service: {e}");
+            }
+        }
+    }
+
+    // 4. Spawn DIDComm health check task (runs on main tokio runtime)
+    let health_shutdown = CancellationToken::new();
+    let health_token = health_shutdown.clone();
+    let health_registry_ks = state.registry_ks.clone();
+    let health_didcomm = state.didcomm_service.clone();
+    let health_control_did = state.config.server_did.clone();
+    let health_interval_secs = state.config.registry.health_check_interval.max(10);
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(health_interval_secs));
+        timer.tick().await; // skip first tick
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    if let Err(e) = run_health_checks(
+                        &health_registry_ks,
+                        &health_didcomm,
+                        health_control_did.as_deref(),
+                        health_interval_secs,
+                    ).await {
+                        warn!("health check error: {e}");
+                    }
+                }
+                _ = health_token.cancelled() => break,
+            }
+        }
+    });
+
+    // Wait for shutdown signal
+    init::shutdown_signal().await;
+
+    // Ordered shutdown: health → DIDComm → REST → Storage
+    let mut any_panic = false;
+
+    health_shutdown.cancel();
+    didcomm_shutdown.cancel();
+    // DIDCommService shutdown is handled by the cancellation token
+
+    let _ = rest_shutdown_tx.send(true);
+    if let Some(handle) = rest_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => info!("REST thread stopped"),
+            Ok(Err(_)) => {
+                error!("REST thread panicked");
+                any_panic = true;
+            }
+            Err(e) => {
+                error!("failed to join REST thread: {e}");
+                any_panic = true;
+            }
+        }
+    }
+
+    let _ = storage_shutdown_tx.send(true);
+    match tokio::task::spawn_blocking(move || storage_handle.join()).await {
+        Ok(Ok(())) => info!("storage thread stopped"),
+        Ok(Err(_)) => {
+            error!("storage thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join storage thread: {e}");
+            any_panic = true;
+        }
+    }
+
+    if any_panic {
+        return Err(AppError::Internal("one or more threads panicked".into()));
+    }
+
+    info!("control plane shut down");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DIDComm service startup (inbound)
+// ---------------------------------------------------------------------------
+
+pub async fn start_didcomm_service(
+    state: &AppState,
+    secrets: &ServerSecrets,
+    shutdown: CancellationToken,
+) -> Result<Option<DIDCommService>, AppError> {
+    let control_did = match &state.config.server_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("DIDComm not configured — server_did not set");
+            return Ok(None);
+        }
+    };
+
+    let mediator_did = match &state.config.mediator_did {
+        Some(did) => did.as_str(),
+        None => {
+            info!("mediator_did not configured — DIDComm messaging disabled");
+            return Ok(None);
+        }
+    };
+
+    info!(
+        control_did = control_did,
+        mediator_did = mediator_did,
+        "building TDK profile for DIDComm"
+    );
+
+    // Block until the mediator DID document is resolvable. On a cold start
+    // the mediator DID may be hosted by a did-hosting-server that has not yet
+    // published its log, so we retry instead of starting the listener
+    // against an unreachable mediator (which surfaces as a cryptic
+    // "No Mediator is configured for this Profile" later).
+    if let Some(resolver) = state.did_resolver.as_ref() {
+        wait_for_did_resolution(mediator_did, "mediator", resolver, &shutdown).await?;
+    }
+
+    let profile = build_tdk_profile(
+        "control",
+        control_did,
+        Some(mediator_did),
+        secrets,
+        state.did_resolver.as_ref(),
+    )
+    .await?;
+
+    info!("TDK profile built, configuring DIDComm listener");
+
+    let listener = ListenerConfig {
+        id: "control".into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        ..Default::default()
+    };
+
+    let router = messaging::build_control_router(state.clone())
+        .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
+
+    info!("starting DIDComm service with mediator connection");
+
+    let svc = DIDCommService::start(
+        DIDCommServiceConfig {
+            listeners: vec![listener],
+        },
+        router,
+        shutdown,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+
+    info!("DIDComm service started for {control_did}");
+    Ok(Some(svc))
+}
+
+// ---------------------------------------------------------------------------
+// Registry seeding
+// ---------------------------------------------------------------------------
+
+/// Seed the registry with statically configured instances.
+pub async fn seed_registry(state: &AppState) {
+    for instance_config in &state.config.registry.instances {
+        let service_type = match instance_config.service_type.as_str() {
+            "server" => registry::ServiceType::Server,
+            "witness" => registry::ServiceType::Witness,
+            "watcher" => registry::ServiceType::Watcher,
+            other => {
+                warn!(service_type = %other, "unknown service type in registry config, skipping");
+                continue;
+            }
+        };
+
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let instance = registry::ServiceInstance {
+            instance_id,
+            service_type,
+            label: instance_config.label.clone(),
+            url: instance_config.url.clone(),
+            status: ServiceStatus::Active,
+            last_health_check: None,
+            registered_at: crate::auth::session::now_epoch(),
+            metadata: serde_json::Value::Null,
+        };
+
+        if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
+            warn!(url = %instance_config.url, error = %e, "failed to seed registry instance");
+        } else {
+            info!(
+                url = %instance_config.url,
+                service_type = %instance_config.service_type,
+                "seeded registry instance"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST thread
+// ---------------------------------------------------------------------------
+
+fn run_rest_thread(
+    std_listener: std::net::TcpListener,
+    state: AppState,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    ready_tx: oneshot::Sender<()>,
+) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("failed to build REST runtime");
+
+    rt.block_on(async {
+        info!("REST thread started");
+
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("failed to convert std TcpListener to tokio TcpListener");
+
+        let app = routes::router()
+            .with_state(state)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+                    .on_response(
+                        DefaultOnResponse::new()
+                            .level(Level::DEBUG)
+                            .latency_unit(tower_http::LatencyUnit::Millis),
+                    ),
+            )
+            .layer(axum::middleware::from_fn(
+                did_hosting_common::server::security_headers,
+            ));
+
+        let _ = ready_tx.send(());
+
+        let mut rx = shutdown_rx.clone();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
+
+        info!("REST thread shutting down");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Storage thread
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_storage_thread(
+    store: Store,
+    sessions_ks: KeyspaceHandle,
+    stats_ks: KeyspaceHandle,
+    timeseries_ks: KeyspaceHandle,
+    dids_ks: KeyspaceHandle,
+    auth_config: AuthConfig,
+    has_auth: bool,
+    collector: Arc<did_hosting_common::server::stats_collector::StatsCollector>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build storage runtime");
+
+    rt.block_on(async {
+        info!("storage thread started");
+
+        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
+        let flush_interval = Duration::from_secs(10);
+
+        let mut session_timer = tokio::time::interval(session_interval);
+        let mut flush_timer = tokio::time::interval(flush_interval);
+
+        // Skip first tick (immediate)
+        session_timer.tick().await;
+        flush_timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = session_timer.tick(), if has_auth => {
+                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
+                        warn!("session cleanup error: {e}");
+                    }
+                }
+                _ = flush_timer.tick() => {
+                    // Flush accumulated per-DID stats deltas to persistent store
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await {
+                        warn!("stats flush error: {e}");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("storage thread shutting down");
+                    break;
+                }
+            }
+        }
+
+        // Final flush before shutdown
+        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await;
+
+        if let Err(e) = store.persist().await {
+            error!("failed to persist store on shutdown: {e}");
+        } else {
+            info!("store persisted");
+        }
+    });
+}
+
+/// Flush accumulated stats deltas from the in-memory collector to the store.
+///
+/// `stats_ks` receives `stats:{mnemonic}` aggregate rows;
+/// `timeseries_ks` receives `ts:{mnemonic}:{bucket}` and
+/// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
+/// future scan over either keyspace returns homogeneous-shaped values.
+/// fjall batches span keyspaces, so atomicity is preserved.
+pub async fn flush_stats_to_store(
+    collector: &did_hosting_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
+    let deltas = collector.drain_for_sync();
+    if deltas.is_empty() {
+        // Update total DID count even if no deltas
+        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+            collector.set_total_dids(dids.len() as u64);
+        }
+        return Ok(());
+    }
+
+    // Current 5-minute time-series bucket
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bucket_epoch = now / 300 * 300;
+
+    // Aggregate totals for the server-wide (_all) time-series bucket
+    let mut all_resolve_delta = 0u64;
+    let mut all_update_delta = 0u64;
+
+    let mut batch = store.batch();
+    for d in &deltas {
+        // Aggregate stats (totals) — stats_ks
+        let key = format!("stats:{}", d.mnemonic);
+        let mut stats: did_hosting_common::DidStats =
+            stats_ks.get(key.as_str()).await?.unwrap_or_default();
+        stats.total_resolves += d.resolve_delta;
+        stats.total_updates += d.update_delta;
+        if let Some(t) = d.last_resolved_at {
+            stats.last_resolved_at = Some(stats.last_resolved_at.map_or(t, |prev| prev.max(t)));
+        }
+        if let Some(t) = d.last_updated_at {
+            stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
+        }
+        batch.insert(stats_ks, key, &stats)?;
+
+        // Time-series bucket (per-DID) — timeseries_ks
+        if d.resolve_delta > 0 || d.update_delta > 0 {
+            let ts_key = format!("ts:{}:{bucket_epoch}", d.mnemonic);
+            let existing: serde_json::Value = timeseries_ks
+                .get(ts_key.as_str())
+                .await?
+                .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+            let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + d.resolve_delta;
+            let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + d.update_delta;
+            batch.insert(timeseries_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
+
+            all_resolve_delta += d.resolve_delta;
+            all_update_delta += d.update_delta;
+        }
+    }
+
+    // Server-wide time-series bucket (_all) — timeseries_ks
+    if all_resolve_delta > 0 || all_update_delta > 0 {
+        let all_key = format!("ts:_all:{bucket_epoch}");
+        let existing: serde_json::Value = timeseries_ks
+            .get(all_key.as_str())
+            .await?
+            .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+        let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + all_resolve_delta;
+        let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + all_update_delta;
+        batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
+    }
+
+    batch.commit().await?;
+
+    // Update total DID count (periodic reconciliation)
+    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+        collector.set_total_dids(dids.len() as u64);
+    }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
+
+    debug!(count = deltas.len(), "flushed stats deltas to store");
+    Ok(())
+}
+
+/// Send DIDComm health pings to all registered instances and evaluate
+/// staleness-based status from the last received pong timestamp.
+pub async fn run_health_checks(
+    registry_ks: &KeyspaceHandle,
+    didcomm: &std::sync::OnceLock<DIDCommService>,
+    control_did: Option<&str>,
+    health_interval_secs: u64,
+) -> Result<(), AppError> {
+    let instances = registry::list_instances(registry_ks).await?;
+    let now = crate::auth::session::now_epoch();
+
+    // Send health pings via DIDComm (fire-and-forget — pong handler updates status)
+    if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
+        for inst in &instances {
+            let server_did = match inst.metadata.get("did").and_then(|v| v.as_str()) {
+                Some(did) => did,
+                None => continue,
+            };
+
+            let msg = affinidi_messaging_didcomm::Message::build(
+                uuid::Uuid::new_v4().to_string(),
+                did_hosting_common::didcomm_types::MSG_HEALTH_PING.to_string(),
+                serde_json::json!({}),
+            )
+            .from(ctrl_did.to_string())
+            .to(server_did.to_string())
+            .created_time(now)
+            .finalize();
+
+            if let Err(e) = svc.send_message("control", msg, server_did).await {
+                debug!(
+                    instance_id = %inst.instance_id,
+                    server_did,
+                    error = %e,
+                    "failed to send health ping"
+                );
+            }
+        }
+    }
+
+    // Evaluate status based on last pong timestamp
+    for inst in &instances {
+        let new_status = registry::health_status_from_timestamp(inst, now, health_interval_secs);
+        if new_status != inst.status {
+            info!(
+                instance_id = %inst.instance_id,
+                old_status = ?inst.status,
+                new_status = ?new_status,
+                "instance status changed"
+            );
+            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now)
+                .await?;
+        }
+    }
+    Ok(())
+}

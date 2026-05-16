@@ -6,15 +6,15 @@ unreachable on the HTTP-signed path), H1 (correctness — error-code
 drift between dispatchers), M4 (design — encryption-asymmetry
 undocumented), SM2 (security — replay window unguarded on the
 HTTP-signed path), plus ~7 test-coverage gaps the test-engineer
-audit flagged for `webvh-control/src/routes/didcomm.rs`.
+audit flagged for `did-hosting-control/src/routes/didcomm.rs`.
 
 ## Background
 
-`webvh-control` exposes the same VTA DID-management protocol over
+`did-hosting-control` exposes the same VTA DID-management protocol over
 two transports:
 
 1. **Mediator-routed via the framework.**
-   `webvh-control/src/messaging.rs::build_control_router` registers a
+   `did-hosting-control/src/messaging.rs::build_control_router` registers a
    handler with `affinidi-messaging-didcomm-service`. Inbound
    messages arrive over a websocket from the configured mediator,
    already encrypted (`MessagePolicy::require_encrypted(true)`) and
@@ -22,7 +22,7 @@ two transports:
    provides reconnect, deduplication, and lifecycle management.
 
 2. **HTTP-signed via `POST /api/didcomm`.**
-   `webvh-control/src/routes/didcomm.rs::dispatch` accepts a JWS-
+   `did-hosting-control/src/routes/didcomm.rs::dispatch` accepts a JWS-
    signed-but-not-encrypted DIDComm envelope over plain HTTPS.
    Used by clients that authenticate over REST and don't have a
    mediator session.
@@ -113,7 +113,7 @@ re-applied), but observable.
 ### 1. Single dispatch function
 
 Extract a transport-agnostic dispatcher in
-`webvh-control/src/messaging/dispatch.rs` (new file):
+`did-hosting-control/src/messaging/dispatch.rs` (new file):
 
 ```rust
 pub async fn dispatch(
@@ -137,7 +137,7 @@ response).
 
 Replace both transports' `map_app_error_code` / `map_app_error`
 with one promoted function in
-`webvh-common/src/server/error.rs::AppError::didcomm_code(&self) -> &'static str`,
+`did-hosting-common/src/server/error.rs::AppError::didcomm_code(&self) -> &'static str`,
 backed by the existing `ValidationKind` tag system rather than
 substring matches. The `did_ops::*` business logic is updated to
 construct tagged validations (`AppError::validation(InvalidLog,
@@ -162,7 +162,7 @@ fails to parse, not on a missing JSONL field).
 
 ### 3. Replay cache
 
-New `webvh-control/src/messaging/replay.rs` module:
+New `did-hosting-control/src/messaging/replay.rs` module:
 
 ```rust
 pub struct ReplayCache { /* HashMap<(String, String), Instant> behind a Mutex */ }
@@ -256,7 +256,7 @@ Each commit independently passes `cargo test --workspace` and
 2. `unpack_signed`'s freshness window is currently fixed at 5
    minutes — should the replay TTL track that constant or be
    configurable separately? Recommend tracking it (single source
-   of truth in `webvh-common/src/server/didcomm_unpack.rs`).
+   of truth in `did-hosting-common/src/server/didcomm_unpack.rs`).
 3. The HTTP-signed transport is currently behind no rate limit
    (review SM3 flagged the `auth/challenge` endpoint specifically;
    this is a different but related surface). A `tower-governor`

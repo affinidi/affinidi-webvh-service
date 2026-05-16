@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use affinidi_webvh_common::server::init;
+use did_hosting_common::server::init;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
@@ -73,7 +73,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                             ),
                     )
                     .layer(axum::middleware::from_fn(
-                        affinidi_webvh_common::server::security_headers,
+                        did_hosting_common::server::security_headers,
                     ))
                     .route("/api/health", get(routes::health::health));
 

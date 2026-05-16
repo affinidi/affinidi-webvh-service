@@ -18,7 +18,7 @@ The protocol covers:
 
 ## Prerequisites
 
-- The client MUST have an authenticated session with the WebVH server, obtained via the existing [authentication protocol](../webvh-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
+- The client MUST have an authenticated session with the WebVH server, obtained via the existing [authentication protocol](../did-hosting-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
 - The client MUST possess a `did:key` identity with Ed25519 signing and X25519 key agreement keys.
 - The server MUST have a resolvable DID with key agreement capabilities for DIDComm encryption.
 

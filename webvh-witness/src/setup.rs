@@ -13,8 +13,8 @@ use crate::config::{
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
-use affinidi_webvh_common::server::operator_messages::WebvhWitnessMessages;
-use affinidi_webvh_common::server::vta_setup;
+use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
+use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
 /// Phase 1 of the headless setup flow: mint an ephemeral did:key,
@@ -109,7 +109,7 @@ pub async fn run_wizard(
 
     // 3. VTA online provision: prompt for VTA DID + context + mediator,
     //    mint ephemeral did:key, print PNM `contexts create` command,
-    //    drive run_provision with the `webvh-server` template.
+    //    drive run_provision with the `did-hosting-server` template.
     //    Headless phase 2 supplies a pre-loaded setup key.
     let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhWitnessMessages);
     let preloaded_setup_key = match preloaded_setup_key_file.as_deref() {
@@ -118,9 +118,9 @@ pub async fn run_wizard(
     };
     let (mediator_did, outcome) = run_online_provision(messages, preloaded_setup_key).await?;
 
-    // 4. DID hosting URL (where webvh-server serves DIDs)
+    // 4. DID hosting URL (where did-hosting-server serves DIDs)
     eprintln!();
-    eprintln!("  The witness DID will be hosted on your webvh-server.");
+    eprintln!("  The witness DID will be hosted on your did-hosting-server.");
     eprintln!();
     let did_hosting_url: String = Input::new()
         .with_prompt("DID hosting URL (e.g. https://did.example.com)")
@@ -197,7 +197,7 @@ pub async fn run_wizard(
 
     // 13. Secrets backend selection
     let secrets_config =
-        affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
             "webvh-witness-secrets",
             "webvh-witness",
         )
@@ -322,7 +322,7 @@ pub async fn run_wizard(
     eprintln!("  Next steps:");
     eprintln!("    1. Import this DID on the server:");
     eprintln!(
-        "       webvh-server bootstrap-did --path {} --did-log witness-did.jsonl",
+        "       did-hosting-server bootstrap-did --path {} --did-log witness-did.jsonl",
         did_path
     );
     eprintln!("    2. Start the witness:");
@@ -342,7 +342,7 @@ enum VtaMode {
     SelfManaged,
 }
 
-use affinidi_webvh_common::server::vta_setup::SELF_MANAGED_DAEMON_ONLY;
+use did_hosting_common::server::vta_setup::SELF_MANAGED_DAEMON_ONLY;
 
 fn prompt_vta_mode() -> Result<VtaMode, Box<dyn std::error::Error>> {
     let items = [
@@ -393,7 +393,7 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), Box<dy
 
 /// Run the online VTA provision-integration round-trip:
 /// prompt for VTA DID + context, resolve the VTA's mediator (since the
-/// `webvh-server` template requires `MEDIATOR_DID`), let the operator
+/// `did-hosting-server` template requires `MEDIATOR_DID`), let the operator
 /// confirm or override it, mint an ephemeral did:key, print the
 /// operator's `pnm contexts create` command, wait for confirmation,
 /// then drive `vta_sdk::provision_client::run_provision`.
@@ -416,7 +416,7 @@ async fn run_online_provision(
         .default("webvh".to_string())
         .interact_text()?;
 
-    // The webvh-server template needs a MEDIATOR_DID up-front (it
+    // The did-hosting-server template needs a MEDIATOR_DID up-front (it
     // embeds a DIDComm service endpoint pointing at the mediator).
     eprintln!();
     eprintln!("  A DIDComm mediator routes encrypted messages to the witness.");
@@ -498,8 +498,8 @@ async fn run_online_provision(
 // ---------------------------------------------------------------------------
 // Offline setup wizard (air-gapped VTA)
 //
-// Same two-step pattern as `webvh-control setup-offline-prepare/complete`
-// and `webvh-server setup-offline-*`, adapted to witness's config:
+// Same two-step pattern as `did-hosting-control setup-offline-prepare/complete`
+// and `did-hosting-server setup-offline-*`, adapted to witness's config:
 // feature toggles (didcomm / rest_api), admin ACL with optional label, and
 // "import this DID on the server" next-step text.
 // ---------------------------------------------------------------------------
@@ -654,7 +654,7 @@ pub async fn run_setup_offline_prepare(
         .default("data/webvh-witness".to_string())
         .interact_text()?;
 
-    let secrets = affinidi_webvh_common::server::secret_store::wizard::prompt_secrets_backend(
+    let secrets = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
         "webvh-witness-secrets",
         "webvh-witness",
     )
@@ -703,21 +703,21 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // VP-framed bootstrap request — names the `webvh-server` template
+    // VP-framed bootstrap request — names the `did-hosting-server` template
     // (DIDComm-only — witness coordination, no HTTP hosting) + binds
     // `MEDIATOR_DID` so the VTA admin can run
     // `vta bootstrap provision-integration --request <file>` directly.
     let mediator_for_template = mediator_did.clone().unwrap_or_default();
     let info = vta_setup::write_offline_bootstrap_request(
         &request_out,
-        "webvh-server",
+        "did-hosting-server",
         &[("MEDIATOR_DID", &mediator_for_template)],
         &context_id,
         Some("webvh-witness"),
     )
     .await?;
     let secret_store =
-        affinidi_webvh_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
+        did_hosting_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
     secret_store.set_bootstrap_seed(&info.seed).await?;
 
     let state = PendingWitnessSetupState {
@@ -797,7 +797,7 @@ pub async fn run_setup_offline_complete(
     let state: PendingWitnessSetupState = toml::from_str(&state_toml)?;
 
     let armor = std::fs::read_to_string(&bundle_path)?;
-    let pre_secret_store = affinidi_webvh_common::server::secret_store::create_secret_store(
+    let pre_secret_store = did_hosting_common::server::secret_store::create_secret_store(
         &state.secrets,
         &state.config_output,
     )?;
@@ -898,7 +898,7 @@ pub async fn run_setup_offline_complete(
     // Drop the now-spent bootstrap seed from the secret store. We
     // re-instantiate post-finalize because plaintext mode rewrites the
     // config.toml when persisting `ServerSecrets`.
-    let post_secret_store = affinidi_webvh_common::server::secret_store::create_secret_store(
+    let post_secret_store = did_hosting_common::server::secret_store::create_secret_store(
         &state.secrets,
         &state.config_output,
     )?;
@@ -916,7 +916,7 @@ pub async fn run_setup_offline_complete(
     eprintln!("  Next steps:");
     eprintln!("    1. Import this DID on the server:");
     eprintln!(
-        "       webvh-server bootstrap-did --path {} --did-log {}",
+        "       did-hosting-server bootstrap-did --path {} --did-log {}",
         state.did_path,
         state.did_log_output.display()
     );

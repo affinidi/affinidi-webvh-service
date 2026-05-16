@@ -4,7 +4,7 @@
 //! # Stability
 //!
 //! Pre-1.0 — the public-module surface is intentionally wide so that
-//! `webvh-daemon` can compose this crate as a library. Treat every `pub`
+//! `did-hosting-daemon` can compose this crate as a library. Treat every `pub`
 //! module as **unstable**; breaking changes can land in any minor version.
 //! Pin internal deps with `major.minor` (`= "0.6"`).
 //!

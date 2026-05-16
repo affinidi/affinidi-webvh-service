@@ -5,14 +5,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use affinidi_webvh_common::server::operator_messages::WebvhWitnessMessages;
-use affinidi_webvh_common::server::setup_recipe::{
+use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
+use did_hosting_common::server::setup_recipe::{
     EXIT_RECIPE_INVALID, ServiceKind, SetupRecipe, VtaMode, VtaSetupOutcome, active_backend,
     apply_env_overrides, back_up_config, inspect_existing, load_recipe, print_recipe_banner,
     refuse_overwrite, require_service, resolve_admin_did, resolve_secrets_config,
     run_uninstall_unchecked, run_vta_for_recipe, to_log_format,
 };
-use affinidi_webvh_common::server::vta_setup;
+use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
@@ -72,7 +72,7 @@ pub async fn apply_recipe(
     };
 
     let offline_complete_seed = if recipe.deployment.vta_mode == VtaMode::OfflineComplete {
-        let store = affinidi_webvh_common::server::secret_store::create_secret_store(
+        let store = did_hosting_common::server::secret_store::create_secret_store(
             &secrets_config,
             &recipe.output.config_path,
         )?;
@@ -96,15 +96,15 @@ pub async fn apply_recipe(
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
 
-    // The witness DID is hosted by the webvh-server; it doesn't host
+    // The witness DID is hosted by the did-hosting-server; it doesn't host
     // its own HTTP DID. With a mediator the DID document carries a
     // `DIDCommMessaging` service (witness accepts inbound DIDComm). The
-    // mint template is `webvh-control` when a mediator exists (both
-    // HTTP + DIDComm), `webvh-daemon` otherwise (HTTP only).
+    // mint template is `did-hosting-control` when a mediator exists (both
+    // HTTP + DIDComm), `did-hosting-daemon` otherwise (HTTP only).
     let template_name = if recipe.identity.mediator_did.is_some() {
-        "webvh-control"
+        "did-hosting-control"
     } else {
-        "webvh-daemon"
+        "did-hosting-daemon"
     };
     let url_var = did_hosting_url.as_str();
     let mediator_var = recipe.identity.mediator_did.as_deref();
@@ -195,8 +195,8 @@ pub async fn apply_recipe(
         .log_format
         .map(to_log_format)
         .map(|f| match f {
-            affinidi_webvh_common::server::config::LogFormat::Text => LogFormat::Text,
-            affinidi_webvh_common::server::config::LogFormat::Json => LogFormat::Json,
+            did_hosting_common::server::config::LogFormat::Text => LogFormat::Text,
+            did_hosting_common::server::config::LogFormat::Json => LogFormat::Json,
         })
         .unwrap_or(LogFormat::Text);
     let data_dir = recipe
@@ -263,7 +263,7 @@ pub async fn apply_recipe(
     );
 
     if recipe.deployment.vta_mode == VtaMode::OfflineComplete {
-        let post = affinidi_webvh_common::server::secret_store::create_secret_store(
+        let post = did_hosting_common::server::secret_store::create_secret_store(
             &secrets_config,
             &recipe.output.config_path,
         )?;
@@ -323,10 +323,10 @@ pub async fn apply_recipe(
 
 async fn persist_offline_prepare(
     recipe: &SetupRecipe,
-    info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
-    secrets_config: &affinidi_webvh_common::server::config::SecretsConfig,
+    info: &did_hosting_common::server::setup_recipe::OfflinePreparedInfo,
+    secrets_config: &did_hosting_common::server::config::SecretsConfig,
 ) -> Result<(), AppError> {
-    let store = affinidi_webvh_common::server::secret_store::create_secret_store(
+    let store = did_hosting_common::server::secret_store::create_secret_store(
         secrets_config,
         &recipe.output.config_path,
     )?;
@@ -338,7 +338,7 @@ async fn persist_offline_prepare(
 fn print_offline_prepare_recap(
     binary: &str,
     recipe: &SetupRecipe,
-    info: &affinidi_webvh_common::server::setup_recipe::OfflinePreparedInfo,
+    info: &did_hosting_common::server::setup_recipe::OfflinePreparedInfo,
 ) {
     eprintln!();
     eprintln!("  [setup-recipe:offline-prepare] phase 1 complete");
@@ -380,7 +380,7 @@ pub async fn run_uninstall(config_path: &Path, yes: bool) -> Result<(), AppError
     })?;
 
     if !yes {
-        let confirmed = affinidi_webvh_common::server::setup_recipe::prompt_uninstall_confirmation(
+        let confirmed = did_hosting_common::server::setup_recipe::prompt_uninstall_confirmation(
             config_path,
         )?;
         if !confirmed {
@@ -410,9 +410,9 @@ pub async fn run_uninstall(config_path: &Path, yes: bool) -> Result<(), AppError
 pub fn map_exit_code(err: &AppError) -> i32 {
     let msg = err.to_string();
     if msg.contains("refusing to overwrite") {
-        affinidi_webvh_common::server::setup_recipe::EXIT_REPROVISION_REFUSED
+        did_hosting_common::server::setup_recipe::EXIT_REPROVISION_REFUSED
     } else if msg.contains("VTA provision") || msg.contains("post-auth") {
-        affinidi_webvh_common::server::setup_recipe::EXIT_VTA_POST_AUTH
+        did_hosting_common::server::setup_recipe::EXIT_VTA_POST_AUTH
     } else if msg.contains("recipe") && (msg.contains("invalid") || msg.contains("missing")) {
         EXIT_RECIPE_INVALID
     } else {

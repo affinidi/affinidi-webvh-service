@@ -1,4 +1,4 @@
-# Changelog — affinidi-webvh-witness
+# Changelog — webvh-witness
 
 See the [workspace CHANGELOG](../CHANGELOG.md) for cross-crate release notes.
 

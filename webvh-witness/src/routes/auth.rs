@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
-use affinidi_webvh_common::server::auth::constant_time_eq;
+use did_hosting_common::server::auth::constant_time_eq;
 use tracing::warn;
 
 use crate::acl::check_acl;
@@ -82,7 +82,7 @@ pub async fn authenticate(
 
     // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
     let (msg, sender_base) =
-        affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+        did_hosting_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
@@ -196,7 +196,7 @@ pub async fn refresh(
 
     // sender_base is JWS-verified; refresh requires the holder's signed envelope.
     let (msg, sender_base) =
-        affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+        did_hosting_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
         return Err(AppError::Authentication(format!(
@@ -214,7 +214,7 @@ pub async fn refresh(
     // Atomically claim and consume the refresh-token → session_id index.
     // Cross-replica safe via Redis GETDEL / DynamoDB DeleteItem
     // ReturnValues=ALL_OLD / fjall mutex. Closes the rotation TOCTOU.
-    let session_id = affinidi_webvh_common::server::auth::session::take_session_id_by_refresh(
+    let session_id = did_hosting_common::server::auth::session::take_session_id_by_refresh(
         &state.sessions_ks,
         refresh_token,
     )

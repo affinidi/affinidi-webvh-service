@@ -1,1 +1,1 @@
-pub use affinidi_webvh_common::server::store::{KeyspaceHandle, Store};
+pub use did_hosting_common::server::store::{KeyspaceHandle, Store};
