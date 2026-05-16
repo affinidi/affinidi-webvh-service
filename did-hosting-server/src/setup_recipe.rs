@@ -14,6 +14,7 @@ use did_hosting_common::server::setup_recipe::{
     print_recipe_banner, refuse_overwrite, require_service, resolve_admin_did,
     resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, to_log_format,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
@@ -290,7 +291,7 @@ pub async fn apply_recipe(
     if let Some(log_entry) = log_entry.as_deref() {
         let did_path = derive_did_path(&public_url_owned);
         let store = Store::open(&config.store).await?;
-        let dids_ks = store.keyspace("dids")?;
+        let dids_ks = store.keyspace(KS_DIDS)?;
         match crate::bootstrap::import_did_at_path(&store, &dids_ks, &did_path, log_entry, None)
             .await
         {
@@ -313,7 +314,7 @@ pub async fn apply_recipe(
     // Admin ACL seeding (if requested by the recipe).
     if let Some(admin_did) = resolve_admin_did(&recipe) {
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
         let entry = AclEntry {
             did: admin_did.clone(),
             role: Role::Admin,

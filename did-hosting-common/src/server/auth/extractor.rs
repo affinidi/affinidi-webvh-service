@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use crate::server::auth::session::{Session, SessionState, store_session};
     use crate::server::config::StoreConfig;
-    use crate::server::store::Store;
+    use crate::server::store::{KS_SESSIONS, Store};
     use axum::http::Request;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -181,7 +181,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let ks = store.keyspace("sessions").unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
         let keys = Arc::new(JwtKeys::from_ed25519_bytes(&[9u8; 32]).unwrap());
         (TestState { keys, ks }, dir)
     }

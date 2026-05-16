@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use did_hosting_common::server::health;
 
 use crate::config::AppConfig;
+use did_hosting_common::server::store::{KS_DIDS};
 
 pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     health::header("did-hosting-server", env!("CARGO_PKG_VERSION"));
@@ -57,7 +58,7 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
 
     // ── Root DID (.well-known) ─────────────────────────────────────
     if let Some(ref store) = store
-        && let Ok(dids_ks) = store.keyspace("dids")
+        && let Ok(dids_ks) = store.keyspace(KS_DIDS)
     {
         health::section("Root DID (.well-known)");
         match crate::bootstrap::root_did_exists(&dids_ks).await {

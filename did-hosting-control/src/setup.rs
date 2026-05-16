@@ -11,6 +11,7 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, RegistryConfig, SecretsConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::{KS_ACL};
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
@@ -308,7 +309,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         };
 
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
 
         let entry = AclEntry {
             did: admin_did.clone(),
@@ -938,7 +939,7 @@ pub async fn run_setup_offline_complete(
     // Bootstrap admin ACL per the choice captured in state.
     if let AdminChoice::Did(ref admin_did) = state.admin {
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
         let entry = AclEntry {
             did: admin_did.clone(),
             role: Role::Admin,

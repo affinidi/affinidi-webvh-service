@@ -5,6 +5,7 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS, KS_WITNESSES};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::build_tdk_profile;
@@ -71,9 +72,9 @@ impl AuthState for AppState {
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Open keyspace handles
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let witnesses_ks = store.keyspace("witnesses")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) =

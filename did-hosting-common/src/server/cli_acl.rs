@@ -3,6 +3,7 @@ use std::str::FromStr;
 use super::acl::{
     AclEntry, Role, delete_acl_entry, get_acl_entry, list_acl_entries, store_acl_entry,
 };
+use crate::server::store::KS_ACL;
 use super::auth::session::now_epoch;
 use super::config::StoreConfig;
 use super::store::Store;
@@ -20,7 +21,7 @@ pub async fn run_add_acl(
         .map_err(|_| format!("invalid role '{role_str}': use 'admin', 'owner', or 'service'"))?;
 
     let store = Store::open(store_config).await?;
-    let acl_ks = store.keyspace("acl")?;
+    let acl_ks = store.keyspace(KS_ACL)?;
 
     if let Some(existing) = get_acl_entry(&acl_ks, &did).await? {
         eprintln!();
@@ -61,7 +62,7 @@ pub async fn run_add_acl(
 /// List all ACL entries in the store.
 pub async fn run_list_acl(store_config: &StoreConfig) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(store_config).await?;
-    let acl_ks = store.keyspace("acl")?;
+    let acl_ks = store.keyspace(KS_ACL)?;
 
     let entries = list_acl_entries(&acl_ks).await?;
 
@@ -108,7 +109,7 @@ pub async fn run_remove_acl(
     did: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(store_config).await?;
-    let acl_ks = store.keyspace("acl")?;
+    let acl_ks = store.keyspace(KS_ACL)?;
 
     let existing = get_acl_entry(&acl_ks, &did).await?;
     if existing.is_none() {

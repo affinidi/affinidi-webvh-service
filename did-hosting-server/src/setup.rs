@@ -8,6 +8,7 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::{KS_DIDS};
 use crate::secret_store::{ServerSecrets, create_secret_store};
 
 use did_hosting_common::server::operator_messages::WebvhServerMessages;
@@ -298,7 +299,7 @@ pub async fn run_wizard(
         eprintln!("  Importing server DID into store at path '{did_path}'...");
 
         let store = crate::store::Store::open(&config.store).await?;
-        let dids_ks = store.keyspace("dids")?;
+        let dids_ks = store.keyspace(KS_DIDS)?;
 
         match crate::bootstrap::import_did_at_path(&store, &dids_ks, &did_path, log_entry, None)
             .await
@@ -808,7 +809,7 @@ pub async fn run_setup_offline_complete(
         );
 
         let store = crate::store::Store::open(&config.store).await?;
-        let dids_ks = store.keyspace("dids")?;
+        let dids_ks = store.keyspace(KS_DIDS)?;
 
         match crate::bootstrap::import_did_at_path(
             &store,

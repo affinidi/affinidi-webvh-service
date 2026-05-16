@@ -2,6 +2,7 @@ use webvh_witness::config::AppConfig;
 use webvh_witness::{
     health, secret_store, server, setup, setup_recipe, store, witness_ops,
 };
+use did_hosting_common::server::store::{KS_WITNESSES};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -438,7 +439,7 @@ async fn run_create_witness(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
-    let witnesses_ks = store.keyspace("witnesses")?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     let record = witness_ops::create_witness(&witnesses_ks, label).await?;
 
@@ -460,7 +461,7 @@ async fn run_list_witnesses(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
-    let witnesses_ks = store.keyspace("witnesses")?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     let records = witness_ops::list_witnesses(&witnesses_ks).await?;
 
@@ -499,7 +500,7 @@ async fn run_delete_witness(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
-    let witnesses_ks = store.keyspace("witnesses")?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     // Check if witness exists
     if witness_ops::get_witness(&witnesses_ks, &witness_id)

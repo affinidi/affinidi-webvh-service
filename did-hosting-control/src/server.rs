@@ -5,6 +5,7 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
@@ -160,14 +161,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     }
 
     // Open keyspace handles
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let registry_ks = store.keyspace("registry")?;
-    let dids_ks = store.keyspace("dids")?;
-    let stats_ks = store.keyspace("stats")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let registry_ks = store.keyspace(KS_REGISTRY)?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
+    let stats_ks = store.keyspace(KS_STATS)?;
     // Time-series buckets live in their own keyspace from v0.7 — see
     // the `timeseries_ks` field doc on `AppState`.
-    let timeseries_ks = store.keyspace("timeseries")?;
+    let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
     // Initialize DIDComm auth infrastructure (requires server_did)
     let (did_resolver, secrets_resolver) =

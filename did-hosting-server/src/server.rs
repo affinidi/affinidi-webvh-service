@@ -5,6 +5,7 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
 
@@ -78,9 +79,9 @@ impl AuthState for AppState {
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Open keyspace handles
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let dids_ks = store.keyspace("dids")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Integrity check on DID keyspace
     match dids_ks.verify_integrity().await {

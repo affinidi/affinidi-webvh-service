@@ -10,6 +10,7 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
     StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::{KS_ACL};
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
 
@@ -297,7 +298,7 @@ pub async fn run_wizard(
         };
 
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
 
         let entry = AclEntry {
             did: admin_did.clone(),
@@ -882,7 +883,7 @@ pub async fn run_setup_offline_complete(
 
     if let AdminChoice::Did { ref did, ref label } = state.admin {
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
         let entry = AclEntry {
             did: did.clone(),
             role: Role::Admin,

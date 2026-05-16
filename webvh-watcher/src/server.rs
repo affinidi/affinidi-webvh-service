@@ -10,6 +10,7 @@ use axum::routing::get;
 use tokio::sync::watch;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
+use did_hosting_common::server::store::{KS_DIDS};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,7 +20,7 @@ pub struct AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let std_listener = {
         let addr = format!("{}:{}", config.server.host, config.server.port);

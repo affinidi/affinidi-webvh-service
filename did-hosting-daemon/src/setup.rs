@@ -16,6 +16,7 @@ use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
     StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
 use did_hosting_common::server::store::Store;
@@ -1168,7 +1169,7 @@ async fn finalize_daemon_setup(
         eprintln!();
         eprintln!("  Importing daemon DID into store at path '{did_path}'...");
         let store = Store::open(&config.store).await?;
-        let dids_ks = store.keyspace("dids")?;
+        let dids_ks = store.keyspace(KS_DIDS)?;
         match did_hosting_server::bootstrap::import_did_at_path(
             &store, &dids_ks, did_path, log_entry, None,
         )
@@ -1199,7 +1200,7 @@ async fn finalize_daemon_setup(
     // same `acl` keyspace the control plane reads on startup.
     if let AdminChoice::Did(admin_did) = admin {
         let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace("acl")?;
+        let acl_ks = store.keyspace(KS_ACL)?;
         let entry = did_hosting_common::server::acl::AclEntry {
             did: admin_did.clone(),
             role: did_hosting_common::server::acl::Role::Admin,

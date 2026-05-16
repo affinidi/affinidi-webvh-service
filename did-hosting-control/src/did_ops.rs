@@ -850,6 +850,7 @@ pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameRespons
 
 #[cfg(test)]
 mod tests_atomic {
+    use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
     use super::*;
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
@@ -906,11 +907,11 @@ mod tests_atomic {
             ..StoreConfig::default()
         };
         let store = Store::open(&store_config).await.expect("open store");
-        let sessions_ks = store.keyspace("sessions").expect("sessions ks");
-        let acl_ks = store.keyspace("acl").expect("acl ks");
-        let registry_ks = store.keyspace("registry").expect("registry ks");
-        let dids_ks = store.keyspace("dids").expect("dids ks");
-        let stats_ks = store.keyspace("stats").expect("stats ks");
+        let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
+        let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
+        let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
+        let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
+        let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
 
         let config = AppConfig {
             features: FeaturesConfig::default(),
@@ -943,7 +944,7 @@ mod tests_atomic {
             didcomm_service: Arc::new(OnceLock::new()),
             stats_collector: Arc::new(StatsCollector::new()),
             stats_ks: stats_ks.clone(),
-            timeseries_ks: store.keyspace("timeseries").expect("timeseries ks"),
+            timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),

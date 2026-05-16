@@ -2,6 +2,7 @@ use did_hosting_control::config::AppConfig;
 use did_hosting_control::{health, secret_store, server, setup, setup_recipe, store};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use did_hosting_common::server::store::{KS_SESSIONS};
 
 #[derive(Parser)]
 #[command(
@@ -520,7 +521,7 @@ async fn run_invite(
     };
 
     let store = store::Store::open(&config.store).await?;
-    let sessions_ks = store.keyspace("sessions")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
     let resp =
         create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;

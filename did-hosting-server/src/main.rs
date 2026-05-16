@@ -2,6 +2,7 @@ use did_hosting_server::config::AppConfig;
 use did_hosting_server::{
     backup, bootstrap, health, secret_store, server, setup, setup_recipe, store,
 };
+use did_hosting_common::server::store::{KS_DIDS};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -641,7 +642,7 @@ async fn run_load_did(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let jsonl = std::fs::read_to_string(&did_log)
         .map_err(|e| format!("failed to read {}: {e}", did_log.display()))?;
@@ -679,7 +680,7 @@ async fn run_recover_did(
 
     let config = AppConfig::load(config_path)?;
     let store_instance = store::Store::open(&config.store).await?;
-    let dids_ks = store_instance.keyspace("dids")?;
+    let dids_ks = store_instance.keyspace(KS_DIDS)?;
 
     let did_key = format!("did:{mnemonic}");
     let mut record: DidRecord = dids_ks
@@ -721,7 +722,7 @@ async fn run_recreate_did(
         .ok_or("public_url must be set in config")?;
 
     let store = store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Delete existing DID at this path if it exists
     let did_key = did_hosting_server::did_ops::did_key(&mnemonic);
@@ -821,7 +822,7 @@ async fn run_bootstrap_did(
         .ok_or("public_url must be set in config for bootstrap")?;
 
     let store = store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Check if DID already exists at this path
     let did_key = did_hosting_server::did_ops::did_key(&mnemonic);
@@ -982,7 +983,7 @@ async fn run_dump_did(
 
     let config = AppConfig::load(config_path)?;
     let store_handle = store::Store::open(&config.store).await?;
-    let dids_ks = store_handle.keyspace("dids")?;
+    let dids_ks = store_handle.keyspace(KS_DIDS)?;
 
     // Verify the DID exists
     let _: did_hosting_common::did_ops::DidRecord = dids_ks
@@ -1019,7 +1020,7 @@ async fn run_list_dids(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::
 
     let config = AppConfig::load(config_path)?;
     let store_handle = store::Store::open(&config.store).await?;
-    let dids_ks = store_handle.keyspace("dids")?;
+    let dids_ks = store_handle.keyspace(KS_DIDS)?;
 
     let raw = dids_ks.prefix_iter_raw("did:").await?;
 
@@ -1063,7 +1064,7 @@ async fn run_remove_did(
 
     let config = AppConfig::load(config_path)?;
     let store_handle = store::Store::open(&config.store).await?;
-    let dids_ks = store_handle.keyspace("dids")?;
+    let dids_ks = store_handle.keyspace(KS_DIDS)?;
 
     let record: Option<DidRecord> = dids_ks.get(did_key(&path)).await?;
     let record = match record {

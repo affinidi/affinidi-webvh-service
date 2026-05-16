@@ -39,7 +39,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::error::AppError;
-use super::store::{KeyspaceHandle, Store};
+use super::store::{KS_META, KeyspaceHandle, Store};
 
 pub mod runner;
 
@@ -49,11 +49,6 @@ pub use runner::{MigrationRunner, RunSummary};
 /// without pulling in `async-trait`. Matches the pattern used by the
 /// storage backends in `super::store`.
 pub type MigrationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>>;
-
-/// Keyspace where the runner records which migrations have been applied.
-/// Centralised here so the constant matches the keyspace registry once
-/// T3 lands.
-pub const META_KEYSPACE: &str = "meta";
 
 /// Key prefix inside the `meta` keyspace for applied-migration markers.
 const APPLIED_KEY_PREFIX: &str = "migration:applied:";
@@ -125,7 +120,7 @@ pub(crate) fn applied_key(id: &str) -> String {
 /// centralised registry in T3; until then it lives next to its only
 /// consumer.
 pub(crate) fn meta_keyspace(store: &Store) -> Result<KeyspaceHandle, AppError> {
-    store.keyspace(META_KEYSPACE)
+    store.keyspace(KS_META)
 }
 
 /// Convenience: register migrations as an ordered list. Lives here so the

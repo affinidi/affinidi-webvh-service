@@ -22,6 +22,7 @@ use did_hosting_common::did_ops::content_log_key;
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use did_hosting_common::server::store::Store;
 use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
@@ -38,9 +39,9 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         ..StoreConfig::default()
     };
     let store = Store::open(&store_config).await.expect("open store");
-    let sessions_ks = store.keyspace("sessions").expect("sessions ks");
-    let acl_ks = store.keyspace("acl").expect("acl ks");
-    let dids_ks = store.keyspace("dids").expect("dids ks");
+    let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
+    let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
+    let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
 
     let config = AppConfig {
         features: FeaturesConfig::default(),

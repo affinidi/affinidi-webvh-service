@@ -6,8 +6,14 @@ mod dynamodb;
 mod firestore;
 #[cfg(feature = "store-fjall")]
 mod fjall;
+pub mod keyspaces;
 #[cfg(feature = "store-redis")]
 mod redis;
+
+pub use keyspaces::{
+    KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_PENDING_PURGES, KS_REGISTRY,
+    KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+};
 
 use std::future::Future;
 use std::pin::Pin;

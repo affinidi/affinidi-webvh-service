@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, KS_STATS};
 
 const BACKUP_VERSION: u32 = 1;
 
@@ -52,10 +53,10 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
 
     let store = Store::open(&config.store).await?;
 
-    let dids_ks = store.keyspace("dids")?;
-    let acl_ks = store.keyspace("acl")?;
-    let stats_ks = store.keyspace("stats")?;
-    let sessions_ks = store.keyspace("sessions")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let stats_ks = store.keyspace(KS_STATS)?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
     let dids = encode_pairs(dids_ks.iter_all().await?);
     let acl = encode_pairs(acl_ks.iter_all().await?);
@@ -154,10 +155,10 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let config = AppConfig::load(config_path)?;
     let store = Store::open(&config.store).await?;
 
-    let dids_ks = store.keyspace("dids")?;
-    let acl_ks = store.keyspace("acl")?;
-    let stats_ks = store.keyspace("stats")?;
-    let sessions_ks = store.keyspace("sessions")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let stats_ks = store.keyspace(KS_STATS)?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
     let dids_count = restore_keyspace(&store, &dids_ks, &backup.keyspaces.dids).await?;
     let acl_count = restore_keyspace(&store, &acl_ks, &backup.keyspaces.acl).await?;

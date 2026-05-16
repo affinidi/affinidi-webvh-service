@@ -24,6 +24,7 @@ use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::{KeyspaceHandle, Store};
 
 use config::DaemonConfig;
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES};
 
 #[derive(Parser)]
 #[command(
@@ -525,15 +526,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         });
 
     // Open keyspaces early — needed for bootstrap, stats seeding, and builders.
-    let dids_ks = main_store.keyspace("dids").unwrap_or_else(|e| {
+    let dids_ks = main_store.keyspace(KS_DIDS).unwrap_or_else(|e| {
         error!("failed to open dids keyspace: {e}");
         std::process::exit(1);
     });
-    let stats_ks = main_store.keyspace("stats").unwrap_or_else(|e| {
+    let stats_ks = main_store.keyspace(KS_STATS).unwrap_or_else(|e| {
         error!("failed to open stats keyspace: {e}");
         std::process::exit(1);
     });
-    let timeseries_ks = main_store.keyspace("timeseries").unwrap_or_else(|e| {
+    let timeseries_ks = main_store.keyspace(KS_TIMESERIES).unwrap_or_else(|e| {
         error!("failed to open timeseries keyspace: {e}");
         std::process::exit(1);
     });
@@ -747,7 +748,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 3a. Unified storage task (session cleanup, DID cleanup, stats flush, health checks)
     let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
-    let sessions_ks = main_store.keyspace("sessions").unwrap_or_else(|e| {
+    let sessions_ks = main_store.keyspace(KS_SESSIONS).unwrap_or_else(|e| {
         error!("failed to open sessions keyspace: {e}");
         std::process::exit(1);
     });
@@ -972,9 +973,9 @@ async fn build_server(
 
     let server_config = config.server_config();
 
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let dids_ks = store.keyspace("dids")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
     let (did_resolver, secrets_resolver) =
         init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
     let jwt_keys = init::init_jwt_keys(secrets);
@@ -1013,9 +1014,9 @@ async fn build_witness(
 
     let witness_config = config.witness_config();
 
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let witnesses_ks = store.keyspace("witnesses")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     let (did_resolver, secrets_resolver) =
         init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
@@ -1043,7 +1044,7 @@ async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
     let watcher_config = config.watcher_config();
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let state = AppState {
         store: store.clone(),
@@ -1070,10 +1071,10 @@ async fn build_control(
 
     let control_config = config.control_config();
 
-    let sessions_ks = store.keyspace("sessions")?;
-    let acl_ks = store.keyspace("acl")?;
-    let registry_ks = store.keyspace("registry")?;
-    let dids_ks = store.keyspace("dids")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
+    let acl_ks = store.keyspace(KS_ACL)?;
+    let registry_ks = store.keyspace(KS_REGISTRY)?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let (did_resolver, secrets_resolver) =
         init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
@@ -1251,7 +1252,7 @@ async fn run_invite(
     };
 
     let store = Store::open(&control_config.store).await?;
-    let sessions_ks = store.keyspace("sessions")?;
+    let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
     let resp =
         create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
@@ -1298,7 +1299,7 @@ async fn run_bootstrap_did(
         .ok_or("public_url must be set in config for bootstrap")?;
 
     let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let did_key = did_hosting_server::did_ops::did_key(&mnemonic);
     if dids_ks.contains_key(did_key).await? {
@@ -1445,7 +1446,7 @@ async fn run_recreate_did(
         .ok_or("public_url must be set in config")?;
 
     let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Delete existing DID at this path. Read the record first so we can
     // remove the correct `owner:{owner}:{mnemonic}` reverse-index entry —
@@ -1529,7 +1530,7 @@ async fn run_recover_did(
 
     let config = DaemonConfig::load(config_path)?;
     let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let did_key = did_hosting_common::did_ops::did_key(&mnemonic);
     let mut record: DidRecord = dids_ks
@@ -1564,7 +1565,7 @@ async fn run_load_did(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
     let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let jsonl = std::fs::read_to_string(&did_log)
         .map_err(|e| format!("failed to read {}: {e}", did_log.display()))?;
@@ -1758,7 +1759,7 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
         let store = health::check_store(&config.store).await;
 
         if let Some(ref store) = store
-            && let Ok(dids_ks) = store.keyspace("dids")
+            && let Ok(dids_ks) = store.keyspace(KS_DIDS)
         {
             health::section("Root DID (.well-known)");
             match did_hosting_server::bootstrap::root_did_exists(&dids_ks).await {
@@ -1855,7 +1856,7 @@ async fn run_list_dids(
 
     let config = DaemonConfig::load(config_path)?;
     let store = did_hosting_common::server::store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let raw = dids_ks.prefix_iter_raw("did:").await?;
 
@@ -1899,7 +1900,7 @@ async fn run_remove_did(
 
     let config = DaemonConfig::load(config_path)?;
     let store = did_hosting_common::server::store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let record: Option<DidRecord> = dids_ks.get(did_key(&path)).await?;
     let record = match record {
