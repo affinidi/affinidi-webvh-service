@@ -247,7 +247,17 @@ pub async fn dispatch_did_op(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), AppError> {
-    match msg.typ.as_str() {
+    // Canonicalise the incoming message type so callers can send EITHER
+    // the legacy `MSG_*` URL (under `affinidi.com/webvh/1.0/...`) or the
+    // canonical Trust-Task URL (under `trusttasks.org/{did-hosting,
+    // webvh}/...`) — both route to the same handler. The match arms
+    // below keep their existing `MSG_*` form; `to_legacy` translates
+    // canonical inbound types back to legacy before the match.
+    // Unrecognised types fall through to the default arm (which emits
+    // a protocol error code).
+    let typ = did_hosting_common::v1_aliases::to_legacy(msg.typ.as_str())
+        .unwrap_or(msg.typ.as_str());
+    match typ {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
             let force = msg
