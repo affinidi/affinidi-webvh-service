@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, SecretsConfig,
-    ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, HostingConfig, IdentityConfig, IdentityMode, LogConfig,
+    SecretsConfig, ServerConfig, StoreConfig,
 };
 use did_hosting_common::server::error::AppError;
 
@@ -58,6 +58,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub identity: IdentityConfig,
 
+    /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
+    /// the `domains` keyspace on first boot when no entries exist;
+    /// `unassigned_purge_grace` controls the retain-then-purge window
+    /// for domains the control plane has unassigned from this server.
+    #[serde(default)]
+    pub hosting: HostingConfig,
+
     /// Which services to enable
     #[serde(default)]
     pub enable: EnableConfig,
@@ -71,6 +78,7 @@ fn default_server() -> ServerConfig {
         host: "0.0.0.0".to_string(),
         port: 8534,
         trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
     }
 }
 

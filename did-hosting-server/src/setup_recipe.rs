@@ -224,6 +224,7 @@ pub async fn apply_recipe(
             host,
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: log_level,

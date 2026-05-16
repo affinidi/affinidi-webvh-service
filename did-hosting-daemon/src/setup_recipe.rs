@@ -232,6 +232,7 @@ pub async fn apply_recipe(
             host,
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -266,7 +267,8 @@ pub async fn apply_recipe(
         },
         enable,
         config_path: recipe.output.config_path.clone(),
-    };
+    
+        hosting: did_hosting_common::server::config::HostingConfig::default(),};
 
     if let Some(parent) = recipe.output.config_path.parent()
         && !parent.as_os_str().is_empty()

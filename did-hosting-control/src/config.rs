@@ -39,6 +39,7 @@ fn default_server() -> ServerConfig {
         host: "0.0.0.0".to_string(),
         port: 8532,
         trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
     }
 }
 

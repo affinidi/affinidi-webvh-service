@@ -146,6 +146,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             host,
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: crate::config::LogConfig {
             level: log_level,
@@ -255,6 +256,7 @@ pub async fn apply_recipe(
             host,
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: crate::config::LogConfig {
             level: log_level,

@@ -224,6 +224,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             host,
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -874,6 +875,7 @@ pub async fn run_setup_offline_complete(
             host: state.host.clone(),
             port: state.port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: state.log_level.clone(),

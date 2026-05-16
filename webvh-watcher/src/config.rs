@@ -44,6 +44,7 @@ impl Default for AppConfig {
                 host: "0.0.0.0".into(),
                 port: 8533,
                 trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
             },
             log: LogConfig::default(),
             store: StoreConfig {

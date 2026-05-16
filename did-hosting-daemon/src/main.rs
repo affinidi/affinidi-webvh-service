@@ -539,6 +539,34 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         std::process::exit(1);
     });
 
+    // First-boot domain seed (T18). Three-tier fallback:
+    //   1. `[hosting] bootstrap_domains`
+    //   2. legacy `public_url` host (upgrade path)
+    //   3. empty (loud warn — daemon boots but won't accept new DIDs
+    //      until an admin creates a domain)
+    // Idempotent: subsequent boots find the `domains` keyspace
+    // already populated and short-circuit.
+    match did_hosting_common::server::domain::seed_domains_first_boot(
+        &main_store,
+        &config.hosting.bootstrap_domains,
+        config.public_url.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            info!(
+                tier = ?outcome.tier,
+                count = outcome.final_count,
+                default = ?outcome.default,
+                "first-boot domain seed"
+            );
+        }
+        Err(e) => {
+            error!("first-boot domain seed failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // ── Phase 1: Pre-serve initialization ─────────────────────────────
 
     // 1a. DID store integrity check

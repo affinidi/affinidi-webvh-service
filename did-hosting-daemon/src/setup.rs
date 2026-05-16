@@ -180,6 +180,7 @@ pub async fn run_wizard(
             host: host.clone(),
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -212,7 +213,8 @@ pub async fn run_wizard(
         identity: IdentityConfig::default(),
         enable,
         config_path: output_path.clone(),
-    };
+    
+        hosting: did_hosting_common::server::config::HostingConfig::default(),};
 
     // 10. Persist via shared helper (same as offline flow path).
     finalize_daemon_setup(
@@ -583,6 +585,7 @@ async fn run_self_managed_setup(
             host: host.clone(),
             port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: log_level,
@@ -612,6 +615,7 @@ async fn run_self_managed_setup(
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
         },
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
         enable,
         config_path: output_path.clone(),
     };
@@ -933,6 +937,7 @@ pub async fn run_setup_offline_complete(
             host: state.host.clone(),
             port: state.port,
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
         },
         log: LogConfig {
             level: state.log_level.clone(),
@@ -963,6 +968,7 @@ pub async fn run_setup_offline_complete(
         registry: did_hosting_control::config::RegistryConfig::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
         enable: state.enable.clone(),
         config_path: state.config_output.clone(),
     };

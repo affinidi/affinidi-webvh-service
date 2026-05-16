@@ -34,6 +34,19 @@ pub struct ServerConfig {
     /// `["10.0.0.1", "10.0.0.2"]`) to opt in.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
+    /// `X-Forwarded-Host` headers are honoured for **request host /
+    /// domain detection** (multi-domain feature, T19). Distinct from
+    /// `trusted_proxies` above: that one is for client-IP
+    /// attribution; this one is for which host the request is
+    /// claiming to address. Outside this set, the daemon always uses
+    /// the literal `Host` header.
+    ///
+    /// Empty (default) disables `Forwarded` / `X-Forwarded-Host`
+    /// trust — appropriate for deployments not behind a reverse
+    /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`.
+    #[serde(default)]
+    pub trusted_proxy_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -175,6 +188,53 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             trusted_proxies: Vec::new(),
+            trusted_proxy_cidrs: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HostingConfig — multi-domain bootstrap + unassignment lifecycle
+// ---------------------------------------------------------------------------
+
+/// Settings for the multi-domain hosting feature.
+///
+/// Per `docs/multi-domain-spec.md` §3: domains are runtime-managed,
+/// but the daemon needs to know what to seed on a fresh deployment
+/// (when no `domains` keyspace entries exist yet) and how long to
+/// retain unassigned-domain data before purging.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct HostingConfig {
+    /// Domain names to seed into the `domains` keyspace on first boot
+    /// when the keyspace is empty. Used only when the operator hasn't
+    /// already created domains via the admin API. The first entry
+    /// becomes the default domain (per spec §3 cold-start fallback
+    /// chain — tier 1).
+    ///
+    /// Empty (default) falls through to tier 2: derive a single
+    /// default domain from the legacy `public_url`'s host.
+    #[serde(default)]
+    pub bootstrap_domains: Vec<String>,
+
+    /// Grace period before a server-locally-unassigned domain's data
+    /// is purged. Per spec §3 retain-then-purge semantics. Format:
+    /// duration string (`"2h"`, `"30m"`, `"7d"`). Default: `"2h"`.
+    ///
+    /// Parsed by the unassignment-purge sweep in T30; the string
+    /// here is the canonical config-file representation.
+    #[serde(default = "default_unassigned_purge_grace")]
+    pub unassigned_purge_grace: String,
+}
+
+fn default_unassigned_purge_grace() -> String {
+    "2h".to_string()
+}
+
+impl Default for HostingConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_domains: Vec::new(),
+            unassigned_purge_grace: default_unassigned_purge_grace(),
         }
     }
 }
