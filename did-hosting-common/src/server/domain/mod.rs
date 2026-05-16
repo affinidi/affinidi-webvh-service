@@ -22,10 +22,17 @@
 //! references) and the ACL module need to see it; keeping the type
 //! definition with the domain module avoids a cycle.
 
+pub mod normalize;
 pub mod scope;
+pub mod store;
 pub mod types;
 
+pub use normalize::normalize_domain_name;
 pub use scope::DomainScope;
+pub use store::{
+    create_domain, delete_domain_record, disable_domain, enable_domain, get_default_domain,
+    get_domain, list_domains, set_default_domain, update_domain,
+};
 pub use types::{
     DomainBranding, DomainEntry, DomainQuota, DomainStatus, DomainUrlScheme,
 };
