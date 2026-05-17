@@ -1,9 +1,12 @@
-/** Typed API client for the webvh-server REST API. */
+/** Typed API client for the did-hosting-control REST API. */
 
 export interface HealthResponse {
   status: string;
   version: string;
 }
+
+/** DID hosting method tag carried on every DidRecord (v0.7+). */
+export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
 
 export interface DidRecord {
   mnemonic: string;
@@ -13,6 +16,70 @@ export interface DidRecord {
   versionCount: number;
   didId: string | null;
   totalResolves: number;
+  /** Resolution method ("webvh" / "web"). Filled by M-01 on legacy records. */
+  method?: DidMethod;
+  /** Hosting domain. Filled by M-01 on legacy records. */
+  domain?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-domain types (v0.7)
+// ---------------------------------------------------------------------------
+
+export type DomainStatus = "active" | "disabled";
+export type DomainUrlScheme = "https" | "http";
+
+export interface DomainBranding {
+  logoUrl?: string | null;
+  primaryColor?: string | null;
+  displayName?: string | null;
+}
+
+export interface DomainQuota {
+  maxDids?: number | null;
+  maxBytes?: number | null;
+}
+
+/** Server-side `DomainEntry` (`KS_DOMAINS`). camelCase wire shape. */
+export interface DomainEntry {
+  name: string;
+  label: string | null;
+  scheme: DomainUrlScheme;
+  status: DomainStatus;
+  createdAt: number;
+  defaultDomain: boolean;
+  branding: DomainBranding | null;
+  witnesses: string[] | null;
+  watchers: string[] | null;
+  quota: DomainQuota | null;
+  wellKnownEnabled: boolean;
+}
+
+export interface DomainListResponse {
+  domains: DomainEntry[];
+  /** Currently-elected system default; may be null on a fresh install. */
+  default: string | null;
+}
+
+/** Per-ACL `DomainScope`. Tagged with `kind` per spec §3 wire shape. */
+export type DomainScope =
+  | { kind: "all" }
+  | { kind: "allowed"; domains: string[] }
+  | { kind: "allowed_with_default"; domains: string[]; default: string };
+
+export interface ServiceInstance {
+  instanceId: string;
+  serviceType: "server" | "witness" | "watcher";
+  label: string | null;
+  url: string;
+  status: "active" | "degraded" | "unreachable";
+  lastHealthCheck: number | null;
+  registeredAt: number;
+  metadata: any;
+  /** v0.7+ capability declaration. */
+  enabledMethods: string[];
+  servedDomains: string[];
+  protocolVersion: string;
 }
 
 export interface LogMetadata {
@@ -85,6 +152,9 @@ export interface AclEntry {
   created_at: number;
   max_total_size: number | null;
   max_did_count: number | null;
+  /** Per-ACL `DomainScope` (v0.7). Optional for forward-compat — a
+   * v0.6 store with no scope field deserialises as `{ kind: "all" }`. */
+  domains?: DomainScope;
 }
 
 export interface AclListResponse {
@@ -335,13 +405,19 @@ export const api = {
   getDidLog: (mnemonic: string) =>
     request<LogEntryInfo[]>(`/api/log/${mnemonic}`),
 
-  createDid: (path?: string, force?: boolean) =>
+  createDid: (
+    path?: string,
+    force?: boolean,
+    /** Optional explicit domain. Omitted → daemon's T34 resolver picks
+     * the caller's ACL default → system default → 400. */
+    domain?: string,
+  ) =>
     request<CreateDidResponse>("/api/dids", {
       method: "POST",
-      ...(path || force
+      ...(path || force || domain
         ? {
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path, force: force ?? false }),
+            body: JSON.stringify({ path, force: force ?? false, domain }),
           }
         : {}),
     }),
@@ -353,11 +429,11 @@ export const api = {
       body: JSON.stringify({ new_owner: newOwner }),
     }),
 
-  checkName: (path: string) =>
+  checkName: (path: string, domain?: string) =>
     request<CheckNameResponse>("/api/dids/check", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path, domain }),
     }),
 
   uploadDid: (mnemonic: string, body: string) =>
@@ -402,7 +478,14 @@ export const api = {
   createAcl: (
     did: string,
     role: "admin" | "owner" | "service",
-    opts?: { label?: string; maxTotalSize?: number; maxDidCount?: number },
+    opts?: {
+      label?: string;
+      maxTotalSize?: number;
+      maxDidCount?: number;
+      /** Optional DomainScope. Omit to inherit the daemon default
+       * (Owner → AllowedWithDefault on system default; Admin/Service → All). */
+      domains?: DomainScope;
+    },
   ) =>
     request<AclEntry>("/api/acl", {
       method: "POST",
@@ -413,6 +496,7 @@ export const api = {
         label: opts?.label,
         max_total_size: opts?.maxTotalSize,
         max_did_count: opts?.maxDidCount,
+        domains: opts?.domains,
       }),
     }),
 
@@ -423,6 +507,7 @@ export const api = {
       label?: string | null;
       maxTotalSize?: number | null;
       maxDidCount?: number | null;
+      domains?: DomainScope;
     },
   ) =>
     request<AclEntry>(`/api/acl/${encodeURIComponent(did)}`, {
@@ -433,11 +518,123 @@ export const api = {
         label: updates.label,
         max_total_size: updates.maxTotalSize,
         max_did_count: updates.maxDidCount,
+        domains: updates.domains,
       }),
     }),
 
   deleteAcl: (did: string) =>
     request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
+
+  // ---- Multi-domain (v0.7) ----
+
+  /** GET /api/domains — Admin only. */
+  listDomains: () => request<DomainListResponse>("/api/domains"),
+
+  /** GET /api/me/domains — caller-scoped subset; returns the caller's
+   * default in the `default` field (falls back to the system default
+   * when the caller's scope is `All` / `Allowed` without a default). */
+  listMyDomains: () => request<DomainListResponse>("/api/me/domains"),
+
+  /** POST /api/domains — Admin creates a new domain. `setAsDefault`
+   * promotes it to the system default in the same call. */
+  createDomain: (input: {
+    name: string;
+    label?: string;
+    scheme?: DomainUrlScheme;
+    branding?: DomainBranding;
+    witnesses?: string[];
+    watchers?: string[];
+    quota?: DomainQuota;
+    wellKnownEnabled?: boolean;
+    setAsDefault?: boolean;
+  }) =>
+    request<DomainEntry>("/api/domains", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: input.name,
+        label: input.label,
+        scheme: input.scheme,
+        branding: input.branding,
+        witnesses: input.witnesses,
+        watchers: input.watchers,
+        quota: input.quota,
+        well_known_enabled: input.wellKnownEnabled,
+        set_as_default: input.setAsDefault,
+      }),
+    }),
+
+  /** PUT /api/domains/{name} — Admin updates metadata. Status,
+   * default-flag, and created_at are preserved. */
+  updateDomain: (
+    name: string,
+    updates: Partial<{
+      label: string;
+      scheme: DomainUrlScheme;
+      branding: DomainBranding;
+      witnesses: string[];
+      watchers: string[];
+      quota: DomainQuota;
+      wellKnownEnabled: boolean;
+    }>,
+  ) =>
+    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: updates.label,
+        scheme: updates.scheme,
+        branding: updates.branding,
+        witnesses: updates.witnesses,
+        watchers: updates.watchers,
+        quota: updates.quota,
+        well_known_enabled: updates.wellKnownEnabled,
+      }),
+    }),
+
+  disableDomain: (name: string) =>
+    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}/disable`, {
+      method: "POST",
+    }),
+
+  enableDomain: (name: string) =>
+    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}/enable`, {
+      method: "POST",
+    }),
+
+  setDefaultDomain: (name: string) =>
+    request<DomainEntry>(
+      `/api/domains/${encodeURIComponent(name)}/set-default`,
+      { method: "POST" },
+    ),
+
+  // ---- Registry + per-(server, domain) ops (admin) ----
+
+  listRegistry: () => request<ServiceInstance[]>("/api/control/registry"),
+
+  /** POST /api/control/registry/{id}/domains/{domain}/assign — pushes
+   * the assign Trust Task to the named server instance. */
+  assignDomainToServer: (instanceId: string, domain: string) =>
+    request<void>(
+      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/assign`,
+      { method: "POST" },
+    ),
+
+  /** Same shape — schedules a pending purge on the server side with
+   * `unassigned_purge_grace` window. */
+  unassignDomainFromServer: (instanceId: string, domain: string) =>
+    request<void>(
+      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/unassign`,
+      { method: "POST" },
+    ),
+
+  /** Admin "Purge now" — bypasses the grace and deletes every DID on
+   * the named domain on the target server immediately. */
+  purgeDomainOnServer: (instanceId: string, domain: string) =>
+    request<void>(
+      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/purge`,
+      { method: "POST" },
+    ),
 
   getConfig: () => request<ControlPlaneConfig>("/api/config"),
 

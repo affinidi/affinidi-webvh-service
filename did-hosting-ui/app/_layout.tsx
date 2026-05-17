@@ -9,6 +9,7 @@ import {
 import { ActivityIndicator, View } from "react-native";
 import { AuthProvider } from "../components/AuthProvider";
 import { ApiProvider } from "../components/ApiProvider";
+import { DomainProvider } from "../components/DomainProvider";
 import { NavBar } from "../components/NavBar";
 import { colors } from "../lib/theme";
 
@@ -42,20 +43,24 @@ export default function RootLayout() {
   return (
     <AuthProvider>
       <ApiProvider>
-        <Stack
-          screenOptions={{
-            header: () => <AppHeader />,
-            contentStyle: { backgroundColor: colors.bgPrimary },
-          }}
-        >
-          <Stack.Screen name="index" />
-          <Stack.Screen name="login" />
-          <Stack.Screen name="dids/index" />
-          <Stack.Screen name="dids/[...mnemonic]" />
-          <Stack.Screen name="acl/index" />
-          <Stack.Screen name="settings/index" />
-          <Stack.Screen name="enroll" />
-        </Stack>
+        <DomainProvider>
+          <Stack
+            screenOptions={{
+              header: () => <AppHeader />,
+              contentStyle: { backgroundColor: colors.bgPrimary },
+            }}
+          >
+            <Stack.Screen name="index" />
+            <Stack.Screen name="login" />
+            <Stack.Screen name="dids/index" />
+            <Stack.Screen name="dids/[...mnemonic]" />
+            <Stack.Screen name="acl/index" />
+            <Stack.Screen name="domains/index" />
+            <Stack.Screen name="servers/index" />
+            <Stack.Screen name="settings/index" />
+            <Stack.Screen name="enroll" />
+          </Stack>
+        </DomainProvider>
       </ApiProvider>
     </AuthProvider>
   );
