@@ -48,3 +48,6 @@ zeroize = { version = "1", features = ["derive"] }
 # Error handling + observability.
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# Message IDs for the DIDComm authenticate / refresh envelopes.
+uuid = { workspace = true }

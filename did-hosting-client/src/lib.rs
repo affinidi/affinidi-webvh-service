@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod trust_tasks;
 
 /// Crate version string (`CARGO_PKG_VERSION`). Useful for telemetry

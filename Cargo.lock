@@ -2621,6 +2621,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "zeroize",
 ]
 
