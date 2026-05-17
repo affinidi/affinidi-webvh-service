@@ -13,6 +13,7 @@ use crate::server::AppState;
 use did_hosting_common::server::acl::{
     AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest, validate_did_format,
 };
+use did_hosting_common::server::domain::{DomainScope, get_default_domain};
 
 // ---------- GET /api/acl ----------
 
@@ -46,6 +47,43 @@ pub async fn create_acl(
             "ACL entry already exists for {did}"
         )));
     }
+    // Default-`domains` policy per `docs/multi-domain-spec.md` §3:
+    //
+    // - Explicit value in the request → honour it verbatim.
+    // - Owner without explicit `domains` → `AllowedWithDefault(
+    //   [system_default], system_default)`. Restrictive by default;
+    //   admin can broaden via PUT after creation.
+    // - Admin / Service without explicit `domains` → `All`. Role-based
+    //   access already constrains the surface for these.
+    //
+    // If no system default is configured yet (fresh deployment, no
+    // domains seeded), Owner fallback can't substitute a default →
+    // fall back to `All` and warn. T18's bootstrap_domains should
+    // close this gap on first boot; this branch only fires on edge
+    // cases where ACL is created before any domain.
+    let role_is_owner = matches!(req.role, did_hosting_common::server::acl::Role::Owner);
+    let domains = match req.domains {
+        Some(scope) => scope,
+        None if role_is_owner => {
+            match get_default_domain(&state.store).await? {
+                Some(default) => {
+                    DomainScope::AllowedWithDefault {
+                        domains: vec![default.clone()],
+                        default,
+                    }
+                }
+                None => {
+                    warn!(
+                        caller = %auth.0.did,
+                        target_did = %did,
+                        "ACL create: Owner without `domains` and no system default — falling back to All"
+                    );
+                    DomainScope::All
+                }
+            }
+        }
+        None => DomainScope::All,
+    };
     let entry = AclEntry {
         did,
         role: req.role,
@@ -53,8 +91,8 @@ pub async fn create_acl(
         created_at: now_epoch(),
         max_total_size: req.max_total_size,
         max_did_count: req.max_did_count,
-    
-        domains: did_hosting_common::server::domain::DomainScope::All,};
+        domains,
+    };
     acl::store_acl_entry(&state.acl_ks, &entry).await?;
     info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
@@ -84,6 +122,9 @@ pub async fn update_acl(
     }
     if updates.max_did_count.is_some() {
         entry.max_did_count = updates.max_did_count;
+    }
+    if let Some(domains) = updates.domains {
+        entry.domains = domains;
     }
 
     acl::store_acl_entry(&state.acl_ks, &entry).await?;
