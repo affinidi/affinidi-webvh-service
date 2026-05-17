@@ -51,7 +51,11 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod error;
+pub mod transport;
 pub mod trust_tasks;
+
+pub use error::ClientError;
 
 /// Crate version string (`CARGO_PKG_VERSION`). Useful for telemetry
 /// and for the `User-Agent` header the client will send once T46
