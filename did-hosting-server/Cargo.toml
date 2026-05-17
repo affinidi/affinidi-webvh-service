@@ -14,9 +14,14 @@ rust-version.workspace = true
 build = "build.rs"
 
 [features]
-default = ["keyring", "store-fjall"]
+default = ["keyring", "store-fjall", "method-webvh", "method-web"]
 metrics = ["did-hosting-common/metrics"]
 keyring = ["did-hosting-common/keyring"]
+# DID method routing (T25). Each method's resolve-side routes are
+# gated behind its feature; the server fails to compile with no
+# methods enabled (matches the common-crate behaviour at T31).
+method-webvh = ["did-hosting-common/method-webvh"]
+method-web = ["did-hosting-common/method-web"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",

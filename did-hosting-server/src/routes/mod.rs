@@ -4,6 +4,11 @@ mod config;
 pub(crate) mod did_manage;
 pub mod did_public;
 pub(crate) mod health;
+mod resolve_shared;
+#[cfg(feature = "method-web")]
+pub mod resolve_web;
+#[cfg(feature = "method-webvh")]
+pub mod resolve_webvh;
 mod stats;
 
 use axum::Router;
@@ -65,17 +70,31 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         router = router.route("/metrics", get(metrics_handler));
     }
 
+    // .well-known root-DID routes (registered before the fallback —
+    // specific routes always take priority). Each method's well-known
+    // surface is feature-gated; a method-web-only build only
+    // registers `/.well-known/did.json`, etc.
+    #[cfg(feature = "method-webvh")]
+    {
+        router = router
+            .route(
+                "/.well-known/did.jsonl",
+                get(resolve_webvh::serve_root_did_log),
+            )
+            .route(
+                "/.well-known/did-witness.json",
+                get(resolve_webvh::serve_root_witness),
+            );
+    }
+    #[cfg(feature = "method-web")]
+    {
+        router = router.route(
+            "/.well-known/did.json",
+            get(resolve_web::serve_root_did_web),
+        );
+    }
+
     router
-        // .well-known routes (specific routes take priority over fallback)
-        .route(
-            "/.well-known/did.jsonl",
-            get(did_public::serve_root_did_log),
-        )
-        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
-        .route(
-            "/.well-known/did-witness.json",
-            get(did_public::serve_root_witness),
-        )
 }
 
 /// Build a minimal router with only public DID-serving routes (daemon mode).
@@ -83,16 +102,28 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
 /// In daemon mode, the control plane handles all `/api/` management routes.
 /// The server only needs `.well-known` routes and the public DID fallback.
 pub fn router_public_only() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/.well-known/did.jsonl",
-            get(did_public::serve_root_did_log),
-        )
-        .route("/.well-known/did.json", get(did_public::serve_root_did_web))
-        .route(
-            "/.well-known/did-witness.json",
-            get(did_public::serve_root_witness),
-        )
+    #[allow(unused_mut)]
+    let mut router = Router::new();
+    #[cfg(feature = "method-webvh")]
+    {
+        router = router
+            .route(
+                "/.well-known/did.jsonl",
+                get(resolve_webvh::serve_root_did_log),
+            )
+            .route(
+                "/.well-known/did-witness.json",
+                get(resolve_webvh::serve_root_witness),
+            );
+    }
+    #[cfg(feature = "method-web")]
+    {
+        router = router.route(
+            "/.well-known/did.json",
+            get(resolve_web::serve_root_did_web),
+        );
+    }
+    router
 }
 
 /// Build the full server router with DID-serving fallback (standalone mode).

@@ -164,6 +164,84 @@ async fn public_did_resolution_round_trip() {
     assert_eq!(cc, "no-store", "404 must not be cached");
 }
 
+/// T25: with both `method-webvh` and `method-web` enabled, the
+/// per-method dispatchers must not swallow specific routes like
+/// `/api/health` or other non-DID paths. The dispatchers' suffix
+/// checks (`/did.jsonl`, `/did.json`) only trigger on actual artifact
+/// URLs; anything else falls through to the eventual 404 (or the
+/// daemon's SPA fallback).
+#[tokio::test]
+async fn route_ordering_specific_routes_beat_method_dispatchers() {
+    let (state, _dir) = make_state().await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state);
+
+    // `/api/services` is a specific authenticated route; without
+    // credentials it must reach its handler and return 401, not be
+    // swallowed by the catch-all fallback (which would 404). The
+    // exact 401 vs 403 doesn't matter — anything non-404 proves the
+    // specific route matched first.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/services")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "/api/services must reach its handler (any non-404 ok), not be swallowed by method dispatchers; got {}",
+        response.status()
+    );
+
+    // A URL with no DID suffix and no specific route — both
+    // dispatchers should `Skip`, and the fallback returns 404.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/some/random/path")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "non-DID, non-API URL must 404 through the fallback"
+    );
+
+    // Without a seeded did:web record on `.well-known`, the
+    // `/.well-known/did.json` specific route still returns 404 — but
+    // it must hit the WEB handler, not be intercepted by the WEBVH
+    // dispatcher (which would return 404 for a different reason).
+    // Either way, the test just confirms the specific route reaches a
+    // handler and doesn't 500.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/did.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::OK,
+        "/.well-known/did.json must reach the did:web handler, got {}",
+        response.status()
+    );
+}
+
 fn domain(name: &str, status: DomainStatus) -> DomainEntry {
     DomainEntry {
         name: name.into(),
