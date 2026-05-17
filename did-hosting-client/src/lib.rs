@@ -58,7 +58,7 @@ pub mod token_store;
 pub mod transport;
 pub mod trust_tasks;
 
-pub use client::{ChallengeResponse, Client};
+pub use client::{ChallengeResponse, Client, RegisterDidRequest, RequestUriResponse};
 pub use error::ClientError;
 pub use locks::ServerLocks;
 pub use token_store::{HostingTokenStore, InMemoryTokenStore, SharedTokenStore, TokenData};

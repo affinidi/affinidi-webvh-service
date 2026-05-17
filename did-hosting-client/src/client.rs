@@ -182,6 +182,146 @@ impl Client {
         decode::<TokenWire>(resp).await.map(TokenWire::into_data)
     }
 
+    // ---- DID management (T48 slice 2) -----------------------------------
+
+    /// `POST /api/dids/check` — validate that `path` is available
+    /// for reservation. The daemon answers `{ available: bool, path }`;
+    /// we surface `available` directly. `domain` is optional per
+    /// spec §5.1 — the daemon's T34 resolver picks the ACL default
+    /// when absent.
+    pub async fn check_path(
+        &self,
+        access_token: &str,
+        path: &str,
+        domain: Option<&str>,
+    ) -> Result<bool, ClientError> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            path: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            domain: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            available: bool,
+        }
+        let url = self.url("/api/dids/check")?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_CHECK_NAME_1_0)?)
+            .bearer_auth(access_token)
+            .json(&Body { path, domain })
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        decode::<Wire>(resp).await.map(|w| w.available)
+    }
+
+    /// `POST /api/dids` — reserve a path slot. Body is optional;
+    /// `path = None` lets the daemon mint a fresh mnemonic. The
+    /// response carries the assigned mnemonic + resolution URL.
+    pub async fn request_uri(
+        &self,
+        access_token: &str,
+        path: Option<&str>,
+        force: bool,
+    ) -> Result<RequestUriResponse, ClientError> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            path: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            force: bool,
+        }
+        let url = self.url("/api/dids")?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REQUEST_1_0)?)
+            .bearer_auth(access_token)
+            .json(&Body { path, force })
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        decode::<RequestUriWire>(resp)
+            .await
+            .map(|w| RequestUriResponse {
+                mnemonic: w.mnemonic,
+                did_url: w.did_url,
+            })
+    }
+
+    /// `POST /api/dids/register` — atomic claim-and-publish.
+    ///
+    /// `did_data` is method-specific: a JSONL string for `webvh`,
+    /// a `did.json` object for `web`. `method` defaults to `webvh`
+    /// per the daemon's T26 inference rule but the caller may
+    /// pass it explicitly. `domain` defers to the daemon's T34
+    /// resolver when absent.
+    pub async fn register_did_atomic(
+        &self,
+        access_token: &str,
+        req: &RegisterDidRequest<'_>,
+    ) -> Result<RequestUriResponse, ClientError> {
+        let url = self.url("/api/dids/register")?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REGISTER_1_0)?)
+            .bearer_auth(access_token)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        decode::<RequestUriWire>(resp)
+            .await
+            .map(|w| RequestUriResponse {
+                mnemonic: w.mnemonic,
+                did_url: w.did_url,
+            })
+    }
+
+    /// `PUT /api/dids/{mnemonic}` — publish a new version of an
+    /// existing DID. `content_type` controls the daemon's T26
+    /// method discriminator: `application/jsonl` → webvh,
+    /// `application/did+json` → web. Returns 204 on success.
+    pub async fn publish_did(
+        &self,
+        access_token: &str,
+        mnemonic: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        let url = self.url(&format!("/api/dids/{}", mnemonic.trim_start_matches('/')))?;
+        let resp = self
+            .http
+            .put(url)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_PUBLISH_1_0)?)
+            .bearer_auth(access_token)
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        decode_no_body(resp).await
+    }
+
+    /// `DELETE /api/dids/{mnemonic}` — delete a DID. Owner-or-
+    /// admin authorisation gated by the daemon.
+    pub async fn delete_did(&self, access_token: &str, mnemonic: &str) -> Result<(), ClientError> {
+        let url = self.url(&format!("/api/dids/{}", mnemonic.trim_start_matches('/')))?;
+        let resp = self
+            .http
+            .delete(url)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_DELETE_1_0)?)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        decode_no_body(resp).await
+    }
+
     // ---- internal plumbing ----
 
     fn url(&self, path: &str) -> Result<Url, ClientError> {
@@ -198,6 +338,75 @@ impl Client {
         h.insert(name, value);
         Ok(h)
     }
+}
+
+/// Request body for [`Client::register_did_atomic`]. Mirrors the
+/// daemon's T26 `DidRegisterRequest` wire shape — the legacy
+/// `did_log: String` form is supported by the daemon for
+/// backwards-compat but new clients should use `did_data`.
+#[derive(Debug, serde::Serialize)]
+pub struct RegisterDidRequest<'a> {
+    /// Path / mnemonic to register under.
+    pub path: &'a str,
+    /// Optional `"webvh"` / `"web"`. When absent, the daemon
+    /// infers from `did_data.id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<&'a str>,
+    /// Method-specific payload (JSONL string for webvh, did.json
+    /// object for web). Serialised verbatim.
+    pub did_data: &'a serde_json::Value,
+    /// Override the caller's ACL default domain. Omitted → the
+    /// daemon's T34 resolver chooses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<&'a str>,
+    /// Admin-only takeover of an existing path. Owners are
+    /// implicitly authorised on their own paths.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// Response from both `request_uri` and `register_did_atomic` —
+/// the daemon-assigned mnemonic + the public resolution URL.
+#[derive(Debug, Clone)]
+pub struct RequestUriResponse {
+    /// Mnemonic / path the DID lives at.
+    pub mnemonic: String,
+    /// Public resolution URL (e.g. `https://example.com/alice/did.jsonl`).
+    pub did_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestUriWire {
+    mnemonic: String,
+    did_url: String,
+}
+
+/// Decode a response that's expected to have no body (204 / 201).
+/// Maps non-success status codes through the same ladder as
+/// [`decode`].
+async fn decode_no_body(resp: reqwest::Response) -> Result<(), ClientError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| String::from("<unreadable body>"));
+    Err(match status.as_u16() {
+        400 => ClientError::Validation(body),
+        401 => ClientError::Auth(body),
+        403 => ClientError::Forbidden(body),
+        404 => ClientError::NotFound(body),
+        409 => ClientError::Conflict(body),
+        415 => ClientError::Protocol(format!("Trust-Task mismatch: {body}")),
+        500..=599 => ClientError::Server {
+            status: status.as_u16(),
+            body,
+        },
+        _ => ClientError::Protocol(format!("unexpected status {status}: {body}")),
+    })
 }
 
 /// Auth challenge response — the integrator-facing flattened form
@@ -345,5 +554,59 @@ mod tests {
         let c = Client::new("https://example.com/", "did:example:srv", tokens()).unwrap();
         let u = c.url("/api/auth/challenge").unwrap();
         assert_eq!(u.as_str(), "https://example.com/api/auth/challenge");
+    }
+
+    /// `RegisterDidRequest` serialises with optional fields
+    /// suppressed when `None` so the daemon's T26 resolver picks
+    /// the inference paths.
+    #[test]
+    fn register_request_minimal_serialisation() {
+        let data = serde_json::json!({ "id": "did:webvh:Q1:example.com:alice" });
+        let req = RegisterDidRequest {
+            path: "alice",
+            method: None,
+            did_data: &data,
+            domain: None,
+            force: false,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        // No `method`, no `domain`, no `force` keys when they're at default.
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("path"), Some(&serde_json::json!("alice")));
+        assert!(obj.contains_key("did_data"));
+        assert!(!obj.contains_key("method"));
+        assert!(!obj.contains_key("domain"));
+        assert!(!obj.contains_key("force"));
+    }
+
+    /// Explicit `method` / `domain` / `force` round-trip correctly.
+    #[test]
+    fn register_request_full_serialisation() {
+        let data = serde_json::json!({ "id": "did:web:example.com:bob" });
+        let req = RegisterDidRequest {
+            path: "bob",
+            method: Some("web"),
+            did_data: &data,
+            domain: Some("example.com"),
+            force: true,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("method"), Some(&serde_json::json!("web")));
+        assert_eq!(obj.get("domain"), Some(&serde_json::json!("example.com")));
+        assert_eq!(obj.get("force"), Some(&serde_json::json!(true)));
+    }
+
+    /// Mnemonic path-segment construction trims an accidental
+    /// leading slash so an integrator passing `"/alice"` works.
+    #[test]
+    fn publish_url_handles_leading_slash() {
+        let c = Client::new("https://example.com/", "did:example:srv", tokens()).unwrap();
+        let u = c.url("/api/dids/alice").unwrap();
+        assert_eq!(u.as_str(), "https://example.com/api/dids/alice");
+        let u = c
+            .url(&format!("/api/dids/{}", "/alice".trim_start_matches('/')))
+            .unwrap();
+        assert_eq!(u.as_str(), "https://example.com/api/dids/alice");
     }
 }
