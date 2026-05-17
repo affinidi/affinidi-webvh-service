@@ -60,11 +60,15 @@ jobs:
         # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
         # the default-features build and break operator-driven feature
         # selections at the next minor release.
+        #
+        # `method-webvh` and `method-web` (multi-method rollout, T11/T24)
+        # are also feature-gated; same MSRV-pass rationale.
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
                      store-firestore store-cosmosdb passkey \
-                     setup-wizard metrics; do
+                     setup-wizard metrics \
+                     method-webvh method-web; do
             echo "::group::MSRV build did-hosting-common --features server-core,$feat"
             cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
               --no-default-features --features "server-core,$feat"
@@ -189,6 +193,64 @@ jobs:
               server::secret_store::keyring::tests::keyring_round_trip_when_backend_available \
               -- --nocapture
           '
+
+  methods:
+    name: cargo build (DID method ${{ matrix.case }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each enabled-by-default method must build cleanly with
+          # only its own feature on — proves the dispatcher arms are
+          # individually compile-gated, and that the daemon CAN be
+          # built as method-webvh-only or method-web-only.
+          - case: webvh-only
+            features: "method-webvh"
+            expect: ok
+          - case: web-only
+            features: "method-web"
+            expect: ok
+          # Stubs MUST refuse to build with a `compile_error!`. CI
+          # asserts the failure message — a future contributor who
+          # accidentally removes the stub without supplying a real
+          # impl would otherwise see the build "succeed" with the
+          # method absent from `method_by_name`.
+          - case: webs-stub
+            features: "method-webs"
+            expect: fail
+            expected_message: "method-webs is not implemented in this release"
+          - case: webplus-stub
+            features: "method-webplus"
+            expect: fail
+            expected_message: "method-webplus is not implemented in this release"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build did-hosting-common (${{ matrix.case }})
+        run: |
+          set +e
+          out=$(cargo build -p did-hosting-common \
+            --no-default-features --features "${{ matrix.features }}" 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ "${{ matrix.expect }}" = "ok" ]; then
+            if [ "$status" -ne 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to build, got exit $status"
+              exit 1
+            fi
+          else
+            if [ "$status" -eq 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to FAIL to build, got success"
+              exit 1
+            fi
+            if ! echo "$out" | grep -q "${{ matrix.expected_message }}"; then
+              echo "::error::expected failure to mention '${{ matrix.expected_message }}'"
+              exit 1
+            fi
+          fi
 
   cloud-secrets-build:
     name: cargo build (cloud secret backends)
