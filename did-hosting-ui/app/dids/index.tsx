@@ -12,6 +12,7 @@ import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { useDomains } from "../../components/DomainProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
@@ -23,6 +24,12 @@ export default function DidList() {
   const { isAuthenticated, role, did: myDid } = useAuth();
   const router = useRouter();
   const { owner } = useLocalSearchParams<{ owner?: string }>();
+  const {
+    domains,
+    currentDomain,
+    defaultDomain,
+    loaded: domainsLoaded,
+  } = useDomains();
   const [dids, setDids] = useState<DidRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -35,6 +42,12 @@ export default function DidList() {
   const [showForm, setShowForm] = useState(false);
   const [customPath, setCustomPath] = useState("");
   const [pathStatus, setPathStatus] = useState<PathStatus>(null);
+  // T26: optional domain override on create. Default to the
+  // switcher's current selection so admins managing one specific
+  // domain don't have to re-pick on every create.
+  const [createDomain, setCreateDomain] = useState<string | null>(
+    currentDomain ?? defaultDomain ?? null,
+  );
 
   const refresh = useCallback(() => {
     if (!isAuthenticated) {
@@ -77,7 +90,7 @@ export default function DidList() {
     setPathStatus("checking");
     debounceRef.current = setTimeout(() => {
       api
-        .checkName(trimmed)
+        .checkName(trimmed, createDomain ?? undefined)
         .then((result) =>
           setPathStatus(result.available ? "available" : "taken"),
         )
@@ -87,13 +100,13 @@ export default function DidList() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [customPath, api]);
+  }, [customPath, api, createDomain]);
 
   const handleCreate = async () => {
     setCreating(true);
     try {
       const path = customPath.trim() || undefined;
-      await api.createDid(path);
+      await api.createDid(path, false, createDomain ?? undefined);
       resetForm();
       refresh();
     } catch (e: unknown) {
@@ -150,6 +163,16 @@ export default function DidList() {
       minute: "2-digit",
     });
 
+  // T34/T35: filter the list to the current domain when the
+  // switcher has one pinned. "All domains" (currentDomain === null,
+  // admin-only) shows everything.
+  const visibleDids =
+    currentDomain === null
+      ? dids
+      : dids.filter(
+          (d) => !d.domain || d.domain === currentDomain,
+        );
+
   return (
     <View style={styles.container}>
       {owner && (
@@ -167,9 +190,16 @@ export default function DidList() {
       )}
 
       <View style={styles.header}>
-        <Text style={styles.title}>
-          {owner ? "Owner DIDs" : role === "admin" ? "All DIDs" : "Your DIDs"}
-        </Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>
+            {owner ? "Owner DIDs" : role === "admin" ? "All DIDs" : "Your DIDs"}
+          </Text>
+          {currentDomain !== null && (
+            <Text style={styles.filterCaption}>
+              Filtered to {currentDomain}
+            </Text>
+          )}
+        </View>
         <View style={styles.headerActions}>
           {showRootDidButton && (
             <Pressable
@@ -203,12 +233,49 @@ export default function DidList() {
             onChangeText={setCustomPath}
             autoCapitalize="none"
             autoCorrect={false}
+            accessibilityLabel="DID path or mnemonic"
           />
           <Text style={styles.validationHint}>
             Segments: 2–63 chars, lowercase letters, digits, and hyphens.
             {"\n"}Use / for folders (e.g. people/staff/glenn).
             {"\n"}Leave blank for a random mnemonic.
           </Text>
+
+          {domainsLoaded && domains.length > 0 && (
+            <View style={styles.domainPickerWrap}>
+              <Text style={styles.formLabel}>Host on domain</Text>
+              <View style={styles.domainPickerRow}>
+                {domains.map((d) => (
+                  <Pressable
+                    key={d.name}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: createDomain === d.name }}
+                    onPress={() => setCreateDomain(d.name)}
+                    disabled={d.status === "disabled"}
+                    style={[
+                      styles.domainPickerOption,
+                      createDomain === d.name && styles.domainPickerOptionActive,
+                      d.status === "disabled" && styles.disabled,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.domainPickerOptionText,
+                        createDomain === d.name && styles.domainPickerOptionTextActive,
+                      ]}
+                    >
+                      {d.name}
+                      {defaultDomain === d.name ? " · default" : ""}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={styles.validationHint}>
+                The selected domain becomes the DID's host. Omit (rare) to let the
+                daemon pick your ACL default.
+              </Text>
+            </View>
+          )}
 
           {pathStatus === "checking" && (
             <Text style={styles.statusChecking}>Checking availability...</Text>
@@ -254,13 +321,15 @@ export default function DidList() {
           size="large"
           style={{ marginTop: spacing.xxl }}
         />
-      ) : dids.length === 0 ? (
+      ) : visibleDids.length === 0 ? (
         <Text style={styles.hint}>
-          No DIDs yet. Create one to get started.
+          {currentDomain
+            ? `No DIDs on ${currentDomain} yet. Create one to get started, or pick a different domain from the switcher.`
+            : "No DIDs yet. Create one to get started."}
         </Text>
       ) : (
         <FlatList
-          data={dids}
+          data={visibleDids}
           keyExtractor={(item) => item.mnemonic}
           contentContainerStyle={{ gap: spacing.md }}
           renderItem={({ item }) => {
@@ -276,6 +345,20 @@ export default function DidList() {
                 >
                   <View style={styles.mnemonicRow}>
                     <Text style={styles.mnemonic}>{item.mnemonic}</Text>
+                    {item.method && (
+                      <View style={styles.methodBadge}>
+                        <Text style={styles.methodBadgeText}>
+                          did:{item.method}
+                        </Text>
+                      </View>
+                    )}
+                    {item.domain && (
+                      <View style={styles.domainBadge}>
+                        <Text style={styles.domainBadgeText}>
+                          {item.domain}
+                        </Text>
+                      </View>
+                    )}
                     {showOwnerInfo && isOwn && (
                       <View style={styles.youBadge}>
                         <Text style={styles.youBadgeText}>You</Text>
@@ -554,5 +637,75 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     fontSize: 14,
     fontFamily: fonts.semibold,
+  },
+  filterCaption: {
+    marginTop: 4,
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+  },
+  formLabel: {
+    fontFamily: fonts.semibold,
+    fontSize: 12,
+    color: colors.textTertiary,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginTop: spacing.sm,
+  },
+  domainPickerWrap: {
+    marginTop: spacing.sm,
+    gap: spacing.xs,
+  },
+  domainPickerRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    marginTop: 4,
+  },
+  domainPickerOption: {
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.full,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.bgTertiary,
+  },
+  domainPickerOptionActive: {
+    borderColor: colors.accent,
+    backgroundColor: colors.accent,
+  },
+  domainPickerOptionText: {
+    fontFamily: fonts.medium,
+    fontSize: 12,
+    color: colors.textSecondary,
+  },
+  domainPickerOptionTextActive: {
+    color: colors.textOnAccent,
+  },
+  methodBadge: {
+    backgroundColor: colors.tealMuted,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+    borderRadius: radii.sm,
+  },
+  methodBadgeText: {
+    fontFamily: fonts.semibold,
+    fontSize: 10,
+    color: colors.teal,
+    letterSpacing: 0.4,
+  },
+  domainBadge: {
+    backgroundColor: colors.bgTertiary,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  domainBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: colors.textSecondary,
+    letterSpacing: 0.4,
   },
 });

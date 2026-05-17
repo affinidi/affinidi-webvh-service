@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -10,21 +10,43 @@ import {
 import { Link } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
+import { useDomains } from "../components/DomainProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
 import { UsageChart } from "../components/UsageChart";
 import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { ControlPlaneConfig, HealthResponse, ServerStats } from "../lib/api";
+import type {
+  AclEntry,
+  ControlPlaneConfig,
+  HealthResponse,
+  ServerStats,
+} from "../lib/api";
 
 export default function Dashboard() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, role } = useAuth();
   const api = useApi();
+  const { currentDomain } = useDomains();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [aclEntries, setAclEntries] = useState<AclEntry[] | null>(null);
 
   const isDaemon = config?.deploymentMode === "daemon";
+  const isAdmin = role === "admin";
+
+  // Owners whose scope is unrestricted ("All") are flagged for migration:
+  // v0.7 grants new Owners a scoped default, but pre-existing rows keep
+  // their `kind: "all"` shape until an admin tightens them. We count
+  // locally rather than requiring a dedicated endpoint — listAcl already
+  // returns the full set for admins.
+  const allScopedOwnerCount = useMemo(() => {
+    if (!aclEntries) return 0;
+    return aclEntries.filter(
+      (e) =>
+        e.role === "owner" && (!e.domains || e.domains.kind === "all"),
+    ).length;
+  }, [aclEntries]);
 
   useEffect(() => {
     api
@@ -44,6 +66,14 @@ export default function Dashboard() {
       .then(setConfig)
       .catch(() => {});
   }, [isAuthenticated, api]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !isAdmin) return;
+    api
+      .listAcl()
+      .then((res) => setAclEntries(res.entries))
+      .catch(() => setAclEntries(null));
+  }, [api, isAuthenticated, isAdmin]);
 
   if (!isAuthenticated) {
     return (
@@ -67,7 +97,31 @@ export default function Dashboard() {
       <View style={styles.header}>
         <AffinidiLogo size={48} />
         <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
+        <Text style={styles.domainCaption}>
+          {currentDomain
+            ? `Active domain: ${currentDomain}`
+            : "Showing all domains"}
+        </Text>
       </View>
+
+      {isAdmin && allScopedOwnerCount > 0 && (
+        <View style={styles.migrationBanner}>
+          <Text style={styles.migrationTitle}>
+            {allScopedOwnerCount} owner
+            {allScopedOwnerCount === 1 ? "" : "s"} on unrestricted scope
+          </Text>
+          <Text style={styles.migrationBody}>
+            These ACL entries still use the legacy "All domains" scope. Open
+            Access Control to narrow each owner to specific domains and set a
+            default.
+          </Text>
+          <Link href="/acl" asChild>
+            <Pressable style={styles.migrationButton}>
+              <Text style={styles.migrationButtonText}>Review owners</Text>
+            </Pressable>
+          </Link>
+        </View>
+      )}
 
       {error ? (
         <View style={[styles.card, styles.errorCard]}>
@@ -232,5 +286,46 @@ const styles = StyleSheet.create({
     color: colors.textOnAccent,
     fontSize: 16,
     fontFamily: fonts.semibold,
+  },
+  domainCaption: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+    marginTop: 4,
+  },
+  migrationBanner: {
+    width: "100%",
+    maxWidth: 800,
+    backgroundColor: "rgba(31, 229, 205, 0.08)",
+    borderColor: colors.teal,
+    borderWidth: 1,
+    borderRadius: radii.lg,
+    padding: spacing.lg,
+    marginBottom: spacing.lg,
+  },
+  migrationTitle: {
+    fontSize: 15,
+    fontFamily: fonts.semibold,
+    color: colors.teal,
+    marginBottom: spacing.xs,
+  },
+  migrationBody: {
+    fontSize: 13,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    lineHeight: 19,
+    marginBottom: spacing.md,
+  },
+  migrationButton: {
+    alignSelf: "flex-start",
+    backgroundColor: colors.teal,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: 8,
+    borderRadius: radii.sm,
+  },
+  migrationButtonText: {
+    fontSize: 13,
+    fontFamily: fonts.semibold,
+    color: colors.bgPrimary,
   },
 });

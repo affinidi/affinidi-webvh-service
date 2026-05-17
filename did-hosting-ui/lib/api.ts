@@ -120,6 +120,10 @@ export interface DidDetailResponse {
   owner: string;
   log: LogMetadata | null;
   watcherSync: WatcherSyncStatus[] | null;
+  /** v0.7: hosting method (`webvh` / `web`). Omitted on legacy records. */
+  method?: string;
+  /** v0.7: hosting domain. Omitted on legacy records pre-M-01. */
+  domain?: string;
 }
 
 export interface LogEntryInfo {

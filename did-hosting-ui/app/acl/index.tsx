@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, memo } from "react";
+import { useEffect, useMemo, useState, useCallback, memo } from "react";
 import {
   View,
   Text,
@@ -12,6 +12,7 @@ import { Link } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { useDomains } from "../../components/DomainProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import {
   formatBytes,
@@ -24,8 +25,18 @@ import type {
   AclEntry,
   CreateInviteResponse,
   DidRecord,
+  DomainScope,
   InviteListItem,
 } from "../../lib/api";
+
+type ScopeKind = "all" | "allowed" | "allowed_with_default";
+
+interface ScopeDraft {
+  kind: ScopeKind;
+  domains: string[];
+  /** Only meaningful when `kind === "allowed_with_default"`. */
+  default: string;
+}
 
 interface EditState {
   did: string;
@@ -33,6 +44,64 @@ interface EditState {
   label: string;
   maxTotalSize: string;
   maxDidCount: string;
+  scope: ScopeDraft;
+}
+
+/** Default scope draft for new ACL entries — "All domains" unless an admin
+ * narrows it. v0.7 backend ultimately defaults new Owners to
+ * AllowedWithDefault, but the UI surfaces the choice explicitly so admins
+ * don't accidentally grant unrestricted access. */
+const DEFAULT_SCOPE_DRAFT: ScopeDraft = {
+  kind: "all",
+  domains: [],
+  default: "",
+};
+
+function aclEntryToDraft(entry: AclEntry): ScopeDraft {
+  if (!entry.domains || entry.domains.kind === "all") {
+    return { kind: "all", domains: [], default: "" };
+  }
+  if (entry.domains.kind === "allowed") {
+    return { kind: "allowed", domains: [...entry.domains.domains], default: "" };
+  }
+  return {
+    kind: "allowed_with_default",
+    domains: [...entry.domains.domains],
+    default: entry.domains.default,
+  };
+}
+
+/** Convert the draft back to wire shape. Returns `undefined` when the
+ * draft is unset/invalid so the caller can omit the field. */
+function draftToScope(draft: ScopeDraft): DomainScope | undefined {
+  if (draft.kind === "all") return { kind: "all" };
+  if (draft.kind === "allowed") {
+    if (draft.domains.length === 0) return undefined;
+    return { kind: "allowed", domains: draft.domains };
+  }
+  if (draft.domains.length === 0 || !draft.default) return undefined;
+  return {
+    kind: "allowed_with_default",
+    domains: draft.domains,
+    default: draft.default,
+  };
+}
+
+/** Validation hook used by the Save / Add buttons — returns an error
+ * message when the draft is not submittable. */
+function validateScopeDraft(draft: ScopeDraft): string | null {
+  if (draft.kind === "all") return null;
+  if (draft.domains.length === 0) return "Select at least one domain";
+  if (draft.kind === "allowed_with_default" && !draft.default) {
+    return "Pick a default domain";
+  }
+  if (
+    draft.kind === "allowed_with_default" &&
+    !draft.domains.includes(draft.default)
+  ) {
+    return "Default must be one of the selected domains";
+  }
+  return null;
 }
 
 const formatDate = (ts: number) =>
@@ -44,10 +113,207 @@ const formatDate = (ts: number) =>
 
 const keyExtractor = (item: AclEntry) => item.did;
 
+/** Renders the current scope of an ACL entry as a compact read-only
+ * cluster of chips. "All domains" collapses to a single chip; otherwise
+ * each allowed domain renders as a chip, with the default marked by a
+ * leading star. Used in the row read view (not the editor). */
+function ScopeBadges({ entry }: { entry: AclEntry }) {
+  const scope = entry.domains;
+  if (!scope || scope.kind === "all") {
+    return (
+      <View style={styles.scopeChip}>
+        <Text style={styles.scopeChipText}>All domains</Text>
+      </View>
+    );
+  }
+  const def = scope.kind === "allowed_with_default" ? scope.default : null;
+  return (
+    <View style={styles.scopeChipRow}>
+      {scope.domains.map((d) => {
+        const isDefault = d === def;
+        return (
+          <View
+            key={d}
+            style={[styles.scopeChip, isDefault && styles.scopeChipDefault]}
+          >
+            <Text
+              style={[
+                styles.scopeChipText,
+                isDefault && styles.scopeChipTextDefault,
+              ]}
+              numberOfLines={1}
+            >
+              {isDefault ? `★ ${d}` : d}
+            </Text>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+/** Inline editor for a `DomainScope` draft. Three modes:
+ * - All domains: no further input
+ * - Specific domains: multi-select chips
+ * - Specific + default: multi-select chips + single-select default
+ *
+ * `availableDomains` is sourced from `useDomains()` so the chip list
+ * always reflects the live catalog (filtered by ACL scope for non-admins,
+ * but Access Control is admin-only so this is the full set).
+ */
+function ScopeEditor({
+  draft,
+  availableDomains,
+  onChange,
+}: {
+  draft: ScopeDraft;
+  availableDomains: { name: string; disabled: boolean }[];
+  onChange: (next: ScopeDraft) => void;
+}) {
+  const toggleDomain = (name: string) => {
+    const has = draft.domains.includes(name);
+    const next = has
+      ? draft.domains.filter((d) => d !== name)
+      : [...draft.domains, name];
+    let nextDefault = draft.default;
+    if (draft.kind === "allowed_with_default" && !next.includes(nextDefault)) {
+      nextDefault = next[0] ?? "";
+    }
+    onChange({ ...draft, domains: next, default: nextDefault });
+  };
+
+  const setKind = (kind: ScopeKind) => {
+    if (kind === "all") {
+      onChange({ kind, domains: [], default: "" });
+      return;
+    }
+    if (kind === "allowed") {
+      onChange({ ...draft, kind, default: "" });
+      return;
+    }
+    // allowed_with_default — auto-pick the first selected as default if
+    // the user hasn't chosen one yet.
+    const def =
+      draft.default && draft.domains.includes(draft.default)
+        ? draft.default
+        : draft.domains[0] ?? "";
+    onChange({ ...draft, kind, default: def });
+  };
+
+  return (
+    <View style={styles.scopeEditor}>
+      <Text style={styles.editFieldLabel}>Domain scope</Text>
+      <View style={styles.scopeKindRow}>
+        {(
+          [
+            { v: "all", label: "All" },
+            { v: "allowed", label: "Specific" },
+            { v: "allowed_with_default", label: "Specific + default" },
+          ] as const
+        ).map((opt) => (
+          <Pressable
+            key={opt.v}
+            style={[
+              styles.scopeKindButton,
+              draft.kind === opt.v && styles.scopeKindButtonActive,
+            ]}
+            onPress={() => setKind(opt.v)}
+          >
+            <Text
+              style={[
+                styles.scopeKindText,
+                draft.kind === opt.v && styles.scopeKindTextActive,
+              ]}
+            >
+              {opt.label}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {draft.kind !== "all" && (
+        <View>
+          <Text style={styles.scopeHint}>
+            {draft.kind === "allowed"
+              ? "Owner can create DIDs on any of the selected domains."
+              : "Owner can create on any selected domain; new DIDs default to the starred one."}
+          </Text>
+          {availableDomains.length === 0 ? (
+            <Text style={styles.scopeEmpty}>
+              No domains configured yet — create one on the Domains page.
+            </Text>
+          ) : (
+            <View style={styles.scopeDomainsWrap}>
+              {availableDomains.map((d) => {
+                const selected = draft.domains.includes(d.name);
+                const isDefault =
+                  draft.kind === "allowed_with_default" &&
+                  draft.default === d.name;
+                return (
+                  <Pressable
+                    key={d.name}
+                    style={[
+                      styles.scopeDomain,
+                      selected && styles.scopeDomainSelected,
+                      isDefault && styles.scopeDomainDefault,
+                      d.disabled && styles.scopeDomainDisabled,
+                    ]}
+                    onPress={() => toggleDomain(d.name)}
+                  >
+                    <Text
+                      style={[
+                        styles.scopeDomainText,
+                        selected && styles.scopeDomainTextSelected,
+                      ]}
+                    >
+                      {isDefault ? `★ ${d.name}` : d.name}
+                      {d.disabled ? "  (disabled)" : ""}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          )}
+          {draft.kind === "allowed_with_default" && draft.domains.length > 1 && (
+            <View>
+              <Text style={styles.editFieldLabel}>Default domain</Text>
+              <View style={styles.scopeDomainsWrap}>
+                {draft.domains.map((name) => {
+                  const active = draft.default === name;
+                  return (
+                    <Pressable
+                      key={name}
+                      style={[
+                        styles.scopeDefaultButton,
+                        active && styles.scopeDefaultButtonActive,
+                      ]}
+                      onPress={() => onChange({ ...draft, default: name })}
+                    >
+                      <Text
+                        style={[
+                          styles.scopeDefaultText,
+                          active && styles.scopeDefaultTextActive,
+                        ]}
+                      >
+                        {active ? `★ ${name}` : name}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+          )}
+        </View>
+      )}
+    </View>
+  );
+}
+
 const AclEntryRow = memo(function AclEntryRow({
   item,
   editing,
   saving,
+  availableDomains,
   onStartEdit,
   onCancelEdit,
   onSave,
@@ -56,10 +322,12 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeLabel,
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
+  onChangeScope,
 }: {
   item: AclEntry;
   editing: EditState | null;
   saving: boolean;
+  availableDomains: { name: string; disabled: boolean }[];
   onStartEdit: (entry: AclEntry) => void;
   onCancelEdit: () => void;
   onSave: (did: string) => void;
@@ -68,8 +336,10 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeLabel: (v: string) => void;
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
+  onChangeScope: (next: ScopeDraft) => void;
 }) {
   const isEditing = editing?.did === item.did;
+  const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
 
   return (
     <View style={styles.entryCard}>
@@ -151,11 +421,24 @@ const AclEntryRow = memo(function AclEntryRow({
                 />
               </View>
             </View>
+            {editing && (
+              <ScopeEditor
+                draft={editing.scope}
+                availableDomains={availableDomains}
+                onChange={onChangeScope}
+              />
+            )}
+            {scopeError && (
+              <Text style={styles.scopeError}>{scopeError}</Text>
+            )}
             <View style={styles.editActions}>
               <Pressable
-                style={[styles.saveButton, saving && styles.disabled]}
+                style={[
+                  styles.saveButton,
+                  (saving || !!scopeError) && styles.disabled,
+                ]}
                 onPress={() => onSave(item.did)}
-                disabled={saving}
+                disabled={saving || !!scopeError}
               >
                 <Text style={styles.saveText}>
                   {saving ? "Saving..." : "Save"}
@@ -167,19 +450,25 @@ const AclEntryRow = memo(function AclEntryRow({
             </View>
           </View>
         ) : (
-          <View style={styles.quotaRow}>
-            <Text style={styles.quotaText}>
-              Max Size:{" "}
-              {item.max_total_size != null
-                ? formatBytes(item.max_total_size)
-                : "Default"}
-            </Text>
-            <Text style={styles.quotaText}>
-              Max DIDs:{" "}
-              {item.max_did_count != null
-                ? item.max_did_count.toLocaleString()
-                : "Default"}
-            </Text>
+          <View>
+            <View style={styles.quotaRow}>
+              <Text style={styles.quotaText}>
+                Max Size:{" "}
+                {item.max_total_size != null
+                  ? formatBytes(item.max_total_size)
+                  : "Default"}
+              </Text>
+              <Text style={styles.quotaText}>
+                Max DIDs:{" "}
+                {item.max_did_count != null
+                  ? item.max_did_count.toLocaleString()
+                  : "Default"}
+              </Text>
+            </View>
+            <View style={styles.scopeReadRow}>
+              <Text style={styles.scopeReadLabel}>Domains:</Text>
+              <ScopeBadges entry={item} />
+            </View>
           </View>
         )}
       </View>
@@ -207,6 +496,19 @@ const AclEntryRow = memo(function AclEntryRow({
 export default function AclManagement() {
   const api = useApi();
   const { isAuthenticated } = useAuth();
+  const { domains: domainCatalog } = useDomains();
+
+  // Trimmed view of `domainCatalog` for ScopeEditor — name + disabled flag,
+  // sorted alphabetically. Disabled domains stay visible so admins can
+  // still see what's selected, but the chip is greyed out.
+  const availableDomains = useMemo(
+    () =>
+      domainCatalog.map((d) => ({
+        name: d.name,
+        disabled: d.status === "disabled",
+      })),
+    [domainCatalog],
+  );
 
   const [entries, setEntries] = useState<AclEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -218,6 +520,7 @@ export default function AclManagement() {
   const [newLabel, setNewLabel] = useState("");
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
+  const [newScope, setNewScope] = useState<ScopeDraft>(DEFAULT_SCOPE_DRAFT);
   const [creating, setCreating] = useState(false);
 
   // Invite form
@@ -353,17 +656,24 @@ export default function AclManagement() {
 
   const handleCreate = async () => {
     if (!newDid.trim()) return;
+    const scopeErr = validateScopeDraft(newScope);
+    if (scopeErr) {
+      showAlert("Invalid scope", scopeErr);
+      return;
+    }
     setCreating(true);
     try {
       await api.createAcl(newDid.trim(), newRole, {
         label: newLabel.trim() || undefined,
         maxTotalSize: parseMbToBytes(newMaxTotalSize) ?? undefined,
         maxDidCount: parseOptionalInt(newMaxDidCount) ?? undefined,
+        domains: draftToScope(newScope),
       });
       setNewDid("");
       setNewLabel("");
       setNewMaxTotalSize("");
       setNewMaxDidCount("");
+      setNewScope(DEFAULT_SCOPE_DRAFT);
       refresh();
     } catch (e: unknown) {
       const msg =
@@ -439,6 +749,7 @@ export default function AclManagement() {
         entry.max_total_size != null ? bytesToMb(entry.max_total_size) : "",
       maxDidCount:
         entry.max_did_count != null ? entry.max_did_count.toString() : "",
+      scope: aclEntryToDraft(entry),
     });
   }, []);
 
@@ -465,10 +776,20 @@ export default function AclManagement() {
       setEditing((prev) => (prev ? { ...prev, maxDidCount: v } : prev)),
     [],
   );
+  const onChangeScope = useCallback(
+    (next: ScopeDraft) =>
+      setEditing((prev) => (prev ? { ...prev, scope: next } : prev)),
+    [],
+  );
 
   const handleSave = useCallback(
     async (did: string) => {
       if (!editing) return;
+      const scopeErr = validateScopeDraft(editing.scope);
+      if (scopeErr) {
+        showAlert("Invalid scope", scopeErr);
+        return;
+      }
       setSaving(true);
       try {
         await api.updateAcl(did, {
@@ -476,6 +797,7 @@ export default function AclManagement() {
           label: editing.label.trim() || null,
           maxTotalSize: parseMbToBytes(editing.maxTotalSize),
           maxDidCount: parseOptionalInt(editing.maxDidCount),
+          domains: draftToScope(editing.scope),
         });
         setEditing(null);
         refresh();
@@ -509,6 +831,7 @@ export default function AclManagement() {
       item={item}
       editing={editing}
       saving={saving}
+      availableDomains={availableDomains}
       onStartEdit={startEditing}
       onCancelEdit={cancelEditing}
       onSave={handleSave}
@@ -517,6 +840,7 @@ export default function AclManagement() {
       onChangeLabel={onChangeLabel}
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
+      onChangeScope={onChangeScope}
     />
   );
 
@@ -789,13 +1113,19 @@ export default function AclManagement() {
         <Text style={styles.quotaHint}>
           Leave blank to use server default
         </Text>
+        <ScopeEditor
+          draft={newScope}
+          availableDomains={availableDomains}
+          onChange={setNewScope}
+        />
         <Pressable
           style={[
             styles.buttonPrimary,
-            (!newDid.trim() || creating) && styles.disabled,
+            (!newDid.trim() || creating || !!validateScopeDraft(newScope)) &&
+              styles.disabled,
           ]}
           onPress={handleCreate}
-          disabled={!newDid.trim() || creating}
+          disabled={!newDid.trim() || creating || !!validateScopeDraft(newScope)}
         >
           <Text style={styles.buttonPrimaryText}>
             {creating ? "Adding..." : "Add Entry"}
@@ -1142,5 +1472,141 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     color: colors.textTertiary,
     marginBottom: spacing.sm,
+  },
+
+  // Domain scope editor + read view
+  scopeEditor: {
+    marginTop: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  scopeKindRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  scopeKindButton: {
+    flex: 1,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  scopeKindButtonActive: {
+    borderColor: colors.accent,
+    backgroundColor: "rgba(59, 113, 255, 0.12)",
+  },
+  scopeKindText: {
+    fontSize: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
+  },
+  scopeKindTextActive: {
+    color: colors.accent,
+  },
+  scopeHint: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    marginBottom: spacing.sm,
+  },
+  scopeEmpty: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textSecondary,
+    fontStyle: "italic",
+    marginBottom: spacing.sm,
+  },
+  scopeDomainsWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  scopeDomain: {
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+  },
+  scopeDomainSelected: {
+    borderColor: colors.accent,
+    backgroundColor: "rgba(59, 113, 255, 0.18)",
+  },
+  scopeDomainDefault: {
+    borderColor: colors.teal,
+    backgroundColor: "rgba(31, 229, 205, 0.18)",
+  },
+  scopeDomainDisabled: {
+    opacity: 0.5,
+  },
+  scopeDomainText: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textSecondary,
+  },
+  scopeDomainTextSelected: {
+    color: colors.textPrimary,
+  },
+  scopeDefaultButton: {
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+  },
+  scopeDefaultButtonActive: {
+    borderColor: colors.teal,
+    backgroundColor: "rgba(31, 229, 205, 0.18)",
+  },
+  scopeDefaultText: {
+    fontSize: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
+  },
+  scopeDefaultTextActive: {
+    color: colors.teal,
+  },
+  scopeError: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.error,
+    marginBottom: spacing.sm,
+  },
+  scopeReadRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    flexWrap: "wrap",
+    marginTop: spacing.xs,
+  },
+  scopeReadLabel: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+  },
+  scopeChipRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    flex: 1,
+  },
+  scopeChip: {
+    backgroundColor: colors.bgTertiary,
+    borderRadius: 999,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
+  scopeChipDefault: {
+    backgroundColor: "rgba(31, 229, 205, 0.18)",
+  },
+  scopeChipText: {
+    fontSize: 11,
+    fontFamily: fonts.medium,
+    color: colors.textSecondary,
+  },
+  scopeChipTextDefault: {
+    color: colors.teal,
   },
 });

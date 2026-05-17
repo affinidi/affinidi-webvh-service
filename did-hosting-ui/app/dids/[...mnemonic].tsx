@@ -355,11 +355,19 @@ export default function DidDetail() {
                   </Text>
                 </View>
               )}
-              {didDetail.log.method && (
+              {(didDetail.method ?? didDetail.log.method) && (
                 <View style={styles.detailRow}>
                   <Text style={styles.detailLabel}>Method</Text>
                   <Text style={styles.detailValueMono}>
-                    {didDetail.log.method}
+                    {didDetail.method ?? didDetail.log.method}
+                  </Text>
+                </View>
+              )}
+              {didDetail.domain && (
+                <View style={styles.detailRow}>
+                  <Text style={styles.detailLabel}>Domain</Text>
+                  <Text style={styles.detailValueMono}>
+                    {didDetail.domain}
                   </Text>
                 </View>
               )}
