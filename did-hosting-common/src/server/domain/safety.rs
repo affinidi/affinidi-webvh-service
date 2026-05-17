@@ -105,6 +105,51 @@ pub async fn assert_did_host_allowed(
     Ok(())
 }
 
+/// Permissive variant of [`assert_did_host_allowed`] used by the
+/// did_ops write paths.
+///
+/// Behaviour:
+/// - If the `domains` keyspace contains **at least one** entry, the
+///   strict check runs and the same error semantics apply
+///   (400 / 403).
+/// - If the keyspace is **empty**, the check is **skipped** with a
+///   warn-log. This is the legacy state — pre-T18 deployments, test
+///   fixtures that haven't seeded a domain — and is the only
+///   ergonomically-tolerable behaviour for the transition window.
+///
+/// Production daemons run T18's first-boot seed before serving
+/// requests, so the empty-keyspace path is unreachable in practice
+/// once the daemon is up. The warn-log makes the legacy state
+/// visible to operators if they hit it.
+///
+/// The strict [`assert_did_host_allowed`] stays available for code
+/// paths that want hard enforcement regardless of keyspace state
+/// (e.g. an admin tool walking the store for a one-shot audit).
+pub async fn assert_did_host_allowed_when_domains_configured(
+    store: &Store,
+    acl_entry: &AclEntry,
+    did: &str,
+) -> Result<(), AppError> {
+    use crate::server::store::KS_DOMAINS;
+    let ks = store.keyspace(KS_DOMAINS)?;
+    let any_domain = ks
+        .prefix_iter_raw(b"".to_vec())
+        .await?
+        .into_iter()
+        .next()
+        .is_some();
+    if !any_domain {
+        tracing::warn!(
+            did = %did,
+            "domains keyspace is empty — skipping host-vs-domain safety check. \
+             Configure `[hosting] bootstrap_domains` or create a domain via the \
+             admin API to enable enforcement."
+        );
+        return Ok(());
+    }
+    assert_did_host_allowed(store, acl_entry, did).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

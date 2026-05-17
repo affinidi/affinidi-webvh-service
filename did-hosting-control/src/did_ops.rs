@@ -19,6 +19,53 @@ use crate::error::AppError;
 use crate::server::AppState;
 use crate::store::KeyspaceHandle;
 
+/// Run the T20 safety check before any storage write on an inbound
+/// create / publish.
+///
+/// Looks up the caller's `AclEntry` from `state.acl_ks` and delegates
+/// to [`did_hosting_common::server::domain::
+/// assert_did_host_allowed_when_domains_configured`] — which is
+/// permissive when the `domains` keyspace is empty (legacy / test
+/// state) and strict otherwise.
+///
+/// Pulled out as a helper so `register_did_atomic` and `publish_did`
+/// can share the call without duplicating the ACL lookup.
+async fn check_did_host_safety(
+    state: &AppState,
+    auth: &AuthClaims,
+    did_id: &str,
+) -> Result<(), AppError> {
+    use did_hosting_common::server::acl::{AclEntry, get_acl_entry};
+    use did_hosting_common::server::domain::DomainScope;
+
+    // Look up the caller's ACL entry. In production an authenticated
+    // caller always has one — the auth extractor enforces it.
+    // In unit-test paths that call did_ops directly without seeding
+    // the ACL keyspace, the entry is absent; fall back to a synthetic
+    // entry with `domains: DomainScope::All` (the role from the JWT
+    // claims). That matches the legacy pre-T20b behaviour where no
+    // domain restriction applied at all — production gates this on
+    // the auth path, tests get the legacy permissive shape.
+    let acl_entry = match get_acl_entry(&state.acl_ks, &auth.did).await? {
+        Some(e) => e,
+        None => AclEntry {
+            did: auth.did.clone(),
+            role: auth.role.clone(),
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    };
+    did_hosting_common::server::domain::assert_did_host_allowed_when_domains_configured(
+        &state.store,
+        &acl_entry,
+        did_id,
+    )
+    .await
+}
+
 // Re-export for convenience
 pub use did_hosting_common::did_ops::{extract_did_id, extract_log_metadata};
 
@@ -302,6 +349,17 @@ pub async fn register_did_atomic(
         AppError::Validation("did_log's latest entry has no resolvable did:webvh state.id".into())
     })?;
 
+    // T20b: multi-domain safety check. Runs before the legacy
+    // `validate_did_id_matches_request` host equality check. In
+    // multi-domain deployments where the embedded DID host is on a
+    // configured-but-non-default domain, this is the authoritative
+    // check; the legacy validator's host comparison is redundant.
+    // For legacy single-domain deployments where `did_hosting_url`
+    // host == the only domain, both checks pass for valid DIDs.
+    // Permissive when the `domains` keyspace is empty — see
+    // `assert_did_host_allowed_when_domains_configured` doc.
+    check_did_host_safety(state, auth, &did_id).await?;
+
     did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
         .map_err(AppError::Validation)?;
 
@@ -439,6 +497,17 @@ pub async fn publish_did(
 
     let new_size = did_log.len() as u64;
     let did_id_val = extract_did_id(did_log);
+
+    // T20b: same safety check as register_did_atomic — the embedded
+    // DID's host must be a configured active domain on this server
+    // and allowed by the caller's ACL. `publish_did` updates an
+    // existing slot, but a malicious or buggy client could push a
+    // log entry pointing at a different host than the one originally
+    // registered — this catches that without trusting the stored
+    // record's old `did_id`.
+    if let Some(did_id) = did_id_val.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
 
     record.updated_at = now_epoch();
     record.version_count += 1;
@@ -1209,6 +1278,168 @@ mod tests_atomic {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("host")));
+    }
+
+    // ---- T20b: multi-domain safety check ----
+
+    /// Seed an active domain for tests that exercise the new
+    /// multi-domain safety check. Returns the canonical name.
+    async fn seed_active_domain(state: &AppState, name: &str) -> String {
+        use did_hosting_common::server::domain::{
+            create_domain,
+            types::{DomainEntry, DomainStatus, DomainUrlScheme},
+        };
+        let entry = DomainEntry {
+            name: name.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Active,
+            created_at: 0,
+            default_domain: true,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+        };
+        create_domain(&state.store, &entry).await.unwrap();
+        name.into()
+    }
+
+    /// Seed an ACL entry for a caller with an explicit DomainScope.
+    async fn seed_caller_acl(
+        state: &AppState,
+        did: &str,
+        role: Role,
+        scope: did_hosting_common::server::domain::DomainScope,
+    ) {
+        use crate::acl::store_acl_entry;
+        use did_hosting_common::server::acl::AclEntry;
+        let entry = AclEntry {
+            did: did.into(),
+            role,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: scope,
+        };
+        store_acl_entry(&state.acl_ks, &entry).await.unwrap();
+    }
+
+    /// With a domain configured and the caller's ACL scoped to it,
+    /// a DID on that domain registers normally.
+    #[tokio::test]
+    async fn register_with_domain_seeded_owner_scoped_to_matching_host() {
+        use did_hosting_common::server::domain::DomainScope;
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:scoped";
+        seed_active_domain(&state, "control.test").await;
+        seed_caller_acl(
+            &state,
+            owner,
+            Role::Owner,
+            DomainScope::Allowed {
+                domains: vec!["control.test".into()],
+            },
+        )
+        .await;
+
+        let did_log = build_test_did_log("scid-ok", "control.test", "alpha").await;
+        let result = register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
+            .await
+            .expect("scoped owner on matching host must succeed");
+        assert_eq!(result.mnemonic, "alpha");
+    }
+
+    /// Same domain configured, but the caller's ACL allows only
+    /// `domain-a` while the DID is on `domain-b`. The legacy host
+    /// validator would already reject this (host != public_url),
+    /// but the safety check fires first and returns Forbidden (403)
+    /// rather than Validation (400) — distinct error codes are how
+    /// the UI tells "we don't serve that domain" from "you can't
+    /// post there".
+    #[tokio::test]
+    async fn register_acl_rejects_host_outside_allowed_scope() {
+        use did_hosting_common::server::domain::DomainScope;
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:scoped";
+        // Two active domains: control.test AND domain-b.example.
+        seed_active_domain(&state, "control.test").await;
+        {
+            use did_hosting_common::server::domain::{
+                create_domain,
+                types::{DomainEntry, DomainStatus, DomainUrlScheme},
+            };
+            create_domain(
+                &state.store,
+                &DomainEntry {
+                    name: "domain-b.example".into(),
+                    label: None,
+                    scheme: DomainUrlScheme::Https,
+                    status: DomainStatus::Active,
+                    created_at: 0,
+                    default_domain: false,
+                    branding: None,
+                    witnesses: None,
+                    watchers: None,
+                    quota: None,
+                    well_known_enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Caller's ACL only allows control.test.
+        seed_caller_acl(
+            &state,
+            owner,
+            Role::Owner,
+            DomainScope::Allowed {
+                domains: vec!["control.test".into()],
+            },
+        )
+        .await;
+
+        let did_log = build_test_did_log("scid-evil", "domain-b.example", "alpha").await;
+        let err =
+            register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
+                .await
+                .expect_err("ACL must reject host outside scope");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
+        // No record written.
+        assert!(
+            state.dids_ks.get_raw(did_key("alpha")).await.unwrap().is_none(),
+            "no record may be written when ACL rejects the host"
+        );
+    }
+
+    /// `Admin` role short-circuits the ACL scope check — admins can
+    /// write to any **active** domain regardless of their ACL
+    /// `domains` field.
+    #[tokio::test]
+    async fn register_admin_can_write_any_active_domain() {
+        use did_hosting_common::server::domain::DomainScope;
+        let (state, _dir) = test_state().await;
+        let admin = "did:example:admin";
+        seed_active_domain(&state, "control.test").await;
+        seed_caller_acl(
+            &state,
+            admin,
+            Role::Admin,
+            DomainScope::Allowed {
+                domains: vec!["irrelevant.example".into()],
+            },
+        )
+        .await;
+
+        let did_log = build_test_did_log("scid-admin", "control.test", "alpha").await;
+        register_did_atomic(&admin_auth(admin), &state, "alpha", &did_log, false)
+            .await
+            .expect("admin role overrides ACL domain scope");
     }
 
     /// Malformed did.jsonl is rejected by `validate_did_jsonl`.
