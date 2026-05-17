@@ -51,6 +51,7 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod authed;
 pub mod client;
 pub mod error;
 pub mod locks;
@@ -58,6 +59,7 @@ pub mod token_store;
 pub mod transport;
 pub mod trust_tasks;
 
+pub use authed::AuthedClient;
 pub use client::{ChallengeResponse, Client, RegisterDidRequest, RequestUriResponse};
 pub use error::ClientError;
 pub use locks::ServerLocks;

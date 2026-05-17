@@ -182,6 +182,94 @@ impl Client {
         decode::<TokenWire>(resp).await.map(TokenWire::into_data)
     }
 
+    // ---- Decision ladder (T49) ------------------------------------------
+
+    /// Spec §7.1 decision ladder under per-server mutual exclusion.
+    ///
+    /// Returns a fresh access token. The path through the ladder
+    /// is invisible to the caller — they just call this and use
+    /// the result.
+    ///
+    /// ## Steps
+    ///
+    /// 1. Take the per-server lock from `locks` (a `Mutex<()>` —
+    ///    the protected region is the read-modify-write below).
+    ///    Two concurrent `ensure_token` calls against the same
+    ///    server serialise; one wins, the other reads the cache
+    ///    the winner populated.
+    /// 2. Read cached tokens. If `access_expires_at - now_epoch >
+    ///    30`, return the cached `access_token`.
+    /// 3. Else try [`Self::refresh`]. On success, persist the new
+    ///    pair and return the access token.
+    /// 4. On `ClientError::Auth` from refresh — refresh token also
+    ///    invalid — invalidate the cache and run the full
+    ///    challenge + authenticate dance. Persist + return.
+    /// 5. On any other error (network, server, protocol), surface
+    ///    to the caller without invalidating the cache.
+    ///
+    /// `now_epoch` is passed in (not read from `SystemTime`) so
+    /// tests can pin a deterministic clock.
+    pub async fn ensure_token(
+        &self,
+        identity: &HostingSigningIdentity<'_>,
+        recipient_did: &str,
+        locks: &crate::locks::ServerLocks,
+        now_epoch: u64,
+    ) -> Result<String, ClientError> {
+        let lock = locks.for_server(&self.server_id);
+        let _guard = lock.lock().await;
+
+        // Step 1: cache lookup.
+        if let Some(td) = self.tokens.get(&self.server_id, identity.did).await? {
+            if td.access_expires_at.saturating_sub(now_epoch) > 30 {
+                // `td` is `ZeroizeOnDrop`, so we clone the token
+                // string out before the value drops at the end of
+                // this scope.
+                return Ok(td.access_token.clone());
+            }
+
+            // Step 2: try refresh while we still have a refresh
+            // token that hasn't aged out either.
+            if td.refresh_expires_at.saturating_sub(now_epoch) > 30 {
+                match self
+                    .refresh(identity, &td.refresh_token, now_epoch, recipient_did)
+                    .await
+                {
+                    Ok(new) => {
+                        let access = new.access_token.clone();
+                        self.tokens.put(&self.server_id, identity.did, new).await?;
+                        return Ok(access);
+                    }
+                    Err(ClientError::Auth(_)) => {
+                        // refresh token was rejected (revoked, ACL change,
+                        // server key rotation); fall through to reauth.
+                        self.tokens
+                            .invalidate(&self.server_id, identity.did)
+                            .await?;
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+
+        // Step 3: full reauth via challenge → authenticate.
+        let challenge = self.challenge(identity.did).await?;
+        let fresh = self
+            .authenticate(
+                identity,
+                &challenge.session_id,
+                &challenge.challenge,
+                now_epoch,
+                recipient_did,
+            )
+            .await?;
+        let access = fresh.access_token.clone();
+        self.tokens
+            .put(&self.server_id, identity.did, fresh)
+            .await?;
+        Ok(access)
+    }
+
     // ---- DID management (T48 slice 2) -----------------------------------
 
     /// `POST /api/dids/check` — validate that `path` is available
