@@ -415,6 +415,17 @@ pub struct DidListEntry {
     pub total_resolves: u64,
     #[serde(default)]
     pub disabled: bool,
+    /// DID hosting method (`"webvh"` / `"web"`). Surfaced on the
+    /// wire so the UI can render a method badge per row without
+    /// loading the full record. Pre-T12 records that haven't been
+    /// migrated yet ship as `None` and the UI hides the badge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Hosting domain (T12 / M-01). Same shape contract as
+    /// `method` above — `None` for unmigrated records, populated
+    /// for everything M-01 has run over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -558,6 +569,8 @@ mod tests {
             did_id: Some("did:webvh:abc:host:path".to_string()),
             total_resolves: 42,
             disabled: false,
+            method: None,
+            domain: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
@@ -583,6 +596,8 @@ mod tests {
             did_id: None,
             total_resolves: 0,
             disabled: false,
+            method: None,
+            domain: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -599,6 +614,8 @@ mod tests {
             did_id: Some("did:webvh:abc:host:path".to_string()),
             total_resolves: 99,
             disabled: false,
+            method: Some("webvh".to_string()),
+            domain: Some("host.example".to_string()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: DidListEntry = serde_json::from_str(&json).unwrap();

@@ -525,6 +525,8 @@ pub async fn list_dids(
                 did_id: record.did_id,
                 total_resolves: did_stats.total_resolves,
                 disabled: record.disabled,
+                method: (!record.method.is_empty()).then(|| record.method.clone()),
+                domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
             });
         }
     }
@@ -560,6 +562,8 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             did_id: record.did_id,
             total_resolves: did_stats.total_resolves,
             disabled: record.disabled,
+            method: (!record.method.is_empty()).then(|| record.method.clone()),
+            domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
         });
     }
 

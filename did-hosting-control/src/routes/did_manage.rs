@@ -159,6 +159,10 @@ pub struct DidDetailResponse {
     pub owner: String,
     pub disabled: bool,
     pub log: Option<LogMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 pub async fn get_did(
@@ -178,6 +182,8 @@ pub async fn get_did(
         owner: record.owner,
         disabled: record.disabled,
         log: log_metadata,
+        method: (!record.method.is_empty()).then(|| record.method.clone()),
+        domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
     }))
 }
 
@@ -347,6 +353,8 @@ pub async fn rollback_did(
         owner: record.owner,
         disabled: record.disabled,
         log: log_metadata,
+        method: (!record.method.is_empty()).then(|| record.method.clone()),
+        domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
     }))
 }
 

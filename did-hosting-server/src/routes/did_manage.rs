@@ -28,6 +28,10 @@ pub struct DidDetailResponse {
     pub disabled: bool,
     pub log: Option<LogMetadata>,
     pub watcher_sync: Option<Vec<WatcherSyncStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 impl DidDetailResponse {
@@ -36,6 +40,8 @@ impl DidDetailResponse {
         log: Option<LogMetadata>,
         watcher_sync: Option<Vec<WatcherSyncStatus>>,
     ) -> Self {
+        let method = (!record.method.is_empty()).then(|| record.method.clone());
+        let domain = (!record.domain.is_empty()).then(|| record.domain.clone());
         Self {
             mnemonic: record.mnemonic,
             created_at: record.created_at,
@@ -46,6 +52,8 @@ impl DidDetailResponse {
             disabled: record.disabled,
             log,
             watcher_sync,
+            method,
+            domain,
         }
     }
 }
