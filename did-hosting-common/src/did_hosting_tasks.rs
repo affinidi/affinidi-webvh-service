@@ -182,6 +182,118 @@ pub static TASK_ME_DOMAINS_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/me/domains/1.0").expect("static")
 });
 
+// -- T8b: REST-only operations that don't have a DIDComm equivalent ---------
+//
+// The DIDComm protocol carries auth challenges, DID lifecycle, server
+// registration etc. The REST surface also exposes admin / observability
+// endpoints (passkey enrolment, ACL CRUD, stats, time-series, registry
+// management) that have no DIDComm twin. Registering Trust-Task URLs for
+// them gates the wire shape uniformly: every authed REST call carries
+// (or can carry, in permissive mode during the v0.7→v0.8 migration) a
+// canonical task identifier.
+
+// Auth — REST-specific (the DIDComm-paired `authenticate` is above).
+pub static TASK_AUTH_CHALLENGE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/challenge/1.0").expect("static")
+});
+pub static TASK_AUTH_REFRESH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/refresh/1.0").expect("static")
+});
+pub static TASK_AUTH_PASSKEY_ENROLL_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-enroll-start/1.0")
+        .expect("static")
+});
+pub static TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-enroll-finish/1.0")
+        .expect("static")
+});
+pub static TASK_AUTH_PASSKEY_LOGIN_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-login-start/1.0")
+        .expect("static")
+});
+pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-login-finish/1.0")
+        .expect("static")
+});
+pub static TASK_AUTH_PASSKEY_INVITE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-invite/1.0").expect("static")
+});
+
+// ACL admin operations.
+pub static TASK_ACL_LIST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/acl/list/1.0").expect("static")
+});
+pub static TASK_ACL_CREATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/acl/create/1.0").expect("static")
+});
+pub static TASK_ACL_UPDATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/acl/update/1.0").expect("static")
+});
+pub static TASK_ACL_DELETE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/acl/delete/1.0").expect("static")
+});
+
+// DID management — REST-specific helpers (the DIDComm-paired ones are
+// above).
+pub static TASK_DID_CHECK_NAME_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/check-name/1.0").expect("static")
+});
+pub static TASK_DID_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/log/1.0").expect("static")
+});
+pub static TASK_DID_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/disable/1.0").expect("static")
+});
+pub static TASK_DID_ENABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/enable/1.0").expect("static")
+});
+pub static TASK_DID_ROLLBACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/rollback/1.0").expect("static")
+});
+pub static TASK_DID_RAW_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/did/raw-log/1.0").expect("static")
+});
+
+// Observability / config.
+pub static TASK_STATS_SERVER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/stats/server/1.0").expect("static")
+});
+pub static TASK_STATS_DID_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/stats/did/1.0").expect("static")
+});
+pub static TASK_TIMESERIES_SERVER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/timeseries/server/1.0").expect("static")
+});
+pub static TASK_TIMESERIES_DID_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/timeseries/did/1.0").expect("static")
+});
+pub static TASK_SERVICES_OVERVIEW_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/services/overview/1.0").expect("static")
+});
+pub static TASK_CONFIG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/config/1.0").expect("static")
+});
+
+// Registry admin operations. Distinct from `TASK_SERVER_REGISTER_1_0`,
+// which is the *server's* self-registration; these are the *admin's*
+// CRUD over the registry table.
+pub static TASK_REGISTRY_LIST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/registry/list/1.0").expect("static")
+});
+pub static TASK_REGISTRY_ADMIN_REGISTER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/registry/admin-register/1.0")
+        .expect("static")
+});
+pub static TASK_REGISTRY_GET_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/registry/get/1.0").expect("static")
+});
+pub static TASK_REGISTRY_DEREGISTER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/registry/deregister/1.0").expect("static")
+});
+pub static TASK_REGISTRY_HEALTH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/registry/health/1.0").expect("static")
+});
+
 // ---------------------------------------------------------------------------
 // webvh-protocol-specific ops — `trusttasks.org/webvh/...`
 // ---------------------------------------------------------------------------
@@ -266,6 +378,35 @@ mod tests {
             &TASK_WEBVH_SYNC_UPDATE_ACK_1_0,
             &TASK_WEBVH_SYNC_DELETE_1_0,
             &TASK_WEBVH_SYNC_DELETE_ACK_1_0,
+            // T8b: REST-specific.
+            &TASK_AUTH_CHALLENGE_1_0,
+            &TASK_AUTH_REFRESH_1_0,
+            &TASK_AUTH_PASSKEY_ENROLL_START_1_0,
+            &TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0,
+            &TASK_AUTH_PASSKEY_LOGIN_START_1_0,
+            &TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0,
+            &TASK_AUTH_PASSKEY_INVITE_1_0,
+            &TASK_ACL_LIST_1_0,
+            &TASK_ACL_CREATE_1_0,
+            &TASK_ACL_UPDATE_1_0,
+            &TASK_ACL_DELETE_1_0,
+            &TASK_DID_CHECK_NAME_1_0,
+            &TASK_DID_LOG_1_0,
+            &TASK_DID_DISABLE_1_0,
+            &TASK_DID_ENABLE_1_0,
+            &TASK_DID_ROLLBACK_1_0,
+            &TASK_DID_RAW_LOG_1_0,
+            &TASK_STATS_SERVER_1_0,
+            &TASK_STATS_DID_1_0,
+            &TASK_TIMESERIES_SERVER_1_0,
+            &TASK_TIMESERIES_DID_1_0,
+            &TASK_SERVICES_OVERVIEW_1_0,
+            &TASK_CONFIG_1_0,
+            &TASK_REGISTRY_LIST_1_0,
+            &TASK_REGISTRY_ADMIN_REGISTER_1_0,
+            &TASK_REGISTRY_GET_1_0,
+            &TASK_REGISTRY_DEREGISTER_1_0,
+            &TASK_REGISTRY_HEALTH_1_0,
         ];
         for lock in all {
             let _t = lock.as_str(); // force deref; expect() inside LazyLock

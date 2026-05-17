@@ -82,6 +82,36 @@ where
         self
     }
 
+    /// Register a route in **permissive** mode — clients MAY include
+    /// a `Trust-Task` header but are not required to. When present,
+    /// the header is validated against `task` and a mismatch returns
+    /// 415 [`AppError::TrustTaskMismatch`]; when absent, the request
+    /// passes through unchecked.
+    ///
+    /// This variant exists for the v0.7→v0.8 transition: existing
+    /// clients (UI, CLI, didwebvh-cli) don't know about Trust-Task
+    /// headers, and a hard-mandatory rollout would break them on
+    /// upgrade. New clients that send the header still get the
+    /// exact-match correctness guarantee for free. A future release
+    /// can re-attach with [`Self::route_with_task`] once the
+    /// ecosystem has caught up.
+    ///
+    /// [`AppError::TrustTaskMismatch`]: crate::error::AppError::TrustTaskMismatch
+    pub fn route_with_task_permissive(
+        mut self,
+        path: &str,
+        method_router: MethodRouter<S>,
+        task: TrustTask,
+    ) -> Self {
+        let task = Arc::new(task);
+        let layered = method_router.layer(axum::middleware::from_fn(move |request, next| {
+            let task = task.clone();
+            async move { super::extractor::validate_header_permissive(&task, request, next).await }
+        }));
+        self.inner = self.inner.route(path, layered);
+        self
+    }
+
     /// Register a route that bypasses Trust-Task validation. Per spec
     /// §16.2 this is intended **only for `/health`** — operators set
     /// up monitoring against the health endpoint without having to
@@ -232,6 +262,75 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- permissive variant (T8b) ----
+
+    fn make_permissive_router() -> Router {
+        let claim = TrustTask::new("https://trusttasks.org/openvtc/vtc/install/claim/1.0").unwrap();
+        TrustTaskRouter::new()
+            .route_with_task_permissive("/v1/install/claim", post(ok), claim)
+            .into_router()
+    }
+
+    /// Permissive mode lets the request through when the client
+    /// hasn't opted in to the Trust-Task header.
+    #[tokio::test]
+    async fn permissive_allows_missing_header() {
+        let app = make_permissive_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/install/claim")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A client that does send the header is held to the same exact-
+    /// match standard as strict mode. Opt-in is binding once chosen.
+    #[tokio::test]
+    async fn permissive_still_rejects_mismatched_header() {
+        let app = make_permissive_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/install/claim")
+                    .header(
+                        HEADER_NAME,
+                        "https://trusttasks.org/openvtc/vtc/auth/login/1.0",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn permissive_accepts_exact_match() {
+        let app = make_permissive_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/install/claim")
+                    .header(
+                        HEADER_NAME,
+                        "https://trusttasks.org/openvtc/vtc/install/claim/1.0",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )

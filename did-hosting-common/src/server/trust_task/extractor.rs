@@ -81,3 +81,38 @@ pub(crate) async fn validate_header(
 
     Ok(next.run(request).await)
 }
+
+/// Permissive variant of [`validate_header`]: clients MAY send the
+/// `Trust-Task` header but aren't required to.
+///
+/// - Header absent → pass through.
+/// - Header present + exact-match → pass through.
+/// - Header present + mismatch → 415 `TrustTaskMismatch` (same as
+///   strict — once a client opts in to declaring a task, it must
+///   declare the right one).
+/// - Header present + non-UTF-8 → 400 `Validation` (same as strict).
+///
+/// Wired in by
+/// [`super::router::TrustTaskRouter::route_with_task_permissive`].
+pub(crate) async fn validate_header_permissive(
+    expected: &TrustTask,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let Some(raw) = request.headers().get(HEADER_NAME) else {
+        // Header absent — let the request through.
+        return Ok(next.run(request).await);
+    };
+    let received = raw
+        .to_str()
+        .map_err(|_| AppError::Validation("Trust-Task header is not valid UTF-8".into()))?;
+
+    if received != expected.as_str() {
+        return Err(AppError::TrustTaskMismatch {
+            expected: expected.as_str().to_string(),
+            received: Some(received.to_string()),
+        });
+    }
+
+    Ok(next.run(request).await)
+}
