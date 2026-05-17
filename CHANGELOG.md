@@ -117,6 +117,27 @@
   (cached → refresh → reauth) runs under per-server async mutex.
   Cross-crate parity test pins URL constants byte-for-byte
   against the daemon (T51).
+- **Web UI catches up to the multi-domain + multi-method surface.**
+  - New admin pages: `/domains` (catalog CRUD with create / set-default /
+    disable / enable) and `/servers` (registry view with per-instance
+    health, enabled methods, served-domain chips, assign / unassign /
+    purge-now actions).
+  - `DomainProvider` + nav-bar `DomainSwitcher` make a domain the
+    active context across the app; admins also see an "All domains"
+    pseudo-selection. Non-admin views are filtered through
+    `GET /api/me/domains`.
+  - ACL page gains a `DomainScope` editor (All / Specific / Specific +
+    default) with chip selection and a separate default picker; the
+    row read view shows the current scope as chips. Both the new-entry
+    form and inline edit write through `createAcl` / `updateAcl`.
+  - DID list filters by the active domain and renders per-row method +
+    domain badges; DID detail shows the method and domain pulled from
+    the new wire fields (T12 / M-01), with a graceful fallback to
+    `log.method` on legacy records.
+  - Dashboard surfaces the active-domain caption and an admin-only
+    migration banner counting owners still on legacy "All" scope —
+    deep-links to `/acl` for cleanup. Count is derived locally from
+    `listAcl` (no new endpoint).
 
 ### Added
 
