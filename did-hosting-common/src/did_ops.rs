@@ -32,6 +32,43 @@ pub struct DidRecord {
     /// content is preserved for recovery within the retention period.
     #[serde(default)]
     pub deleted_at: Option<u64>,
+
+    // ---- Multi-method + multi-domain fields (T12) ----
+    //
+    // Both `#[serde(default)]` for backwards-compat — v0.6-vintage
+    // `DidRecord`s lack these fields and deserialise unchanged. T13's
+    // M-01 migration walks the keyspace and populates them
+    // (`method = "webvh"` for every legacy record; `domain` derived
+    // from the legacy `public_url` host that T18's bootstrap_domains
+    // seed surfaced).
+    //
+    // The dual storage model (this record carries metadata; raw
+    // content lives at `content_log_key` / `content_witness_key`)
+    // is kept intentionally — see `docs/multi-method-hosting-spec.md`
+    // §3 "Storage" tradeoff note. Inlining `data: Vec<u8>` into the
+    // record made `list_dids` pull content bytes on every scan; the
+    // split keeps metadata reads cheap.
+
+    /// DID method this record was registered under. Always one of the
+    /// enabled-at-compile-time methods (`webvh`, `web`); the daemon
+    /// rejects any other value on the write path. Legacy records
+    /// (pre-T13 migration) default to `"webvh"` via the `#[serde(default)]`
+    /// fallback in [`Self::default_method`].
+    #[serde(default = "default_method")]
+    pub method: String,
+
+    /// Domain (hostname) this DID is hosted under. Matches the host
+    /// segment of the DID identifier (`did:{method}:…:{domain}:…`).
+    /// Legacy records (pre-T13 migration) default to the empty string;
+    /// the migration fills it with the host derived from the legacy
+    /// `public_url`. New records always carry a normalised non-empty
+    /// value.
+    #[serde(default)]
+    pub domain: String,
+}
+
+fn default_method() -> String {
+    "webvh".to_string()
 }
 
 /// A single parsed log entry with its DID document and parameters.
@@ -404,6 +441,70 @@ pub fn parse_log_entries(jsonl_content: &str) -> Vec<LogEntryInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- T12: DidRecord new fields backwards-compat ----
+
+    #[test]
+    fn legacy_did_record_deserialises_with_webvh_default_method() {
+        // A v0.6-vintage stored record lacks `method` + `domain`.
+        // The `#[serde(default)]` fallback on both fields must accept
+        // it: `method = "webvh"`, `domain = ""`. T13's M-01 migration
+        // walks the keyspace and fills `domain` with the legacy
+        // public_url host.
+        let legacy = r#"{
+            "owner": "did:example:owner",
+            "mnemonic": "tenant/user1",
+            "created_at": 1700000000,
+            "updated_at": 1700000000,
+            "version_count": 1,
+            "did_id": null,
+            "content_size": 0,
+            "disabled": false,
+            "deleted_at": null
+        }"#;
+        let rec: DidRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.method, "webvh");
+        assert_eq!(rec.domain, "");
+    }
+
+    #[test]
+    fn new_did_record_round_trips_method_and_domain() {
+        let original = DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "user1".into(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 1,
+            did_id: None,
+            content_size: 0,
+            disabled: false,
+            deleted_at: None,
+            method: "web".into(),
+            domain: "tenant-a.example.com".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: DidRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.method, "web");
+        assert_eq!(back.domain, "tenant-a.example.com");
+    }
+
+    #[test]
+    fn explicit_empty_domain_round_trips() {
+        // Mid-migration state: M-01 set `method` but `domain` is
+        // still the default empty string. Must round-trip cleanly so
+        // the migration is idempotent.
+        let legacy = r#"{
+            "owner": "did:example:owner",
+            "mnemonic": "u",
+            "created_at": 0,
+            "updated_at": 0,
+            "version_count": 0,
+            "method": "webvh"
+        }"#;
+        let rec: DidRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.method, "webvh");
+        assert_eq!(rec.domain, "");
+    }
 
     #[test]
     fn extract_did_id_from_state_id() {

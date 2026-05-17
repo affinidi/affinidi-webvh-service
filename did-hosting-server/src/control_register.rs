@@ -189,6 +189,10 @@ pub async fn apply_single_update(
         content_size: update.log_content.len() as u64,
         disabled: false,
         deleted_at: None,
+    
+        // T12: legacy construction site; T13 migration fills `domain`.
+        method: "webvh".to_string(),
+        domain: String::new(),
     };
 
     let mut batch = store.batch();

@@ -213,6 +213,10 @@ pub async fn create_did(
         content_size: 0,
         disabled: false,
         deleted_at: None,
+    
+        // T12: legacy construction site; T13 migration fills `domain`.
+        method: "webvh".to_string(),
+        domain: String::new(),
     };
 
     let mut batch = state.store.batch();
@@ -361,6 +365,10 @@ pub async fn register_did_atomic(
         content_size: did_log.len() as u64,
         disabled: false,
         deleted_at: None,
+    
+        // T12: legacy construction site; T13 migration fills `domain`.
+        method: "webvh".to_string(),
+        domain: String::new(),
     };
 
     // 4. Single-batch atomic write: record, log content, owner index;
