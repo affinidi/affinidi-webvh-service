@@ -2606,6 +2606,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "did-hosting-client"
+version = "0.1.0"
+dependencies = [
+ "affinidi-tdk",
+ "async-trait",
+ "dashmap",
+ "didwebvh-rs",
+ "ipnetwork",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "did-hosting-common"
 version = "0.7.1"
 dependencies = [
