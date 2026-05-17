@@ -52,10 +52,14 @@
 
 pub mod auth;
 pub mod error;
+pub mod locks;
+pub mod token_store;
 pub mod transport;
 pub mod trust_tasks;
 
 pub use error::ClientError;
+pub use locks::ServerLocks;
+pub use token_store::{HostingTokenStore, InMemoryTokenStore, SharedTokenStore, TokenData};
 
 /// Crate version string (`CARGO_PKG_VERSION`). Useful for telemetry
 /// and for the `User-Agent` header the client will send once T46
