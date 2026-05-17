@@ -569,6 +569,34 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         }
     }
 
+    // First-boot assignment seed (T29). Mirrors the T18 tier chain so
+    // a freshly-deployed daemon — even with no control plane
+    // reachable — has the same effective assignments and will host
+    // its bootstrap_domains immediately. Once the control plane sends
+    // `MSG_DOMAIN_ASSIGN` the keyspace is the same; subsequent boots
+    // short-circuit at tier 0.
+    let assignment_now = did_hosting_common::server::auth::session::now_epoch();
+    match did_hosting_common::server::assignment_seed::seed_assignments_first_boot(
+        &main_store,
+        &config.hosting.bootstrap_domains,
+        config.public_url.as_deref(),
+        assignment_now,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            info!(
+                tier = ?outcome.tier,
+                count = outcome.final_count,
+                "first-boot assignment seed"
+            );
+        }
+        Err(e) => {
+            error!("first-boot assignment seed failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Storage migrations (T2 runner + T13 M-01). Runs after the
     // domain seed so M-01 can use the system default as a tier-2
     // fallback for legacy records that have no `did_id` to derive a
