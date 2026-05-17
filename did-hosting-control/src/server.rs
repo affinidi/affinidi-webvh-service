@@ -554,6 +554,12 @@ pub async fn seed_registry(state: &AppState) {
             last_health_check: None,
             registered_at: crate::auth::session::now_epoch(),
             metadata: serde_json::Value::Null,
+            // Config-seeded instances pre-date T27's capability
+            // declaration; assume webvh-only until the instance
+            // re-registers and reports its compile-time methods.
+            enabled_methods: vec!["webvh".to_string()],
+            served_domains: Vec::new(),
+            protocol_version: "1.0".to_string(),
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {

@@ -109,12 +109,20 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         return;
     }
 
+    // T27: declare capabilities to the control plane on registration.
+    // `enabled_methods` is the compile-time set from common; an older
+    // control plane that hasn't picked up the T27 fields will simply
+    // ignore them.
+    let enabled_methods: Vec<&str> = did_hosting_common::method::enabled_methods().to_vec();
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         MSG_SERVER_REGISTER.to_string(),
         json!({
             "public_url": public_url,
             "label": "did-hosting-server",
+            "enabled_methods": enabled_methods,
+            "served_domains": Vec::<String>::new(),
+            "protocol_version": "1.0",
         }),
     )
     .from(server_did.clone())

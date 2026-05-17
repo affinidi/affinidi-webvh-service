@@ -47,6 +47,12 @@ pub async fn register(
         last_health_check: None,
         registered_at: crate::auth::session::now_epoch(),
         metadata: serde_json::Value::Null,
+        // REST-registered instances don't declare capabilities here;
+        // the registering server fills them in on its own
+        // MSG_SERVER_REGISTER message (T27).
+        enabled_methods: vec!["webvh".to_string()],
+        served_domains: Vec::new(),
+        protocol_version: "1.0".to_string(),
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -202,6 +208,11 @@ pub async fn register_service(
         last_health_check: None,
         registered_at: crate::auth::session::now_epoch(),
         metadata,
+        // Capabilities default to pre-T27 webvh-only; the registering
+        // server will overwrite via its DIDComm MSG_SERVER_REGISTER.
+        enabled_methods: vec!["webvh".to_string()],
+        served_domains: Vec::new(),
+        protocol_version: "1.0".to_string(),
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;

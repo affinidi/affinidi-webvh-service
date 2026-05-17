@@ -42,6 +42,47 @@ pub struct ServiceInstance {
     pub registered_at: u64,
     #[serde(default)]
     pub metadata: serde_json::Value,
+
+    // ---- Capability declaration (T27) ----
+    //
+    // Both fields are `#[serde(default)]` so pre-T27 records persisted
+    // on disk continue to deserialise. `default_enabled_methods`
+    // returns `["webvh"]` — the only method any pre-T27 server could
+    // host — which matches the spec's backwards-compat behaviour.
+    //
+    // The control plane uses these for:
+    // - routing inbound DIDs to a server that supports the method
+    //   (`enabled_methods`);
+    // - choosing which servers receive `domain/assign/1.0` Trust
+    //   Tasks (T28) and which the unassignment-purge sweep (T30)
+    //   targets (`served_domains`).
+    /// DID methods this server's binary supports. New servers send
+    /// the exhaustive enabled-at-compile-time list from
+    /// [`did_hosting_common::method::enabled_methods`].
+    #[serde(default = "default_enabled_methods")]
+    pub enabled_methods: Vec<String>,
+
+    /// Domains the server currently hosts. Initially empty after a
+    /// fresh register; control-plane updates via `domain/assign/1.0`
+    /// (T28). Persisted so the registry survives a control-plane
+    /// restart.
+    #[serde(default)]
+    pub served_domains: Vec<String>,
+
+    /// Server-register protocol version. Distinct from the Trust-Task
+    /// URL's version: the URL tracks the *wire* compatibility, this
+    /// tracks the *capability-set* compatibility (added in T27 to
+    /// detect old daemons that don't speak the assignment protocol).
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: String,
+}
+
+fn default_enabled_methods() -> Vec<String> {
+    vec!["webvh".to_string()]
+}
+
+fn default_protocol_version() -> String {
+    "1.0".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +237,53 @@ mod tests {
 
     fn list(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// T27 backwards-compat: a pre-T27 `ServiceInstance` (no capability
+    /// fields in the persisted JSON) deserialises with `enabled_methods
+    /// = ["webvh"]`, `served_domains = []`, `protocol_version = "1.0"`.
+    /// Catching this here matters because the persisted records are
+    /// stored as JSON and any deployment upgrading from v0.7 will have
+    /// pre-T27 records on disk.
+    #[test]
+    fn pre_t27_record_deserialises_with_compat_defaults() {
+        let json = r#"{
+            "instanceId": "did_example_old",
+            "serviceType": "server",
+            "label": null,
+            "url": "http://old.example.com",
+            "status": "active",
+            "lastHealthCheck": null,
+            "registeredAt": 1,
+            "metadata": { "did": "did:example:old" }
+        }"#;
+        let instance: ServiceInstance = serde_json::from_str(json).unwrap();
+        assert_eq!(instance.enabled_methods, vec!["webvh".to_string()]);
+        assert!(instance.served_domains.is_empty());
+        assert_eq!(instance.protocol_version, "1.0");
+    }
+
+    /// New T27 records round-trip exactly.
+    #[test]
+    fn t27_record_round_trips() {
+        let original = ServiceInstance {
+            instance_id: "x".into(),
+            service_type: ServiceType::Server,
+            label: None,
+            url: "http://new.example.com".into(),
+            status: ServiceStatus::Active,
+            last_health_check: None,
+            registered_at: 0,
+            metadata: serde_json::Value::Null,
+            enabled_methods: vec!["webvh".into(), "web".into()],
+            served_domains: vec!["a.example".into()],
+            protocol_version: "1.1".into(),
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.enabled_methods, original.enabled_methods);
+        assert_eq!(parsed.served_domains, original.served_domains);
+        assert_eq!(parsed.protocol_version, original.protocol_version);
     }
 
     /// Empty allowlist preserves the existing "operator opted out" behaviour.

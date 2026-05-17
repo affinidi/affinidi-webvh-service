@@ -741,6 +741,35 @@ async fn handle_server_register(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // T27: parse capability declaration. Backwards-compat: pre-T27
+    // servers don't send these fields; default to webvh-only.
+    let enabled_methods: Vec<String> = message
+        .body
+        .get("enabled_methods")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["webvh".to_string()]);
+    let served_domains: Vec<String> = message
+        .body
+        .get("served_domains")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let protocol_version = message
+        .body
+        .get("protocol_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1.0")
+        .to_string();
+
     // Use the sender DID as a stable instance ID (one registration per DID)
     let instance_id = sender.replace(':', "_");
 
@@ -753,6 +782,9 @@ async fn handle_server_register(
         last_health_check: None,
         registered_at: crate::auth::session::now_epoch(),
         metadata: json!({ "did": sender }),
+        enabled_methods,
+        served_domains,
+        protocol_version,
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
