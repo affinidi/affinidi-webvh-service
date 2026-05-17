@@ -567,6 +567,30 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         }
     }
 
+    // Storage migrations (T2 runner + T13 M-01). Runs after the
+    // domain seed so M-01 can use the system default as a tier-2
+    // fallback for legacy records that have no `did_id` to derive a
+    // host from. Idempotent — applied markers in the `meta`
+    // keyspace gate re-runs across boots.
+    {
+        let runner = did_hosting_common::server::migrations::MigrationRunner::new(
+            did_hosting_common::server::migrations::registry(),
+        );
+        match runner.run_pending(&main_store).await {
+            Ok(summary) => {
+                info!(
+                    applied = ?summary.applied,
+                    skipped = ?summary.skipped,
+                    "migration runner complete"
+                );
+            }
+            Err(e) => {
+                error!("migration runner failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // ── Phase 1: Pre-serve initialization ─────────────────────────────
 
     // 1a. DID store integrity check

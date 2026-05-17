@@ -41,8 +41,10 @@ use serde::{Deserialize, Serialize};
 use super::error::AppError;
 use super::store::{KS_META, KeyspaceHandle, Store};
 
+pub mod m01_tag_did_records_with_domain;
 pub mod runner;
 
+pub use m01_tag_did_records_with_domain::M01TagDidRecordsWithDomain;
 pub use runner::{MigrationRunner, RunSummary};
 
 /// Boxed future used by [`Migration::run`] so the trait stays object-safe
@@ -127,8 +129,9 @@ pub(crate) fn meta_keyspace(store: &Store) -> Result<KeyspaceHandle, AppError> {
 /// per-binary boot path can hand the runner a slice without juggling
 /// `Arc`s. The runner itself only reads in order.
 pub fn registry() -> Vec<Arc<dyn Migration>> {
-    // Intentionally empty in T2. First migrations land in T13 (M-01:
-    // wrap legacy did_log → DidRecord) and a sibling task (M-02: tag
-    // existing DIDs with their domain).
-    Vec::new()
+    // Migrations run in registration order. New migrations append at
+    // the bottom; never reorder past a shipped release (operators'
+    // stores carry `meta:migration:applied:{id}` markers that gate
+    // re-runs by ID, not order).
+    vec![Arc::new(M01TagDidRecordsWithDomain)]
 }
