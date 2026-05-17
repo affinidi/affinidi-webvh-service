@@ -11,7 +11,7 @@ Workstream IDs (WS-*) reference the plan §workstream-decomposition.
 
 ## Pre-flight (before any task opens)
 
-- [ ] **P0** Patch the three specs for the two factual corrections surfaced during planning
+- [x] **P0** Patch the three specs for the two factual corrections surfaced during planning
   - Files: `docs/multi-domain-spec.md` (§5.1, §6.3), `docs/multi-method-hosting-spec.md` (§7.1, §9.3), `docs/did-hosting-client-crate-spec.md` (§5.1)
   - Changes:
     - Webvh resolution path `/log/{*mnemonic}` → `/{*mnemonic}/did.jsonl` (it's a catch-all fallback at `webvh-server/src/routes/did_public.rs:150`, not a prefix-mounted route)
@@ -26,14 +26,14 @@ Workstream IDs (WS-*) reference the plan §workstream-decomposition.
 
 Mechanical + structural setup. Must complete before Phase II opens.
 
-- [ ] **T1** Atomic repo rename: `affinidi-webvh-service` → `did-hosting-service`
+- [x] **T1** Atomic repo rename: `affinidi-webvh-service` → `did-hosting-service`
   - Files: `Cargo.toml` (workspace), every crate's `Cargo.toml` (rename `name` + `webvh-* → did-hosting-*` except `webvh-witness`/`webvh-watcher`), folder renames via `git mv`, env-var rename in `webvh-common/src/server/config.rs` (`WEBVH_* → DID_HOSTING_*`), binary names in `webvh-daemon/src/main.rs` and siblings, `README.md`, `CHANGELOG.md`, CI workflow files, docs/* references
   - Acceptance: `cargo build --workspace --all-features` clean; full existing test suite passes; CHANGELOG entry documents env-var rename with one-line migration note; new operator-facing CLI `did-hosting-daemon migrate-from-webvh-config /path/to/old.toml` skeleton exists (impl can be empty `unimplemented!` for now — fills in T2 + later)
   - Verify: `cargo build --workspace --all-features && cargo test --workspace` + `rg -l "affinidi-webvh-service" .` returns only historical/changelog mentions
   - Deps: P0
   - Estimate: 1 session (mechanical, atomic — pause other merges during review)
 
-- [ ] **T2** Migration-runner skeleton + meta-keyspace
+- [x] **T2** Migration-runner skeleton + meta-keyspace
   - Files: `did-hosting-common/src/migrations/mod.rs` (new) + `did-hosting-common/src/migrations/runner.rs` (new), `did-hosting-common/src/server/store/keyspaces.rs` (new — see T3, but `meta` lands here first), wire into `did-hosting-daemon/src/main.rs` boot path
   - Acceptance:
     - `Migration` trait with `id() -> &'static str`, `run(&mut Store)` async; idempotent dispatcher walks an in-process registry and skips any whose id is already in the `meta` keyspace under `migration:applied:{id}`
@@ -43,7 +43,7 @@ Mechanical + structural setup. Must complete before Phase II opens.
   - Deps: T1
   - Estimate: 1 session
 
-- [ ] **T3** Centralised keyspace registry
+- [x] **T3** Centralised keyspace registry
   - Files: `did-hosting-common/src/server/store/keyspaces.rs` (extend T2's stub), refactor existing call-sites that hardcode keyspace names: `did-hosting-server/src/main.rs:644`, `did-hosting-daemon/src/main.rs:459–470` and other open-on-demand sites, `did-hosting-control/tests/change_owner_rest.rs:1–7`, `did-hosting-server/tests/smoke.rs:41–43`, `did-hosting-server/src/backup.rs:55–58`
   - Acceptance:
     - `pub const KS_DIDS: &str = "dids"; ...` for every existing keyspace (`acl`, `sessions`, `stats`, `timeseries`, `registry`, `witnesses`, `meta`) + the new ones (`domains`, `assignments`, `pending_purges`)
@@ -53,7 +53,7 @@ Mechanical + structural setup. Must complete before Phase II opens.
   - Deps: T2
   - Estimate: 1 session
 
-- [ ] **T4** Shared wizard prompt helpers (extend existing module)
+- [x] **T4** Shared wizard prompt helpers (extend existing module)
   - Files: `did-hosting-common/src/server/setup_prompts.rs` (new — split off from existing `secret_store/wizard.rs`), refactor `did-hosting-server/src/setup.rs`, `did-hosting-control/src/setup.rs`, `did-hosting-daemon/src/setup.rs`, `webvh-witness/src/setup.rs` to use new helpers for the existing duplicated prompts (public URL, listen host/port, log format)
   - Acceptance:
     - New helpers: `prompt_public_url`, `prompt_listen_host`, `prompt_listen_port`, `prompt_log_format` — each takes a default + returns the validated value
@@ -73,7 +73,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track 1: Trust-Tasks transport (WS-1)
 
-- [ ] **T5** Decide and execute Trust-Tasks primitive sourcing
+- [x] **T5** Decide and execute Trust-Tasks primitive sourcing
   - Files: either (a) `trust-tasks/` new workspace member with `src/{mod.rs, router.rs, extractor.rs}` ported from `verifiable-trust-infrastructure/vti-common/src/trust_task/` — plus add to workspace `Cargo.toml`; OR (b) copy into `did-hosting-common/src/trust_task/`
   - Acceptance:
     - Decision recorded in PR description with rationale (extract = single source of truth across orgs; copy = no cross-repo dep)
@@ -83,7 +83,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T3 (workspace registry)
   - Estimate: 1 session (extract) or 0.5 session (copy)
 
-- [ ] **T6** DIDComm dispatch helper for Trust-Tasks (new — not in VTI)
+- [x] **T6** DIDComm dispatch helper for Trust-Tasks (new — not in VTI)
   - Files: `trust-tasks/src/didcomm.rs` (or `did-hosting-common/src/trust_task/didcomm.rs` per T5 decision), new
   - Acceptance:
     - Helper `fn dispatch_by_type(msg_type: &str, dispatcher: &TaskDispatcher) -> Result<Handler, TaskErr>` — exact-match lookup with the same semantics as the REST router
@@ -92,7 +92,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T5
   - Estimate: 0.5 session
 
-- [ ] **T7** Trust-Tasks URL constants module
+- [x] **T7** Trust-Tasks URL constants module
   - Files: `did-hosting-common/src/did_hosting_tasks.rs` (new)
   - Acceptance:
     - One `LazyLock<TrustTask>` const per registered URL, covering everything from `webvh-common/src/didcomm_types.rs:10–71` (auth, DID lifecycle, witness, sync, server-register, stats, health) plus the new domain-management URLs
@@ -103,7 +103,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T5
   - Estimate: 0.5 session
 
-- [ ] **T8** V1-alias table + dispatcher integration
+- [x] **T8** V1-alias table + dispatcher integration
   - Files: `did-hosting-common/src/v1_aliases.rs` (new), `did-hosting-control/src/messaging.rs` (extend `dispatch_did_op()` at line 245 to canonicalise via the alias table before matching), `did-hosting-control/src/routes/didcomm.rs` (line 176–193 already shares; verify no changes needed), REST router setup in `did-hosting-server/src/server.rs` (wrap with `TrustTaskRouter`)
   - Acceptance:
     - Alias table maps every `MSG_*` const → its canonical Trust-Task URL
@@ -114,7 +114,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T6, T7
   - Estimate: 1 session
 
-- [ ] **T9** Trust-Tasks parity harness
+- [x] **T9** Trust-Tasks parity harness
   - Files: `did-hosting-server/tests/trust_task_parity.rs` (new), `did-hosting-control/tests/trust_task_parity.rs` (new)
   - Acceptance: For every operation, the harness sends two requests — one with the legacy `MSG_*` `type` (or no `Trust-Task` header on REST), and one with the canonical Trust-Task URL — and asserts byte-equivalent observable state (response body + store state)
   - Verify: `cargo test --workspace trust_task_parity`
@@ -123,7 +123,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track 2: Method abstraction (WS-2)
 
-- [ ] **T10** `DidMethod` trait + dispatcher
+- [x] **T10** `DidMethod` trait + dispatcher
   - Files: `did-hosting-common/src/method/mod.rs` (new — `DidMethod` trait, `ParsedDid`, `MethodError`, `method_by_name`, `enabled_methods`), `did-hosting-common/src/method/parse.rs` (new — `parse_did_method`)
   - Acceptance:
     - Trait surface exactly as in `multi-method-hosting-spec.md` §6
@@ -133,7 +133,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T3 (registry constants for storage)
   - Estimate: 1 session
 
-- [ ] **T11** `methods/webvh.rs` impl wrapping existing webvh logic
+- [x] **T11** `methods/webvh.rs` impl wrapping existing webvh logic
   - Files: `did-hosting-common/src/method/webvh.rs` (new, gated `#[cfg(feature = "method-webvh")]`), refactor `did-hosting-server/src/did_ops.rs` (the parts that hardcode webvh format) to call through the trait
   - Acceptance:
     - Webvh impl satisfies `DidMethod` trait: parse identifier, build resolution URL, validate jsonl, apply_update appends
@@ -143,7 +143,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T10
   - Estimate: 1–2 sessions
 
-- [ ] **T12** `DidRecord` storage shape
+- [x] **T12** `DidRecord` storage shape
   - Files: `did-hosting-common/src/server/store/dids.rs` (new), refactor `did-hosting-control/src/did_ops.rs:78–99` (`get_authorized_record`) and `webvh-server/src/routes/did_public.rs:150` to read/write `DidRecord` instead of raw bytes
   - Acceptance:
     - `DidRecord { method, domain, path, content_type, data, version, created_at, updated_at }` — `data: Vec<u8>` is method-specific bytes
@@ -153,7 +153,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T11
   - Estimate: 1 session
 
-- [ ] **T13** Migration M-1: legacy `did_log` bytes → `DidRecord { method: "webvh", ... }`
+- [x] **T13** Migration M-1: legacy `did_log` bytes → `DidRecord { method: "webvh", ... }`
   - Files: `did-hosting-common/src/migrations/m01_wrap_did_record.rs` (new), register in `did-hosting-common/src/migrations/mod.rs`
   - Acceptance:
     - Migration walks every `dids` entry, parses legacy shape, wraps as `DidRecord` with `method = "webvh"` and `domain`/`path` derived from the key
@@ -165,7 +165,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track 3: Domain model (WS-3)
 
-- [ ] **T14** Domain-related keyspaces + types
+- [x] **T14** Domain-related keyspaces + types
   - Files: `did-hosting-common/src/server/store/keyspaces.rs` (already added the consts in T3; add types here or in a new file `did-hosting-common/src/server/domain/types.rs`), `did-hosting-common/src/server/domain/mod.rs` (new — `DomainEntry`, `DomainBranding`, `DomainQuota`, `DomainScope`)
   - Acceptance:
     - Types exactly per `multi-domain-spec.md` §3 design-decisions table
@@ -175,7 +175,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T3
   - Estimate: 1 session
 
-- [ ] **T15** `DomainEntry` CRUD + domain normalisation
+- [x] **T15** `DomainEntry` CRUD + domain normalisation
   - Files: `did-hosting-common/src/server/domain/mod.rs` (extend with CRUD functions), `did-hosting-common/src/server/domain/normalize.rs` (new — lowercase + IDNA + path-prefix parser + validator)
   - Acceptance:
     - `create_domain`, `get_domain`, `list_domains`, `update_domain`, `disable_domain`, `set_default_domain` — all use the new `domains` keyspace
@@ -186,7 +186,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T14
   - Estimate: 1 session
 
-- [ ] **T16** `DomainScope` on `AclEntry` (additive, backwards-compat)
+- [x] **T16** `DomainScope` on `AclEntry` (additive, backwards-compat)
   - Files: `did-hosting-common/src/server/acl.rs` (extend `AclEntry`, `CreateAclRequest`, `UpdateAclRequest`, `AclEntryResponse`), `did-hosting-control/src/routes/acl.rs` (handlers carry new field through)
   - Acceptance:
     - `AclEntry.domains: DomainScope` with `#[serde(default)]` → missing field deserialises as `DomainScope::All`
@@ -197,7 +197,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T14
   - Estimate: 1 session
 
-- [ ] **T17** `GET /api/domains` + `GET /api/me/domains` endpoints (no enforcement yet)
+- [x] **T17** `GET /api/domains` + `GET /api/me/domains` endpoints (no enforcement yet)
   - Files: `did-hosting-control/src/routes/domain.rs` (new), `did-hosting-control/src/routes/mod.rs` (register the new routes)
   - Acceptance:
     - `GET /api/domains` (Admin) returns the full domain list
@@ -207,7 +207,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T15, T16, T8 (router)
   - Estimate: 1 session
 
-- [ ] **T18** `bootstrap_domains` config seed + first-boot wiring
+- [x] **T18** `bootstrap_domains` config seed + first-boot wiring
   - Files: `did-hosting-common/src/server/config.rs` (add `bootstrap_domains: Vec<String>`, `unassigned_purge_grace`, `trusted_proxy_cidrs`), `did-hosting-daemon/src/main.rs` (first-boot seed: if `domains` keyspace empty, seed from `bootstrap_domains`, else from legacy `public_url`'s host as a single default), wizard prompt in `did-hosting-daemon/src/setup.rs`
   - Acceptance:
     - Fresh daemon with `bootstrap_domains = ["example.com"]` boots and has exactly that one domain in the keyspace, marked as default
@@ -225,7 +225,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Enforcement (WS-4) — sequential, must precede WS-5/WS-8
 
-- [ ] **T19** `Forwarded`/`X-Forwarded-Host`/`Host` extractor with `trusted_proxy_cidrs`
+- [x] **T19** `Forwarded`/`X-Forwarded-Host`/`Host` extractor with `trusted_proxy_cidrs`
   - Files: `did-hosting-common/src/server/domain/detect.rs` (new), `did-hosting-server/src/server.rs` + `did-hosting-control/src/server.rs` (insert as Axum middleware that populates request extensions with the resolved domain)
   - Acceptance:
     - With `trusted_proxy_cidrs = ["10.0.0.0/8"]`, requests from a 10.x source honour `Forwarded` (RFC 7239 `host=`) then `X-Forwarded-Host` (first value) then `Host`
@@ -236,7 +236,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T18 (config field), T17 (routes mounted)
   - Estimate: 1–2 sessions
 
-- [ ] **T20** Safety check on create / publish (`did.host` × active domain × ACL)
+- [x] **T20** Safety check on create / publish (`did.host` × active domain × ACL)
   - Files: `did-hosting-control/src/did_ops.rs:78–99` (`get_authorized_record` extended; add `assert_domain_allowed` helper), `did-hosting-common/src/server/domain/safety.rs` (new — encapsulates the check)
   - Acceptance:
     - On every create / publish, the embedded `did:{method}:…:<host>:…` host is parsed and matched against the active assigned-domain set; mismatch → 400 with explicit reason
@@ -247,7 +247,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T15, T16, T11, T19
   - Estimate: 1 session
 
-- [ ] **T21** Safety check on resolution (`Host` vs `did.host`, 503 on disabled)
+- [x] **T21** Safety check on resolution (`Host` vs `did.host`, 503 on disabled)
   - Files: `did-hosting-server/src/routes/did_public.rs:150–196` (extend `serve_public()`), `did-hosting-common/src/server/domain/safety.rs` (add `assert_resolution_allowed`)
   - Acceptance:
     - Resolution request where `Host`-derived domain ≠ embedded `did.host` returns 404 (not 403)
@@ -257,7 +257,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T15, T19, T11
   - Estimate: 1 session
 
-- [ ] **T22** Flip new-Owner ACL default to `AllowedWithDefault([default], default)`
+- [x] **T22** Flip new-Owner ACL default to `AllowedWithDefault([default], default)`
   - Files: `did-hosting-control/src/routes/acl.rs` (handler that creates new ACL entries)
   - Acceptance:
     - New ACL entries with role `Owner` created via API default to `AllowedWithDefault { allowed: [system_default], default: system_default }`
@@ -270,7 +270,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: did:web (WS-5) — after WS-2 + WS-4 enforcement
 
-- [ ] **T23** Audit existing `serve_did_web()` and remove or wrap
+- [x] **T23** Audit existing `serve_did_web()` and remove or wrap
   - Files: `did-hosting-server/src/routes/did_public.rs:182` (existing handler) + any callers
   - Acceptance:
     - Written audit in PR description: what the existing handler does, what its tests cover, how it interacts with storage
@@ -280,7 +280,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T11
   - Estimate: 0.5–1 session
 
-- [ ] **T24** `methods/web.rs` impl
+- [x] **T24** `methods/web.rs` impl
   - Files: `did-hosting-common/src/method/web.rs` (new, gated `#[cfg(feature = "method-web")]`)
   - Acceptance:
     - Parser handles `did:web:{domain}[:{path}]` and the no-path form (path = `""`)
@@ -292,7 +292,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T10, T23
   - Estimate: 1 session
 
-- [ ] **T25** Per-method resolution routes + ordering test
+- [x] **T25** Per-method resolution routes + ordering test
   - Files: `did-hosting-server/src/server.rs` (router build — explicit comment on registration order), `did-hosting-server/src/routes/resolve_web.rs` (new), `did-hosting-server/src/routes/resolve_webvh.rs` (extract from current `did_public.rs`)
   - Acceptance:
     - `GET /{*path}/did.json` + `GET /.well-known/did.json` registered behind `#[cfg(feature = "method-web")]`
@@ -303,7 +303,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T24
   - Estimate: 1 session
 
-- [ ] **T26** Generalise request body fields (`did_log` → `did_data`, `method` field)
+- [x] **T26** Generalise request body fields (`did_log` → `did_data`, `method` field)
   - Files: `did-hosting-control/src/routes/dids.rs` (all DID management handlers), `did-hosting-control/src/did_ops.rs` (signatures change accordingly), update DTOs in `did-hosting-common/src/server/` (request types)
   - Acceptance:
     - `RegisterAtomicBody { method?, path, domain?, did_data: Value, force }` accepted on `POST /api/dids/register`
@@ -316,7 +316,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Distributed assignment + unassignment (WS-6) — parallel after Phase II
 
-- [ ] **T27** Extend server-register Trust Task with capability declaration
+- [x] **T27** Extend server-register Trust Task with capability declaration
   - Files: `did-hosting-server/src/registry/handshake.rs` (extend the existing `MSG_SERVER_REGISTER` payload), `did-hosting-control/src/registry/mod.rs` (acceptance side)
   - Acceptance:
     - Outbound `server.register/1.0` payload carries `enabled_methods: Vec<String>`, `served_domains: Vec<String>` (initially empty), and protocol-version marker
@@ -326,7 +326,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T8 (Trust-Tasks dispatcher)
   - Estimate: 1 session
 
-- [ ] **T28** `domain/assign/1.0` + `domain/unassign/1.0` Trust Tasks
+- [x] **T28** `domain/assign/1.0` + `domain/unassign/1.0` Trust Tasks
   - Files: `did-hosting-control/src/routes/server_assignments.rs` (new), `did-hosting-server/src/task_dispatch.rs` (inbound handler for assignment payloads)
   - Acceptance:
     - Control plane can push `domain/assign/1.0 { domain }` and `domain/unassign/1.0 { domain }` to a registered server
@@ -336,7 +336,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T27, T17
   - Estimate: 1 session
 
-- [ ] **T29** Persistent local `assignments` cache + cold-start fallback
+- [x] **T29** Persistent local `assignments` cache + cold-start fallback
   - Files: `did-hosting-server/src/assignments.rs` (new — cached read from keyspace, tier fallback to `bootstrap_domains` then legacy `public_url`)
   - Acceptance:
     - Server restarted while control plane unreachable serves DIDs in persisted `assignments` set
@@ -346,7 +346,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T28, T18
   - Estimate: 1 session
 
-- [ ] **T30** Background purge sweep + admin "Purge now" Trust Task
+- [x] **T30** Background purge sweep + admin "Purge now" Trust Task
   - Files: `did-hosting-server/src/assignments.rs` (extend with background task), `did-hosting-common/src/server/store/keyspaces.rs` (already has `pending_purges` const from T3), `did-hosting-control/src/routes/server_assignments.rs` (admin "Purge now" handler)
   - Acceptance:
     - Unassignment schedules a `pending_purges:{server,domain,scheduled_at}` entry with grace = `unassigned_purge_grace` (default `"2h"`)
@@ -360,14 +360,14 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Stubs + CI matrix (WS-9) — parallel, off critical path
 
-- [ ] **T31** `methods/webs.rs` + `methods/webplus.rs` stubs
+- [x] **T31** `methods/webs.rs` + `methods/webplus.rs` stubs
   - Files: `did-hosting-common/src/method/webs.rs` (new, gated `#[cfg(feature = "method-webs")]`, body = `compile_error!("method-webs is not implemented in this release; see docs/multi-method-hosting-spec.md §1")`), same for `webplus.rs`
   - Acceptance: enabling `--features method-webs` produces a clean compile error with the pointer message; defaults unchanged
   - Verify: `cargo build --workspace --features method-webs 2>&1 | grep -q "not implemented"`
   - Deps: T10
   - Estimate: 0.25 session
 
-- [ ] **T32** CI matrix for feature combinations
+- [x] **T32** CI matrix for feature combinations
   - Files: `.github/workflows/ci.yml` (or wherever CI is configured)
   - Acceptance:
     - Matrix entries: default features, `--no-default-features --features method-webvh`, `--no-default-features --features method-web`, `--features method-webs` (expected fail)
@@ -378,7 +378,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Domain-aware Trust Tasks (WS-8) — last in Phase III
 
-- [ ] **T33** Register domain-management Trust Tasks
+- [x] **T33** Register domain-management Trust Tasks
   - Files: `did-hosting-common/src/did_hosting_tasks.rs` (already has the URL consts from T7), `did-hosting-control/src/routes/domain.rs` (handlers wired through `TrustTaskRouter`)
   - Acceptance:
     - `domain/create/1.0`, `domain/update/1.0`, `domain/disable/1.0`, `domain/set_default/1.0`, `domain/purge/1.0` Trust Tasks wired and tested (admin only)
@@ -388,7 +388,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T15, T17, T30 (for purge)
   - Estimate: 1 session
 
-- [ ] **T34** Optional `domain` + `method` params on DID-management Trust Tasks
+- [x] **T34** Optional `domain` + `method` params on DID-management Trust Tasks
   - Files: `did-hosting-control/src/routes/dids.rs` (extend request types — already done partially in T26), `did-hosting-control/src/did_ops.rs` (handler resolution rule per spec §3 ACL default)
   - Acceptance:
     - Resolution rule: explicit `domain` wins → caller ACL `AllowedWithDefault.default` → system default → 400 if caller is `Allowed([…])` with no default
@@ -398,7 +398,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T20, T26
   - Estimate: 1 session
 
-- [ ] **T35** Final integration test: domain-aware + method-aware end-to-end
+- [x] **T35** Final integration test: domain-aware + method-aware end-to-end
   - Files: `did-hosting-server/tests/multi_method_multi_domain.rs` (new)
   - Acceptance:
     - Test creates two domains, one ACL Owner with `AllowedWithDefault([a,b], default=a)`, then in one session creates one did:webvh on domain-a and one did:web on domain-b, asserts isolated resolution
@@ -473,56 +473,56 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Client crate (WS-11) — backend dev, parallel after Phase III
 
-- [ ] **T44** New `did-hosting-client/` workspace member + Cargo.toml
+- [x] **T44** New `did-hosting-client/` workspace member + Cargo.toml
   - Files: `did-hosting-client/Cargo.toml`, `did-hosting-client/src/lib.rs` (skeleton), update workspace `Cargo.toml`
   - Acceptance: builds clean; published name `did-hosting-client`; deps per `did-hosting-client-crate-spec.md` §3 (no `did-hosting-common` dep)
   - Verify: `cargo build -p did-hosting-client`
   - Deps: T1 (rename), T9 (parity harness so we know wire is stable)
   - Estimate: 0.5 session
 
-- [ ] **T45** Port `auth/` (message construction + signing identity types) from VTI
+- [x] **T45** Port `auth/` (message construction + signing identity types) from VTI
   - Files: `did-hosting-client/src/auth/mod.rs`, `did-hosting-client/src/auth/message.rs`
   - Acceptance: `HostingSigningIdentity{,Owned}`, `build_authenticate_message`, `build_refresh_message` ported from `verifiable-trust-infrastructure/vta-service/src/webvh_auth.rs`; renamed `Vta` → `Hosting` prefix; golden JWS test passes
   - Verify: `cargo test -p did-hosting-client auth`
   - Deps: T44
   - Estimate: 1 session
 
-- [ ] **T46** Port `transport.rs` + HTTPS enforcement
+- [x] **T46** Port `transport.rs` + HTTPS enforcement
   - Files: `did-hosting-client/src/transport.rs`
   - Acceptance: `ServiceEntry` trait, `resolve_server_transport`, `enforce_transport_security`, `is_loopback_host` — exact behaviour from spec §5.4 source paths
   - Verify: `cargo test -p did-hosting-client transport`
   - Deps: T44
   - Estimate: 1 session
 
-- [ ] **T47** `TokenData`, `HostingTokenStore`, `InMemoryTokenStore`, `ServerLocks`
+- [x] **T47** `TokenData`, `HostingTokenStore`, `InMemoryTokenStore`, `ServerLocks`
   - Files: `did-hosting-client/src/token_store.rs`, `did-hosting-client/src/locks.rs`
   - Acceptance: `TokenData` is `ZeroizeOnDrop` + redacted `Debug` (test asserts neither token substring appears in debug output); `InMemoryTokenStore` over `DashMap`; `ServerLocks::for_server` returns `Arc<TokioMutex<()>>`
   - Verify: `cargo test -p did-hosting-client token_store && cargo test -p did-hosting-client locks`
   - Deps: T44
   - Estimate: 1 session
 
-- [ ] **T48** `Client` impl with REST methods + `Trust-Task` header
+- [x] **T48** `Client` impl with REST methods + `Trust-Task` header
   - Files: `did-hosting-client/src/client.rs`, `did-hosting-client/src/error.rs`
   - Acceptance: `Client::new` enforces HTTPS at construction; `challenge` / `authenticate` / `refresh` / `register_did_atomic` / `publish_did` / `delete_did` / `request_uri` / `check_path` / `get_did` implemented with `Trust-Task` header on every call; typed errors per spec §6.4
   - Verify: `cargo test -p did-hosting-client client_unit`
   - Deps: T45, T46, T47
   - Estimate: 2 sessions
 
-- [ ] **T49** `ensure_token` decision ladder + `AuthedClient` wrapper
+- [x] **T49** `ensure_token` decision ladder + `AuthedClient` wrapper
   - Files: `did-hosting-client/src/client.rs` (add `ensure_token`), `did-hosting-client/src/authed.rs` (new — `AuthedClient`)
   - Acceptance: decision ladder per spec §7 (fresh cache → refresh → reauth); per-server `ServerLocks` mutex around the entire RMW; `AuthedClient` wraps and exposes the same DID-ops minus the explicit token argument
   - Verify: `cargo test -p did-hosting-client ensure_token_ladder && cargo test -p did-hosting-client authed_client`
   - Deps: T48
   - Estimate: 1 session
 
-- [ ] **T50** wiremock integration tests
+- [x] **T50** wiremock integration tests
   - Files: `did-hosting-client/tests/wiremock_integration.rs`
   - Acceptance: covers challenge/auth happy path, refresh happy path, 401-on-publish-triggers-reauth, 403 bubbles, network error, 5xx mapped, `domain` + `method` params forwarded; concurrency test asserts two parallel `ensure_token`s against same server-id serialise
   - Verify: `cargo test -p did-hosting-client --test wiremock_integration`
   - Deps: T49
   - Estimate: 1–2 sessions
 
-- [ ] **T51** Cross-crate URL invariant test
+- [x] **T51** Cross-crate URL invariant test
   - Files: `did-hosting-common/tests/trust_task_url_consistency.rs`
   - Acceptance: every `TASK_*` const in `did-hosting-client::auth` and `did-hosting-client::client` matches the same-named const in `did-hosting-common/src/did_hosting_tasks.rs` byte-for-byte
   - Verify: `cargo test -p did-hosting-common trust_task_url_consistency`
@@ -531,7 +531,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Track: Composed migration finalisation (WS-7)
 
-- [ ] **T52** Compose multi-domain migration first then multi-method
+- [x] **T52** Compose multi-domain migration first then multi-method
   - Files: `did-hosting-common/src/migrations/m02_assign_domain.rs` (new — multi-domain), order in registry ensures M02 runs before M01-rewrap
   - Acceptance:
     - M-02 assigns every existing DID a domain derived from the legacy `public_url`'s host
@@ -541,7 +541,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T13, T18
   - Estimate: 1 session
 
-- [ ] **T53** Migration replay test against three v0.6.0 backup fixtures
+- [x] **T53** Migration replay test against three v0.6.0 backup fixtures
   - Files: `did-hosting-server/tests/migration_replay.rs` (new), fixtures committed under `did-hosting-server/tests/fixtures/v0.6.0/`
   - Acceptance:
     - Three fixtures: (a) empty store, (b) ~10 webvh DIDs, (c) mixed ACL entries with various owner counts
@@ -551,7 +551,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
   - Deps: T52
   - Estimate: 1 session
 
-- [ ] **T54** Backup/restore tooling for new shape
+- [x] **T54** Backup/restore tooling for new shape
   - Files: `did-hosting-server/src/backup.rs:55–58` and surrounding restore code — extend dump format with `method` field; restore handles both legacy and new shapes
   - Acceptance: round-trip backup → restore → diff = empty for both legacy and new-shape stores
   - Verify: `cargo test -p did-hosting-server backup_restore_roundtrip`
@@ -569,7 +569,7 @@ Three workstreams in parallel. They don't conflict at the file level (different 
 
 ### Release prep
 
-- [ ] **T56** CHANGELOG + migration guide + rollback doc + release notes
+- [x] **T56** CHANGELOG + migration guide + rollback doc + release notes
   - Files: `CHANGELOG.md`, `docs/migrations/v0.6.0-to-v0.7.0.md` (new), `docs/rollback.md` (new)
   - Acceptance:
     - CHANGELOG entry covers: rename, multi-domain, multi-method, client crate, Trust-Tasks transport, env-var renames
