@@ -30,14 +30,18 @@ use serde::{Deserialize, Serialize};
 /// Per-ACL-entry rule describing which domains a caller may use.
 ///
 /// Default is [`Self::All`] for backwards-compat with v0.6-vintage
-/// stores (where ACL entries had no scope field at all). T22 flips the
-/// default for **newly-created** `Owner` entries to
-/// [`Self::AllowedWithDefault`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// stores (where ACL entries had no scope field at all) — see the
+/// `#[default]` mark below. That choice preserves on-disk
+/// deserialisation: a stored ACL entry without a `domains` field
+/// reads as `All`, matching `docs/multi-domain-spec.md` §3 "ACL
+/// domain scope". T22 flips the default for **newly-created**
+/// `Owner` entries to [`Self::AllowedWithDefault`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DomainScope {
     /// No per-domain restriction. Default for `Admin` / `Service` roles
     /// and for pre-rollout `Owner` entries via the migration.
+    #[default]
     All,
 
     /// Caller may operate only on the listed domains. A request that
@@ -53,16 +57,6 @@ pub enum DomainScope {
         domains: Vec<String>,
         default: String,
     },
-}
-
-impl Default for DomainScope {
-    fn default() -> Self {
-        // Defaulting to `All` preserves the v0.6-vintage shape on
-        // deserialisation — a stored ACL entry without a `domains`
-        // field reads as `All`. Same rationale as
-        // `multi-domain-spec.md` §3 "ACL domain scope" entry.
-        Self::All
-    }
 }
 
 impl DomainScope {
@@ -135,10 +129,10 @@ pub fn resolve_request_domain(
     system_default: Option<&str>,
 ) -> Result<String, DomainResolveError> {
     // Tier 1: explicit on the wire.
-    if let Some(d) = request_domain {
-        if !d.is_empty() {
-            return Ok(d.to_string());
-        }
+    if let Some(d) = request_domain
+        && !d.is_empty()
+    {
+        return Ok(d.to_string());
     }
     // Tier 2: caller's ACL default.
     if let Some(d) = caller_scope.default_domain() {

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.1 (unreleased)
+## 0.7.0 (unreleased)
 
 ### Changed — **BREAKING**
 
@@ -148,15 +148,6 @@
   parse/validation failed. Matches the mediator-setup wizard.
 - **Example recipes** in `examples/` for every service, plus CI smoke
   tests that load + validate each one.
-
-### Changed
-
-- **Patch-bumped every workspace crate 0.7.0 → 0.7.1.** Public Rust
-  APIs are additive (new `setup_recipe` module + new CLI flags);
-  internal deps remain pinned to `version = "0.7"` (major.minor) per
-  `CLAUDE.md`.
-
-## 0.7.0 (unreleased)
 
 ### Security
 

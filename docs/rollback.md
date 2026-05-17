@@ -7,7 +7,7 @@ this doc covers — are:
 1. **Roll back v0.7 → v0.6** after the multi-domain migration
    has run. **Forward-migrated stores cannot be downgraded**;
    restore-from-backup is mandatory.
-2. **Roll back a v0.7 point release** (e.g. v0.7.1 → v0.7.0).
+2. **Roll back a future v0.7 point release** (e.g. v0.7.x → v0.7.0).
    In-place binary swap is safe; no migration to undo.
 3. **Recover from a failed multi-domain assignment / purge**
    without rolling back the binary at all.
@@ -97,9 +97,9 @@ change the schema).
 4. Verify resolves with `curl`.
 
 The store format is forward-compatible within v0.7.x. v0.7.0
-reads v0.7.1's stored records fine — the only schema additions
-within the v0.7 line are `#[serde(default)]` and deserialise
-back to defaults.
+reads later-v0.7.x stored records fine — the only schema
+additions within the v0.7 line are `#[serde(default)]` and
+deserialise back to defaults.
 
 ## Scenario 3: Failed assignment / purge (no binary rollback)
 

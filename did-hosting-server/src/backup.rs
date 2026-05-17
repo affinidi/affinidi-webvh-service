@@ -411,7 +411,7 @@ mod tests {
         let original = Backup {
             version: BACKUP_VERSION,
             created_at: "now".into(),
-            server_version: "0.7.1".into(),
+            server_version: "0.7.0".into(),
             config: "{}".into(),
             keyspaces: BackupKeyspaces {
                 dids: entry.clone(),

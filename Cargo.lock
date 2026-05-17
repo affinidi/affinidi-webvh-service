@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-secrets-resolver",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -2773,7 +2773,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-daemon"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "affinidi-messaging-didcomm-service",
  "affinidi-tdk",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-server"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -9316,7 +9316,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-watcher"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "axum",
  "axum-extra",
@@ -9335,7 +9335,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-witness"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
