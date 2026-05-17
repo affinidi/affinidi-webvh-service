@@ -145,3 +145,7 @@ tokio = { workspace = true }
 # Trust-Tasks router unit tests use `oneshot()` + raw body collection.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# T51 cross-crate URL invariant test — assert client and daemon
+# constants match byte-for-byte. dev-only; doesn't enter the
+# production dep graph.
+did-hosting-client = { path = "../did-hosting-client" }
