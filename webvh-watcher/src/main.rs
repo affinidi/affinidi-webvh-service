@@ -1,7 +1,7 @@
-use affinidi_webvh_watcher::config::AppConfig;
-use affinidi_webvh_watcher::{health, server, setup, store};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use webvh_watcher::config::AppConfig;
+use webvh_watcher::{health, server, setup, store};
 
 #[derive(Parser)]
 #[command(
@@ -81,7 +81,7 @@ async fn run_watcher(config_path: Option<PathBuf>) {
         }
     };
 
-    affinidi_webvh_common::server::config::init_tracing(&config.log);
+    did_hosting_common::server::config::init_tracing(&config.log);
 
     let store = store::Store::open(&config.store)
         .await

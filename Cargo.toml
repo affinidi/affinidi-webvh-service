@@ -1,9 +1,10 @@
 [workspace]
 members = [
-  "webvh-common",
-  "webvh-control",
-  "webvh-daemon",
-  "webvh-server",
+  "did-hosting-client",
+  "did-hosting-common",
+  "did-hosting-control",
+  "did-hosting-daemon",
+  "did-hosting-server",
   "webvh-watcher",
   "webvh-witness",
 ]
@@ -17,7 +18,7 @@ readme = "README.md"
 homepage = "https://affinidi.com/"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "webvh"]
-repository = "https://github.com/affinidi/affinidi-webvh-service"
+repository = "https://github.com/affinidi/did-hosting-service"
 publish = true
 rust-version = "1.95.0"
 

@@ -8,7 +8,7 @@ use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
-use affinidi_webvh_common::server::acl::{
+use did_hosting_common::server::acl::{
     AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest,
 };
 
@@ -46,6 +46,8 @@ pub async fn create_acl(
         created_at: now_epoch(),
         max_total_size: req.max_total_size,
         max_did_count: req.max_did_count,
+
+        domains: did_hosting_common::server::domain::DomainScope::All,
     };
 
     store_acl_entry(&state.acl_ks, &entry).await?;

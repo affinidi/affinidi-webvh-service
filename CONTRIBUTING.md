@@ -1,7 +1,7 @@
 # Contributing
 
 When contributing to this repository, please first discuss the change you wish to
-make by opening a [GitHub issue](https://github.com/affinidi/affinidi-webvh-service/issues/new).
+make by opening a [GitHub issue](https://github.com/affinidi/did-hosting-service/issues/new).
 
 ## Development requirements
 
@@ -9,7 +9,7 @@ make by opening a [GitHub issue](https://github.com/affinidi/affinidi-webvh-serv
   The local toolchain is typically a more recent stable; the MSRV is the
   floor we publish against.
 - **Edition 2024.**
-- **Node ≥ 20** for the `webvh-ui` Expo workspace.
+- **Node ≥ 20** for the `did-hosting-ui` Expo workspace.
 
 Optional but useful:
 
@@ -30,7 +30,7 @@ cargo test --workspace
 For the UI:
 
 ```bash
-cd webvh-ui
+cd did-hosting-ui
 node_modules/.bin/tsc --noEmit
 npx --no-install expo export --platform web   # only if you touched the UI build path
 ```
@@ -77,7 +77,7 @@ git config user.email "you@example.com"
    isolation; integration tests prove the whole thing fits.
 3. **Tests for new code paths.** Every public function should have at
    least one happy-path test; every dispatch arm in
-   `webvh-control/src/messaging.rs` and `webvh-control/src/routes/didcomm.rs`
+   `did-hosting-control/src/messaging.rs` and `did-hosting-control/src/routes/didcomm.rs`
    should exercise both success and at least one failure mode.
 4. **Comments explain WHY, not WHAT.** Identifier names + types should
    carry the WHAT. Reserve `///` and `//` for the non-obvious — a
@@ -94,8 +94,8 @@ git config user.email "you@example.com"
 
 ## Daemon parity
 
-`webvh-daemon` embeds the main features of `webvh-server`,
-`webvh-witness`, `webvh-watcher`, and `webvh-control` in a single
+`did-hosting-daemon` embeds the main features of `did-hosting-server`,
+`webvh-witness`, `webvh-watcher`, and `did-hosting-control` in a single
 binary. CLAUDE.md (workspace root) lists what is mirrored, what is
 intentionally omitted, and a heuristic for deciding which side a new
 capability belongs on. Read that before adding routes, background

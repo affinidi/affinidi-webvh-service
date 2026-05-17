@@ -6,7 +6,7 @@ verification. Witness proofs provide third-party attestation that a
 DID document was observed at a specific point in time.
 
 > **IMPORTANT:**
-> affinidi-webvh-service crates are provided "as is" without any
+> did-hosting-service crates are provided "as is" without any
 > warranties or guarantees, and by using this framework, users
 > agree to assume all risks associated with its deployment and
 > use including implementing security, and privacy measures in
@@ -22,7 +22,7 @@ DID document was observed at a specific point in time.
 ### 1. Build
 
 ```bash
-cargo build -p affinidi-webvh-witness --release
+cargo build -p webvh-witness --release
 ```
 
 The binary is produced at `target/release/webvh-witness`.
@@ -43,7 +43,7 @@ The interactive wizard walks you through configuration:
 - **VTA credential** — authenticates with the witness's VTA
   context and creates the witness DID automatically
 - **Features** — enable DIDComm messaging and/or REST API
-- **DID hosting** — URL and path where webvh-server will host
+- **DID hosting** — URL and path where did-hosting-server will host
   the witness DID
 - **Host / port** — listen address (default: `0.0.0.0:8102`)
 - **Log level / format** — logging configuration
@@ -190,13 +190,13 @@ All API endpoints are under the `/api` prefix.
 ## Library Usage
 
 The webvh-witness crate can be used as a library (e.g., by the
-[webvh-daemon](../webvh-daemon/)). It exposes:
+[did-hosting-daemon](../did-hosting-daemon/)). It exposes:
 
-- `affinidi_webvh_witness::config::AppConfig` — configuration
-- `affinidi_webvh_witness::server::AppState` — application state
-- `affinidi_webvh_witness::routes::router()` — Axum router
-- `affinidi_webvh_witness::server::run()` — standalone entry point
-- `affinidi_webvh_witness::signing::LocalSigner` — witness proof signing
+- `webvh_witness::config::AppConfig` — configuration
+- `webvh_witness::server::AppState` — application state
+- `webvh_witness::routes::router()` — Axum router
+- `webvh_witness::server::run()` — standalone entry point
+- `webvh_witness::signing::LocalSigner` — witness proof signing
 
 ## Support & feedback
 
@@ -211,11 +211,11 @@ codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on
    GitHub under
-   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
+   [Issues](https://github.com/affinidi/did-hosting-service/issues).
 
 2. If you're unable to find an open issue addressing the
    problem,
-   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
+   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
    Be sure to include a **title and clear description**, as
    much relevant information as possible, and a **code sample**
    or an **executable test case** demonstrating the expected
@@ -224,5 +224,5 @@ codebase, you can also create an issue directly in GitHub.
 ## Contributing
 
 Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/affinidi-webvh-service/blob/main/CONTRIBUTING.md)
+[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
 guidelines.

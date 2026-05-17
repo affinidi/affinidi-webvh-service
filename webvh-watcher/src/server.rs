@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use affinidi_webvh_common::server::init;
+use did_hosting_common::server::init;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::routes;
 use crate::store::{KeyspaceHandle, Store};
 use axum::routing::get;
+use did_hosting_common::server::store::KS_DIDS;
 use tokio::sync::watch;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
@@ -19,7 +20,7 @@ pub struct AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
-    let dids_ks = store.keyspace("dids")?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
 
     let std_listener = {
         let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -73,7 +74,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<(), AppError> {
                             ),
                     )
                     .layer(axum::middleware::from_fn(
-                        affinidi_webvh_common::server::security_headers,
+                        did_hosting_common::server::security_headers,
                     ))
                     .route("/api/health", get(routes::health::health));
 

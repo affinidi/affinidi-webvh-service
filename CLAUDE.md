@@ -1,10 +1,10 @@
 # WebVH Service — Project Instructions
 
-## webvh-daemon: the unified binary
+## did-hosting-daemon: the unified binary
 
-`webvh-daemon` is a self-contained, single-binary deployment that embeds
-**all the main features** of `webvh-server`, `webvh-witness`,
-`webvh-watcher`, and `webvh-control` in one process. It is the
+`did-hosting-daemon` is a self-contained, single-binary deployment that embeds
+**all the main features** of `did-hosting-server`, `webvh-witness`,
+`webvh-watcher`, and `did-hosting-control` in one process. It is the
 recommended deployment for single-host operators; it is not a strict
 superset of the standalone services.
 
@@ -17,11 +17,11 @@ fewer wires.
 
 ### What the daemon mirrors from the standalone services
 
-When you add capability to `webvh-server` or `webvh-control`, mirror it
+When you add capability to `did-hosting-server` or `did-hosting-control`, mirror it
 in the daemon if it falls into any of these buckets:
 
 - **CLI commands.** Subcommands added to either standalone binary
-  should also be reachable through `webvh-daemon`.
+  should also be reachable through `did-hosting-daemon`.
 - **Startup initialisation.** Auto-bootstrap, integrity checks, stats
   seeding, registry seeding, key/secret loading — anything the
   standalone services do at boot belongs in `run_daemon()` too.

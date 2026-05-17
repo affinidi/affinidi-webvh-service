@@ -1,0 +1,145 @@
+mod acl;
+mod auth;
+mod config;
+pub(crate) mod did_manage;
+pub mod did_public;
+pub(crate) mod health;
+mod resolve_shared;
+#[cfg(feature = "method-web")]
+pub mod resolve_web;
+#[cfg(feature = "method-webvh")]
+pub mod resolve_webvh;
+mod stats;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post, put};
+
+use crate::server::AppState;
+
+/// Build the server router without the DID-serving fallback.
+///
+/// Used by the daemon to allow a combined fallback (DID serving + UI).
+pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
+    // Upload routes with a custom body-size limit
+    let upload_routes = Router::new()
+        .route("/dids/{*mnemonic}", put(did_manage::upload_did))
+        .route("/witness/{*mnemonic}", put(did_manage::upload_witness))
+        .layer(DefaultBodyLimit::max(upload_body_limit));
+
+    // API routes live under /api/ so they never collide with DID serving paths.
+    //
+    // The server is a read-only edge node. DID lifecycle management (create,
+    // rollback, recover) is handled by the control plane. The server only
+    // accepts sync'd content (publish, witness, delete) and provides
+    // read-only introspection (list, get, log, stats).
+    let api = Router::new()
+        // Auth routes
+        .route("/auth/challenge", post(auth::challenge))
+        .route("/auth/", post(auth::authenticate))
+        .route("/auth/refresh", post(auth::refresh))
+        // DID introspection + sync (authenticated)
+        .route("/dids", get(did_manage::list_dids))
+        .route(
+            "/dids/{*mnemonic}",
+            get(did_manage::get_did).delete(did_manage::delete_did),
+        )
+        .route("/log/{*mnemonic}", get(did_manage::get_did_log))
+        .route("/raw/{*mnemonic}", get(did_manage::get_raw_log))
+        .route("/disable/{*mnemonic}", put(did_manage::disable_did))
+        .route("/enable/{*mnemonic}", put(did_manage::enable_did))
+        // Services (authenticated, any role)
+        .route("/services", get(config::get_services))
+        // Stats (authenticated — in-memory only, authoritative stats on control plane)
+        .route("/stats", get(stats::get_server_stats))
+        .route("/stats/{*mnemonic}", get(stats::get_did_stats))
+        // Server config (admin only)
+        .route("/config", get(config::get_config))
+        // ACL management (admin only)
+        .route("/acl", get(acl::list_acl).post(acl::create_acl))
+        .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
+        // Merge upload routes (body-limited) into the API router
+        .merge(upload_routes);
+
+    #[allow(unused_mut)]
+    let mut router = Router::new().nest("/api", api);
+
+    // Prometheus metrics endpoint (only when metrics feature is enabled)
+    #[cfg(feature = "metrics")]
+    {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    // .well-known root-DID routes (registered before the fallback —
+    // specific routes always take priority). Each method's well-known
+    // surface is feature-gated; a method-web-only build only
+    // registers `/.well-known/did.json`, etc.
+    #[cfg(feature = "method-webvh")]
+    {
+        router = router
+            .route(
+                "/.well-known/did.jsonl",
+                get(resolve_webvh::serve_root_did_log),
+            )
+            .route(
+                "/.well-known/did-witness.json",
+                get(resolve_webvh::serve_root_witness),
+            );
+    }
+    #[cfg(feature = "method-web")]
+    {
+        router = router.route(
+            "/.well-known/did.json",
+            get(resolve_web::serve_root_did_web),
+        );
+    }
+
+    router
+}
+
+/// Build a minimal router with only public DID-serving routes (daemon mode).
+///
+/// In daemon mode, the control plane handles all `/api/` management routes.
+/// The server only needs `.well-known` routes and the public DID fallback.
+pub fn router_public_only() -> Router<AppState> {
+    #[allow(unused_mut)]
+    let mut router = Router::new();
+    #[cfg(feature = "method-webvh")]
+    {
+        router = router
+            .route(
+                "/.well-known/did.jsonl",
+                get(resolve_webvh::serve_root_did_log),
+            )
+            .route(
+                "/.well-known/did-witness.json",
+                get(resolve_webvh::serve_root_witness),
+            );
+    }
+    #[cfg(feature = "method-web")]
+    {
+        router = router.route(
+            "/.well-known/did.json",
+            get(resolve_web::serve_root_did_web),
+        );
+    }
+    router
+}
+
+/// Build the full server router with DID-serving fallback (standalone mode).
+pub fn router(upload_body_limit: usize) -> Router<AppState> {
+    router_without_fallback(upload_body_limit).fallback(did_public::serve_public)
+}
+
+#[cfg(feature = "metrics")]
+async fn metrics_handler() -> (
+    axum::http::StatusCode,
+    [(&'static str, &'static str); 1],
+    String,
+) {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        did_hosting_common::server::metrics::render(),
+    )
+}

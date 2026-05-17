@@ -1,0 +1,305 @@
+use axum::Json;
+use axum::extract::State;
+use serde::Deserialize;
+
+use did_hosting_common::server::auth::constant_time_eq;
+use did_hosting_common::server::didcomm_unpack;
+use did_hosting_common::{
+    AuthenticateData, AuthenticateResponse, ChallengeData, ChallengeResponse, RefreshData,
+    RefreshResponse,
+};
+
+use crate::acl::check_acl;
+use crate::auth::session::{
+    Session, SessionState, create_authenticated_session, delete_session,
+    finalize_challenge_session, get_session, now_epoch, store_session,
+};
+use crate::error::AppError;
+use crate::server::AppState;
+use tracing::{info, warn};
+
+// ---------- POST /auth/challenge ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ChallengeRequest {
+    pub did: String,
+}
+
+/// Maximum concurrent pending challenges per DID.
+const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+
+pub async fn challenge(
+    State(state): State<AppState>,
+    Json(req): Json<ChallengeRequest>,
+) -> Result<Json<ChallengeResponse>, AppError> {
+    // Input validation: reject excessively long DIDs (DoS mitigation)
+    if req.did.len() > 512 {
+        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    }
+
+    // ACL enforcement: DID must be in the ACL to request a challenge
+    check_acl(&state.acl_ks, &req.did).await?;
+
+    // Rate limit: prevent session exhaustion by limiting pending challenges per DID
+    let sessions = state.sessions_ks.prefix_iter_raw("session:").await?;
+    let pending_count = sessions
+        .iter()
+        .filter(|(_, v)| {
+            serde_json::from_slice::<Session>(v)
+                .map(|s| s.did == req.did && s.state == SessionState::ChallengeSent)
+                .unwrap_or(false)
+        })
+        .count();
+    if pending_count >= MAX_PENDING_CHALLENGES_PER_DID {
+        warn!(did = %req.did, pending = pending_count, "challenge rate limited");
+        return Err(AppError::Validation(
+            "too many pending challenges — try again later".into(),
+        ));
+    }
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Generate 32-byte random challenge as hex
+    let mut challenge_bytes = [0u8; 32];
+    rand::fill(&mut challenge_bytes);
+    let challenge = hex::encode(challenge_bytes);
+
+    let session = Session {
+        session_id: session_id.clone(),
+        did: req.did,
+        challenge: challenge.clone(),
+        state: SessionState::ChallengeSent,
+        created_at: now_epoch(),
+        refresh_token: None,
+        refresh_expires_at: None,
+        token_id: None,
+    };
+
+    store_session(&state.sessions_ks, &session).await?;
+
+    #[cfg(feature = "metrics")]
+    did_hosting_common::server::metrics::inc_auth_challenge();
+    info!(audit = true, did = %session.did, session_id = %session.session_id, "auth challenge issued");
+
+    Ok(Json(ChallengeResponse {
+        session_id,
+        data: ChallengeData { challenge },
+    }))
+}
+
+// ---------- POST /auth/ ----------
+
+pub async fn authenticate(
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<AuthenticateResponse>, AppError> {
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+
+    // Validate message type
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    // Extract challenge and session_id from body
+    let challenge = msg.body["challenge"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing challenge in message body".into()))?;
+    let session_id = msg.body["session_id"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?;
+
+    // Look up session and validate
+    let mut session = get_session(&state.sessions_ks, session_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    if session.state != SessionState::ChallengeSent {
+        warn!(session_id, "authentication rejected: session replay");
+        return Err(AppError::Authentication(
+            "session already authenticated (replay)".into(),
+        ));
+    }
+    if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
+        warn!(session_id, "authentication rejected: challenge mismatch");
+        return Err(AppError::Authentication("challenge mismatch".into()));
+    }
+    if session.did != sender_base {
+        warn!(session_id, sender = %sender_base, expected = %session.did, "authentication rejected: DID mismatch");
+        return Err(AppError::Authentication("DID mismatch".into()));
+    }
+
+    // Check challenge TTL
+    let now = now_epoch();
+    if now.saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
+        warn!(session_id, "authentication rejected: challenge expired");
+        return Err(AppError::Authentication("challenge expired".into()));
+    }
+
+    // Validate DIDComm message created_time to prevent replay attacks
+    let created_time = msg
+        .created_time
+        .ok_or_else(|| AppError::Authentication("message missing created_time".into()))?;
+    let challenge_ttl = state.config.auth.challenge_ttl;
+    if created_time < session.created_at {
+        warn!(
+            session_id,
+            created_time,
+            session_created = session.created_at,
+            "authentication rejected: message created_time before challenge"
+        );
+        return Err(AppError::Authentication(
+            "message created_time is before the challenge was issued".into(),
+        ));
+    }
+    if now.saturating_sub(created_time) > challenge_ttl {
+        warn!(
+            session_id,
+            created_time,
+            now,
+            challenge_ttl,
+            "authentication rejected: message created_time outside challenge TTL"
+        );
+        return Err(AppError::Authentication(
+            "message created_time is outside the challenge TTL window".into(),
+        ));
+    }
+
+    // Look up ACL entry to get role for the token
+    let role = check_acl(&state.acl_ks, &session.did).await?;
+
+    // Generate tokens and finalize session
+    let token_resp = finalize_challenge_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &mut session,
+        &role,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
+
+    #[cfg(feature = "metrics")]
+    did_hosting_common::server::metrics::inc_auth_success();
+    info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
+
+    Ok(Json(AuthenticateResponse {
+        session_id: token_resp.session_id,
+        data: AuthenticateData {
+            access_token: token_resp.access_token,
+            access_expires_at: token_resp.access_expires_at,
+            refresh_token: token_resp.refresh_token,
+            refresh_expires_at: token_resp.refresh_expires_at,
+        },
+    }))
+}
+
+// ---------- POST /auth/refresh ----------
+
+pub async fn refresh(
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<RefreshResponse>, AppError> {
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+
+    // sender_base is JWS-verified; refresh requires the holder's signed envelope.
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+
+    // Validate message type
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    // Extract refresh_token from body
+    let refresh_token = msg.body["refresh_token"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
+
+    // Atomically claim and consume the refresh-token → session_id index.
+    // Cross-replica safe via Redis GETDEL / DynamoDB DeleteItem
+    // ReturnValues=ALL_OLD / fjall mutex. Closes the rotation TOCTOU.
+    let session_id = did_hosting_common::server::auth::session::take_session_id_by_refresh(
+        &state.sessions_ks,
+        refresh_token,
+    )
+    .await?
+    .ok_or_else(|| AppError::Authentication("refresh token not found".into()))?;
+
+    let session = get_session(&state.sessions_ks, &session_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    // Bind the JWS signer to the session DID. Without this check, a leaked
+    // refresh token plus any attacker-controlled DID is enough to rotate the
+    // victim's tokens — the signed envelope alone proves possession of *some*
+    // signing key, not the right one.
+    if sender_base != session.did {
+        warn!(
+            session_id = %session.session_id,
+            session_did = %session.did,
+            sender = %sender_base,
+            "refresh rejected: signer DID does not match session DID",
+        );
+        return Err(AppError::Authentication(
+            "signer DID does not match session DID".into(),
+        ));
+    }
+
+    if session.state != SessionState::Authenticated {
+        warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: session not authenticated");
+        return Err(AppError::Authentication("session not authenticated".into()));
+    }
+
+    // Verify refresh token hasn't expired
+    if let Some(expires_at) = session.refresh_expires_at
+        && now_epoch() > expires_at
+    {
+        warn!(session_id = %session.session_id, did = %session.did, "refresh rejected: token expired");
+        return Err(AppError::Authentication("refresh token expired".into()));
+    }
+
+    // Refresh rotates everything: a brand-new session id, access token, and
+    // refresh token. The old session is deleted atomically so a leaked
+    // refresh token cannot be reused.
+    delete_session(&state.sessions_ks, &session.session_id).await?;
+
+    // Look up current ACL role (propagates changes at refresh time)
+    let role = check_acl(&state.acl_ks, &session.did).await?;
+
+    let token_response = create_authenticated_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &session.did,
+        &role,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
+
+    info!(
+        audit = true,
+        did = %session.did,
+        role = %role,
+        old_session_id = %session.session_id,
+        new_session_id = %token_response.session_id,
+        "token refreshed",
+    );
+
+    Ok(Json(RefreshResponse {
+        session_id: token_response.session_id,
+        data: RefreshData {
+            access_token: token_response.access_token,
+            access_expires_at: token_response.access_expires_at,
+            refresh_token: token_response.refresh_token,
+            refresh_expires_at: token_response.refresh_expires_at,
+        },
+    }))
+}

@@ -1,0 +1,60 @@
+[package]
+name = "did-hosting-client"
+description = "Client library for talking to a did-hosting-server / did-hosting-daemon over REST + DIDComm. Pairs with the daemon's REST API and the Trust-Tasks wire contract."
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "did_hosting_client"
+path = "src/lib.rs"
+
+[dependencies]
+# Protocol types — the only daemon-shared dep per the crate spec.
+# We deliberately do NOT depend on `did-hosting-common` so the client
+# stays publishable as a stand-alone integrator surface.
+didwebvh-rs = { workspace = true }
+
+# DIDComm v2 signed-message construction (same TDK the daemon uses,
+# so JWS shapes match byte-for-byte).
+affinidi-tdk = { workspace = true }
+
+# HTTPS transport. Pinned to rustls so integrators don't need OpenSSL.
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+
+# Async primitives.
+tokio = { version = "1", features = ["sync", "macros"] }
+async-trait = "0.1"
+dashmap = "6"
+
+# URL parsing + HTTPS host validation.
+url = { workspace = true }
+ipnetwork = "0.21"
+
+# Serialisation.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Token zeroization for defence-in-depth on memory dumps.
+zeroize = { version = "1", features = ["derive"] }
+
+# Error handling + observability.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Message IDs for the DIDComm authenticate / refresh envelopes.
+uuid = { workspace = true }
+
+[dev-dependencies]
+# In-process HTTP fixture for integration tests. Spins up an
+# ephemeral server we can match request shapes against — no real
+# daemon required for T50.
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

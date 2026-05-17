@@ -8,9 +8,9 @@ use tracing::{info, warn};
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::watcher_ops::{self, WatcherRecord};
-use affinidi_webvh_common::server::auth::constant_time_eq;
-use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
-use affinidi_webvh_common::{SyncDeleteRequest, SyncDidRequest};
+use did_hosting_common::server::auth::constant_time_eq;
+use did_hosting_common::server::mnemonic::validate_mnemonic;
+use did_hosting_common::{SyncDeleteRequest, SyncDidRequest};
 
 // ---------------------------------------------------------------------------
 // SyncAuth extractor — validates bearer token against configured push_tokens
@@ -64,7 +64,7 @@ pub async fn receive_did(
     if req.log_content.is_empty() {
         return Err(AppError::Validation("log_content cannot be empty".into()));
     }
-    affinidi_webvh_common::did_ops::validate_did_jsonl(&req.log_content).map_err(|e| {
+    did_hosting_common::did_ops::validate_did_jsonl(&req.log_content).map_err(|e| {
         warn!(mnemonic = %req.mnemonic, error = %e, "invalid WebVH JSONL in sync push");
         AppError::Validation(format!("invalid WebVH log content: {e}"))
     })?;

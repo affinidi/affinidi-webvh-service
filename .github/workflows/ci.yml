@@ -54,19 +54,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: MSRV — build workspace (default features)
         run: cargo +${{ env.MSRV }} build --workspace --locked
-      - name: MSRV — build webvh-common with every feature combination
+      - name: MSRV — build did-hosting-common with every feature combination
         # Cloud-secret backends and non-default storage backends are gated
         # behind feature flags. They must also build at MSRV; otherwise a
         # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
         # the default-features build and break operator-driven feature
         # selections at the next minor release.
+        #
+        # `method-webvh` and `method-web` (multi-method rollout, T11/T24)
+        # are also feature-gated; same MSRV-pass rationale.
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
                      store-firestore store-cosmosdb passkey \
-                     setup-wizard metrics; do
-            echo "::group::MSRV build affinidi-webvh-common --features server-core,$feat"
-            cargo +${{ env.MSRV }} build -p affinidi-webvh-common --locked \
+                     setup-wizard metrics \
+                     method-webvh method-web; do
+            echo "::group::MSRV build did-hosting-common --features server-core,$feat"
+            cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
               --no-default-features --features "server-core,$feat"
             echo "::endgroup::"
           done
@@ -96,16 +100,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build webvh-common with ${{ matrix.store }}
+      - name: Build did-hosting-common with ${{ matrix.store }}
         run: >
-          cargo build -p affinidi-webvh-common --no-default-features
+          cargo build -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
-      - name: Test webvh-common with ${{ matrix.store }}
+      - name: Test did-hosting-common with ${{ matrix.store }}
         # Default-feature test runs catch the bulk of the suite; here we just
         # confirm the alternate-store build compiles + its small unit slice
         # still passes.
         run: >
-          cargo test -p affinidi-webvh-common --lib --no-default-features
+          cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"
 
   test-default:
@@ -123,10 +127,10 @@ jobs:
       # the operator-facing contract for non-interactive setup. The smoke
       # test loads each one, validates it, and fails the build on schema
       # drift. Gated on `server-core` because the recipe module lives
-      # under `affinidi_webvh_common::server`.
+      # under `did_hosting_common::server`.
       - name: setup-recipe examples parse + validate
         run: >
-          cargo test -p affinidi-webvh-common --locked
+          cargo test -p did-hosting-common --locked
           --features server-core --test recipe_examples
       # End-to-end smoke test for the offline-prepare (phase 1) recipe
       # path. Exercises `run_vta_for_recipe` + plaintext-store seed
@@ -135,7 +139,7 @@ jobs:
       # sealed bundle that phase 2 opens.
       - name: setup-recipe offline phase 1 round-trip
         run: >
-          cargo test -p affinidi-webvh-common --locked
+          cargo test -p did-hosting-common --locked
           --features server-core --test offline_phase1
 
   keyring-required:
@@ -166,7 +170,7 @@ jobs:
       - name: Run keyring round-trip on macOS
         if: matrix.os == 'macos-latest'
         run: >
-          cargo test -p affinidi-webvh-common --lib
+          cargo test -p did-hosting-common --lib
           --features server-core,store-fjall,keyring
           server::secret_store::keyring::tests::keyring_round_trip_when_backend_available
           --
@@ -184,11 +188,69 @@ jobs:
             echo -n "ci-test-password" | gnome-keyring-daemon --unlock
             eval "$(echo -n "ci-test-password" | gnome-keyring-daemon --start)"
             export GNOME_KEYRING_CONTROL DBUS_SESSION_BUS_ADDRESS
-            cargo test -p affinidi-webvh-common --lib \
+            cargo test -p did-hosting-common --lib \
               --features server-core,store-fjall,keyring \
               server::secret_store::keyring::tests::keyring_round_trip_when_backend_available \
               -- --nocapture
           '
+
+  methods:
+    name: cargo build (DID method ${{ matrix.case }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each enabled-by-default method must build cleanly with
+          # only its own feature on — proves the dispatcher arms are
+          # individually compile-gated, and that the daemon CAN be
+          # built as method-webvh-only or method-web-only.
+          - case: webvh-only
+            features: "method-webvh"
+            expect: ok
+          - case: web-only
+            features: "method-web"
+            expect: ok
+          # Stubs MUST refuse to build with a `compile_error!`. CI
+          # asserts the failure message — a future contributor who
+          # accidentally removes the stub without supplying a real
+          # impl would otherwise see the build "succeed" with the
+          # method absent from `method_by_name`.
+          - case: webs-stub
+            features: "method-webs"
+            expect: fail
+            expected_message: "method-webs is not implemented in this release"
+          - case: webplus-stub
+            features: "method-webplus"
+            expect: fail
+            expected_message: "method-webplus is not implemented in this release"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build did-hosting-common (${{ matrix.case }})
+        run: |
+          set +e
+          out=$(cargo build -p did-hosting-common \
+            --no-default-features --features "${{ matrix.features }}" 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ "${{ matrix.expect }}" = "ok" ]; then
+            if [ "$status" -ne 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to build, got exit $status"
+              exit 1
+            fi
+          else
+            if [ "$status" -eq 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to FAIL to build, got success"
+              exit 1
+            fi
+            if ! echo "$out" | grep -q "${{ matrix.expected_message }}"; then
+              echo "::error::expected failure to mention '${{ matrix.expected_message }}'"
+              exit 1
+            fi
+          fi
 
   cloud-secrets-build:
     name: cargo build (cloud secret backends)
@@ -205,7 +267,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: >
-          cargo build -p affinidi-webvh-common --no-default-features
+          cargo build -p did-hosting-common --no-default-features
           --features "server-core,${{ matrix.backend }}"
 
   deny:
@@ -224,12 +286,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # webvh-common is publishable on its own. The other crates depend on
+      # did-hosting-common is publishable on its own. The other crates depend on
       # it via `version = "0.6"` + path, so cargo refuses to dry-run them
       # until common is on crates.io. Verifying the leaf is enough to catch
       # packaging mistakes (manifests, exclude/include, missing files) on
       # every PR; the actual publish sequence happens manually after a tag.
       - name: cargo package --list (sanity)
-        run: cargo package --list -p affinidi-webvh-common
-      - name: cargo publish --dry-run (webvh-common)
-        run: cargo publish --dry-run --allow-dirty -p affinidi-webvh-common
+        run: cargo package --list -p did-hosting-common
+      - name: cargo publish --dry-run (did-hosting-common)
+        run: cargo publish --dry-run --allow-dirty -p did-hosting-common

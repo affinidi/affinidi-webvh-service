@@ -1,1 +1,1 @@
-pub use affinidi_webvh_common::server::error::AppError;
+pub use did_hosting_common::server::error::AppError;

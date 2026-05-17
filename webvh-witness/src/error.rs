@@ -1,2 +1,2 @@
-// Re-export from webvh-common shared server infrastructure
-pub use affinidi_webvh_common::server::error::AppError;
+// Re-export from did-hosting-common shared server infrastructure
+pub use did_hosting_common::server::error::AppError;

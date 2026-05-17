@@ -1,0 +1,616 @@
+//! DIDComm sync handlers for the WebVH server edge node.
+//!
+//! The server is a read-only node that receives `sync-update` and
+//! `sync-delete` messages from the control plane via the mediator.
+//! All DID provisioning (VTA protocol) is handled by the control plane.
+
+use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_didcomm_service::{
+    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
+    MessagePolicy, MiddlewareResult, Next, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
+    middleware_fn, trust_ping_handler,
+};
+use serde_json::{Value, json};
+use tracing::{info, warn};
+
+use did_hosting_common::didcomm_types::*;
+use did_hosting_common::server::problem_report::log_problem_report;
+
+use crate::acl::{Role, check_acl};
+use crate::server::AppState;
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// Build the DIDComm router for the WebVH server.
+///
+/// Handles only sync messages from the control plane (sync-update,
+/// sync-delete) and domain assignment messages (assign / unassign,
+/// T28). VTA provisioning is handled by the control plane.
+pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceError> {
+    Ok(Router::new()
+        .extension(state)
+        .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
+        .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
+        .route(MSG_SERVER_REGISTER_ACK, handler_fn(handle_register_ack))?
+        .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
+        .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
+        .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
+        .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
+        .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
+        .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
+        .route(MSG_DOMAIN_PURGE, handler_fn(handle_domain_purge))?
+        .fallback(handler_fn(handle_fallback))
+        .layer(
+            MessagePolicy::new()
+                .require_encrypted(true)
+                .require_sender_did(true),
+        )
+        .layer(middleware_fn(filtered_request_logging)))
+}
+
+/// Request logging middleware that silences noisy health/stats messages.
+async fn filtered_request_logging(
+    ctx: HandlerContext,
+    message: Message,
+    meta: affinidi_messaging_didcomm::UnpackMetadata,
+    next: Next,
+) -> MiddlewareResult {
+    const QUIET: &[&str] = &[
+        MSG_HEALTH_PING,
+        MSG_HEALTH_PONG,
+        MSG_STATS_ACK,
+        MESSAGE_PICKUP_STATUS_TYPE,
+    ];
+
+    let msg_type = message.typ.clone();
+    let result = next.run(ctx, message, meta).await;
+
+    if !QUIET.iter().any(|t| msg_type == *t) {
+        let status = match &result {
+            Ok(Some(_)) => "ok(response)",
+            Ok(None) => "ok(empty)",
+            Err(_) => "error",
+        };
+        info!(message_type = %msg_type, status, "DIDComm request processed");
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Registration ack
+// ---------------------------------------------------------------------------
+
+async fn handle_register_ack(
+    _ctx: HandlerContext,
+    message: Message,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let instance_id = message
+        .body
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    info!(instance_id, "registration acknowledged by control plane");
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Health ping (control plane → server → control plane)
+// ---------------------------------------------------------------------------
+
+async fn handle_health_ping(
+    _ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let did_count = state
+        .dids_ks
+        .prefix_iter_raw("did:")
+        .await
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
+
+    Ok(Some(
+        DIDCommResponse::new(
+            MSG_HEALTH_PONG.to_string(),
+            json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "did_count": did_count,
+            }),
+        )
+        .thid(message.id.clone()),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Sync handlers (control plane → server via mediator)
+// ---------------------------------------------------------------------------
+
+async fn handle_sync_update(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+
+    let (response_type, response_body) = match do_sync_update(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.did.internal-error", &e),
+    };
+
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn handle_sync_delete(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+
+    let (response_type, response_body) = match do_sync_delete(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.did.internal-error", &e),
+    };
+
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn handle_fallback(
+    ctx: HandlerContext,
+    message: Message,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = ctx.sender_did.as_deref();
+    if log_problem_report("server", sender, &message) {
+        return Ok(None);
+    }
+    warn!(
+        sender = sender.unwrap_or("unknown"),
+        msg_type = %message.typ,
+        "unknown message type — ignoring"
+    );
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Sync message handling
+// ---------------------------------------------------------------------------
+
+async fn do_sync_update(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use crate::control_register::apply_single_update;
+    use did_hosting_common::DidSyncUpdate;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "sync message rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.did.unauthorized",
+            "admin or service role required for sync messages",
+        ));
+    }
+
+    let mnemonic = msg
+        .body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'mnemonic' in sync-update")?;
+    let did_id = msg
+        .body
+        .get("did_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'did_id' in sync-update")?;
+    let log_content = msg
+        .body
+        .get("log_content")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'log_content' in sync-update")?;
+    let witness_content = msg
+        .body
+        .get("witness_content")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let version_count = msg
+        .body
+        .get("version_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing 'version_count' in sync-update")?;
+
+    let update = DidSyncUpdate {
+        mnemonic: mnemonic.to_string(),
+        did_id: did_id.to_string(),
+        log_content: log_content.to_string(),
+        witness_content,
+        version_count,
+    };
+
+    apply_single_update(&state.dids_ks, &state.store, &update, &state.did_cache)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    info!(
+        did = sender,
+        mnemonic = %mnemonic,
+        version_count,
+        "applied DID sync update from control plane via mediator"
+    );
+
+    Ok((
+        MSG_SYNC_UPDATE_ACK.to_string(),
+        json!({ "mnemonic": mnemonic, "status": "applied" }),
+    ))
+}
+
+async fn do_sync_delete(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use crate::did_ops;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "sync message rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.did.unauthorized",
+            "admin or service role required for sync messages",
+        ));
+    }
+
+    let mnemonic = msg
+        .body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'mnemonic' in sync-delete")?;
+
+    let record: Option<did_ops::DidRecord> = state
+        .dids_ks
+        .get(did_ops::did_key(mnemonic))
+        .await
+        .unwrap_or(None);
+
+    if let Some(record) = record {
+        let mut batch = state.store.batch();
+        batch.remove(&state.dids_ks, did_ops::did_key(mnemonic));
+        batch.remove(&state.dids_ks, did_ops::content_log_key(mnemonic));
+        batch.remove(&state.dids_ks, did_ops::content_witness_key(mnemonic));
+        batch.remove(&state.dids_ks, did_ops::owner_key(&record.owner, mnemonic));
+        batch.remove(&state.dids_ks, did_ops::watcher_sync_key(mnemonic));
+        batch.commit().await.map_err(|e| e.to_string())?;
+
+        info!(did = sender, mnemonic = %mnemonic, "deleted DID via sync from control plane");
+    } else {
+        info!(mnemonic = %mnemonic, "sync delete: DID not found locally");
+    }
+
+    Ok((
+        MSG_SYNC_DELETE_ACK.to_string(),
+        json!({ "mnemonic": mnemonic, "status": "deleted" }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Domain assignment (T28, control plane → server)
+// ---------------------------------------------------------------------------
+//
+// The control plane is the source of truth for which domains a server
+// hosts. Both handlers are idempotent — re-assigning an already-
+// assigned domain or unassigning an unknown domain returns a status
+// ack rather than an error. Only Admin or Service-role callers are
+// allowed; an ACL'd Service role is what the control-plane DID gets
+// at register time (see `control_register::run`).
+
+async fn handle_domain_assign(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_assign(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn handle_domain_unassign(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_unassign(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn do_domain_assign(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment::{AssignOutcome, assign};
+    use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::pending_purge::{self, CancelOutcome};
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/assign rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain assignment",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/assign")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let now = crate::auth::session::now_epoch();
+    let outcome = assign(&state.store, &domain, sender, now)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (status, log_msg) = match &outcome {
+        AssignOutcome::Created(_) => ("assigned", "domain assigned"),
+        AssignOutcome::Existing(_) => ("already_assigned", "domain re-assign no-op"),
+    };
+
+    // T30: re-assign within the grace window cancels any pending
+    // purge. Audit-log the cancellation so an operator can answer
+    // "did my data survive the unassign / re-assign round trip?".
+    let cancelled = pending_purge::cancel(&state.store, &domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let CancelOutcome::Removed(prev) = cancelled {
+        info!(
+            did = sender,
+            domain = %domain,
+            scheduled_at = prev.scheduled_at,
+            grace_seconds = prev.grace_seconds,
+            "domain re-assign cancelled pending purge — data retained"
+        );
+    }
+
+    info!(
+        did = sender,
+        domain = %domain,
+        status,
+        "{log_msg}"
+    );
+
+    Ok((
+        MSG_DOMAIN_ASSIGN_ACK.to_string(),
+        json!({ "domain": domain, "status": status }),
+    ))
+}
+
+async fn do_domain_unassign(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
+    use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::pending_purge::{self, parse_grace_string};
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/unassign rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain unassignment",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/unassign")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let outcome = unassign(&state.store, &domain)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (status, log_msg) = match &outcome {
+        UnassignOutcome::Removed(_) => ("unassigned", "domain unassigned"),
+        UnassignOutcome::Missing => ("not_assigned", "domain unassign no-op"),
+    };
+
+    // T30: schedule a grace-period purge. Idempotent — overwriting an
+    // existing pending purge just resets the timer, which is the
+    // right behaviour for "operator unassigned, then unassigned
+    // again". Stops at the schedule step here; the actual purge sweep
+    // (which deletes DID records whose domain matches) lands in T30's
+    // follow-up.
+    if matches!(outcome, UnassignOutcome::Removed(_)) {
+        // Source the grace from `config.hosting.unassigned_purge_grace`.
+        // A misconfigured / unparseable value defaults to 2h and emits
+        // a warn — the server keeps working with a sensible default
+        // rather than failing the unassign entirely.
+        let grace_seconds = parse_grace_string(&state.config.hosting.unassigned_purge_grace)
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    config = %state.config.hosting.unassigned_purge_grace,
+                    "unassigned_purge_grace unparseable; defaulting to 2h"
+                );
+                2 * 60 * 60
+            });
+        let now = crate::auth::session::now_epoch();
+        if let Err(e) = pending_purge::schedule(
+            &state.store,
+            &domain,
+            now,
+            grace_seconds,
+            "grace-expired",
+            sender,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                domain = %domain,
+                "failed to schedule pending purge; domain is unassigned but \
+                 data retention is unbounded until manual cleanup"
+            );
+        } else {
+            info!(
+                did = sender,
+                domain = %domain,
+                grace_seconds,
+                "pending purge scheduled"
+            );
+        }
+    }
+
+    info!(
+        did = sender,
+        domain = %domain,
+        status,
+        "{log_msg}"
+    );
+
+    Ok((
+        MSG_DOMAIN_UNASSIGN_ACK.to_string(),
+        json!({ "domain": domain, "status": status }),
+    ))
+}
+
+async fn handle_domain_purge(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_purge(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+/// Handle `MSG_DOMAIN_PURGE` — admin "Purge now" Trust Task.
+///
+/// Bypasses the grace period and immediately deletes every DID
+/// record on the named domain. The unassignment must already have
+/// happened (the domain is removed from KS_ASSIGNMENTS); admins can
+/// run an explicit unassign-then-purge sequence, or purge a domain
+/// whose grace timer is still running. Either way the pending
+/// purge entry (if any) is cleared after the synchronous purge.
+async fn do_domain_purge(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::domain_purge::purge_domain_dids;
+    use did_hosting_common::server::pending_purge;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/purge rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain purge",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/purge")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Clear any pending purge — the synchronous purge supersedes it.
+    let _ = pending_purge::cancel(&state.store, &domain).await;
+
+    info!(
+        did = sender,
+        domain = %domain,
+        deleted = report.deleted,
+        skipped_no_domain = report.skipped_no_domain,
+        skipped_other_domain = report.skipped_other_domain,
+        "domain purged via admin Purge Now"
+    );
+
+    Ok((
+        MSG_DOMAIN_PURGE_ACK.to_string(),
+        json!({
+            "domain": domain,
+            "deleted": report.deleted,
+            "skipped_no_domain": report.skipped_no_domain,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn require_sender(ctx: &HandlerContext) -> Result<&str, DIDCommServiceError> {
+    ctx.sender_did
+        .as_deref()
+        .map(|did| did.split('#').next().unwrap_or(did))
+        .ok_or_else(|| DIDCommServiceError::Internal("missing sender DID".into()))
+}
+
+fn problem_report(code: &str, comment: &str) -> (String, Value) {
+    (
+        MSG_PROBLEM_REPORT.to_string(),
+        json!({ "code": code, "comment": comment }),
+    )
+}

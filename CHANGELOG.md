@@ -1,11 +1,148 @@
 # Changelog
 
-## 0.7.1 (unreleased)
+## 0.7.0 (unreleased)
+
+### Changed — **BREAKING**
+
+- **Repo and workspace renamed.** `affinidi-webvh-service` →
+  `did-hosting-service`. Method-agnostic crates renamed to
+  `did-hosting-*`:
+  - `affinidi-webvh-common`  → `did-hosting-common`
+  - `affinidi-webvh-server`  → `did-hosting-server`
+  - `affinidi-webvh-control` → `did-hosting-control`
+  - `affinidi-webvh-daemon`  → `did-hosting-daemon`
+  Method-specific crates drop the `affinidi-` prefix but keep their
+  method name:
+  - `affinidi-webvh-witness` → `webvh-witness`
+  - `affinidi-webvh-watcher` → `webvh-watcher`
+  Binaries follow crate names. Cargo `name`, library names (snake-case),
+  binary names, and folder paths all change together. Bumps every
+  workspace member's import statement; downstream consumers must
+  update their `Cargo.toml` dependency names. See
+  `tasks/did-hosting-rollout-plan.md` for the rollout context.
+- **Env-var rename: `WEBVH_*` → `DID_HOSTING_*`.** Affects every legacy
+  webvh-server env var. The other per-binary prefixes (`DAEMON_*`,
+  `CONTROL_*`, `WITNESS_*`, `WATCHER_*`) are unchanged.
+- **New CLI subcommand stub: `did-hosting-daemon migrate-from-webvh-config
+  --input <FILE> [--output <FILE>] [--force]`.** Operators can script
+  against the invocation now; the rewriter implementation lands in a
+  follow-up release (see `tasks/did-hosting-rollout-plan.md` WS-7).
+- **Multi-domain hosting.** Domains are now first-class objects.
+  The daemon stores `DomainEntry { name, label, scheme, status,
+  default_domain, branding, witnesses, watchers, quota,
+  well_known_enabled }` records in a new `domains` keyspace and
+  enforces per-domain isolation on every resolve:
+  - **Resolve-side safety** — every `GET /{mnemonic}/did.jsonl`
+    (and the did:web / witness siblings) checks the request's
+    `Host` against the embedded `did_id`'s host. Mismatch → 404
+    (hides off-domain DIDs from cross-domain probes); disabled
+    domain → 503 with structured maintenance body
+    `{ "status": "disabled", "domain": "<name>", "message": ... }`.
+  - **ACL domain scope** — `AclEntry` gains a `domains` field
+    (`All` / `Allowed([…])` / `AllowedWithDefault { domains,
+    default }`). New `Owner` entries default to
+    `AllowedWithDefault`. Existing v0.6 entries deserialise as
+    `All` for backwards-compat (run the ACL-lockdown admin tool
+    in T42 to migrate).
+  - **Request resolution rule** — `POST /api/dids/register`'s
+    new `domain` field follows: explicit → ACL default → system
+    default → reject. `Allowed([…])` callers without a default
+    must declare a domain on every call.
+  - **Domain admin surface** — `GET /api/domains` (Admin),
+    `GET /api/me/domains` (per-caller scoped), `POST /api/domains`
+    (create + optional set-as-default), `PUT /api/domains/{name}`
+    (update metadata), `POST /api/domains/{name}/disable`,
+    `POST /api/domains/{name}/enable`,
+    `POST /api/domains/{name}/set-default`. All Trust-Task-bound
+    via `TASK_DOMAIN_*` URLs.
+  - **Trusted-proxy CIDR config** — `server.trusted_proxy_cidrs`
+    controls which peers can override the `Host` header via
+    `Forwarded` / `X-Forwarded-Host`. Outside the CIDR set, the
+    daemon always uses the literal `Host`. RFC 7239 parsed.
+- **Multi-method DID hosting.** Compile-time feature gates
+  `method-webvh` + `method-web` (default) + `method-webs` /
+  `method-webplus` (compile-error stubs for future work). Per-
+  method resolution routes (`/{mnemonic}/did.jsonl` →
+  `resolve_webvh`; `/{mnemonic}/did.json` → `resolve_web`)
+  feature-gated; a method-webvh-only build doesn't compile (or
+  register) the web routes.
+  - `POST /api/dids/register` accepts the new
+    `{ path, method?, did_data, domain?, force? }` body shape.
+    `method` is optional and inferred from `did_data.id` when
+    absent; explicit mismatch → 400.
+  - `PUT /api/dids/{mnemonic}` content-type discriminator:
+    `application/jsonl` → webvh, `application/did+json` → web.
+  - Legacy `did_log: String` field accepted as a backwards-
+    compat alias for webvh-only callers; will be removed in a
+    future release.
+- **Distributed domain assignment + retain-then-purge lifecycle.**
+  The control plane is now the source of truth for which domains
+  each server hosts.
+  - `MSG_SERVER_REGISTER` carries `enabled_methods` +
+    `served_domains` + `protocol_version` so the control plane
+    can route method-aware requests.
+  - `MSG_DOMAIN_ASSIGN { domain }` / `MSG_DOMAIN_UNASSIGN { domain }`
+    + admin REST triggers at
+    `POST /api/control/registry/{instance_id}/domains/{domain}/{assign,unassign}`.
+    Idempotent on the server side.
+  - Unassignment schedules a `PendingPurge { domain, scheduled_at,
+    grace_seconds, reason, scheduled_by }` row with grace from
+    `[hosting] unassigned_purge_grace` (default `"2h"`). The
+    background sweep (60s tick) walks ripe entries and purges
+    the matching DID records.
+  - `MSG_DOMAIN_PURGE` + admin
+    `POST /api/control/registry/{instance_id}/domains/{domain}/purge`
+    bypass the grace for immediate cleanup
+    (audit-log `reason: "admin-immediate"`).
+  - Server cold-start fallback chain (T29): persisted
+    `KS_ASSIGNMENTS` → `bootstrap_domains` config →
+    legacy `public_url` host → empty (warn-log).
+- **Trust-Tasks transport.** Every DIDComm message type and
+  every authed REST route now has a canonical
+  `https://trusttasks.org/did-hosting/...` URL.
+  - DIDComm dispatcher accepts both legacy `MSG_*` and canonical
+    `TASK_*` as `typ`; `v1_aliases` table provides the bijection.
+    Existing clients keep working unchanged.
+  - REST routes register through `TrustTaskRouter::route_with_task_permissive`
+    — a client that sends the `Trust-Task:` header gets exact-
+    match validation (415 on drift), a client that doesn't passes
+    through (v0.7 → v0.8 migration window).
+- **Companion client library `did-hosting-client`.** New
+  workspace member exposing a thin REST + DIDComm client.
+  Public surface includes `Client`, `AuthedClient`,
+  `HostingSigningIdentity{,Owned}`, `HostingTokenStore` +
+  `InMemoryTokenStore`, `ServerLocks`, `ClientError`,
+  `ServiceEntry`, and all `TASK_*` URL constants. HTTPS enforced
+  at construction (loopback exempt for dev). Decision ladder
+  (cached → refresh → reauth) runs under per-server async mutex.
+  Cross-crate parity test pins URL constants byte-for-byte
+  against the daemon (T51).
+- **Web UI catches up to the multi-domain + multi-method surface.**
+  - New admin pages: `/domains` (catalog CRUD with create / set-default /
+    disable / enable) and `/servers` (registry view with per-instance
+    health, enabled methods, served-domain chips, assign / unassign /
+    purge-now actions).
+  - `DomainProvider` + nav-bar `DomainSwitcher` make a domain the
+    active context across the app; admins also see an "All domains"
+    pseudo-selection. Non-admin views are filtered through
+    `GET /api/me/domains`.
+  - ACL page gains a `DomainScope` editor (All / Specific / Specific +
+    default) with chip selection and a separate default picker; the
+    row read view shows the current scope as chips. Both the new-entry
+    form and inline edit write through `createAcl` / `updateAcl`.
+  - DID list filters by the active domain and renders per-row method +
+    domain badges; DID detail shows the method and domain pulled from
+    the new wire fields (T12 / M-01), with a graceful fallback to
+    `log.method` on legacy records.
+  - Dashboard surfaces the active-domain caption and an admin-only
+    migration banner counting owners still on legacy "All" scope —
+    deep-links to `/acl` for cleanup. Count is derived locally from
+    `listAcl` (no new endpoint).
 
 ### Added
 
 - **Non-interactive setup for every service.** Every `setup` subcommand
-  on `webvh-{daemon,server,control,witness,watcher}` accepts a
+  on `did-hosting-{daemon,server,control}` + `webvh-{witness,watcher}` accepts a
   declarative `--from <recipe.toml>` recipe — drives the wizard with
   zero TTY interaction. The recipe contains no secrets; cloud creds
   come from the environment and crypto material is generated at setup
@@ -20,11 +157,11 @@
   configured secret backend for an existing `ServerSecrets` entry. If
   one is present it refuses with exit 4 unless `--force-reprovision`
   is set. Backs up `config.toml` to `config.toml.bak` on overwrite.
-- **`uninstall` subcommand** on `webvh-{daemon,server,control,witness}`
+- **`uninstall` subcommand** on `did-hosting-{daemon,server,control}` + `webvh-witness`
   — clears managed secrets from the configured backend and removes the
   config file plus companion DID-log files. Prompts for a typed
   `DELETE` confirmation; CI passes `--yes` to skip.
-- **Env-var overlay on recipes.** `DAEMON_*` / `WEBVH_*` / `CONTROL_*`
+- **Env-var overlay on recipes.** `DAEMON_*` / `DID_HOSTING_*` / `CONTROL_*`
   / `WITNESS_*` / `WATCHER_*` env vars override recipe values at load
   time — one recipe template can ship across dev/staging/prod.
 - **Stable exit codes for headless mode.** 0 success, 2 no-transport
@@ -32,15 +169,6 @@
   parse/validation failed. Matches the mediator-setup wizard.
 - **Example recipes** in `examples/` for every service, plus CI smoke
   tests that load + validate each one.
-
-### Changed
-
-- **Patch-bumped every workspace crate 0.7.0 → 0.7.1.** Public Rust
-  APIs are additive (new `setup_recipe` module + new CLI flags);
-  internal deps remain pinned to `version = "0.7"` (major.minor) per
-  `CLAUDE.md`.
-
-## 0.7.0 (unreleased)
 
 ### Security
 
@@ -109,7 +237,7 @@
 
 - **Stats counter advances on control-plane writes.** Previously
   `total_updates` and `last_updated_at` only moved via stats-sync
-  messages from remote `webvh-server` instances; in self-hosted /
+  messages from remote `did-hosting-server` instances; in self-hosted /
   daemon deployments where the control plane is authoritative, the
   counters never advanced. Added `record_update` calls to
   `publish_did` and `register_did_atomic` after the storage commit
@@ -122,7 +250,7 @@
   publish step's own `notify_servers_did` fans out the new content.
   Operators wanting an atomic ownership-takeover should use
   `register_did_atomic`.
-- **`webvh-daemon::run_recreate_did`** now removes the owner-index
+- **`did-hosting-daemon::run_recreate_did`** now removes the owner-index
   entry under the *actual* owner DID rather than the hard-coded
   literal `"system"` (which only worked because `auto_bootstrap_dids`
   happened to use that owner string).
@@ -157,7 +285,7 @@
 
 - **All three refresh handlers (control, server, witness) now require a
   JWS-signed DIDComm envelope and bind the signer to the session DID.**
-  webvh-control was the last hold-out — it accepted a raw refresh-token
+  did-hosting-control was the last hold-out — it accepted a raw refresh-token
   string in the body. Refresh now requires possession of both the refresh
   token *and* the session-DID's signing key on every service.
 - **Offline-bootstrap latent-bug fix.** `open_offline_bootstrap_response`
@@ -191,12 +319,12 @@
   the rotation check when `claims.jti.is_empty()`. Any session with a
   `token_id` now requires a non-empty matching `jti`, regardless of how
   the token was minted.
-- **Registry / proxy trust chain hardened in webvh-control.** The audit
+- **Registry / proxy trust chain hardened in did-hosting-control.** The audit
   found a Service-role JWT could register an attacker URL as a backend
   instance, and the proxy would then forward an Admin caller's
   Authorization header to it on the next proxy hit:
   - `RegistryConfig` gains an optional `url_allowlist` for backend hostnames.
-  - `webvh-control`'s reqwest client is built with `Policy::none()` so
+  - `did-hosting-control`'s reqwest client is built with `Policy::none()` so
     a malicious backend cannot redirect the proxy onto a third-party host.
   - The proxy strips RFC 7230 §6.1 hop-by-hop headers and `Set-Cookie`
     from upstream responses before forwarding.
@@ -236,7 +364,7 @@
 - **Witness `sign_proof` is now Admin-only** and emits an audit log on every
   signed proof. Previously any authenticated caller could request a witness
   proof for any version_id.
-- **Reverse proxy in webvh-control requires Admin role** rather than any
+- **Reverse proxy in did-hosting-control requires Admin role** rather than any
   authenticated user.
 - **Refresh handlers rotate everything.** The control / server / witness
   refresh endpoints now mint a fresh `session_id`, access token and refresh
@@ -260,7 +388,7 @@
   a structured `AppError::SecretStore` instead of warning-then-mystery-error.
 
 ### Added
-- **webvh-daemon**: Self-managed identity mode. The setup wizard now
+- **did-hosting-daemon**: Self-managed identity mode. The setup wizard now
   offers a fourth choice ("Self-managed — no VTA — daemon manages its
   own DID") that skips every VTA prompt and instead generates the
   daemon's Ed25519 + X25519 keys locally and self-hosts a `did:webvh`
@@ -268,17 +396,17 @@
   field (default `"vta"` for back-compat — existing configs without
   the section continue to load unchanged). Admin enrolment in
   self-managed mode uses passkey-invite only via the existing
-  `webvh-daemon invite --did <DID> --role admin` CLI; the wizard does
+  `did-hosting-daemon invite --did <DID> --role admin` CLI; the wizard does
   not seed any admin DID into the ACL. Tenant DID provisioning over
   DIDComm is unchanged — external tenant VTAs can still provision
   DIDs into a self-managed daemon. Daemon-only in v1; standalone
-  `webvh-server` / `webvh-control` / `webvh-witness` setup wizards
+  `did-hosting-server` / `did-hosting-control` / `webvh-witness` setup wizards
   reject the self-managed choice with a clear "daemon-only" error
-  pointing at `webvh-daemon`. See `docs/self-managed-mode-spec.md`.
-- **webvh-control**: Web UI for creating enrollment invites. The Access
+  pointing at `did-hosting-daemon`. See `docs/self-managed-mode-spec.md`.
+- **did-hosting-control**: Web UI for creating enrollment invites. The Access
   Control page now has an "Invite by Link" card that generates an
   enrollment URL for a given DID and role, removing the need to drop to
-  the `webvh-control invite` CLI to onboard new users. The invitee opens
+  the `did-hosting-control invite` CLI to onboard new users. The invitee opens
   the link, registers a passkey, and is added to the ACL automatically.
 
 ### Fixed
@@ -312,13 +440,13 @@
   `KeyringSecretStore::new()` call. No on-disk format changes — entries
   written by the previous build are still readable.
 - **vta-sdk integration**: adapted to upstream `ProvisionAsk` builder
-  renames — `webvh_hosting_server` → `webvh_daemon`, `webvh_service`
-  → `webvh_server` for witness-style consumers, and a new
-  `webvh_control(context, host_url, mediator_did)` builder for the
+  renames — `webvh_hosting_server` → `did_hosting_daemon`, `webvh_service`
+  → `did_hosting_server` for witness-style consumers, and a new
+  `did_hosting_control(context, host_url, mediator_did)` builder for the
   control plane (now requires `host_url` since the upstream template
   embeds it as the `WebVHHosting` service endpoint). The control-plane
   wizard now collects `did_hosting_url` before the VTA round-trip.
-- **webvh-ui**: Login page "need access?" section no longer surfaces the
+- **did-hosting-ui**: Login page "need access?" section no longer surfaces the
   CLI command — it now instructs users to request an invite link from an
   admin, matching the new web-based flow.
 - **MSRV**: raised from 1.91.0 to 1.94.0. Required by the updated
@@ -337,7 +465,7 @@
   `"eastus"` when unset.
 
 ### Tests
-- **DIDComm dispatcher coverage** in `webvh-control`. Added 22 unit tests
+- **DIDComm dispatcher coverage** in `did-hosting-control`. Added 22 unit tests
   exercising the wire-level contract: every `dispatch_did_op` arm
   (validation, success, conflict, not-found, cross-owner forbidden), the
   authenticate flow end-to-end with JWT decode-back assertions, and the
@@ -365,9 +493,9 @@
   `Array.prototype.toReversed()`, which landed in Node 20 — older
   toolchains fail deep inside `expo export` with
   `TypeError: configs.toReversed is not a function`.
-  `webvh-control/build.rs` now preflights `node --version` and fails
+  `did-hosting-control/build.rs` now preflights `node --version` and fails
   with an actionable message when Node is missing or too old.
-  `webvh-ui/package.json` also declares `engines.node >= 20`. README
+  `did-hosting-ui/package.json` also declares `engines.node >= 20`. README
   prerequisites updated from Node 18+ to Node 20+.
 
 ### Dependencies
@@ -394,44 +522,44 @@
 ## 0.5.0 (2026-04-13)
 
 ### Added
-- **webvh-server**: DIDComm-based server registration with control plane,
+- **did-hosting-server**: DIDComm-based server registration with control plane,
   replacing HTTP-based registration. Servers now authenticate and register
   via DIDComm messages over a persistent websocket connection.
-- **webvh-server**: DIDComm health ping/pong replaces HTTP health checks,
+- **did-hosting-server**: DIDComm health ping/pong replaces HTTP health checks,
   providing reliable liveness monitoring over the existing DIDComm channel.
-- **webvh-server**: `list-dids` and `remove-did` CLI commands for managing
+- **did-hosting-server**: `list-dids` and `remove-did` CLI commands for managing
   DIDs directly from the server command line.
-- **webvh-control**: Consolidated VTA provisioning protocol — the control
+- **did-hosting-control**: Consolidated VTA provisioning protocol — the control
   plane now handles the full DIDComm VTA flow (did/request, did/publish)
   for all registered servers.
-- **webvh-control**: Auto-adds its own DID to server ACL on registration,
+- **did-hosting-control**: Auto-adds its own DID to server ACL on registration,
   enabling seamless DID sync without manual ACL configuration.
-- **webvh-common**: Shared DIDComm message type constants for health,
+- **did-hosting-common**: Shared DIDComm message type constants for health,
   stats, and DID sync protocols.
 
 ### Changed
-- **webvh-server**: Management routes removed from server edge nodes.
+- **did-hosting-server**: Management routes removed from server edge nodes.
   All DID management is now done through the control plane; servers are
   read-only edge nodes that serve DID documents.
-- **webvh-server**: Single DIDComm connection per service using
+- **did-hosting-server**: Single DIDComm connection per service using
   `DIDCommService` v0.2.0, replacing per-operation connections.
-- **webvh-server**: Setup wizard simplified for read-only edge node role —
+- **did-hosting-server**: Setup wizard simplified for read-only edge node role —
   asks only for DID hosting URL instead of full server configuration.
-- **webvh-server**: DID path derived from URL instead of hardcoded
+- **did-hosting-server**: DID path derived from URL instead of hardcoded
   `.well-known`, supporting flexible DID hosting configurations.
-- **webvh-control**: DIDComm service and handlers restructured for
+- **did-hosting-control**: DIDComm service and handlers restructured for
   improved message routing and handler visibility.
-- **webvh-daemon**: DIDComm config flag now read from `[features]` section.
+- **did-hosting-daemon**: DIDComm config flag now read from `[features]` section.
   HTTP server starts before DIDComm to avoid self-resolution race condition.
 
 ### Fixed
-- **webvh-server**: Always serve HTTP for public DID resolution regardless
+- **did-hosting-server**: Always serve HTTP for public DID resolution regardless
   of `rest_api` flag — DID documents must remain publicly accessible.
-- **webvh-server**: Websocket connection established before sending
+- **did-hosting-server**: Websocket connection established before sending
   registration message, preventing message loss.
-- **webvh-control**: DID sync and stats flow now works reliably between
+- **did-hosting-control**: DID sync and stats flow now works reliably between
   control plane and registered servers.
-- **webvh-control**: DIDComm service properly visible to route handlers.
+- **did-hosting-control**: DIDComm service properly visible to route handlers.
 - Improved DIDComm error logging across all services.
 
 ### Performance
@@ -444,7 +572,7 @@
 ## 0.4.2 (2026-04-13)
 
 ### Added
-- **webvh-daemon**: Full parity with standalone webvh-server + webvh-control.
+- **did-hosting-daemon**: Full parity with standalone did-hosting-server + did-hosting-control.
   The daemon now includes all lifecycle management that was previously only
   available in standalone mode:
   - Background storage task: session cleanup, DID cleanup, stats flush to
@@ -455,47 +583,47 @@
   - DIDComm support via new `didcomm` config field — inbound listener for VTA
     integration and outbound ATM for sync push messages
   - Ordered shutdown: DIDComm → HTTP → storage flush → persist
-- **webvh-daemon**: New CLI commands from webvh-server: `bootstrap-did`,
+- **did-hosting-daemon**: New CLI commands from did-hosting-server: `bootstrap-did`,
   `recreate-did`, `recover-did`, `load-did`, `import-secrets`, `backup`,
   `restore`
-- **webvh-daemon**: DID store integrity check on startup
+- **did-hosting-daemon**: DID store integrity check on startup
 
 ### Fixed
-- **webvh-daemon**: fjall `Locked` error on startup — server, watcher, and
+- **did-hosting-daemon**: fjall `Locked` error on startup — server, watcher, and
   control all share the same store path but each opened it independently.
   Stores are now opened once and shared.
-- **webvh-daemon**: Enrollment invite URLs returned 404 — the control plane
+- **did-hosting-daemon**: Enrollment invite URLs returned 404 — the control plane
   was nested at `/control` but enrollment URLs pointed to `/enroll`. Control
   plane is now merged at root so URLs work identically in daemon and
   standalone modes.
-- **webvh-daemon**: DID resolve stats were not recorded — the server's
+- **did-hosting-daemon**: DID resolve stats were not recorded — the server's
   stats collector was `None`. Now a shared `Arc<StatsCollector>` is used by
   both server and control plane.
-- **webvh-daemon**: HTTP client had no timeouts — now uses 30s request /
+- **did-hosting-daemon**: HTTP client had no timeouts — now uses 30s request /
   10s connect timeouts matching standalone server.
-- **webvh-control**: Time-series graphs showed zero — `flush_stats_to_store`
+- **did-hosting-control**: Time-series graphs showed zero — `flush_stats_to_store`
   wrote aggregate totals but never wrote time-series bucket entries
   (`ts:{mnemonic}:{epoch}`). Now writes per-DID and server-wide (`_all`)
   5-minute buckets on each flush cycle. This fix applies to both daemon
   and standalone control plane modes.
 
 ### Changed
-- **webvh-server**: `start_didcomm_service` is now `pub` for daemon reuse.
-- **webvh-control**: `flush_stats_to_store`, `run_health_checks`, and
+- **did-hosting-server**: `start_didcomm_service` is now `pub` for daemon reuse.
+- **did-hosting-control**: `flush_stats_to_store`, `run_health_checks`, and
   `seed_registry` are now `pub` for daemon reuse.
 
 ## 0.4.1 (2026-04-13)
 
 ### Added
-- **webvh-daemon**: Restore unified CLI management commands (`add-acl`,
+- **did-hosting-daemon**: Restore unified CLI management commands (`add-acl`,
   `list-acl`, `remove-acl`, `invite`) so operators can manage ACLs and create
   passkey enrollment invites directly from the daemon binary without needing to
-  run `webvh-control` separately.
+  run `did-hosting-control` separately.
 
 ## 0.4.0 (2026-04-13)
 
 ### Added
-- **webvh-server**: Restore `import-secrets` CLI command for importing server
+- **did-hosting-server**: Restore `import-secrets` CLI command for importing server
   secrets from a VTA secrets bundle or individual multibase-encoded keys. This
   is required for cold-start bootstrap scenarios where no VTA service is running.
 
@@ -503,15 +631,15 @@
 
 ### Changed
 - Simplified architecture: removed shared CLI module, VTA-cache layer, and
-  background task infrastructure from webvh-common
+  background task infrastructure from did-hosting-common
 - Each service binary now owns its CLI directly instead of delegating to
-  `webvh-common::server::cli`
+  `did-hosting-common::server::cli`
 - Switched from local-path `vta-sdk` to crates.io published version (0.3.x)
 
 ### Removed
-- `webvh-common::server::cli` module (CLI logic moved into each binary)
-- `webvh-common::server::vta_cache` module (VTA key refresh on startup removed)
-- `import-secrets` CLI command from webvh-server (restored in 0.4.0)
+- `did-hosting-common::server::cli` module (CLI logic moved into each binary)
+- `did-hosting-common::server::vta_cache` module (VTA key refresh on startup removed)
+- `import-secrets` CLI command from did-hosting-server (restored in 0.4.0)
 
 ## 0.2.0 (2026-04-08)
 
@@ -529,14 +657,14 @@ security, performance, scalability, and operational readiness.
   `Message.typ`; `pack_signed` and `unpack_string` replaced with new sync APIs
 - **StatsSyncPayload**: Now carries per-DID deltas instead of aggregate totals;
   includes monotonic sequence number for idempotency
-- **Stats persistence removed from webvh-server**: Stats are in-memory only;
+- **Stats persistence removed from did-hosting-server**: Stats are in-memory only;
   control plane is the single source of truth
 - **DID delete is now soft-delete**: Content preserved for 30-day recovery
   period; hard delete happens via cleanup thread
 
 ### New Features
 
-#### webvh-common (0.1.0)
+#### did-hosting-common (0.1.0)
 - `StatsCollector`: Simplified to per-DID delta tracking with `drain_for_sync()`
   and `record_deltas()` for control plane ingestion
 - `ServiceAuth` extractor for service-role-only endpoints
@@ -553,7 +681,7 @@ security, performance, scalability, and operational readiness.
 - Input bounds validation (DID length, path length)
 - Error sanitization — 4xx responses no longer leak internal DIDs/paths
 
-#### webvh-server (0.1.0)
+#### did-hosting-server (0.1.0)
 - Multi-threaded REST executor (4 Tokio workers)
 - DID resolution cache with TTL and write-through invalidation
 - Per-DID stats sync to control plane (delta-based, no double-counting)
@@ -567,7 +695,7 @@ security, performance, scalability, and operational readiness.
 - Shutdown timeout (30s) on thread joins
 - Store integrity check on startup
 
-#### webvh-control (0.1.0)
+#### did-hosting-control (0.1.0)
 - Per-DID stats storage with in-memory collector and periodic flush
 - Stats sync authentication (ACL validation on incoming payloads)
 - Stats idempotency (sequence number deduplication)
@@ -584,8 +712,8 @@ security, performance, scalability, and operational readiness.
 #### webvh-watcher (0.1.0)
 - HTTP trace logging reduced to DEBUG level
 
-#### webvh-daemon (0.1.0)
-- Aligned with webvh-server AppState changes (cache, signing key)
+#### did-hosting-daemon (0.1.0)
+- Aligned with did-hosting-server AppState changes (cache, signing key)
 
 ### Security
 - Session fixation prevention via JWT `jti` rotation on refresh

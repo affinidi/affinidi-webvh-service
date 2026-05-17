@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
-pub use affinidi_webvh_common::server::config::{
+pub use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
     VtaConfig,
 };
@@ -35,6 +35,7 @@ fn default_server() -> ServerConfig {
         host: "0.0.0.0".to_string(),
         port: 8531,
         trusted_proxies: Vec::new(),
+        trusted_proxy_cidrs: Vec::new(),
     }
 }
 
@@ -65,7 +66,7 @@ impl AppConfig {
         config.config_path = path.clone();
 
         // Apply shared env overrides for common config fields
-        affinidi_webvh_common::server::config::apply_env_overrides(
+        did_hosting_common::server::config::apply_env_overrides(
             "WITNESS",
             &mut config.features,
             &mut config.server,

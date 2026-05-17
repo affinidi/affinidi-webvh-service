@@ -1,0 +1,103 @@
+[package]
+name = "did-hosting-daemon"
+description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
+version = "0.7.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["keyring", "store-fjall", "ui", "passkey"]
+ui = ["did-hosting-control/ui"]
+passkey = ["did-hosting-control/passkey", "did-hosting-common/passkey"]
+keyring = [
+  "did-hosting-server/keyring",
+  "webvh-witness/keyring",
+  "did-hosting-control/keyring",
+]
+aws-secrets = [
+  "did-hosting-server/aws-secrets",
+  "webvh-witness/aws-secrets",
+  "did-hosting-control/aws-secrets",
+]
+gcp-secrets = [
+  "did-hosting-server/gcp-secrets",
+  "webvh-witness/gcp-secrets",
+  "did-hosting-control/gcp-secrets",
+]
+azure-secrets = [
+  "did-hosting-server/azure-secrets",
+  "webvh-witness/azure-secrets",
+  "did-hosting-control/azure-secrets",
+]
+metrics = [
+  "did-hosting-server/metrics",
+  "did-hosting-control/metrics",
+]
+store-fjall = [
+  "did-hosting-common/store-fjall",
+  "did-hosting-server/store-fjall",
+  "webvh-witness/store-fjall",
+  "webvh-watcher/store-fjall",
+  "did-hosting-control/store-fjall",
+]
+store-redis = [
+  "did-hosting-server/store-redis",
+  "webvh-witness/store-redis",
+  "webvh-watcher/store-redis",
+  "did-hosting-control/store-redis",
+]
+store-dynamodb = [
+  "did-hosting-server/store-dynamodb",
+  "webvh-witness/store-dynamodb",
+  "webvh-watcher/store-dynamodb",
+  "did-hosting-control/store-dynamodb",
+]
+store-firestore = [
+  "did-hosting-server/store-firestore",
+  "webvh-witness/store-firestore",
+  "webvh-watcher/store-firestore",
+  "did-hosting-control/store-firestore",
+]
+store-cosmosdb = [
+  "did-hosting-server/store-cosmosdb",
+  "webvh-witness/store-cosmosdb",
+  "webvh-watcher/store-cosmosdb",
+  "did-hosting-control/store-cosmosdb",
+]
+
+[[bin]]
+name = "did-hosting-daemon"
+path = "src/main.rs"
+
+[dependencies]
+did-hosting-common = { version = "0.7", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
+did-hosting-server = { version = "0.7", path = "../did-hosting-server", default-features = false }
+webvh-witness = { version = "0.7", path = "../webvh-witness", default-features = false }
+webvh-watcher = { version = "0.7", path = "../webvh-watcher", default-features = false }
+did-hosting-control = { version = "0.7", path = "../did-hosting-control", default-features = false }
+affinidi-messaging-didcomm-service = { workspace = true }
+affinidi-tdk = { workspace = true }
+axum = "0.8"
+base64 = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = "1.0"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vta-sdk = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

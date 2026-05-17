@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
-use affinidi_webvh_common::server::mnemonic::validate_mnemonic;
+use did_hosting_common::server::mnemonic::validate_mnemonic;
 use tracing::debug;
 
 use crate::error::AppError;
