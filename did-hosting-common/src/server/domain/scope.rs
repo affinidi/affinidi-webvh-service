@@ -108,6 +108,147 @@ impl DomainScope {
     }
 }
 
+/// Resolve the effective `domain` for a DID-management request per
+/// spec §3 "Default-domain selection". T34 makes this the single
+/// authoritative resolver so REST and DIDComm handlers can't drift
+/// on the precedence rules.
+///
+/// Precedence:
+/// 1. `request_domain` (explicit on the wire) — if set, use it.
+/// 2. `caller_scope.default_domain()` — caller's ACL
+///    `AllowedWithDefault.default`.
+/// 3. `system_default` — the daemon's default domain.
+/// 4. Reject: caller is `Allowed([…])` with no default and the
+///    request omits `domain`.
+///
+/// The `Allow`-without-default rejection is deliberate: callers
+/// pinned to a specific domain set without a default must make the
+/// target explicit on every request to avoid the server having to
+/// guess.
+///
+/// Returns the resolved domain name (already canonical if the
+/// caller normalised before calling) or a domain-resolution error
+/// the handler can surface as 400.
+pub fn resolve_request_domain(
+    request_domain: Option<&str>,
+    caller_scope: &DomainScope,
+    system_default: Option<&str>,
+) -> Result<String, DomainResolveError> {
+    // Tier 1: explicit on the wire.
+    if let Some(d) = request_domain {
+        if !d.is_empty() {
+            return Ok(d.to_string());
+        }
+    }
+    // Tier 2: caller's ACL default.
+    if let Some(d) = caller_scope.default_domain() {
+        return Ok(d.to_string());
+    }
+    // Tier 3: system default. Falls through for `All`-scope callers
+    // who haven't specified an explicit domain.
+    if matches!(caller_scope, DomainScope::All)
+        && let Some(d) = system_default
+    {
+        return Ok(d.to_string());
+    }
+    // Tier 4: `Allowed([…])` callers with no default must declare
+    // a domain. System default isn't applicable because the caller
+    // may not be authorised on it.
+    Err(DomainResolveError::NoDefault)
+}
+
+/// Failure modes for [`resolve_request_domain`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum DomainResolveError {
+    /// Caller is `Allowed([…])` (no default) and the request omitted
+    /// `domain`. The caller must declare a target explicitly.
+    NoDefault,
+}
+
+impl std::fmt::Display for DomainResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDefault => write!(
+                f,
+                "request omits `domain` and the caller's ACL scope has no default; \
+                 explicit `domain` is required for this caller"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn allowed(names: &[&str]) -> DomainScope {
+        DomainScope::Allowed {
+            domains: names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn with_default(names: &[&str], default: &str) -> DomainScope {
+        DomainScope::AllowedWithDefault {
+            domains: names.iter().map(|s| s.to_string()).collect(),
+            default: default.to_string(),
+        }
+    }
+
+    #[test]
+    fn explicit_request_domain_wins() {
+        let r = resolve_request_domain(
+            Some("explicit.example"),
+            &with_default(&["a.example", "b.example"], "a.example"),
+            Some("system.example"),
+        );
+        assert_eq!(r.unwrap(), "explicit.example");
+    }
+
+    #[test]
+    fn empty_request_domain_falls_through_to_default() {
+        let r = resolve_request_domain(
+            Some(""),
+            &with_default(&["a.example"], "a.example"),
+            Some("system.example"),
+        );
+        assert_eq!(r.unwrap(), "a.example");
+    }
+
+    #[test]
+    fn acl_default_used_when_request_omits() {
+        let r = resolve_request_domain(
+            None,
+            &with_default(&["a.example", "b.example"], "b.example"),
+            Some("system.example"),
+        );
+        assert_eq!(r.unwrap(), "b.example");
+    }
+
+    #[test]
+    fn all_scope_falls_back_to_system_default() {
+        let r = resolve_request_domain(None, &DomainScope::All, Some("system.example"));
+        assert_eq!(r.unwrap(), "system.example");
+    }
+
+    #[test]
+    fn allowed_without_default_rejects_implicit() {
+        let err = resolve_request_domain(
+            None,
+            &allowed(&["a.example", "b.example"]),
+            Some("system.example"),
+        )
+        .expect_err("must require explicit domain");
+        assert_eq!(err, DomainResolveError::NoDefault);
+    }
+
+    #[test]
+    fn all_scope_with_no_system_default_rejects() {
+        let err = resolve_request_domain(None, &DomainScope::All, None)
+            .expect_err("no source of truth — must reject");
+        assert_eq!(err, DomainResolveError::NoDefault);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

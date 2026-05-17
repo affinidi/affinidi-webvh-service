@@ -97,6 +97,36 @@ pub async fn register_did(
     }
     let did_log = std::str::from_utf8(&payload)
         .map_err(|e| AppError::Validation(format!("webvh `did_data` is not valid UTF-8: {e}")))?;
+
+    // T34: domain resolution — explicit request → ACL default →
+    // system default → reject. The resolved domain is recorded for
+    // audit clarity; the host-equality safety check against the
+    // embedded `did_id` runs inside `register_did_atomic` via
+    // `check_did_host_safety` (T20b), so a mismatch between the
+    // resolved `domain` and the DID's host is caught downstream.
+    let acl_scope =
+        match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
+            Some(e) => e.domains,
+            None => did_hosting_common::server::domain::DomainScope::All,
+        };
+    let system_default = did_hosting_common::server::domain::get_default_domain(&state.store)
+        .await
+        .ok()
+        .flatten();
+    let resolved_domain = did_hosting_common::server::domain::resolve_request_domain(
+        req.domain.as_deref(),
+        &acl_scope,
+        system_default.as_deref(),
+    )
+    .map_err(|e| AppError::Validation(e.to_string()))?;
+    info!(
+        did = %auth.did,
+        path = %req.path,
+        resolved_domain = %resolved_domain,
+        explicit = req.domain.is_some(),
+        "domain resolved for atomic register"
+    );
+
     let result = did_ops::register_did_atomic(&auth, &state, &req.path, did_log, req.force).await?;
 
     // Push the (potentially replaced) log to downstream servers so their

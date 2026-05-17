@@ -38,7 +38,7 @@ pub use safety::{
     assert_host_is_active_domain, assert_request_host_matches_did, assert_resolution_allowed,
     extract_did_host,
 };
-pub use scope::DomainScope;
+pub use scope::{DomainResolveError, DomainScope, resolve_request_domain};
 pub use seed::{SeedOutcome, SeedTier, seed_domains_first_boot};
 pub use store::{
     create_domain, delete_domain_record, disable_domain, enable_domain, get_default_domain,
