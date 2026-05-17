@@ -51,3 +51,10 @@ tracing = { workspace = true }
 
 # Message IDs for the DIDComm authenticate / refresh envelopes.
 uuid = { workspace = true }
+
+[dev-dependencies]
+# In-process HTTP fixture for integration tests. Spins up an
+# ephemeral server we can match request shapes against — no real
+# daemon required for T50.
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -509,6 +509,7 @@ pub struct ChallengeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ChallengeWire {
     session_id: String,
     data: ChallengeData,
