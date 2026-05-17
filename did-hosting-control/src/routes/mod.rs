@@ -167,8 +167,28 @@ pub fn router_without_fallback() -> Router<AppState> {
         // Domains (multi-domain)
         .route_with_task_permissive(
             "/domains",
-            get(domain::list_domains),
+            get(domain::list_domains).post(domain::create_domain_route),
             (*TASK_DOMAIN_LIST_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/domains/{name}",
+            put(domain::update_domain_route),
+            (*TASK_DOMAIN_UPDATE_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/domains/{name}/disable",
+            post(domain::disable_domain_route),
+            (*TASK_DOMAIN_DISABLE_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/domains/{name}/enable",
+            post(domain::enable_domain_route),
+            (*TASK_DOMAIN_DISABLE_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/domains/{name}/set-default",
+            post(domain::set_default_domain_route),
+            (*TASK_DOMAIN_SET_DEFAULT_1_0).clone(),
         )
         .route_with_task_permissive(
             "/me/domains",
