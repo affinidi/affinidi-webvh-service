@@ -27,6 +27,96 @@
   --input <FILE> [--output <FILE>] [--force]`.** Operators can script
   against the invocation now; the rewriter implementation lands in a
   follow-up release (see `tasks/did-hosting-rollout-plan.md` WS-7).
+- **Multi-domain hosting.** Domains are now first-class objects.
+  The daemon stores `DomainEntry { name, label, scheme, status,
+  default_domain, branding, witnesses, watchers, quota,
+  well_known_enabled }` records in a new `domains` keyspace and
+  enforces per-domain isolation on every resolve:
+  - **Resolve-side safety** — every `GET /{mnemonic}/did.jsonl`
+    (and the did:web / witness siblings) checks the request's
+    `Host` against the embedded `did_id`'s host. Mismatch → 404
+    (hides off-domain DIDs from cross-domain probes); disabled
+    domain → 503 with structured maintenance body
+    `{ "status": "disabled", "domain": "<name>", "message": ... }`.
+  - **ACL domain scope** — `AclEntry` gains a `domains` field
+    (`All` / `Allowed([…])` / `AllowedWithDefault { domains,
+    default }`). New `Owner` entries default to
+    `AllowedWithDefault`. Existing v0.6 entries deserialise as
+    `All` for backwards-compat (run the ACL-lockdown admin tool
+    in T42 to migrate).
+  - **Request resolution rule** — `POST /api/dids/register`'s
+    new `domain` field follows: explicit → ACL default → system
+    default → reject. `Allowed([…])` callers without a default
+    must declare a domain on every call.
+  - **Domain admin surface** — `GET /api/domains` (Admin),
+    `GET /api/me/domains` (per-caller scoped), `POST /api/domains`
+    (create + optional set-as-default), `PUT /api/domains/{name}`
+    (update metadata), `POST /api/domains/{name}/disable`,
+    `POST /api/domains/{name}/enable`,
+    `POST /api/domains/{name}/set-default`. All Trust-Task-bound
+    via `TASK_DOMAIN_*` URLs.
+  - **Trusted-proxy CIDR config** — `server.trusted_proxy_cidrs`
+    controls which peers can override the `Host` header via
+    `Forwarded` / `X-Forwarded-Host`. Outside the CIDR set, the
+    daemon always uses the literal `Host`. RFC 7239 parsed.
+- **Multi-method DID hosting.** Compile-time feature gates
+  `method-webvh` + `method-web` (default) + `method-webs` /
+  `method-webplus` (compile-error stubs for future work). Per-
+  method resolution routes (`/{mnemonic}/did.jsonl` →
+  `resolve_webvh`; `/{mnemonic}/did.json` → `resolve_web`)
+  feature-gated; a method-webvh-only build doesn't compile (or
+  register) the web routes.
+  - `POST /api/dids/register` accepts the new
+    `{ path, method?, did_data, domain?, force? }` body shape.
+    `method` is optional and inferred from `did_data.id` when
+    absent; explicit mismatch → 400.
+  - `PUT /api/dids/{mnemonic}` content-type discriminator:
+    `application/jsonl` → webvh, `application/did+json` → web.
+  - Legacy `did_log: String` field accepted as a backwards-
+    compat alias for webvh-only callers; will be removed in a
+    future release.
+- **Distributed domain assignment + retain-then-purge lifecycle.**
+  The control plane is now the source of truth for which domains
+  each server hosts.
+  - `MSG_SERVER_REGISTER` carries `enabled_methods` +
+    `served_domains` + `protocol_version` so the control plane
+    can route method-aware requests.
+  - `MSG_DOMAIN_ASSIGN { domain }` / `MSG_DOMAIN_UNASSIGN { domain }`
+    + admin REST triggers at
+    `POST /api/control/registry/{instance_id}/domains/{domain}/{assign,unassign}`.
+    Idempotent on the server side.
+  - Unassignment schedules a `PendingPurge { domain, scheduled_at,
+    grace_seconds, reason, scheduled_by }` row with grace from
+    `[hosting] unassigned_purge_grace` (default `"2h"`). The
+    background sweep (60s tick) walks ripe entries and purges
+    the matching DID records.
+  - `MSG_DOMAIN_PURGE` + admin
+    `POST /api/control/registry/{instance_id}/domains/{domain}/purge`
+    bypass the grace for immediate cleanup
+    (audit-log `reason: "admin-immediate"`).
+  - Server cold-start fallback chain (T29): persisted
+    `KS_ASSIGNMENTS` → `bootstrap_domains` config →
+    legacy `public_url` host → empty (warn-log).
+- **Trust-Tasks transport.** Every DIDComm message type and
+  every authed REST route now has a canonical
+  `https://trusttasks.org/did-hosting/...` URL.
+  - DIDComm dispatcher accepts both legacy `MSG_*` and canonical
+    `TASK_*` as `typ`; `v1_aliases` table provides the bijection.
+    Existing clients keep working unchanged.
+  - REST routes register through `TrustTaskRouter::route_with_task_permissive`
+    — a client that sends the `Trust-Task:` header gets exact-
+    match validation (415 on drift), a client that doesn't passes
+    through (v0.7 → v0.8 migration window).
+- **Companion client library `did-hosting-client`.** New
+  workspace member exposing a thin REST + DIDComm client.
+  Public surface includes `Client`, `AuthedClient`,
+  `HostingSigningIdentity{,Owned}`, `HostingTokenStore` +
+  `InMemoryTokenStore`, `ServerLocks`, `ClientError`,
+  `ServiceEntry`, and all `TASK_*` URL constants. HTTPS enforced
+  at construction (loopback exempt for dev). Decision ladder
+  (cached → refresh → reauth) runs under per-server async mutex.
+  Cross-crate parity test pins URL constants byte-for-byte
+  against the daemon (T51).
 
 ### Added
 
