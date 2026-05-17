@@ -1464,14 +1464,18 @@ mod tests_atomic {
         assert!(matches!(err, AppError::Validation(_)));
     }
 
-    /// Smoke test: the wire request type round-trips with default `force`.
+    /// Smoke test: the wire request type round-trips with default `force`
+    /// and the legacy `did_log` field still parses (T26 backwards-compat).
     #[test]
     fn did_register_request_round_trip_defaults_force_false() {
         let raw = r#"{"path":"alpha","did_log":"line"}"#;
         let req: DidRegisterRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.path, "alpha");
-        assert_eq!(req.did_log, "line");
+        assert_eq!(req.did_log.as_deref(), Some("line"));
         assert!(!req.force, "force must default to false");
+        let (method, payload) = req.resolve().unwrap();
+        assert_eq!(method, "webvh");
+        assert_eq!(payload, b"line");
     }
 
     /// Pin the stats-counter behaviour: every successful

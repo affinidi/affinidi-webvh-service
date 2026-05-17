@@ -279,24 +279,26 @@ pub async fn dispatch_did_op(
         }
         MSG_DID_REGISTER => {
             // Atomic claim-and-publish — see did_ops::register_did_atomic.
-            // Body shape mirrors `DidRegisterRequest` from did-hosting-common.
-            let path = msg
-                .body
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'path' in body".into()))?;
-            let did_log = msg
-                .body
-                .get("did_log")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'did_log' in body".into()))?;
-            let force = msg
-                .body
-                .get("force")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            // Body shape mirrors `DidRegisterRequest` from did-hosting-common,
+            // including T26's `did_data` + `method` extension.
+            let req: did_hosting_common::DidRegisterRequest =
+                serde_json::from_value(msg.body.clone())
+                    .map_err(|e| AppError::Validation(format!("invalid DidRegister body: {e}")))?;
+            if req.path.is_empty() {
+                return Err(AppError::Validation("missing 'path' in body".into()));
+            }
+            let (method, payload) = req.resolve().map_err(AppError::Validation)?;
+            if method != "webvh" {
+                return Err(AppError::Validation(format!(
+                    "DIDComm register is currently webvh-only; received method = '{method}'.",
+                )));
+            }
+            let did_log = std::str::from_utf8(&payload).map_err(|e| {
+                AppError::Validation(format!("webvh did_data is not valid UTF-8: {e}"))
+            })?;
 
-            let result = did_ops::register_did_atomic(auth, state, path, did_log, force).await?;
+            let result =
+                did_ops::register_did_atomic(auth, state, &req.path, did_log, req.force).await?;
             server_push::notify_servers_did(state, result.mnemonic.clone());
 
             let server_did = state.config.server_did.as_deref().unwrap_or_default();

@@ -81,8 +81,23 @@ pub async fn register_did(
     State(state): State<AppState>,
     Json(req): Json<DidRegisterRequest>,
 ) -> Result<Json<DidRegisterResponse>, AppError> {
-    let result =
-        did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force).await?;
+    // T26: resolve multi-shape body (legacy `did_log` OR new
+    // `did_data` + `method`) into `(method, payload_bytes)`.
+    let (method, payload) = req.resolve().map_err(AppError::Validation)?;
+    if method != "webvh" {
+        // Method-aware register paths (did:web etc.) land with T26's
+        // follow-up plumbing through the `DidMethod` trait. For now,
+        // refuse explicitly so callers don't see a webvh-validation
+        // error against a did:web payload.
+        return Err(AppError::Validation(format!(
+            "registration via REST is currently webvh-only; received method = '{method}'. \
+             Use PUT /api/dids/{{mnemonic}} with the appropriate Content-Type once \
+             T26 follow-up wires per-method storage.",
+        )));
+    }
+    let did_log = std::str::from_utf8(&payload)
+        .map_err(|e| AppError::Validation(format!("webvh `did_data` is not valid UTF-8: {e}")))?;
+    let result = did_ops::register_did_atomic(&auth, &state, &req.path, did_log, req.force).await?;
 
     // Push the (potentially replaced) log to downstream servers so their
     // resolvers see the new content right away. Same as `upload_did`.
@@ -150,13 +165,49 @@ pub async fn get_did_log(
 
 // ---------- PUT /api/dids/{mnemonic} ----------
 
+/// `PUT /api/dids/{mnemonic}` — publish a new version of a hosted DID.
+///
+/// T26 content-type discriminator:
+/// - `application/jsonl` (or absent / `application/jsonl+json`) →
+///   webvh (the historical default; body is the did.jsonl text).
+/// - `application/did+json` → did:web (single document upload). Not
+///   yet wired through `publish_did`; returns 501 with a clear
+///   message until the per-method publish path lands.
+/// - Any other content-type → 415 with the same enumeration.
 pub async fn upload_did(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, AppError> {
     let mnemonic = clean_mnemonic(&mnemonic);
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
+
+    let method = match content_type.as_deref() {
+        // Default + explicit webvh content types.
+        None | Some("application/jsonl") | Some("application/jsonl+json") | Some("text/plain") => {
+            "webvh"
+        }
+        Some("application/did+json") | Some("application/json") => "web",
+        Some(other) => {
+            return Err(AppError::Validation(format!(
+                "unsupported Content-Type '{other}' on PUT /api/dids/{{mnemonic}}; \
+                 use 'application/jsonl' (webvh) or 'application/did+json' (web)",
+            )));
+        }
+    };
+
+    if method != "webvh" {
+        return Err(AppError::Validation(format!(
+            "method '{method}' publish via PUT not yet wired; T26 follow-up will \
+             route per-method through `DidMethod::apply_update`",
+        )));
+    }
+
     did_ops::publish_did(&auth, &state, mnemonic, &body).await?;
     server_push::notify_servers_did(&state, mnemonic.to_string());
     Ok(StatusCode::NO_CONTENT)

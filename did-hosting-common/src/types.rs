@@ -85,23 +85,308 @@ pub struct RequestUriResponse {
 }
 
 /// Atomic claim-and-publish request — see `MSG_DID_REGISTER` for the
-/// motivation. Both `path` and `did_log` are required; `force` is only
-/// honoured when the caller is an admin taking over a slot owned by a
-/// different DID (no force needed when the caller is already the owner;
-/// the operation is idempotent in that case).
+/// motivation. `path` is required; the DID payload is supplied via
+/// `did_data` (preferred) or `did_log` (legacy, webvh-only alias).
+/// `force` is only honoured when the caller is an admin taking over a
+/// slot owned by a different DID (no force needed when the caller is
+/// already the owner; the operation is idempotent in that case).
 ///
-/// Server-side validation rejects `did_log` whose embedded DID identifier
-/// does not name this host or does not name `path`, so an admin can't
-/// upload arbitrary `did.jsonl` content under a path they happen to own.
-#[derive(Debug, Serialize, Deserialize)]
+/// Server-side validation rejects payloads whose embedded DID
+/// identifier does not name this host or does not name `path`, so an
+/// admin can't upload arbitrary content under a path they happen to
+/// own.
+///
+/// ## Multi-method wire shape (T26)
+///
+/// - `method`: one of `"webvh"`, `"web"`. Optional; if omitted, the
+///   server attempts to derive it from `did_data.id` and falls back to
+///   `"webvh"` for backwards-compat (matching the pre-T26 wire shape
+///   that only supports webvh).
+/// - `did_data`: the method-specific payload. For `webvh` this is the
+///   `did.jsonl` log (either a JSON string carrying the raw text, or a
+///   JSON array of log entries that will be serialised to jsonl). For
+///   `web` this is a `did.json` document (object).
+/// - `domain`: the hosting domain this DID should be registered under.
+///   Optional; defaults to the caller's ACL default-domain per spec
+///   §3.
+/// - `did_log`: deprecated legacy field. When set without `did_data`,
+///   treated as `method = "webvh"` and the string is the jsonl
+///   payload. Setting both `did_data` and `did_log` is a 400 (the
+///   server can't tell which the caller meant).
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DidRegisterRequest {
     pub path: String,
-    pub did_log: String,
+
+    /// Preferred T26 shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did_data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+
+    /// Legacy pre-T26 field — webvh-only. Use `did_data` + `method`
+    /// for new clients; this field is accepted unchanged for v0.7
+    /// backwards-compat and will be removed in a future release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did_log: Option<String>,
+
     /// Required when admin is replacing a slot they don't own; ignored
     /// when caller is already the owner or the slot is free. Defaults
     /// to false.
     #[serde(default)]
     pub force: bool,
+}
+
+impl DidRegisterRequest {
+    /// Normalise the multi-shape wire form into `(method, payload_bytes)`
+    /// pairs the server-side handlers can act on directly.
+    ///
+    /// Returns:
+    /// - `Err` with `Validation` when the request is ambiguous (both
+    ///   `did_data` and `did_log` set), missing payload entirely, or
+    ///   the declared `method` mismatches the method derived from
+    ///   `did_data.id`.
+    /// - `Ok((method, payload))` where `method` is one of the known
+    ///   strings (`"webvh"`, `"web"`) and `payload` is the bytes the
+    ///   storage layer will persist (the jsonl text for webvh, the
+    ///   did.json bytes for web).
+    pub fn resolve(&self) -> Result<(String, Vec<u8>), String> {
+        if self.did_data.is_some() && self.did_log.is_some() {
+            return Err("request carries both `did_data` and `did_log`; supply exactly one".into());
+        }
+
+        if let Some(did_log) = &self.did_log {
+            // Legacy: did_log implies webvh. If `method` is explicit
+            // and contradicts, reject.
+            let method = self.method.as_deref().unwrap_or("webvh");
+            if method != "webvh" {
+                return Err(format!(
+                    "`did_log` legacy field is webvh-only; received method = '{method}'. \
+                     Use `did_data` for non-webvh methods.",
+                ));
+            }
+            return Ok(("webvh".to_string(), did_log.clone().into_bytes()));
+        }
+
+        let did_data = self
+            .did_data
+            .as_ref()
+            .ok_or_else(|| "request requires either `did_data` or `did_log`".to_string())?;
+
+        // Derive the method from `did_data.id` when present, then
+        // cross-check with the explicit `method` if both supplied.
+        let derived_method = derive_method_from_did_data(did_data);
+        let method = match (&self.method, &derived_method) {
+            (Some(m), Some(d)) if m != d => {
+                return Err(format!(
+                    "method mismatch: request declares `method = \"{m}\"` but \
+                     `did_data.id` resolves to method `\"{d}\"`. \
+                     Either remove `method` (it will be derived) or fix `did_data.id`.",
+                ));
+            }
+            (Some(m), _) => m.clone(),
+            (None, Some(d)) => d.clone(),
+            (None, None) => {
+                return Err(
+                    "request requires `method` (or a `did_data.id` from which it can \
+                     be derived)"
+                        .into(),
+                );
+            }
+        };
+
+        let bytes = match method.as_str() {
+            "webvh" => {
+                // webvh payload is jsonl text. Accept either a JSON
+                // string (preferred) or an array of objects (one per
+                // log entry — serialise to jsonl).
+                if let Some(s) = did_data.as_str() {
+                    s.as_bytes().to_vec()
+                } else if let Some(arr) = did_data.as_array() {
+                    let mut buf = String::new();
+                    for (i, entry) in arr.iter().enumerate() {
+                        if i > 0 {
+                            buf.push('\n');
+                        }
+                        buf.push_str(
+                            &serde_json::to_string(entry).map_err(|e| format!("entry {i}: {e}"))?,
+                        );
+                    }
+                    buf.into_bytes()
+                } else {
+                    return Err(
+                        "webvh `did_data` must be a jsonl string or an array of log entries".into(),
+                    );
+                }
+            }
+            "web" => {
+                if did_data.is_object() {
+                    serde_json::to_vec(did_data).map_err(|e| e.to_string())?
+                } else {
+                    return Err("web `did_data` must be a did.json object".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown or unsupported method `{other}`; compiled-in methods: webvh, web",
+                ));
+            }
+        };
+
+        Ok((method, bytes))
+    }
+}
+
+/// Best-effort extraction of `"<method>"` from `did_data.id`, e.g.
+/// `did_data.id = "did:web:example.com:alice"` → `Some("web")`.
+/// Returns `None` when `id` is missing or malformed.
+fn derive_method_from_did_data(did_data: &serde_json::Value) -> Option<String> {
+    let id = did_data.get("id")?.as_str()?;
+    // Fast extraction: split on ':'; expect "did:<method>:<rest>".
+    let mut parts = id.splitn(3, ':');
+    let prefix = parts.next()?;
+    let method = parts.next()?;
+    let _rest = parts.next()?;
+    if prefix != "did" || method.is_empty() {
+        return None;
+    }
+    Some(method.to_string())
+}
+
+#[cfg(test)]
+mod did_register_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn req() -> DidRegisterRequest {
+        DidRegisterRequest {
+            path: "alpha".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_did_log_resolves_as_webvh() {
+        let r = DidRegisterRequest {
+            did_log: Some("line1\nline2".into()),
+            ..req()
+        };
+        let (method, payload) = r.resolve().unwrap();
+        assert_eq!(method, "webvh");
+        assert_eq!(payload, b"line1\nline2");
+    }
+
+    #[test]
+    fn legacy_did_log_with_explicit_webvh_method_ok() {
+        let r = DidRegisterRequest {
+            method: Some("webvh".into()),
+            did_log: Some("line".into()),
+            ..req()
+        };
+        let (method, _) = r.resolve().unwrap();
+        assert_eq!(method, "webvh");
+    }
+
+    #[test]
+    fn legacy_did_log_with_non_webvh_method_rejected() {
+        let r = DidRegisterRequest {
+            method: Some("web".into()),
+            did_log: Some("line".into()),
+            ..req()
+        };
+        let err = r.resolve().expect_err("conflict must reject");
+        assert!(err.contains("webvh-only"), "got: {err}");
+    }
+
+    #[test]
+    fn both_did_data_and_did_log_rejected() {
+        let r = DidRegisterRequest {
+            did_data: Some(json!("line")),
+            did_log: Some("line".into()),
+            ..req()
+        };
+        let err = r.resolve().expect_err("ambiguous must reject");
+        assert!(err.contains("both"), "got: {err}");
+    }
+
+    #[test]
+    fn neither_did_data_nor_did_log_rejected() {
+        let err = req().resolve().expect_err("missing payload must reject");
+        assert!(err.contains("either"), "got: {err}");
+    }
+
+    #[test]
+    fn did_data_webvh_string_passes_through() {
+        let r = DidRegisterRequest {
+            method: Some("webvh".into()),
+            did_data: Some(json!("the\njsonl\nbytes")),
+            ..req()
+        };
+        let (method, payload) = r.resolve().unwrap();
+        assert_eq!(method, "webvh");
+        assert_eq!(payload, b"the\njsonl\nbytes");
+    }
+
+    #[test]
+    fn did_data_webvh_array_serialises_to_jsonl() {
+        let r = DidRegisterRequest {
+            method: Some("webvh".into()),
+            did_data: Some(json!([{"v": 1}, {"v": 2}])),
+            ..req()
+        };
+        let (_, payload) = r.resolve().unwrap();
+        let text = String::from_utf8(payload).unwrap();
+        assert_eq!(text, "{\"v\":1}\n{\"v\":2}");
+    }
+
+    #[test]
+    fn did_data_web_object_serialises() {
+        let r = DidRegisterRequest {
+            method: Some("web".into()),
+            did_data: Some(json!({ "id": "did:web:example.com:alice" })),
+            ..req()
+        };
+        let (method, payload) = r.resolve().unwrap();
+        assert_eq!(method, "web");
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            parsed.get("id").and_then(|v| v.as_str()).unwrap(),
+            "did:web:example.com:alice"
+        );
+    }
+
+    #[test]
+    fn method_mismatch_explicit_vs_did_data_id_rejected() {
+        let r = DidRegisterRequest {
+            method: Some("webvh".into()),
+            did_data: Some(json!({ "id": "did:web:example.com:alice" })),
+            ..req()
+        };
+        let err = r.resolve().expect_err("method mismatch must reject");
+        assert!(err.contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn method_derived_from_did_data_id_when_not_explicit() {
+        let r = DidRegisterRequest {
+            did_data: Some(json!({ "id": "did:web:example.com:bob" })),
+            ..req()
+        };
+        let (method, _) = r.resolve().unwrap();
+        assert_eq!(method, "web");
+    }
+
+    #[test]
+    fn unknown_method_rejected() {
+        let r = DidRegisterRequest {
+            method: Some("webxyz".into()),
+            did_data: Some(json!("some-bytes")),
+            ..req()
+        };
+        let err = r.resolve().expect_err("unknown method must reject");
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
 }
 
 /// Atomic register response. `mnemonic` equals `path` (custom paths are
