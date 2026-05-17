@@ -24,6 +24,7 @@
 
 pub mod detect;
 pub mod normalize;
+pub mod safety;
 pub mod scope;
 pub mod seed;
 pub mod store;
@@ -31,6 +32,9 @@ pub mod types;
 
 pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve_request_host};
 pub use normalize::normalize_domain_name;
+pub use safety::{
+    assert_acl_allows_host, assert_did_host_allowed, assert_host_is_active_domain, extract_did_host,
+};
 pub use scope::DomainScope;
 pub use seed::{SeedOutcome, SeedTier, seed_domains_first_boot};
 pub use store::{
