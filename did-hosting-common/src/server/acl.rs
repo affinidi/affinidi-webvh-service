@@ -228,6 +228,33 @@ pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, App
         .collect()
 }
 
+/// Count `Owner` ACL entries whose `domains` field is
+/// [`DomainScope::All`] (T52).
+///
+/// Surfaces the post-migration "how many owners still have
+/// unrestricted scope?" signal that the spec wants on a future
+/// admin dashboard. Pre-T22 deployments deserialise all existing
+/// `Owner` entries with `DomainScope::All` (backwards-compat
+/// default); the ACL-lockdown follow-up tool (planned for T42)
+/// will iterate the same set to migrate them to
+/// `AllowedWithDefault`.
+///
+/// Excludes `Admin` and `Service` roles — those are implicitly
+/// `All` regardless of the field and don't need migration.
+///
+/// O(n) over the ACL keyspace. Use sparingly on large ACLs;
+/// dashboards can cache the result.
+pub async fn count_all_scoped_owners(acl: &KeyspaceHandle) -> Result<u64, AppError> {
+    let entries = list_acl_entries(acl).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| {
+            matches!(e.role, Role::Owner)
+                && matches!(e.domains, crate::server::domain::DomainScope::All)
+        })
+        .count() as u64)
+}
+
 /// Check whether a DID is in the ACL and return its role.
 ///
 /// Returns `Forbidden` if the DID is not found.
@@ -471,5 +498,78 @@ mod tests {
                 ch
             );
         }
+    }
+
+    // ---- T52: count_all_scoped_owners --------------------------------------
+
+    use crate::server::config::StoreConfig;
+    use crate::server::domain::DomainScope;
+    use crate::server::store::{KS_ACL, Store};
+
+    async fn fjall_store() -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        std::mem::forget(dir);
+        Store::open(&cfg).await.expect("open fjall")
+    }
+
+    fn entry(did: &str, role: Role, domains: DomainScope) -> AclEntry {
+        AclEntry {
+            did: did.into(),
+            role,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains,
+        }
+    }
+
+    #[tokio::test]
+    async fn count_all_scoped_owners_counts_only_owner_all() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+
+        // Mix of roles + scopes — only Owner+All counts.
+        store_acl_entry(&ks, &entry("did:e:o1", Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(&ks, &entry("did:e:o2", Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(
+            &ks,
+            &entry(
+                "did:e:o3",
+                Role::Owner,
+                DomainScope::Allowed {
+                    domains: vec!["a.example".into()],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        store_acl_entry(&ks, &entry("did:e:a1", Role::Admin, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(&ks, &entry("did:e:s1", Role::Service, DomainScope::All))
+            .await
+            .unwrap();
+
+        let count = count_all_scoped_owners(&ks).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "must count only Owner+DomainScope::All; Admin / Service / scoped owners excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_all_scoped_owners_empty_acl_returns_zero() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        assert_eq!(count_all_scoped_owners(&ks).await.unwrap(), 0);
     }
 }
