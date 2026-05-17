@@ -39,6 +39,10 @@
 //! as small additions.
 
 pub mod parse;
+#[cfg(feature = "method-webplus")]
+pub mod webplus;
+#[cfg(feature = "method-webs")]
+pub mod webs;
 #[cfg(feature = "method-webvh")]
 pub mod webvh;
 
