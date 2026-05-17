@@ -3,9 +3,9 @@ use crate::error::AppError;
 use crate::store::{RawKvPair, Store};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, KS_STATS};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, KS_STATS};
 
 const BACKUP_VERSION: u32 = 1;
 
@@ -139,7 +139,11 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     // Write config.toml from the backup
     let config_file_path = config_path
         .clone()
-        .or_else(|| std::env::var("DID_HOSTING_CONFIG_PATH").ok().map(PathBuf::from))
+        .or_else(|| {
+            std::env::var("DID_HOSTING_CONFIG_PATH")
+                .ok()
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     let config_toml = toml::to_string_pretty(&backup_config)

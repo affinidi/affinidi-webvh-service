@@ -255,8 +255,8 @@ pub async fn dispatch_did_op(
     // canonical inbound types back to legacy before the match.
     // Unrecognised types fall through to the default arm (which emits
     // a protocol error code).
-    let typ = did_hosting_common::v1_aliases::to_legacy(msg.typ.as_str())
-        .unwrap_or(msg.typ.as_str());
+    let typ =
+        did_hosting_common::v1_aliases::to_legacy(msg.typ.as_str()).unwrap_or(msg.typ.as_str());
     match typ {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
@@ -840,7 +840,9 @@ fn map_app_error_code(err: &AppError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
+    use did_hosting_common::server::store::{
+        KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+    };
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
@@ -949,7 +951,7 @@ mod tests {
             content_size: 42,
             disabled: false,
             deleted_at: None,
-        
+
             // T12: legacy construction site; T13 migration fills `domain`.
             method: "webvh".to_string(),
             domain: String::new(),
@@ -1300,8 +1302,9 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            
-                domains: did_hosting_common::server::domain::DomainScope::All,},
+
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
         )
         .await
         .unwrap();
@@ -1335,8 +1338,9 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            
-                domains: did_hosting_common::server::domain::DomainScope::All,},
+
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
         )
         .await
         .unwrap();
@@ -1618,8 +1622,9 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            
-                domains: did_hosting_common::server::domain::DomainScope::All,},
+
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
         )
         .await
         .unwrap();
@@ -1664,8 +1669,9 @@ mod tests {
                 created_at: 0,
                 max_total_size: None,
                 max_did_count: None,
-            
-                domains: did_hosting_common::server::domain::DomainScope::All,},
+
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
         )
         .await
         .unwrap();
@@ -1732,9 +1738,7 @@ mod tests {
         // Old log content has been wiped; new record has version_count 0.
         let log = state
             .dids_ks
-            .get_raw(did_hosting_common::did_ops::content_log_key(
-                "shared-path",
-            ))
+            .get_raw(did_hosting_common::did_ops::content_log_key("shared-path"))
             .await
             .unwrap();
         assert!(log.is_none(), "old log content should be wiped");

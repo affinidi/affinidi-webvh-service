@@ -212,10 +212,7 @@ mod tests {
         assert_eq!(outcome.default.as_deref(), Some("primary.example"));
         // Default flag set on primary, cleared on secondary.
         let listed = list_domains(&store).await.unwrap();
-        let primary = listed
-            .iter()
-            .find(|d| d.name == "primary.example")
-            .unwrap();
+        let primary = listed.iter().find(|d| d.name == "primary.example").unwrap();
         let secondary = listed
             .iter()
             .find(|d| d.name == "secondary.example")
@@ -227,13 +224,9 @@ mod tests {
     #[tokio::test]
     async fn tier_1_single_entry() {
         let store = fjall_store().await;
-        let outcome = seed_domains_first_boot(
-            &store,
-            &["only.example".to_string()],
-            None,
-        )
-        .await
-        .unwrap();
+        let outcome = seed_domains_first_boot(&store, &["only.example".to_string()], None)
+            .await
+            .unwrap();
         assert_eq!(outcome.tier, SeedTier::FromBootstrapDomains);
         assert_eq!(outcome.final_count, 1);
         assert_eq!(outcome.default.as_deref(), Some("only.example"));
@@ -242,13 +235,10 @@ mod tests {
     #[tokio::test]
     async fn tier_2_seeds_from_legacy_public_url() {
         let store = fjall_store().await;
-        let outcome = seed_domains_first_boot(
-            &store,
-            &[],
-            Some("https://old.example.com/some/path"),
-        )
-        .await
-        .unwrap();
+        let outcome =
+            seed_domains_first_boot(&store, &[], Some("https://old.example.com/some/path"))
+                .await
+                .unwrap();
         assert_eq!(outcome.tier, SeedTier::FromLegacyPublicUrl);
         assert_eq!(outcome.final_count, 1);
         assert_eq!(outcome.default.as_deref(), Some("old.example.com"));
@@ -257,13 +247,9 @@ mod tests {
     #[tokio::test]
     async fn tier_2_lowercases_host() {
         let store = fjall_store().await;
-        let outcome = seed_domains_first_boot(
-            &store,
-            &[],
-            Some("https://OLD.example.com"),
-        )
-        .await
-        .unwrap();
+        let outcome = seed_domains_first_boot(&store, &[], Some("https://OLD.example.com"))
+            .await
+            .unwrap();
         assert_eq!(outcome.tier, SeedTier::FromLegacyPublicUrl);
         assert_eq!(outcome.default.as_deref(), Some("old.example.com"));
     }
@@ -334,8 +320,9 @@ mod tests {
     #[tokio::test]
     async fn unparseable_legacy_url_falls_through_to_no_seed() {
         let store = fjall_store().await;
-        let outcome =
-            seed_domains_first_boot(&store, &[], Some("not-a-url")).await.unwrap();
+        let outcome = seed_domains_first_boot(&store, &[], Some("not-a-url"))
+            .await
+            .unwrap();
         assert_eq!(outcome.tier, SeedTier::NoSeed);
     }
 

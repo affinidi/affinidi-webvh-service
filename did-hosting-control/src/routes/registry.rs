@@ -1,9 +1,9 @@
 //! Service registry API routes.
 
-use did_hosting_common::{DidSyncEntry, DidSyncUpdate, RegisterServiceResponse};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use did_hosting_common::{DidSyncEntry, DidSyncUpdate, RegisterServiceResponse};
 use serde::Deserialize;
 use tracing::{info, warn};
 

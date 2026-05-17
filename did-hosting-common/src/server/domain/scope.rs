@@ -69,10 +69,7 @@ impl DomainScope {
     /// Construct an `AllowedWithDefault` after validating that
     /// `default` appears in `domains` (and that `domains` is non-empty).
     /// Returns `Err` with a human-readable reason on misuse.
-    pub fn new_allowed_with_default(
-        domains: Vec<String>,
-        default: String,
-    ) -> Result<Self, String> {
+    pub fn new_allowed_with_default(domains: Vec<String>, default: String) -> Result<Self, String> {
         if domains.is_empty() {
             return Err("AllowedWithDefault requires a non-empty domain list".into());
         }
@@ -145,11 +142,9 @@ mod tests {
         .expect("default in list");
         assert_eq!(ok.default_domain(), Some("a.example"));
 
-        let err = DomainScope::new_allowed_with_default(
-            vec!["a.example".into()],
-            "b.example".into(),
-        )
-        .expect_err("default not in list must reject");
+        let err =
+            DomainScope::new_allowed_with_default(vec!["a.example".into()], "b.example".into())
+                .expect_err("default not in list must reject");
         assert!(err.contains("not a member"));
     }
 
@@ -170,11 +165,7 @@ mod tests {
             .default_domain(),
             None
         );
-        let scoped = DomainScope::new_allowed_with_default(
-            vec!["x".into()],
-            "x".into(),
-        )
-        .unwrap();
+        let scoped = DomainScope::new_allowed_with_default(vec!["x".into()], "x".into()).unwrap();
         assert_eq!(scoped.default_domain(), Some("x"));
     }
 

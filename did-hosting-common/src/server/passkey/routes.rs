@@ -113,8 +113,9 @@ pub async fn enroll_start<S: PasskeyState>(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: crate::server::domain::DomainScope::All,};
+
+            domains: crate::server::domain::DomainScope::All,
+        };
         acl::store_acl_entry(acl_ks, &entry).await?;
         info!(did = %enrollment.did, role = %role, "ACL entry created from enrollment");
     }

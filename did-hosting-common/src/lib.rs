@@ -1,15 +1,15 @@
 mod client;
 mod control_client;
 pub mod did;
-pub mod did_ops;
-pub mod didcomm_types;
 #[cfg(feature = "server-core")]
 pub mod did_hosting_tasks;
+pub mod did_ops;
+pub mod didcomm_types;
+mod error;
 pub mod method;
+mod types;
 #[cfg(feature = "server-core")]
 pub mod v1_aliases;
-mod error;
-mod types;
 mod watcher_client;
 mod witness_client;
 

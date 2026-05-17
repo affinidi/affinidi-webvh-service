@@ -4,13 +4,13 @@
 //! operate on the control plane's `dids` keyspace and use the shared types
 //! from `did-hosting-common::did_ops`.
 
+use bip39::Language;
 use did_hosting_common::did_ops::{
     self, DidRecord, LogEntryInfo, LogMetadata, content_log_key, content_witness_key, did_key,
     owner_key,
 };
 use did_hosting_common::server::mnemonic::{validate_custom_path, validate_mnemonic};
 use did_hosting_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
-use bip39::Language;
 use rand::random_range;
 use tracing::{debug, info, warn};
 
@@ -260,7 +260,7 @@ pub async fn create_did(
         content_size: 0,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
@@ -423,7 +423,7 @@ pub async fn register_did_atomic(
         content_size: did_log.len() as u64,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
@@ -927,8 +927,10 @@ pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameRespons
 
 #[cfg(test)]
 mod tests_atomic {
-    use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
     use super::*;
+    use did_hosting_common::server::store::{
+        KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+    };
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
@@ -1402,17 +1404,21 @@ mod tests_atomic {
         .await;
 
         let did_log = build_test_did_log("scid-evil", "domain-b.example", "alpha").await;
-        let err =
-            register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
-                .await
-                .expect_err("ACL must reject host outside scope");
+        let err = register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
+            .await
+            .expect_err("ACL must reject host outside scope");
         assert!(
             matches!(err, AppError::Forbidden(_)),
             "expected Forbidden, got {err:?}"
         );
         // No record written.
         assert!(
-            state.dids_ks.get_raw(did_key("alpha")).await.unwrap().is_none(),
+            state
+                .dids_ks
+                .get_raw(did_key("alpha"))
+                .await
+                .unwrap()
+                .is_none(),
             "no record may be written when ACL rejects the host"
         );
     }

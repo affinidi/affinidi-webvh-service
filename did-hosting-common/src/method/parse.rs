@@ -31,7 +31,10 @@ pub fn parse_did_method(did: &str) -> Result<&str, MethodError> {
     }
     // Method names per DID-core grammar are lowercase alphanumeric.
     // A future caller might pass garbage; reject early.
-    if !method.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+    if !method
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return Err(MethodError::Malformed(did.to_string()));
     }
     Ok(method)

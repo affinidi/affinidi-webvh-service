@@ -8,8 +8,8 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_DIDS};
 use crate::secret_store::{ServerSecrets, create_secret_store};
+use did_hosting_common::server::store::KS_DIDS;
 
 use did_hosting_common::server::operator_messages::WebvhServerMessages;
 use did_hosting_common::server::setup_prompts;
@@ -25,7 +25,10 @@ pub async fn run_setup_phase1(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::stderr;
     let messages = WebvhServerMessages;
-    let finalise = format!("did-hosting-server setup --setup-key-file {}", out_path.display());
+    let finalise = format!(
+        "did-hosting-server setup --setup-key-file {}",
+        out_path.display()
+    );
     let mut writer = stderr();
     vta_sdk::provision_client::driver::run_phase1_init(
         &mut writer,
@@ -217,12 +220,11 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 11. Secrets backend selection
-    let secrets_config =
-        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-            "did-hosting-server-secrets",
-            "webvh",
-        )
-        .await?;
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "did-hosting-server-secrets",
+        "webvh",
+    )
+    .await?;
 
     // 12. Build and write config
     let config = AppConfig {
@@ -324,7 +326,10 @@ pub async fn run_wizard(
         outcome.integration_did
     );
     eprintln!("    2. Start the server:");
-    eprintln!("       did-hosting-server --config {}", output_path.display());
+    eprintln!(
+        "       did-hosting-server --config {}",
+        output_path.display()
+    );
     eprintln!();
 
     Ok(())

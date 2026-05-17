@@ -7,13 +7,13 @@ use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::server_push;
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use did_hosting_common::did_ops::LogMetadata;
 use did_hosting_common::{
     CheckNameResponse, DidListEntry, DidRegisterRequest, DidRegisterResponse, RequestUriResponse,
 };
-use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 

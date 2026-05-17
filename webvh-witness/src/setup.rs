@@ -10,9 +10,9 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
     StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL};
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
+use did_hosting_common::server::store::KS_ACL;
 
 use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
 use did_hosting_common::server::setup_prompts;
@@ -182,12 +182,11 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 13. Secrets backend selection
-    let secrets_config =
-        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-            "webvh-witness-secrets",
-            "webvh-witness",
-        )
-        .await?;
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "webvh-witness-secrets",
+        "webvh-witness",
+    )
+    .await?;
 
     // 14. Build and write config
     let config = AppConfig {
@@ -293,8 +292,9 @@ pub async fn run_wizard(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
 
         store_acl_entry(&acl_ks, &entry).await?;
         eprintln!("  Admin ACL entry created for {admin_did}");
@@ -863,8 +863,9 @@ pub async fn run_setup_offline_complete(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
         store_acl_entry(&acl_ks, &entry).await?;
         eprintln!("  Admin ACL entry created for {did}");
     }

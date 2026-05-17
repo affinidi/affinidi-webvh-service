@@ -196,9 +196,8 @@ pub async fn delete_domain_record(store: &Store, name: &str) -> Result<(), AppEr
 /// bootstrap-domains finish).
 pub async fn get_default_domain(store: &Store) -> Result<Option<String>, AppError> {
     let ks = meta_ks(store)?;
-    let pointer: Option<DefaultDomainPointer> = ks
-        .get(META_DEFAULT_DOMAIN_KEY.as_bytes().to_vec())
-        .await?;
+    let pointer: Option<DefaultDomainPointer> =
+        ks.get(META_DEFAULT_DOMAIN_KEY.as_bytes().to_vec()).await?;
     Ok(pointer.map(|p| p.domain))
 }
 
@@ -236,9 +235,7 @@ pub async fn set_default_domain(store: &Store, name: &str) -> Result<(), AppErro
         let is_default = e.name == canonical;
         if e.default_domain != is_default {
             e.default_domain = is_default;
-            domains_ks
-                .insert(e.name.as_bytes().to_vec(), &e)
-                .await?;
+            domains_ks.insert(e.name.as_bytes().to_vec(), &e).await?;
         }
     }
 
@@ -372,12 +369,20 @@ mod tests {
         create_domain(&store, &entry("a.example")).await.unwrap();
         disable_domain(&store, "a.example").await.unwrap();
         assert_eq!(
-            get_domain(&store, "a.example").await.unwrap().unwrap().status,
+            get_domain(&store, "a.example")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             DomainStatus::Disabled
         );
         enable_domain(&store, "a.example").await.unwrap();
         assert_eq!(
-            get_domain(&store, "a.example").await.unwrap().unwrap().status,
+            get_domain(&store, "a.example")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             DomainStatus::Active
         );
     }

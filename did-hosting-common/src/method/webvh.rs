@@ -108,15 +108,17 @@ impl DidMethod for Webvh {
         // called from the existing publish path. This trait method runs
         // first and gives a cheap, transport-layer rejection for
         // obviously-malformed payloads.
-        let text = std::str::from_utf8(data).map_err(|e| {
-            MethodError::Validation(format!("did.jsonl is not valid UTF-8: {e}"))
-        })?;
+        let text = std::str::from_utf8(data)
+            .map_err(|e| MethodError::Validation(format!("did.jsonl is not valid UTF-8: {e}")))?;
         for (idx, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             serde_json::from_str::<serde_json::Value>(line).map_err(|e| {
-                MethodError::Validation(format!("did.jsonl line {} is not valid JSON: {e}", idx + 1))
+                MethodError::Validation(format!(
+                    "did.jsonl line {} is not valid JSON: {e}",
+                    idx + 1
+                ))
             })?;
         }
         Ok(())
@@ -220,7 +222,11 @@ mod tests {
 
     #[test]
     fn parse_identifier_rejects_missing_scid() {
-        assert!(Webvh.parse_identifier("did:webvh::example.com:user").is_err());
+        assert!(
+            Webvh
+                .parse_identifier("did:webvh::example.com:user")
+                .is_err()
+        );
     }
 
     #[test]
@@ -277,7 +283,9 @@ mod tests {
     #[test]
     fn validate_rejects_bad_json() {
         let data = b"{not json}\n";
-        let err = Webvh.validate(data).expect_err("must reject malformed JSON");
+        let err = Webvh
+            .validate(data)
+            .expect_err("must reject malformed JSON");
         assert!(matches!(err, MethodError::Validation(_)));
         assert!(err.to_string().contains("line 1"));
     }
@@ -285,7 +293,9 @@ mod tests {
     #[test]
     fn validate_rejects_bad_json_at_line_2() {
         let data = b"{\"versionId\":\"1\"}\n{not json}\n";
-        let err = Webvh.validate(data).expect_err("must reject malformed line 2");
+        let err = Webvh
+            .validate(data)
+            .expect_err("must reject malformed line 2");
         assert!(err.to_string().contains("line 2"));
     }
 

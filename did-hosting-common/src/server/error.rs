@@ -49,7 +49,6 @@ pub enum AppError {
     // enforces exact-match at attach time; the response body for these
     // variants is structured (`{ "error": "<VariantName>", ... }`) so
     // callers can switch on the discriminant without parsing prose.
-
     /// `Trust-Task` header was absent on a route that requires it.
     /// Renders to 400 Bad Request with body `{ "error": "TrustTaskMissing" }`.
     #[error("Trust-Task header missing")]
@@ -70,6 +69,18 @@ pub enum AppError {
     TrustTaskMismatch {
         expected: String,
         received: Option<String>,
+    },
+
+    /// Resolution attempted against a configured-but-disabled domain.
+    /// Per `docs/multi-domain-spec.md` §3, renders to **503** with the
+    /// maintenance-status JSON body `{ "status": "disabled", "domain":
+    /// "<name>", "message"?, "eta"? }`. Distinct from `NotFound` —
+    /// 404 means "we don't serve this", 503 means "we serve this but
+    /// it's temporarily unavailable".
+    #[error("domain '{domain}' is disabled")]
+    DomainDisabled {
+        domain: String,
+        message: Option<String>,
     },
 }
 
@@ -239,9 +250,14 @@ impl IntoResponse for AppError {
             AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMalformed(_) => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMismatch { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            AppError::DomainDisabled { .. } => StatusCode::SERVICE_UNAVAILABLE,
         };
 
-        if status.is_server_error() {
+        // DomainDisabled is a 5xx but the body is part of the public
+        // contract (status / domain / message) so clients can render a
+        // maintenance page. Fall through to the structured-body branch
+        // below; everything else 5xx collapses to a generic message.
+        if status.is_server_error() && !matches!(self, AppError::DomainDisabled { .. }) {
             warn!(status = %status.as_u16(), error = %self, "server error");
             let body = serde_json::json!({ "error": "internal server error" });
             return (status, axum::Json(body)).into_response();
@@ -262,6 +278,11 @@ impl IntoResponse for AppError {
                 "error": "TrustTaskMismatch",
                 "expected": expected,
                 "received": received,
+            }),
+            AppError::DomainDisabled { domain, message } => serde_json::json!({
+                "status": "disabled",
+                "domain": domain,
+                "message": message,
             }),
             _ => serde_json::json!({ "error": self.user_message() }),
         };

@@ -191,9 +191,11 @@ mod tests {
         IpAddr::from_str(s).expect("valid ip")
     }
 
-    fn h(host: Option<&'static str>, fwd: Option<&'static str>, xfh: Option<&'static str>)
-        -> HostHeaders<'static>
-    {
+    fn h(
+        host: Option<&'static str>,
+        fwd: Option<&'static str>,
+        xfh: Option<&'static str>,
+    ) -> HostHeaders<'static> {
         HostHeaders {
             host,
             forwarded: fwd,
@@ -283,7 +285,11 @@ mod tests {
     fn trusted_peer_xfh_first_value_wins() {
         // Multi-proxy: client claim is index 0, intermediate proxies
         // append. First wins.
-        let headers = h(None, None, Some("client.example, proxy1.example, proxy2.example"));
+        let headers = h(
+            None,
+            None,
+            Some("client.example, proxy1.example, proxy2.example"),
+        );
         let cidrs = vec![cidr("10.0.0.0/8")];
         let resolved = resolve_request_host(&headers, Some(ip("10.0.0.5")), &cidrs);
         assert_eq!(resolved, Some("client.example"));
@@ -325,8 +331,14 @@ mod tests {
 
     #[test]
     fn forwarded_is_case_insensitive_for_param_name() {
-        assert_eq!(parse_forwarded_host("HOST=example.com"), Some("example.com"));
-        assert_eq!(parse_forwarded_host("Host=example.com"), Some("example.com"));
+        assert_eq!(
+            parse_forwarded_host("HOST=example.com"),
+            Some("example.com")
+        );
+        assert_eq!(
+            parse_forwarded_host("Host=example.com"),
+            Some("example.com")
+        );
     }
 
     #[test]
@@ -339,10 +351,7 @@ mod tests {
 
     #[test]
     fn forwarded_missing_host_param() {
-        assert_eq!(
-            parse_forwarded_host("for=192.0.2.60;proto=https"),
-            None
-        );
+        assert_eq!(parse_forwarded_host("for=192.0.2.60;proto=https"), None);
     }
 
     #[test]
@@ -386,11 +395,7 @@ mod tests {
         // and trust it.
         let cidrs = vec![cidr("10.0.0.0/16")];
         let alb_ip = Some(ip("10.0.5.42"));
-        let headers = h(
-            Some("internal.example"),
-            None,
-            Some("tenant-a.example.com"),
-        );
+        let headers = h(Some("internal.example"), None, Some("tenant-a.example.com"));
         assert_eq!(
             resolve_request_host(&headers, alb_ip, &cidrs),
             Some("tenant-a.example.com")

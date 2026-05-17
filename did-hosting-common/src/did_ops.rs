@@ -48,7 +48,6 @@ pub struct DidRecord {
     // §3 "Storage" tradeoff note. Inlining `data: Vec<u8>` into the
     // record made `list_dids` pull content bytes on every scan; the
     // split keeps metadata reads cheap.
-
     /// DID method this record was registered under. Always one of the
     /// enabled-at-compile-time methods (`webvh`, `web`); the daemon
     /// rejects any other value on the write path. Legacy records

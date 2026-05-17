@@ -64,24 +64,20 @@ pub async fn create_acl(
     let role_is_owner = matches!(req.role, did_hosting_common::server::acl::Role::Owner);
     let domains = match req.domains {
         Some(scope) => scope,
-        None if role_is_owner => {
-            match get_default_domain(&state.store).await? {
-                Some(default) => {
-                    DomainScope::AllowedWithDefault {
-                        domains: vec![default.clone()],
-                        default,
-                    }
-                }
-                None => {
-                    warn!(
-                        caller = %auth.0.did,
-                        target_did = %did,
-                        "ACL create: Owner without `domains` and no system default — falling back to All"
-                    );
-                    DomainScope::All
-                }
+        None if role_is_owner => match get_default_domain(&state.store).await? {
+            Some(default) => DomainScope::AllowedWithDefault {
+                domains: vec![default.clone()],
+                default,
+            },
+            None => {
+                warn!(
+                    caller = %auth.0.did,
+                    target_did = %did,
+                    "ACL create: Owner without `domains` and no system default — falling back to All"
+                );
+                DomainScope::All
             }
-        }
+        },
         None => DomainScope::All,
     };
     let entry = AclEntry {

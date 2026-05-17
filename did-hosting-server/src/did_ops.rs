@@ -264,7 +264,7 @@ pub async fn create_did(
         content_size: 0,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),

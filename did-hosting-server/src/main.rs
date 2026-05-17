@@ -1,13 +1,17 @@
+use clap::{Parser, Subcommand};
+use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_server::config::AppConfig;
 use did_hosting_server::{
     backup, bootstrap, health, secret_store, server, setup, setup_recipe, store,
 };
-use did_hosting_common::server::store::{KS_DIDS};
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "did-hosting-server", about = "WebVH DID Hosting Server", version)]
+#[command(
+    name = "did-hosting-server",
+    about = "WebVH DID Hosting Server",
+    version
+)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, global = true)]
@@ -733,15 +737,11 @@ async fn run_recreate_did(
             .remove(did_hosting_server::did_ops::content_log_key(&mnemonic))
             .await?;
         dids_ks
-            .remove(did_hosting_server::did_ops::content_witness_key(
-                &mnemonic,
-            ))
+            .remove(did_hosting_server::did_ops::content_witness_key(&mnemonic))
             .await?;
         // Remove owner index entry (owner is "system" for bootstrapped DIDs)
         dids_ks
-            .remove(did_hosting_server::did_ops::owner_key(
-                "system", &mnemonic,
-            ))
+            .remove(did_hosting_server::did_ops::owner_key("system", &mnemonic))
             .await?;
         eprintln!("  Removed existing DID at path '{mnemonic}'");
     }

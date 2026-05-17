@@ -5,12 +5,14 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
 use did_hosting_common::server::init;
 use did_hosting_common::server::passkey::PasskeyState;
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+};
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
 
@@ -238,8 +240,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             let mut last_updated_at: Option<u64> = None;
             if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
                 for (_key, value) in raw {
-                    if let Ok(s) = serde_json::from_slice::<did_hosting_common::DidStats>(&value)
-                    {
+                    if let Ok(s) = serde_json::from_slice::<did_hosting_common::DidStats>(&value) {
                         total_resolves += s.total_resolves;
                         total_updates += s.total_updates;
                         last_resolved_at = match (last_resolved_at, s.last_resolved_at) {

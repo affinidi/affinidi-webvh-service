@@ -26,7 +26,6 @@ use affinidi_messaging_test_mediator::TestMediator;
 use did_hosting_common::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
 use did_hosting_common::server::auth::session::now_epoch;
 use did_hosting_common::server::config::{
@@ -34,6 +33,9 @@ use did_hosting_common::server::config::{
 };
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+};
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::did_ops::{
@@ -114,8 +116,9 @@ async fn acl(state: &AppState, did: &str, role: Role) {
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,},
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
     )
     .await
     .expect("store ACL entry");
@@ -215,10 +218,7 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
         .await
         .expect_err("old owner must lose access");
     assert!(
-        matches!(
-            info_err,
-            did_hosting_control::error::AppError::Forbidden(_)
-        ),
+        matches!(info_err, did_hosting_control::error::AppError::Forbidden(_)),
         "expected Forbidden, got {info_err:?}"
     );
 

@@ -17,7 +17,6 @@ use affinidi_tdk::secrets_resolver::secrets::Secret;
 use did_hosting_common::did::{
     DidDocumentOptions, build_did_document, create_log_entry, encode_host,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use did_hosting_common::did_ops::{DidRecord, did_key};
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
 use did_hosting_common::server::auth::session::now_epoch;
@@ -26,6 +25,9 @@ use did_hosting_common::server::config::{
 };
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+};
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::did_ops::{create_did, publish_did};
@@ -102,8 +104,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         created_at: now_epoch(),
         max_total_size: None,
         max_did_count: None,
-    
-        domains: did_hosting_common::server::domain::DomainScope::All,};
+
+        domains: did_hosting_common::server::domain::DomainScope::All,
+    };
     store_acl_entry(&acl_ks, &acl_entry)
         .await
         .expect("store ACL entry");

@@ -3,10 +3,10 @@ use std::str::FromStr;
 use super::acl::{
     AclEntry, Role, delete_acl_entry, get_acl_entry, list_acl_entries, store_acl_entry,
 };
-use crate::server::store::KS_ACL;
 use super::auth::session::now_epoch;
 use super::config::StoreConfig;
 use super::store::Store;
+use crate::server::store::KS_ACL;
 
 /// Add an ACL entry to the store.
 pub async fn run_add_acl(
@@ -39,8 +39,9 @@ pub async fn run_add_acl(
         created_at: now_epoch(),
         max_total_size,
         max_did_count,
-    
-        domains: crate::server::domain::DomainScope::All,};
+
+        domains: crate::server::domain::DomainScope::All,
+    };
 
     store_acl_entry(&acl_ks, &entry).await?;
 

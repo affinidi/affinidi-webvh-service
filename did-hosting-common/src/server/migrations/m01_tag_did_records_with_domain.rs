@@ -97,10 +97,7 @@ impl Migration for M01TagDidRecordsWithDomain {
                 let mnemonic = match std::str::from_utf8(&key) {
                     Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
                     Err(_) => {
-                        warn!(
-                            migration_id = ID,
-                            "skipping non-UTF-8 key in dids keyspace"
-                        );
+                        warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
                         continue;
                     }
                 };
@@ -176,12 +173,12 @@ mod tests {
     use super::super::MigrationRunner;
     use super::*;
     use crate::did_ops::did_key;
-    use crate::server::error::AppError;
     use crate::server::config::StoreConfig;
     use crate::server::domain::{
         create_domain, set_default_domain,
         types::{DomainEntry, DomainStatus, DomainUrlScheme},
     };
+    use crate::server::error::AppError;
     use std::sync::Arc;
 
     async fn fjall_store() -> Store {
@@ -243,8 +240,7 @@ mod tests {
     }
 
     async fn run_migration(store: &Store) -> Result<(), AppError> {
-        let migrations: Vec<Arc<dyn Migration>> =
-            vec![Arc::new(M01TagDidRecordsWithDomain)];
+        let migrations: Vec<Arc<dyn Migration>> = vec![Arc::new(M01TagDidRecordsWithDomain)];
         MigrationRunner::new(migrations).run_pending(store).await?;
         Ok(())
     }
@@ -263,10 +259,7 @@ mod tests {
     async fn tags_from_did_id_when_present() {
         let store = fjall_store().await;
         let dids = store.keyspace(KS_DIDS).unwrap();
-        let rec = legacy_record(
-            "user1",
-            Some("did:webvh:Q1:example.com:user1"),
-        );
+        let rec = legacy_record("user1", Some("did:webvh:Q1:example.com:user1"));
         dids.insert(did_key("user1"), &rec).await.unwrap();
 
         run_migration(&store).await.unwrap();
@@ -279,10 +272,7 @@ mod tests {
     async fn tags_from_did_id_with_encoded_port() {
         let store = fjall_store().await;
         let dids = store.keyspace(KS_DIDS).unwrap();
-        let rec = legacy_record(
-            "user1",
-            Some("did:webvh:Q1:example.com%3A8085:user1"),
-        );
+        let rec = legacy_record("user1", Some("did:webvh:Q1:example.com%3A8085:user1"));
         dids.insert(did_key("user1"), &rec).await.unwrap();
         run_migration(&store).await.unwrap();
         assert_eq!(get_rec(&store, "user1").await.domain, "example.com%3A8085");
@@ -293,8 +283,12 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_system_default_when_did_id_absent() {
         let store = fjall_store().await;
-        create_domain(&store, &entry("fallback.example")).await.unwrap();
-        set_default_domain(&store, "fallback.example").await.unwrap();
+        create_domain(&store, &entry("fallback.example"))
+            .await
+            .unwrap();
+        set_default_domain(&store, "fallback.example")
+            .await
+            .unwrap();
 
         let dids = store.keyspace(KS_DIDS).unwrap();
         let rec = legacy_record("user1", None);
@@ -308,8 +302,12 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_system_default_when_did_id_unparseable() {
         let store = fjall_store().await;
-        create_domain(&store, &entry("fallback.example")).await.unwrap();
-        set_default_domain(&store, "fallback.example").await.unwrap();
+        create_domain(&store, &entry("fallback.example"))
+            .await
+            .unwrap();
+        set_default_domain(&store, "fallback.example")
+            .await
+            .unwrap();
 
         let dids = store.keyspace(KS_DIDS).unwrap();
         let rec = legacy_record("user1", Some("garbage-not-a-did"));
@@ -381,12 +379,9 @@ mod tests {
         dids.insert(did_key("b"), &legacy_record("b", None))
             .await
             .unwrap();
-        dids.insert(
-            did_key("c"),
-            &already_tagged_record("c", "preset.example"),
-        )
-        .await
-        .unwrap();
+        dids.insert(did_key("c"), &already_tagged_record("c", "preset.example"))
+            .await
+            .unwrap();
 
         run_migration(&store).await.unwrap();
         assert_eq!(get_rec(&store, "a").await.domain, "from-did.example");
@@ -412,7 +407,9 @@ mod tests {
         let dids = store.keyspace(KS_DIDS).unwrap();
         // Bad value at a `did:` key — corrupted store. Migration logs
         // and continues; doesn't crash the whole run.
-        dids.insert_raw(did_key("bad"), b"not json".to_vec()).await.unwrap();
+        dids.insert_raw(did_key("bad"), b"not json".to_vec())
+            .await
+            .unwrap();
         dids.insert(did_key("good"), &legacy_record("good", None))
             .await
             .unwrap();

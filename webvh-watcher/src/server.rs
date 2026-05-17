@@ -7,10 +7,10 @@ use crate::error::AppError;
 use crate::routes;
 use crate::store::{KeyspaceHandle, Store};
 use axum::routing::get;
+use did_hosting_common::server::store::KS_DIDS;
 use tokio::sync::watch;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
-use did_hosting_common::server::store::{KS_DIDS};
 
 #[derive(Clone)]
 pub struct AppState {

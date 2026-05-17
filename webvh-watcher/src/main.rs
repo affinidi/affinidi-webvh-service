@@ -1,7 +1,7 @@
-use webvh_watcher::config::AppConfig;
-use webvh_watcher::{health, server, setup, store};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use webvh_watcher::config::AppConfig;
+use webvh_watcher::{health, server, setup, store};
 
 #[derive(Parser)]
 #[command(

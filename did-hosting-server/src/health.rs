@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use did_hosting_common::server::health;
 
 use crate::config::AppConfig;
-use did_hosting_common::server::store::{KS_DIDS};
+use did_hosting_common::server::store::KS_DIDS;
 
 pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     health::header("did-hosting-server", env!("CARGO_PKG_VERSION"));

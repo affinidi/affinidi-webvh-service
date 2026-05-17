@@ -52,7 +52,10 @@ fn alias_pairs() -> [(&'static str, &'static str); 29] {
     [
         // Auth
         (MSG_AUTHENTICATE, TASK_AUTH_AUTHENTICATE_1_0.as_str()),
-        (MSG_AUTH_RESPONSE, TASK_AUTH_AUTHENTICATE_RESPONSE_1_0.as_str()),
+        (
+            MSG_AUTH_RESPONSE,
+            TASK_AUTH_AUTHENTICATE_RESPONSE_1_0.as_str(),
+        ),
         // DID lifecycle
         (MSG_DID_REQUEST, TASK_DID_REQUEST_1_0.as_str()),
         (MSG_DID_OFFER, TASK_DID_OFFER_1_0.as_str()),
@@ -86,24 +89,12 @@ fn alias_pairs() -> [(&'static str, &'static str); 29] {
         (MSG_STATS_SYNC, TASK_SERVER_STATS_SYNC_1_0.as_str()),
         (MSG_STATS_ACK, TASK_SERVER_STATS_ACK_1_0.as_str()),
         // webvh-specific: witness + sync
-        (
-            MSG_WITNESS_PUBLISH,
-            TASK_WEBVH_WITNESS_PUBLISH_1_0.as_str(),
-        ),
-        (
-            MSG_WITNESS_CONFIRM,
-            TASK_WEBVH_WITNESS_CONFIRM_1_0.as_str(),
-        ),
+        (MSG_WITNESS_PUBLISH, TASK_WEBVH_WITNESS_PUBLISH_1_0.as_str()),
+        (MSG_WITNESS_CONFIRM, TASK_WEBVH_WITNESS_CONFIRM_1_0.as_str()),
         (MSG_SYNC_UPDATE, TASK_WEBVH_SYNC_UPDATE_1_0.as_str()),
-        (
-            MSG_SYNC_UPDATE_ACK,
-            TASK_WEBVH_SYNC_UPDATE_ACK_1_0.as_str(),
-        ),
+        (MSG_SYNC_UPDATE_ACK, TASK_WEBVH_SYNC_UPDATE_ACK_1_0.as_str()),
         (MSG_SYNC_DELETE, TASK_WEBVH_SYNC_DELETE_1_0.as_str()),
-        (
-            MSG_SYNC_DELETE_ACK,
-            TASK_WEBVH_SYNC_DELETE_ACK_1_0.as_str(),
-        ),
+        (MSG_SYNC_DELETE_ACK, TASK_WEBVH_SYNC_DELETE_ACK_1_0.as_str()),
     ]
 }
 
@@ -151,7 +142,7 @@ pub fn to_legacy(msg_type: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::didcomm_types::{
-        MSG_AUTHENTICATE, MSG_AUTH_RESPONSE, MSG_DELETE, MSG_DELETE_CONFIRM, MSG_DID_CHANGE_OWNER,
+        MSG_AUTH_RESPONSE, MSG_AUTHENTICATE, MSG_DELETE, MSG_DELETE_CONFIRM, MSG_DID_CHANGE_OWNER,
         MSG_DID_CHANGE_OWNER_CONFIRM, MSG_DID_CONFIRM, MSG_DID_OFFER, MSG_DID_PUBLISH,
         MSG_DID_REGISTER, MSG_DID_REGISTER_CONFIRM, MSG_DID_REQUEST, MSG_HEALTH_PING,
         MSG_HEALTH_PONG, MSG_INFO, MSG_INFO_REQUEST, MSG_LIST, MSG_LIST_REQUEST,
@@ -240,10 +231,7 @@ mod tests {
             MSG_STATS_ACK,
         ];
         for m in msgs {
-            assert!(
-                canonicalize(m).is_some(),
-                "MSG_* `{m}` has no alias entry"
-            );
+            assert!(canonicalize(m).is_some(), "MSG_* `{m}` has no alias entry");
         }
     }
 

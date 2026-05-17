@@ -11,18 +11,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 use did_hosting_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
     StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
 use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::vta_setup;
-use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
@@ -37,7 +37,10 @@ pub async fn run_setup_phase1(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::stderr;
     let messages = WebvhDaemonMessages;
-    let finalise = format!("did-hosting-daemon setup --setup-key-file {}", out_path.display());
+    let finalise = format!(
+        "did-hosting-daemon setup --setup-key-file {}",
+        out_path.display()
+    );
     let mut writer = stderr();
     vta_sdk::provision_client::driver::run_phase1_init(
         &mut writer,
@@ -160,12 +163,11 @@ pub async fn run_wizard(
     let witness_store_path = PathBuf::from(&data_dir).join("witness");
 
     // 6. Secrets backend
-    let secrets_config =
-        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-            "did-hosting-daemon-secrets",
-            "webvh",
-        )
-        .await?;
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "did-hosting-daemon-secrets",
+        "webvh",
+    )
+    .await?;
 
     // 7. Admin ACL (optional, captured as AdminChoice for reuse by offline flow)
     let admin = prompt_admin_choice()?;
@@ -213,8 +215,9 @@ pub async fn run_wizard(
         identity: IdentityConfig::default(),
         enable,
         config_path: output_path.clone(),
-    
-        hosting: did_hosting_common::server::config::HostingConfig::default(),};
+
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
+    };
 
     // 10. Persist via shared helper (same as offline flow path).
     finalize_daemon_setup(
@@ -545,12 +548,11 @@ async fn run_self_managed_setup(
     let witness_store_path = PathBuf::from(&data_dir).join("witness");
 
     // 5. Secrets backend.
-    let secrets_config =
-        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-            "did-hosting-daemon-secrets",
-            "webvh",
-        )
-        .await?;
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "did-hosting-daemon-secrets",
+        "webvh",
+    )
+    .await?;
 
     // 6. Generate keys locally.
     let signing = Secret::generate_ed25519(None, None);
@@ -644,7 +646,10 @@ async fn run_self_managed_setup(
     eprintln!("  Next steps:");
     eprintln!();
     eprintln!("    1. Start the daemon:");
-    eprintln!("         did-hosting-daemon --config {}", output_path.display());
+    eprintln!(
+        "         did-hosting-daemon --config {}",
+        output_path.display()
+    );
     eprintln!();
     eprintln!("    2. Mint your first admin enrolment invite (replace");
     eprintln!("       <ADMIN_DID> with the DID the admin will authenticate as):");
@@ -1170,8 +1175,9 @@ async fn finalize_daemon_setup(
             created_at: did_hosting_common::server::auth::session::now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
         did_hosting_common::server::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  Admin ACL entry added for {admin_did}");

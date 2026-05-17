@@ -121,7 +121,11 @@ impl AppConfig {
 
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
-            .or_else(|| std::env::var("DID_HOSTING_CONFIG_PATH").ok().map(PathBuf::from))
+            .or_else(|| {
+                std::env::var("DID_HOSTING_CONFIG_PATH")
+                    .ok()
+                    .map(PathBuf::from)
+            })
             .unwrap_or_else(|| PathBuf::from("config.toml"));
 
         if !path.exists() {

@@ -117,7 +117,7 @@ pub async fn bootstrap_did(
         content_size: jsonl.len() as u64,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
@@ -220,7 +220,7 @@ pub async fn import_did_at_path(
         content_size: jsonl.len() as u64,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),

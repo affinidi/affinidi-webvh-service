@@ -90,9 +90,8 @@ pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
 /// conversion. Rejects IP literals and any host containing characters
 /// outside the LDH (letters, digits, hyphens) + `.` + IDN-punycode set.
 fn normalize_host(host: &str) -> Result<String, AppError> {
-    let parsed = url::Host::parse(host).map_err(|e| {
-        AppError::Validation(format!("malformed host '{host}': {e}"))
-    })?;
+    let parsed = url::Host::parse(host)
+        .map_err(|e| AppError::Validation(format!("malformed host '{host}': {e}")))?;
     match parsed {
         url::Host::Domain(s) => {
             // url::Host::parse lowercases and IDNA-encodes; double-check
@@ -284,8 +283,7 @@ mod tests {
             "example.com/foo#bar",
             "example.com/foo%20bar",
         ] {
-            let err = normalize_domain_name(bad)
-                .expect_err(&format!("{bad} must reject"));
+            let err = normalize_domain_name(bad).expect_err(&format!("{bad} must reject"));
             let s = err.to_string();
             // For inputs that reach normalize_path the error mentions
             // "invalid character"; for inputs that get caught earlier
@@ -299,8 +297,7 @@ mod tests {
     #[test]
     fn rejects_path_with_uppercase_host() {
         // Uppercase host + valid path → canonical is fully lowercased.
-        let err =
-            normalize_domain_name("Example.com/webvh-a").expect_err("uppercase host rejects");
+        let err = normalize_domain_name("Example.com/webvh-a").expect_err("uppercase host rejects");
         assert_canonical_msg(&err, "example.com/webvh-a");
     }
 

@@ -34,7 +34,8 @@ pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve
 pub use normalize::normalize_domain_name;
 pub use safety::{
     assert_acl_allows_host, assert_did_host_allowed,
-    assert_did_host_allowed_when_domains_configured, assert_host_is_active_domain,
+    assert_did_host_allowed_when_domains_configured, assert_domain_active_for_resolution,
+    assert_host_is_active_domain, assert_request_host_matches_did, assert_resolution_allowed,
     extract_did_host,
 };
 pub use scope::DomainScope;
@@ -43,6 +44,4 @@ pub use store::{
     create_domain, delete_domain_record, disable_domain, enable_domain, get_default_domain,
     get_domain, list_domains, set_default_domain, update_domain,
 };
-pub use types::{
-    DomainBranding, DomainEntry, DomainQuota, DomainStatus, DomainUrlScheme,
-};
+pub use types::{DomainBranding, DomainEntry, DomainQuota, DomainStatus, DomainUrlScheme};

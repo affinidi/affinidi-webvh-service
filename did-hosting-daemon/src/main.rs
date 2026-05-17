@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::{StatusCode, Uri};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
@@ -24,7 +24,9 @@ use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::{KeyspaceHandle, Store};
 
 use config::DaemonConfig;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES};
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+};
 
 #[derive(Parser)]
 #[command(
@@ -760,9 +762,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     combined = match server_state {
         Some(ref state) => combined.fallback({
             let state = state.clone();
-            move |uri: Uri| {
+            move |request: axum::extract::Request| {
                 let state = state.clone();
-                async move { daemon_fallback(state, uri).await }
+                async move { daemon_fallback(state, request).await }
             }
         }),
         None => {
@@ -1033,6 +1035,16 @@ async fn build_server(
     let jwt_keys = init::init_jwt_keys(secrets);
     let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
+    let (parsed_cidrs, bad_cidrs) = did_hosting_common::server::domain::parse_trusted_cidrs(
+        &server_config.server.trusted_proxy_cidrs,
+    );
+    if !bad_cidrs.is_empty() {
+        warn!(
+            bad_cidrs = ?bad_cidrs,
+            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
+        );
+    }
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -1048,6 +1060,7 @@ async fn build_server(
         did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
             Duration::from_secs(300),
         )),
+        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
     };
 
     let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
@@ -1179,8 +1192,7 @@ async fn build_control(
     // gracefully no-op when state.atm is None.
 
     // Build router without UI fallback — daemon adds its own combined fallback
-    let router =
-        did_hosting_control::routes::router_without_fallback().with_state(state.clone());
+    let router = did_hosting_control::routes::router_without_fallback().with_state(state.clone());
     info!("control plane service initialized");
 
     Ok((router, state))
@@ -1195,12 +1207,17 @@ async fn build_control(
 /// Tries DID public serving first (e.g. `/{mnemonic}/did.jsonl`).
 /// If that returns 404, falls through to the SPA static handler so that
 /// paths like `/enroll` serve `index.html` for client-side routing.
-async fn daemon_fallback(state: did_hosting_server::server::AppState, uri: Uri) -> Response {
-    let did_resp = did_hosting_server::routes::did_public::serve_public(
-        axum::extract::State(state),
-        uri.clone(),
-    )
-    .await;
+async fn daemon_fallback(
+    state: did_hosting_server::server::AppState,
+    request: axum::extract::Request,
+) -> Response {
+    // Snapshot the URI for the SPA fallback (which only needs path
+    // routing); the full Request is consumed by serve_public to read
+    // ConnectInfo + headers for resolve-side host detection.
+    let uri = request.uri().clone();
+    let did_resp =
+        did_hosting_server::routes::did_public::serve_public(axum::extract::State(state), request)
+            .await;
 
     if did_resp.status() != StatusCode::NOT_FOUND {
         return did_resp;
@@ -1213,6 +1230,7 @@ async fn daemon_fallback(state: did_hosting_server::server::AppState, uri: Uri) 
 
     #[cfg(not(feature = "ui"))]
     {
+        let _ = uri;
         StatusCode::NOT_FOUND.into_response()
     }
 }
@@ -1515,9 +1533,7 @@ async fn run_recreate_did(
             .remove(did_hosting_server::did_ops::content_log_key(&mnemonic))
             .await?;
         dids_ks
-            .remove(did_hosting_server::did_ops::content_witness_key(
-                &mnemonic,
-            ))
+            .remove(did_hosting_server::did_ops::content_witness_key(&mnemonic))
             .await?;
         dids_ks
             .remove(did_hosting_server::did_ops::owner_key(

@@ -255,7 +255,10 @@ mod tests {
 
     #[test]
     fn status_serialises_lowercase() {
-        assert_eq!(serde_json::to_string(&DomainStatus::Active).unwrap(), "\"active\"");
+        assert_eq!(
+            serde_json::to_string(&DomainStatus::Active).unwrap(),
+            "\"active\""
+        );
         assert_eq!(
             serde_json::to_string(&DomainStatus::Disabled).unwrap(),
             "\"disabled\""

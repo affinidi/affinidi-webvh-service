@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use dialoguer::{Confirm, Input, Select};
 use did_hosting_common::server::setup_recipe::{
     ServiceKind, SetupRecipe, load_recipe, require_service, to_log_format,
 };
-use dialoguer::{Confirm, Input, Select};
 
 use crate::config::{AppConfig, LogFormat, ServerConfig, SourceConfig, StoreConfig, SyncConfig};
 

@@ -33,11 +33,11 @@ use affinidi_tdk::didcomm::Message;
 use affinidi_tdk::didcomm::message::pack;
 use affinidi_tdk::messaging::protocols::discover_features::DiscoverFeatures;
 use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
-use did_hosting_common::didcomm_types::*;
-use did_hosting_common::server::didcomm_unpack;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use did_hosting_common::didcomm_types::*;
+use did_hosting_common::server::didcomm_unpack;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 

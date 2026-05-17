@@ -11,14 +11,14 @@ use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, RegistryConfig, SecretsConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL};
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
+use dialoguer::{Confirm, Input, Select};
 use did_hosting_common::server::operator_messages::WebvhControlMessages;
 use did_hosting_common::server::setup_prompts;
+use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::vta_setup;
-use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -189,13 +189,12 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     // 11. Secrets backend
     eprintln!();
-    let secrets_config =
-        did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-            "did-hosting-control-secrets",
-            "webvh",
-        )
-        .await
-        .map_err(|e| AppError::Config(e.to_string()))?;
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "did-hosting-control-secrets",
+        "webvh",
+    )
+    .await
+    .map_err(|e| AppError::Config(e.to_string()))?;
 
     // 12. JWT signing key (always generated)
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
@@ -304,8 +303,9 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
 
         crate::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
@@ -328,7 +328,10 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         did_path
     );
     eprintln!("    3. Start the control plane:");
-    eprintln!("       did-hosting-control --config {}", output_path.display());
+    eprintln!(
+        "       did-hosting-control --config {}",
+        output_path.display()
+    );
     eprintln!();
 
     Ok(())
@@ -919,8 +922,9 @@ pub async fn run_setup_offline_complete(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
         crate::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  Admin ACL entry added for {admin_did}");

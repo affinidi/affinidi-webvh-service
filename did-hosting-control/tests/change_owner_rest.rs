@@ -21,20 +21,22 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use did_hosting_common::did_ops::{DidRecord, did_key, owner_key};
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
 use did_hosting_common::server::auth::session::{create_authenticated_session, now_epoch};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+};
 use did_hosting_control::auth::jwt::JwtKeys;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::server::AppState;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -119,8 +121,9 @@ async fn add_acl(state: &AppState, did: &str, role: Role) {
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,},
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
     )
     .await
     .expect("store acl");
@@ -159,7 +162,7 @@ async fn seed_did(state: &AppState, owner_did: &str, mnemonic: &str) {
         content_size: 42,
         disabled: false,
         deleted_at: None,
-    
+
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),

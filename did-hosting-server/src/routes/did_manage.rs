@@ -3,10 +3,10 @@ use crate::did_ops::{self, LogEntryInfo, LogMetadata};
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::watcher_push::{self, WatcherSyncStatus};
-use did_hosting_common::DidListEntry;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use did_hosting_common::DidListEntry;
 use serde::{Deserialize, Serialize};
 
 /// Strip leading slash from path-extracted mnemonics.

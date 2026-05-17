@@ -13,7 +13,7 @@ use did_hosting_common::server::setup_recipe::{
     refuse_overwrite, require_service, resolve_admin_did, resolve_secrets_config,
     run_uninstall_unchecked, run_vta_for_recipe, to_log_format,
 };
-use did_hosting_common::server::store::{KS_ACL};
+use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
 
@@ -317,8 +317,9 @@ pub async fn apply_recipe(
             created_at: now_epoch(),
             max_total_size: None,
             max_did_count: None,
-        
-            domains: did_hosting_common::server::domain::DomainScope::All,};
+
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        };
         store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  [setup-recipe] admin ACL entry added for {admin_did}");
@@ -398,9 +399,8 @@ pub async fn run_uninstall(config_path: &Path, yes: bool) -> Result<(), AppError
     })?;
 
     if !yes {
-        let confirmed = did_hosting_common::server::setup_recipe::prompt_uninstall_confirmation(
-            config_path,
-        )?;
+        let confirmed =
+            did_hosting_common::server::setup_recipe::prompt_uninstall_confirmation(config_path)?;
         if !confirmed {
             eprintln!("  Aborted (DELETE not entered).");
             return Ok(());

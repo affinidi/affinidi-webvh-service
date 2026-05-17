@@ -5,9 +5,11 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
+use did_hosting_common::server::domain::parse_trusted_cidrs;
+use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
+use ipnetwork::IpNetwork;
 
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
@@ -44,6 +46,10 @@ pub struct AppState {
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
     /// In-memory cache for DID content (did.jsonl). TTL-based eviction on read.
     pub did_cache: Arc<crate::cache::ContentCache>,
+    /// Parsed `server.trusted_proxy_cidrs` — peers inside this set
+    /// have their `Forwarded` / `X-Forwarded-Host` headers honoured
+    /// for request-host detection (multi-domain, T19/T21).
+    pub trusted_proxy_cidrs: Arc<Vec<IpNetwork>>,
 }
 
 impl AppState {
@@ -138,6 +144,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         Arc::new(collector)
     };
 
+    let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
+    if !bad_cidrs.is_empty() {
+        warn!(
+            bad_cidrs = ?bad_cidrs,
+            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
+        );
+    }
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -156,6 +170,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             .expect("failed to build HTTP client"),
         stats_collector: Some(stats_collector.clone()),
         did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
+        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
     };
 
     // Log startup configuration

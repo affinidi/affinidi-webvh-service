@@ -101,9 +101,8 @@ impl DidMethod for Web {
     }
 
     fn validate(&self, data: &[u8]) -> Result<(), MethodError> {
-        let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
-            MethodError::Validation(format!("did.json is not valid JSON: {e}"))
-        })?;
+        let v: serde_json::Value = serde_json::from_slice(data)
+            .map_err(|e| MethodError::Validation(format!("did.json is not valid JSON: {e}")))?;
         let id = v
             .get("id")
             .and_then(|x| x.as_str())
@@ -192,7 +191,10 @@ mod tests {
             .expect_err("did:webvh must reject");
         assert!(matches!(
             err,
-            MethodError::MethodMismatch { expected: "web", .. }
+            MethodError::MethodMismatch {
+                expected: "web",
+                ..
+            }
         ));
     }
 
@@ -255,9 +257,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_id() {
-        let err = Web
-            .validate(br#"{"foo":"bar"}"#)
-            .expect_err("must reject");
+        let err = Web.validate(br#"{"foo":"bar"}"#).expect_err("must reject");
         assert!(matches!(err, MethodError::Validation(_)));
         assert!(err.to_string().contains("missing `id` field"));
     }
@@ -284,7 +284,9 @@ mod tests {
     fn apply_update_overwrites_returns_new_bytes() {
         let existing = br#"{"id":"did:web:example.com","version":1}"#;
         let new_data = br#"{"id":"did:web:example.com","version":2}"#;
-        let out = Web.apply_update(Some(existing.as_slice()), new_data).unwrap();
+        let out = Web
+            .apply_update(Some(existing.as_slice()), new_data)
+            .unwrap();
         assert_eq!(out, new_data);
     }
 
@@ -295,7 +297,9 @@ mod tests {
         // overwrite semantics.
         let existing = b"GIBBERISH";
         let new_data = br#"{"id":"did:web:example.com"}"#;
-        let out = Web.apply_update(Some(existing.as_slice()), new_data).unwrap();
+        let out = Web
+            .apply_update(Some(existing.as_slice()), new_data)
+            .unwrap();
         assert_eq!(out, new_data);
     }
 

@@ -5,11 +5,11 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS, KS_WITNESSES};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::build_tdk_profile;
 use did_hosting_common::server::init;
+use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS, KS_WITNESSES};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::jwt::JwtKeys;

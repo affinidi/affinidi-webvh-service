@@ -1,10 +1,8 @@
-use webvh_witness::config::AppConfig;
-use webvh_witness::{
-    health, secret_store, server, setup, setup_recipe, store, witness_ops,
-};
-use did_hosting_common::server::store::{KS_WITNESSES};
 use clap::{Parser, Subcommand};
+use did_hosting_common::server::store::KS_WITNESSES;
 use std::path::PathBuf;
+use webvh_witness::config::AppConfig;
+use webvh_witness::{health, secret_store, server, setup, setup_recipe, store, witness_ops};
 
 #[derive(Parser)]
 #[command(name = "webvh-witness", about = "WebVH Witness Node", version)]

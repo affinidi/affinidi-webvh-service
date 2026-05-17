@@ -65,6 +65,7 @@ didwebvh-rs = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true, optional = true }
 hex = "0.4"
+ipnetwork = "0.21"
 jsonwebtoken = { workspace = true }
 multibase = { workspace = true }
 rand = { workspace = true }

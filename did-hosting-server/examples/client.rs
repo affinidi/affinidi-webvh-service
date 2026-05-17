@@ -1,7 +1,7 @@
-use did_hosting_common::WebVHClient;
-use did_hosting_common::did::generate_ed25519_identity;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use did_hosting_common::WebVHClient;
+use did_hosting_common::did::generate_ed25519_identity;
 use std::io::{self, Write};
 use tracing::info;
 

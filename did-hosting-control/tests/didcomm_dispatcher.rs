@@ -24,9 +24,11 @@ use std::sync::{Arc, OnceLock};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+};
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::server::AppState;
 
