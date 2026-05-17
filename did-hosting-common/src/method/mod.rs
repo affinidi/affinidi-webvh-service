@@ -39,6 +39,8 @@
 //! as small additions.
 
 pub mod parse;
+#[cfg(feature = "method-web")]
+pub mod web;
 #[cfg(feature = "method-webplus")]
 pub mod webplus;
 #[cfg(feature = "method-webs")]
@@ -171,12 +173,14 @@ pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
     // is enough — there's no per-call state.
     #[cfg(feature = "method-webvh")]
     static WEBVH: webvh::Webvh = webvh::Webvh;
-    // T24 will add: #[cfg(feature = "method-web")] static WEB: web::Web = web::Web;
+    #[cfg(feature = "method-web")]
+    static WEB: web::Web = web::Web;
 
     match name {
         #[cfg(feature = "method-webvh")]
         "webvh" => Some(&WEBVH),
-        // T24: #[cfg(feature = "method-web")] "web" => Some(&WEB),
+        #[cfg(feature = "method-web")]
+        "web" => Some(&WEB),
         _ => None,
     }
 }
@@ -194,7 +198,8 @@ pub fn enabled_methods() -> &'static [&'static str] {
     &[
         #[cfg(feature = "method-webvh")]
         "webvh",
-        // T24: #[cfg(feature = "method-web")] "web",
+        #[cfg(feature = "method-web")]
+        "web",
     ]
 }
 
@@ -270,12 +275,17 @@ mod tests {
         assert!(method_by_name("anything-not-a-method").is_none());
     }
 
+    #[cfg(feature = "method-web")]
+    #[test]
+    fn dispatcher_routes_web() {
+        let m = method_by_name("web").expect("web feature enabled in default build");
+        assert_eq!(m.name(), "web");
+        assert_eq!(m.content_type(), "application/did+json");
+    }
+
     #[cfg(not(feature = "method-web"))]
     #[test]
     fn dispatcher_returns_none_for_web_when_feature_off() {
-        // T24 wires the "web" arm. Until then, method-web is feature-
-        // scaffolded but unimplemented — method_by_name returns None
-        // regardless of whether the feature is enabled or not.
         assert!(method_by_name("web").is_none());
     }
 
@@ -283,6 +293,12 @@ mod tests {
     #[test]
     fn enabled_methods_contains_webvh() {
         assert!(enabled_methods().contains(&"webvh"));
+    }
+
+    #[cfg(feature = "method-web")]
+    #[test]
+    fn enabled_methods_contains_web() {
+        assert!(enabled_methods().contains(&"web"));
     }
 
     #[cfg(not(any(feature = "method-webvh", feature = "method-web")))]

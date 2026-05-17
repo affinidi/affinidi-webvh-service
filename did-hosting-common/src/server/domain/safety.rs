@@ -177,6 +177,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_host_web() {
+        let host = extract_did_host("did:web:example.com:user1").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_web_no_path() {
+        let host = extract_did_host("did:web:example.com").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
     fn extract_host_malformed_rejects() {
         for bad in ["not-a-did", "did:", "did::body", "did:webvh:onlyone"] {
             let err = extract_did_host(bad).expect_err(bad);
