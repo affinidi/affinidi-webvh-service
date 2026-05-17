@@ -356,6 +356,7 @@ async fn do_domain_assign(
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::assignment::{AssignOutcome, assign};
     use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::pending_purge::{self, CancelOutcome};
 
     let role = check_acl(&state.acl_ks, sender)
         .await
@@ -388,6 +389,22 @@ async fn do_domain_assign(
         AssignOutcome::Existing(_) => ("already_assigned", "domain re-assign no-op"),
     };
 
+    // T30: re-assign within the grace window cancels any pending
+    // purge. Audit-log the cancellation so an operator can answer
+    // "did my data survive the unassign / re-assign round trip?".
+    let cancelled = pending_purge::cancel(&state.store, &domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let CancelOutcome::Removed(prev) = cancelled {
+        info!(
+            did = sender,
+            domain = %domain,
+            scheduled_at = prev.scheduled_at,
+            grace_seconds = prev.grace_seconds,
+            "domain re-assign cancelled pending purge — data retained"
+        );
+    }
+
     info!(
         did = sender,
         domain = %domain,
@@ -408,6 +425,7 @@ async fn do_domain_unassign(
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
     use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::pending_purge::{self, parse_grace_string};
 
     let role = check_acl(&state.acl_ks, sender)
         .await
@@ -438,6 +456,53 @@ async fn do_domain_unassign(
         UnassignOutcome::Removed(_) => ("unassigned", "domain unassigned"),
         UnassignOutcome::Missing => ("not_assigned", "domain unassign no-op"),
     };
+
+    // T30: schedule a grace-period purge. Idempotent — overwriting an
+    // existing pending purge just resets the timer, which is the
+    // right behaviour for "operator unassigned, then unassigned
+    // again". Stops at the schedule step here; the actual purge sweep
+    // (which deletes DID records whose domain matches) lands in T30's
+    // follow-up.
+    if matches!(outcome, UnassignOutcome::Removed(_)) {
+        // Source the grace from `config.hosting.unassigned_purge_grace`.
+        // A misconfigured / unparseable value defaults to 2h and emits
+        // a warn — the server keeps working with a sensible default
+        // rather than failing the unassign entirely.
+        let grace_seconds = parse_grace_string(&state.config.hosting.unassigned_purge_grace)
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    config = %state.config.hosting.unassigned_purge_grace,
+                    "unassigned_purge_grace unparseable; defaulting to 2h"
+                );
+                2 * 60 * 60
+            });
+        let now = crate::auth::session::now_epoch();
+        if let Err(e) = pending_purge::schedule(
+            &state.store,
+            &domain,
+            now,
+            grace_seconds,
+            "grace-expired",
+            sender,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                domain = %domain,
+                "failed to schedule pending purge; domain is unassigned but \
+                 data retention is unbounded until manual cleanup"
+            );
+        } else {
+            info!(
+                did = sender,
+                domain = %domain,
+                grace_seconds,
+                "pending purge scheduled"
+            );
+        }
+    }
 
     info!(
         did = sender,

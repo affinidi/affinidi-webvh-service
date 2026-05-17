@@ -17,6 +17,7 @@ pub mod mnemonic;
 pub mod operator_messages;
 #[cfg(feature = "passkey")]
 pub mod passkey;
+pub mod pending_purge;
 pub mod problem_report;
 pub mod secret_store;
 #[cfg(feature = "setup-wizard")]

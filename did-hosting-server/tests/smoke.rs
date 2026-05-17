@@ -55,6 +55,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         log: LogConfig::default(),
         store: store_config.clone(),
         auth: AuthConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),

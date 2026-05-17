@@ -202,6 +202,7 @@ impl DaemonConfig {
             log: self.log.clone(),
             store: self.store.clone(),
             auth: self.auth.clone(),
+            hosting: self.hosting.clone(),
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
             watchers: self.watchers.clone(),

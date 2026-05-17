@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
-    VtaConfig,
+    AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
+    StoreConfig, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,6 +23,13 @@ pub struct AppConfig {
     pub store: StoreConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Multi-domain hosting (bootstrap_domains + unassigned_purge_grace).
+    /// Daemon mode already exposes this via its own DaemonConfig; the
+    /// standalone server gains it here so T28's unassignment handler
+    /// (which lives in `did-hosting-server::messaging`) can read the
+    /// grace duration uniformly.
+    #[serde(default)]
+    pub hosting: HostingConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
     #[serde(default)]

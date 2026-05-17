@@ -235,6 +235,7 @@ pub async fn apply_recipe(
             ..StoreConfig::default()
         },
         auth: AuthConfig::default(),
+        hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config.clone(),
         limits: LimitsConfig::default(),
         watchers: Vec::new(),

@@ -251,6 +251,7 @@ pub async fn run_wizard(
             ..StoreConfig::default()
         },
         auth: AuthConfig::default(),
+        hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config,
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
@@ -743,6 +744,7 @@ pub async fn run_setup_offline_complete(
             ..StoreConfig::default()
         },
         auth: AuthConfig::default(),
+        hosting: crate::config::HostingConfig::default(),
         secrets: state.secrets.clone(),
         limits: LimitsConfig::default(),
         watchers: Vec::new(),
