@@ -422,6 +422,40 @@ pub async fn send_domain_assign(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
+/// Send `MSG_DOMAIN_PURGE { domain }` to a specific server. Bypasses
+/// the grace period — the server deletes every DID on the domain
+/// immediately. Use sparingly: the audit-log records this as
+/// `reason: "admin-immediate"`.
+pub async fn send_domain_purge(
+    state: &AppState,
+    target_did: &str,
+    domain: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let svc = state
+        .didcomm_service
+        .get()
+        .ok_or("DIDComm service not initialised")?;
+    let control_did = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or("control plane has no server_did configured")?;
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_DOMAIN_PURGE.to_string(),
+        json!({ "domain": domain }),
+    )
+    .from(control_did.to_string())
+    .to(target_did.to_string())
+    .created_time(now_epoch())
+    .finalize();
+
+    svc.send_message("control", msg, target_did)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
 /// Send `MSG_DOMAIN_UNASSIGN { domain }` to a specific server. Same
 /// retry / idempotency semantics as [`send_domain_assign`].
 pub async fn send_domain_unassign(

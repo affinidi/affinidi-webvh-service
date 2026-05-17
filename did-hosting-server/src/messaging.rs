@@ -40,6 +40,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
         .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
         .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
+        .route(MSG_DOMAIN_PURGE, handler_fn(handle_domain_purge))?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -514,6 +515,85 @@ async fn do_domain_unassign(
     Ok((
         MSG_DOMAIN_UNASSIGN_ACK.to_string(),
         json!({ "domain": domain, "status": status }),
+    ))
+}
+
+async fn handle_domain_purge(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_purge(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+/// Handle `MSG_DOMAIN_PURGE` — admin "Purge now" Trust Task.
+///
+/// Bypasses the grace period and immediately deletes every DID
+/// record on the named domain. The unassignment must already have
+/// happened (the domain is removed from KS_ASSIGNMENTS); admins can
+/// run an explicit unassign-then-purge sequence, or purge a domain
+/// whose grace timer is still running. Either way the pending
+/// purge entry (if any) is cleared after the synchronous purge.
+async fn do_domain_purge(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::domain_purge::purge_domain_dids;
+    use did_hosting_common::server::pending_purge;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/purge rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain purge",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/purge")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Clear any pending purge — the synchronous purge supersedes it.
+    let _ = pending_purge::cancel(&state.store, &domain).await;
+
+    info!(
+        did = sender,
+        domain = %domain,
+        deleted = report.deleted,
+        skipped_no_domain = report.skipped_no_domain,
+        skipped_other_domain = report.skipped_other_domain,
+        "domain purged via admin Purge Now"
+    );
+
+    Ok((
+        MSG_DOMAIN_PURGE_ACK.to_string(),
+        json!({
+            "domain": domain,
+            "deleted": report.deleted,
+            "skipped_no_domain": report.skipped_no_domain,
+        }),
     ))
 }
 

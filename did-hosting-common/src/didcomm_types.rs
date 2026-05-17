@@ -87,3 +87,11 @@ pub const MSG_DOMAIN_ASSIGN: &str = "https://affinidi.com/webvh/1.0/domain/assig
 pub const MSG_DOMAIN_ASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/assign-ack";
 pub const MSG_DOMAIN_UNASSIGN: &str = "https://affinidi.com/webvh/1.0/domain/unassign";
 pub const MSG_DOMAIN_UNASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/unassign-ack";
+
+/// Admin "Purge now" Trust Task (T30). Bypasses the grace period
+/// scheduled by an unassignment and deletes every DID on the named
+/// domain immediately. The receiving server audit-logs the reason as
+/// `admin-immediate` so a compliance audit can distinguish a normal
+/// grace-expired purge from an admin-triggered one.
+pub const MSG_DOMAIN_PURGE: &str = "https://affinidi.com/webvh/1.0/domain/purge";
+pub const MSG_DOMAIN_PURGE_ACK: &str = "https://affinidi.com/webvh/1.0/domain/purge-ack";

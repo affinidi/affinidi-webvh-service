@@ -191,6 +191,39 @@ pub async fn unassign_domain_from_server(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Admin "Purge now" — T30. Pushes `domain/purge/1.0` to a server,
+/// bypassing the unassignment grace and deleting every DID on the
+/// named domain immediately. Returns 202 since the server's ack is
+/// asynchronous.
+pub async fn purge_domain_on_server(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path((instance_id, domain)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let instance = registry::get_instance(&state.registry_ks, &instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
+    let target_did = instance
+        .metadata
+        .get("did")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "instance {instance_id} has no `did` in metadata; cannot push DIDComm",
+            ))
+        })?;
+    crate::server_push::send_domain_purge(&state, target_did, &domain)
+        .await
+        .map_err(|e| AppError::Internal(format!("send_domain_purge failed: {e}")))?;
+    info!(
+        instance_id = %instance_id,
+        domain = %domain,
+        target_did,
+        "MSG_DOMAIN_PURGE pushed to server (admin Purge Now)"
+    );
+    Ok(StatusCode::ACCEPTED)
+}
+
 // ---------- POST /api/control/register-service ----------
 
 /// Request body for `POST /api/control/register-service`.

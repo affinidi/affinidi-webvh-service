@@ -38,6 +38,11 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/registry/{instance_id}/domains/{domain}/unassign",
             post(registry::unassign_domain_from_server),
         )
+        // T30: admin "Purge now". Bypasses the grace period.
+        .route(
+            "/registry/{instance_id}/domains/{domain}/purge",
+            post(registry::purge_domain_on_server),
+        )
         .route("/register-service", post(registry::register_service));
 
     // Upload routes with a custom body-size limit (DID log + witness).
