@@ -299,14 +299,21 @@ Acceptance:
 
 ### 9.3 Phase M2 — `did:web` method
 
-**Audit first**, then formalise. The existing `serve_did_web()` at `webvh-server/src/routes/did_public.rs:182` already serves did:web in a best-effort form. Phase M2 audits it, then implements `methods/web.rs` (parser, validator, apply_update) and **wraps** the existing handler through the `DidMethod` trait (or removes it and replaces with a trait-routed equivalent — decision made in audit). Add `GET /.well-known/did.json` as the new no-path arm. Generalise `/api/dids/register` body to `did_data`.
+**Audit first**, then formalise. T23 audit findings (commit history; landed alongside this commit): the existing `serve_did_web()` at `did-hosting-server/src/routes/did_public.rs:76` is **not** a standalone did:web handler — it's a **did:webvh → did:web bridge**. It reads the same `content_log_key(mnemonic)` jsonl that did:webvh resolution uses, then extracts a did:web-shaped snapshot via `did_ops::extract_did_web_document` matched against the document's `alsoKnownAs`. It exists so a tenant who hosts did:webvh can also expose a did:web view for cross-compatibility with older resolvers.
+
+T24's `methods/web.rs` (this release) is a **separate**, standalone did:web — overwrite semantics, no jsonl backing, independent storage. Both paths must coexist:
+
+- **Tenant has did:webvh AND wants a did:web view** → existing bridge (`serve_did_web`).
+- **Tenant only wants did:web** (no log, simpler storage) → T24's `methods/web.rs` via the trait-routed path that lands with T25.
+
+The dispatch decision at request time will be made by T25's per-method route registration based on the stored `DidRecord`'s method tag (T12). Until T25 ships, the existing bridge keeps serving `*/did.json` requests; the trait-routed path is a separate write surface (`Web::apply_update`) with its own future read path. **Decision: wrap, don't remove.**
 
 Acceptance:
-- Audit recorded in PR description: what the existing handler does, what its callers expect, decision recorded (wrap vs replace).
+- Audit recorded inline at `did_public.rs:71-104` rustdoc + this spec section.
 - New DID created via `POST /api/dids/register` with `method = "web"` resolves at `/{path}/did.json`.
 - No-path did:web (`__root` mnemonic) resolves at `/.well-known/did.json`.
 - Method-mismatch between `did_data.id` and `method` field rejects with 400.
-- Existing did:web call paths unchanged in observable behaviour.
+- Existing did:webvh-bridged did:web call paths unchanged in observable behaviour.
 
 ### 9.4 Phase M3 — UX (method-aware)
 

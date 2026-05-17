@@ -73,6 +73,37 @@ async fn serve_content(
 /// Loads the JSONL log, constructs the expected `did:web` identifier,
 /// checks `alsoKnownAs`, and returns the rewritten DID document with
 /// `application/did+json` content type.
+///
+/// ## T23 audit — relationship to `crate::method::web::Web`
+///
+/// This handler predates the multi-method work (T10/T24) and is a
+/// **did:webvh → did:web bridge**: the underlying storage is the
+/// same `content_log_key(mnemonic)` jsonl that `serve_public` reads
+/// for did:webvh, and `extract_did_web_document` finds a did:web-
+/// shaped snapshot inside the log entries (matched against the
+/// document's `alsoKnownAs` field).
+///
+/// `crate::method::web::Web` (T24) is a **separate** path: a
+/// standalone did:web method with its own apply_update (overwrite
+/// semantics), no log, independent of any webvh storage. Both paths
+/// must coexist:
+///
+/// - **Tenant has did:webvh AND wants a did:web view** (e.g. cross-
+///   compat with older resolvers) → existing bridge here.
+/// - **Tenant only wants did:web** (no log, simpler storage) →
+///   T24's `methods/web.rs` via the trait-routed path that lands
+///   with T25.
+///
+/// The dispatch decision at request time will be made by T25's
+/// per-method route registration based on the stored `DidRecord`'s
+/// method tag (T12). Until T25 ships, this handler keeps serving
+/// `*/did.json` requests; the trait-routed path is a separate write
+/// surface (`Web::apply_update`) with its own future read path.
+///
+/// Decision: **wrap, don't remove.** The semantics are different
+/// enough that a single handler would either lose the dual-view
+/// behaviour or grow a method-discriminator branch. Two handlers
+/// with clear names is cleaner.
 async fn serve_did_web(state: &AppState, mnemonic: &str) -> Result<Response, AppError> {
     // Check if the DID is disabled
     if let Some(record) = state
