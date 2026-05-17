@@ -967,11 +967,17 @@ async fn run_daemon_storage_task(
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
     let mut flush_timer = tokio::time::interval(flush_interval);
+    // T30 background purge sweep — 60s tick, processes ripe pending
+    // entries (unassign-then-wait-grace) by deleting matching DID
+    // records and clearing the pending entry.
+    let mut purge_timer =
+        tokio::time::interval(did_hosting_server::purge_sweep::DEFAULT_SWEEP_INTERVAL);
 
     // Skip first ticks (immediate)
     session_timer.tick().await;
     did_timer.tick().await;
     flush_timer.tick().await;
+    purge_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -1007,6 +1013,12 @@ async fn run_daemon_storage_task(
                     &params.store,
                 ).await {
                     warn!("stats flush error: {e}");
+                }
+            }
+            _ = purge_timer.tick() => {
+                let purged = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
+                if purged > 0 {
+                    info!(count = purged, "purge sweep tick completed");
                 }
             }
             _ = shutdown_rx.changed() => {
