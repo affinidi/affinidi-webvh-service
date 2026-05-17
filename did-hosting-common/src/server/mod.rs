@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod assignment;
 pub mod auth;
 pub mod cli_acl;
 pub mod config;

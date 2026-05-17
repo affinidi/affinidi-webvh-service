@@ -26,7 +26,8 @@ use crate::server::AppState;
 /// Build the DIDComm router for the WebVH server.
 ///
 /// Handles only sync messages from the control plane (sync-update,
-/// sync-delete). VTA provisioning is handled by the control plane.
+/// sync-delete) and domain assignment messages (assign / unassign,
+/// T28). VTA provisioning is handled by the control plane.
 pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceError> {
     Ok(Router::new()
         .extension(state)
@@ -37,6 +38,8 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
+        .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
+        .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -302,6 +305,150 @@ async fn do_sync_delete(
     Ok((
         MSG_SYNC_DELETE_ACK.to_string(),
         json!({ "mnemonic": mnemonic, "status": "deleted" }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Domain assignment (T28, control plane → server)
+// ---------------------------------------------------------------------------
+//
+// The control plane is the source of truth for which domains a server
+// hosts. Both handlers are idempotent — re-assigning an already-
+// assigned domain or unassigning an unknown domain returns a status
+// ack rather than an error. Only Admin or Service-role callers are
+// allowed; an ACL'd Service role is what the control-plane DID gets
+// at register time (see `control_register::run`).
+
+async fn handle_domain_assign(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_assign(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn handle_domain_unassign(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_unassign(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+async fn do_domain_assign(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment::{AssignOutcome, assign};
+    use did_hosting_common::server::domain::normalize_domain_name;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/assign rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain assignment",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/assign")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let now = crate::auth::session::now_epoch();
+    let outcome = assign(&state.store, &domain, sender, now)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (status, log_msg) = match &outcome {
+        AssignOutcome::Created(_) => ("assigned", "domain assigned"),
+        AssignOutcome::Existing(_) => ("already_assigned", "domain re-assign no-op"),
+    };
+
+    info!(
+        did = sender,
+        domain = %domain,
+        status,
+        "{log_msg}"
+    );
+
+    Ok((
+        MSG_DOMAIN_ASSIGN_ACK.to_string(),
+        json!({ "domain": domain, "status": status }),
+    ))
+}
+
+async fn do_domain_unassign(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
+    use did_hosting_common::server::domain::normalize_domain_name;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/unassign rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain unassignment",
+        ));
+    }
+
+    let domain_raw = msg
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'domain' in domain/unassign")?;
+    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    let outcome = unassign(&state.store, &domain)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (status, log_msg) = match &outcome {
+        UnassignOutcome::Removed(_) => ("unassigned", "domain unassigned"),
+        UnassignOutcome::Missing => ("not_assigned", "domain unassign no-op"),
+    };
+
+    info!(
+        did = sender,
+        domain = %domain,
+        status,
+        "{log_msg}"
+    );
+
+    Ok((
+        MSG_DOMAIN_UNASSIGN_ACK.to_string(),
+        json!({ "domain": domain, "status": status }),
     ))
 }
 

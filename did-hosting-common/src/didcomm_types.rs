@@ -69,3 +69,21 @@ pub const MSG_SYNC_DELETE_ACK: &str = "https://affinidi.com/webvh/1.0/did/sync-d
 
 pub const MSG_STATS_SYNC: &str = "https://affinidi.com/webvh/1.0/server/stats-sync";
 pub const MSG_STATS_ACK: &str = "https://affinidi.com/webvh/1.0/server/stats-ack";
+
+// ---------------------------------------------------------------------------
+// Domain assignment (control plane → server, T28)
+// ---------------------------------------------------------------------------
+//
+// The control plane is the source of truth for which domains a server
+// hosts. It pushes `MSG_DOMAIN_ASSIGN` to claim a domain on a
+// registered server and `MSG_DOMAIN_UNASSIGN` to release it. Both are
+// idempotent — re-assigning an already-assigned domain or
+// unassigning an already-unassigned one is a no-op (no audit-log
+// noise). The unassign side queues a `pending_purges` entry; the
+// actual content purge runs in the background sweep (T30) after the
+// configured grace period.
+
+pub const MSG_DOMAIN_ASSIGN: &str = "https://affinidi.com/webvh/1.0/domain/assign";
+pub const MSG_DOMAIN_ASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/assign-ack";
+pub const MSG_DOMAIN_UNASSIGN: &str = "https://affinidi.com/webvh/1.0/domain/unassign";
+pub const MSG_DOMAIN_UNASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/unassign-ack";

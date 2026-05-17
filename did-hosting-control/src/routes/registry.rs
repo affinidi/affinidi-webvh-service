@@ -119,6 +119,78 @@ pub async fn health_check(
     Ok(Json(updated))
 }
 
+// ---------- POST /api/control/registry/{instance_id}/domains/{domain}/assign ----------
+// ---------- DELETE /api/control/registry/{instance_id}/domains/{domain} ----------
+
+/// Admin trigger for `MSG_DOMAIN_ASSIGN` (T28).
+///
+/// Looks up the server instance, extracts its DID from metadata, and
+/// pushes a `domain/assign/1.0` DIDComm message via the mediator.
+/// Returns 202 Accepted on successful send (the server's ack is
+/// asynchronous and idempotent — the operator's view of "did it
+/// stick?" comes from the server's reported `served_domains` on its
+/// next registration cycle).
+pub async fn assign_domain_to_server(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path((instance_id, domain)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let instance = registry::get_instance(&state.registry_ks, &instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
+    let target_did = instance
+        .metadata
+        .get("did")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "instance {instance_id} has no `did` in metadata; cannot push DIDComm",
+            ))
+        })?;
+    crate::server_push::send_domain_assign(&state, target_did, &domain)
+        .await
+        .map_err(|e| AppError::Internal(format!("send_domain_assign failed: {e}")))?;
+    info!(
+        instance_id = %instance_id,
+        domain = %domain,
+        target_did,
+        "MSG_DOMAIN_ASSIGN pushed to server"
+    );
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Admin trigger for `MSG_DOMAIN_UNASSIGN` (T28). Same semantics as
+/// [`assign_domain_to_server`] — fire-and-forget DIDComm push, server
+/// acks asynchronously, idempotent on the server side.
+pub async fn unassign_domain_from_server(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path((instance_id, domain)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let instance = registry::get_instance(&state.registry_ks, &instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
+    let target_did = instance
+        .metadata
+        .get("did")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "instance {instance_id} has no `did` in metadata; cannot push DIDComm",
+            ))
+        })?;
+    crate::server_push::send_domain_unassign(&state, target_did, &domain)
+        .await
+        .map_err(|e| AppError::Internal(format!("send_domain_unassign failed: {e}")))?;
+    info!(
+        instance_id = %instance_id,
+        domain = %domain,
+        target_did,
+        "MSG_DOMAIN_UNASSIGN pushed to server"
+    );
+    Ok(StatusCode::ACCEPTED)
+}
+
 // ---------- POST /api/control/register-service ----------
 
 /// Request body for `POST /api/control/register-service`.

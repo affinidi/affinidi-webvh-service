@@ -27,6 +27,17 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/registry/{instance_id}/health",
             post(registry::health_check),
         )
+        // T28: admin-triggered domain assignment to a specific server.
+        // Both routes are fire-and-forget DIDComm pushes; the server's
+        // ack flows back asynchronously. Idempotent on the server side.
+        .route(
+            "/registry/{instance_id}/domains/{domain}/assign",
+            post(registry::assign_domain_to_server),
+        )
+        .route(
+            "/registry/{instance_id}/domains/{domain}/unassign",
+            post(registry::unassign_domain_from_server),
+        )
         .route("/register-service", post(registry::register_service));
 
     // Upload routes with a custom body-size limit (DID log + witness).

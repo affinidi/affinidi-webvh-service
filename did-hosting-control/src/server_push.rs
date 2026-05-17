@@ -383,6 +383,77 @@ async fn send_sync_delete(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
+// ---------------------------------------------------------------------------
+// Domain assignment push (T28)
+// ---------------------------------------------------------------------------
+
+/// Send `MSG_DOMAIN_ASSIGN { domain }` to a specific server. Returns
+/// `Err` when the DIDComm service is unavailable or the send fails;
+/// the caller decides whether to retry or surface the failure. The
+/// server-side handler is idempotent (T28 spec §3), so a retry after
+/// a transient mediator outage is safe.
+pub async fn send_domain_assign(
+    state: &AppState,
+    target_did: &str,
+    domain: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let svc = state
+        .didcomm_service
+        .get()
+        .ok_or("DIDComm service not initialised")?;
+    let control_did = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or("control plane has no server_did configured")?;
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_DOMAIN_ASSIGN.to_string(),
+        json!({ "domain": domain }),
+    )
+    .from(control_did.to_string())
+    .to(target_did.to_string())
+    .created_time(now_epoch())
+    .finalize();
+
+    svc.send_message("control", msg, target_did)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+/// Send `MSG_DOMAIN_UNASSIGN { domain }` to a specific server. Same
+/// retry / idempotency semantics as [`send_domain_assign`].
+pub async fn send_domain_unassign(
+    state: &AppState,
+    target_did: &str,
+    domain: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let svc = state
+        .didcomm_service
+        .get()
+        .ok_or("DIDComm service not initialised")?;
+    let control_did = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or("control plane has no server_did configured")?;
+
+    let msg = Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_DOMAIN_UNASSIGN.to_string(),
+        json!({ "domain": domain }),
+    )
+    .from(control_did.to_string())
+    .to(target_did.to_string())
+    .created_time(now_epoch())
+    .finalize();
+
+    svc.send_message("control", msg, target_did)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
 /// Retry a send operation with exponential backoff.
 async fn send_with_retry<F, Fut, E>(make_future: F, max_retries: u32) -> Result<(), E>
 where
