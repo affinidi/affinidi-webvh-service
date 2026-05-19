@@ -30,7 +30,7 @@ pub struct AppConfig {
     pub vta: VtaConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
-    /// Trust Tasks (v0.7.1+) configuration.
+    /// Trust Tasks (v0.7.0+) configuration.
     #[serde(default)]
     pub trust_tasks: TrustTasksConfig,
     #[serde(skip)]
@@ -39,7 +39,7 @@ pub struct AppConfig {
 
 /// Trust Tasks framework runtime knobs.
 ///
-/// Introduced in v0.7.1 with `enforce_proofs` defaulting to `false`
+/// Introduced in v0.7.0 with `enforce_proofs` defaulting to `false`
 /// so the new `POST /api/trust-tasks` surface accepts unsigned
 /// envelopes from clients (notably the Web UI, which has no
 /// browser-side signing infrastructure in this release). Operators
@@ -55,7 +55,7 @@ pub struct TrustTasksConfig {
     /// When `true`, dispatch passes the configured proof verifier
     /// (`state.trust_tasks_verifier`) to `dispatch_inbound`. Inbound
     /// non-bearer specs without a `proof` member are then rejected
-    /// with `proof_required`. When `false` (default in v0.7.1), the
+    /// with `proof_required`. When `false` (default in v0.7.0), the
     /// dispatcher runs in proof-optional mode: a present proof is
     /// ignored, an absent proof is accepted.
     #[serde(default)]

@@ -83,7 +83,7 @@ async fn handle_inner(
     // No auth check: discovery is non-authoritative metadata. SPEC.md
     // §11 + the spec's Privacy considerations note that a maintainer
     // MAY return a filtered subset (or no response) for unknown
-    // discoverers; for v0.7.1 we publish the full set. A future tighten
+    // discoverers; for v0.7.0 we publish the full set. A future tighten
     // (admin-only discovery) lands as a thin wrapper that checks the
     // ACL before calling registry().respond_to.
     let response = registry().respond_to(&doc.payload);

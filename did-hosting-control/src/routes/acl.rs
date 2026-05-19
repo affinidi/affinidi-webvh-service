@@ -1,9 +1,9 @@
 //! ACL management routes for the control plane.
 //!
-//! ## Deprecation notice (v0.7.1)
+//! ## Deprecation notice (v0.7.0)
 //!
 //! These four routes (`GET/POST /api/acl`, `PUT/DELETE /api/acl/{did}`)
-//! are **deprecated** as of v0.7.1 in favour of the new Trust Tasks
+//! are **deprecated** as of v0.7.0 in favour of the new Trust Tasks
 //! surface at `POST /api/trust-tasks`. Every response from this
 //! module carries:
 //!

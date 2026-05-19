@@ -1,6 +1,6 @@
-# Trust Tasks ACL — client migration guide (v0.7.1 → v0.8.0)
+# Trust Tasks ACL — client migration guide (v0.7.0 → v0.8.0)
 
-v0.7.1 introduces a new wire surface for ACL administration based on the
+v0.7.0 introduces a new wire surface for ACL administration based on the
 [Trust Tasks framework](https://trusttasks.org/). The legacy
 `GET/POST /api/acl`, `PUT/DELETE /api/acl/{did}` REST routes are
 **deprecated** and will be **removed in v0.8.0**.
@@ -44,8 +44,11 @@ maintainer-policy invariants the spec calls for:
   changes by another admin rather than silently overwriting.
 - **`acl/revoke`** has a *last-authority guard*: a revocation that
   would leave the maintainer with zero `Admin` entries is rejected
-  with `acl/revoke:last_authority_protected`. Same guard fires on
-  `acl/change-role` demoting the last admin.
+  with `acl/revoke:last_authority_protected`. The same invariant
+  fires on `acl/change-role` demoting the last admin and is reported
+  there as `acl/change-role:last_authority_protected` — the slug
+  matches the request's `type` so a client dispatching on
+  `payload.code` doesn't need to cross spec slugs.
 - **`acl/revoke`** supports *scope reduction*: with `payload.scopes`
   present, only the listed scopes are removed. webvh interprets each
   scope item as `domain:<name>` — items in any other shape are
@@ -166,21 +169,26 @@ the same envelope type.
 > [`Cargo.toml`](../Cargo.toml). The links in this document point at
 > the upstream GitHub source meanwhile.
 
-## Proof policy (v0.7.1)
+## Proof policy (v0.7.0)
 
 The framework spec marks `acl/grant`, `acl/revoke`, and
-`acl/change-role` as `proof: REQUIRED`. v0.7.1 ships a **config flag**
+`acl/change-role` as `proof: REQUIRED`. v0.7.0 ships a **config flag**
 that gates strict enforcement so the Web UI (no in-browser signing
 infrastructure today) keeps working:
 
 ```toml
 [trust_tasks]
-enforce_proofs = false   # default in v0.7.1
+enforce_proofs = false   # default in v0.7.0
 ```
 
-- `false` (default): a present `proof` is ignored; an absent `proof`
-  on a non-bearer spec is accepted. Bearer JWT (HTTPS) or authcrypt
-  (DIDComm) is the authentication source.
+- `false` (default): an absent `proof` is accepted (the transport's
+  bearer JWT or authcrypt-verified sender carries the caller's
+  identity end-to-end). A request that *does* carry a `proof`
+  member is rejected with `malformed_request` — a producer that
+  signed the envelope believed their signing key was authenticating
+  the request; silently dropping the proof would mislead them about
+  what's actually authoritative. Either omit the proof, or ask the
+  operator to enable enforcement.
 - `true`: the maintainer verifies a present `proof`; an absent
   `proof` on a non-bearer spec is rejected with `proof_required`.
 
@@ -238,7 +246,8 @@ Spec-extended codes (`acl/grant:role_change_required`,
 `acl/revoke:subject_not_present`,
 `acl/revoke:last_authority_protected`,
 `acl/change-role:state_mismatch`,
-`acl/change-role:role_not_recognized`) all map to HTTP **422
+`acl/change-role:role_not_recognized`,
+`acl/change-role:last_authority_protected`) all map to HTTP **422
 Unprocessable Entity** with the extended code carried in
 `payload.code` and structured context in `payload.details`. Parse
 `payload.code` for application-layer handling; the HTTP status is
@@ -276,7 +285,7 @@ note above).
 
 ## Sample client (TypeScript / browser)
 
-The webvh Web UI shipped in v0.7.1 uses the
+The webvh Web UI shipped in v0.7.0 uses the
 `api.createAcl/updateAcl/aclShow/deleteAcl/listAcl` methods which now
 internally POST trust-task envelopes. See
 `did-hosting-ui/lib/api.ts` for the reference TypeScript translator

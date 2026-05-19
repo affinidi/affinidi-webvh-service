@@ -477,7 +477,7 @@ export const api = {
   getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),
 
-  // ---- ACL via Trust Tasks (v0.7.1+) ----
+  // ---- ACL via Trust Tasks (v0.7.0+) ----
   //
   // The four methods below post to `/api/trust-tasks` carrying typed
   // `acl/*` envelopes. The wire shape comes from the registry at
@@ -491,7 +491,7 @@ export const api = {
   // on the server (deprecation-tagged); we no longer hit them from
   // the UI. They are removed in v0.8.0.
   //
-  // **Proofs**: v0.7.1 emits *unsigned* envelopes — the browser has
+  // **Proofs**: v0.7.0 emits *unsigned* envelopes — the browser has
   // no Data Integrity signing infrastructure today. The server's
   // bearer JWT auth establishes the caller's identity end-to-end on
   // the §4.8.1 transport channel. Operators with backend-only
@@ -662,7 +662,7 @@ export const api = {
     return entry;
   },
 
-  /** Single-entry lookup (v0.7.1). Returns `null` when the subject
+  /** Single-entry lookup (v0.7.0). Returns `null` when the subject
    * is not in the ACL — distinct from a server error. */
   aclShow: async (did: string): Promise<AclEntry | null> => {
     const resp = await trustTask<AclShowPayload, AclShowResponsePayload>(
@@ -855,7 +855,7 @@ export const api = {
 };
 
 // ---------------------------------------------------------------------------
-// Trust Tasks transport (v0.7.1+)
+// Trust Tasks transport (v0.7.0+)
 // ---------------------------------------------------------------------------
 
 /** Trust Tasks framework Type URI prefix. */

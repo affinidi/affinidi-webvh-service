@@ -75,6 +75,75 @@
   [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
   for migration guidance.
 
+### Hardening (review-driven)
+
+A multi-axis review of the trust-tasks adoption (security,
+correctness, tests, documentation) surfaced a set of issues; the
+fixes landed before the v0.7.0 cut. The wire shape and the
+operator-facing config didn't change — these are correctness +
+safety fixes.
+
+- **ACL writes serialise through a single global lock.** Without
+  this, two concurrent `acl/revoke` requests targeting the two
+  remaining Admins could each pass the last-authority guard (each
+  saw the *other* still present) and both commit, emptying the
+  Admin set. The new `acl_locks: PathLocks` on `AppState` is a
+  separate registry from the existing `path_locks` (which serialises
+  DID-mnemonic writes); the three ACL-write handlers (`grant`,
+  `change-role`, `revoke`) acquire one fixed key
+  (`ACL_WRITE_LOCK_KEY`) so the read-then-write critical section is
+  race-free across concurrent admins targeting different subjects.
+  `PathLocks` itself is hoisted from `did-hosting-control` into
+  `did-hosting-common::server::path_locks` so the dispatcher (in
+  the common crate) can construct one.
+- **`acl/grant` same-role regrant now persists metadata updates.**
+  The UI's `updateAcl` relies on "same-role grant = idempotent
+  metadata update" semantics; the previous implementation returned
+  the existing entry verbatim, silently dropping label/quota/domain
+  changes. The handler now merges the producer's non-role fields
+  onto the existing entry, preserves `created_at`, and persists
+  only when at least one field actually changed.
+- **`acl/change-role` last-authority code re-namespaced.** The
+  handler previously raised `acl/revoke:last_authority_protected`
+  on the change-role path — cross-slug. Now raises
+  `acl/change-role:last_authority_protected` (extended code per
+  SPEC.md §8.5) so the slug matches the request's `type` URI.
+- **`POST /api/trust-tasks` body is parsed by hand.** Replaces the
+  `axum::Json` extractor whose text/plain 400 violated the spec's
+  "malformed_request → `trust-task-error/0.1` document" contract.
+  Body-shape failures now emit the routed error document with the
+  spec-correct code.
+- **64 KB body limit** on `/api/trust-tasks` caps an
+  authenticated-Owner DoS class. Constant
+  `routes::TRUST_TASKS_BODY_LIMIT_BYTES`.
+- **`proof` carried with `enforce_proofs = false` is rejected, not
+  silently dropped.** A producer who signed the envelope believed
+  their signing key was authenticating; only the bearer JWT was. The
+  new `(Some(proof), None)` arm of `run_pipeline` returns
+  `malformed_request` with an operator-actionable message.
+- **`NoVerifier` is now an uninhabited `enum NoVerifier {}`.** The
+  previous unit-struct + panic-on-call carried the "bad call" risk
+  as a runtime trap; the enum makes `Some(&NoVerifier)`
+  uninstantiable.
+- **`acl/list` cursor encodes `last_seen` DID** instead of a
+  positional offset. Offset-based pagination skipped/repeated
+  entries across concurrent deletes; `last_seen` is stable. The
+  cursor stays opaque to consumers per spec.
+- **`acl/list` `domain:` filter matches `All`-scoped entries.**
+  `All` semantically operates on any domain; a "show me everyone
+  who can publish to alpha.example" query now correctly includes
+  `All`-scoped Admins.
+- **`Suppressed` outcome promoted to `error!` log** (was `warn!`).
+  The DIDComm gate `require_sender_did(true)` makes this branch
+  unreachable in practice; the `should_not_happen=true` field
+  surfaces an invariant violation to error dashboards if it ever
+  fires.
+- **Documentation fixes**: migration doc's worked example now
+  distinguishes the caller (admin) from the grant's subject
+  (alice); pre-publication crates.io links repointed at the
+  upstream GitHub source; orphan doc block on `dispatch_inbound`
+  attached.
+
 ### Known gap — Web UI emits unsigned envelopes
 
 The Web UI POSTs trust-task envelopes without a Data Integrity
@@ -87,7 +156,10 @@ framework's transport-derived-identity precedence (SPEC.md §4.8.1).
 v0.8.0 either ships the session-key protocol that lets the UI sign,
 or constrains the surface differently. Operators with backend-only
 callers (CLI, service-to-service) should flip
-`enforce_proofs = true`.
+`enforce_proofs = true`; the dispatcher will then enforce
+`proof_required` on a missing proof and `proof_invalid` on a
+failing verification, *and* will reject any envelope that carries a
+`proof` member while enforcement is disabled.
 
 ### Changed — **BREAKING**
 

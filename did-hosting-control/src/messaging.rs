@@ -61,7 +61,7 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
-        // Trust Tasks envelope (v0.7.1+) — routes the five `acl/*`
+        // Trust Tasks envelope (v0.7.0+) — routes the five `acl/*`
         // ops and `trust-task-discovery` through the same handlers
         // the HTTPS transport hits at `POST /api/trust-tasks`.
         .route(
@@ -880,7 +880,7 @@ fn map_app_error_code(err: &AppError) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Trust Tasks envelope handler (v0.7.1+)
+// Trust Tasks envelope handler (v0.7.0+)
 // ---------------------------------------------------------------------------
 
 /// DIDComm handler for the Trust Tasks envelope

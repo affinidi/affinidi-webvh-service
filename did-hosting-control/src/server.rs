@@ -45,7 +45,7 @@ pub struct AppState {
     /// lookups. `None` when `did_resolver` is unconfigured (e.g. a
     /// non-DIDComm deployment); in that case the trust-tasks pipeline
     /// runs in proof-optional mode — a present proof is ignored, a
-    /// REQUIRED proof on the spec is not enforced. v0.7.1 ships this
+    /// REQUIRED proof on the spec is not enforced. v0.7.0 ships this
     /// way for backwards compat; v0.8.0 makes the verifier mandatory
     /// for the strict-proof specs (`acl/grant`, `acl/revoke`,
     /// `acl/change-role`).
