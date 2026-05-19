@@ -903,7 +903,28 @@ async fn handle_trust_tasks_envelope(
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = require_sender(&ctx)?;
     info!(sender = sender, "inbound DIDComm: trust-tasks envelope");
+    match run_trust_tasks_envelope(&state, sender, &message).await? {
+        Some((response_type, response_body)) => Ok(Some(
+            DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+        )),
+        None => Ok(None),
+    }
+}
 
+/// Compute the wire-level `(response_type, response_body)` tuple for
+/// an inbound trust-tasks envelope. Extracted from
+/// `handle_trust_tasks_envelope` so the dispatch + body-parse +
+/// repack logic is testable without an `ATM`-backed
+/// [`HandlerContext`] — matches the pattern used by
+/// `run_authenticate` / `run_webvh_dispatch` above. Returns `None`
+/// for the SPEC.md §8.1 routing exception (identity-mismatch with no
+/// transport sender), which is unreachable on the dispatcher's
+/// `require_sender_did(true)` gate.
+pub(crate) async fn run_trust_tasks_envelope(
+    state: &AppState,
+    sender: &str,
+    message: &Message,
+) -> Result<Option<(String, Value)>, DIDCommServiceError> {
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
         Ok(d) => d,
         Err(e) => {
@@ -915,15 +936,11 @@ async fn handle_trust_tasks_envelope(
             // Mirror the routed-error pattern from the HTTPS
             // transport: build a `malformed_request` document and
             // pack it back inside the same envelope type so the
-            // sender sees a consistent error shape across
-            // transports.
+            // sender sees a consistent error shape across transports.
             let err_doc = body_parse_error(&e.to_string());
             let body =
                 serde_json::to_value(&err_doc).expect("trust-task-error/0.1 document serialises");
-            return Ok(Some(
-                DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)
-                    .thid(message.id.clone()),
-            ));
+            return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
         }
     };
 
@@ -971,8 +988,11 @@ async fn handle_trust_tasks_envelope(
         DispatchOutcome::Suppressed => {
             // §8.1 routing exception: don't emit any response. The
             // DIDComm service framework accepts `Ok(None)` as
-            // fire-and-forget.
-            warn!(
+            // fire-and-forget. Bumped to `error!` because the dispatcher
+            // is gated by `require_sender_did(true)` upstream — if we
+            // see this fire, the invariant has broken.
+            tracing::error!(
+                should_not_happen = true,
                 sender = sender,
                 "trust-tasks envelope: dispatch suppressed (identity_mismatch w/ no transport sender)"
             );
@@ -980,10 +1000,7 @@ async fn handle_trust_tasks_envelope(
         }
     };
 
-    Ok(Some(
-        DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)
-            .thid(message.id.clone()),
-    ))
+    Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)))
 }
 
 /// Build the same body-parse `trust-task-error/0.1` document that the
@@ -1968,5 +1985,152 @@ mod tests {
             .unwrap()
             .expect("record present");
         assert_eq!(record.owner, "did:example:admin");
+    }
+
+    // -----------------------------------------------------------------
+    // run_trust_tasks_envelope tests (v0.7.0)
+    //
+    // The DIDComm-side dispatch was previously uncovered because the
+    // outer `handle_trust_tasks_envelope` takes `HandlerContext`, which
+    // an in-process test can't build. The `run_*` extraction lets us
+    // exercise the unpack + dispatch + repack logic without an
+    // ATM-backed context.
+    // -----------------------------------------------------------------
+
+    fn build_grant_envelope(issuer_did: &str, subject: &str, role: &str) -> Message {
+        use trust_tasks_rs::specs::acl::grant::v0_1 as grant;
+        let entry = grant::AclEntry {
+            subject: subject.into(),
+            role: role.into(),
+            scopes: vec![],
+            label: Some("test".into()),
+            created_at: None,
+            created_by: None,
+            updated_at: None,
+            updated_by: None,
+            expires_at: None,
+            ext: serde_json::from_value(json!({
+                "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
+            }))
+            .unwrap(),
+        };
+        let payload = grant::Payload {
+            entry,
+            ext: None,
+            reason: None,
+        };
+        let mut doc = trust_tasks_rs::TrustTask::for_payload(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            payload,
+        );
+        doc.issuer = Some(issuer_did.into());
+        doc.recipient = Some("did:webvh:test:control.example.com".into());
+        doc.issued_at = Some(chrono::Utc::now());
+
+        let body = serde_json::to_value(&doc).expect("envelope serialises");
+        build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, body)
+    }
+
+    #[tokio::test]
+    async fn trust_tasks_envelope_happy_path_grant_returns_handled_response() {
+        let (state, _dir) = test_state().await;
+        // Seed an Admin so the grant authorises.
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: "did:example:admin".into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = build_grant_envelope("did:example:admin", "did:web:alice.example", "owner");
+        let (resp_type, resp_body) =
+            super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
+                .await
+                .expect("dispatch returns Ok")
+                .expect("envelope produces a response");
+
+        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        let inner_type = resp_body["type"].as_str().unwrap();
+        assert!(
+            inner_type.ends_with("/acl/grant/0.1#response"),
+            "expected acl/grant response type, got {inner_type}"
+        );
+        assert_eq!(
+            resp_body["payload"]["entry"]["subject"],
+            "did:web:alice.example"
+        );
+
+        // Storage reflects the grant — the daemon-mode path persisted.
+        let stored: Option<AclEntry> = state
+            .acl_ks
+            .get(format!("acl:{}", "did:web:alice.example").into_bytes())
+            .await
+            .unwrap();
+        assert!(stored.is_some());
+    }
+
+    #[tokio::test]
+    async fn trust_tasks_envelope_malformed_inner_body_returns_routed_error() {
+        let (state, _dir) = test_state().await;
+        // Body is a valid JSON value but not a TrustTask document.
+        let msg = build_msg(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            json!({"not": "a-trust-task"}),
+        );
+        let (resp_type, resp_body) =
+            super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
+                .await
+                .expect("dispatch returns Ok")
+                .expect("malformed body emits an error doc");
+
+        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        assert_eq!(
+            resp_body["type"].as_str().unwrap(),
+            "https://trusttasks.org/spec/trust-task-error/0.1"
+        );
+        assert_eq!(resp_body["payload"]["code"], "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn trust_tasks_envelope_returns_none_when_server_did_unconfigured() {
+        // server_did = None — the dispatch can't run §7.2 recipient
+        // enforcement and bubbles a DIDCommServiceError::Internal.
+        let (mut state, _dir) = test_state().await;
+        let cfg = AppConfig {
+            features: state.config.features.clone(),
+            server_did: None,
+            mediator_did: None,
+            public_url: state.config.public_url.clone(),
+            did_hosting_url: state.config.did_hosting_url.clone(),
+            server: state.config.server.clone(),
+            log: state.config.log.clone(),
+            store: state.config.store.clone(),
+            auth: state.config.auth.clone(),
+            secrets: state.config.secrets.clone(),
+            vta: state.config.vta.clone(),
+            registry: state.config.registry.clone(),
+            trust_tasks: state.config.trust_tasks.clone(),
+            config_path: state.config.config_path.clone(),
+        };
+        state.config = Arc::new(cfg);
+
+        let msg = build_grant_envelope("did:example:admin", "did:web:alice.example", "owner");
+        let err = super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
+            .await
+            .expect_err("missing server_did should fail");
+        match err {
+            DIDCommServiceError::Internal(msg) => {
+                assert!(msg.contains("server_did"), "operator-actionable: {msg}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
     }
 }

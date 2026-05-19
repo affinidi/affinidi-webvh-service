@@ -346,6 +346,47 @@ mod tests {
             .with_peer(peer.to_string())
     }
 
+    /// Stub verifier that accepts every proof. Used to exercise the
+    /// `enforce_proofs = true` happy-path branch in `run_pipeline`.
+    struct AlwaysOkVerifier;
+    #[async_trait::async_trait]
+    impl ProofVerifier for AlwaysOkVerifier {
+        async fn verify<P>(&self, _doc: &TrustTask<P>) -> Result<(), VerificationError>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            Ok(())
+        }
+    }
+
+    /// Stub verifier that rejects every proof with `SignatureInvalid`.
+    /// Used to exercise the `proof_invalid` rejection branch.
+    struct AlwaysErrVerifier;
+    #[async_trait::async_trait]
+    impl ProofVerifier for AlwaysErrVerifier {
+        async fn verify<P>(&self, _doc: &TrustTask<P>) -> Result<(), VerificationError>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            Err(VerificationError::SignatureInvalid)
+        }
+    }
+
+    /// Add a minimal stub `proof` member to a grant request so the
+    /// pipeline takes the verifier path. The proof shape isn't
+    /// validated by the stub verifiers — we just need it present.
+    fn add_stub_proof(doc: &mut TrustTask<grant::Payload>) {
+        doc.proof = Some(trust_tasks_rs::Proof {
+            proof_type: "DataIntegrityProof".into(),
+            cryptosuite: "eddsa-rdfc-2022".into(),
+            verification_method: "did:web:admin.example#key-1".into(),
+            created: chrono::Utc::now(),
+            proof_purpose: "assertionMethod".into(),
+            proof_value: "z-stub".into(),
+            extra: Default::default(),
+        });
+    }
+
     #[tokio::test]
     async fn fresh_grant_inserts_and_returns_realized_entry() {
         let (_store, acl_ks) = harness().await;
@@ -630,6 +671,116 @@ mod tests {
             alice_entries.len(),
             1,
             "race produced duplicate entries: {alice_entries:?}"
+        );
+    }
+
+    /// `enforce_proofs = true` + present proof + verifier accepts →
+    /// the grant lands. Exercises the `(Some(proof), Some(v))`
+    /// happy-path branch of `run_pipeline`.
+    #[tokio::test]
+    async fn enforce_proofs_with_valid_proof_grant_lands() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        add_stub_proof(&mut doc);
+
+        let outcome = handle(&ctx, &transport, Some(&AlwaysOkVerifier), doc).await;
+        assert!(matches!(outcome, DispatchOutcome::Handled(_)));
+        assert!(
+            acl::get_acl_entry(&acl_ks, ALICE_DID)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// `enforce_proofs = true` + present proof + verifier rejects →
+    /// `proof_invalid`. Exercises the `(Some(proof), Some(v))` →
+    /// verify-fails branch.
+    #[tokio::test]
+    async fn enforce_proofs_with_invalid_proof_rejects_proof_invalid() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        add_stub_proof(&mut doc);
+
+        let outcome = handle(&ctx, &transport, Some(&AlwaysErrVerifier), doc).await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::ProofInvalid)
+        );
+        // No partial write.
+        assert!(
+            acl::get_acl_entry(&acl_ks, ALICE_DID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `enforce_proofs = true` + absent proof on a non-bearer spec →
+    /// `proof_required`. Exercises the `(None, Some(_))` branch.
+    #[tokio::test]
+    async fn enforce_proofs_with_missing_proof_rejects_proof_required() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        // No proof attached.
+        let doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+
+        let outcome = handle(&ctx, &transport, Some(&AlwaysOkVerifier), doc).await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::ProofRequired)
+        );
+        assert!(
+            acl::get_acl_entry(&acl_ks, ALICE_DID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `enforce_proofs = false` (verifier = None) + present proof →
+    /// `malformed_request`. The previous behaviour (silent drop of a
+    /// present proof) was the security-relevant footgun the v0.7.0
+    /// review pass surfaced. This test pins the new explicit-reject
+    /// behaviour.
+    #[tokio::test]
+    async fn proof_present_without_verifier_rejects_malformed_request() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        add_stub_proof(&mut doc);
+
+        let outcome = handle(&ctx, &transport, no_verifier(), doc).await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
+        );
+        let msg = err.payload.message.as_deref().unwrap();
+        assert!(
+            msg.contains("enforce_proofs"),
+            "operator-actionable message expected, got: {msg}"
         );
     }
 
