@@ -8727,6 +8727,7 @@ dependencies = [
 [[package]]
 name = "trust-tasks-didcomm"
 version = "0.1.1"
+source = "git+https://github.com/trustoverip/dtgwg-trust-tasks-tf.git?rev=bc33ff0c42111615f8894feefc981c12ffe43f68#bc33ff0c42111615f8894feefc981c12ffe43f68"
 dependencies = [
  "affinidi-messaging-didcomm",
  "serde",
@@ -8739,6 +8740,7 @@ dependencies = [
 [[package]]
 name = "trust-tasks-https"
 version = "0.1.1"
+source = "git+https://github.com/trustoverip/dtgwg-trust-tasks-tf.git?rev=bc33ff0c42111615f8894feefc981c12ffe43f68#bc33ff0c42111615f8894feefc981c12ffe43f68"
 dependencies = [
  "axum",
  "chrono",
@@ -8756,6 +8758,7 @@ dependencies = [
 [[package]]
 name = "trust-tasks-proof"
 version = "0.1.1"
+source = "git+https://github.com/trustoverip/dtgwg-trust-tasks-tf.git?rev=bc33ff0c42111615f8894feefc981c12ffe43f68#bc33ff0c42111615f8894feefc981c12ffe43f68"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -8771,6 +8774,7 @@ dependencies = [
 [[package]]
 name = "trust-tasks-rs"
 version = "0.1.1"
+source = "git+https://github.com/trustoverip/dtgwg-trust-tasks-tf.git?rev=bc33ff0c42111615f8894feefc981c12ffe43f68#bc33ff0c42111615f8894feefc981c12ffe43f68"
 dependencies = [
  "async-trait",
  "chrono",

@@ -135,13 +135,25 @@ trust-tasks-didcomm = { version = "0.1", default-features = false }
 trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
 
 [patch.crates-io]
-# Path-resolve the trust-tasks crates while they are unpublished. Remove
-# this block (and let the workspace.dependencies version pins resolve to
-# crates.io) once the upstream publishes.
-trust-tasks-rs = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-rs" }
-trust-tasks-https = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-https" }
-trust-tasks-didcomm = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-didcomm" }
-trust-tasks-proof = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-proof" }
+# Pin the trust-tasks crates to a specific upstream commit while
+# they are unpublished. Reproducible: anyone cloning this repo +
+# running `cargo build` fetches the same bytes from GitHub, no
+# sibling checkout required, no risk of CI / dev / packager
+# disagreeing on which trust-tasks bytes they consumed.
+#
+# When the upstream publishes to crates.io, drop this whole
+# [patch.crates-io] block — the workspace.dependencies version
+# pins will then resolve normally. Cargo.lock will be updated by
+# the next `cargo update`; that's the visible diff that
+# documents the transition.
+#
+# Commit chosen: tip of `main` containing the jsonwebtoken 9 → 10
+# bump that our `enforce_proofs` strict-mode wiring relies on
+# (PR #32).
+trust-tasks-rs = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
+trust-tasks-https = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
+trust-tasks-didcomm = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
+trust-tasks-proof = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.
