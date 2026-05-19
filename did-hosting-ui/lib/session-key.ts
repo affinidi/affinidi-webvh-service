@@ -5,23 +5,33 @@
  *
  * Lifecycle:
  *  1. `generateSessionKeypair()` on login — fresh Ed25519 keypair per
- *     browser session via WebCrypto. Public key is encoded as an Ed25519
+ *     login via WebCrypto. Public key is encoded as an Ed25519
  *     multikey (`z6Mk…`) and sent to the server during
  *     `/api/auth/passkey/login/finish`; the server stores it on the
- *     session record.
+ *     session record. The keypair is mirrored to IndexedDB so it
+ *     survives full page reloads while the JWT is still valid.
  *  2. `signEnvelope()` on every REQUIRED-spec request — implements the
  *     `eddsa-jcs-2022` cryptosuite (W3C VC Data Integrity ed25519):
  *     JCS-canonicalize doc and proof config, SHA-256 each, concat, sign
  *     with the session private key, base58btc-encode signature into
- *     `proof.proofValue`.
+ *     `proof.proofValue`. Lazily restores from IndexedDB if the
+ *     module-scope cache is empty (page reload after login).
  *  3. Server-side `dispatch_trust_task` reads the bound pubkey from
  *     AuthClaims, checks that `proof.verificationMethod` matches the
  *     session-bound `did:key`, and lets the AffinidiVerifier verify
  *     the signature.
  *
- * The private key is held as a non-extractable `CryptoKey` in module
- * scope; it never crosses the JS boundary or hits storage. A page
- * reload starts a fresh session and a fresh key.
+ * The private key is generated as a non-extractable `CryptoKey` —
+ * IndexedDB stores the opaque wrapper, not the raw bytes; even
+ * inspection through devtools cannot extract the private key material.
+ * The browser's CryptoKey-to-IDB serialiser is structured-clone-aware
+ * and keeps the non-extractable invariant across the round-trip.
+ *
+ * Storage scope: per-origin (the standard IndexedDB scope). Multiple
+ * tabs on the same origin share the same persisted keypair, which
+ * matches the shared JWT typically stored in localStorage. Logout
+ * (`clearSessionKeypair()`) wipes the IDB entry; clearing site data
+ * via the browser's settings does the same.
  */
 
 // ---------------------------------------------------------------------------
@@ -32,13 +42,22 @@ let sessionKeypair: CryptoKeyPair | null = null;
 let sessionPubkeyMultikey: string | null = null;
 let sessionDidKey: string | null = null;
 
+/** Cached promise of an in-flight IDB restore; coalesces concurrent
+ * `signEnvelope()` calls so they share one restore round-trip rather
+ * than racing each other to open the database. Cleared after restore
+ * completes (success or failure). */
+let restoreInFlight: Promise<void> | null = null;
+
 /**
- * Generate a fresh Ed25519 keypair for this browser session. The private
- * key is stored as a non-extractable `CryptoKey` in module scope; the
- * public key is exposed as a `did:key` multikey for the server to bind
- * to the JWT session.
+ * Generate a fresh Ed25519 keypair for this login session. The private
+ * key is stored as a non-extractable `CryptoKey` in module scope and
+ * persisted to IndexedDB; the public key is exposed as a `did:key`
+ * multikey for the server to bind to the JWT session.
  *
- * Calling twice replaces the previous keypair (e.g. on re-login).
+ * Calling twice replaces the previous keypair (e.g. on re-login). The
+ * IDB persistence is fire-and-forget: a transient IDB failure does
+ * not block login, but the keypair will not survive a page reload in
+ * that case (the user has to log in again).
  */
 export async function generateSessionKeypair(): Promise<{
   pubkeyMultikey: string;
@@ -53,7 +72,9 @@ export async function generateSessionKeypair(): Promise<{
   // Ed25519 in WebCrypto is supported on Chrome 137+, Firefox 130+,
   // Safari 17+. `extractable=true` is needed to export the raw public
   // key bytes; the private key stays inside the CryptoKey wrapper and
-  // is used only via `crypto.subtle.sign(...)`.
+  // is used only via `crypto.subtle.sign(...)`. IndexedDB's
+  // structured-clone serialiser preserves the wrapper across the
+  // round-trip without exposing key material.
   const keypair = (await crypto.subtle.generateKey(
     { name: "Ed25519" },
     true,
@@ -76,19 +97,71 @@ export async function generateSessionKeypair(): Promise<{
   sessionPubkeyMultikey = multikey;
   sessionDidKey = didKey;
 
+  // Persist for reload survival. Best-effort: if IDB is unavailable
+  // (private browsing, file: origin, embedded webview), the in-memory
+  // copy keeps working for this tab session, but the user has to log
+  // in again after a reload.
+  await idbPut(KEYPAIR_KEY, { keypair, pubkeyMultikey: multikey, didKey }).catch(
+    (e) => {
+      // eslint-disable-next-line no-console
+      console.warn("session-key: IDB persist failed", e);
+    },
+  );
+
   return { pubkeyMultikey: multikey, didKey };
 }
 
-/** Returns `true` once a session keypair has been generated. */
+/** Returns `true` once a session keypair is in the in-memory cache.
+ * Synchronous; does NOT consult IndexedDB. Use `restoreSessionKeypair()`
+ * to attempt an IDB restore before checking. */
 export function hasSessionKeypair(): boolean {
   return sessionKeypair !== null;
 }
 
-/** Drop the current session keypair (logout / re-login). */
+/**
+ * Attempt to restore the session keypair from IndexedDB into the
+ * module-scope cache. No-op if the cache already has one or no entry
+ * exists. Idempotent and safe to call multiple times — concurrent
+ * calls share one in-flight IDB open via `restoreInFlight`.
+ *
+ * Called by `signEnvelope()` before signing if the cache is empty,
+ * so page-reload-after-login flows survive transparently.
+ */
+export async function restoreSessionKeypair(): Promise<void> {
+  if (sessionKeypair !== null) return;
+  if (restoreInFlight) return restoreInFlight;
+
+  restoreInFlight = (async () => {
+    try {
+      const persisted = await idbGet<PersistedKeypair>(KEYPAIR_KEY);
+      if (persisted) {
+        sessionKeypair = persisted.keypair;
+        sessionPubkeyMultikey = persisted.pubkeyMultikey;
+        sessionDidKey = persisted.didKey;
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn("session-key: IDB restore failed", e);
+    } finally {
+      restoreInFlight = null;
+    }
+  })();
+  return restoreInFlight;
+}
+
+/**
+ * Drop the current session keypair from both the in-memory cache and
+ * IndexedDB. Called on logout. The IDB delete is fire-and-forget so
+ * synchronous logout handlers don't have to await it.
+ */
 export function clearSessionKeypair(): void {
   sessionKeypair = null;
   sessionPubkeyMultikey = null;
   sessionDidKey = null;
+  void idbDelete(KEYPAIR_KEY).catch((e) => {
+    // eslint-disable-next-line no-console
+    console.warn("session-key: IDB clear failed", e);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +188,11 @@ export type SignableEnvelope = {
 export async function signEnvelope<T extends SignableEnvelope>(
   envelope: T,
 ): Promise<T> {
+  // Lazy-restore from IndexedDB so a page reload after login still
+  // produces a working keypair without an explicit boot-time call.
+  if (sessionKeypair === null) {
+    await restoreSessionKeypair();
+  }
   if (sessionKeypair === null || sessionDidKey === null) {
     throw new Error(
       "no session keypair available — call generateSessionKeypair() before signEnvelope()",
@@ -293,4 +371,87 @@ function jcsCanonicalize(value: unknown): string {
 async function sha256(input: string): Promise<Uint8Array> {
   const buf = new TextEncoder().encode(input);
   return new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+}
+
+// ---------------------------------------------------------------------------
+// IndexedDB persistence (page-reload survival)
+// ---------------------------------------------------------------------------
+
+/** Single IDB entry — one keypair per origin, overwritten on each login. */
+type PersistedKeypair = {
+  keypair: CryptoKeyPair;
+  pubkeyMultikey: string;
+  didKey: string;
+};
+
+const IDB_NAME = "did-hosting-ui";
+const IDB_STORE = "session-keys";
+const IDB_VERSION = 1;
+/** Stable key for the one-and-only persisted entry. */
+const KEYPAIR_KEY = "current";
+
+/**
+ * Open (or upgrade-and-open) the per-origin database. Returns `null`
+ * when IndexedDB is unavailable — the caller's catch path then treats
+ * persistence as a no-op so the rest of the flow still works.
+ */
+function openDb(): Promise<IDBDatabase | null> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      resolve(null);
+      return;
+    }
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error("indexedDB.open failed"));
+    req.onblocked = () =>
+      reject(new Error("indexedDB.open blocked by an older connection"));
+  });
+}
+
+async function idbPut(key: string, value: PersistedKeypair): Promise<void> {
+  const db = await openDb();
+  if (!db) return; // IDB unavailable; treat as no-op
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("IDB put failed"));
+    tx.onabort = () => reject(tx.error ?? new Error("IDB put aborted"));
+  });
+  db.close();
+}
+
+async function idbGet<T>(key: string): Promise<T | undefined> {
+  const db = await openDb();
+  if (!db) return undefined;
+  try {
+    return await new Promise<T | undefined>((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result as T | undefined);
+      req.onerror = () => reject(req.error ?? new Error("IDB get failed"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function idbDelete(key: string): Promise<void> {
+  const db = await openDb();
+  if (!db) return;
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("IDB delete failed"));
+    tx.onabort = () => reject(tx.error ?? new Error("IDB delete aborted"));
+  });
+  db.close();
 }

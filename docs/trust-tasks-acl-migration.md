@@ -94,7 +94,11 @@ Consumers that don't speak webvh MUST ignore this namespace per
 ## Worked example — `acl/grant` over HTTPS
 
 Caller is `did:web:admin.example` (an Admin in the maintainer's ACL).
-The grant adds `did:web:alice.example` as a new Owner.
+The grant adds `did:web:alice.example` as a new Owner. `acl/grant`
+is a REQUIRED-spec under the framework's
+[`IS_PROOF_REQUIRED`](https://github.com/trustoverip/dtgwg-trust-tasks-tf/blob/main/SPEC.md#7-consumer-pipeline)
+gate, so the envelope carries a Data Integrity proof signed by the
+caller's session keypair (see [Web UI session-key flow](#web-ui-session-key-flow)).
 
 ```http
 POST /api/trust-tasks HTTP/1.1
@@ -118,16 +122,28 @@ Content-Type: application/json
       }
     },
     "reason": "Onboarding new owner"
+  },
+  "proof": {
+    "type": "DataIntegrityProof",
+    "cryptosuite": "eddsa-jcs-2022",
+    "verificationMethod": "did:key:z6Mk…#z6Mk…",
+    "created": "2026-05-19T10:00:00Z",
+    "proofPurpose": "assertionMethod",
+    "proofValue": "z…"
   }
 }
 ```
 
 The `issuer`/`recipient` are omitted in this example because the
 bearer JWT pins the caller end-to-end (SPEC.md §4.8.1 falls back to
-transport-derived identity when in-band is absent). On success, the
-response is routed back to the **caller** (the admin who issued the
-grant) — `recipient` is `did:web:admin.example`, not the grant's
-subject:
+transport-derived identity when in-band is absent). The proof's
+`verificationMethod` references the ephemeral session keypair the
+client registered at login — server-side, `dispatch_trust_task`
+verifies that the `did:key` matches the JWT-bound session pubkey
+before the framework's `AffinidiVerifier` verifies the signature.
+On success, the response is routed back to the **caller** (the admin
+who issued the grant) — `recipient` is `did:web:admin.example`, not
+the grant's subject:
 
 ```json
 {
@@ -207,6 +223,62 @@ proof not accepted by consumer policy (SPEC §7.2 item 7)"); the
 operator-actionable diagnostic ("flip `enforce_proofs = true`")
 lives in a `tracing::warn!` emitted by `dispatch_inbound` so an
 unauth probe can't enumerate verifier coverage across a fleet.
+
+## Web UI session-key flow
+
+The Web UI shipped in v0.7.0 emits signed envelopes for REQUIRED
+specs using an ephemeral Ed25519 session keypair, bound to the JWT
+session at login. The flow:
+
+1. **At `POST /api/auth/passkey/login/finish`:** the browser
+   generates a fresh Ed25519 keypair via WebCrypto
+   (`crypto.subtle.generateKey({ name: "Ed25519" })`), encodes the
+   public key as an Ed25519 multikey (base58btc, `z6Mk…`), and
+   sends it in the request body as `session_pubkey_b58btc`. The
+   server stores the multikey on the session record
+   (`Session.session_pubkey_b58btc`) alongside the JWT's session
+   ID and token rotation state. The private key is held as a
+   non-extractable `CryptoKey` and never leaves the browser tab.
+2. **At `POST /api/trust-tasks` (REQUIRED specs):** the browser
+   signs the envelope with the `eddsa-jcs-2022` cryptosuite —
+   JCS-canonicalises (RFC 8785) the doc and proof config,
+   SHA-256s each, concatenates, signs with the session private
+   key, and base58btc-encodes the signature into
+   `proof.proofValue`. The proof's `verificationMethod` is the
+   `did:key:{multikey}#{multikey}` URL derived from the session
+   pubkey.
+3. **Server-side `dispatch_trust_task`:** reads
+   `session_pubkey_b58btc` from `AuthClaims` (loaded from the
+   session record by the JWT auth extractor). If present, asserts
+   that the inbound `proof.verificationMethod` equals
+   `did:key:{multikey}#{multikey}`; mismatch → `proof_invalid`
+   rejection. Backend callers without a session pubkey (the
+   `Option<String>` is `None`) skip this pre-check and authenticate
+   solely via the proof's verificationMethod resolved against the
+   caller's DID document.
+4. **Framework verification:** the framework's `AffinidiVerifier`
+   (already used to verify other Data Integrity proofs against
+   `did:web` / `did:webvh` DID docs) verifies the signature against
+   the `did:key` — no DID-doc lookup required for `did:key`, since
+   the public key is embedded in the URL itself.
+
+The keypair is persisted to IndexedDB (per-origin, structured-clone
+of the `CryptoKey` wrapper — key material remains inside the browser
+crypto layer) so it survives page reloads while the JWT is still
+valid. Logout (`POST /api/auth/logout` or the UI's logout button)
+clears both the JWT and the IndexedDB entry. Clearing site data via
+the browser's settings does the same.
+
+Operator implications:
+- Make sure `auth.access_token_expiry` and the IDB-persisted keypair
+  lifetime are aligned. If the JWT expires but the keypair persists,
+  the next REQUIRED-spec request will fail at the bearer-JWT step
+  (`401 Unauthorized`), and the UI's existing re-login redirect
+  will kick in.
+- Operators that run the UI against an older v0.6 server (the
+  v0.7.0 → v0.8.0 deprecation overlap) should not set
+  `enforce_proofs = true` until they have rolled out v0.7.0+
+  to all UI clients — the v0.6 UI emits proofless envelopes.
 
 ## Discovery
 
@@ -298,9 +370,19 @@ note above).
 
 The webvh Web UI shipped in v0.7.0 uses the
 `api.createAcl/updateAcl/aclShow/deleteAcl/listAcl` methods which now
-internally POST trust-task envelopes. See
-`did-hosting-ui/lib/api.ts` for the reference TypeScript translator
-between the wire shape and the existing `AclEntry` type.
+internally POST trust-task envelopes. Two reference files:
+- `did-hosting-ui/lib/api.ts` — typed translator between the wire
+  shape and the UI's `AclEntry` type, plus the `trustTask()` helper
+  that dispatches envelopes and signs REQUIRED specs.
+- `did-hosting-ui/lib/session-key.ts` — `generateSessionKeypair()`,
+  `signEnvelope()` (eddsa-jcs-2022), plus the IndexedDB persistence
+  layer that survives page reloads. ~370 LOC, no npm deps beyond
+  what the UI already pulls in (uses WebCrypto + inline JCS +
+  inline base58btc).
+
+Third-party browser clients that talk to `did-hosting-control`
+directly (without the Web UI's framework) can lift `session-key.ts`
+wholesale — it has no UI-specific dependencies.
 
 ## See also
 

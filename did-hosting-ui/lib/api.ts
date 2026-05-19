@@ -1,8 +1,10 @@
 /** Typed API client for the did-hosting-control REST API. */
 
 import {
+  clearSessionKeypair,
   generateSessionKeypair,
   hasSessionKeypair,
+  restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
 
@@ -332,6 +334,9 @@ export function clearToken(): void {
   } catch {
     // ignore
   }
+  // Drop the session keypair from both memory and IndexedDB.
+  // Fire-and-forget; logout shouldn't block on storage.
+  clearSessionKeypair();
 }
 
 async function request<T>(
@@ -1014,18 +1019,20 @@ async function trustTask<Req, Resp>(
     payload,
   };
 
-  // REQUIRED-spec envelopes need a Data Integrity proof. If the
-  // session keypair isn't yet generated (e.g. legacy login flow,
-  // page reload after login), generate one on demand — the server
-  // won't know about it, so the request will fail with
-  // `proof_invalid`, but that's a clearer error than `proof_required`.
-  // The expected operator action is "log in again" so the keypair is
-  // bound to a fresh JWT.
+  // REQUIRED-spec envelopes need a Data Integrity proof. The
+  // resolution order:
+  //   1. In-memory keypair from this tab (login or earlier restore).
+  //   2. IndexedDB restore — survives page reloads while the JWT is
+  //      still cached in localStorage, so the user doesn't have to
+  //      re-login every time they refresh the admin page.
+  //   3. Fall through to generate a fresh keypair (will fail server-
+  //      side with `proof_invalid` because the new pubkey isn't bound
+  //      to the JWT) — the failure prompts the user to log in again.
   if (REQUIRED_PROOF_TYPES.has(typeUri)) {
     if (!hasSessionKeypair()) {
-      // Build the keypair anyway; the request will fail server-side
-      // because this pubkey isn't bound to the JWT. The error message
-      // makes the cause clear in DevTools.
+      await restoreSessionKeypair();
+    }
+    if (!hasSessionKeypair()) {
       await generateSessionKeypair();
     }
     await signEnvelope(envelope as unknown as Record<string, unknown>);
