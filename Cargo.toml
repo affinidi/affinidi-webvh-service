@@ -116,6 +116,23 @@ vta-sdk = { version = "0.6", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Trust Tasks (DTGWG, ToIP). 0.1.x pre-publication: resolved via the
+# [patch.crates-io] block below. When the upstream crates land on
+# crates.io, drop the [patch] block and these resolve normally.
+trust-tasks-rs = { version = "0.1", default-features = false, features = ["validate"] }
+trust-tasks-https = { version = "0.1", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.1", default-features = false }
+trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
+
+[patch.crates-io]
+# Path-resolve the trust-tasks crates while they are unpublished. Remove
+# this block (and let the workspace.dependencies version pins resolve to
+# crates.io) once the upstream publishes.
+trust-tasks-rs = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-rs" }
+trust-tasks-https = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-https" }
+trust-tasks-didcomm = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-didcomm" }
+trust-tasks-proof = { path = "../../fpp/dtgwg-trust-tasks-tf/trust-tasks-proof" }
+
 [profile.release]
 # Tell `rustc` to optimize for small code size.
 opt-level = "s"

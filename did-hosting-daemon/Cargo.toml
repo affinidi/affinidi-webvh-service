@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-daemon"
 description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -82,6 +82,11 @@ did-hosting-server = { version = "0.7", path = "../did-hosting-server", default-
 webvh-witness = { version = "0.7", path = "../webvh-witness", default-features = false }
 webvh-watcher = { version = "0.7", path = "../webvh-watcher", default-features = false }
 did-hosting-control = { version = "0.7", path = "../did-hosting-control", default-features = false }
+# Trust Tasks proof verifier — daemon's `build_control` constructs
+# `AppState.trust_tasks_verifier` directly, so it needs the type to
+# be visible. Kept aligned with the workspace pin in case did-hosting-control
+# ever drops the dep.
+trust-tasks-proof = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk = { workspace = true }
 axum = "0.8"

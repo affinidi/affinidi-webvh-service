@@ -8,6 +8,7 @@ mod passkey;
 mod proxy;
 mod registry;
 pub(crate) mod stats_sync;
+mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -272,6 +273,10 @@ pub fn router_without_fallback() -> Router<AppState> {
             get(did_manage::get_config),
             (*TASK_CONFIG_1_0).clone(),
         )
+        // Exempt: Trust Tasks transport (v0.7.1+). The envelope's
+        // `type` URI is the task identifier; the legacy
+        // `Trust-Task:` header isn't carried on this surface.
+        .route_exempt("/trust-tasks", post(trust_tasks::dispatch_trust_task))
         // Exempt: DIDComm envelope (inner message type is the real
         // task identifier).
         .route_exempt("/didcomm", post(didcomm::handle))

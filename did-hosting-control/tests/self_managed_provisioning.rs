@@ -63,6 +63,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(), // headline: all None
         registry: RegistryConfig::default(),
+        trust_tasks: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -77,6 +78,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        trust_tasks_verifier: None,
         jwt_keys: None,
         webauthn: None,
         http_client: reqwest::Client::new(),

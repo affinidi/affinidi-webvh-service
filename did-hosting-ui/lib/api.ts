@@ -477,9 +477,39 @@ export const api = {
   getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),
 
-  listAcl: () => request<AclListResponse>("/api/acl"),
+  // ---- ACL via Trust Tasks (v0.7.1+) ----
+  //
+  // The four methods below post to `/api/trust-tasks` carrying typed
+  // `acl/*` envelopes. The wire shape comes from the registry at
+  // https://trusttasks.org/spec/acl/; webvh-specific fields land
+  // inside `payload.entry.ext.vnd.affinidi.webvh.*`.
+  //
+  // The methods preserve the same TypeScript surface the UI screens
+  // already use (in, out, error semantics) so the ACL admin page
+  // didn't have to change shape — the wire format swap is invisible
+  // to the caller. The legacy `/api/acl/*` REST routes still exist
+  // on the server (deprecation-tagged); we no longer hit them from
+  // the UI. They are removed in v0.8.0.
+  //
+  // **Proofs**: v0.7.1 emits *unsigned* envelopes — the browser has
+  // no Data Integrity signing infrastructure today. The server's
+  // bearer JWT auth establishes the caller's identity end-to-end on
+  // the §4.8.1 transport channel. Operators with backend-only
+  // callers can flip `trust_tasks.enforce_proofs = true` server-side
+  // to require signed envelopes; v0.8.0 ships the session-key
+  // protocol that lets the UI sign too.
 
-  createAcl: (
+  listAcl: async (): Promise<AclListResponse> => {
+    const resp = await trustTask<AclListEnvelopePayload, AclListResponsePayload>(
+      "https://trusttasks.org/spec/acl/list/0.1",
+      { /* no filters; defaults to everything paged */ },
+    );
+    return {
+      entries: (resp.entries ?? []).map(specEntryToLocal),
+    };
+  },
+
+  createAcl: async (
     did: string,
     role: "admin" | "owner" | "service",
     opts?: {
@@ -490,21 +520,40 @@ export const api = {
        * (Owner → AllowedWithDefault on system default; Admin/Service → All). */
       domains?: DomainScope;
     },
-  ) =>
-    request<AclEntry>("/api/acl", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        did,
-        role,
-        label: opts?.label,
-        max_total_size: opts?.maxTotalSize,
-        max_did_count: opts?.maxDidCount,
-        domains: opts?.domains,
-      }),
-    }),
+  ): Promise<AclEntry> => {
+    // The webvh `vnd.affinidi.webvh` ext namespace requires `domains`
+    // because the auth path uses it on every request. Build a default
+    // when the caller didn't supply one; the server reshapes `All`
+    // appropriately for Admin/Service roles.
+    const webvhExt: Record<string, any> = {
+      domains: opts?.domains ?? { kind: "all" },
+    };
+    const quota: Record<string, number> = {};
+    if (typeof opts?.maxTotalSize === "number") {
+      quota.maxTotalSize = opts.maxTotalSize;
+    }
+    if (typeof opts?.maxDidCount === "number") {
+      quota.maxDidCount = opts.maxDidCount;
+    }
+    if (Object.keys(quota).length > 0) {
+      webvhExt.quota = quota;
+    }
 
-  updateAcl: (
+    const resp = await trustTask<AclGrantPayload, AclEntryResponsePayload>(
+      "https://trusttasks.org/spec/acl/grant/0.1",
+      {
+        entry: {
+          subject: did,
+          role,
+          ...(opts?.label !== undefined ? { label: opts.label } : {}),
+          ext: { "vnd.affinidi.webvh": webvhExt },
+        },
+      },
+    );
+    return specEntryToLocal(resp.entry);
+  },
+
+  updateAcl: async (
     did: string,
     updates: {
       role?: "admin" | "owner" | "service";
@@ -513,21 +562,122 @@ export const api = {
       maxDidCount?: number | null;
       domains?: DomainScope;
     },
-  ) =>
-    request<AclEntry>(`/api/acl/${encodeURIComponent(did)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        role: updates.role,
-        label: updates.label,
-        max_total_size: updates.maxTotalSize,
-        max_did_count: updates.maxDidCount,
-        domains: updates.domains,
-      }),
-    }),
+  ): Promise<AclEntry> => {
+    // v0.7's `updateAcl` was a kitchen-sink PUT that could change
+    // role + label + quotas + domains in one call. The acl/* spec
+    // family splits these:
+    //
+    //   - role change   → acl/change-role/0.1 (state-checked)
+    //   - other fields  → re-emit acl/grant/0.1 with the new entry
+    //     shape (the maintainer treats same-role grants as
+    //     idempotent updates of the metadata fields)
+    //
+    // We surface the same single `updateAcl(did, updates)` call by
+    // sequencing the two tasks as needed. A change-role-only update
+    // hits exactly one trust-task; a metadata-only update hits one;
+    // a combined update hits two with the role transition first.
+    let entry: AclEntry | null = null;
 
-  deleteAcl: (did: string) =>
-    request<void>(`/api/acl/${encodeURIComponent(did)}`, { method: "DELETE" }),
+    if (updates.role !== undefined) {
+      // Need the existing role for the state-checked transition.
+      const current = await api.aclShow(did);
+      if (!current) {
+        throw new ApiError(404, `subject ${did} not found in ACL`);
+      }
+      if (current.role !== updates.role) {
+        const resp = await trustTask<AclChangeRolePayload, AclEntryResponsePayload>(
+          "https://trusttasks.org/spec/acl/change-role/0.1",
+          {
+            subject: did,
+            fromRole: current.role,
+            toRole: updates.role,
+          },
+        );
+        entry = specEntryToLocal(resp.entry);
+      } else {
+        entry = current;
+      }
+    }
+
+    const wantsMetadataUpdate =
+      updates.label !== undefined ||
+      updates.maxTotalSize !== undefined ||
+      updates.maxDidCount !== undefined ||
+      updates.domains !== undefined;
+
+    if (wantsMetadataUpdate) {
+      const base = entry ?? (await api.aclShow(did));
+      if (!base) {
+        throw new ApiError(404, `subject ${did} not found in ACL`);
+      }
+      const webvhExt: Record<string, any> = {
+        domains: updates.domains ?? base.domains ?? { kind: "all" },
+      };
+      const quota: Record<string, number> = {};
+      const finalMaxTotalSize =
+        updates.maxTotalSize === undefined
+          ? base.max_total_size
+          : updates.maxTotalSize;
+      const finalMaxDidCount =
+        updates.maxDidCount === undefined
+          ? base.max_did_count
+          : updates.maxDidCount;
+      if (typeof finalMaxTotalSize === "number") {
+        quota.maxTotalSize = finalMaxTotalSize;
+      }
+      if (typeof finalMaxDidCount === "number") {
+        quota.maxDidCount = finalMaxDidCount;
+      }
+      if (Object.keys(quota).length > 0) {
+        webvhExt.quota = quota;
+      }
+
+      const finalLabel =
+        updates.label === undefined ? base.label : updates.label;
+
+      const resp = await trustTask<AclGrantPayload, AclEntryResponsePayload>(
+        "https://trusttasks.org/spec/acl/grant/0.1",
+        {
+          entry: {
+            subject: did,
+            role: base.role,
+            ...(finalLabel !== null && finalLabel !== undefined
+              ? { label: finalLabel }
+              : {}),
+            ext: { "vnd.affinidi.webvh": webvhExt },
+          },
+        },
+      );
+      entry = specEntryToLocal(resp.entry);
+    }
+
+    if (!entry) {
+      // Shouldn't happen: caller invoked update with no changes.
+      const refreshed = await api.aclShow(did);
+      if (!refreshed) {
+        throw new ApiError(404, `subject ${did} not found in ACL`);
+      }
+      entry = refreshed;
+    }
+    return entry;
+  },
+
+  /** Single-entry lookup (v0.7.1). Returns `null` when the subject
+   * is not in the ACL — distinct from a server error. */
+  aclShow: async (did: string): Promise<AclEntry | null> => {
+    const resp = await trustTask<AclShowPayload, AclShowResponsePayload>(
+      "https://trusttasks.org/spec/acl/show/0.1",
+      { subject: did },
+    );
+    return resp.entry ? specEntryToLocal(resp.entry) : null;
+  },
+
+  deleteAcl: async (did: string): Promise<void> => {
+    await trustTask<AclRevokePayload, AclRevokeResponsePayload>(
+      "https://trusttasks.org/spec/acl/revoke/0.1",
+      { subject: did },
+    );
+  },
 
   // ---- Multi-domain (v0.7) ----
 
@@ -703,3 +853,191 @@ export const api = {
       method: "DELETE",
     }),
 };
+
+// ---------------------------------------------------------------------------
+// Trust Tasks transport (v0.7.1+)
+// ---------------------------------------------------------------------------
+
+/** Trust Tasks framework Type URI prefix. */
+const TT_RESPONSE_FRAGMENT = "#response";
+const TT_ERROR_TYPE = "https://trusttasks.org/spec/trust-task-error/0.1";
+
+/** Outer envelope shape produced by every `trustTask()` call. */
+interface TrustTaskEnvelope<P> {
+  id: string;
+  type: string;
+  issuer?: string;
+  recipient?: string;
+  issuedAt?: string;
+  payload: P;
+}
+
+/** `trust-task-error/0.1` payload shape. Mirrors `trust_tasks_rs::ErrorPayload`. */
+interface TrustTaskErrorPayload {
+  code: string;
+  message?: string;
+  retryable: boolean;
+  retryAfter?: string;
+  details?: any;
+}
+
+/** Per-spec request-payload shapes used by the ACL surface. */
+interface AclGrantPayload {
+  entry: SpecAclEntry;
+  reason?: string;
+  ext?: Record<string, any>;
+}
+interface AclRevokePayload {
+  subject: string;
+  scopes?: string[];
+  reason?: string;
+  ext?: Record<string, any>;
+}
+interface AclChangeRolePayload {
+  subject: string;
+  fromRole: string;
+  toRole: string;
+  reason?: string;
+  ext?: Record<string, any>;
+}
+interface AclShowPayload {
+  subject: string;
+  ext?: Record<string, any>;
+}
+interface AclListEnvelopePayload {
+  role?: string;
+  scope?: string;
+  subjectPrefix?: string;
+  pageSize?: number;
+  cursor?: string;
+  ext?: Record<string, any>;
+}
+
+/** Per-spec response-payload shapes. */
+interface AclEntryResponsePayload {
+  entry: SpecAclEntry;
+  ext?: Record<string, any>;
+}
+interface AclShowResponsePayload {
+  entry: SpecAclEntry | null;
+  redactedFields?: string[];
+  ext?: Record<string, any>;
+}
+interface AclRevokeResponsePayload {
+  entry: SpecAclEntry | null;
+  ext?: Record<string, any>;
+}
+interface AclListResponsePayload {
+  entries: SpecAclEntry[];
+  truncated: boolean;
+  cursor?: string;
+  redactedFields?: string[];
+  ext?: Record<string, any>;
+}
+
+/** Wire-form AclEntry per the spec's _shared/0.1/acl-entry.schema.json. */
+interface SpecAclEntry {
+  subject: string;
+  role: string;
+  scopes?: string[];
+  label?: string;
+  createdAt?: string;
+  createdBy?: string;
+  updatedAt?: string;
+  updatedBy?: string;
+  expiresAt?: string;
+  ext?: Record<string, any>;
+}
+
+/**
+ * POST `/api/trust-tasks` with a typed envelope; throw an `ApiError`
+ * for `trust-task-error/0.1` responses, return the typed response
+ * payload otherwise.
+ *
+ * `issuer` / `recipient` are deliberately omitted from the envelope —
+ * the bearer JWT carries the caller's DID and SPEC.md §4.8.1's
+ * "transport-derived fills the absent in-band" rule populates both
+ * sides server-side. A future version that emits signed envelopes
+ * will set `issuer` explicitly so the proof's `verificationMethod`
+ * binds to the document.
+ */
+async function trustTask<Req, Resp>(
+  typeUri: string,
+  payload: Req,
+): Promise<Resp> {
+  const id = `urn:uuid:${cryptoRandomUuid()}`;
+  const envelope: TrustTaskEnvelope<Req> = {
+    id,
+    type: typeUri,
+    issuedAt: new Date().toISOString(),
+    payload,
+  };
+  const respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(
+    "/api/trust-tasks",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(envelope),
+    },
+  );
+
+  // Successful response carries `type: <request-type>#response`. An
+  // error response carries `type: <trust-task-error/0.1>`. We
+  // discriminate on the response envelope's `type` to surface the
+  // right shape to the caller.
+  if (respDoc.type === TT_ERROR_TYPE) {
+    const err = respDoc.payload as TrustTaskErrorPayload;
+    throw new ApiError(
+      422, // surface as application-layer; the HTTP status carried the same signal
+      err.message ?? err.code ?? "trust task rejected",
+    );
+  }
+  if (!respDoc.type.endsWith(TT_RESPONSE_FRAGMENT)) {
+    throw new ApiError(
+      500,
+      `unexpected trust-task response type: ${respDoc.type}`,
+    );
+  }
+  return respDoc.payload as Resp;
+}
+
+/** Browser-safe UUIDv4. Falls back to a polyfill where crypto.randomUUID
+ * isn't available (e.g. iOS Safari < 15.4). */
+function cryptoRandomUuid(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // RFC 4122 v4 polyfill via getRandomValues.
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
+    .slice(6, 8)
+    .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+}
+
+/** Project a spec-wire `SpecAclEntry` into the existing `AclEntry`
+ * shape the UI screens already render. The wire form carries webvh
+ * fields under `ext.vnd.affinidi.webvh.*`; the UI reads them off
+ * the top-level `AclEntry` for backwards-compat with v0.7 code. */
+function specEntryToLocal(spec: SpecAclEntry): AclEntry {
+  const role = spec.role as "admin" | "owner" | "service";
+  const webvh: any = spec.ext?.["vnd.affinidi.webvh"] ?? {};
+  const quota: any = webvh.quota ?? {};
+  const createdAt = spec.createdAt
+    ? Math.floor(new Date(spec.createdAt).getTime() / 1000)
+    : 0;
+  return {
+    did: spec.subject,
+    role,
+    label: spec.label ?? null,
+    created_at: createdAt,
+    max_total_size:
+      typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
+    max_did_count:
+      typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
+    domains: (webvh.domains as DomainScope | undefined) ?? { kind: "all" },
+  };
+}

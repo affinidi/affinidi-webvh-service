@@ -61,6 +61,13 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
+        // Trust Tasks envelope (v0.7.1+) — routes the five `acl/*`
+        // ops and `trust-task-discovery` through the same handlers
+        // the HTTPS transport hits at `POST /api/trust-tasks`.
+        .route(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            handler_fn(handle_trust_tasks_envelope),
+        )?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -872,6 +879,138 @@ fn map_app_error_code(err: &AppError) -> &'static str {
     err.didcomm_code()
 }
 
+// ---------------------------------------------------------------------------
+// Trust Tasks envelope handler (v0.7.1+)
+// ---------------------------------------------------------------------------
+
+/// DIDComm handler for the Trust Tasks envelope
+/// (`https://trusttasks.org/binding/didcomm/0.1/envelope`).
+///
+/// The DIDComm service layer has already verified the JWE and
+/// authenticated the sender; `ctx.sender_did` is the producer's DID.
+/// `message.body` is the JSON of the inner `TrustTask<Value>` document
+/// (per the binding's wire shape — see `trust-tasks-didcomm/src/pack.rs`).
+///
+/// We construct a [`DidcommHandler`] reporting `local = server_did`
+/// and `peer = sender`, then hand the document to the shared
+/// [`dispatch_inbound`] core. The result is repacked as a new DIDComm
+/// message of the same envelope type so the same routing rules
+/// (mediator pickup, attachment, etc.) apply.
+async fn handle_trust_tasks_envelope(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    info!(sender = sender, "inbound DIDComm: trust-tasks envelope");
+
+    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                sender = sender,
+                error = %e,
+                "trust-tasks envelope: inner body did not parse as TrustTask<Value>"
+            );
+            // Mirror the routed-error pattern from the HTTPS
+            // transport: build a `malformed_request` document and
+            // pack it back inside the same envelope type so the
+            // sender sees a consistent error shape across
+            // transports.
+            let err_doc = body_parse_error(&e.to_string());
+            let body =
+                serde_json::to_value(&err_doc).expect("trust-task-error/0.1 document serialises");
+            return Ok(Some(
+                DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)
+                    .thid(message.id.clone()),
+            ));
+        }
+    };
+
+    let my_vid = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
+    let transport =
+        trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
+    let ctx = did_hosting_common::server::trust_tasks::TrustTaskContext {
+        acl_ks: &state.acl_ks,
+        my_vid,
+    };
+    // Dispatch with the configured proof verifier when the operator
+    // has opted in. Mirrors `routes::trust_tasks` — both transports
+    // share one proof policy.
+    let outcome = match (
+        state.config.trust_tasks.enforce_proofs,
+        state.trust_tasks_verifier.as_deref(),
+    ) {
+        (true, Some(v)) => {
+            did_hosting_common::server::trust_tasks::dispatch_inbound::<
+                trust_tasks_proof::affinidi::Verifier,
+            >(&ctx, &transport, Some(v), doc)
+            .await
+        }
+        _ => {
+            did_hosting_common::server::trust_tasks::dispatch_inbound::<
+                did_hosting_common::server::trust_tasks::NoVerifier,
+            >(&ctx, &transport, None, doc)
+            .await
+        }
+    };
+
+    use did_hosting_common::server::trust_tasks::DispatchOutcome;
+    let body = match outcome {
+        DispatchOutcome::Handled(resp) => {
+            serde_json::to_value(&resp).expect("response document serialises")
+        }
+        DispatchOutcome::Rejected(err) => {
+            serde_json::to_value(&err).expect("error document serialises")
+        }
+        DispatchOutcome::Suppressed => {
+            // §8.1 routing exception: don't emit any response. The
+            // DIDComm service framework accepts `Ok(None)` as
+            // fire-and-forget.
+            warn!(
+                sender = sender,
+                "trust-tasks envelope: dispatch suppressed (identity_mismatch w/ no transport sender)"
+            );
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(
+        DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)
+            .thid(message.id.clone()),
+    ))
+}
+
+/// Build the same body-parse `trust-task-error/0.1` document that the
+/// HTTPS transport uses, kept here so the two transports emit
+/// byte-identical error shapes for parse failures.
+fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
+    use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
+    let reject = RejectReason::MalformedRequest {
+        reason: format!("body did not parse as a Trust Task document: {reason}"),
+    };
+    let payload: ErrorPayload = reject.into();
+    TrustTask {
+        id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        thread_id: None,
+        type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
+            .parse()
+            .expect("framework error Type URI parses"),
+        issuer: None,
+        recipient: None,
+        issued_at: Some(chrono::Utc::now()),
+        expires_at: None,
+        payload,
+        context: None,
+        proof: None,
+        extra: Default::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use did_hosting_common::server::store::{
@@ -925,6 +1064,7 @@ mod tests {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             registry: RegistryConfig::default(),
+            trust_tasks: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -937,6 +1077,7 @@ mod tests {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
+            trust_tasks_verifier: None,
             jwt_keys: None,
             webauthn: None,
             http_client: reqwest::Client::new(),

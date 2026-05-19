@@ -78,6 +78,7 @@ async fn make_harness() -> Harness {
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),
         registry: RegistryConfig::default(),
+        trust_tasks: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -92,6 +93,7 @@ async fn make_harness() -> Harness {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        trust_tasks_verifier: None,
         jwt_keys: Some(jwt_keys),
         webauthn: None,
         http_client: reqwest::Client::new(),

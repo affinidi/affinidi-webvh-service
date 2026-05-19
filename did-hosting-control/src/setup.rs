@@ -241,6 +241,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             context_id: None,
         },
         registry: RegistryConfig::default(),
+        trust_tasks: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -896,6 +897,7 @@ pub async fn run_setup_offline_complete(
             context_id: None, // offline flow doesn't surface the VTA context id
         },
         registry: RegistryConfig::default(),
+        trust_tasks: Default::default(),
         config_path: state.config_output.clone(),
     };
 

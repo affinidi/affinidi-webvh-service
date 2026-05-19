@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-control"
 description = "WebVH Control Plane — Unified management UI and service registry"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -49,6 +49,13 @@ path = "src/main.rs"
 
 [dependencies]
 did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
+# Trust Tasks framework — used by routes/trust_tasks.rs (the
+# /api/trust-tasks endpoint introduced in v0.7.1).
+trust-tasks-rs = { workspace = true }
+trust-tasks-https = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+trust-tasks-proof = { workspace = true }
+chrono = { workspace = true }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }

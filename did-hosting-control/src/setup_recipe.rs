@@ -245,6 +245,7 @@ pub async fn apply_recipe(
             context_id: None,
         },
         registry: RegistryConfig::default(),
+        trust_tasks: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

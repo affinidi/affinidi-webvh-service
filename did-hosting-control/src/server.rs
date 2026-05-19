@@ -39,6 +39,17 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    /// Trust Tasks proof verifier — backed by the
+    /// `affinidi-data-integrity` crate, sharing the same
+    /// [`DIDCacheClient`] as `did_resolver` for verificationMethod
+    /// lookups. `None` when `did_resolver` is unconfigured (e.g. a
+    /// non-DIDComm deployment); in that case the trust-tasks pipeline
+    /// runs in proof-optional mode — a present proof is ignored, a
+    /// REQUIRED proof on the spec is not enforced. v0.7.1 ships this
+    /// way for backwards compat; v0.8.0 makes the verifier mandatory
+    /// for the strict-proof specs (`acl/grant`, `acl/revoke`,
+    /// `acl/change-role`).
+    pub trust_tasks_verifier: Option<Arc<trust_tasks_proof::affinidi::Verifier>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
@@ -210,6 +221,21 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
+    // Trust Tasks verifier — share the configured DIDCacheClient so
+    // `did:web` / `did:webvh` verificationMethod lookups hit the same
+    // cache the DIDComm path already populates. We clone the client
+    // (DIDCacheClient is cheap to clone — internal Arcs) rather than
+    // sharing one Arc, because did_resolver remains `Option<DIDCacheClient>`
+    // for callers that prefer the un-Arc'd form.
+    let trust_tasks_verifier = did_resolver.clone().map(|client| {
+        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
+            Arc::new(client),
+        ));
+        Arc::new(trust_tasks_proof::affinidi::Verifier::with_resolver(
+            resolver,
+        ))
+    });
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -219,6 +245,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
+        trust_tasks_verifier,
         jwt_keys,
         webauthn,
         // Disable redirect-following: combined with the proxy's

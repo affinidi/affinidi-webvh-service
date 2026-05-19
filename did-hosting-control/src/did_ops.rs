@@ -1009,6 +1009,7 @@ mod tests_atomic {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             registry: RegistryConfig::default(),
+            trust_tasks: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -1021,6 +1022,7 @@ mod tests_atomic {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
+            trust_tasks_verifier: None,
             jwt_keys: None,
             webauthn: None,
             http_client: reqwest::Client::new(),

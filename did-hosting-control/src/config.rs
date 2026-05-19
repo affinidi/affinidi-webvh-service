@@ -30,8 +30,44 @@ pub struct AppConfig {
     pub vta: VtaConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
+    /// Trust Tasks (v0.7.1+) configuration.
+    #[serde(default)]
+    pub trust_tasks: TrustTasksConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+/// Trust Tasks framework runtime knobs.
+///
+/// Introduced in v0.7.1 with `enforce_proofs` defaulting to `false`
+/// so the new `POST /api/trust-tasks` surface accepts unsigned
+/// envelopes from clients (notably the Web UI, which has no
+/// browser-side signing infrastructure in this release). Operators
+/// running backend-to-backend callers can flip it to `true` to get
+/// the strict-proof behaviour the spec calls for on
+/// `acl/grant`, `acl/revoke`, and `acl/change-role`.
+///
+/// v0.8.0 will either ship the session-key protocol that lets the
+/// UI emit signed envelopes, or change the default to `true` and
+/// require operators to opt out — direction TBD.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrustTasksConfig {
+    /// When `true`, dispatch passes the configured proof verifier
+    /// (`state.trust_tasks_verifier`) to `dispatch_inbound`. Inbound
+    /// non-bearer specs without a `proof` member are then rejected
+    /// with `proof_required`. When `false` (default in v0.7.1), the
+    /// dispatcher runs in proof-optional mode: a present proof is
+    /// ignored, an absent proof is accepted.
+    #[serde(default)]
+    pub enforce_proofs: bool,
+}
+
+impl Default for TrustTasksConfig {
+    fn default() -> Self {
+        Self {
+            enforce_proofs: false,
+        }
+    }
 }
 
 fn default_server() -> ServerConfig {

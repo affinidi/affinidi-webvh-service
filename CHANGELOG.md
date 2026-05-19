@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.7.1 (unreleased)
+
+### Added
+
+- **Trust Tasks ACL surface (`POST /api/trust-tasks`).** New wire
+  shape for ACL administration built on the
+  [Trust Tasks framework](https://trusttasks.org/) at the registry's
+  `acl/*/0.1` family. Six operations live behind one endpoint
+  (envelope `type` member discriminates):
+  - `acl/grant/0.1` — idempotent insert; role-change attempts rejected
+    with `permission_denied` + `details.reason = "role_change_required"`.
+  - `acl/revoke/0.1` — full removal **or** scope reduction (`scopes`
+    items in `domain:<name>` shape); `last-authority` guard refuses
+    revocations that would leave zero Admin entries.
+  - `acl/change-role/0.1` — state-checked (`fromRole`/`toRole`);
+    rejects concurrent overwrites with `acl/change-role:state_mismatch`.
+  - `acl/show/0.1` — single-entry lookup; self-lookup permitted for
+    non-Admin callers.
+  - `acl/list/0.1` — conjunctive filters (`role`, `scope`,
+    `subjectPrefix`) + opaque base64 cursor paging; pageSize ceiling 500.
+  - `trust-task-discovery/0.1` — advertises all six types, declares
+    `frameworkVersion: "0.1"`, and pins
+    `requiredExt: ["vnd.affinidi.webvh"]` on `acl/grant` + `acl/change-role`.
+- **DIDComm trust-tasks envelope route.** The control plane's DIDComm
+  router accepts inbound messages of type
+  `https://trusttasks.org/binding/didcomm/0.1/envelope`. Both
+  transports share one async dispatch core (handlers don't care which
+  transport delivered the document).
+- **`trust-tasks-proof` verifier wired through `AppState`.** When
+  `state.trust_tasks_verifier` is configured (a `DIDCacheClient` is
+  available) AND the new `trust_tasks.enforce_proofs` config flag is
+  `true`, the maintainer verifies a present Data Integrity proof and
+  rejects an absent proof on a non-bearer spec with `proof_required`.
+- **Vendor extension shape (`ext.vnd.affinidi.webvh`).** webvh-
+  specific fields (quota + domain scope) live in the spec's `ext`
+  slot under a reverse-DNS namespace. See
+  [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
+  for the wire shape.
+- **Daemon parity.** `did-hosting-daemon` automatically picks up the
+  new HTTPS route AND the new DIDComm envelope handler — the daemon
+  builds its routers via the control plane's `routes::router_without_fallback()`
+  and `messaging::build_control_router()`, so there is no separate
+  wiring to maintain (CLAUDE.md §What the daemon mirrors).
+
+### Changed
+
+- **`AppState` gains `trust_tasks_verifier: Option<Arc<trust_tasks_proof::affinidi::Verifier>>`.**
+  Constructed at startup when `did_resolver` is configured (the
+  verifier shares the same DID-resolver cache as the DIDComm path).
+- **`AppConfig` gains `trust_tasks: TrustTasksConfig`.** New section
+  with a single `enforce_proofs: bool` knob (default `false` in
+  v0.7.1; revisited in v0.8.0).
+- **UI ACL surface (`did-hosting-ui`) routes through `/api/trust-tasks`.**
+  The four `api.{list,create,update,delete}Acl` methods plus a new
+  `api.aclShow` now POST trust-task envelopes. Wire-shape translation
+  between the spec's `AclEntry` and the existing TypeScript `AclEntry`
+  type is invisible to screen code.
+
+### Deprecated
+
+- **`GET/POST /api/acl`, `PUT/DELETE /api/acl/{did}`** — every legacy
+  ACL route now emits:
+  - `Deprecation: true`
+  - `Sunset: Mon, 01 Dec 2026 00:00:00 GMT`
+  - `Link: </api/trust-tasks>; rel="successor-version"`
+  - Structured `warn`-level log line per call identifying caller +
+    successor URL (grep for `legacy_route=`).
+  Removal target: **v0.8.0**. See
+  [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
+  for migration guidance.
+
+### Known gap
+
+- **The Web UI emits unsigned trust-task envelopes** in v0.7.1 because
+  the browser has no Data Integrity signing infrastructure today (the
+  admin's private key isn't reachable from JavaScript after the
+  WebAuthn-bootstrapped DIDComm authenticate). The `enforce_proofs`
+  default of `false` accommodates this — bearer-JWT auth still
+  authenticates the caller end-to-end. v0.8.0 either ships the
+  session-key protocol that lets the UI sign, or constrains the
+  surface differently. Operators with backend-only callers (CLI,
+  service-to-service) should flip `enforce_proofs = true`.
+
+### Documentation
+
+- New [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
+  — client migration guide (old vs. new wire shape, proof policy,
+  worked examples for both HTTPS and DIDComm, error-code mapping).
+- New [`docs/trust-tasks-registry-gaps.md`](docs/trust-tasks-registry-gaps.md)
+  — catalogue of webvh ops not yet in the public Trust Tasks
+  registry, grouped by reusability tier with proposed slugs + payload
+  sketches per type. ~50 ops across 8 groups, ready to file upstream.
+
 ## 0.7.0 (unreleased)
 
 ### Changed — **BREAKING**

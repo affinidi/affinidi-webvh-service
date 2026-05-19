@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-common"
 description = "WebVH Common, Common methods and structs related to WebVH Content"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -35,6 +35,8 @@ server-core = [
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
+    "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
+    "dep:trust-tasks-proof",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -81,6 +83,11 @@ url = { workspace = true }
 # without further plumbing.
 ipnetwork = "0.21"
 vta-sdk = { workspace = true }
+# Used by `server::trust_tasks::NoVerifier` (and any future impl) to
+# match the `async_trait`-shaped `ProofVerifier::verify` signature.
+# The trait is `async fn verify<P: Serialize + Send + Sync>`, so it
+# can't be expanded to a plain GAT without the proc-macro.
+async-trait = "0.1"
 
 # server-core dependencies (optional)
 axum = { version = "0.8", optional = true }
@@ -96,6 +103,16 @@ tower-http = { version = "0.6", features = ["trace"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 toml = "1.0"
+
+# Trust Tasks framework — see workspace Cargo.toml for version pin and
+# [patch.crates-io] block. Gated behind `server-core` because the
+# dispatcher only runs on the server side; the client (no trust-tasks
+# admin surface yet) ignores them. Re-evaluate when we add a typed
+# client builder for outbound trust-task documents.
+trust-tasks-rs = { workspace = true, optional = true }
+trust-tasks-https = { workspace = true, optional = true }
+trust-tasks-didcomm = { workspace = true, optional = true }
+trust-tasks-proof = { workspace = true, optional = true }
 
 # store backends (optional)
 fjall = { workspace = true, optional = true }
@@ -145,6 +162,8 @@ tokio = { workspace = true }
 # Trust-Tasks router unit tests use `oneshot()` + raw body collection.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# async-trait moved to main [dependencies] for the prod NoVerifier impl;
+# tests inherit it from there.
 # T51 cross-crate URL invariant test — assert client and daemon
 # constants match byte-for-byte. dev-only; doesn't enter the
 # production dep graph.

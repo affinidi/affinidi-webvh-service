@@ -1199,6 +1199,19 @@ async fn build_control(
         }
     });
 
+    // Trust Tasks verifier — share the configured DID cache so
+    // `did:web` / `did:webvh` proof verifications hit the same cache
+    // the DIDComm path populates. Mirrors `did_hosting_control::server::build`
+    // for daemon-mode parity (see CLAUDE.md §What the daemon mirrors).
+    let trust_tasks_verifier = did_resolver.clone().map(|client| {
+        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
+            Arc::new(client),
+        ));
+        Arc::new(trust_tasks_proof::affinidi::Verifier::with_resolver(
+            resolver,
+        ))
+    });
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -1208,6 +1221,7 @@ async fn build_control(
         config: Arc::new(control_config),
         did_resolver,
         secrets_resolver,
+        trust_tasks_verifier,
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),

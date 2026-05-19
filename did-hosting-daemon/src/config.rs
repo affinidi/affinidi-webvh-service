@@ -256,6 +256,7 @@ impl DaemonConfig {
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
             registry: self.registry.clone(),
+            trust_tasks: did_hosting_control::config::TrustTasksConfig::default(),
             config_path: self.config_path.clone(),
         }
     }
