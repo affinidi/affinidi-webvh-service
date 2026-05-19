@@ -191,19 +191,40 @@ dispatch core:
   the framework enforcing IS_PROOF_REQUIRED authoritatively,
   REQUIRED specs (grant/revoke/change-role) are unreachable
   without a verified proof. The new default produces the
-  framework-correct shape; backend-only callers (CLI,
-  service-to-service) that already sign their envelopes work
-  out-of-the-box.
+  framework-correct shape for both backend-only callers (CLI,
+  service-to-service) and the Web UI (browser-side signing —
+  see next entry).
 
-  **Web UI signing.** Browser-side Data Integrity signing
-  (ephemeral Ed25519 session keypair, `eddsa-jcs-2022`
-  cryptosuite, JWT `cnf.jwk` binding per RFC 7800,
-  `SessionKeyVerifier` server-side) lands in a follow-up commit
-  in this PR. Until that lands, operators running the Web UI
-  against this code MUST set `trust_tasks.enforce_proofs = false`
-  in their control config — the UI's proofless envelopes will
-  otherwise be rejected with `proof_required`. The follow-up
-  commit removes the need for that operator step.
+- **Browser-side Data Integrity signing for the Web UI.** Closes
+  the "Web UI can't sign in-band" gap that was the original
+  reason `enforce_proofs` defaulted to `false`. Ephemeral
+  Ed25519 keypair generated via WebCrypto on each `passkey/login/
+  finish`; public multikey (base58btc, `z6Mk…`) sent to the
+  server and stored on the session record. Every REQUIRED-spec
+  envelope carries an `eddsa-jcs-2022` proof whose
+  `verificationMethod` is the matching `did:key` —
+  `did-hosting-ui/lib/session-key.ts` implements the cryptosuite
+  inline (~280 LOC, no npm deps for JCS or base58btc; uses
+  WebCrypto `crypto.subtle.sign`). Private key stays as a
+  non-extractable `CryptoKey` and never leaves the tab.
+
+  Server side wires the binding in three places:
+   * `Session.session_pubkey_b58btc` field carries the bound
+     pubkey across requests (stored in the existing sessions
+     keyspace).
+   * `AuthClaims.session_pubkey_b58btc` surfaces it to
+     `dispatch_trust_task`.
+   * Pre-check in `dispatch_trust_task` (SECURITY): when the JWT
+     carries a session pubkey, the proof's `verificationMethod`
+     MUST be the matching `did:key:{pk}#{pk}`. Mismatch →
+     `proof_invalid` rejection. Closes the "JWT subject A signs
+     with B's session key to forge requests as A" attack — the
+     framework's verifier would verify the cryptographic
+     signature successfully but wouldn't enforce the JWT-binding
+     itself.
+   * The framework's `AffinidiVerifier` then does the actual
+     signature verification (via the existing
+     `CachedDidResolver` which already supports `did:key`).
 - **`[patch.crates-io]` rev bumped to
   [`21db8a8`](https://github.com/trustoverip/dtgwg-trust-tasks-tf/commit/21db8a8a031a59797a2cc49ad800158e644d51e4)
   on `dtgwg-trust-tasks-tf`.** This is the PR #33 merge commit;

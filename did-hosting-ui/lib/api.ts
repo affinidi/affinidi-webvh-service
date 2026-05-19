@@ -1,5 +1,11 @@
 /** Typed API client for the did-hosting-control REST API. */
 
+import {
+  generateSessionKeypair,
+  hasSessionKeypair,
+  signEnvelope,
+} from "./session-key";
+
 export interface HealthResponse {
   status: string;
   version: string;
@@ -814,12 +820,25 @@ export const api = {
       body: JSON.stringify({}),
     }),
 
-  passkeyLoginFinish: (authId: string, credential: any) =>
-    request<TokenResponse>("/api/auth/passkey/login/finish", {
+  passkeyLoginFinish: async (authId: string, credential: any) => {
+    // Generate a fresh ephemeral Ed25519 keypair for this browser
+    // session and send the public multikey to the server. The server
+    // binds it to the JWT session so REQUIRED-spec trust-task
+    // requests (acl/grant, acl/revoke, acl/change-role) can carry
+    // `eddsa-jcs-2022` Data Integrity proofs signed with the matching
+    // private key. The private key stays in the CryptoKey wrapper
+    // and never leaves this tab.
+    const { pubkeyMultikey } = await generateSessionKeypair();
+    return request<TokenResponse>("/api/auth/passkey/login/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ auth_id: authId, credential }),
-    }),
+      body: JSON.stringify({
+        auth_id: authId,
+        credential,
+        session_pubkey_b58btc: pubkeyMultikey,
+      }),
+    });
+  },
 
   createInvite: (did: string, role: "admin" | "owner" | "service") =>
     request<CreateInviteResponse>("/api/auth/passkey/invite", {
@@ -950,16 +969,38 @@ interface SpecAclEntry {
 }
 
 /**
+ * Set of REQUIRED-spec type URIs that MUST carry a Data Integrity
+ * proof per the upstream Trust Tasks 0.1.1 framework. Proofless
+ * documents on these types are rejected with `proof_required`
+ * regardless of consumer policy (framework's
+ * `Payload::IS_PROOF_REQUIRED` const enforced authoritatively).
+ *
+ * `acl/list`, `acl/show`, and `trust-task-discovery` are
+ * RECOMMENDED / OPTIONAL — they're accepted proofless.
+ */
+const REQUIRED_PROOF_TYPES = new Set<string>([
+  "https://trusttasks.org/spec/acl/grant/0.1",
+  "https://trusttasks.org/spec/acl/revoke/0.1",
+  "https://trusttasks.org/spec/acl/change-role/0.1",
+]);
+
+/**
  * POST `/api/trust-tasks` with a typed envelope; throw an `ApiError`
  * for `trust-task-error/0.1` responses, return the typed response
  * payload otherwise.
  *
- * `issuer` / `recipient` are deliberately omitted from the envelope —
- * the bearer JWT carries the caller's DID and SPEC.md §4.8.1's
- * "transport-derived fills the absent in-band" rule populates both
- * sides server-side. A future version that emits signed envelopes
- * will set `issuer` explicitly so the proof's `verificationMethod`
- * binds to the document.
+ * REQUIRED-spec envelopes (`acl/grant`, `acl/revoke`,
+ * `acl/change-role`) carry an `eddsa-jcs-2022` Data Integrity proof
+ * signed by the ephemeral session keypair generated at login. The
+ * proof's `verificationMethod` is the `did:key` of the
+ * session pubkey; the server's `dispatch_trust_task` verifies that
+ * matches the JWT-bound pubkey before the framework's verifier runs.
+ *
+ * `issuer` / `recipient` remain omitted — the bearer JWT carries the
+ * caller's DID and SPEC.md §4.8.1's "transport-derived fills the
+ * absent in-band" rule populates both sides server-side. The proof's
+ * `verificationMethod` ties the signature to the session, not to the
+ * JWT subject's published DID.
  */
 async function trustTask<Req, Resp>(
   typeUri: string,
@@ -972,6 +1013,24 @@ async function trustTask<Req, Resp>(
     issuedAt: new Date().toISOString(),
     payload,
   };
+
+  // REQUIRED-spec envelopes need a Data Integrity proof. If the
+  // session keypair isn't yet generated (e.g. legacy login flow,
+  // page reload after login), generate one on demand — the server
+  // won't know about it, so the request will fail with
+  // `proof_invalid`, but that's a clearer error than `proof_required`.
+  // The expected operator action is "log in again" so the keypair is
+  // bound to a fresh JWT.
+  if (REQUIRED_PROOF_TYPES.has(typeUri)) {
+    if (!hasSessionKeypair()) {
+      // Build the keypair anyway; the request will fail server-side
+      // because this pubkey isn't bound to the JWT. The error message
+      // makes the cause clear in DevTools.
+      await generateSessionKeypair();
+    }
+    await signEnvelope(envelope as unknown as Record<string, unknown>);
+  }
+
   const respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(
     "/api/trust-tasks",
     {
