@@ -36,11 +36,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use trust_tasks_https::{HttpsHandler, status_for_code};
-use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
+use trust_tasks_rs::{ErrorPayload, ProofPolicy, RejectReason, TrustTask};
 use uuid::Uuid;
 
 use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, NoVerifier, TrustTaskContext, dispatch_inbound,
+    DispatchOutcome, TrustTaskContext, dispatch_inbound,
 };
 use trust_tasks_proof::affinidi::Verifier as AffinidiVerifier;
 
@@ -95,23 +95,28 @@ pub async fn dispatch_trust_task(
 
     // ─── 4. Dispatch.
     //
-    // Strict-proof mode (`enforce_proofs = true` AND a verifier is
-    // configured) passes `Some(&verifier)` — `dispatch_inbound` then
-    // enforces SPEC.md §7.2 item 7 (proof present + verified, or
-    // `proof_required` on a non-bearer spec). Otherwise we pass
-    // `None` and the run_pipeline silently-accepts a present proof
-    // *and* refuses to accept one — see the explicit rejection at the
-    // `(Some(proof), None)` arm of `run_pipeline`, which closes the
-    // "silent drop of a present proof" footgun.
-    let outcome = match (
+    // Map the operator's `enforce_proofs` toggle to a framework
+    // [`ProofPolicy`]:
+    //
+    //   * `true` + verifier configured → `Verify(&verifier)` — proof-
+    //     bearing documents are verified, proofless REQUIRED-spec
+    //     documents are rejected `proof_required`.
+    //   * `false` (default) → `RejectIfPresent` — proof-bearing
+    //     documents are rejected `malformed_request` with the
+    //     framework-shared sanitised wire message (see
+    //     `trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY`). The
+    //     operator-actionable diagnostic moves to a `tracing::warn!`
+    //     in `dispatch_inbound`. Silently dropping a proof would
+    //     mislead the producer about the integrity guarantees of
+    //     the exchange.
+    let policy: ProofPolicy<'_, AffinidiVerifier> = match (
         state.config.trust_tasks.enforce_proofs,
         state.trust_tasks_verifier.as_deref(),
     ) {
-        (true, Some(v)) => {
-            dispatch_inbound::<AffinidiVerifier>(&ctx, &transport, Some(v), doc).await
-        }
-        _ => dispatch_inbound::<NoVerifier>(&ctx, &transport, None, doc).await,
+        (true, Some(v)) => ProofPolicy::Verify(v),
+        _ => ProofPolicy::RejectIfPresent,
     };
+    let outcome = dispatch_inbound::<AffinidiVerifier>(&ctx, &transport, policy, doc).await;
     Ok(into_response(outcome))
 }
 

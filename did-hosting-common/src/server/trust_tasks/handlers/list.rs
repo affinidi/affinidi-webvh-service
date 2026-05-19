@@ -31,8 +31,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use trust_tasks_rs::{
-    ErrorPayload, ErrorResponse, ProofVerifier, StandardCode, TransportHandler, TrustTask,
-    specs::acl::list::v0_1 as list,
+    ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
+    TransportHandler, TrustTask, specs::acl::list::v0_1 as list,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
@@ -61,7 +61,7 @@ struct CursorState {
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
-    verifier: Option<&V>,
+    policy: ProofPolicy<'_, V>,
     doc: TrustTask<list::Payload>,
 ) -> DispatchOutcome
 where
@@ -70,10 +70,10 @@ where
     let acl_ks = ctx.acl_ks.clone();
     run_pipeline(
         transport,
-        verifier,
+        policy,
         doc,
         ctx.my_vid,
-        move |doc| async move { handle_inner(&acl_ks, doc).await },
+        move |doc, parties| async move { handle_inner(&acl_ks, doc, &parties).await },
     )
     .await
 }
@@ -81,12 +81,13 @@ where
 async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<list::Payload>,
+    parties: &ResolvedParties,
 ) -> Result<TrustTask<list::Response>, ErrorResponse> {
-    let caller = doc.issuer.as_deref().ok_or_else(|| {
+    let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
             &doc,
             ErrorPayload::new(StandardCode::PermissionDenied)
-                .with_message("inbound document has no in-band issuer"),
+                .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
     match acl::check_acl(acl_ks, caller).await {
@@ -259,11 +260,11 @@ mod tests {
         where
             P: serde::Serialize + Send + Sync,
         {
-            panic!("unexpected verify");
+            panic!("verifier called under RejectIfPresent policy");
         }
     }
-    fn no_verifier() -> Option<&'static PanickingVerifier> {
-        None
+    fn no_verifier() -> ProofPolicy<'static, PanickingVerifier> {
+        ProofPolicy::RejectIfPresent
     }
 
     async fn harness() -> (Store, crate::server::store::KeyspaceHandle) {

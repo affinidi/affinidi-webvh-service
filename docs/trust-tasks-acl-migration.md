@@ -172,30 +172,41 @@ the same envelope type.
 ## Proof policy (v0.7.0)
 
 The framework spec marks `acl/grant`, `acl/revoke`, and
-`acl/change-role` as `proof: REQUIRED`. v0.7.0 ships a **config flag**
-that gates strict enforcement so the Web UI (no in-browser signing
-infrastructure today) keeps working:
+`acl/change-role` as `proof: REQUIRED`. Under the upstream 0.1.1
+framework adoption, that requirement is enforced **authoritatively
+per-spec** — proofless documents are rejected with `proof_required`
+regardless of consumer policy. The Web UI ships browser-side
+Data Integrity signing (`eddsa-jcs-2022` cryptosuite, ephemeral
+Ed25519 session keypair) so admin flows work end-to-end.
 
 ```toml
 [trust_tasks]
-enforce_proofs = false   # default in v0.7.0
+enforce_proofs = true   # default in v0.7.0
 ```
 
-- `false` (default): an absent `proof` is accepted (the transport's
-  bearer JWT or authcrypt-verified sender carries the caller's
-  identity end-to-end). A request that *does* carry a `proof`
-  member is rejected with `malformed_request` — a producer that
-  signed the envelope believed their signing key was authenticating
-  the request; silently dropping the proof would mislead them about
-  what's actually authoritative. Either omit the proof, or ask the
-  operator to enable enforcement.
-- `true`: the maintainer verifies a present `proof`; an absent
-  `proof` on a non-bearer spec is rejected with `proof_required`.
+- `true` (default) — [`ProofPolicy::Verify`](../did-hosting-common/src/server/trust_tasks/mod.rs):
+  the maintainer verifies a present `proof` against the configured
+  verifier (`affinidi-data-integrity` resolving `did:web` /
+  `did:webvh` / `did:key`). Failure → `proof_invalid` on the wire.
+  An absent `proof` on a REQUIRED spec → `proof_required`. This is
+  the framework-correct shape; backend-only callers (CLI,
+  service-to-service) that already sign their envelopes work
+  out-of-the-box.
 
-Operators with **backend-only callers** (CLI, service-to-service)
-should flip the flag to `true`. v0.8.0 ships either the session-key
-protocol that lets the Web UI sign too, or makes the flag mandatory.
-Track [the v0.8.0 milestone](../CHANGELOG.md) for the decision.
+- `false` — [`ProofPolicy::RejectIfPresent`](../did-hosting-common/src/server/trust_tasks/mod.rs):
+  proof-bearing documents are rejected with `malformed_request`
+  (silently dropping a producer-supplied proof would mislead the
+  producer about the integrity guarantees of the exchange). Useful
+  during migration from v0.6 / legacy clients that have not yet
+  rolled out signing. REQUIRED specs remain unreachable without
+  flipping back to `true`.
+
+The wire message under `false` + present proof is the framework-
+shared sanitised constant `PROOF_NOT_ACCEPTED_BY_POLICY` ("in-band
+proof not accepted by consumer policy (SPEC §7.2 item 7)"); the
+operator-actionable diagnostic ("flip `enforce_proofs = true`")
+lives in a `tracing::warn!` emitted by `dispatch_inbound` so an
+unauth probe can't enumerate verifier coverage across a fleet.
 
 ## Discovery
 

@@ -959,23 +959,17 @@ pub(crate) async fn run_trust_tasks_envelope(
     // Dispatch with the configured proof verifier when the operator
     // has opted in. Mirrors `routes::trust_tasks` — both transports
     // share one proof policy.
-    let outcome = match (
+    let policy: trust_tasks_rs::ProofPolicy<'_, trust_tasks_proof::affinidi::Verifier> = match (
         state.config.trust_tasks.enforce_proofs,
         state.trust_tasks_verifier.as_deref(),
     ) {
-        (true, Some(v)) => {
-            did_hosting_common::server::trust_tasks::dispatch_inbound::<
-                trust_tasks_proof::affinidi::Verifier,
-            >(&ctx, &transport, Some(v), doc)
-            .await
-        }
-        _ => {
-            did_hosting_common::server::trust_tasks::dispatch_inbound::<
-                did_hosting_common::server::trust_tasks::NoVerifier,
-            >(&ctx, &transport, None, doc)
-            .await
-        }
+        (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
+        _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
     };
+    let outcome = did_hosting_common::server::trust_tasks::dispatch_inbound::<
+        trust_tasks_proof::affinidi::Verifier,
+    >(&ctx, &transport, policy, doc)
+    .await;
 
     use did_hosting_common::server::trust_tasks::DispatchOutcome;
     let body = match outcome {
@@ -1997,27 +1991,15 @@ mod tests {
     // ATM-backed context.
     // -----------------------------------------------------------------
 
-    fn build_grant_envelope(issuer_did: &str, subject: &str, role: &str) -> Message {
-        use trust_tasks_rs::specs::acl::grant::v0_1 as grant;
-        let entry = grant::AclEntry {
-            subject: subject.into(),
-            role: role.into(),
-            scopes: vec![],
-            label: Some("test".into()),
-            created_at: None,
-            created_by: None,
-            updated_at: None,
-            updated_by: None,
-            expires_at: None,
-            ext: serde_json::from_value(json!({
-                "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
-            }))
-            .unwrap(),
-        };
-        let payload = grant::Payload {
-            entry,
+    fn build_list_envelope(issuer_did: &str) -> Message {
+        use trust_tasks_rs::specs::acl::list::v0_1 as list;
+        let payload = list::Payload {
             ext: None,
-            reason: None,
+            cursor: None,
+            page_size: None,
+            role: None,
+            scope: None,
+            subject_prefix: None,
         };
         let mut doc = trust_tasks_rs::TrustTask::for_payload(
             format!("urn:uuid:{}", uuid::Uuid::new_v4()),
@@ -2031,10 +2013,17 @@ mod tests {
         build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, body)
     }
 
+    /// Happy-path envelope dispatch. Exercises the `acl/list/0.1`
+    /// flow (a RECOMMENDED spec — proofless requests are valid under
+    /// the framework's IS_PROOF_REQUIRED enforcement). REQUIRED specs
+    /// (`acl/grant`, `acl/revoke`, `acl/change-role`) require a
+    /// real Data Integrity proof under upstream 0.1.1; the
+    /// end-to-end integration test for those lives in the browser-
+    /// signing path test once that lands.
     #[tokio::test]
-    async fn trust_tasks_envelope_happy_path_grant_returns_handled_response() {
+    async fn trust_tasks_envelope_happy_path_list_returns_handled_response() {
         let (state, _dir) = test_state().await;
-        // Seed an Admin so the grant authorises.
+        // Seed an Admin so list authorises (list rejects non-Admin).
         store_acl_entry(
             &state.acl_ks,
             &AclEntry {
@@ -2050,7 +2039,7 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = build_grant_envelope("did:example:admin", "did:web:alice.example", "owner");
+        let msg = build_list_envelope("did:example:admin");
         let (resp_type, resp_body) =
             super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
                 .await
@@ -2060,21 +2049,13 @@ mod tests {
         assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
         let inner_type = resp_body["type"].as_str().unwrap();
         assert!(
-            inner_type.ends_with("/acl/grant/0.1#response"),
-            "expected acl/grant response type, got {inner_type}"
+            inner_type.ends_with("/acl/list/0.1#response"),
+            "expected acl/list response type, got {inner_type}"
         );
-        assert_eq!(
-            resp_body["payload"]["entry"]["subject"],
-            "did:web:alice.example"
-        );
-
-        // Storage reflects the grant — the daemon-mode path persisted.
-        let stored: Option<AclEntry> = state
-            .acl_ks
-            .get(format!("acl:{}", "did:web:alice.example").into_bytes())
-            .await
-            .unwrap();
-        assert!(stored.is_some());
+        // The single seeded Admin should appear in the response.
+        let entries = resp_body["payload"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["subject"], "did:example:admin");
     }
 
     #[tokio::test]
@@ -2122,7 +2103,7 @@ mod tests {
         };
         state.config = Arc::new(cfg);
 
-        let msg = build_grant_envelope("did:example:admin", "did:web:alice.example", "owner");
+        let msg = build_list_envelope("did:example:admin");
         let err = super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
             .await
             .expect_err("missing server_did should fail");

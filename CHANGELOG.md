@@ -144,22 +144,71 @@ safety fixes.
   upstream GitHub source; orphan doc block on `dispatch_inbound`
   attached.
 
-### Known gap — Web UI emits unsigned envelopes
+### Upstream alignment — trust-tasks 0.1.1
 
-The Web UI POSTs trust-task envelopes without a Data Integrity
-`proof` member because the browser has no signing infrastructure
-today (the admin's private key isn't reachable from JavaScript after
-the WebAuthn-bootstrapped DIDComm authenticate). The
-`trust_tasks.enforce_proofs` default of `false` accommodates this —
-bearer-JWT auth still authenticates the caller end-to-end via the
-framework's transport-derived-identity precedence (SPEC.md §4.8.1).
-v0.8.0 either ships the session-key protocol that lets the UI sign,
-or constrains the surface differently. Operators with backend-only
-callers (CLI, service-to-service) should flip
-`enforce_proofs = true`; the dispatcher will then enforce
-`proof_required` on a missing proof and `proof_invalid` on a
-failing verification, *and* will reject any envelope that carries a
-`proof` member while enforcement is disabled.
+The framework consumed our v0.7.0 review feedback in
+[PR #33](https://github.com/trustoverip/dtgwg-trust-tasks-tf/pull/33);
+v0.7.0 adopts the resulting 0.1.1 surface. Behavioural-equivalent
+where the old code was correct, and a strict simplification of the
+dispatch core:
+
+- **`run_pipeline` is now a thin shim over
+  `trust_tasks_rs::consume_inbound`.** ~110 lines of hand-rolled
+  §7.2 pipeline replaced by ~20 lines of adapter. The framework
+  owns expiry, recipient enforcement, party resolution, proof
+  policy, and audience binding; our shim adapts `ConsumeOutcome` →
+  `DispatchOutcome` and re-encodes the typed response as
+  `TrustTask<Value>`.
+- **`ProofPolicy` replaces `Option<&V>`.** Three explicit variants
+  (`Verify(&v)`, `RejectIfPresent`, `AcceptUnverified`) make the
+  consumer's posture audit-able at the call site. The control
+  plane's `enforce_proofs` toggle maps to `Verify(&verifier)` /
+  `RejectIfPresent`.
+- **`Payload::IS_PROOF_REQUIRED` enforced authoritatively.**
+  Codegen reads each spec's `proofRequirement.requirement` from
+  front matter; `consume_inbound` checks the const independently of
+  the consumer's `ProofPolicy`. `acl/grant`, `acl/revoke`,
+  `acl/change-role` (all REQUIRED) refuse proofless documents
+  regardless of policy; `acl/list`, `acl/show`, and
+  `trust-task-discovery` (RECOMMENDED / OPTIONAL) accept them.
+- **`Payload::extended_code(local)` helper** replaces every hand-
+  rolled `TrustTaskCode::Extended { slug, local }` literal across
+  `change_role.rs` and `revoke.rs`. Slug is sourced from
+  `TYPE_URI` and can't drift.
+- **`NoVerifier` uninhabited enum + `verification_error_to_reason`
+  helper removed.** Framework handles both. Pipeline is generic in
+  `V: ProofVerifier + ?Sized` and the `RejectIfPresent` /
+  `AcceptUnverified` variants don't carry a verifier reference.
+- **Sanitised wire-rejection diagnostic.** The
+  `RejectIfPresent` path now emits the framework-shared
+  `PROOF_NOT_ACCEPTED_BY_POLICY` constant ("in-band proof not
+  accepted by consumer policy (SPEC §7.2 item 7)") rather than the
+  previous verbose form. The verbose operator-actionable form
+  ("flip `enforce_proofs = true`") lives in a `tracing::warn!` in
+  `dispatch_inbound`. Sanitising the wire prevents an unauth
+  probe from enumerating verifier coverage across a fleet.
+- **`enforce_proofs` default flipped from `false` to `true`.** With
+  the framework enforcing IS_PROOF_REQUIRED authoritatively,
+  REQUIRED specs (grant/revoke/change-role) are unreachable
+  without a verified proof. The new default produces the
+  framework-correct shape; backend-only callers (CLI,
+  service-to-service) that already sign their envelopes work
+  out-of-the-box.
+
+  **Web UI signing.** Browser-side Data Integrity signing
+  (ephemeral Ed25519 session keypair, `eddsa-jcs-2022`
+  cryptosuite, JWT `cnf.jwk` binding per RFC 7800,
+  `SessionKeyVerifier` server-side) lands in a follow-up commit
+  in this PR. Until that lands, operators running the Web UI
+  against this code MUST set `trust_tasks.enforce_proofs = false`
+  in their control config — the UI's proofless envelopes will
+  otherwise be rejected with `proof_required`. The follow-up
+  commit removes the need for that operator step.
+- **`[patch.crates-io]` rev bumped to
+  [`21db8a8`](https://github.com/trustoverip/dtgwg-trust-tasks-tf/commit/21db8a8a031a59797a2cc49ad800158e644d51e4)
+  on `dtgwg-trust-tasks-tf`.** This is the PR #33 merge commit;
+  drops along with the rest of `[patch.crates-io]` when the
+  upstream publishes to crates.io.
 
 ### Changed — **BREAKING**
 

@@ -147,13 +147,22 @@ trust-tasks-proof = { version = "0.1", default-features = false, features = ["af
 # the next `cargo update`; that's the visible diff that
 # documents the transition.
 #
-# Commit chosen: tip of `main` containing the jsonwebtoken 9 → 10
-# bump that our `enforce_proofs` strict-mode wiring relies on
-# (PR #32).
-trust-tasks-rs = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
-trust-tasks-https = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
-trust-tasks-didcomm = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
-trust-tasks-proof = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "bc33ff0c42111615f8894feefc981c12ffe43f68" }
+# Commit chosen: PR #33 ("Harden consumer pipeline: proof-handling +
+# handler ergonomics"). 0.1.1 brings:
+#   * `consume_inbound` handler returns `ErrorResponse` (not
+#     `RejectReason`) and receives the SPEC §4.8.1 `ResolvedParties`
+#     — eliminates our hand-rolled `run_pipeline`.
+#   * `Payload::IS_PROOF_REQUIRED` codegen const — per-spec proof
+#     enforcement, replacing the IS_BEARER+verifier heuristic.
+#   * `ProofPolicy` enum (`Verify`/`RejectIfPresent`/`AcceptUnverified`)
+#     — `enforce_proofs=false` now maps to `RejectIfPresent`.
+#   * `Payload::extended_code(local)` helper — slug sourced from
+#     `TYPE_URI`, can't drift.
+#   * `DynProofVerifier` + `erase_verifier` for `Arc<dyn _>` storage.
+trust-tasks-rs = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
+trust-tasks-https = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
+trust-tasks-didcomm = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
+trust-tasks-proof = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.

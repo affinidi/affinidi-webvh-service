@@ -83,11 +83,6 @@ url = { workspace = true }
 # without further plumbing.
 ipnetwork = "0.21"
 vta-sdk = { workspace = true }
-# Used by `server::trust_tasks::NoVerifier` (and any future impl) to
-# match the `async_trait`-shaped `ProofVerifier::verify` signature.
-# The trait is `async fn verify<P: Serialize + Send + Sync>`, so it
-# can't be expanded to a plain GAT without the proc-macro.
-async-trait = "0.1"
 
 # server-core dependencies (optional)
 axum = { version = "0.8", optional = true }
@@ -162,8 +157,13 @@ tokio = { workspace = true }
 # Trust-Tasks router unit tests use `oneshot()` + raw body collection.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# async-trait moved to main [dependencies] for the prod NoVerifier impl;
-# tests inherit it from there.
+# Test-only stub `ProofVerifier` impls (`AlwaysOkVerifier`,
+# `AlwaysErrVerifier`, `PanickingVerifier`) use the
+# `#[async_trait::async_trait]` macro to match the trait's
+# `async fn verify<P>(...)` shape. Prod code uses `ProofPolicy`
+# variants that don't carry a custom verifier impl, so the dep is
+# test-only.
+async-trait = "0.1"
 # T51 cross-crate URL invariant test — assert client and daemon
 # constants match byte-for-byte. dev-only; doesn't enter the
 # production dep graph.

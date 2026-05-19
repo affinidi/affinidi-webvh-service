@@ -32,8 +32,9 @@
 
 use serde_json::json;
 use trust_tasks_rs::{
-    ErrorPayload, ErrorResponse, ProofVerifier, StandardCode, TransportHandler, TrustTask,
-    TrustTaskCode, guards::acl::reject_last_authority, specs::acl::revoke::v0_1 as revoke,
+    ErrorPayload, ErrorResponse, Payload, ProofPolicy, ProofVerifier, ResolvedParties,
+    StandardCode, TransportHandler, TrustTask, guards::acl::reject_last_authority,
+    specs::acl::revoke::v0_1 as revoke,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
@@ -45,17 +46,17 @@ use crate::server::trust_tasks::{
 const SCOPE_DOMAIN_PREFIX: &str = "domain:";
 
 /// Spec-extended error codes published in the `acl/revoke/0.1` front
-/// matter. We surface these verbatim as `TrustTaskCode::Extended`.
+/// matter. Minted via [`Payload::extended_code`] so the slug is sourced
+/// from `TYPE_URI` and can't drift.
 const ERR_SUBJECT_NOT_PRESENT: &str = "subject_not_present";
 const ERR_LAST_AUTHORITY: &str = "last_authority_protected";
-const REVOKE_SLUG: &str = "acl/revoke";
 
 /// Run the framework pipeline + business logic for an inbound
 /// `acl/revoke/0.1` request.
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
-    verifier: Option<&V>,
+    policy: ProofPolicy<'_, V>,
     doc: TrustTask<revoke::Payload>,
 ) -> DispatchOutcome
 where
@@ -65,10 +66,10 @@ where
     let acl_locks = ctx.acl_locks.clone();
     run_pipeline(
         transport,
-        verifier,
+        policy,
         doc,
         ctx.my_vid,
-        move |doc| async move {
+        move |doc, parties| async move {
             // Serialise every ACL mutation through one global lock so
             // the read-then-write critical section (auth check, last-
             // authority guard, write) is race-free across concurrent
@@ -78,7 +79,7 @@ where
             let _guard = acl_locks
                 .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
                 .await;
-            handle_inner(&acl_ks, doc).await
+            handle_inner(&acl_ks, doc, &parties).await
         },
     )
     .await
@@ -87,13 +88,14 @@ where
 async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<revoke::Payload>,
+    parties: &ResolvedParties,
 ) -> Result<TrustTask<revoke::Response>, ErrorResponse> {
     let subject = doc.payload.subject.clone();
-    let caller = doc.issuer.as_deref().ok_or_else(|| {
+    let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
             &doc,
             ErrorPayload::new(StandardCode::PermissionDenied)
-                .with_message("inbound document has no in-band issuer"),
+                .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
     let self_revoke = caller == subject;
@@ -301,11 +303,8 @@ fn into_spec_entry(local: &AclEntry) -> revoke::AclEntry {
     serde_json::from_value(value).expect("revoke::AclEntry from SpecAclEntry value")
 }
 
-fn extended_code(local: &str) -> TrustTaskCode {
-    TrustTaskCode::Extended {
-        slug: REVOKE_SLUG.into(),
-        local: local.into(),
-    }
+fn extended_code(local: &str) -> trust_tasks_rs::TrustTaskCode {
+    revoke::Payload::extended_code(local.to_string())
 }
 
 fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
@@ -340,12 +339,32 @@ mod tests {
         where
             P: serde::Serialize + Send + Sync,
         {
-            panic!("verifier called in a test that passed Option::None");
+            panic!("verifier called under RejectIfPresent policy");
         }
     }
 
-    fn no_verifier() -> Option<&'static PanickingVerifier> {
-        None
+    /// Default test policy: `AcceptUnverified`. `acl/revoke/0.1` is
+    /// REQUIRED — every test request carries a stub proof for the
+    /// IS_PROOF_REQUIRED gate, and AcceptUnverified lets the framework
+    /// pipeline reach the handler.
+    fn no_verifier() -> ProofPolicy<'static, PanickingVerifier> {
+        ProofPolicy::AcceptUnverified
+    }
+
+    /// Stub proof attached to every test request so the framework's
+    /// `IS_PROOF_REQUIRED` check passes. Shape is not validated under
+    /// `ProofPolicy::AcceptUnverified` — we just need a present
+    /// `proof` member.
+    fn add_stub_proof(doc: &mut TrustTask<revoke::Payload>) {
+        doc.proof = Some(trust_tasks_rs::Proof {
+            proof_type: "DataIntegrityProof".into(),
+            cryptosuite: "eddsa-jcs-2022".into(),
+            verification_method: "did:web:admin.example#key-1".into(),
+            created: chrono::Utc::now(),
+            proof_purpose: "assertionMethod".into(),
+            proof_value: "z-stub".into(),
+            extra: Default::default(),
+        });
     }
 
     async fn harness() -> (Store, crate::server::store::KeyspaceHandle) {
@@ -410,6 +429,7 @@ mod tests {
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
         doc.issued_at = Some(chrono::Utc::now());
+        add_stub_proof(&mut doc);
         doc
     }
 
@@ -589,13 +609,7 @@ mod tests {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
         };
-        assert_eq!(
-            err.payload.code,
-            TrustTaskCode::Extended {
-                slug: REVOKE_SLUG.into(),
-                local: ERR_LAST_AUTHORITY.into(),
-            }
-        );
+        assert_eq!(err.payload.code, extended_code(ERR_LAST_AUTHORITY));
         let details = err.payload.details.expect("details present");
         assert_eq!(details["protectedRole"], "admin");
         assert_eq!(details["remainingHolders"], serde_json::json!([]));
@@ -723,13 +737,7 @@ mod tests {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
         };
-        assert_eq!(
-            err.payload.code,
-            TrustTaskCode::Extended {
-                slug: REVOKE_SLUG.into(),
-                local: ERR_SUBJECT_NOT_PRESENT.into(),
-            }
-        );
+        assert_eq!(err.payload.code, extended_code(ERR_SUBJECT_NOT_PRESENT));
     }
 
     #[tokio::test]
@@ -778,7 +786,7 @@ mod tests {
         };
         assert_eq!(
             err.payload.code,
-            TrustTaskCode::Standard(StandardCode::PermissionDenied)
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
         );
     }
 
@@ -808,7 +816,7 @@ mod tests {
         };
         assert_eq!(
             err.payload.code,
-            TrustTaskCode::Standard(StandardCode::MalformedRequest)
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
         );
     }
 
@@ -830,7 +838,7 @@ mod tests {
         };
         assert_eq!(
             err.payload.code,
-            TrustTaskCode::Standard(StandardCode::MalformedRequest)
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
         );
     }
 }

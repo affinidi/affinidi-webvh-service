@@ -14,8 +14,8 @@
 
 use serde_json::json;
 use trust_tasks_rs::{
-    ErrorPayload, ErrorResponse, ProofVerifier, StandardCode, TransportHandler, TrustTask,
-    specs::acl::grant::v0_1 as grant,
+    ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
+    TransportHandler, TrustTask, specs::acl::grant::v0_1 as grant,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
@@ -29,7 +29,7 @@ use crate::server::trust_tasks::{
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
-    verifier: Option<&V>,
+    policy: ProofPolicy<'_, V>,
     doc: TrustTask<grant::Payload>,
 ) -> DispatchOutcome
 where
@@ -39,10 +39,10 @@ where
     let acl_locks = ctx.acl_locks.clone();
     run_pipeline(
         transport,
-        verifier,
+        policy,
         doc,
         ctx.my_vid,
-        move |doc| async move {
+        move |doc, parties| async move {
             // Serialise every ACL mutation through one global lock so
             // the read-existing → check-policy → store window is
             // race-free. See `ACL_WRITE_LOCK_KEY` doc-comment for
@@ -50,7 +50,7 @@ where
             let _guard = acl_locks
                 .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
                 .await;
-            handle_inner(&acl_ks, doc).await
+            handle_inner(&acl_ks, doc, &parties).await
         },
     )
     .await
@@ -59,17 +59,20 @@ where
 async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<grant::Payload>,
+    parties: &ResolvedParties,
 ) -> Result<TrustTask<grant::Response>, ErrorResponse> {
     // ─── 1. Authorise the caller. ──────────────────────────────────
     // The framework has already validated identity (in-band issuer
-    // matches transport-derived sender, proof verified, ...). We need
-    // to additionally check the maintainer-side policy: only Admin
+    // matches transport-derived sender, proof verified, ...) and
+    // surfaced the resolved party in `parties.issuer` — in-band
+    // wins, transport fills in when in-band is absent (SPEC §4.8.1).
+    // We additionally check the maintainer-side policy: only Admin
     // entries in our own ACL may grant.
-    let caller = doc.issuer.as_deref().ok_or_else(|| {
+    let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
             &doc,
             ErrorPayload::new(StandardCode::PermissionDenied)
-                .with_message("inbound document has no in-band issuer"),
+                .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
     match acl::check_acl(acl_ks, caller).await {
@@ -239,10 +242,10 @@ mod tests {
     use crate::server::trust_tasks::TrustTaskContext;
     use crate::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
-    /// Test-only [`ProofVerifier`] used to pin the generic `V` type on
-    /// the handler when we pass `Option::<&_>::None`. `verify` panics
-    /// because the pipeline does not invoke the verifier when the
-    /// `Option` is `None` — if this ever runs, the test setup is wrong.
+    /// Type-anchor only — `RejectIfPresent` doesn't carry a verifier
+    /// reference, but [`ProofPolicy`] is generic in `V` and needs *some*
+    /// concrete type to fix inference. `verify` panics because the
+    /// pipeline never reaches a verifier under this policy.
     struct PanickingVerifier;
 
     #[async_trait::async_trait]
@@ -251,12 +254,22 @@ mod tests {
         where
             P: serde::Serialize + Send + Sync,
         {
-            panic!("verifier called in a test that passed Option::None");
+            panic!("verifier called under RejectIfPresent policy");
         }
     }
 
-    fn no_verifier() -> Option<&'static PanickingVerifier> {
-        None
+    /// Default test policy: `AcceptUnverified`. Since the upstream
+    /// 0.1.1 framework enforces `P::IS_PROOF_REQUIRED` authoritatively
+    /// (`acl/grant` / `acl/revoke` / `acl/change-role` mandate a
+    /// proof regardless of consumer policy), every REQUIRED-spec test
+    /// request carries a stub proof via [`add_stub_proof`]. Pairing
+    /// that with `AcceptUnverified` lets the framework pipeline reach
+    /// the handler's business logic without a real verifier
+    /// configured. Tests that *do* want to exercise verification build
+    /// a `ProofPolicy::Verify(...)` directly with one of the stub
+    /// verifiers defined below.
+    fn no_verifier() -> ProofPolicy<'static, PanickingVerifier> {
+        ProofPolicy::AcceptUnverified
     }
 
     const SERVICE_DID: &str = "did:web:maintainer.example";
@@ -326,6 +339,13 @@ mod tests {
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
         doc.issued_at = Some(chrono::Utc::now());
+        // `acl/grant/0.1` is REQUIRED: framework rejects proofless
+        // documents with `proof_required` regardless of policy. Every
+        // grant_request() carries a stub proof so the pipeline reaches
+        // the handler under `ProofPolicy::AcceptUnverified` (the test
+        // default, mirroring `enforce_proofs=false` minus the
+        // RECOMMENDED-spec-only constraint).
+        add_stub_proof(&mut doc);
         doc
     }
 
@@ -686,7 +706,13 @@ mod tests {
         let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
         add_stub_proof(&mut doc);
 
-        let outcome = handle(&ctx, &transport, Some(&AlwaysOkVerifier), doc).await;
+        let outcome = handle(
+            &ctx,
+            &transport,
+            ProofPolicy::Verify(&AlwaysOkVerifier),
+            doc,
+        )
+        .await;
         assert!(matches!(outcome, DispatchOutcome::Handled(_)));
         assert!(
             acl::get_acl_entry(&acl_ks, ALICE_DID)
@@ -708,7 +734,13 @@ mod tests {
         let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
         add_stub_proof(&mut doc);
 
-        let outcome = handle(&ctx, &transport, Some(&AlwaysErrVerifier), doc).await;
+        let outcome = handle(
+            &ctx,
+            &transport,
+            ProofPolicy::Verify(&AlwaysErrVerifier),
+            doc,
+        )
+        .await;
         let err = match outcome {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
@@ -726,18 +758,28 @@ mod tests {
         );
     }
 
-    /// `enforce_proofs = true` + absent proof on a non-bearer spec →
-    /// `proof_required`. Exercises the `(None, Some(_))` branch.
+    /// REQUIRED spec + absent proof → `proof_required`. Under upstream
+    /// 0.1.1 this fires authoritatively from `P::IS_PROOF_REQUIRED`
+    /// regardless of the consumer's `ProofPolicy`. Test pins the
+    /// framework's per-spec enforcement on `acl/grant/0.1`.
     #[tokio::test]
-    async fn enforce_proofs_with_missing_proof_rejects_proof_required() {
+    async fn required_spec_with_missing_proof_rejects_proof_required() {
         let (_store, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
-        // No proof attached.
-        let doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        // Build a request, then strip the stub proof that
+        // `grant_request()` attached by default.
+        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        doc.proof = None;
 
-        let outcome = handle(&ctx, &transport, Some(&AlwaysOkVerifier), doc).await;
+        let outcome = handle(
+            &ctx,
+            &transport,
+            ProofPolicy::Verify(&AlwaysOkVerifier),
+            doc,
+        )
+        .await;
         let err = match outcome {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
@@ -754,21 +796,24 @@ mod tests {
         );
     }
 
-    /// `enforce_proofs = false` (verifier = None) + present proof →
-    /// `malformed_request`. The previous behaviour (silent drop of a
-    /// present proof) was the security-relevant footgun the v0.7.0
-    /// review pass surfaced. This test pins the new explicit-reject
-    /// behaviour.
+    /// `enforce_proofs = false` (`ProofPolicy::RejectIfPresent`) +
+    /// present proof → `malformed_request`. The previous behaviour
+    /// (silent drop of a present proof) was the security-relevant
+    /// footgun the v0.7.0 review pass surfaced. This test pins the
+    /// new explicit-reject behaviour.
     #[tokio::test]
-    async fn proof_present_without_verifier_rejects_malformed_request() {
+    async fn proof_present_under_reject_if_present_rejects_malformed_request() {
         let (_store, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
-        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
-        add_stub_proof(&mut doc);
+        // grant_request() already attaches a stub proof for the
+        // IS_PROOF_REQUIRED gate; that same proof here triggers the
+        // RejectIfPresent rejection.
+        let doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
 
-        let outcome = handle(&ctx, &transport, no_verifier(), doc).await;
+        let outcome =
+            handle::<PanickingVerifier>(&ctx, &transport, ProofPolicy::RejectIfPresent, doc).await;
         let err = match outcome {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
@@ -777,10 +822,16 @@ mod tests {
             err.payload.code,
             trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
         );
-        let msg = err.payload.message.as_deref().unwrap();
+        // The wire message is the framework-shared sanitised constant
+        // (see trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY) — the
+        // verbose operator-actionable form ("flip enforce_proofs =
+        // true") lives in a tracing::warn! emitted by dispatch_inbound,
+        // not on the wire. Sanitising the wire prevents an unauth
+        // probe from enumerating verifier coverage across a fleet.
+        let msg = err.payload.message.as_deref().unwrap_or("");
         assert!(
-            msg.contains("enforce_proofs"),
-            "operator-actionable message expected, got: {msg}"
+            msg.contains("SPEC §7.2 item 7"),
+            "framework's sanitised wire message expected, got: {msg}"
         );
     }
 

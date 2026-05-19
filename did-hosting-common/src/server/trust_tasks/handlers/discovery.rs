@@ -26,7 +26,7 @@
 //! checks consistent with the ACL handlers above.
 
 use trust_tasks_rs::{
-    ErrorResponse, Payload, ProofVerifier, TransportHandler, TrustTask,
+    ErrorResponse, Payload, ProofPolicy, ProofVerifier, TransportHandler, TrustTask,
     discovery::DiscoveryRegistry,
     specs::{
         acl::{
@@ -65,15 +65,19 @@ pub fn registry() -> DiscoveryRegistry {
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
-    verifier: Option<&V>,
+    policy: ProofPolicy<'_, V>,
     doc: TrustTask<discovery::Payload>,
 ) -> DispatchOutcome
 where
     V: ProofVerifier + ?Sized,
 {
-    run_pipeline(transport, verifier, doc, ctx.my_vid, |doc| async move {
-        handle_inner(doc).await
-    })
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        ctx.my_vid,
+        |doc, _parties| async move { handle_inner(doc).await },
+    )
     .await
 }
 
@@ -109,11 +113,11 @@ mod tests {
         where
             P: serde::Serialize + Send + Sync,
         {
-            panic!("unexpected verify");
+            panic!("verifier called under RejectIfPresent policy");
         }
     }
-    fn no_verifier() -> Option<&'static PanickingVerifier> {
-        None
+    fn no_verifier() -> ProofPolicy<'static, PanickingVerifier> {
+        ProofPolicy::RejectIfPresent
     }
 
     // Discovery doesn't touch the ACL store, but the harness type
