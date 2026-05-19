@@ -18,6 +18,13 @@ use did_hosting_common::server::trust_task::TrustTaskRouter;
 
 use crate::server::AppState;
 
+/// Maximum body size accepted on `POST /api/trust-tasks` (in bytes).
+/// Sized for the largest legitimate envelope a client produces
+/// (`acl/list` response with a full page) plus headroom; an
+/// authenticated-Owner attacker can no longer drive multi-MB JSON
+/// allocations before the handler-level Admin check rejects.
+pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
 /// Build the control plane router without the UI fallback (daemon mode).
 ///
 /// ## T8b: Trust-Task header gating
@@ -273,10 +280,21 @@ pub fn router_without_fallback() -> Router<AppState> {
             get(did_manage::get_config),
             (*TASK_CONFIG_1_0).clone(),
         )
-        // Exempt: Trust Tasks transport (v0.7.1+). The envelope's
+        // Exempt: Trust Tasks transport (v0.7.0+). The envelope's
         // `type` URI is the task identifier; the legacy
         // `Trust-Task:` header isn't carried on this surface.
-        .route_exempt("/trust-tasks", post(trust_tasks::dispatch_trust_task))
+        //
+        // Body limit is tight (64 KB) — the largest envelope a
+        // well-behaved client produces is the `acl/list` response
+        // payload at ~16 KB on a full page; doubling for ext + safety
+        // gives 64 KB. Caps an authenticated-Owner DoS class where a
+        // compromised credential drives parsing of multi-MB documents
+        // before the handler-level Admin check rejects.
+        .route_exempt(
+            "/trust-tasks",
+            post(trust_tasks::dispatch_trust_task)
+                .layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
+        )
         // Exempt: DIDComm envelope (inner message type is the real
         // task identifier).
         .route_exempt("/didcomm", post(didcomm::handle))

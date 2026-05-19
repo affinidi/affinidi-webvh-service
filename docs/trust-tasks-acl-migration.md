@@ -90,6 +90,9 @@ Consumers that don't speak webvh MUST ignore this namespace per
 
 ## Worked example — `acl/grant` over HTTPS
 
+Caller is `did:web:admin.example` (an Admin in the maintainer's ACL).
+The grant adds `did:web:alice.example` as a new Owner.
+
 ```http
 POST /api/trust-tasks HTTP/1.1
 Host: control.example
@@ -111,7 +114,7 @@ Content-Type: application/json
         }
       }
     },
-    "reason": "Onboarding new admin contractor"
+    "reason": "Onboarding new owner"
   }
 }
 ```
@@ -119,7 +122,9 @@ Content-Type: application/json
 The `issuer`/`recipient` are omitted in this example because the
 bearer JWT pins the caller end-to-end (SPEC.md §4.8.1 falls back to
 transport-derived identity when in-band is absent). On success, the
-response carries:
+response is routed back to the **caller** (the admin who issued the
+grant) — `recipient` is `did:web:admin.example`, not the grant's
+subject:
 
 ```json
 {
@@ -127,7 +132,7 @@ response carries:
   "type": "https://trusttasks.org/spec/acl/grant/0.1#response",
   "threadId": "urn:uuid:8a91c7b3-2e62-4a91-a3a4-9d61b75e2f01",
   "issuer": "did:web:control.example",
-  "recipient": "did:web:alice.example",
+  "recipient": "did:web:admin.example",
   "issuedAt": "2026-05-19T10:00:01Z",
   "payload": {
     "entry": {
@@ -149,10 +154,17 @@ response carries:
 
 The same envelope rides inside a DIDComm v2.1 message whose type is
 `https://trusttasks.org/binding/didcomm/0.1/envelope` (see the
-[trust-tasks-didcomm](https://crates.io/crates/trust-tasks-didcomm)
+[trust-tasks-didcomm](https://github.com/trustoverip/dtgwg-trust-tasks-tf/tree/main/trust-tasks-didcomm)
 binding spec). DIDComm carries authcrypt — the verified sender DID
 becomes the in-band `issuer` automatically. Response packs back into
 the same envelope type.
+
+> **Note**: the `trust-tasks-*` crates are pre-publication at the
+> time of v0.7.0. The workspace resolves them via `[patch.crates-io]`
+> against an upstream sibling checkout until they land on crates.io
+> — see the `[patch.crates-io]` block in the workspace
+> [`Cargo.toml`](../Cargo.toml). The links in this document point at
+> the upstream GitHub source meanwhile.
 
 ## Proof policy (v0.7.1)
 
@@ -257,8 +269,10 @@ let req = TrustTask::for_payload(
 let resp: TrustTask<grant::Response> = client.send(&req).await?;
 ```
 
-See the [trust-tasks-https](https://crates.io/crates/trust-tasks-https)
-crate docs for the typed client surface.
+See the
+[trust-tasks-https](https://github.com/trustoverip/dtgwg-trust-tasks-tf/tree/main/trust-tasks-https)
+crate docs for the typed client surface (pre-publication; see the
+note above).
 
 ## Sample client (TypeScript / browser)
 

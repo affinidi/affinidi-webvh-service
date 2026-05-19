@@ -212,9 +212,21 @@ where
     }
 
     // §7.2 item 7 — proof verification (when present) + spec-mandated
-    // proof: REQUIRED enforcement. The conservative default: with a
-    // verifier configured and the document on a non-bearer spec, an
-    // absent proof is rejected with `proof_required`.
+    // proof: REQUIRED enforcement. Four cases:
+    //
+    //   - proof + verifier → verify, reject `proof_invalid` on failure.
+    //   - no proof + verifier + non-bearer spec → `proof_required`.
+    //   - **proof + no verifier** → reject `malformed_request`. A
+    //     producer carrying a Data Integrity proof has explicitly
+    //     opted into the signed-envelope contract; if the maintainer
+    //     has not opted into verification (default
+    //     `trust_tasks.enforce_proofs = false`) the proof would be
+    //     silently dropped, which is a misleading wire shape and a
+    //     security-relevant footgun (the producer believes their
+    //     signing key is authenticating the request; only the
+    //     transport's bearer JWT is). We refuse the ambiguity
+    //     loudly so the producer or operator fixes the mismatch.
+    //   - no proof + no verifier (or bearer spec) → fine.
     match (doc.proof.as_ref(), verifier) {
         (Some(_), Some(v)) => {
             if let Err(verr) = v.verify(&doc).await {
@@ -222,6 +234,20 @@ where
                     doc.reject_with(new_id(), verification_error_to_reason(verr)),
                 );
             }
+        }
+        (Some(_), None) => {
+            return DispatchOutcome::Rejected(
+                doc.reject_with(
+                    new_id(),
+                    RejectReason::MalformedRequest {
+                        reason: "document carries a `proof` member but this maintainer has \
+                                 not opted into proof verification (`trust_tasks.enforce_proofs \
+                                 = false`). Either omit the proof and authenticate via the \
+                                 transport, or ask the operator to enable enforcement."
+                            .to_string(),
+                    },
+                ),
+            );
         }
         (None, Some(_)) if !P::IS_BEARER => {
             return DispatchOutcome::Rejected(
@@ -285,18 +311,23 @@ pub(crate) fn reject_with<P>(
     request.reject_with(id, payload)
 }
 
-/// Placeholder [`ProofVerifier`] used by transports that haven't yet
-/// wired in the real verifier. Calls to [`Self::verify`] panic — the
-/// pipeline only invokes `verify` when the caller passes
-/// `Option::Some(verifier)`, so passing `Option::<&NoVerifier>::None`
-/// (the type-inference anchor) is safe.
+/// Type-anchor for the no-verifier case of [`run_pipeline`] /
+/// [`dispatch_inbound`].
 ///
-/// Task #11 wires the production verifier (the `trust-tasks-proof`
-/// crate's Affinidi backend). Until then, transports import this type,
-/// hand `None` to [`run_pipeline`] / [`dispatch_inbound`], and the
-/// framework's "verifier configured but absent on a non-bearer spec"
-/// rule does not fire.
-pub struct NoVerifier;
+/// The pipeline functions are generic in `V: ProofVerifier + ?Sized`,
+/// which means `Option::<&V>::None` still needs a concrete `V` for
+/// inference. This uninhabited type fills that slot: it satisfies the
+/// trait bound *structurally* (the `ProofVerifier` impl exists) but
+/// can never be instantiated. `Some(&NoVerifier)` won't compile —
+/// you can only ever pass `None::<&NoVerifier>`.
+///
+/// Used when the operator has not opted into strict proof
+/// enforcement (`trust_tasks.enforce_proofs = false`); the dispatch
+/// layer routes through `Option::<&NoVerifier>::None`. The
+/// `(Some(proof), None)` arm of [`run_pipeline`] returns
+/// `malformed_request` rather than silently dropping a present
+/// proof — see the match arms there.
+pub enum NoVerifier {}
 
 #[async_trait::async_trait]
 impl ProofVerifier for NoVerifier {
@@ -304,13 +335,17 @@ impl ProofVerifier for NoVerifier {
     where
         P: serde::Serialize + Send + Sync,
     {
-        // Unreachable: callers only invoke `verify` when they passed
-        // Some(verifier). If you see this panic, a caller is supplying
-        // `Some(&NoVerifier::INSTANCE)` instead of None — fix the
-        // call site rather than relaxing the assertion.
-        panic!("NoVerifier::verify called; pipeline should have skipped it");
+        // Unreachable by construction: `NoVerifier` has no variants,
+        // so `&self` is uninhabited. Rust's exhaustiveness analysis
+        // doesn't *prove* this without `unreachable!()` because the
+        // trait method takes a generic `P`; the unreachable! is
+        // belt-and-braces.
+        unreachable!("NoVerifier has no variants; verify cannot be called");
     }
 }
+
+/// Top-level dispatch: narrow an untyped inbound document, then call
+/// the matching async handler.
 ///
 /// Steps:
 /// 1. SPEC.md §7.2 items 1–3 — framework / payload schema validation

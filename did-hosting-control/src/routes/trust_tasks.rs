@@ -1,13 +1,24 @@
-//! `POST /api/trust-tasks` — the new Trust Tasks transport endpoint
-//! introduced in v0.7.1.
+//! `POST /api/trust-tasks` — the Trust Tasks transport endpoint
+//! introduced in v0.7.0.
 //!
 //! Receives a JSON-encoded `TrustTask<serde_json::Value>` envelope,
 //! authenticates the caller via the existing JWT-bearer flow, and
 //! hands the document to [`did_hosting_common::server::trust_tasks::dispatch_inbound`].
-//! The dispatch layer narrows the untyped document to one of the
-//! six typed handlers (five `acl/*` + `trust-task-discovery`), runs
+//! The dispatch layer narrows the untyped document to one of the six
+//! typed handlers (five `acl/*` + `trust-task-discovery`), runs
 //! SPEC.md §7.2 items 4–8 against it, and produces a typed response
 //! or routed error.
+//!
+//! ## Body-parse failures are spec-conformant
+//!
+//! We accept the request body as `axum::body::Bytes` and parse to
+//! `TrustTask<Value>` by hand. The reason: axum's typed `Json<...>`
+//! extractor rejects malformed bodies with a plain-text 400 *before*
+//! the handler runs, which would be a wire-shape regression — the
+//! framework spec asks for a `trust-task-error/0.1` document on
+//! malformed input. Handling the parse here lets us emit the routed
+//! error document with `code: malformed_request` for any body-shape
+//! failure.
 //!
 //! ## Why this isn't wired through `trust_tasks_https::HttpsServer`
 //!
@@ -20,7 +31,6 @@
 //! peer into framework identity), [`trust_tasks_https::status_for_code`]
 //! (for the spec status table), and our own async dispatch core.
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,84 +53,56 @@ use crate::server::AppState;
 /// Bearer-auth'd via [`AuthClaims`]; the caller's DID becomes the
 /// transport-authenticated peer for SPEC.md §4.8.1 precedence inside
 /// each typed handler.
-pub async fn dispatch_trust_task(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Json(doc): Json<TrustTask<Value>>,
-) -> Result<Response, AppError> {
-    // Service DID is the local party — every typed handler uses it as
-    // `recipient` and (on success) as the response document's issuer.
-    // Without one configured we can't run the §7.2 recipient check,
-    // so refuse early with a clear operator message.
-    let my_vid = state
-        .config
-        .server_did
-        .as_deref()
-        .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
-
-    let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
-    let ctx = TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-    };
-
-    // Dispatch with the configured proof verifier only when the
-    // operator has opted in via `trust_tasks.enforce_proofs = true`.
-    // v0.7.1 ships proof-optional by default so the Web UI (no
-    // browser-side signing infrastructure yet) keeps working; backend
-    // callers that DO sign get strict enforcement by flipping the
-    // flag. See `AppConfig.trust_tasks.enforce_proofs`.
-    let outcome = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => {
-            dispatch_inbound::<AffinidiVerifier>(&ctx, &transport, Some(v), doc).await
-        }
-        _ => dispatch_inbound::<NoVerifier>(&ctx, &transport, None, doc).await,
-    };
-    Ok(into_response(outcome))
-}
-
-/// Custom JSON-decode rejection handler: when the body is not a
-/// valid `TrustTask<Value>`, axum's `Json` extractor returns a 400
-/// with a plain-text error. We never reach `dispatch_trust_task` in
-/// that case. To preserve the trust-task error-document shape on the
-/// malformed-body path, axum lets us register a fallback. The
-/// simplest way to keep this behaviour explicit is to handle the
-/// parse manually — see [`dispatch_trust_task_raw`] below.
 ///
-/// In practice we expose [`dispatch_trust_task`] (which uses axum's
-/// `Json` extractor) and accept that body-parse failures land as a
-/// plain-text 400. Clients should treat 400 with `Content-Type:
-/// text/plain` as a body-shape failure (≈ `malformed_request`); a
-/// future tighten can swap this for [`dispatch_trust_task_raw`] if
-/// the wire shape matters.
-#[allow(dead_code)]
-pub async fn dispatch_trust_task_raw(
+/// Body is accepted as raw bytes so a parse failure surfaces as a
+/// `trust-task-error/0.1` document with `code: malformed_request`
+/// rather than axum's text/plain default. The route mount caps body
+/// size separately (see [`crate::routes::TRUST_TASKS_BODY_LIMIT`]).
+pub async fn dispatch_trust_task(
     auth: AuthClaims,
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
-        Ok(d) => d,
-        Err(e) => {
-            let err_doc = body_parse_error(&e.to_string());
-            return Ok(into_response(DispatchOutcome::Rejected(err_doc)));
-        }
-    };
+    // ─── 1. Service DID required. Without one configured the §7.2
+    //        recipient check has no `my_vid` to compare against, so we
+    //        refuse early with an operator-actionable error rather
+    //        than emitting a wire response.
     let my_vid = state
         .config
         .server_did
         .as_deref()
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+
+    // ─── 2. Parse the body to `TrustTask<Value>`. A parse failure
+    //        emits a routed `trust-task-error/0.1` document with
+    //        `code: malformed_request`.
+    let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(into_response(DispatchOutcome::Rejected(body_parse_error(
+                &e.to_string(),
+            ))));
+        }
+    };
+
+    // ─── 3. Build the transport adapter + context.
     let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
     let ctx = TrustTaskContext {
         acl_ks: &state.acl_ks,
         acl_locks: &state.acl_locks,
         my_vid,
     };
+
+    // ─── 4. Dispatch.
+    //
+    // Strict-proof mode (`enforce_proofs = true` AND a verifier is
+    // configured) passes `Some(&verifier)` — `dispatch_inbound` then
+    // enforces SPEC.md §7.2 item 7 (proof present + verified, or
+    // `proof_required` on a non-bearer spec). Otherwise we pass
+    // `None` and the run_pipeline silently-accepts a present proof
+    // *and* refuses to accept one — see the explicit rejection at the
+    // `(Some(proof), None)` arm of `run_pipeline`, which closes the
+    // "silent drop of a present proof" footgun.
     let outcome = match (
         state.config.trust_tasks.enforce_proofs,
         state.trust_tasks_verifier.as_deref(),
@@ -135,9 +117,9 @@ pub async fn dispatch_trust_task_raw(
 
 /// Build a `trust-task-error/0.1` document for a body-parse failure.
 /// We have no source `TrustTask` to draw `issuer`/`recipient` from,
-/// so the error response is unrouted (per the framework, this is
-/// acceptable for malformed-body failures — the producer can correlate
-/// on the response `id`).
+/// so the error response is unrouted — the framework permits this on
+/// malformed-body failures since the producer can correlate on the
+/// response `id`.
 fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
     let reject = RejectReason::MalformedRequest {
         reason: format!("body did not parse as a Trust Task document: {reason}"),
@@ -159,8 +141,6 @@ fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
 }
 
 fn error_type_uri() -> trust_tasks_rs::TypeUri {
-    // `trust-task-error/0.1` is a framework-reserved slug; the parser
-    // accepts it as canonical.
     "https://trusttasks.org/spec/trust-task-error/0.1"
         .parse()
         .expect("framework error Type URI parses")
@@ -180,13 +160,7 @@ fn into_response(outcome: DispatchOutcome) -> Response {
         }
         DispatchOutcome::Rejected(err_doc) => {
             let status_u16 = status_for_code(&err_doc.payload.code);
-            // Default `task_failed` to 422 when the maintainer-side
-            // policy did not pick a more specific standard code (the
-            // status_for_code table maps every variant; this branch
-            // covers the InternalError edge).
             let status = StatusCode::from_u16(status_u16).unwrap_or_else(|_| {
-                // Conservative fallback — status table emits values
-                // axum accepts, so this only fires on bug.
                 tracing::error!(status_u16, "unexpected status code from status_for_code");
                 StatusCode::INTERNAL_SERVER_ERROR
             });
@@ -200,20 +174,13 @@ fn into_response(outcome: DispatchOutcome) -> Response {
                 .into_response()
         }
         DispatchOutcome::Suppressed => {
-            // SPEC.md §8.1: identity-mismatch rejection where the
-            // transport authenticated no sender. Emitting any body
-            // would constitute an oracle — return an empty 204 so
-            // the client at least sees the request was received.
-            // (The §8.1 letter says "SHOULD NOT emit any response,"
-            // which 204 with no body honours at the application
-            // layer; the response line itself is unavoidable on HTTP.)
-            //
-            // In practice this branch is unreachable on the HTTPS
-            // transport — the bearer-auth resolved the peer DID, so
-            // transport.derive_parties().issuer is always Some.
-            tracing::warn!(
-                "trust-tasks dispatch returned Suppressed on HTTPS — this should be unreachable \
-                 because bearer auth pins the transport sender"
+            // SPEC.md §8.1: identity-mismatch with no transport
+            // authenticated sender. Unreachable on the HTTPS transport
+            // because bearer auth always resolves a peer. Surfaced as
+            // an `error!` log on the off-chance the invariant breaks.
+            tracing::error!(
+                should_not_happen = true,
+                "trust-tasks dispatch returned Suppressed on HTTPS — bearer auth always resolves a peer"
             );
             StatusCode::NO_CONTENT.into_response()
         }
@@ -222,38 +189,14 @@ fn into_response(outcome: DispatchOutcome) -> Response {
 
 #[cfg(test)]
 mod tests {
-    //! Smoke tests for the `POST /api/trust-tasks` route wiring.
-    //!
-    //! The handlers themselves are tested exhaustively in
-    //! `did_hosting_common::server::trust_tasks::handlers::*`. Tests
-    //! here only verify the route + transport + auth glue.
+    //! Smoke tests for the route wiring. The handlers themselves are
+    //! tested exhaustively in
+    //! `did_hosting_common::server::trust_tasks::handlers::*`.
 
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use serde_json::json;
-    use tower::ServiceExt;
     use trust_tasks_rs::{Payload, specs::acl::grant::v0_1 as grant};
 
-    use crate::routes;
-
-    /// Build an `AppState`-bearing router for inline integration tests.
-    /// Requires the full setup pipeline; we use the existing test
-    /// harness in `crate::server::test_support` if present, otherwise
-    /// fall through with a `#[ignore]` marker for ops to run manually.
-    #[tokio::test]
-    #[ignore = "requires AppState test harness (TODO: wire test fixture)"]
-    async fn route_returns_400_on_malformed_body() {
-        // Placeholder for an inline AppState fixture. The control
-        // plane doesn't currently expose a test-only `AppState::test()`
-        // constructor; building one here would duplicate the setup
-        // logic in src/main.rs. Skipped until task #14 lands the
-        // shared harness.
-        let _ = routes::router; // smoke-link the symbol
-    }
-
-    /// Unit test of [`body_parse_error`] — verifies the produced
-    /// document carries the `malformed_request` code and the wire
-    /// shape clients depend on.
+    /// Unit test of [`body_parse_error`] — pins the wire shape clients
+    /// depend on (code, type URI, unrouted issuer/recipient).
     #[test]
     fn body_parse_error_shape() {
         let err = super::body_parse_error("expected `,`");
@@ -278,12 +221,12 @@ mod tests {
         );
     }
 
-    /// Verify that a well-formed acl/grant payload at least deserialises
-    /// at the Json<TrustTask<Value>> boundary that the route uses.
-    /// (The handler-level behaviour is tested in did-hosting-common.)
+    /// Verify that a well-formed acl/grant payload at least
+    /// deserialises at the `TrustTask<Value>` boundary the route's
+    /// hand-rolled parse uses.
     #[test]
     fn well_formed_grant_envelope_round_trips() {
-        let body = json!({
+        let body = serde_json::json!({
             "id": "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
             "type": grant::Payload::TYPE_URI,
             "issuer": "did:web:admin.example",
@@ -301,24 +244,8 @@ mod tests {
                 }
             }
         });
-        // Round-trips into the untyped envelope axum's Json<TrustTask<Value>>
-        // produces on the wire — proves the body shape parses.
         let doc: trust_tasks_rs::TrustTask<serde_json::Value> =
             serde_json::from_value(body).expect("envelope parses");
         assert_eq!(doc.type_uri.to_string(), grant::Payload::TYPE_URI);
-    }
-
-    // Touch the `tower` + `to_bytes` imports so dropping the
-    // #[ignore]'d integration test below doesn't leave an unused-dep
-    // warning.
-    fn _imports_silencer() {
-        let _ = std::any::type_name::<Body>();
-        let _ = std::any::type_name::<Request<Body>>();
-        let _ = StatusCode::OK;
-        // tower's ServiceExt is the trait we'd use for `oneshot()`.
-        fn _take<T: ServiceExt<()>>() {}
-        async fn _async_silence() {
-            let _: Vec<u8> = to_bytes(Body::empty(), 0).await.unwrap_or_default().into();
-        }
     }
 }
