@@ -11,11 +11,10 @@
 //!   `fromRole`) is forbidden by maintainer policy — flagged with
 //!   `permission_denied`.
 //! * Last-authority guard: a change that demotes the only Admin is
-//!   rejected with `acl/revoke:last_authority_protected` (we reuse the
-//!   revoke spec's error code since the underlying invariant is
-//!   identical and the framework requires extension codes to be slug-
-//!   namespaced — the spec's `change-role` errorCodes list doesn't
-//!   include this case but Admin-protection is enforced regardless).
+//!   rejected with `acl/change-role:last_authority_protected` — a
+//!   maintainer-minted extended code (SPEC.md §8.5) pinned to this
+//!   spec's slug so clients dispatching on `payload.code` don't have
+//!   to cross slugs.
 
 use serde_json::json;
 use trust_tasks_rs::{
@@ -31,6 +30,7 @@ use crate::server::trust_tasks::{
 const CHANGE_ROLE_SLUG: &str = "acl/change-role";
 const ERR_STATE_MISMATCH: &str = "state_mismatch";
 const ERR_ROLE_NOT_RECOGNIZED: &str = "role_not_recognized";
+const ERR_LAST_AUTHORITY: &str = "last_authority_protected";
 
 /// Run the framework pipeline + business logic for an inbound
 /// `acl/change-role/0.1` request.
@@ -44,12 +44,22 @@ where
     V: ProofVerifier + ?Sized,
 {
     let acl_ks = ctx.acl_ks.clone();
+    let acl_locks = ctx.acl_locks.clone();
     run_pipeline(
         transport,
         verifier,
         doc,
         ctx.my_vid,
-        move |doc| async move { handle_inner(&acl_ks, doc).await },
+        move |doc| async move {
+            // Serialise every ACL mutation through one global lock so
+            // the read-then-write critical section is race-free
+            // across concurrent admins. See `ACL_WRITE_LOCK_KEY` for
+            // why per-subject locking is insufficient.
+            let _guard = acl_locks
+                .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+                .await;
+            handle_inner(&acl_ks, doc).await
+        },
     )
     .await
 }
@@ -162,8 +172,11 @@ async fn handle_inner(
 
     // ─── 6. Last-authority guard. ────────────────────────────────
     // A demote that removes the only Admin would empty the privileged
-    // set. We surface the standard `acl/revoke:last_authority_protected`
-    // code since the underlying spec invariant is identical.
+    // set. The spec's `change-role/0.1` doesn't enumerate this error
+    // code, but §8.5 permits a consumer to mint its own slug-
+    // namespaced code — `acl/change-role:last_authority_protected`
+    // keeps the slug aligned with the request's `type` URI so a
+    // client dispatching on `payload.code` doesn't cross spec slugs.
     if matches!(from_role, Role::Admin) && !matches!(to_role, Role::Admin) {
         let all = acl::list_acl_entries(acl_ks)
             .await
@@ -176,15 +189,14 @@ async fn handle_inner(
         if other_admins.is_empty() {
             return Err(reject_with(
                 &doc,
-                ErrorPayload::new(TrustTaskCode::Extended {
-                    slug: "acl/revoke".into(),
-                    local: "last_authority_protected".into(),
-                })
-                .with_message("this role change would leave the maintainer with no Admin entries")
-                .with_details(json!({
-                    "protectedRole": "admin",
-                    "remainingHolders": other_admins,
-                })),
+                ErrorPayload::new(extended_code(ERR_LAST_AUTHORITY))
+                    .with_message(
+                        "this role change would leave the maintainer with no Admin entries",
+                    )
+                    .with_details(json!({
+                        "protectedRole": "admin",
+                        "remainingHolders": other_admins,
+                    })),
             ));
         }
     }
@@ -311,9 +323,13 @@ mod tests {
         (store, acl_ks)
     }
 
-    fn ctx<'a>(acl_ks: &'a crate::server::store::KeyspaceHandle) -> TrustTaskContext<'a> {
+    fn ctx<'a>(
+        acl_ks: &'a crate::server::store::KeyspaceHandle,
+        acl_locks: &'a crate::server::path_locks::PathLocks,
+    ) -> TrustTaskContext<'a> {
         TrustTaskContext {
             acl_ks,
+            acl_locks,
             my_vid: SERVICE_DID,
         }
     }
@@ -364,9 +380,10 @@ mod tests {
     #[tokio::test]
     async fn successful_role_transition_persists() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ALICE_DID, "owner", "service"),
@@ -391,10 +408,11 @@ mod tests {
     #[tokio::test]
     async fn state_mismatch_when_fromrole_wrong() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         // Caller claims Alice was a `service` but she's an `owner`.
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ALICE_DID, "service", "admin"),
@@ -426,9 +444,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_role_string_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ALICE_DID, "owner", "superuser"),
@@ -450,35 +469,16 @@ mod tests {
         assert_eq!(details["knownRoles"], json!(["admin", "owner", "service"]));
     }
 
-    #[tokio::test]
-    async fn self_promotion_forbidden() {
-        let (_s, acl_ks) = harness().await;
-        // Alice is Owner; she tries to promote herself to Admin.
-        seed(&acl_ks, ALICE_DID, Role::Owner).await;
-        // Alice would also need to be Admin to even be authorised —
-        // but our guard runs before the change. Seed her as Admin to
-        // isolate the self-promotion check.
-        seed(&acl_ks, ALICE_DID, Role::Owner).await; // ensure starting state
-        // Auth check is first → we need Alice as Admin to pass it,
-        // which we do via a second admin entry. But that's awkward —
-        // the test for self-promotion in our model requires Alice to
-        // be Admin (so authorised) AND attempting to promote herself
-        // strictly further. Since Admin is the top role, there's no
-        // "further" promotion. So the test of strict-promotion is
-        // actually unreachable in our 3-role enum — the guard is
-        // belt-and-braces for any future role addition. Instead, we
-        // test the *equal* direction (no-op) and trust the rank
-        // function via a separate unit test below.
-        // [no assertion here; see role_rank_unit_test]
-        let _ = (acl_ks, ALICE_DID);
-    }
-
+    /// `is_strict_promotion` is the gate for the self-promotion
+    /// refusal. Admin is the top of the 3-role enum, so an
+    /// end-to-end "self-promotes from Admin → ??" test is
+    /// unreachable today; this unit test is what catches a
+    /// regression in the predicate if a future role landing
+    /// reorders the rank.
     #[test]
     fn role_rank_unit() {
-        // Total order: Service < Owner < Admin.
         assert!(role_rank(&Role::Service) < role_rank(&Role::Owner));
         assert!(role_rank(&Role::Owner) < role_rank(&Role::Admin));
-        // Promotion check.
         assert!(is_strict_promotion(&Role::Owner, &Role::Admin));
         assert!(is_strict_promotion(&Role::Service, &Role::Owner));
         assert!(!is_strict_promotion(&Role::Owner, &Role::Owner));
@@ -488,9 +488,10 @@ mod tests {
     #[tokio::test]
     async fn last_authority_blocks_admin_demote() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         // ADMIN_DID is the only admin. Demote → reject.
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ADMIN_DID, "admin", "owner"),
@@ -503,8 +504,8 @@ mod tests {
         assert_eq!(
             err.payload.code,
             TrustTaskCode::Extended {
-                slug: "acl/revoke".into(),
-                local: "last_authority_protected".into(),
+                slug: CHANGE_ROLE_SLUG.into(),
+                local: ERR_LAST_AUTHORITY.into(),
             }
         );
         assert_eq!(
@@ -520,9 +521,10 @@ mod tests {
     #[tokio::test]
     async fn admin_demote_allowed_when_another_admin_exists() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, SECOND_ADMIN, Role::Admin).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(SECOND_ADMIN),
             no_verifier(),
             request(SECOND_ADMIN, ADMIN_DID, "admin", "owner"),
@@ -542,9 +544,10 @@ mod tests {
     #[tokio::test]
     async fn non_admin_caller_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
             request(ALICE_DID, ALICE_DID, "owner", "service"),
@@ -563,8 +566,9 @@ mod tests {
     #[tokio::test]
     async fn missing_subject_returns_state_mismatch_with_null() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, "did:web:nobody.example", "owner", "service"),
@@ -590,9 +594,10 @@ mod tests {
     #[tokio::test]
     async fn same_role_is_idempotent_noop() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ALICE_DID, "owner", "owner"),

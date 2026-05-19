@@ -89,6 +89,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         signing_key_bytes: None,
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
+        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),

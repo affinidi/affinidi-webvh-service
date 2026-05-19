@@ -90,6 +90,14 @@ pub struct AppState {
     /// concurrent calls on the same path can't both observe
     /// `existing == None` and both commit.
     pub path_locks: crate::path_locks::PathLocks,
+    /// Per-key write lock for Trust Tasks ACL mutations. Separate
+    /// from `path_locks` so DID-mnemonic locking and ACL-write locking
+    /// don't share a keyspace — the `grant` / `change-role` /
+    /// `revoke` handlers acquire a single fixed key
+    /// (`ACL_WRITE_LOCK_KEY`) here so concurrent admins serialise
+    /// through one queue, closing the race the last-authority guard
+    /// would otherwise have.
+    pub acl_locks: did_hosting_common::server::path_locks::PathLocks,
     /// Bounded counter for pending DIDComm authentication challenges.
     /// Replaces an O(N) prefix scan in `routes::auth::challenge` with
     /// O(1) per-DID and global counters; closes the unauthenticated
@@ -304,6 +312,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
+        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
     };

@@ -1232,6 +1232,7 @@ async fn build_control(
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
+        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),

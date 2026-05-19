@@ -61,6 +61,7 @@ pub async fn dispatch_trust_task(
     let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
     let ctx = TrustTaskContext {
         acl_ks: &state.acl_ks,
+        acl_locks: &state.acl_locks,
         my_vid,
     };
 
@@ -117,6 +118,7 @@ pub async fn dispatch_trust_task_raw(
     let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
     let ctx = TrustTaskContext {
         acl_ks: &state.acl_ks,
+        acl_locks: &state.acl_locks,
         my_vid,
     };
     let outcome = match (

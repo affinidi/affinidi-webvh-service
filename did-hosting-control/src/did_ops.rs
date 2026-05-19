@@ -1033,6 +1033,7 @@ mod tests_atomic {
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
+            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         };

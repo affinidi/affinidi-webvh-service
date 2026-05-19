@@ -936,6 +936,7 @@ async fn handle_trust_tasks_envelope(
         trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
     let ctx = did_hosting_common::server::trust_tasks::TrustTaskContext {
         acl_ks: &state.acl_ks,
+        acl_locks: &state.acl_locks,
         my_vid,
     };
     // Dispatch with the configured proof verifier when the operator
@@ -1088,6 +1089,7 @@ mod tests {
             signing_key_bytes: None,
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
+            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         };

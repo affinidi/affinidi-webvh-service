@@ -268,9 +268,13 @@ mod tests {
         (store, acl_ks)
     }
 
-    fn ctx<'a>(acl_ks: &'a crate::server::store::KeyspaceHandle) -> TrustTaskContext<'a> {
+    fn ctx<'a>(
+        acl_ks: &'a crate::server::store::KeyspaceHandle,
+        acl_locks: &'a crate::server::path_locks::PathLocks,
+    ) -> TrustTaskContext<'a> {
         TrustTaskContext {
             acl_ks,
+            acl_locks,
             my_vid: SERVICE_DID,
         }
     }
@@ -340,11 +344,12 @@ mod tests {
     #[tokio::test]
     async fn lists_all_when_no_filters() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 5, Role::Owner).await;
 
         let resp = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(ADMIN_DID, None, None, None, None, None),
@@ -366,12 +371,13 @@ mod tests {
     #[tokio::test]
     async fn role_filter_narrows_results() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
         seed_many(&acl_ks, "did:web:s", 2, Role::Service).await;
 
         let resp = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(ADMIN_DID, None, None, Some("owner"), None, None),
@@ -388,11 +394,12 @@ mod tests {
     #[tokio::test]
     async fn pagination_returns_cursor_and_truncated() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 12, Role::Owner).await;
 
         let resp1 = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(ADMIN_DID, Some(5), None, Some("owner"), None, None),
@@ -406,7 +413,7 @@ mod tests {
 
         let resp2 = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(
@@ -426,7 +433,7 @@ mod tests {
 
         let resp3 = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(
@@ -459,11 +466,12 @@ mod tests {
     #[tokio::test]
     async fn unrecognised_scope_filter_returns_empty() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
         // `domain:nonexistent.example` should match nothing.
         let resp = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(
@@ -485,12 +493,13 @@ mod tests {
     #[tokio::test]
     async fn subject_prefix_filter() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
         seed_many(&acl_ks, "did:key:k", 4, Role::Owner).await;
 
         let resp = unwrap_response(
             handle(
-                &ctx(&acl_ks),
+                &ctx(&acl_ks, &acl_locks),
                 &transport(ADMIN_DID),
                 no_verifier(),
                 request(ADMIN_DID, None, None, None, None, Some("did:key:")),
@@ -507,8 +516,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_cursor_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, None, Some("not-a-cursor!"), None, None, None),
@@ -527,6 +537,7 @@ mod tests {
     #[tokio::test]
     async fn non_admin_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         acl::store_acl_entry(
             &acl_ks,
             &AclEntry {
@@ -542,7 +553,7 @@ mod tests {
         .await
         .unwrap();
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport("did:web:alice.example"),
             no_verifier(),
             request("did:web:alice.example", None, None, None, None, None),

@@ -62,12 +62,24 @@ where
     V: ProofVerifier + ?Sized,
 {
     let acl_ks = ctx.acl_ks.clone();
+    let acl_locks = ctx.acl_locks.clone();
     run_pipeline(
         transport,
         verifier,
         doc,
         ctx.my_vid,
-        move |doc| async move { handle_inner(&acl_ks, doc).await },
+        move |doc| async move {
+            // Serialise every ACL mutation through one global lock so
+            // the read-then-write critical section (auth check, last-
+            // authority guard, write) is race-free across concurrent
+            // admins targeting different subjects. See
+            // `ACL_WRITE_LOCK_KEY` for why per-subject locking is
+            // insufficient.
+            let _guard = acl_locks
+                .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+                .await;
+            handle_inner(&acl_ks, doc).await
+        },
     )
     .await
 }
@@ -362,9 +374,13 @@ mod tests {
         (store, acl_ks)
     }
 
-    fn ctx<'a>(acl_ks: &'a crate::server::store::KeyspaceHandle) -> TrustTaskContext<'a> {
+    fn ctx<'a>(
+        acl_ks: &'a crate::server::store::KeyspaceHandle,
+        acl_locks: &'a crate::server::path_locks::PathLocks,
+    ) -> TrustTaskContext<'a> {
         TrustTaskContext {
             acl_ks,
+            acl_locks,
             my_vid: SERVICE_DID,
         }
     }
@@ -423,9 +439,10 @@ mod tests {
     #[tokio::test]
     async fn full_removal_returns_entry_null_and_deletes() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &[]),
@@ -451,6 +468,7 @@ mod tests {
     #[tokio::test]
     async fn scope_reduction_narrows_allowed_domains() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
             &acl_ks,
             ALICE_DID,
@@ -462,7 +480,7 @@ mod tests {
         .await;
 
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &["domain:b.example"]),
@@ -494,6 +512,7 @@ mod tests {
     #[tokio::test]
     async fn scope_reduction_removing_default_demotes_to_allowed() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
             &acl_ks,
             ALICE_DID,
@@ -505,7 +524,7 @@ mod tests {
         )
         .await;
         let _ = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),
@@ -524,6 +543,7 @@ mod tests {
     #[tokio::test]
     async fn scope_reduction_emptying_set_deletes_entry() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
             &acl_ks,
             ALICE_DID,
@@ -534,7 +554,7 @@ mod tests {
         )
         .await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),
@@ -556,9 +576,10 @@ mod tests {
     #[tokio::test]
     async fn last_authority_guard_blocks_sole_admin_removal() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         // ADMIN_DID is the only admin from harness().
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ADMIN_DID, &[]), // self-revoke as sole admin
@@ -587,12 +608,98 @@ mod tests {
         );
     }
 
+    /// Two concurrent `acl/revoke` requests targeting the two
+    /// remaining Admins must NOT both succeed — the maintainer must
+    /// always retain at least one Admin. Without the `acl_locks`
+    /// guard, each request reads the ACL before the other writes,
+    /// sees the *other* Admin present, passes the last-authority
+    /// check, and commits — emptying the privileged role set. Pinning
+    /// this catches a regression where the lock acquisition is
+    /// dropped from `handle`.
+    #[tokio::test]
+    async fn concurrent_revokes_of_remaining_admins_preserve_admin_set() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed(&acl_ks, SECOND_ADMIN, Role::Admin, DomainScope::All).await;
+        // Two admins now: ADMIN_DID (from harness) + SECOND_ADMIN.
+
+        let transport_a = transport(ADMIN_DID);
+        let transport_b = transport(SECOND_ADMIN);
+
+        let ks_a = acl_ks.clone();
+        let locks_a = acl_locks.clone();
+        let task_a = tokio::spawn(async move {
+            let ctx = TrustTaskContext {
+                acl_ks: &ks_a,
+                acl_locks: &locks_a,
+                my_vid: SERVICE_DID,
+            };
+            handle(
+                &ctx,
+                &transport_a,
+                no_verifier(),
+                revoke_request(ADMIN_DID, SECOND_ADMIN, &[]),
+            )
+            .await
+        });
+        let ks_b = acl_ks.clone();
+        let locks_b = acl_locks.clone();
+        let task_b = tokio::spawn(async move {
+            let ctx = TrustTaskContext {
+                acl_ks: &ks_b,
+                acl_locks: &locks_b,
+                my_vid: SERVICE_DID,
+            };
+            handle(
+                &ctx,
+                &transport_b,
+                no_verifier(),
+                revoke_request(SECOND_ADMIN, ADMIN_DID, &[]),
+            )
+            .await
+        });
+
+        let (a, b) = tokio::join!(task_a, task_b);
+        // Exactly one revoke succeeds — the second runs after the
+        // lock guard releases, sees only one Admin left, and is
+        // rejected with `last_authority_protected`.
+        let outcomes = [a.unwrap(), b.unwrap()];
+        let handled_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, DispatchOutcome::Handled(_)))
+            .count();
+        let rejected_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, DispatchOutcome::Rejected(_)))
+            .count();
+        assert_eq!(
+            handled_count, 1,
+            "exactly one revoke should succeed; got {outcomes:?}"
+        );
+        assert_eq!(
+            rejected_count, 1,
+            "exactly one revoke should be rejected; got {outcomes:?}"
+        );
+
+        // At least one Admin remains.
+        let entries = acl::list_acl_entries(&acl_ks).await.unwrap();
+        let admins_left: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.role, Role::Admin))
+            .collect();
+        assert!(
+            !admins_left.is_empty(),
+            "ACL must retain at least one Admin: {entries:?}"
+        );
+    }
+
     #[tokio::test]
     async fn second_admin_removal_succeeds_when_another_remains() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, SECOND_ADMIN, Role::Admin, DomainScope::All).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, SECOND_ADMIN, &[]),
@@ -604,8 +711,9 @@ mod tests {
     #[tokio::test]
     async fn subject_not_in_acl_returns_extended_code() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, "did:web:nobody.example", &[]),
@@ -627,9 +735,10 @@ mod tests {
     #[tokio::test]
     async fn self_revoke_permitted_when_not_last_authority() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
             revoke_request(ALICE_DID, ALICE_DID, &[]),
@@ -647,6 +756,7 @@ mod tests {
     #[tokio::test]
     async fn non_admin_revoking_other_subject_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
         seed(
             &acl_ks,
@@ -656,7 +766,7 @@ mod tests {
         )
         .await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
             revoke_request(ALICE_DID, "did:web:bob.example", &[]),
@@ -675,6 +785,7 @@ mod tests {
     #[tokio::test]
     async fn scope_with_unknown_prefix_rejected_as_malformed() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
             &acl_ks,
             ALICE_DID,
@@ -685,7 +796,7 @@ mod tests {
         )
         .await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &["context:project-alpha"]),
@@ -704,9 +815,10 @@ mod tests {
     #[tokio::test]
     async fn scope_reduce_on_all_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),

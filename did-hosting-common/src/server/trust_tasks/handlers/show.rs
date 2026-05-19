@@ -151,9 +151,13 @@ mod tests {
         (store, acl_ks)
     }
 
-    fn ctx<'a>(acl_ks: &'a crate::server::store::KeyspaceHandle) -> TrustTaskContext<'a> {
+    fn ctx<'a>(
+        acl_ks: &'a crate::server::store::KeyspaceHandle,
+        acl_locks: &'a crate::server::path_locks::PathLocks,
+    ) -> TrustTaskContext<'a> {
         TrustTaskContext {
             acl_ks,
+            acl_locks,
             my_vid: SERVICE_DID,
         }
     }
@@ -196,9 +200,10 @@ mod tests {
     #[tokio::test]
     async fn admin_lookup_returns_entry() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, ALICE_DID),
@@ -219,8 +224,9 @@ mod tests {
     #[tokio::test]
     async fn missing_subject_returns_entry_null() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
             request(ADMIN_DID, "did:web:nobody.example"),
@@ -236,9 +242,10 @@ mod tests {
     #[tokio::test]
     async fn self_lookup_permitted_for_non_admin() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
             request(ALICE_DID, ALICE_DID),
@@ -254,10 +261,11 @@ mod tests {
     #[tokio::test]
     async fn non_admin_lookup_of_other_rejected() {
         let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, ALICE_DID, Role::Owner).await;
         seed(&acl_ks, "did:web:bob.example", Role::Owner).await;
         let outcome = handle(
-            &ctx(&acl_ks),
+            &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
             request(ALICE_DID, "did:web:bob.example"),

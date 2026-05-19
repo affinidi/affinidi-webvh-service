@@ -36,20 +36,28 @@ where
     V: ProofVerifier + ?Sized,
 {
     let acl_ks = ctx.acl_ks.clone();
-    let my_vid = ctx.my_vid.to_string();
+    let acl_locks = ctx.acl_locks.clone();
     run_pipeline(
         transport,
         verifier,
         doc,
         ctx.my_vid,
-        move |doc| async move { handle_inner(&acl_ks, &my_vid, doc).await },
+        move |doc| async move {
+            // Serialise every ACL mutation through one global lock so
+            // the read-existing → check-policy → store window is
+            // race-free. See `ACL_WRITE_LOCK_KEY` doc-comment for
+            // why per-subject locking is insufficient.
+            let _guard = acl_locks
+                .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+                .await;
+            handle_inner(&acl_ks, doc).await
+        },
     )
     .await
 }
 
 async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
-    _my_vid: &str,
     doc: TrustTask<grant::Payload>,
 ) -> Result<TrustTask<grant::Response>, ErrorResponse> {
     // ─── 1. Authorise the caller. ──────────────────────────────────
@@ -116,11 +124,35 @@ async fn handle_inner(
 
     let realized = match existing {
         Some(current) if current.role == proposed.role => {
-            // Idempotent: spec §3 — re-emitting an identical grant
-            // produces no state change. We return the maintainer's
-            // canonical entry verbatim, which may include createdAt,
-            // createdBy, etc the producer did not supply.
-            current
+            // Idempotent on *role*, but the producer's view of the
+            // non-role metadata fields (label, quota knobs, domain
+            // scope) wins on re-grant. Spec §3 says "re-emitting an
+            // identical grant produces no state change" — and the
+            // common case for `updateAcl`-style flows is the UI
+            // changing a label or quota while leaving the role
+            // alone. We preserve `created_at` (the maintainer's
+            // canonical insertion time) and replace everything else
+            // from the producer's intent. Persist only when at
+            // least one mutable field actually changes.
+            let merged = AclEntry {
+                did: current.did.clone(),
+                role: current.role.clone(),
+                label: proposed.label.clone(),
+                created_at: current.created_at,
+                max_total_size: proposed.max_total_size,
+                max_did_count: proposed.max_did_count,
+                domains: proposed.domains.clone(),
+            };
+            if merged.label != current.label
+                || merged.max_total_size != current.max_total_size
+                || merged.max_did_count != current.max_did_count
+                || merged.domains != current.domains
+            {
+                acl::store_acl_entry(acl_ks, &merged)
+                    .await
+                    .map_err(|e| internal(&doc, e))?;
+            }
+            merged
         }
         Some(current) => {
             return Err(reject_with(
@@ -297,9 +329,13 @@ mod tests {
         doc
     }
 
-    fn ctx<'a>(acl_ks: &'a crate::server::store::KeyspaceHandle) -> TrustTaskContext<'a> {
+    fn ctx<'a>(
+        acl_ks: &'a crate::server::store::KeyspaceHandle,
+        acl_locks: &'a crate::server::path_locks::PathLocks,
+    ) -> TrustTaskContext<'a> {
         TrustTaskContext {
             acl_ks,
+            acl_locks,
             my_vid: SERVICE_DID,
         }
     }
@@ -313,7 +349,8 @@ mod tests {
     #[tokio::test]
     async fn fresh_grant_inserts_and_returns_realized_entry() {
         let (_store, acl_ks) = harness().await;
-        let ctx = ctx(&acl_ks);
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
         let doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
 
@@ -344,7 +381,8 @@ mod tests {
     #[tokio::test]
     async fn idempotent_regrant_returns_existing_entry() {
         let (_store, acl_ks) = harness().await;
-        let ctx = ctx(&acl_ks);
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
 
         // First grant lands.
@@ -380,7 +418,8 @@ mod tests {
     #[tokio::test]
     async fn role_change_attempt_returns_permission_denied_with_details() {
         let (_store, acl_ks) = harness().await;
-        let ctx = ctx(&acl_ks);
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
 
         // Seed Alice as owner.
@@ -425,7 +464,8 @@ mod tests {
     #[tokio::test]
     async fn non_admin_caller_rejected() {
         let (_store, acl_ks) = harness().await;
-        let ctx = ctx(&acl_ks);
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
 
         // Seed Alice as owner.
         acl::store_acl_entry(
@@ -469,10 +509,135 @@ mod tests {
         );
     }
 
+    /// Re-grant with the same role but a changed `label` /
+    /// `quota` / `domains` MUST persist the producer's updated view
+    /// of the metadata fields. Pinning this catches a regression where
+    /// the idempotent branch returns the existing entry verbatim and
+    /// silently drops UI-driven metadata edits.
+    #[tokio::test]
+    async fn same_role_regrant_with_changed_metadata_persists_updates() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+
+        let _ = handle(
+            &ctx,
+            &transport,
+            no_verifier(),
+            grant_request(ADMIN_DID, ALICE_DID, "owner"),
+        )
+        .await;
+        let before = acl::get_acl_entry(&acl_ks, ALICE_DID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.label, Some("test entry".into()));
+
+        let mut update = grant_request(ADMIN_DID, ALICE_DID, "owner");
+        update.payload.entry.label = Some("Alice — updated".into());
+        update.payload.entry.ext = serde_json::from_value(serde_json::json!({
+            WEBVH_EXT_KEY: {
+                "domains": {
+                    "kind": "allowed",
+                    "domains": ["alpha.example", "beta.example"]
+                },
+                "quota": { "maxDidCount": 25 }
+            }
+        }))
+        .unwrap();
+
+        let outcome = handle(&ctx, &transport, no_verifier(), update).await;
+        let resp = match outcome {
+            DispatchOutcome::Handled(d) => d,
+            other => panic!("expected Handled, got {other:?}"),
+        };
+        assert_eq!(resp.payload["entry"]["label"], "Alice — updated");
+        assert_eq!(
+            resp.payload["entry"]["ext"][WEBVH_EXT_KEY]["domains"]["kind"],
+            "allowed"
+        );
+
+        let after = acl::get_acl_entry(&acl_ks, ALICE_DID)
+            .await
+            .unwrap()
+            .unwrap();
+        // created_at preserved from the original insert.
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.label, Some("Alice — updated".into()));
+        assert_eq!(after.max_did_count, Some(25));
+        match after.domains {
+            crate::server::domain::DomainScope::Allowed { domains } => {
+                assert_eq!(domains, vec!["alpha.example", "beta.example"]);
+            }
+            other => panic!("expected Allowed scope, got {other:?}"),
+        }
+    }
+
+    /// Two concurrent `acl/grant` requests targeting the same fresh
+    /// subject must serialise — exactly one stores the entry, the
+    /// other observes it via the idempotent branch. Without the
+    /// `acl_locks` guard, both observe `existing == None` and both
+    /// `store_acl_entry`, racing on insertion. Pinning this catches
+    /// a regression where the lock acquisition is dropped from
+    /// `handle`.
+    #[tokio::test]
+    async fn concurrent_fresh_grants_for_same_subject_serialise() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let transport_a = transport(ADMIN_DID);
+        let transport_b = transport(ADMIN_DID);
+
+        let ctx_a_ks = acl_ks.clone();
+        let ctx_a_locks = acl_locks.clone();
+        let task_a = tokio::spawn(async move {
+            let ctx = TrustTaskContext {
+                acl_ks: &ctx_a_ks,
+                acl_locks: &ctx_a_locks,
+                my_vid: SERVICE_DID,
+            };
+            handle(
+                &ctx,
+                &transport_a,
+                no_verifier(),
+                grant_request(ADMIN_DID, ALICE_DID, "owner"),
+            )
+            .await
+        });
+        let ctx_b_ks = acl_ks.clone();
+        let ctx_b_locks = acl_locks.clone();
+        let task_b = tokio::spawn(async move {
+            let ctx = TrustTaskContext {
+                acl_ks: &ctx_b_ks,
+                acl_locks: &ctx_b_locks,
+                my_vid: SERVICE_DID,
+            };
+            handle(
+                &ctx,
+                &transport_b,
+                no_verifier(),
+                grant_request(ADMIN_DID, ALICE_DID, "owner"),
+            )
+            .await
+        });
+        let (a, b) = tokio::join!(task_a, task_b);
+        assert!(matches!(a.unwrap(), DispatchOutcome::Handled(_)));
+        assert!(matches!(b.unwrap(), DispatchOutcome::Handled(_)));
+
+        let entries = acl::list_acl_entries(&acl_ks).await.unwrap();
+        let alice_entries: Vec<_> = entries.iter().filter(|e| e.did == ALICE_DID).collect();
+        assert_eq!(
+            alice_entries.len(),
+            1,
+            "race produced duplicate entries: {alice_entries:?}"
+        );
+    }
+
     #[tokio::test]
     async fn opaque_scopes_on_grant_rejected_as_malformed() {
         let (_store, acl_ks) = harness().await;
-        let ctx = ctx(&acl_ks);
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
 
         let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");

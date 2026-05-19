@@ -164,8 +164,10 @@ mod tests {
     #[tokio::test]
     async fn empty_patterns_returns_all_six_types() {
         let (_dir, _store, ks) = ctx_storage().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = TrustTaskContext {
             acl_ks: &ks,
+            acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
         };
         let resp = unwrap_response(handle(&ctx, &transport(), no_verifier(), request(&[])).await);
@@ -204,8 +206,10 @@ mod tests {
     #[tokio::test]
     async fn acl_pattern_returns_only_acl_types() {
         let (_dir, _store, ks) = ctx_storage().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = TrustTaskContext {
             acl_ks: &ks,
+            acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
         };
         let resp =
@@ -227,8 +231,10 @@ mod tests {
     #[tokio::test]
     async fn grant_advertises_required_ext_namespace() {
         let (_dir, _store, ks) = ctx_storage().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = TrustTaskContext {
             acl_ks: &ks,
+            acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
         };
         let resp = unwrap_response(

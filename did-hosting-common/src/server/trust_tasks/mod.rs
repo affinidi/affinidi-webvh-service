@@ -45,6 +45,7 @@ use trust_tasks_rs::{
 };
 use uuid::Uuid;
 
+use crate::server::path_locks::PathLocks;
 use crate::server::store::KeyspaceHandle;
 
 /// The set of inbound Trust Task payloads this service routes. New
@@ -111,12 +112,28 @@ pub struct TrustTaskContext<'a> {
     /// Handle to the `KS_ACL` keyspace — every ACL handler reads /
     /// writes through this.
     pub acl_ks: &'a KeyspaceHandle,
+    /// Per-key mutex registry the ACL write handlers acquire to
+    /// serialise their read-then-write critical sections. All three
+    /// write handlers (`grant`, `change-role`, `revoke`) acquire the
+    /// same well-known key (`ACL_WRITE_LOCK_KEY`) so concurrent
+    /// admins targeting *different* subjects still serialise — that's
+    /// the only way to make the last-authority guard race-free
+    /// without per-row read locks. Contention is negligible: ACL
+    /// writes are admin-action-rate (tens per day at most).
+    pub acl_locks: &'a PathLocks,
     /// The local service DID (our `recipient` from the framework's
     /// perspective). Used by [`TrustTask::validate_basic`] for SPEC.md
     /// §7.2 item 5 recipient enforcement, and surfaces as `issuer` on
     /// outbound response documents.
     pub my_vid: &'a str,
 }
+
+/// Single shared key under which every ACL write serialises. A
+/// per-subject key would let parallel grants on different subjects
+/// proceed, but the last-authority guard reads the *whole* ACL —
+/// per-subject locking can't make that guard race-free. The simpler
+/// global gate is correct and cheap.
+pub const ACL_WRITE_LOCK_KEY: &str = "::trust-tasks::acl-write";
 
 /// Run SPEC.md §7.2 items 4–8 against a typed inbound document, then
 /// invoke `handler` and wrap the result in a [`DispatchOutcome`].
@@ -399,8 +416,10 @@ mod tests {
         .await
         .unwrap();
 
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = TrustTaskContext {
             acl_ks: &acl_ks,
+            acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
         };
         let transport = InMemoryHandler::new()
@@ -463,8 +482,10 @@ mod tests {
         std::mem::forget(dir);
         let store = Store::open(&cfg).await.expect("open store");
         let acl_ks = store.keyspace(KS_ACL).expect("acl keyspace");
+        let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = TrustTaskContext {
             acl_ks: &acl_ks,
+            acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
         };
         let transport = InMemoryHandler::new()
