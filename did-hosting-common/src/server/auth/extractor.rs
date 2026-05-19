@@ -32,6 +32,12 @@ pub trait AuthState: Clone + Send + Sync + 'static {
 pub struct AuthClaims {
     pub did: String,
     pub role: Role,
+    /// Ephemeral session pubkey if one was registered during login —
+    /// Ed25519 multikey, base58btc-encoded with the `z` prefix.
+    /// `dispatch_trust_task` uses this to verify a Data Integrity proof's
+    /// `verificationMethod` came from the same session that issued the
+    /// JWT.
+    pub session_pubkey_b58btc: Option<String>,
 }
 
 impl<S: AuthState> FromRequestParts<S> for AuthClaims {
@@ -94,6 +100,7 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         Ok(AuthClaims {
             did: claims.sub,
             role,
+            session_pubkey_b58btc: session.session_pubkey_b58btc,
         })
     }
 }
@@ -213,6 +220,7 @@ mod tests {
             refresh_token: None,
             refresh_expires_at: None,
             token_id: Some(jti.to_string()),
+            session_pubkey_b58btc: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         session_id
@@ -293,6 +301,7 @@ mod tests {
             refresh_token: None,
             refresh_expires_at: None,
             token_id: Some("tok".into()),
+            session_pubkey_b58btc: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue(&state, &session_id, "owner", "tok");

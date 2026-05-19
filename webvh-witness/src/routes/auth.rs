@@ -64,6 +64,7 @@ pub async fn challenge(
         refresh_token: None,
         refresh_expires_at: None,
         token_id: None,
+        session_pubkey_b58btc: None,
     };
 
     store_session(&state.sessions_ks, &session).await?;
@@ -265,6 +266,7 @@ pub async fn refresh(
         &role,
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
+        None,
     )
     .await?;
 

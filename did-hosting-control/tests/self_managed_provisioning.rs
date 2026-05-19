@@ -117,6 +117,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
     let auth = AuthClaims {
         did: tenant_did.clone(),
         role: Role::Owner,
+        session_pubkey_b58btc: None,
     };
 
     // 5. Phase 1 — tenant requests a DID slot (analog to MSG_DID_REQUEST).

@@ -152,6 +152,7 @@ async fn run_authenticate(
                 &role,
                 state.config.auth.access_token_expiry,
                 state.config.auth.refresh_token_expiry,
+                None,
             )
             .await
             {
@@ -215,6 +216,7 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
             let auth = AuthClaims {
                 did: sender.to_string(),
                 role,
+                session_pubkey_b58btc: None,
             };
             match dispatch_did_op(&auth, state, message).await {
                 Ok(result) => result,
@@ -1112,6 +1114,7 @@ mod tests {
         AuthClaims {
             did: did.to_string(),
             role: Role::Owner,
+            session_pubkey_b58btc: None,
         }
     }
 
@@ -1119,6 +1122,7 @@ mod tests {
         AuthClaims {
             did: did.to_string(),
             role: Role::Admin,
+            session_pubkey_b58btc: None,
         }
     }
 

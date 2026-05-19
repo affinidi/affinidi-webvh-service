@@ -1045,6 +1045,7 @@ mod tests_atomic {
         AuthClaims {
             did: did.to_string(),
             role: Role::Owner,
+            session_pubkey_b58btc: None,
         }
     }
 
@@ -1052,6 +1053,7 @@ mod tests_atomic {
         AuthClaims {
             did: did.to_string(),
             role: Role::Admin,
+            session_pubkey_b58btc: None,
         }
     }
 

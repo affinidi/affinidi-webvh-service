@@ -145,6 +145,7 @@ async fn mint_token(state: &AppState, did: &str, role: Role) -> String {
         &role,
         auth.access_token_expiry,
         auth.refresh_token_expiry,
+        None,
     )
     .await
     .expect("create session");

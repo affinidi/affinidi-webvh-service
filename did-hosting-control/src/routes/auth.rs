@@ -81,6 +81,7 @@ pub async fn challenge(
         refresh_token: None,
         refresh_expires_at: None,
         token_id: None,
+        session_pubkey_b58btc: None,
     };
 
     session::store_session(&state.sessions_ks, &session).await?;
@@ -165,6 +166,31 @@ pub async fn authenticate(
 
     // Determine role from ACL
     let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
+
+    // Optional: pick up the client's ephemeral session pubkey
+    // (Ed25519 multikey, base58btc-encoded with the `z` prefix).
+    // Stored on the session so `dispatch_trust_task` can verify
+    // Data Integrity proofs on REQUIRED-spec trust-task requests
+    // came from the same browser session that authenticated.
+    //
+    // We validate the prefix shape minimally — only ed25519
+    // multikey is supported today (`z6Mk` is the base58btc-encoded
+    // multicodec 0xed01 prefix). Anything else is rejected so the
+    // server doesn't accept a key shape it can't later resolve via
+    // `did:key`.
+    if let Some(pk) = msg
+        .body
+        .get("session_pubkey_b58btc")
+        .and_then(|v| v.as_str())
+    {
+        if !pk.starts_with("z6Mk") {
+            warn!(prefix = %&pk[..pk.len().min(8)], "rejected unsupported session-key shape");
+            return Err(AppError::Authentication(
+                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
+            ));
+        }
+        session.session_pubkey_b58btc = Some(pk.to_string());
+    }
 
     // Finalize session and issue tokens
     let token_response = session::finalize_challenge_session(
@@ -279,6 +305,7 @@ pub async fn refresh(
         &role,
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
+        None,
     )
     .await?;
 

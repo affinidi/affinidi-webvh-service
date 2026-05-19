@@ -146,6 +146,7 @@ fn auth(did: &str) -> AuthClaims {
     AuthClaims {
         did: did.into(),
         role: Role::Owner,
+        session_pubkey_b58btc: None,
     }
 }
 

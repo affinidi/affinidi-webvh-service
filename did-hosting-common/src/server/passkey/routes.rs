@@ -236,7 +236,9 @@ pub async fn enroll_finish<S: PasskeyState>(
     // Check ACL role
     let role = check_acl(acl_ks, &user.did).await?;
 
-    // Issue session
+    // Enrollment doesn't supply a session pubkey today — the UI
+    // sends it on subsequent /login/finish calls (so each enrolled
+    // device gets a fresh ephemeral key per session). Pass `None`.
     let token_resp = create_authenticated_session(
         sessions_ks,
         jwt_keys,
@@ -244,6 +246,7 @@ pub async fn enroll_finish<S: PasskeyState>(
         &role,
         state.access_token_expiry(),
         state.refresh_token_expiry(),
+        None,
     )
     .await?;
 
@@ -301,6 +304,15 @@ pub async fn login_start<S: PasskeyState>(
 pub struct LoginFinishRequest {
     pub auth_id: String,
     pub credential: PublicKeyCredential,
+    /// Optional ephemeral session pubkey — Ed25519 multikey
+    /// base58btc-encoded (`z6Mk…`). When the client supplies this on
+    /// login, the server stores it on the session record and uses it
+    /// to verify Data Integrity proofs on REQUIRED-spec trust-task
+    /// requests. Absent for backend callers that sign with their own
+    /// DID's verificationMethods (and for legacy UI builds without
+    /// in-band signing).
+    #[serde(default)]
+    pub session_pubkey_b58btc: Option<String>,
 }
 
 pub async fn login_finish<S: PasskeyState>(
@@ -340,6 +352,25 @@ pub async fn login_finish<S: PasskeyState>(
     // Check DID still in ACL
     let role = check_acl(acl_ks, &user.did).await?;
 
+    // Validate the client-supplied session pubkey shape minimally —
+    // only Ed25519 multikey is supported today. `z6Mk` is the
+    // base58btc-encoded multicodec 0xed01 prefix; anything else is
+    // rejected so the server doesn't accept a key shape it can't
+    // later resolve via `did:key`.
+    let session_pubkey = match req.session_pubkey_b58btc.as_deref() {
+        Some(pk) if pk.starts_with("z6Mk") => Some(pk.to_string()),
+        Some(pk) => {
+            warn!(
+                prefix = %&pk[..pk.len().min(8)],
+                "rejected unsupported session-key shape on passkey login"
+            );
+            return Err(AppError::Authentication(
+                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
+            ));
+        }
+        None => None,
+    };
+
     // Issue session
     let token_resp = create_authenticated_session(
         sessions_ks,
@@ -348,6 +379,7 @@ pub async fn login_finish<S: PasskeyState>(
         &role,
         state.access_token_expiry(),
         state.refresh_token_expiry(),
+        session_pubkey,
     )
     .await?;
 

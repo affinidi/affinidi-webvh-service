@@ -29,6 +29,19 @@ pub struct Session {
     /// each token issue/refresh so old tokens are immediately invalidated.
     #[serde(default)]
     pub token_id: Option<String>,
+    /// Optional ephemeral session pubkey — Ed25519 multikey encoded as
+    /// base58btc with the `z` prefix (e.g. `z6MkfBwQrx…`). Set by the
+    /// client during login so the server can verify Data Integrity
+    /// proofs (`eddsa-jcs-2022`) on REQUIRED-spec trust-task requests.
+    /// The corresponding `did:key:<this>` is the verificationMethod the
+    /// client uses on every signed envelope.
+    ///
+    /// `None` when the client did not register a session pubkey
+    /// (legacy clients, backend callers signing with their own DID's
+    /// key); REQUIRED-spec dispatch then rejects proofless envelopes
+    /// per the framework's IS_PROOF_REQUIRED gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_pubkey_b58btc: Option<String>,
 }
 
 // Manual `Debug` redacts the secret fields (challenge, refresh_token, token_id)
@@ -49,6 +62,7 @@ impl std::fmt::Debug for Session {
             )
             .field("refresh_expires_at", &self.refresh_expires_at)
             .field("token_id", &self.token_id.as_ref().map(|_| "<redacted>"))
+            .field("session_pubkey_b58btc", &self.session_pubkey_b58btc)
             .finish()
     }
 }
@@ -297,6 +311,12 @@ pub async fn finalize_challenge_session(
 /// Create a new authenticated session, returning access + refresh tokens.
 ///
 /// Reusable across DIDComm and passkey authentication flows.
+///
+/// `session_pubkey_b58btc` is the optional client-supplied ephemeral
+/// Ed25519 multikey (base58btc, `z6Mk…`) used for Data Integrity
+/// proofs on REQUIRED-spec trust-task requests. `None` for backend
+/// callers that sign with their own DID's verification methods, or
+/// when the Web UI hasn't enabled in-band signing yet.
 pub async fn create_authenticated_session(
     sessions: &KeyspaceHandle,
     jwt_keys: &JwtKeys,
@@ -304,6 +324,7 @@ pub async fn create_authenticated_session(
     role: &Role,
     access_expiry: u64,
     refresh_expiry: u64,
+    session_pubkey_b58btc: Option<String>,
 ) -> Result<TokenResponse, AppError> {
     let session_id = Uuid::new_v4().to_string();
 
@@ -326,6 +347,7 @@ pub async fn create_authenticated_session(
         refresh_token: Some(refresh_token.clone()),
         refresh_expires_at: Some(refresh_expires_at),
         token_id: Some(token_id),
+        session_pubkey_b58btc,
     };
 
     store_session(sessions, &session).await?;

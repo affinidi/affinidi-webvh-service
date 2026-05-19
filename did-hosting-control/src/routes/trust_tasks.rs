@@ -85,7 +85,39 @@ pub async fn dispatch_trust_task(
         }
     };
 
-    // ─── 3. Build the transport adapter + context.
+    // ─── 3. Session-key binding pre-check (SECURITY).
+    //
+    // When the JWT was issued with an ephemeral session pubkey
+    // (Web UI flow), the proof's `verificationMethod` MUST be the
+    // matching `did:key:{pk}#{pk}` URL. Otherwise the proof was
+    // signed by a key the server hasn't bound to this JWT — even
+    // if its signature verifies, accepting it would let any key
+    // holder forge requests as the JWT subject.
+    //
+    // Backend callers that authenticate without a session pubkey
+    // (auth.session_pubkey_b58btc is None) skip this check: their
+    // proof's verificationMethod is resolved against the DID
+    // document and the framework's verifier does the binding.
+    if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
+        if let Some(proof) = doc.proof.as_ref() {
+            let expected_vm = format!("did:key:{pk}#{pk}");
+            if proof.verification_method != expected_vm {
+                tracing::warn!(
+                    actual_vm = %proof.verification_method,
+                    expected_vm,
+                    "trust-task proof verificationMethod does not match the JWT-bound \
+                     session pubkey — rejecting as proof_invalid"
+                );
+                let reject = RejectReason::ProofInvalid {
+                    reason: "proof verificationMethod is not bound to this session".to_string(),
+                };
+                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+                return Ok(into_response(DispatchOutcome::Rejected(routed)));
+            }
+        }
+    }
+
+    // ─── 4. Build the transport adapter + context.
     let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
     let ctx = TrustTaskContext {
         acl_ks: &state.acl_ks,
@@ -93,7 +125,7 @@ pub async fn dispatch_trust_task(
         my_vid,
     };
 
-    // ─── 4. Dispatch.
+    // ─── 5. Dispatch.
     //
     // Map the operator's `enforce_proofs` toggle to a framework
     // [`ProofPolicy`]:

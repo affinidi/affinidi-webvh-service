@@ -156,6 +156,7 @@ async fn do_authenticate(state: &AppState, sender_base: &str) -> Result<(String,
         &role,
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
+        None,
     )
     .await?;
 

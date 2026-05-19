@@ -131,6 +131,7 @@ fn auth_for(did: &str, role: Role) -> AuthClaims {
     AuthClaims {
         did: did.into(),
         role,
+        session_pubkey_b58btc: None,
     }
 }
 
