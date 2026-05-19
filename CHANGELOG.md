@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.7.1 (unreleased)
+## 0.7.0 (unreleased)
 
-### Added
+### Added — Trust Tasks framework adoption
 
 - **Trust Tasks ACL surface (`POST /api/trust-tasks`).** New wire
   shape for ACL administration built on the
@@ -43,22 +43,26 @@
   builds its routers via the control plane's `routes::router_without_fallback()`
   and `messaging::build_control_router()`, so there is no separate
   wiring to maintain (CLAUDE.md §What the daemon mirrors).
-
-### Changed
-
 - **`AppState` gains `trust_tasks_verifier: Option<Arc<trust_tasks_proof::affinidi::Verifier>>`.**
   Constructed at startup when `did_resolver` is configured (the
   verifier shares the same DID-resolver cache as the DIDComm path).
 - **`AppConfig` gains `trust_tasks: TrustTasksConfig`.** New section
-  with a single `enforce_proofs: bool` knob (default `false` in
-  v0.7.1; revisited in v0.8.0).
+  with a single `enforce_proofs: bool` knob (default `false`;
+  revisited in v0.8.0).
 - **UI ACL surface (`did-hosting-ui`) routes through `/api/trust-tasks`.**
   The four `api.{list,create,update,delete}Acl` methods plus a new
   `api.aclShow` now POST trust-task envelopes. Wire-shape translation
   between the spec's `AclEntry` and the existing TypeScript `AclEntry`
   type is invisible to screen code.
+- New [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
+  — client migration guide (old vs. new wire shape, proof policy,
+  worked examples for both HTTPS and DIDComm, error-code mapping).
+- New [`docs/trust-tasks-registry-gaps.md`](docs/trust-tasks-registry-gaps.md)
+  — catalogue of webvh ops not yet in the public Trust Tasks
+  registry, grouped by reusability tier with proposed slugs + payload
+  sketches per type. ~50 ops across 8 groups, ready to file upstream.
 
-### Deprecated
+### Deprecated — legacy ACL REST surface
 
 - **`GET/POST /api/acl`, `PUT/DELETE /api/acl/{did}`** — every legacy
   ACL route now emits:
@@ -71,29 +75,19 @@
   [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
   for migration guidance.
 
-### Known gap
+### Known gap — Web UI emits unsigned envelopes
 
-- **The Web UI emits unsigned trust-task envelopes** in v0.7.1 because
-  the browser has no Data Integrity signing infrastructure today (the
-  admin's private key isn't reachable from JavaScript after the
-  WebAuthn-bootstrapped DIDComm authenticate). The `enforce_proofs`
-  default of `false` accommodates this — bearer-JWT auth still
-  authenticates the caller end-to-end. v0.8.0 either ships the
-  session-key protocol that lets the UI sign, or constrains the
-  surface differently. Operators with backend-only callers (CLI,
-  service-to-service) should flip `enforce_proofs = true`.
-
-### Documentation
-
-- New [`docs/trust-tasks-acl-migration.md`](docs/trust-tasks-acl-migration.md)
-  — client migration guide (old vs. new wire shape, proof policy,
-  worked examples for both HTTPS and DIDComm, error-code mapping).
-- New [`docs/trust-tasks-registry-gaps.md`](docs/trust-tasks-registry-gaps.md)
-  — catalogue of webvh ops not yet in the public Trust Tasks
-  registry, grouped by reusability tier with proposed slugs + payload
-  sketches per type. ~50 ops across 8 groups, ready to file upstream.
-
-## 0.7.0 (unreleased)
+The Web UI POSTs trust-task envelopes without a Data Integrity
+`proof` member because the browser has no signing infrastructure
+today (the admin's private key isn't reachable from JavaScript after
+the WebAuthn-bootstrapped DIDComm authenticate). The
+`trust_tasks.enforce_proofs` default of `false` accommodates this —
+bearer-JWT auth still authenticates the caller end-to-end via the
+framework's transport-derived-identity precedence (SPEC.md §4.8.1).
+v0.8.0 either ships the session-key protocol that lets the UI sign,
+or constrains the surface differently. Operators with backend-only
+callers (CLI, service-to-service) should flip
+`enforce_proofs = true`.
 
 ### Changed — **BREAKING**
 
