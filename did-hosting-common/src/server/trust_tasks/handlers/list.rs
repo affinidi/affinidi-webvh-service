@@ -9,19 +9,24 @@
 //! * `pageSize`: maintainer chooses default + ceiling. We use 50 /
 //!   500. The spec's schema caps `pageSize` at 1000 — our ceiling
 //!   stays under that for safety on large ACL tables.
-//! * `cursor`: opaque to consumers. We encode `{offset: N}` as
-//!   base64 of its JSON for stable bookmarking; future maintainers
-//!   may change the inner shape without breaking clients (per spec
-//!   "consumers MUST treat the cursor as opaque").
+//! * `cursor`: opaque to consumers. We encode `{last_seen: <did>}`
+//!   as base64 of its JSON; future maintainers may change the inner
+//!   shape without breaking clients (per spec "consumers MUST treat
+//!   the cursor as opaque").
 //! * `truncated` set to `true` when more matching entries exist;
 //!   `cursor` carries the continuation token in that case.
 //!
-//! ## Why our cursor is a simple offset
+//! ## Why the cursor encodes `last_seen` rather than an offset
 //!
-//! fjall's keyspace iteration is sorted by key; offsets are stable
-//! across read-mostly workloads. A future maintainer with a
-//! write-heavy ACL would swap this for a "last key seen" cursor —
-//! the change is invisible to clients because the cursor is opaque.
+//! Entries are returned in sorted-by-`did` order. With a positional
+//! offset cursor (`{offset: N}`), a delete of an entry before the
+//! cursor would shift every subsequent entry's index — the next
+//! page would silently skip one row. An add at the same place would
+//! repeat one. Encoding the last subject DID we returned makes
+//! pagination stable: the next page starts at the first row whose
+//! `did > last_seen`. Inserts and deletes between pages produce the
+//! right "see new entries on the next round" / "skip rows that are
+//! gone" semantics with no positional drift.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -39,11 +44,18 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 500;
 const SCOPE_DOMAIN_PREFIX: &str = "domain:";
 
-/// Internal cursor shape. Round-tripped via base64+JSON; opaque to
-/// consumers.
+/// Internal cursor shape: the subject DID of the last entry on the
+/// previous page. Round-tripped via base64+JSON; opaque to
+/// consumers. Stable across concurrent deletes — an offset-based
+/// cursor would skip an entry if a neighbour before the cursor were
+/// deleted, or repeat one if a neighbour after the cursor were
+/// granted-then-deleted between pages. Stable for our list-order
+/// invariant (sorted by `did` ascending).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CursorState {
-    offset: usize,
+    /// Last subject DID returned in the previous page. The next page
+    /// begins at the first entry whose `did > last_seen`.
+    last_seen: String,
 }
 
 pub async fn handle<V>(
@@ -89,14 +101,14 @@ async fn handle_inner(
     }
 
     // Parse the cursor (if present).
-    let start_offset = match doc.payload.cursor.as_deref() {
-        Some(c) => decode_cursor(c).map_err(|msg| {
+    let last_seen = match doc.payload.cursor.as_deref() {
+        Some(c) => Some(decode_cursor(c).map_err(|msg| {
             reject_with(
                 &doc,
                 ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
             )
-        })?,
-        None => 0usize,
+        })?),
+        None => None,
     };
 
     let page_size = doc
@@ -133,23 +145,34 @@ async fn handle_inner(
         })
         .collect();
 
-    // Sort by subject DID for stable ordering across pages.
+    // Sort by subject DID for stable ordering across pages — the
+    // `last_seen` cursor relies on this monotonic order.
     let mut sorted = filtered;
     sorted.sort_by(|a, b| a.did.cmp(&b.did));
 
-    let total_matching = sorted.len();
-    let page: Vec<&AclEntry> = sorted
-        .into_iter()
-        .skip(start_offset)
-        .take(page_size)
-        .collect();
-    let next_offset = start_offset + page.len();
-    let truncated = next_offset < total_matching;
-    let cursor = if truncated {
-        Some(encode_cursor(next_offset))
+    // Start the page strictly after `last_seen` when a cursor was
+    // supplied. Stable under concurrent deletes: if an entry between
+    // `last_seen` and the start of this page is deleted, we just
+    // skip what's no longer there; we never repeat or skip a
+    // currently-present entry.
+    let page: Vec<&AclEntry> = match last_seen.as_deref() {
+        Some(last) => sorted
+            .into_iter()
+            .skip_while(|e| e.did.as_str() <= last)
+            .take(page_size + 1)
+            .collect(),
+        None => sorted.into_iter().take(page_size + 1).collect(),
+    };
+    // `take(page_size + 1)` lets us look one entry past the page end:
+    // if we got one more than we asked for, more remain → truncated.
+    let has_more = page.len() > page_size;
+    let page: Vec<&AclEntry> = page.into_iter().take(page_size).collect();
+    let cursor = if has_more {
+        page.last().map(|e| encode_cursor(&e.did))
     } else {
         None
     };
+    let truncated = has_more;
 
     let entries: Vec<list::AclEntry> = page.iter().map(|e| into_spec_entry(e)).collect();
     let resp_payload = list::Response {
@@ -165,14 +188,13 @@ async fn handle_inner(
 
 fn entry_has_scope(entry: &AclEntry, want: &str) -> bool {
     // Match domain: prefixed filters against the entry's DomainScope.
-    // `All`-scoped entries carry no scope strings on the wire — they
-    // match by *role* rather than by enumerated scope — so a scope
-    // filter against them returns false (the spec's "scopes filter"
-    // is about the entries' opaque scope list, which `All` has none
-    // of). Use the role filter to enumerate Admin / Service.
+    // `All`-scoped entries match every `domain:` filter — they can
+    // operate on any domain, including the queried one. A UI use case
+    // is "show me every entry that can publish to alpha.example",
+    // which should include `All`-scoped Admins.
     if let Some(domain) = want.strip_prefix(SCOPE_DOMAIN_PREFIX) {
         return match &entry.domains {
-            crate::server::domain::DomainScope::All => false,
+            crate::server::domain::DomainScope::All => true,
             crate::server::domain::DomainScope::Allowed { domains } => {
                 domains.iter().any(|d| d == domain)
             }
@@ -191,19 +213,21 @@ fn into_spec_entry(local: &AclEntry) -> list::AclEntry {
     serde_json::from_value(value).expect("list::AclEntry from SpecAclEntry value")
 }
 
-fn encode_cursor(offset: usize) -> String {
-    let state = CursorState { offset };
+fn encode_cursor(last_seen: &str) -> String {
+    let state = CursorState {
+        last_seen: last_seen.to_string(),
+    };
     let json = serde_json::to_vec(&state).expect("CursorState serialises");
     URL_SAFE_NO_PAD.encode(json)
 }
 
-fn decode_cursor(s: &str) -> Result<usize, String> {
+fn decode_cursor(s: &str) -> Result<String, String> {
     let bytes = URL_SAFE_NO_PAD
         .decode(s)
         .map_err(|e| format!("cursor is not valid base64url: {e}"))?;
     let state: CursorState =
         serde_json::from_slice(&bytes).map_err(|e| format!("cursor payload malformed: {e}"))?;
-    Ok(state.offset)
+    Ok(state.last_seen)
 }
 
 fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
@@ -463,12 +487,21 @@ mod tests {
         assert_eq!(seen.len(), 12);
     }
 
+    /// `domain:X` filter returns only entries that *could operate* on
+    /// X — `Allowed`/`AllowedWithDefault` entries whose list contains
+    /// X, *plus* `All`-scoped entries (which can operate on any
+    /// domain). A `domain:nonexistent` filter therefore returns the
+    /// `All`-scoped admins, not zero — the UI use case "show me
+    /// everyone who can publish to alpha.example" needs admins
+    /// included.
     #[tokio::test]
-    async fn unrecognised_scope_filter_returns_empty() {
+    async fn domain_filter_includes_all_scoped_entries() {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
+        // 3 owners with Allowed{["a.example"]} (seeded by seed_many).
         seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
-        // `domain:nonexistent.example` should match nothing.
+        // Filter by a domain none of the owners hold; the harness
+        // Admin is `All`-scoped, so it matches.
         let resp = unwrap_response(
             handle(
                 &ctx(&acl_ks, &acl_locks),
@@ -486,8 +519,105 @@ mod tests {
             .await,
         );
         let entries = resp.payload["entries"].as_array().unwrap();
+        // Just the harness Admin matches; no owners do.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["role"], "admin");
+        assert_eq!(resp.payload["truncated"], false);
+    }
+
+    /// Filter prefixes that aren't `domain:` (and aren't anything else
+    /// we understand) match nothing. The spec says "filter values the
+    /// maintainer does not recognize MUST simply produce zero matches;
+    /// they are not an error."
+    #[tokio::test]
+    async fn unrecognised_scope_filter_prefix_returns_empty() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
+        let resp = unwrap_response(
+            handle(
+                &ctx(&acl_ks, &acl_locks),
+                &transport(ADMIN_DID),
+                no_verifier(),
+                request(
+                    ADMIN_DID,
+                    None,
+                    None,
+                    None,
+                    Some("context:project-alpha"),
+                    None,
+                ),
+            )
+            .await,
+        );
+        let entries = resp.payload["entries"].as_array().unwrap();
         assert!(entries.is_empty());
         assert_eq!(resp.payload["truncated"], false);
+    }
+
+    /// Cursor stability under concurrent deletes: if the entry at the
+    /// last-seen position is deleted between pages, the next page's
+    /// `last_seen` cursor still works (skips to the next strictly
+    /// greater DID). Offset-based cursors would have skipped an entry
+    /// here; the test pins our `last_seen` cursor's stability.
+    #[tokio::test]
+    async fn cursor_survives_concurrent_delete_of_last_seen() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed_many(&acl_ks, "did:web:o", 6, Role::Owner).await;
+
+        // Page 1: take 3 owners.
+        let resp1 = unwrap_response(
+            handle(
+                &ctx(&acl_ks, &acl_locks),
+                &transport(ADMIN_DID),
+                no_verifier(),
+                request(ADMIN_DID, Some(3), None, Some("owner"), None, None),
+            )
+            .await,
+        );
+        let entries1 = resp1.payload["entries"].as_array().unwrap().clone();
+        assert_eq!(entries1.len(), 3);
+        let cursor1 = resp1.payload["cursor"].as_str().unwrap().to_string();
+        let last_did = entries1[2]["subject"].as_str().unwrap().to_string();
+
+        // Delete the entry the cursor points at.
+        acl::delete_acl_entry(&acl_ks, &last_did).await.unwrap();
+
+        // Page 2 with the stale cursor: must still resolve, returning
+        // the 3 owners strictly after `last_did` (positions 3-5 of
+        // the original 6, of which we deleted one — leaving 2 owners
+        // and any other non-Owner entries that happen to sort after).
+        let resp2 = unwrap_response(
+            handle(
+                &ctx(&acl_ks, &acl_locks),
+                &transport(ADMIN_DID),
+                no_verifier(),
+                request(
+                    ADMIN_DID,
+                    Some(3),
+                    Some(&cursor1),
+                    Some("owner"),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+        );
+        let entries2 = resp2.payload["entries"].as_array().unwrap();
+        // 2 owners remain after the deletion (we had 3 in positions
+        // 3-5, deleted one). No duplicates with page 1.
+        let seen_in_page1: std::collections::HashSet<&str> = entries1
+            .iter()
+            .map(|e| e.get("subject").unwrap().as_str().unwrap())
+            .collect();
+        for e in entries2 {
+            let did = e["subject"].as_str().unwrap();
+            assert!(
+                !seen_in_page1.contains(did),
+                "cursor straddled a duplicate: {did}"
+            );
+        }
     }
 
     #[tokio::test]

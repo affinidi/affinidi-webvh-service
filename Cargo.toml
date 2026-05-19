@@ -119,7 +119,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Trust Tasks (DTGWG, ToIP). 0.1.x pre-publication: resolved via the
 # [patch.crates-io] block below. When the upstream crates land on
 # crates.io, drop the [patch] block and these resolve normally.
-trust-tasks-rs = { version = "0.1", default-features = false, features = ["validate"] }
+#
+# `validate` feature: deliberately NOT enabled. The codegen-emitted
+# `Payload` structs use `#[serde(deny_unknown_fields)]` plus newtype
+# wrappers that reject `minLength: 1` / regex constraints at
+# deserialise time, so we get framework-shape + payload-shape
+# validation as a side-effect of typed dispatch. The `validate`
+# feature would add JSON-Schema-driven validation against the
+# embedded schema string per request — redundant for our consumers
+# and a compile-time tax we don't pay. Re-enable if a future spec
+# carries constraints not captured by the codegen newtypes.
+trust-tasks-rs = { version = "0.1", default-features = false }
 trust-tasks-https = { version = "0.1", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.1", default-features = false }
 trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
