@@ -481,6 +481,9 @@ fn run_rest_thread(
             .layer(axum::middleware::from_fn(
                 affinidi_webvh_common::server::security_headers,
             ))
+            // Allow browser-based resolvers to fetch public DID documents
+            // cross-origin. Read-only, unauthenticated, wildcard origin.
+            .layer(affinidi_webvh_common::server::public_resolution_cors())
             .route("/api/health", get(routes::health::health));
 
         // Signal that REST is ready to serve
