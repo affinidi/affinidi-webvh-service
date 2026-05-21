@@ -818,6 +818,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
                         .latency_unit(tower_http::LatencyUnit::Millis),
                 ),
         )
+        // Allow browser-based resolvers to fetch public DID documents
+        // cross-origin. Read-only, unauthenticated, wildcard origin.
+        .layer(did_hosting_common::server::public_resolution_cors())
         .route("/health", get(daemon_health));
 
     // Log startup summary
