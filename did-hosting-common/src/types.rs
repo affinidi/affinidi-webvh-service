@@ -21,6 +21,35 @@ pub struct ChallengeData {
     pub challenge: String,
 }
 
+/// Payload of the `did-hosting/auth/authenticate/1.0` Trust-Task
+/// envelope (SIOPv2 self-issued login).
+///
+/// The browser wallet self-issues an `id_token` (a compact EdDSA JWS
+/// signed by its `did:key`) and carries it in the Trust-Task
+/// envelope's `payload`. The server verifies the token by resolving
+/// the issuer DID, then binds the session.
+///
+/// Field naming is `snake_case` on the wire to match the wallet's
+/// emitted payload (`id_token`, `session_id`, `session_pubkey_b58btc`).
+/// This is the *inner* Trust-Task payload, not a top-level response
+/// type, so it intentionally does not use the `camelCase` convention
+/// the response types do.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthenticatePayload {
+    /// SIOPv2 self-issued `id_token` — a compact EdDSA JWS
+    /// (`header.payload.signature`, base64url no-pad).
+    pub id_token: String,
+    /// The challenge session this login answers. The token's `nonce`
+    /// must equal the session's issued challenge.
+    pub session_id: String,
+    /// Optional ephemeral session pubkey (Ed25519 multikey,
+    /// base58btc-encoded with the `z` prefix). Bound to the issued JWT
+    /// so subsequent Trust-Task Data-Integrity proofs can be tied to
+    /// the same browser session. Only `z6Mk…` (Ed25519) is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_pubkey_b58btc: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticateResponse {

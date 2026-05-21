@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use did_hosting_common::server::auth::constant_time_eq;
@@ -94,58 +95,88 @@ pub async fn challenge(
     }))
 }
 
-/// POST /api/auth/ — authenticate with a signed DIDComm message.
+/// POST /api/auth/ — authenticate with a SIOPv2 self-issued `id_token`.
+///
+/// The request body is a `TrustTask<serde_json::Value>` envelope whose
+/// `type` is `did-hosting/auth/authenticate/1.0` and whose `payload`
+/// carries an [`AuthenticatePayload`] (`id_token`, `session_id`,
+/// optional `session_pubkey_b58btc`).
+///
+/// The `id_token` is a compact EdDSA JWS the wallet self-issues, signed
+/// by its `did:key`. We verify it by resolving the issuer DID and
+/// checking the signature, then bind the JWT to the resolved DID.
+///
+/// Body is accepted as raw bytes (mirroring `routes/trust_tasks.rs`) so
+/// a malformed envelope surfaces a `trust-task-error/0.1` document with
+/// `code: malformed_request` rather than axum's text/plain default.
 pub async fn authenticate(
     State(state): State<AppState>,
-    body: String,
-) -> Result<Json<did_hosting_common::AuthenticateResponse>, AppError> {
+    body: axum::body::Bytes,
+) -> Result<Response, AppError> {
+    use did_hosting_common::AuthenticatePayload;
     use did_hosting_common::server::didcomm_unpack;
+    use trust_tasks_rs::TrustTask;
 
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    // Unpack the signed DIDComm message; sender_base is the JWS-verified DID.
-    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+    // ─── 1. Parse the Trust-Task envelope. A parse failure emits a
+    //        routed `trust-task-error/0.1` document with
+    //        `code: malformed_request` (same pattern as the
+    //        /trust-tasks endpoint).
+    let doc: TrustTask<serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(trust_task_malformed(&format!(
+                "body did not parse as a Trust Task document: {e}"
+            )));
+        }
+    };
 
-    // Validate message type
-    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
-        return Err(AppError::Authentication(format!(
-            "unexpected message type: {}",
-            msg.typ
+    // Envelope `type` must be the authenticate task.
+    let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_1_0.as_str();
+    if doc.type_uri.to_string() != expected_type {
+        return Ok(trust_task_malformed(&format!(
+            "unexpected Trust-Task type: expected {expected_type}, got {}",
+            doc.type_uri
         )));
     }
 
-    // Extract session_id and challenge from the message body
-    let session_id = msg
-        .body
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?;
+    let payload: AuthenticatePayload = match serde_json::from_value(doc.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(trust_task_malformed(&format!(
+                "authenticate payload malformed: {e}"
+            )));
+        }
+    };
 
-    let challenge = msg
-        .body
-        .get("challenge")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing challenge in message body".into()))?;
+    // ─── 2–4. Verify the SIOPv2 id_token: signature over
+    //          `header.payload` against the `iss` did:key's resolved
+    //          Ed25519 authentication key, with `iss == sub`.
+    let verified = didcomm_unpack::verify_siop_id_token(&payload.id_token, did_resolver).await?;
 
-    // Look up the session
-    let mut session = session::get_session(&state.sessions_ks, session_id)
+    // ─── 6. Look up the session named by the payload's `session_id`.
+    let mut session = session::get_session(&state.sessions_ks, &payload.session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
+    // ─── 7. Session must be awaiting a challenge response.
     if session.state != SessionState::ChallengeSent {
         return Err(AppError::Authentication(
             "session already authenticated".into(),
         ));
     }
-    if !constant_time_eq(session.challenge.as_bytes(), challenge.as_bytes()) {
-        warn!(session_id, "authentication rejected: challenge mismatch");
-        return Err(AppError::Authentication("challenge mismatch".into()));
+
+    // ─── 6 (cont). nonce must equal the issued challenge (constant-time).
+    if !constant_time_eq(session.challenge.as_bytes(), verified.nonce.as_bytes()) {
+        warn!(session_id = %payload.session_id, "authentication rejected: nonce mismatch");
+        return Err(AppError::Authentication("nonce mismatch".into()));
     }
 
-    // Check TTL
+    // ─── 7 (cont). Same challenge-TTL check as the legacy flow.
     let now = now_epoch();
     if now.saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
-        session::delete_session(&state.sessions_ks, session_id).await?;
+        session::delete_session(&state.sessions_ks, &payload.session_id).await?;
         // Free the pending-challenge slot so the legitimate caller
         // can re-issue. Without this, an expired challenge would
         // hold the slot until the per-DID cap caused subsequent
@@ -154,20 +185,57 @@ pub async fn authenticate(
         return Err(AppError::Authentication("challenge expired".into()));
     }
 
-    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
-    if sender_base != session.did {
+    // ─── 5. `aud` must equal this service's RP identifier (its own
+    //        DID, configured as `server_did`). Without a configured
+    //        server DID there is no RP identity to bind the token to,
+    //        so refuse rather than accept an unbound token.
+    let rp_id = state.config.server_did.as_deref().ok_or_else(|| {
+        AppError::Config("server_did not configured; cannot verify id_token `aud`".into())
+    })?;
+    if verified.audience != rp_id {
+        warn!(
+            expected = %rp_id,
+            actual = %verified.audience,
+            "authentication rejected: id_token `aud` does not match this service",
+        );
+        return Err(AppError::Authentication(
+            "id_token `aud` does not match this service".into(),
+        ));
+    }
+
+    // ─── 8. The authenticated DID is `iss`; it must match the DID the
+    //        challenge was issued to (replaces the legacy
+    //        `sender_base != session.did` check).
+    if verified.issuer != session.did {
         warn!(
             expected = %session.did,
-            actual = %sender_base,
-            "DID mismatch in authentication"
+            actual = %verified.issuer,
+            "DID mismatch in authentication",
         );
         return Err(AppError::Authentication("DID mismatch".into()));
     }
 
-    // Determine role from ACL
+    // ─── 9. Token freshness: `exp` in the future, `iat` not in the
+    //        future (small skew tolerance) and not after `exp`.
+    const CLOCK_SKEW_SECS: u64 = 60;
+    if verified.expires_at <= now {
+        return Err(AppError::Authentication("id_token has expired".into()));
+    }
+    if verified.issued_at > now + CLOCK_SKEW_SECS {
+        return Err(AppError::Authentication(
+            "id_token `iat` is in the future".into(),
+        ));
+    }
+    if verified.issued_at > verified.expires_at {
+        return Err(AppError::Authentication(
+            "id_token `iat` is after `exp`".into(),
+        ));
+    }
+
+    // Determine role from ACL.
     let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
 
-    // Optional: pick up the client's ephemeral session pubkey
+    // ─── 10. Optional: pick up the client's ephemeral session pubkey
     // (Ed25519 multikey, base58btc-encoded with the `z` prefix).
     // Stored on the session so `dispatch_trust_task` can verify
     // Data Integrity proofs on REQUIRED-spec trust-task requests
@@ -178,11 +246,7 @@ pub async fn authenticate(
     // multicodec 0xed01 prefix). Anything else is rejected so the
     // server doesn't accept a key shape it can't later resolve via
     // `did:key`.
-    if let Some(pk) = msg
-        .body
-        .get("session_pubkey_b58btc")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
         if !pk.starts_with("z6Mk") {
             warn!(prefix = %&pk[..pk.len().min(8)], "rejected unsupported session-key shape");
             return Err(AppError::Authentication(
@@ -192,7 +256,8 @@ pub async fn authenticate(
         session.session_pubkey_b58btc = Some(pk.to_string());
     }
 
-    // Finalize session and issue tokens
+    // Finalize session and issue tokens — same primitive as the legacy
+    // flow, so the JWT shape and lifetimes are unchanged.
     let token_response = session::finalize_challenge_session(
         &state.sessions_ks,
         jwt_keys,
@@ -207,9 +272,9 @@ pub async fn authenticate(
     // transitioned to Authenticated.
     state.pending_challenges.release(&session.did).await;
 
-    info!(did = %session.did, role = %role, "authenticated via DIDComm");
+    info!(did = %session.did, role = %role, "authenticated via SIOPv2 id_token");
 
-    Ok(Json(did_hosting_common::AuthenticateResponse {
+    let resp = did_hosting_common::AuthenticateResponse {
         session_id: token_response.session_id,
         data: did_hosting_common::AuthenticateData {
             access_token: token_response.access_token,
@@ -217,7 +282,48 @@ pub async fn authenticate(
             refresh_token: token_response.refresh_token,
             refresh_expires_at: token_response.refresh_expires_at,
         },
-    }))
+    };
+    Ok(Json(resp).into_response())
+}
+
+/// Build a `trust-task-error/0.1` HTTP response for a malformed
+/// authenticate envelope. Mirrors `routes/trust_tasks.rs::body_parse_error`
+/// — unrouted (no source issuer/recipient to draw from), `code:
+/// malformed_request`, mapped to its spec status via `status_for_code`.
+fn trust_task_malformed(reason: &str) -> Response {
+    use trust_tasks_https::status_for_code;
+    use trust_tasks_rs::{ErrorPayload, RejectReason};
+    use uuid::Uuid;
+
+    let reject = RejectReason::MalformedRequest {
+        reason: reason.to_string(),
+    };
+    let payload: ErrorPayload = reject.into();
+    let status_u16 = status_for_code(&payload.code);
+    let status =
+        axum::http::StatusCode::from_u16(status_u16).unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+    let err_doc = trust_tasks_rs::ErrorResponse {
+        id: format!("urn:uuid:{}", Uuid::new_v4()),
+        thread_id: None,
+        type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
+            .parse()
+            .expect("framework error Type URI parses"),
+        issuer: None,
+        recipient: None,
+        issued_at: Some(chrono::Utc::now()),
+        expires_at: None,
+        payload,
+        context: None,
+        proof: None,
+        extra: Default::default(),
+    };
+    let body = serde_json::to_vec(&err_doc).expect("error document serialises");
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// POST /api/auth/refresh — refresh an access token.
