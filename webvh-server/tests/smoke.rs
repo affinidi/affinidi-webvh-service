@@ -158,3 +158,50 @@ async fn public_did_resolution_round_trip() {
         .unwrap();
     assert_eq!(cc, "no-store", "404 must not be cached");
 }
+
+/// Public DID resolution must be reachable from browser-based resolvers on any
+/// origin, so the assembled router advertises `Access-Control-Allow-Origin: *`.
+#[tokio::test]
+async fn public_did_resolution_sets_cors_header() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "alice";
+    let body =
+        "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:server.example.com:alice\"}}";
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+
+    // Assemble the router exactly as `run_rest_thread` does: security headers
+    // then the public-resolution CORS layer.
+    let app = affinidi_webvh_server::routes::router(1024 * 1024)
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            affinidi_webvh_common::server::security_headers,
+        ))
+        .layer(affinidi_webvh_common::server::public_resolution_cors());
+
+    // A cross-origin browser fetch carries an Origin header.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .header("origin", "https://wallet.example.org")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let acao = response
+        .headers()
+        .get("access-control-allow-origin")
+        .expect("access-control-allow-origin header present")
+        .to_str()
+        .unwrap();
+    assert_eq!(acao, "*", "public DID resolution must allow any origin");
+}

@@ -91,3 +91,25 @@ pub async fn security_headers(
     }
     resp
 }
+
+/// CORS layer for public DID resolution.
+///
+/// DID documents (`did.jsonl`, `/.well-known/did.json`) are public,
+/// content-addressed, unauthenticated data. Browser-based resolvers and
+/// wallets fetch them cross-origin, so we advertise `Access-Control-Allow-Origin: *`
+/// to let any page read the response. Resolution is read-only, so only the
+/// safe methods are allowed.
+///
+/// This is deliberately permissive but safe: credentials are never reflected
+/// (wildcard origin forbids `Access-Control-Allow-Credentials: true`), and the
+/// management API authenticates with bearer JWTs rather than cookies — so a
+/// wildcard origin grants a cross-origin page nothing it could not already
+/// fetch server-to-server, while still blocking it from reading authenticated
+/// responses it has no token for.
+pub fn public_resolution_cors() -> tower_http::cors::CorsLayer {
+    use axum::http::Method;
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_headers(tower_http::cors::Any)
+}

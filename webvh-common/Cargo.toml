@@ -70,7 +70,7 @@ chrono = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tower-http = { version = "0.6", features = ["trace"], optional = true }
+tower-http = { version = "0.6", features = ["trace", "cors"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 toml = "1.0"
