@@ -101,7 +101,14 @@ async fn authenticate_happy_path_parses_token_data() {
     let id_owned = identity();
     let id = id_owned.borrow();
     let td = c
-        .authenticate(&id, "sess-42", "deadbeef", 1_700_000_000, RECIPIENT_DID)
+        .authenticate(
+            &id,
+            "sess-42",
+            "deadbeef",
+            1_700_000_000,
+            RECIPIENT_DID,
+            None,
+        )
         .await
         .expect("authenticate");
     assert_eq!(td.access_token, "AAA");

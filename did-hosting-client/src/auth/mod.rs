@@ -1,21 +1,25 @@
-//! DIDComm v2 challenge-response authentication against a
-//! `did-hosting-server` / `did-hosting-daemon`.
+//! Challenge-response authentication against a `did-hosting-server` /
+//! `did-hosting-daemon`.
 //!
 //! The daemon's auth flow has two REST round-trips:
 //!
 //! 1. `POST /api/auth/challenge` with `{ did }` → returns
 //!    `{ session_id, data: { challenge } }`.
-//! 2. The client constructs a DIDComm v2 message with `typ =
-//!    "https://affinidi.com/webvh/1.0/authenticate"`, body
-//!    `{ session_id, challenge }`, signs it with the holder's key,
-//!    and POSTs the JWS-packed envelope to `/api/auth/`. The daemon
-//!    unpacks the JWS, verifies the sender DID matches the
-//!    challenge subject, and issues `{ access_token, refresh_token,
-//!    access_expires_at, refresh_expires_at }`.
+//! 2. The client self-issues a SIOPv2 `id_token` (a compact EdDSA JWS
+//!    signed by the holder's Ed25519 key, with the challenge as
+//!    `nonce` and the relying-party DID as `aud`), wraps it in a
+//!    Trust-Task envelope (`type =
+//!    "https://trusttasks.org/did-hosting/auth/authenticate/1.0"`,
+//!    `payload = { id_token, session_id, session_pubkey_b58btc? }`),
+//!    and POSTs that envelope to `/api/auth/`. The daemon verifies
+//!    the `id_token` via
+//!    `did_hosting_common::server::didcomm_unpack::verify_siop_id_token`
+//!    and issues `{ access_token, refresh_token, access_expires_at,
+//!    refresh_expires_at }`.
 //!
-//! Token refresh follows the same shape: a DIDComm message with
-//! `typ = "https://affinidi.com/webvh/1.0/authenticate-response"`
-//! carrying the refresh token, posted to `/api/auth/refresh`.
+//! Token refresh is unchanged: a DIDComm message with `typ =
+//! "https://affinidi.com/webvh/1.0/authenticate-response"` carrying
+//! the refresh token, posted to `/api/auth/refresh`.
 //!
 //! ## What this module owns
 //!
@@ -24,12 +28,14 @@
 //!   variants so the integrator can either pass a borrow (avoid a
 //!   copy when the key already lives in their secret store) or
 //!   move an owned value into the client.
-//! - [`build_authenticate_message`] and [`build_refresh_message`]
-//!   — the two message constructors. Each returns a JWS-packed
-//!   string ready to POST. Pack-side uses
-//!   [`affinidi_tdk::didcomm::message::pack::pack_signed`], the
-//!   same primitive the daemon uses to construct its responses, so
-//!   the wire shapes are byte-identical.
+//! - [`build_authenticate_body`] — builds the Trust-Task envelope
+//!   carrying the self-issued SIOPv2 `id_token`. The `id_token`'s
+//!   `iss`/`sub` is a `did:key` derived from the holder's Ed25519
+//!   *public* key (not the `did:webvh` identity), so the server
+//!   resolves it without a DID-document round-trip.
+//! - [`build_refresh_message`] — the (unchanged) refresh constructor.
+//!   Returns a JWS-packed string via
+//!   [`affinidi_tdk::didcomm::message::pack::pack_signed`].
 //!
 //! ## Why not VTI
 //!
@@ -46,7 +52,7 @@ pub mod message;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub use message::{build_authenticate_message, build_refresh_message};
+pub use message::{build_authenticate_body, build_refresh_message};
 
 /// Trust-Task URL stamped on `POST /api/auth/challenge` requests.
 pub const TASK_AUTH_CHALLENGE_1_0: &str = super::trust_tasks::TASK_AUTH_CHALLENGE_1_0;
@@ -57,12 +63,6 @@ pub const TASK_AUTH_AUTHENTICATE_1_0: &str = super::trust_tasks::TASK_AUTH_AUTHE
 
 /// Trust-Task URL stamped on `POST /api/auth/refresh` requests.
 pub const TASK_AUTH_REFRESH_1_0: &str = super::trust_tasks::TASK_AUTH_REFRESH_1_0;
-
-/// DIDComm v2 message `typ` for the authenticate envelope. The
-/// daemon's `routes::auth::authenticate` exact-matches this; new
-/// clients sending the canonical Trust-Task URL also work because
-/// the daemon's `v1_aliases` table canonicalises both forms.
-pub const MSG_AUTHENTICATE: &str = "https://affinidi.com/webvh/1.0/authenticate";
 
 /// DIDComm v2 message `typ` for the authenticate-response /
 /// refresh envelope.

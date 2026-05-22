@@ -15,7 +15,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use url::Url;
 
-use crate::auth::{HostingSigningIdentity, build_authenticate_message, build_refresh_message};
+use crate::auth::{HostingSigningIdentity, build_authenticate_body, build_refresh_message};
 use crate::error::ClientError;
 use crate::token_store::{SharedTokenStore, TokenData};
 use crate::transport::enforce_transport_security;
@@ -126,11 +126,16 @@ impl Client {
             })
     }
 
-    /// `POST /api/auth/` — exchange a signed authenticate envelope
-    /// for an access + refresh token pair. The caller is expected
-    /// to have already called [`Self::challenge`] and built the
-    /// envelope via
-    /// [`crate::auth::build_authenticate_message`].
+    /// `POST /api/auth/` — exchange a self-issued SIOPv2 `id_token`
+    /// (wrapped in a Trust-Task envelope) for an access + refresh
+    /// token pair. The caller is expected to have already called
+    /// [`Self::challenge`]; the body is built via
+    /// [`crate::auth::build_authenticate_body`].
+    ///
+    /// `recipient_did` is the relying-party DID (the daemon's
+    /// `server_did`); it becomes the `id_token`'s `aud`.
+    /// `session_pubkey_b58btc` optionally binds an ephemeral session
+    /// key to the issued JWT for later Data-Integrity proofs.
     pub async fn authenticate(
         &self,
         identity: &HostingSigningIdentity<'_>,
@@ -138,16 +143,23 @@ impl Client {
         challenge: &str,
         now_epoch: u64,
         recipient_did: &str,
+        session_pubkey_b58btc: Option<&str>,
     ) -> Result<TokenData, ClientError> {
-        let body =
-            build_authenticate_message(identity, session_id, challenge, now_epoch, recipient_did)
-                .map_err(|e| ClientError::Protocol(format!("pack authenticate message: {e}")))?;
+        let body = build_authenticate_body(
+            identity,
+            session_id,
+            challenge,
+            recipient_did,
+            now_epoch,
+            session_pubkey_b58btc,
+        )
+        .map_err(|e| ClientError::Protocol(format!("build authenticate body: {e}")))?;
         let url = self.url("/api/auth/")?;
         let resp = self
             .http
             .post(url)
             .headers(self.trust_task_headers(TASK_AUTH_AUTHENTICATE_1_0)?)
-            .header("content-type", "application/didcomm-signed+json")
+            .header("content-type", "application/json")
             .body(body)
             .send()
             .await
@@ -261,6 +273,7 @@ impl Client {
                 &challenge.challenge,
                 now_epoch,
                 recipient_did,
+                None,
             )
             .await?;
         let access = fresh.access_token.clone();
