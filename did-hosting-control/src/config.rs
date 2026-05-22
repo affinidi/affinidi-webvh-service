@@ -14,6 +14,12 @@ pub struct AppConfig {
     pub features: FeaturesConfig,
     pub server_did: Option<String>,
     pub mediator_did: Option<String>,
+    /// VTA DID trusted to issue step-up approvals. When set, a VTA-signed
+    /// approval token from this DID elevates a session to `aal2`
+    /// (`amr: [did, vta]`). The single-trusted-VTA model (this is the RP's
+    /// provisioning VTA); per-holder VTA discovery is future work.
+    #[serde(default)]
+    pub step_up_trusted_vta_did: Option<String>,
     pub public_url: Option<String>,
     pub did_hosting_url: Option<String>,
     #[serde(default = "default_server")]
@@ -183,6 +189,10 @@ impl AppConfig {
 
         env_opt!("CONTROL_SERVER_DID", config.server_did);
         env_opt!("CONTROL_MEDIATOR_DID", config.mediator_did);
+        env_opt!(
+            "CONTROL_STEP_UP_TRUSTED_VTA_DID",
+            config.step_up_trusted_vta_did
+        );
         env_opt!("CONTROL_PUBLIC_URL", config.public_url);
         env_opt!("CONTROL_DID_HOSTING_URL", config.did_hosting_url);
 

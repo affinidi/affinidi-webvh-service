@@ -71,6 +71,18 @@ pub static TASK_AUTH_STEP_UP_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-check/1.0").expect("static")
 });
 
+/// `did-hosting/auth/step-up-vta-start/1.0` — issue a step-up nonce.
+pub static TASK_AUTH_STEP_UP_VTA_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-vta-start/1.0").expect("static")
+});
+
+/// `did-hosting/auth/step-up-vta-finish/1.0` — submit a VTA-signed approval
+/// and elevate the session to aal2.
+pub static TASK_AUTH_STEP_UP_VTA_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-vta-finish/1.0")
+        .expect("static")
+});
+
 // -- DID provisioning lifecycle --------------------------------------------
 
 pub static TASK_DID_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {

@@ -157,6 +157,17 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(passkey::step_up_finish::<AppState>),
             (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0).clone(),
         )
+        // Step-up via VTA approval (wallet-driven, works cross-origin).
+        .route_with_task_permissive(
+            "/auth/step-up/vta/start",
+            post(auth::step_up_vta_start),
+            (*TASK_AUTH_STEP_UP_VTA_START_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/auth/step-up/vta/finish",
+            post(auth::step_up_vta_finish),
+            (*TASK_AUTH_STEP_UP_VTA_FINISH_1_0).clone(),
+        )
         // Demo sensitive op gated on aal2 (proves the StepUpAuth gate).
         .route_with_task_permissive(
             "/auth/step-up/check",

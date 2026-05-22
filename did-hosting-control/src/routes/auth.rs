@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::{ChallengeData, ChallengeRequest, ChallengeResponse};
 
+use crate::auth::AuthClaims;
 use crate::auth::session::{self, Session, SessionState, now_epoch};
 use crate::error::AppError;
 use crate::rate_limit::resolve_client_ip;
@@ -342,6 +343,123 @@ fn trust_task_malformed(reason: &str) -> Response {
         body,
     )
         .into_response()
+}
+
+/// POST /api/auth/step-up/vta/start — issue a step-up nonce bound to the
+/// caller's session. The wallet relays it to the VTA, which signs an
+/// approval committing to it.
+pub async fn step_up_vta_start(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let nonce = rand::random::<[u8; 32]>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    state
+        .sessions_ks
+        .insert_raw(
+            format!("stepup-nonce:{}", auth.session_id),
+            nonce.as_bytes().to_vec(),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "nonce": nonce })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct StepUpVtaFinishRequest {
+    /// VTA-signed approval token (compact EdDSA JWS).
+    pub approval_token: String,
+}
+
+/// POST /api/auth/step-up/vta/finish — verify a VTA-signed approval and
+/// elevate the caller's session to `aal2` (`amr: [did, vta]`).
+pub async fn step_up_vta_finish(
+    State(state): State<AppState>,
+    auth: AuthClaims,
+    Json(req): Json<StepUpVtaFinishRequest>,
+) -> Result<Json<did_hosting_common::server::auth::session::TokenResponse>, AppError> {
+    use did_hosting_common::server::didcomm_unpack;
+
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+
+    let trusted_vta = state
+        .config
+        .step_up_trusted_vta_did
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::Config("step_up_trusted_vta_did not configured; VTA step-up disabled".into())
+        })?;
+    let rp_id = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+
+    let verified =
+        didcomm_unpack::verify_vta_approval_token(&req.approval_token, did_resolver).await?;
+
+    // ─── Bindings. ───
+    if verified.issuer != trusted_vta {
+        warn!(expected = %trusted_vta, actual = %verified.issuer, "step-up rejected: approval not from the trusted VTA");
+        return Err(AppError::Forbidden(
+            "approval was not issued by the trusted VTA".into(),
+        ));
+    }
+    if verified.subject != auth.did {
+        warn!(authed = %auth.did, subject = %verified.subject, "step-up rejected: approval subject mismatch");
+        return Err(AppError::Authentication(
+            "approval subject does not match the authenticated DID".into(),
+        ));
+    }
+    if verified.audience != rp_id {
+        return Err(AppError::Authentication(
+            "approval audience does not match this service".into(),
+        ));
+    }
+
+    // Consume the session-bound nonce (single use).
+    let stored = state
+        .sessions_ks
+        .take_raw(format!("stepup-nonce:{}", auth.session_id))
+        .await?
+        .ok_or_else(|| {
+            AppError::Authentication("no step-up challenge issued for this session".into())
+        })?;
+    let stored = String::from_utf8(stored)
+        .map_err(|e| AppError::Internal(format!("stored nonce not utf8: {e}")))?;
+    if !constant_time_eq(stored.as_bytes(), verified.nonce.as_bytes()) {
+        warn!(session_id = %auth.session_id, "step-up rejected: nonce mismatch");
+        return Err(AppError::Authentication("step-up nonce mismatch".into()));
+    }
+
+    // Freshness.
+    const CLOCK_SKEW_SECS: u64 = 60;
+    let now = now_epoch();
+    if verified.expires_at <= now {
+        return Err(AppError::Authentication("approval has expired".into()));
+    }
+    if verified.issued_at > now + CLOCK_SKEW_SECS {
+        return Err(AppError::Authentication(
+            "approval `iat` is in the future".into(),
+        ));
+    }
+
+    let role = crate::acl::check_acl(&state.acl_ks, &auth.did).await?;
+    let token_resp = session::elevate_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &auth.session_id,
+        &role,
+        vec!["did".to_string(), "vta".to_string()],
+        "aal2",
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
+
+    info!(did = %auth.did, "step-up complete via VTA approval: session elevated to aal2");
+    Ok(Json(token_resp))
 }
 
 /// POST /api/auth/refresh — refresh an access token.

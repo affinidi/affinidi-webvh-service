@@ -49,6 +49,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         features: FeaturesConfig::default(),
         server_did: Some("did:webvh:test:control.example.com".into()),
         mediator_did: None,
+        step_up_trusted_vta_did: None,
         public_url: Some("http://localhost:8532".into()),
         did_hosting_url: Some("http://localhost:8532".into()),
         server: ServerConfig::default(),
