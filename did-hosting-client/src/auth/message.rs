@@ -71,11 +71,14 @@ pub fn build_authenticate_body(
 ) -> Result<String, AuthMessageError> {
     let id_token = build_siop_id_token(identity, challenge, recipient_did, now_epoch)?;
 
-    // Trust-Task envelope. The server deserializes this as
-    // `trust_tasks_rs::TrustTask<serde_json::Value>` and only requires
-    // `id` + `type` + `payload`; any other top-level members land in
-    // its `extra` map. We emit exactly those three so the body stays
-    // minimal and unambiguous.
+    // Trust-Task envelope. The did-hosting task identifier is a flat,
+    // exact-match-routed URL (`…/did-hosting/auth/authenticate/1.0`), not a
+    // framework `/spec/<slug>/<ver>` `TypeUri` — so the server parses a
+    // minimal envelope by hand (`type` + `payload`) and string-matches the
+    // type via `v1_aliases`, rather than deserializing a
+    // `trust_tasks_rs::TrustTask<Value>` (whose strict `TypeUri` field
+    // would reject the flat URL). We emit `id` + `type` + `payload`; the
+    // server ignores `id`.
     let mut payload = json!({
         "id_token": id_token,
         "session_id": session_id,

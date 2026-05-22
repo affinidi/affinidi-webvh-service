@@ -97,10 +97,12 @@ pub async fn challenge(
 
 /// POST /api/auth/ — authenticate with a SIOPv2 self-issued `id_token`.
 ///
-/// The request body is a `TrustTask<serde_json::Value>` envelope whose
-/// `type` is `did-hosting/auth/authenticate/1.0` and whose `payload`
-/// carries an [`AuthenticatePayload`] (`id_token`, `session_id`,
-/// optional `session_pubkey_b58btc`).
+/// The request body is a Trust-Task-shaped envelope whose `type` is the
+/// flat, exact-match-routed `did-hosting/auth/authenticate/1.0` URL and
+/// whose `payload` carries an [`AuthenticatePayload`] (`id_token`,
+/// `session_id`, optional `session_pubkey_b58btc`). Because that flat URL
+/// is not a framework `/spec/<slug>/<ver>` `TypeUri`, the envelope is
+/// parsed by hand rather than as a `trust_tasks_rs::TrustTask<Value>`.
 ///
 /// The `id_token` is a compact EdDSA JWS the wallet self-issues, signed
 /// by its `did:key`. We verify it by resolving the issuer DID and
@@ -115,33 +117,49 @@ pub async fn authenticate(
 ) -> Result<Response, AppError> {
     use did_hosting_common::AuthenticatePayload;
     use did_hosting_common::server::didcomm_unpack;
-    use trust_tasks_rs::TrustTask;
+    use did_hosting_common::v1_aliases;
 
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    // ─── 1. Parse the Trust-Task envelope. A parse failure emits a
-    //        routed `trust-task-error/0.1` document with
-    //        `code: malformed_request` (same pattern as the
-    //        /trust-tasks endpoint).
-    let doc: TrustTask<serde_json::Value> = match serde_json::from_slice(&body) {
-        Ok(d) => d,
+    // ─── 1. Parse the authenticate envelope.
+    //
+    // The did-hosting task identifiers (`https://trusttasks.org/did-hosting/
+    // …`) are exact-match routed strings, *not* framework `/spec/<slug>/
+    // <ver>` `TypeUri`s. So the body cannot be deserialized as
+    // `trust_tasks_rs::TrustTask<Value>`: that type's `type_uri: TypeUri`
+    // field runs the strict `/spec/` parser and rejects our flat URI. We
+    // parse a minimal envelope by hand and match the `type` string the same
+    // way the DIDComm dispatcher matches `msg.typ` — via `v1_aliases`. A
+    // parse failure emits a routed `trust-task-error/0.1` document with
+    // `code: malformed_request` (same pattern as the /trust-tasks endpoint).
+    #[derive(serde::Deserialize)]
+    struct AuthEnvelope {
+        #[serde(rename = "type")]
+        type_uri: String,
+        payload: serde_json::Value,
+    }
+
+    let envelope: AuthEnvelope = match serde_json::from_slice(&body) {
+        Ok(e) => e,
         Err(e) => {
             return Ok(trust_task_malformed(&format!(
-                "body did not parse as a Trust Task document: {e}"
+                "body did not parse as an authenticate envelope: {e}"
             )));
         }
     };
 
-    // Envelope `type` must be the authenticate task.
+    // Envelope `type` must canonicalise to the authenticate task. Accepts
+    // both the canonical `did-hosting/auth/authenticate/1.0` URL and its
+    // legacy `affinidi.com/webvh/1.0/authenticate` alias.
     let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_1_0.as_str();
-    if doc.type_uri.to_string() != expected_type {
+    if v1_aliases::canonicalize(&envelope.type_uri) != Some(expected_type) {
         return Ok(trust_task_malformed(&format!(
             "unexpected Trust-Task type: expected {expected_type}, got {}",
-            doc.type_uri
+            envelope.type_uri
         )));
     }
 
-    let payload: AuthenticatePayload = match serde_json::from_value(doc.payload.clone()) {
+    let payload: AuthenticatePayload = match serde_json::from_value(envelope.payload) {
         Ok(p) => p,
         Err(e) => {
             return Ok(trust_task_malformed(&format!(
