@@ -37,6 +37,15 @@ pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The caller is authenticated but the operation requires a higher
+    /// assurance level (`acr == aal2`) than the session currently holds.
+    /// Renders to 403 with the distinct body `{ "error":
+    /// "step_up_required", "required_acr": "aal2" }` so the wallet can
+    /// trigger a step-up ceremony rather than treating it as a plain
+    /// permission denial.
+    #[error("step-up required: {0}")]
+    StepUpRequired(String),
+
     #[error("validation error: {0}")]
     Validation(String),
 
@@ -220,6 +229,7 @@ impl AppError {
             AppError::Authentication(_) => "authentication failed".into(),
             AppError::Unauthorized(_) => "unauthorized".into(),
             AppError::Forbidden(_) => "forbidden".into(),
+            AppError::StepUpRequired(_) => "step_up_required".into(),
             AppError::Validation(msg) => sanitize_user_message(msg),
             AppError::Conflict(msg) => sanitize_user_message(msg),
             AppError::QuotaExceeded(msg) => sanitize_user_message(msg),
@@ -245,6 +255,7 @@ impl IntoResponse for AppError {
             AppError::Authentication(_) => StatusCode::UNAUTHORIZED,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::StepUpRequired(_) => StatusCode::FORBIDDEN,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
             AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
@@ -283,6 +294,10 @@ impl IntoResponse for AppError {
                 "status": "disabled",
                 "domain": domain,
                 "message": message,
+            }),
+            AppError::StepUpRequired(_) => serde_json::json!({
+                "error": "step_up_required",
+                "required_acr": "aal2",
             }),
             _ => serde_json::json!({ "error": self.user_message() }),
         };

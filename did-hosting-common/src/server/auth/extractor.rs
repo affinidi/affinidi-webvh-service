@@ -38,6 +38,12 @@ pub struct AuthClaims {
     /// `verificationMethod` came from the same session that issued the
     /// JWT.
     pub session_pubkey_b58btc: Option<String>,
+    /// Authentication methods on the session's token (`["did"]` base,
+    /// plus `"webauthn"`/`"vta"` after a step-up).
+    pub amr: Vec<String>,
+    /// Assurance level on the session's token (`"aal1"` base, `"aal2"`
+    /// after a step-up). Gated by [`StepUpAuth`].
+    pub acr: String,
 }
 
 impl<S: AuthState> FromRequestParts<S> for AuthClaims {
@@ -101,6 +107,8 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
             did: claims.sub,
             role,
             session_pubkey_b58btc: session.session_pubkey_b58btc,
+            amr: claims.amr,
+            acr: claims.acr,
         })
     }
 }
@@ -151,6 +159,37 @@ impl<S: AuthState> FromRequestParts<S> for AdminAuth {
                 warn!(did = %claims.did, role = %claims.role, "auth rejected: admin role required");
                 Err(AppError::Forbidden("admin role required".into()))
             }
+        }
+    }
+}
+
+/// Extractor that requires a **stepped-up** session (`acr == "aal2"`).
+///
+/// Use on sensitive operations that demand a second factor beyond the
+/// base did:key login:
+/// ```ignore
+/// async fn delete_did(auth: StepUpAuth, ...) { }
+/// ```
+/// A base (`aal1`) session is rejected with [`AppError::StepUpRequired`]
+/// (403, body `{ "error": "step_up_required", "required_acr": "aal2" }`)
+/// — a distinct signal the wallet uses to trigger a step-up ceremony,
+/// rather than the generic `forbidden` it would get from a role gate.
+#[derive(Debug, Clone)]
+pub struct StepUpAuth(pub AuthClaims);
+
+impl<S: AuthState> FromRequestParts<S> for StepUpAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let claims = AuthClaims::from_request_parts(parts, state).await?;
+
+        if claims.acr == "aal2" {
+            Ok(StepUpAuth(claims))
+        } else {
+            warn!(did = %claims.did, acr = %claims.acr, "auth rejected: step-up (aal2) required");
+            Err(AppError::StepUpRequired(
+                "operation requires a stepped-up (aal2) session".into(),
+            ))
         }
     }
 }

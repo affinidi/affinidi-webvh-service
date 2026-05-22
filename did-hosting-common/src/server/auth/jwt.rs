@@ -30,6 +30,19 @@ fn ensure_jwt_crypto_provider() {
     });
 }
 
+/// Default authentication methods (`amr`) for a base login: a single
+/// `did` factor (did:key over REST SIOP / DIDComm authcrypt). Step-up
+/// adds factors (`webauthn`, `vta`) and bumps `acr` to `aal2`.
+fn default_amr() -> Vec<String> {
+    vec!["did".to_string()]
+}
+
+/// Default assurance level (`acr`) for a base login. Step-up elevates to
+/// `aal2`. Tokens minted before this field existed decode as `aal1`.
+fn default_acr() -> String {
+    "aal1".to_string()
+}
+
 /// JWT claims for WebVH access tokens.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -44,6 +57,14 @@ pub struct Claims {
     /// Unique token ID — rotated on each refresh so old tokens are invalidated.
     #[serde(default)]
     pub jti: String,
+    /// Authentication methods references (RFC 8176-style). Base login is
+    /// `["did"]`; step-up appends `"webauthn"` or `"vta"`.
+    #[serde(default = "default_amr")]
+    pub amr: Vec<String>,
+    /// Authentication context class / assurance level. `"aal1"` for a base
+    /// login, `"aal2"` after a step-up. RP gates sensitive ops on this.
+    #[serde(default = "default_acr")]
+    pub acr: String,
 }
 
 /// Holds the JWT encoding and decoding keys derived from an Ed25519 seed.
@@ -120,6 +141,8 @@ impl JwtKeys {
             exp: now + expiry_secs,
             iat: now,
             jti: uuid::Uuid::new_v4().to_string(),
+            amr: default_amr(),
+            acr: default_acr(),
         }
     }
 }

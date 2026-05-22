@@ -217,6 +217,9 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
                 did: sender.to_string(),
                 role,
                 session_pubkey_b58btc: None,
+                // DIDComm authcrypt-sender auth is a base (did) factor.
+                amr: vec!["did".to_string()],
+                acr: "aal1".to_string(),
             };
             match dispatch_did_op(&auth, state, message).await {
                 Ok(result) => result,
