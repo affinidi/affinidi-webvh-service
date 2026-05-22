@@ -1037,6 +1037,7 @@ mod tests_atomic {
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+            pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         (state, dir)

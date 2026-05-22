@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,23 @@ use crate::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
+
+/// A wallet-confirmation request awaiting the holder's authcrypted
+/// `confirm-response/1.0`. Keyed by `challenge` in
+/// [`AppState::pending_confirms`]. The REST trigger endpoint parks a
+/// `oneshot::Receiver` while the inbound DIDComm response handler fires
+/// the approve/deny on `tx`.
+pub struct PendingConfirm {
+    /// The holder DID the `confirm/1.0` was addressed to. The inbound
+    /// response is only honoured if its authcrypt sender equals this —
+    /// the authcrypt envelope is the authentication.
+    pub holder_did: String,
+    /// Resolves the parked REST request with the user's decision.
+    pub tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Map of in-flight wallet confirmations, keyed by `challenge`.
+pub type PendingConfirms = Arc<tokio::sync::Mutex<HashMap<String, PendingConfirm>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -109,6 +127,12 @@ pub struct AppState {
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
     pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
+    /// In-flight RP→wallet confirmation requests, keyed by `challenge`.
+    /// The `POST /confirm/request` endpoint inserts a pending entry and
+    /// parks on a `oneshot`; the inbound `confirm-response/1.0` DIDComm
+    /// handler looks the entry up by challenge, verifies the authcrypt
+    /// sender matches the addressed holder DID, and resolves the wait.
+    pub pending_confirms: PendingConfirms,
 }
 
 impl AppState {
@@ -315,6 +339,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+        pending_confirms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     // Seed registry from static config

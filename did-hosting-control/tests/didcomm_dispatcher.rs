@@ -88,6 +88,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
+        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     (state, dir)

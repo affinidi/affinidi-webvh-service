@@ -83,6 +83,14 @@ pub static TASK_AUTH_STEP_UP_VTA_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new
         .expect("static")
 });
 
+/// `did-hosting/confirm/request/1.0` — RP-initiated wallet confirmation:
+/// the admin asks the control plane to send a `confirm/1.0` DIDComm
+/// message to a holder DID and waits (synchronously, over REST) for the
+/// holder's authcrypted `confirm-response/1.0` approve/deny.
+pub static TASK_CONFIRM_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/confirm/request/1.0").expect("static")
+});
+
 // -- DID provisioning lifecycle --------------------------------------------
 
 pub static TASK_DID_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
@@ -373,6 +381,7 @@ mod tests {
         let all: &[&LazyLock<TrustTask>] = &[
             &TASK_AUTH_AUTHENTICATE_1_0,
             &TASK_AUTH_AUTHENTICATE_RESPONSE_1_0,
+            &TASK_CONFIRM_REQUEST_1_0,
             &TASK_DID_REQUEST_1_0,
             &TASK_DID_OFFER_1_0,
             &TASK_DID_PUBLISH_1_0,

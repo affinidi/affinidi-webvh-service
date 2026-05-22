@@ -52,6 +52,13 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
         .route(MSG_DID_CHANGE_OWNER, handler_fn(handle_webvh_message))?
+        // Wallet confirmation response (RP→wallet confirm protocol).
+        // The matching outbound `confirm/1.0` is sent by the REST
+        // endpoint `POST /api/confirm/request`.
+        .route(
+            crate::routes::confirm::MSG_WALLET_CONFIRM_RESPONSE,
+            handler_fn(handle_confirm_response),
+        )?
         // Server registration
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
         // Health pong from servers
@@ -179,6 +186,71 @@ async fn run_authenticate(
         }
     };
     Ok(pair)
+}
+
+/// Inbound `confirm-response/1.0` from a wallet.
+///
+/// The authcrypt envelope *is* the authentication: the DIDComm service
+/// layer has already authenticated the sender, so `ctx.sender_did` is the
+/// holder DID. We correlate by `challenge`, verify the sender matches the
+/// holder DID the request was addressed to, and resolve the parked REST
+/// request with the user's decision. No DIDComm reply is needed.
+async fn handle_confirm_response(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+
+    let approved = message.body.get("approved").and_then(|v| v.as_bool());
+    let challenge = message.body.get("challenge").and_then(|v| v.as_str());
+
+    let (approved, challenge) = match (approved, challenge) {
+        (Some(a), Some(c)) => (a, c),
+        _ => {
+            warn!(
+                sender = sender,
+                "confirm-response missing 'approved' or 'challenge' — ignoring"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Look up and remove the pending entry under the same lock so two
+    // responses for the same challenge can't both fire the sender.
+    let pending = {
+        let mut map = state.pending_confirms.lock().await;
+        map.remove(challenge)
+    };
+
+    let pending = match pending {
+        Some(p) => p,
+        None => {
+            // Stale, duplicate, or already-resolved challenge.
+            warn!(
+                sender = sender,
+                "confirm-response for unknown challenge — ignoring"
+            );
+            return Ok(None);
+        }
+    };
+
+    // The authcrypt sender must equal the holder DID the request was
+    // sent to — reject a response from any other DID.
+    if pending.holder_did != sender {
+        warn!(
+            sender = sender,
+            expected = %pending.holder_did,
+            "confirm-response sender does not match addressed holder DID — rejecting"
+        );
+        // Entry already removed; the parked REST request will time out.
+        return Ok(None);
+    }
+
+    info!(sender = sender, approved, "confirm-response received");
+    // Receiver may have already timed out and dropped — ignore the error.
+    let _ = pending.tx.send(approved);
+    Ok(None)
 }
 
 async fn handle_webvh_message(
@@ -1111,6 +1183,7 @@ mod tests {
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+            pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         (state, dir)

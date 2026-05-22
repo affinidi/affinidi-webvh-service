@@ -95,6 +95,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
+        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA

@@ -1,5 +1,6 @@
 mod acl;
 mod auth;
+pub mod confirm;
 mod did_manage;
 mod didcomm;
 mod domain;
@@ -124,6 +125,14 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/auth/refresh",
             post(auth::refresh),
             (*TASK_AUTH_REFRESH_1_0).clone(),
+        )
+        // RP-initiated wallet confirmation (admin-only). Sends a
+        // `confirm/1.0` DIDComm message to a holder DID and waits for the
+        // wallet's authcrypted approve/deny.
+        .route_with_task_permissive(
+            "/confirm/request",
+            post(confirm::request),
+            (*TASK_CONFIRM_REQUEST_1_0).clone(),
         )
         // Passkey (WebAuthn)
         .route_with_task_permissive(
