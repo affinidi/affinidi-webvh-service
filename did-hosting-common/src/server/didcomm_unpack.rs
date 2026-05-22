@@ -260,14 +260,17 @@ fn ed25519_pubkey_from_did_key(did: &str) -> Result<[u8; 32], AppError> {
 /// 1. Split the compact JWS into `header.payload.signature`.
 /// 2. Parse the payload JSON (pre-verify) and require `iss` present and
 ///    `iss == sub`.
-/// 3. Resolve the Ed25519 public key for `iss`. The `kid` in the JWS
-///    header is honoured for the verification-method lookup (resolved
-///    via [`resolve_verifying_key`], the same DID-resolve + Ed25519
-///    key-extraction primitive `unpack_signed` uses), but the resolved
-///    key's base DID must equal `iss`, and the key must match the key
-///    encoded in the `iss` did:key itself. Both anchors must agree, so
-///    a header pointing at a different DID's key cannot impersonate the
-///    `iss`.
+/// 3. Resolve the authentication key for `iss`. The `kid` is honoured
+///    for the verification-method lookup (resolved via
+///    [`resolve_verifying_key`], the same DID-resolve + Ed25519
+///    key-extraction primitive `unpack_signed` uses), and the resolved
+///    key's base DID must equal `iss`. Works for any DID method the
+///    resolver supports — `did:key` (in-tree) and `did:webvh` (DID
+///    document fetched) alike. For `did:key`, which is self-certifying,
+///    the resolved key is *additionally* pinned against the key encoded
+///    in the DID string, so a header pointing at a foreign DID's key
+///    cannot impersonate the `iss`. For document-based methods the
+///    resolved DID document is the authority.
 /// 4. EdDSA-verify the signature over the ASCII `header.payload`.
 ///
 /// Returns the [`VerifiedSiopIdToken`] with eagerly-parsed claims.
@@ -321,16 +324,26 @@ pub async fn verify_siop_id_token(
             "id_token header `kid` DID does not match `iss`".into(),
         ));
     }
+    // Resolve `iss`'s authentication key. The resolver handles any DID
+    // method it supports — `did:key` in-tree, `did:webvh` by fetching
+    // the DID document, etc. For `did:key` (self-certifying) we
+    // additionally pin the resolved key against the key encoded directly
+    // in the DID string, so a `kid` can't point at a foreign key. For
+    // document-based methods (`did:webvh`, `did:peer`) the resolved DID
+    // document is the authority — there is no in-string key to pin to.
     let resolved_key = resolve_verifying_key(did_resolver, &kid).await?;
-    let did_key_pub = ed25519_pubkey_from_did_key(&iss)?;
-    if resolved_key != did_key_pub {
-        return Err(AppError::Authentication(
-            "id_token `iss` did:key does not match its resolved authentication key".into(),
-        ));
+    if iss.starts_with("did:key:") {
+        let did_key_pub = ed25519_pubkey_from_did_key(&iss)?;
+        if resolved_key != did_key_pub {
+            return Err(AppError::Authentication(
+                "id_token `iss` did:key does not match its resolved authentication key".into(),
+            ));
+        }
     }
 
-    // 4. EdDSA-verify the signature over the ASCII `header.payload`.
-    let verifying_key = VerifyingKey::from_bytes(&did_key_pub)
+    // 4. EdDSA-verify the signature over the ASCII `header.payload`
+    //    against the resolved authentication key.
+    let verifying_key = VerifyingKey::from_bytes(&resolved_key)
         .map_err(|e| AppError::Authentication(format!("invalid Ed25519 public key: {e}")))?;
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(sig_b64)
