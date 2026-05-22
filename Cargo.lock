@@ -2639,9 +2639,12 @@ version = "0.1.0"
 dependencies = [
  "affinidi-tdk",
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
  "didwebvh-rs",
+ "ed25519-dalek",
  "ipnetwork",
+ "multibase",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
