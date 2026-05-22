@@ -216,6 +216,8 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
             let auth = AuthClaims {
                 did: sender.to_string(),
                 role,
+                // Per-message DIDComm auth has no session record.
+                session_id: String::new(),
                 session_pubkey_b58btc: None,
                 // DIDComm authcrypt-sender auth is a base (did) factor.
                 amr: vec!["did".to_string()],
@@ -1118,6 +1120,9 @@ mod tests {
             did: did.to_string(),
             role: Role::Owner,
             session_pubkey_b58btc: None,
+            session_id: String::new(),
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
         }
     }
 
@@ -1126,6 +1131,9 @@ mod tests {
             did: did.to_string(),
             role: Role::Admin,
             session_pubkey_b58btc: None,
+            session_id: String::new(),
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
         }
     }
 

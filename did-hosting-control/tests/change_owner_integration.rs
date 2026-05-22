@@ -132,6 +132,9 @@ fn auth_for(did: &str, role: Role) -> AuthClaims {
         did: did.into(),
         role,
         session_pubkey_b58btc: None,
+        session_id: String::new(),
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
     }
 }
 

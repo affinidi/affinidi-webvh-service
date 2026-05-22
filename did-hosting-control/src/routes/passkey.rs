@@ -10,4 +10,7 @@ pub use did_hosting_common::server::passkey::routes::list_invites;
 pub use did_hosting_common::server::passkey::routes::login_finish;
 pub use did_hosting_common::server::passkey::routes::login_start;
 pub use did_hosting_common::server::passkey::routes::revoke_invite;
+pub use did_hosting_common::server::passkey::routes::step_up_check;
+pub use did_hosting_common::server::passkey::routes::step_up_finish;
+pub use did_hosting_common::server::passkey::routes::step_up_start;
 pub use did_hosting_common::server::passkey::routes::update_invite;

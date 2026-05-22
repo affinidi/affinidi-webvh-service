@@ -147,6 +147,9 @@ fn auth(did: &str) -> AuthClaims {
         did: did.into(),
         role: Role::Owner,
         session_pubkey_b58btc: None,
+        session_id: String::new(),
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
     }
 }
 

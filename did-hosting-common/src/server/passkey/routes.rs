@@ -8,8 +8,10 @@ use webauthn_rs::prelude::*;
 
 use super::{PasskeyState, store};
 use crate::server::acl::{self, AclEntry, Role, check_acl};
-use crate::server::auth::extractor::AdminAuth;
-use crate::server::auth::session::{TokenResponse, create_authenticated_session, now_epoch};
+use crate::server::auth::extractor::{AdminAuth, AuthClaims, StepUpAuth};
+use crate::server::auth::session::{
+    TokenResponse, create_authenticated_session, elevate_session, now_epoch,
+};
 use crate::server::error::AppError;
 
 // ---------------------------------------------------------------------------
@@ -386,6 +388,140 @@ pub async fn login_finish<S: PasskeyState>(
     info!(did = %user.did, "passkey login successful");
 
     Ok(Json(token_resp))
+}
+
+// ---------------------------------------------------------------------------
+// Step-up: elevate an existing (aal1) session to aal2 via a WebAuthn
+// assertion. Both endpoints require an authenticated caller; the assertion
+// is scoped to — and must belong to — that caller's own DID.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct StepUpStartResponse {
+    pub auth_id: String,
+    pub options: RequestChallengeResponse,
+}
+
+/// POST /auth/step-up/passkey/start — issue a WebAuthn assertion challenge
+/// restricted to the authenticated DID's registered passkeys.
+pub async fn step_up_start<S: PasskeyState>(
+    auth: AuthClaims,
+    State(state): State<S>,
+) -> Result<Json<StepUpStartResponse>, AppError> {
+    let webauthn = require_webauthn(&state)?;
+    let sessions_ks = state.sessions_ks();
+
+    let user = store::get_passkey_user_by_did(sessions_ks, &auth.did)
+        .await?
+        .filter(|u| !u.credentials.is_empty())
+        .ok_or_else(|| {
+            warn!(did = %auth.did, "step-up start failed: no passkey enrolled for this DID");
+            AppError::Authentication(
+                "no passkey enrolled for this DID; enroll one before stepping up".into(),
+            )
+        })?;
+
+    let (rcr, auth_state) = webauthn
+        .start_passkey_authentication(&user.credentials)
+        .map_err(|e| AppError::Internal(format!("webauthn auth start failed: {e}")))?;
+
+    let auth_id = Uuid::new_v4().to_string();
+    store::store_auth_state(sessions_ks, &auth_id, &auth_state).await?;
+
+    info!(did = %auth.did, auth_id = %auth_id, "step-up challenge issued");
+    Ok(Json(StepUpStartResponse {
+        auth_id,
+        options: rcr,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StepUpFinishRequest {
+    pub auth_id: String,
+    pub credential: PublicKeyCredential,
+}
+
+/// POST /auth/step-up/passkey/finish — verify the assertion and elevate the
+/// caller's current session to `aal2` (`amr` += `webauthn`). Rejects if the
+/// presented passkey belongs to a DID other than the authenticated one.
+pub async fn step_up_finish<S: PasskeyState>(
+    auth: AuthClaims,
+    State(state): State<S>,
+    Json(req): Json<StepUpFinishRequest>,
+) -> Result<Json<TokenResponse>, AppError> {
+    let webauthn = require_webauthn(&state)?;
+    let jwt_keys = require_jwt_keys(&state)?;
+    let sessions_ks = state.sessions_ks();
+    let acl_ks = state.acl_ks();
+
+    let auth_state = store::take_auth_state(sessions_ks, &req.auth_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("auth state not found or expired".into()))?;
+
+    let auth_result = webauthn
+        .finish_passkey_authentication(&req.credential, &auth_state)
+        .map_err(|e| {
+            warn!(auth_id = %req.auth_id, error = %e, "step-up ceremony failed");
+            AppError::Authentication(format!("passkey authentication failed: {e}"))
+        })?;
+
+    // The presented credential must belong to the authenticated DID — a
+    // passkey for some other DID must not elevate this session.
+    let cred_id_hex = hex::encode(auth_result.cred_id());
+    let mut user = store::get_passkey_user_by_cred(sessions_ks, &cred_id_hex)
+        .await?
+        .ok_or_else(|| AppError::Authentication("credential not registered".into()))?;
+    if user.did != auth.did {
+        warn!(authed = %auth.did, cred_did = %user.did, "step-up rejected: passkey belongs to a different DID");
+        return Err(AppError::Forbidden(
+            "passkey does not belong to the authenticated DID".into(),
+        ));
+    }
+
+    // Counter update (replay protection).
+    for cred in &mut user.credentials {
+        cred.update_credential(&auth_result);
+    }
+    store::store_passkey_user(sessions_ks, &user).await?;
+
+    // ACL still gates — elevation doesn't bypass it.
+    let role = check_acl(acl_ks, &auth.did).await?;
+
+    let token_resp = elevate_session(
+        sessions_ks,
+        jwt_keys,
+        &auth.session_id,
+        &role,
+        vec!["did".to_string(), "webauthn".to_string()],
+        "aal2",
+        state.access_token_expiry(),
+        state.refresh_token_expiry(),
+    )
+    .await?;
+
+    info!(did = %auth.did, "step-up complete: session elevated to aal2");
+    Ok(Json(token_resp))
+}
+
+#[derive(Debug, Serialize)]
+pub struct StepUpCheckResponse {
+    pub ok: bool,
+    pub did: String,
+    pub acr: String,
+    pub amr: Vec<String>,
+}
+
+/// GET /auth/step-up/check — a demo "sensitive operation" gated by
+/// [`StepUpAuth`]. A base (`aal1`) session is rejected with
+/// `step_up_required` (403); an elevated (`aal2`) session gets `200` with
+/// its assurance echoed back. Exists so the demo has something to gate.
+pub async fn step_up_check(StepUpAuth(claims): StepUpAuth) -> Json<StepUpCheckResponse> {
+    Json(StepUpCheckResponse {
+        ok: true,
+        did: claims.did,
+        acr: claims.acr,
+        amr: claims.amr,
+    })
 }
 
 // ---------------------------------------------------------------------------

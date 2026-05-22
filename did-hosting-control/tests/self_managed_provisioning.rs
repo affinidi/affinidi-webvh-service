@@ -118,6 +118,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         did: tenant_did.clone(),
         role: Role::Owner,
         session_pubkey_b58btc: None,
+        session_id: String::new(),
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
     };
 
     // 5. Phase 1 — tenant requests a DID slot (analog to MSG_DID_REQUEST).

@@ -52,6 +52,25 @@ pub static TASK_AUTH_AUTHENTICATE_RESPONSE_1_0: LazyLock<TrustTask> = LazyLock::
         .expect("static")
 });
 
+/// `did-hosting/auth/step-up-passkey-start/1.0` — request a WebAuthn
+/// assertion challenge to elevate the current session to aal2.
+pub static TASK_AUTH_STEP_UP_PASSKEY_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-passkey-start/1.0")
+        .expect("static")
+});
+
+/// `did-hosting/auth/step-up-passkey-finish/1.0` — submit the assertion and
+/// elevate the session to aal2.
+pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-passkey-finish/1.0")
+        .expect("static")
+});
+
+/// `did-hosting/auth/step-up-check/1.0` — demo sensitive op gated on aal2.
+pub static TASK_AUTH_STEP_UP_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-check/1.0").expect("static")
+});
+
 // -- DID provisioning lifecycle --------------------------------------------
 
 pub static TASK_DID_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {

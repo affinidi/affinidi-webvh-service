@@ -146,6 +146,23 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(passkey::login_finish::<AppState>),
             (*TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0).clone(),
         )
+        // Step-up: elevate the current session to aal2 via a WebAuthn assertion.
+        .route_with_task_permissive(
+            "/auth/step-up/passkey/start",
+            post(passkey::step_up_start::<AppState>),
+            (*TASK_AUTH_STEP_UP_PASSKEY_START_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/auth/step-up/passkey/finish",
+            post(passkey::step_up_finish::<AppState>),
+            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0).clone(),
+        )
+        // Demo sensitive op gated on aal2 (proves the StepUpAuth gate).
+        .route_with_task_permissive(
+            "/auth/step-up/check",
+            get(passkey::step_up_check),
+            (*TASK_AUTH_STEP_UP_CHECK_1_0).clone(),
+        )
         .route_with_task_permissive(
             "/auth/passkey/invite",
             post(passkey::create_invite::<AppState>),

@@ -361,3 +361,56 @@ pub async fn create_authenticated_session(
         refresh_expires_at,
     })
 }
+
+/// Elevate an existing authenticated session to a higher assurance level,
+/// minting a fresh token with the given `amr`/`acr` and rotating the
+/// session's `token_id` so the prior (lower-`acr`) access token is
+/// invalidated. The `session_id` is preserved — this upgrades the session
+/// in place rather than creating a new one. Used by step-up.
+#[allow(clippy::too_many_arguments)]
+pub async fn elevate_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    session_id: &str,
+    role: &Role,
+    amr: Vec<String>,
+    acr: &str,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<TokenResponse, AppError> {
+    let mut session = get_session(sessions, session_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+    if session.state != SessionState::Authenticated {
+        return Err(AppError::Authentication("session not authenticated".into()));
+    }
+
+    let mut claims = JwtKeys::new_claims(
+        session.did.clone(),
+        session_id.to_string(),
+        role.to_string(),
+        access_expiry,
+    );
+    claims.amr = amr;
+    claims.acr = acr.to_string();
+    let access_expires_at = claims.exp;
+    let token_id = claims.jti.clone();
+    let access_token = jwt_keys.encode(&claims)?;
+
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+
+    session.token_id = Some(token_id);
+    session.refresh_token = Some(refresh_token.clone());
+    session.refresh_expires_at = Some(refresh_expires_at);
+    store_session(sessions, &session).await?;
+    store_refresh_index(sessions, &refresh_token, session_id).await?;
+
+    Ok(TokenResponse {
+        session_id: session_id.to_string(),
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+    })
+}

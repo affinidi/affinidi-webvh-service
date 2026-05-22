@@ -207,6 +207,8 @@ mod tests {
             exp: now - 3600,
             iat: now - 7200,
             jti: "j".into(),
+            amr: vec!["did".into()],
+            acr: "aal1".into(),
         };
         let token = keys.encode(&claims).unwrap();
         let err = keys.decode(&token).unwrap_err();
@@ -228,6 +230,8 @@ mod tests {
             exp: now + 60,
             iat: now,
             jti: "j".into(),
+            amr: vec!["did".into()],
+            acr: "aal1".into(),
         };
         let token = keys.encode(&claims).unwrap();
         assert!(keys.decode(&token).is_err());

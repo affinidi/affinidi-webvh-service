@@ -32,6 +32,10 @@ pub trait AuthState: Clone + Send + Sync + 'static {
 pub struct AuthClaims {
     pub did: String,
     pub role: Role,
+    /// The session this token belongs to. Used by step-up to elevate the
+    /// same session in place. Empty for transports without a session
+    /// record (e.g. per-message DIDComm auth).
+    pub session_id: String,
     /// Ephemeral session pubkey if one was registered during login —
     /// Ed25519 multikey, base58btc-encoded with the `z` prefix.
     /// `dispatch_trust_task` uses this to verify a Data Integrity proof's
@@ -106,6 +110,7 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         Ok(AuthClaims {
             did: claims.sub,
             role,
+            session_id: claims.session_id,
             session_pubkey_b58btc: session.session_pubkey_b58btc,
             amr: claims.amr,
             acr: claims.acr,

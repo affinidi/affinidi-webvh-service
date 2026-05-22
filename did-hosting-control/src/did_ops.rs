@@ -1046,6 +1046,9 @@ mod tests_atomic {
             did: did.to_string(),
             role: Role::Owner,
             session_pubkey_b58btc: None,
+            session_id: String::new(),
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
         }
     }
 
@@ -1054,6 +1057,9 @@ mod tests_atomic {
             did: did.to_string(),
             role: Role::Admin,
             session_pubkey_b58btc: None,
+            session_id: String::new(),
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
         }
     }
 
