@@ -265,6 +265,8 @@ mod tests {
             refresh_expires_at: None,
             token_id: Some(jti.to_string()),
             session_pubkey_b58btc: None,
+            amr: Vec::new(),
+            acr: String::new(),
         };
         store_session(&state.ks, &session).await.unwrap();
         session_id
@@ -346,6 +348,8 @@ mod tests {
             refresh_expires_at: None,
             token_id: Some("tok".into()),
             session_pubkey_b58btc: None,
+            amr: Vec::new(),
+            acr: String::new(),
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue(&state, &session_id, "owner", "tok");

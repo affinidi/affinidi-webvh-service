@@ -74,6 +74,9 @@ pub async fn challenge(
         refresh_expires_at: None,
         token_id: None,
         session_pubkey_b58btc: None,
+        // AAL is unknown at challenge time; populated on authenticate.
+        amr: Vec::new(),
+        acr: String::new(),
     };
 
     store_session(&state.sessions_ks, &session).await?;
@@ -265,6 +268,15 @@ pub async fn refresh(
         return Err(AppError::Authentication("refresh token expired".into()));
     }
 
+    // Preserve the pre-rotation AAL so a step-upped session stays at
+    // aal2 across refresh. Empty amr on legacy rows falls back to
+    // create_authenticated_session's default ["did"]/"aal1".
+    let preserved_amr_acr = if session.amr.is_empty() {
+        None
+    } else {
+        Some((session.amr.clone(), session.acr.clone()))
+    };
+
     // Refresh rotates everything: a brand-new session id, access token, and
     // refresh token. The old session is deleted atomically so a leaked
     // refresh token cannot be reused.
@@ -281,6 +293,7 @@ pub async fn refresh(
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
         None,
+        preserved_amr_acr,
     )
     .await?;
 

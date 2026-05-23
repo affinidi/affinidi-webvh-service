@@ -152,6 +152,8 @@ async fn run_authenticate(
                 .as_ref()
                 .ok_or_else(|| DIDCommServiceError::Internal("JWT keys not configured".into()))?;
 
+            // Mediator auth is the DIDComm-authenticate path: single
+            // DID-key factor → aal1.
             match create_authenticated_session(
                 &state.sessions_ks,
                 jwt_keys,
@@ -159,6 +161,7 @@ async fn run_authenticate(
                 &role,
                 state.config.auth.access_token_expiry,
                 state.config.auth.refresh_token_expiry,
+                None,
                 None,
             )
             .await

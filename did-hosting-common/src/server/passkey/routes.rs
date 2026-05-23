@@ -241,6 +241,8 @@ pub async fn enroll_finish<S: PasskeyState>(
     // Enrollment doesn't supply a session pubkey today — the UI
     // sends it on subsequent /login/finish calls (so each enrolled
     // device gets a fresh ephemeral key per session). Pass `None`.
+    // Passkey enrollment-as-login mints at aal2 (the WebAuthn
+    // assertion IS the second factor).
     let token_resp = create_authenticated_session(
         sessions_ks,
         jwt_keys,
@@ -249,6 +251,7 @@ pub async fn enroll_finish<S: PasskeyState>(
         state.access_token_expiry(),
         state.refresh_token_expiry(),
         None,
+        Some((vec!["passkey".to_string()], "aal2".to_string())),
     )
     .await?;
 
@@ -373,7 +376,9 @@ pub async fn login_finish<S: PasskeyState>(
         None => None,
     };
 
-    // Issue session
+    // Issue session at aal2 (WebAuthn assertion is the second
+    // factor). Session row + JWT both carry amr=["passkey"], acr=
+    // "aal2"; refresh preserves the level across token rotation.
     let token_resp = create_authenticated_session(
         sessions_ks,
         jwt_keys,
@@ -382,6 +387,7 @@ pub async fn login_finish<S: PasskeyState>(
         state.access_token_expiry(),
         state.refresh_token_expiry(),
         session_pubkey,
+        Some((vec!["passkey".to_string()], "aal2".to_string())),
     )
     .await?;
 

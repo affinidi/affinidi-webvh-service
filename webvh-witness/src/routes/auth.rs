@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use did_hosting_common::server::auth::constant_time_eq;
 use tracing::warn;
@@ -18,30 +18,11 @@ pub struct ChallengeRequest {
     pub did: String,
 }
 
-#[derive(Serialize)]
-pub struct ChallengeResponse {
-    pub session_id: String,
-    pub data: ChallengeData,
-}
-
-#[derive(Serialize)]
-pub struct ChallengeData {
-    pub challenge: String,
-}
-
-#[derive(Serialize)]
-pub struct AuthenticateResponse {
-    pub session_id: String,
-    pub data: AuthenticateData,
-}
-
-#[derive(Serialize)]
-pub struct AuthenticateData {
-    pub access_token: String,
-    pub access_expires_at: u64,
-    pub refresh_token: String,
-    pub refresh_expires_at: u64,
-}
+// Wire types reuse did-hosting-common's canonical shapes
+// (spec/auth/challenge/0.1#response, spec/auth/authenticate/0.1#response)
+// so the witness exposes the same wire contract as the main
+// did-hosting daemon.
+pub use did_hosting_common::{AuthenticateResponse, ChallengeResponse};
 
 pub async fn challenge(
     State(state): State<AppState>,
@@ -65,13 +46,20 @@ pub async fn challenge(
         refresh_expires_at: None,
         token_id: None,
         session_pubkey_b58btc: None,
+        amr: Vec::new(),
+        acr: String::new(),
     };
 
     store_session(&state.sessions_ks, &session).await?;
 
+    // Canonical wire: { challenge, sessionId, expiresAt }.
+    let expires_at_epoch = session
+        .created_at
+        .saturating_add(state.config.auth.challenge_ttl);
     Ok(Json(ChallengeResponse {
+        challenge,
         session_id,
-        data: ChallengeData { challenge },
+        expires_at: did_hosting_common::epoch_to_rfc3339(expires_at_epoch),
     }))
 }
 
@@ -178,15 +166,7 @@ pub async fn authenticate(
     )
     .await?;
 
-    Ok(Json(AuthenticateResponse {
-        session_id: token_response.session_id,
-        data: AuthenticateData {
-            access_token: token_response.access_token,
-            access_expires_at: token_response.access_expires_at,
-            refresh_token: token_response.refresh_token,
-            refresh_expires_at: token_response.refresh_expires_at,
-        },
-    }))
+    Ok(Json(token_response.into_canonical()))
 }
 
 pub async fn refresh(
@@ -256,6 +236,15 @@ pub async fn refresh(
     // Re-check ACL
     let role = check_acl(&state.acl_ks, &session.did).await?;
 
+    // Preserve the pre-rotation AAL so a step-upped session stays at
+    // its existing level across refresh. Empty amr on legacy rows
+    // falls back to ["did"]/"aal1".
+    let preserved_amr_acr = if session.amr.is_empty() {
+        None
+    } else {
+        Some((session.amr.clone(), session.acr.clone()))
+    };
+
     // Invalidate the old session to prevent refresh token reuse
     delete_session(&state.sessions_ks, &session.session_id).await?;
 
@@ -267,16 +256,10 @@ pub async fn refresh(
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
         None,
+        preserved_amr_acr,
     )
     .await?;
 
-    Ok(Json(serde_json::json!({
-        "session_id": token_response.session_id,
-        "data": {
-            "access_token": token_response.access_token,
-            "access_expires_at": token_response.access_expires_at,
-            "refresh_token": token_response.refresh_token,
-            "refresh_expires_at": token_response.refresh_expires_at,
-        }
-    })))
+    // Canonical { session, tokens } shape via the helper on TokenResponse.
+    Ok(Json(serde_json::to_value(token_response.into_canonical())?))
 }

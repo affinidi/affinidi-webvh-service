@@ -42,6 +42,20 @@ pub struct Session {
     /// per the framework's IS_PROOF_REQUIRED gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_pubkey_b58btc: Option<String>,
+    /// AAL claims persisted across token rotation. Mirrors the JWT's
+    /// `amr` / `acr` so refresh re-mints at the same authentication
+    /// level — a session that was step-upped to aal2 stays at aal2
+    /// across the 15-minute access-token rotation rather than
+    /// silently dropping back to aal1.
+    ///
+    /// `#[serde(default)]` on both: a session row written before
+    /// these fields landed deserialises with empty vector / empty
+    /// string, which the refresh handler treats as "unknown AAL —
+    /// fall back to aal1". Same behaviour as pre-migration.
+    #[serde(default)]
+    pub amr: Vec<String>,
+    #[serde(default)]
+    pub acr: String,
 }
 
 // Manual `Debug` redacts the secret fields (challenge, refresh_token, token_id)
@@ -284,6 +298,11 @@ impl TokenResponse {
 }
 
 /// Generate access + refresh tokens for an authenticated session.
+///
+/// `amr_acr_override` lets refresh paths preserve an elevated session's
+/// AAL — pass `Some((["did","passkey"], "aal2"))` to mint a token at
+/// the post-step-up level. `None` falls back to the Claims-struct
+/// defaults (`["did"]`/`"aal1"`), correct for first-time authenticate.
 fn generate_tokens(
     jwt_keys: &JwtKeys,
     did: &str,
@@ -291,13 +310,18 @@ fn generate_tokens(
     role: &Role,
     access_expiry: u64,
     refresh_expiry: u64,
+    amr_acr_override: Option<(Vec<String>, String)>,
 ) -> Result<(String, u64, String, u64, String), AppError> {
-    let claims = JwtKeys::new_claims(
+    let mut claims = JwtKeys::new_claims(
         did.to_string(),
         session_id.to_string(),
         role.to_string(),
         access_expiry,
     );
+    if let Some((amr, acr)) = amr_acr_override {
+        claims.amr = amr;
+        claims.acr = acr;
+    }
     let access_expires_at = claims.exp;
     let token_id = claims.jti.clone();
     let access_token = jwt_keys.encode(&claims)?;
@@ -331,12 +355,18 @@ pub async fn finalize_challenge_session(
             role,
             access_expiry,
             refresh_expiry,
+            None,
         )?;
 
+    // Persist AAL on the session row so refresh re-mints at the same
+    // level (challenge-response is aal1; passkey / VTA step-up
+    // elevates via `elevate_session` which records the higher value).
     session.state = SessionState::Authenticated;
     session.refresh_token = Some(refresh_token.clone());
     session.refresh_expires_at = Some(refresh_expires_at);
     session.token_id = Some(token_id);
+    session.amr = vec!["did".to_string()];
+    session.acr = "aal1".to_string();
     store_session(sessions, session).await?;
 
     store_refresh_index(sessions, &refresh_token, &session.session_id).await?;
@@ -364,6 +394,13 @@ pub async fn finalize_challenge_session(
 /// proofs on REQUIRED-spec trust-task requests. `None` for backend
 /// callers that sign with their own DID's verification methods, or
 /// when the Web UI hasn't enabled in-band signing yet.
+///
+/// `amr_acr_override` lets the refresh handler preserve an elevated
+/// session's AAL across the rotation. Initial authenticate paths
+/// pass `None` and get the defaults (`["did"]`/`"aal1"`); refresh
+/// reads the pre-rotation session's amr/acr and passes
+/// `Some((..., ...))` so the new session row + JWT carry the same
+/// values.
 pub async fn create_authenticated_session(
     sessions: &KeyspaceHandle,
     jwt_keys: &JwtKeys,
@@ -372,6 +409,7 @@ pub async fn create_authenticated_session(
     access_expiry: u64,
     refresh_expiry: u64,
     session_pubkey_b58btc: Option<String>,
+    amr_acr_override: Option<(Vec<String>, String)>,
 ) -> Result<TokenResponse, AppError> {
     let session_id = Uuid::new_v4().to_string();
 
@@ -383,8 +421,11 @@ pub async fn create_authenticated_session(
             role,
             access_expiry,
             refresh_expiry,
+            amr_acr_override.clone(),
         )?;
 
+    let (amr, acr) =
+        amr_acr_override.unwrap_or_else(|| (vec!["did".to_string()], "aal1".to_string()));
     let session = Session {
         session_id: session_id.clone(),
         did: did.to_string(),
@@ -395,6 +436,8 @@ pub async fn create_authenticated_session(
         refresh_expires_at: Some(refresh_expires_at),
         token_id: Some(token_id),
         session_pubkey_b58btc,
+        amr: amr.clone(),
+        acr: acr.clone(),
     };
 
     store_session(sessions, &session).await?;
@@ -408,13 +451,8 @@ pub async fn create_authenticated_session(
         refresh_token,
         refresh_expires_at,
         issued_at: now_epoch(),
-        // create_authenticated_session is the shared SIOPv2/passkey
-        // entry; SIOPv2 callers pass session_pubkey_b58btc=None and
-        // get the DID-only factor. Passkey callers pass a key and get
-        // the same AAL — the WebAuthn factor is recorded by the
-        // passkey-finish route handler upgrading the claim.
-        amr: vec!["did".to_string()],
-        acr: "aal1".to_string(),
+        amr,
+        acr,
     })
 }
 
@@ -456,9 +494,14 @@ pub async fn elevate_session(
     let refresh_token = Uuid::new_v4().to_string();
     let refresh_expires_at = now_epoch() + refresh_expiry;
 
+    // Persist the elevated AAL on the session row so subsequent
+    // refreshes preserve aal2 (instead of silently dropping back to
+    // the pre-step-up aal1).
     session.token_id = Some(token_id);
     session.refresh_token = Some(refresh_token.clone());
     session.refresh_expires_at = Some(refresh_expires_at);
+    session.amr = amr.clone();
+    session.acr = acr.to_string();
     store_session(sessions, &session).await?;
     store_refresh_index(sessions, &refresh_token, session_id).await?;
 
