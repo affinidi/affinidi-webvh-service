@@ -105,22 +105,21 @@ export default function Login() {
           <View style={styles.dividerLine} />
         </View>
 
-        {walletAvailable ? (
-          <>
-            <Pressable
-              style={[styles.secondaryButton, walletLoading && styles.disabled]}
-              onPress={handleWalletLogin}
-              disabled={walletLoading}
-            >
-              <Text style={styles.secondaryButtonText}>
-                {walletLoading ? "Authenticating…" : "Login with VTI Wallet"}
-              </Text>
-            </Pressable>
-            {walletError && (
-              <Text style={styles.errorText}>{walletError}</Text>
-            )}
-          </>
-        ) : (
+        {walletAvailable && (
+          <Pressable
+            style={walletLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
+            onPress={handleWalletLogin}
+            disabled={walletLoading}
+          >
+            <Text style={styles.secondaryButtonText}>
+              {walletLoading ? "Authenticating…" : "Login with VTI Wallet"}
+            </Text>
+          </Pressable>
+        )}
+        {walletAvailable && walletError && (
+          <Text style={styles.errorText}>{walletError}</Text>
+        )}
+        {!walletAvailable && (
           <Text style={styles.cliHint}>
             Install the VTI Wallet browser extension to sign in with your did:peer
             identity (no passkey required).
