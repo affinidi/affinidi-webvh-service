@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use did_hosting_client::auth::HostingSigningIdentityOwned;
 use did_hosting_client::trust_tasks::{
-    TASK_AUTH_AUTHENTICATE_1_0, TASK_AUTH_CHALLENGE_1_0, TASK_AUTH_REFRESH_1_0,
+    TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_CHALLENGE_0_1, TASK_AUTH_REFRESH_0_1,
     TASK_DID_PUBLISH_1_0,
 };
 use did_hosting_client::{
@@ -62,7 +62,7 @@ async fn challenge_happy_path() {
     let server = mock_server().await;
     Mock::given(method("POST"))
         .and(path("/api/auth/challenge"))
-        .and(header("trust-task", TASK_AUTH_CHALLENGE_1_0))
+        .and(header("trust-task", TASK_AUTH_CHALLENGE_0_1))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "sessionId": "sess-42",
             "data": { "challenge": "deadbeef" },
@@ -83,7 +83,7 @@ async fn authenticate_happy_path_parses_token_data() {
     let server = mock_server().await;
     Mock::given(method("POST"))
         .and(path("/api/auth/"))
-        .and(header("trust-task", TASK_AUTH_AUTHENTICATE_1_0))
+        .and(header("trust-task", TASK_AUTH_AUTHENTICATE_0_1))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "sessionId": "sess-42",
             "data": {
@@ -123,7 +123,7 @@ async fn refresh_happy_path() {
     let server = mock_server().await;
     Mock::given(method("POST"))
         .and(path("/api/auth/refresh"))
-        .and(header("trust-task", TASK_AUTH_REFRESH_1_0))
+        .and(header("trust-task", TASK_AUTH_REFRESH_0_1))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "sessionId": "sess-42",
             "data": {

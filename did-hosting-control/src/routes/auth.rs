@@ -152,7 +152,7 @@ pub async fn authenticate(
     // Envelope `type` must canonicalise to the authenticate task. Accepts
     // both the canonical `did-hosting/auth/authenticate/1.0` URL and its
     // legacy `affinidi.com/webvh/1.0/authenticate` alias.
-    let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_1_0.as_str();
+    let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_0_1.as_str();
     if v1_aliases::canonicalize(&envelope.type_uri) != Some(expected_type) {
         return Ok(trust_task_malformed(&format!(
             "unexpected Trust-Task type: expected {expected_type}, got {}",

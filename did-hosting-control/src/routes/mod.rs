@@ -115,17 +115,17 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/auth/challenge",
             post(auth::challenge),
-            (*TASK_AUTH_CHALLENGE_1_0).clone(),
+            (*TASK_AUTH_CHALLENGE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/",
             post(auth::authenticate),
-            (*TASK_AUTH_AUTHENTICATE_1_0).clone(),
+            (*TASK_AUTH_AUTHENTICATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/refresh",
             post(auth::refresh),
-            (*TASK_AUTH_REFRESH_1_0).clone(),
+            (*TASK_AUTH_REFRESH_0_1).clone(),
         )
         // RP-initiated wallet confirmation (admin-only). Sends a
         // `confirm/1.0` DIDComm message to a holder DID and waits for the
@@ -133,50 +133,50 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/confirm/request",
             post(confirm::request),
-            (*TASK_CONFIRM_REQUEST_1_0).clone(),
+            (*TASK_CONFIRM_REQUEST_0_1).clone(),
         )
         // Passkey (WebAuthn)
         .route_with_task_permissive(
             "/auth/passkey/enroll/start",
             post(passkey::enroll_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_START_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_ENROLL_START_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/passkey/enroll/finish",
             post(passkey::enroll_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/passkey/login/start",
             post(passkey::login_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_START_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_LOGIN_START_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/passkey/login/finish",
             post(passkey::login_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1).clone(),
         )
         // Step-up: elevate the current session to aal2 via a WebAuthn assertion.
         .route_with_task_permissive(
             "/auth/step-up/passkey/start",
             post(passkey::step_up_start::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_START_1_0).clone(),
+            (*TASK_AUTH_STEP_UP_PASSKEY_START_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/step-up/passkey/finish",
             post(passkey::step_up_finish::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0).clone(),
+            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1).clone(),
         )
         // Step-up via VTA approval (wallet-driven, works cross-origin).
         .route_with_task_permissive(
             "/auth/step-up/vta/start",
             post(auth::step_up_vta_start),
-            (*TASK_AUTH_STEP_UP_VTA_START_1_0).clone(),
+            (*TASK_AUTH_STEP_UP_VTA_START_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/step-up/vta/finish",
             post(auth::step_up_vta_finish),
-            (*TASK_AUTH_STEP_UP_VTA_FINISH_1_0).clone(),
+            (*TASK_AUTH_STEP_UP_VTA_FINISH_0_1).clone(),
         )
         // Demo sensitive op gated on aal2 (proves the StepUpAuth gate).
         .route_with_task_permissive(
@@ -187,17 +187,17 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/auth/passkey/invite",
             post(passkey::create_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/passkey/invites",
             get(passkey::list_invites::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/passkey/invite/{token}",
             put(passkey::update_invite::<AppState>).delete(passkey::revoke_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_1_0).clone(),
+            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )
         // ACL
         .route_with_task_permissive(

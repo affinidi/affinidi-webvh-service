@@ -22,7 +22,7 @@
 //! that drift on every workspace build.
 
 use crate::did_hosting_tasks::{
-    TASK_AUTH_AUTHENTICATE_1_0, TASK_AUTH_AUTHENTICATE_RESPONSE_1_0, TASK_DID_CHANGE_OWNER_1_0,
+    TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_AUTHENTICATE_RESPONSE_0_1, TASK_DID_CHANGE_OWNER_1_0,
     TASK_DID_CHANGE_OWNER_CONFIRM_1_0, TASK_DID_CONFIRM_1_0, TASK_DID_DELETE_1_0,
     TASK_DID_DELETE_CONFIRM_1_0, TASK_DID_INFO_1_0, TASK_DID_INFO_REQUEST_1_0, TASK_DID_LIST_1_0,
     TASK_DID_LIST_REQUEST_1_0, TASK_DID_OFFER_1_0, TASK_DID_PROBLEM_REPORT_1_0,
@@ -51,10 +51,10 @@ use crate::didcomm_types::{
 fn alias_pairs() -> [(&'static str, &'static str); 32] {
     [
         // Auth
-        (MSG_AUTHENTICATE, TASK_AUTH_AUTHENTICATE_1_0.as_str()),
+        (MSG_AUTHENTICATE, TASK_AUTH_AUTHENTICATE_0_1.as_str()),
         (
             MSG_AUTH_RESPONSE,
-            TASK_AUTH_AUTHENTICATE_RESPONSE_1_0.as_str(),
+            TASK_AUTH_AUTHENTICATE_RESPONSE_0_1.as_str(),
         ),
         // DID lifecycle
         (MSG_DID_REQUEST, TASK_DID_REQUEST_1_0.as_str()),

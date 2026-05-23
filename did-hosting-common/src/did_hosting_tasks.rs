@@ -44,7 +44,7 @@ use crate::server::trust_task::TrustTask;
 /// `spec/auth/authenticate/0.1` — canonical cross-cutting authenticate.
 /// (Was did-hosting/auth/authenticate/1.0; migrated to the framework
 /// spec so VTA + VTC + did-hosting share one client surface.)
-pub static TASK_AUTH_AUTHENTICATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_AUTHENTICATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/authenticate/0.1").expect("static")
 });
 
@@ -53,7 +53,7 @@ pub static TASK_AUTH_AUTHENTICATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 /// `<type>#response` rather than a paired response-type URI; the
 /// constant is retained for code that still references the dedicated
 /// response identifier.
-pub static TASK_AUTH_AUTHENTICATE_RESPONSE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_AUTHENTICATE_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/authenticate/0.1#response").expect("static")
 });
 
@@ -61,14 +61,14 @@ pub static TASK_AUTH_AUTHENTICATE_RESPONSE_1_0: LazyLock<TrustTask> = LazyLock::
 /// WebAuthn assertion to elevate the current session to aal2. Same
 /// canonical spec as initial passkey login; handler dispatches on
 /// `payload.purpose == "step-up"`.
-pub static TASK_AUTH_STEP_UP_PASSKEY_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_STEP_UP_PASSKEY_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
 });
 
 /// `spec/auth/passkey/login/finish/0.1` (step-up purpose) — submit
 /// the assertion; the consumer elevates the existing session rather
 /// than minting a new one.
-pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
 });
 
@@ -84,13 +84,13 @@ pub static TASK_AUTH_STEP_UP_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 /// `spec/auth/step-up/approve-request/0.1` — RP asks the holder's
 /// VTA/wallet to ratify an AAL elevation. Sent FROM did-hosting TO
 /// the holder's VTA over DIDComm.
-pub static TASK_AUTH_STEP_UP_VTA_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_STEP_UP_VTA_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-request/0.1").expect("static")
 });
 
 /// `spec/auth/step-up/approve-response/0.1` — VTA/wallet returns the
 /// signed approval; the proof IS the cryptographic step-up gate.
-pub static TASK_AUTH_STEP_UP_VTA_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_STEP_UP_VTA_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-response/0.1").expect("static")
 });
 
@@ -98,7 +98,7 @@ pub static TASK_AUTH_STEP_UP_VTA_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new
 /// loop. did-hosting uses it for the "park a REST call, await a
 /// holder's DIDComm approve" pattern that backs admin-initiated
 /// sensitive operations.
-pub static TASK_CONFIRM_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_CONFIRM_REQUEST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/confirm/request/0.1").expect("static")
 });
 
@@ -243,25 +243,25 @@ pub static TASK_ME_DOMAINS_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 // canonical task identifier.
 
 // Auth — canonical cross-cutting specs from trusttasks-tf.
-pub static TASK_AUTH_CHALLENGE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_CHALLENGE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/challenge/0.1").expect("static")
 });
-pub static TASK_AUTH_REFRESH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_REFRESH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/refresh/0.1").expect("static")
 });
-pub static TASK_AUTH_PASSKEY_ENROLL_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_PASSKEY_ENROLL_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/start/0.1").expect("static")
 });
-pub static TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/finish/0.1").expect("static")
 });
-pub static TASK_AUTH_PASSKEY_LOGIN_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_PASSKEY_LOGIN_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
 });
-pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
 });
-pub static TASK_AUTH_PASSKEY_INVITE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+pub static TASK_AUTH_PASSKEY_INVITE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/invite/0.1").expect("static")
 });
 
@@ -386,9 +386,9 @@ mod tests {
         // this list is the kind of drift the cross-crate invariant
         // test (T9) will catch; for now this list is the local proof.
         let all: &[&LazyLock<TrustTask>] = &[
-            &TASK_AUTH_AUTHENTICATE_1_0,
-            &TASK_AUTH_AUTHENTICATE_RESPONSE_1_0,
-            &TASK_CONFIRM_REQUEST_1_0,
+            &TASK_AUTH_AUTHENTICATE_0_1,
+            &TASK_AUTH_AUTHENTICATE_RESPONSE_0_1,
+            &TASK_CONFIRM_REQUEST_0_1,
             &TASK_DID_REQUEST_1_0,
             &TASK_DID_OFFER_1_0,
             &TASK_DID_PUBLISH_1_0,
@@ -426,13 +426,13 @@ mod tests {
             &TASK_WEBVH_SYNC_DELETE_1_0,
             &TASK_WEBVH_SYNC_DELETE_ACK_1_0,
             // T8b: REST-specific.
-            &TASK_AUTH_CHALLENGE_1_0,
-            &TASK_AUTH_REFRESH_1_0,
-            &TASK_AUTH_PASSKEY_ENROLL_START_1_0,
-            &TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0,
-            &TASK_AUTH_PASSKEY_LOGIN_START_1_0,
-            &TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0,
-            &TASK_AUTH_PASSKEY_INVITE_1_0,
+            &TASK_AUTH_CHALLENGE_0_1,
+            &TASK_AUTH_REFRESH_0_1,
+            &TASK_AUTH_PASSKEY_ENROLL_START_0_1,
+            &TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1,
+            &TASK_AUTH_PASSKEY_LOGIN_START_0_1,
+            &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1,
+            &TASK_AUTH_PASSKEY_INVITE_0_1,
             &TASK_ACL_LIST_1_0,
             &TASK_ACL_CREATE_1_0,
             &TASK_ACL_UPDATE_1_0,
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn every_url_ends_in_a_maj_min_version() {
         let all: &[&LazyLock<TrustTask>] = &[
-            &TASK_AUTH_AUTHENTICATE_1_0,
+            &TASK_AUTH_AUTHENTICATE_0_1,
             &TASK_DID_REQUEST_1_0,
             &TASK_DOMAIN_LIST_1_0,
             &TASK_WEBVH_SYNC_UPDATE_1_0,

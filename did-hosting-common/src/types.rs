@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 // Auth types
 // ---------------------------------------------------------------------------
 
+/// Wire shape for `POST /api/auth/challenge`. Conforms to
+/// `spec/auth/challenge/0.1`: the `did` field serialises as `subject`
+/// per the canonical payload schema. The Rust identifier stays `did`
+/// for consistency with the rest of the codebase. `alias = "did"`
+/// keeps clients that still send the legacy name working through one
+/// upgrade cycle.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChallengeRequest {
+    #[serde(rename = "subject", alias = "did")]
     pub did: String,
 }
 

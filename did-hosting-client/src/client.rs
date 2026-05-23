@@ -20,7 +20,7 @@ use crate::error::ClientError;
 use crate::token_store::{SharedTokenStore, TokenData};
 use crate::transport::enforce_transport_security;
 use crate::trust_tasks::{
-    TASK_AUTH_AUTHENTICATE_1_0, TASK_AUTH_CHALLENGE_1_0, TASK_AUTH_REFRESH_1_0,
+    TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_CHALLENGE_0_1, TASK_AUTH_REFRESH_0_1,
 };
 
 /// HTTP header name used for Trust-Task routing on every authed
@@ -113,7 +113,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(TASK_AUTH_CHALLENGE_1_0)?)
+            .headers(self.trust_task_headers(TASK_AUTH_CHALLENGE_0_1)?)
             .json(&Body { did: holder_did })
             .send()
             .await
@@ -158,7 +158,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(TASK_AUTH_AUTHENTICATE_1_0)?)
+            .headers(self.trust_task_headers(TASK_AUTH_AUTHENTICATE_0_1)?)
             .header("content-type", "application/json")
             .body(body)
             .send()
@@ -185,7 +185,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(TASK_AUTH_REFRESH_1_0)?)
+            .headers(self.trust_task_headers(TASK_AUTH_REFRESH_0_1)?)
             .header("content-type", "application/didcomm-signed+json")
             .body(body)
             .send()
@@ -641,11 +641,11 @@ mod tests {
     fn trust_task_header_carries_canonical_url() {
         let c = Client::new("https://example.com", "did:example:srv", tokens()).unwrap();
         let h = c
-            .trust_task_headers(TASK_AUTH_CHALLENGE_1_0)
+            .trust_task_headers(TASK_AUTH_CHALLENGE_0_1)
             .expect("static URL must be valid");
         assert_eq!(
             h.get(TRUST_TASK_HEADER).and_then(|v| v.to_str().ok()),
-            Some(TASK_AUTH_CHALLENGE_1_0)
+            Some(TASK_AUTH_CHALLENGE_0_1)
         );
     }
 

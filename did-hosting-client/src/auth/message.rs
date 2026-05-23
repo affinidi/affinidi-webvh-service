@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 
-use super::{HostingSigningIdentity, MSG_AUTH_RESPONSE, TASK_AUTH_AUTHENTICATE_1_0};
+use super::{HostingSigningIdentity, MSG_AUTH_RESPONSE, TASK_AUTH_AUTHENTICATE_0_1};
 
 /// SIOPv2 `id_token` lifetime, in seconds. The server enforces
 /// `iat <= now <= exp`; we stamp `exp = iat + 300` (5 minutes), which
@@ -89,7 +89,7 @@ pub fn build_authenticate_body(
 
     let envelope = json!({
         "id": uuid::Uuid::new_v4().to_string(),
-        "type": TASK_AUTH_AUTHENTICATE_1_0,
+        "type": TASK_AUTH_AUTHENTICATE_0_1,
         "payload": payload,
     });
 
@@ -238,7 +238,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
         assert_eq!(
             v.get("type").and_then(|t| t.as_str()),
-            Some(TASK_AUTH_AUTHENTICATE_1_0)
+            Some(TASK_AUTH_AUTHENTICATE_0_1)
         );
         assert!(v.get("id").and_then(|i| i.as_str()).is_some());
         let payload = v.get("payload").expect("payload present");

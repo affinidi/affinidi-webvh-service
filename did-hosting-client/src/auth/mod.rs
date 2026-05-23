@@ -55,14 +55,14 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub use message::{build_authenticate_body, build_refresh_message};
 
 /// Trust-Task URL stamped on `POST /api/auth/challenge` requests.
-pub const TASK_AUTH_CHALLENGE_1_0: &str = super::trust_tasks::TASK_AUTH_CHALLENGE_1_0;
+pub const TASK_AUTH_CHALLENGE_0_1: &str = super::trust_tasks::TASK_AUTH_CHALLENGE_0_1;
 
 /// Trust-Task URL stamped on `POST /api/auth/` (authenticate)
 /// requests.
-pub const TASK_AUTH_AUTHENTICATE_1_0: &str = super::trust_tasks::TASK_AUTH_AUTHENTICATE_1_0;
+pub const TASK_AUTH_AUTHENTICATE_0_1: &str = super::trust_tasks::TASK_AUTH_AUTHENTICATE_0_1;
 
 /// Trust-Task URL stamped on `POST /api/auth/refresh` requests.
-pub const TASK_AUTH_REFRESH_1_0: &str = super::trust_tasks::TASK_AUTH_REFRESH_1_0;
+pub const TASK_AUTH_REFRESH_0_1: &str = super::trust_tasks::TASK_AUTH_REFRESH_0_1;
 
 /// DIDComm v2 message `typ` for the authenticate-response /
 /// refresh envelope.

@@ -24,15 +24,15 @@
 
 /// Initial challenge request — `POST /api/auth/challenge`.
 /// Canonical cross-cutting spec from trusttasks-tf.
-pub const TASK_AUTH_CHALLENGE_1_0: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
+pub const TASK_AUTH_CHALLENGE_0_1: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
 
 /// JWS-packed authenticate response — `POST /api/auth/`.
 /// Canonical cross-cutting spec from trusttasks-tf.
-pub const TASK_AUTH_AUTHENTICATE_1_0: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
+pub const TASK_AUTH_AUTHENTICATE_0_1: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
 
 /// JWS-packed refresh — `POST /api/auth/refresh`.
 /// Canonical cross-cutting spec from trusttasks-tf.
-pub const TASK_AUTH_REFRESH_1_0: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
+pub const TASK_AUTH_REFRESH_0_1: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
 
 // ---------------------------------------------------------------------------
 // DID lifecycle (the v0.1 client surface)
@@ -62,9 +62,9 @@ mod tests {
     #[test]
     fn every_url_is_canonical() {
         let all = [
-            TASK_AUTH_CHALLENGE_1_0,
-            TASK_AUTH_AUTHENTICATE_1_0,
-            TASK_AUTH_REFRESH_1_0,
+            TASK_AUTH_CHALLENGE_0_1,
+            TASK_AUTH_AUTHENTICATE_0_1,
+            TASK_AUTH_REFRESH_0_1,
             TASK_DID_CHECK_NAME_1_0,
             TASK_DID_REQUEST_1_0,
             TASK_DID_REGISTER_1_0,

@@ -37,7 +37,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, StatusCode};
-use did_hosting_common::did_hosting_tasks::TASK_AUTH_CHALLENGE_1_0;
+use did_hosting_common::did_hosting_tasks::TASK_AUTH_CHALLENGE_0_1;
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
@@ -150,7 +150,7 @@ async fn trust_task_parity_rest_permissive_legacy_vs_canonical() {
                 .header("content-type", "application/json")
                 .header(
                     HEADER_NAME,
-                    HeaderValue::from_str(TASK_AUTH_CHALLENGE_1_0.as_str()).unwrap(),
+                    HeaderValue::from_str(TASK_AUTH_CHALLENGE_0_1.as_str()).unwrap(),
                 )
                 .body(Body::from(body_json))
                 .unwrap(),
