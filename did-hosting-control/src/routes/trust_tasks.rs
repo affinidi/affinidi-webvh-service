@@ -85,21 +85,32 @@ pub async fn dispatch_trust_task(
         }
     };
 
-    // ─── 3. Session-key binding pre-check (SECURITY).
+    // ─── 3. Proof-verificationMethod binding pre-check (SECURITY).
     //
-    // When the JWT was issued with an ephemeral session pubkey
-    // (Web UI flow), the proof's `verificationMethod` MUST be the
-    // matching `did:key:{pk}#{pk}` URL. Otherwise the proof was
-    // signed by a key the server hasn't bound to this JWT — even
-    // if its signature verifies, accepting it would let any key
-    // holder forge requests as the JWT subject.
+    // Two cases, depending on how the JWT was issued:
     //
-    // Backend callers that authenticate without a session pubkey
-    // (auth.session_pubkey_b58btc is None) skip this check: their
-    // proof's verificationMethod is resolved against the DID
-    // document and the framework's verifier does the binding.
-    if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
-        if let Some(proof) = doc.proof.as_ref() {
+    // (a) JWT carries an ephemeral session pubkey (passkey Web UI flow).
+    //     The proof's `verificationMethod` MUST be the matching
+    //     `did:key:{pk}#{pk}` URL. Otherwise the proof was signed by a key
+    //     the server hasn't bound to this JWT — even if the signature
+    //     verifies, accepting it would let any key holder forge requests
+    //     as the JWT subject.
+    //
+    // (b) JWT carries no session pubkey (wallet SIOPv2 flow, machine-to-
+    //     machine auth). The proof's `verificationMethod` MUST resolve to
+    //     a DID that matches `auth.did` (the JWT `sub`). Without this
+    //     check, the framework's verifier would happily accept a proof
+    //     from ANY resolvable DID — letting a wallet user with one
+    //     authenticated session sign trust-tasks attributed to a totally
+    //     different DID, as long as that other DID's key can be resolved.
+    //
+    // The framework's verifier handles signature verification + DID
+    // resolution; this pre-check enforces caller binding *before*
+    // verification so a forged-attribution attempt is rejected with the
+    // explicit reason rather than a generic "proof_invalid".
+    if let Some(proof) = doc.proof.as_ref() {
+        if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
+            // Case (a): session-key flow.
             let expected_vm = format!("did:key:{pk}#{pk}");
             if proof.verification_method != expected_vm {
                 tracing::warn!(
@@ -110,6 +121,28 @@ pub async fn dispatch_trust_task(
                 );
                 let reject = RejectReason::ProofInvalid {
                     reason: "proof verificationMethod is not bound to this session".to_string(),
+                };
+                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+                return Ok(into_response(DispatchOutcome::Rejected(routed)));
+            }
+        } else {
+            // Case (b): no session-key bound; verify the proof's DID matches
+            // the authenticated caller (JWT.sub).
+            let proof_did = proof
+                .verification_method
+                .split_once('#')
+                .map(|(d, _)| d)
+                .unwrap_or("");
+            if proof_did != auth.did {
+                tracing::warn!(
+                    proof_did = %proof_did,
+                    auth_did = %auth.did,
+                    "trust-task proof verificationMethod DID does not match the \
+                     authenticated caller — rejecting as proof_invalid"
+                );
+                let reject = RejectReason::ProofInvalid {
+                    reason: "proof verificationMethod DID does not match the authenticated caller"
+                        .to_string(),
                 };
                 let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
                 return Ok(into_response(DispatchOutcome::Rejected(routed)));
