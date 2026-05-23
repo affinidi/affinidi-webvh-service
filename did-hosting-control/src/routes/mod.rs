@@ -8,6 +8,7 @@ pub mod health;
 mod passkey;
 mod proxy;
 mod registry;
+pub mod server_info;
 pub(crate) mod stats_sync;
 mod trust_tasks;
 
@@ -358,7 +359,8 @@ pub fn router_without_fallback() -> Router<AppState> {
     #[allow(unused_mut)]
     let mut router = Router::new()
         .nest("/api", api)
-        .route("/api/health", get(health::health));
+        .route("/api/health", get(health::health))
+        .route("/api/server-info", get(server_info::server_info));
 
     // Prometheus metrics endpoint (only when metrics feature is enabled)
     #[cfg(feature = "metrics")]

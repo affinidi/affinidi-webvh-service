@@ -406,8 +406,28 @@ async function requestText(
   return res.text();
 }
 
+/** Response shape of `GET /api/server-info`. */
+export interface ServerInfoResponse {
+  /** The server's DID — used as the `recipient` / audience-binding value on
+   *  signed trust-task envelopes (SPEC §4.8.2). `null` when the operator
+   *  hasn't configured one (signed trust tasks will then be refused by the
+   *  server). */
+  server_did: string | null;
+}
+
+// Cache the server-info response for the lifetime of the tab. The server's
+// DID is stable per-deployment + already published in the server's did.jsonl,
+// so we never need to re-fetch unless we hit a config error somewhere.
+let cachedServerInfo: ServerInfoResponse | null = null;
+async function getServerInfo(): Promise<ServerInfoResponse> {
+  if (cachedServerInfo) return cachedServerInfo;
+  cachedServerInfo = await request<ServerInfoResponse>("/api/server-info");
+  return cachedServerInfo;
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
+  serverInfo: getServerInfo,
 
   listDids: (owner?: string) => {
     const params = owner ? `?owner=${encodeURIComponent(owner)}` : "";
@@ -1001,11 +1021,14 @@ const REQUIRED_PROOF_TYPES = new Set<string>([
  * session pubkey; the server's `dispatch_trust_task` verifies that
  * matches the JWT-bound pubkey before the framework's verifier runs.
  *
- * `issuer` / `recipient` remain omitted — the bearer JWT carries the
- * caller's DID and SPEC.md §4.8.1's "transport-derived fills the
- * absent in-band" rule populates both sides server-side. The proof's
- * `verificationMethod` ties the signature to the session, not to the
- * JWT subject's published DID.
+ * `issuer` stays omitted — the bearer JWT carries the caller's DID and
+ * SPEC.md §4.8.1's "transport-derived fills the absent in-band" rule
+ * populates the issuer server-side. `recipient` is set explicitly whenever
+ * a proof is attached: SPEC §4.8.2 (audience binding) requires it on every
+ * signed envelope on a non-bearer specification (acl/grant, acl/revoke,
+ * acl/change-role) so the signature is bound to *this* server and can't be
+ * replayed against another verifier. The proof's `verificationMethod` ties
+ * the signature to the session keypair, not the JWT subject's published DID.
  */
 async function trustTask<Req, Resp>(
   typeUri: string,
@@ -1029,6 +1052,19 @@ async function trustTask<Req, Resp>(
   //      side with `proof_invalid` because the new pubkey isn't bound
   //      to the JWT) — the failure prompts the user to log in again.
   if (REQUIRED_PROOF_TYPES.has(typeUri)) {
+    // §4.8.2 audience binding: bind the signature to *this* server before
+    // signing. Without `recipient`, the framework rejects with
+    // `malformed_request` ("proof present with no in-band recipient on a
+    // non-bearer specification").
+    const info = await getServerInfo();
+    if (!info.server_did) {
+      throw new ApiError(
+        500,
+        "server_did is not configured — signed trust tasks cannot be sent",
+      );
+    }
+    envelope.recipient = info.server_did;
+
     if (!hasSessionKeypair()) {
       await restoreSessionKeypair();
     }
