@@ -11,6 +11,7 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { api } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
+import { isWalletAvailable, loginWithWallet } from "../lib/wallet";
 
 export default function Login() {
   const { isAuthenticated, logout } = useAuth();
@@ -18,6 +19,9 @@ export default function Login() {
   const router = useRouter();
   const [passkeyLoading, setPasskeyLoading] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
+  const [walletLoading, setWalletLoading] = useState(false);
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const walletAvailable = isWalletAvailable();
 
   const handlePasskeyLogin = async () => {
     setPasskeyLoading(true);
@@ -34,6 +38,24 @@ export default function Login() {
       );
     } finally {
       setPasskeyLoading(false);
+    }
+  };
+
+  // The wallet's `login()` returns the SAME server-issued JWT shape the
+  // passkey path produces (both come out of did-hosting-control's
+  // `/api/auth/`), so we route into `useAuth().login(...)` identically.
+  // Passkey login stays as-is — this is additive.
+  const handleWalletLogin = async () => {
+    setWalletLoading(true);
+    setWalletError(null);
+    try {
+      const result = await loginWithWallet();
+      login(result.accessToken);
+      router.replace("/");
+    } catch (err: any) {
+      setWalletError(err?.message || "Wallet login failed.");
+    } finally {
+      setWalletLoading(false);
     }
   };
 
@@ -75,6 +97,34 @@ export default function Login() {
 
         {passkeyError && (
           <Text style={styles.errorText}>{passkeyError}</Text>
+        )}
+
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>or</Text>
+          <View style={styles.dividerLine} />
+        </View>
+
+        {walletAvailable ? (
+          <>
+            <Pressable
+              style={[styles.secondaryButton, walletLoading && styles.disabled]}
+              onPress={handleWalletLogin}
+              disabled={walletLoading}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {walletLoading ? "Authenticating…" : "Login with VTI Wallet"}
+              </Text>
+            </Pressable>
+            {walletError && (
+              <Text style={styles.errorText}>{walletError}</Text>
+            )}
+          </>
+        ) : (
+          <Text style={styles.cliHint}>
+            Install the VTI Wallet browser extension to sign in with your did:peer
+            identity (no passkey required).
+          </Text>
         )}
 
         <View style={styles.divider}>
@@ -148,6 +198,22 @@ const styles = StyleSheet.create({
   },
   buttonText: {
     color: colors.textOnAccent,
+    fontSize: 16,
+    fontFamily: fonts.semibold,
+  },
+  // Visual distinction from the primary passkey button: outlined rather than
+  // filled, so the two options read as peers without one looking like the
+  // canonical answer.
+  secondaryButton: {
+    backgroundColor: "transparent",
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.accent,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  secondaryButtonText: {
+    color: colors.accent,
     fontSize: 16,
     fontFamily: fonts.semibold,
   },
