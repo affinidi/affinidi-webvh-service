@@ -175,13 +175,13 @@ mod tests {
         let canonical = canonicalize(MSG_AUTHENTICATE).expect("MSG_AUTHENTICATE must be aliased");
         assert_eq!(
             canonical,
-            "https://trusttasks.org/did-hosting/auth/authenticate/1.0"
+            "https://trusttasks.org/spec/auth/authenticate/0.1"
         );
     }
 
     #[test]
     fn passes_canonical_url_through_unchanged() {
-        let input = "https://trusttasks.org/did-hosting/auth/authenticate/1.0";
+        let input = "https://trusttasks.org/spec/auth/authenticate/0.1";
         let canonical = canonicalize(input).expect("canonical URL must round-trip");
         assert_eq!(canonical, input);
     }

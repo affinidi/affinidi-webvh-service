@@ -23,14 +23,16 @@
 // ---------------------------------------------------------------------------
 
 /// Initial challenge request — `POST /api/auth/challenge`.
-pub const TASK_AUTH_CHALLENGE_1_0: &str = "https://trusttasks.org/did-hosting/auth/challenge/1.0";
+/// Canonical cross-cutting spec from trusttasks-tf.
+pub const TASK_AUTH_CHALLENGE_1_0: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
 
 /// JWS-packed authenticate response — `POST /api/auth/`.
-pub const TASK_AUTH_AUTHENTICATE_1_0: &str =
-    "https://trusttasks.org/did-hosting/auth/authenticate/1.0";
+/// Canonical cross-cutting spec from trusttasks-tf.
+pub const TASK_AUTH_AUTHENTICATE_1_0: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
 
 /// JWS-packed refresh — `POST /api/auth/refresh`.
-pub const TASK_AUTH_REFRESH_1_0: &str = "https://trusttasks.org/did-hosting/auth/refresh/1.0";
+/// Canonical cross-cutting spec from trusttasks-tf.
+pub const TASK_AUTH_REFRESH_1_0: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
 
 // ---------------------------------------------------------------------------
 // DID lifecycle (the v0.1 client surface)
@@ -70,9 +72,13 @@ mod tests {
             TASK_DID_DELETE_1_0,
         ];
         for url in all {
+            // Either the did-hosting-specific namespace (lifecycle ops
+            // unique to this service) or the canonical /spec/auth/*
+            // family in trusttasks-tf (cross-cutting auth primitives).
             assert!(
-                url.starts_with("https://trusttasks.org/did-hosting/"),
-                "URL must be under the did-hosting namespace: {url}"
+                url.starts_with("https://trusttasks.org/did-hosting/")
+                    || url.starts_with("https://trusttasks.org/spec/auth/"),
+                "URL must live under did-hosting/ or spec/auth/: {url}"
             );
             // Trailing `{maj}.{min}` per the canonical Trust-Tasks spec.
             let tail = url.rsplit('/').next().unwrap();

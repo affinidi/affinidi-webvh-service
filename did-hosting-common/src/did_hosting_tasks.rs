@@ -41,54 +41,65 @@ use crate::server::trust_task::TrustTask;
 // Method-agnostic ops — `trusttasks.org/did-hosting/...`
 // ---------------------------------------------------------------------------
 
-/// `did-hosting/auth/authenticate/1.0` — alias of MSG_AUTHENTICATE.
+/// `spec/auth/authenticate/0.1` — canonical cross-cutting authenticate.
+/// (Was did-hosting/auth/authenticate/1.0; migrated to the framework
+/// spec so VTA + VTC + did-hosting share one client surface.)
 pub static TASK_AUTH_AUTHENTICATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/authenticate/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/authenticate/0.1").expect("static")
 });
 
-/// `did-hosting/auth/authenticate-response/1.0` — alias of MSG_AUTH_RESPONSE.
+/// `spec/auth/authenticate/0.1#response` — the response variant of
+/// the canonical authenticate. The framework now uses
+/// `<type>#response` rather than a paired response-type URI; the
+/// constant is retained for code that still references the dedicated
+/// response identifier.
 pub static TASK_AUTH_AUTHENTICATE_RESPONSE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/authenticate-response/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/authenticate/0.1#response").expect("static")
 });
 
-/// `did-hosting/auth/step-up-passkey-start/1.0` — request a WebAuthn
-/// assertion challenge to elevate the current session to aal2.
+/// `spec/auth/passkey/login/start/0.1` (step-up purpose) — request a
+/// WebAuthn assertion to elevate the current session to aal2. Same
+/// canonical spec as initial passkey login; handler dispatches on
+/// `payload.purpose == "step-up"`.
 pub static TASK_AUTH_STEP_UP_PASSKEY_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-passkey-start/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
 });
 
-/// `did-hosting/auth/step-up-passkey-finish/1.0` — submit the assertion and
-/// elevate the session to aal2.
+/// `spec/auth/passkey/login/finish/0.1` (step-up purpose) — submit
+/// the assertion; the consumer elevates the existing session rather
+/// than minting a new one.
 pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-passkey-finish/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
 });
 
-/// `did-hosting/auth/step-up-check/1.0` — demo sensitive op gated on aal2.
+/// `did-hosting/auth/step-up-check/1.0` — demo sensitive op gated on
+/// aal2. Stays under did-hosting/ namespace: the framework canonical
+/// "is my session at AAL X?" is `auth/whoami/0.1` plus the client
+/// reading `session.acr`. This route remains because the demo
+/// scaffolding exercises a specific gating path.
 pub static TASK_AUTH_STEP_UP_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-check/1.0").expect("static")
 });
 
-/// `did-hosting/auth/step-up-vta-start/1.0` — issue a step-up nonce.
+/// `spec/auth/step-up/approve-request/0.1` — RP asks the holder's
+/// VTA/wallet to ratify an AAL elevation. Sent FROM did-hosting TO
+/// the holder's VTA over DIDComm.
 pub static TASK_AUTH_STEP_UP_VTA_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-vta-start/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-request/0.1").expect("static")
 });
 
-/// `did-hosting/auth/step-up-vta-finish/1.0` — submit a VTA-signed approval
-/// and elevate the session to aal2.
+/// `spec/auth/step-up/approve-response/0.1` — VTA/wallet returns the
+/// signed approval; the proof IS the cryptographic step-up gate.
 pub static TASK_AUTH_STEP_UP_VTA_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/step-up-vta-finish/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-response/0.1").expect("static")
 });
 
-/// `did-hosting/confirm/request/1.0` — RP-initiated wallet confirmation:
-/// the admin asks the control plane to send a `confirm/1.0` DIDComm
-/// message to a holder DID and waits (synchronously, over REST) for the
-/// holder's authcrypted `confirm-response/1.0` approve/deny.
+/// `spec/confirm/request/0.1` — canonical RP→wallet/VTA consent
+/// loop. did-hosting uses it for the "park a REST call, await a
+/// holder's DIDComm approve" pattern that backs admin-initiated
+/// sensitive operations.
 pub static TASK_CONFIRM_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/confirm/request/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/confirm/request/0.1").expect("static")
 });
 
 // -- DID provisioning lifecycle --------------------------------------------
@@ -231,31 +242,27 @@ pub static TASK_ME_DOMAINS_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 // (or can carry, in permissive mode during the v0.7→v0.8 migration) a
 // canonical task identifier.
 
-// Auth — REST-specific (the DIDComm-paired `authenticate` is above).
+// Auth — canonical cross-cutting specs from trusttasks-tf.
 pub static TASK_AUTH_CHALLENGE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/challenge/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/challenge/0.1").expect("static")
 });
 pub static TASK_AUTH_REFRESH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/refresh/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/refresh/0.1").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_ENROLL_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-enroll-start/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/start/0.1").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_ENROLL_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-enroll-finish/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/finish/0.1").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_LOGIN_START_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-login-start/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-login-finish/1.0")
-        .expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_INVITE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/auth/passkey-invite/1.0").expect("static")
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/invite/0.1").expect("static")
 });
 
 // ACL admin operations.

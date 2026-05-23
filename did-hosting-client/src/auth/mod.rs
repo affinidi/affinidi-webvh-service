@@ -9,7 +9,7 @@
 //!    signed by the holder's Ed25519 key, with the challenge as
 //!    `nonce` and the relying-party DID as `aud`), wraps it in a
 //!    Trust-Task envelope (`type =
-//!    "https://trusttasks.org/did-hosting/auth/authenticate/1.0"`,
+//!    "https://trusttasks.org/spec/auth/authenticate/0.1"`,
 //!    `payload = { id_token, session_id, session_pubkey_b58btc? }`),
 //!    and POSTs that envelope to `/api/auth/`. The daemon verifies
 //!    the `id_token` via
