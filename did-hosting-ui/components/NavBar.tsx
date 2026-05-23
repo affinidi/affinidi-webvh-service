@@ -73,21 +73,29 @@ export function NavBar() {
               item.href === "/"
                 ? pathname === "/"
                 : pathname.startsWith(item.href);
+            // Pre-flatten the style arrays. `<Link asChild>` clones the
+            // Pressable + forwards its props; with Expo SDK 54 / React 19 /
+            // react-native-web 0.21, an array `style` prop survives the
+            // clone and reaches react-dom's `setValueForStyles`, which then
+            // tries to write `element.style[0] = …` and crashes the whole
+            // page with "Indexed property setter is not supported." Passing
+            // a single flattened object sidesteps the bug.
+            const buttonStyle = StyleSheet.flatten([
+              styles.linkButton,
+              active && styles.linkButtonActive,
+            ]);
+            const textStyle = StyleSheet.flatten([
+              styles.linkText,
+              active && styles.linkTextActive,
+            ]);
             return (
               <Link key={item.href} href={item.href as any} asChild>
                 <Pressable
                   accessibilityRole="link"
                   accessibilityState={{ selected: active }}
-                  style={[styles.linkButton, active && styles.linkButtonActive]}
+                  style={buttonStyle}
                 >
-                  <Text
-                    style={[
-                      styles.linkText,
-                      active && styles.linkTextActive,
-                    ]}
-                  >
-                    {item.label}
-                  </Text>
+                  <Text style={textStyle}>{item.label}</Text>
                 </Pressable>
               </Link>
             );
