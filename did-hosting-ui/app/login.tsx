@@ -8,7 +8,7 @@ import {
 import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
-import { api } from "../lib/api";
+import { api, setAuthMethod } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import { isWalletAvailable, loginWithWallet } from "../lib/wallet";
@@ -30,6 +30,7 @@ export default function Login() {
       const { auth_id, options } = await api.passkeyLoginStart();
       const credential = await getPasskeyCredential(options);
       const result = await api.passkeyLoginFinish(auth_id, credential);
+      setAuthMethod("passkey");
       login(result.access_token);
       router.replace("/");
     } catch (err: any) {
@@ -50,6 +51,7 @@ export default function Login() {
     setWalletError(null);
     try {
       const result = await loginWithWallet();
+      setAuthMethod("wallet");
       login(result.accessToken);
       router.replace("/");
     } catch (err: any) {

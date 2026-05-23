@@ -312,6 +312,13 @@ export class ApiError extends Error {
 
 const TOKEN_KEY = "webvh_token";
 
+/** Which auth path produced the current session. Trust-task signing
+ *  branches on this: `"wallet"` calls `window.vtaWallet.signTrustTask` (the
+ *  holder did:peer is the signing identity); anything else uses the
+ *  ephemeral session keypair the passkey-login flow generates. */
+export type AuthMethod = "passkey" | "wallet";
+const AUTH_METHOD_KEY = "webvh_auth_method";
+
 export function getToken(): string | null {
   try {
     return localStorage.getItem(TOKEN_KEY);
@@ -328,9 +335,27 @@ export function setToken(token: string): void {
   }
 }
 
+export function getAuthMethod(): AuthMethod | null {
+  try {
+    const v = localStorage.getItem(AUTH_METHOD_KEY);
+    return v === "passkey" || v === "wallet" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthMethod(method: AuthMethod): void {
+  try {
+    localStorage.setItem(AUTH_METHOD_KEY, method);
+  } catch {
+    // ignore
+  }
+}
+
 export function clearToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(AUTH_METHOD_KEY);
   } catch {
     // ignore
   }
@@ -1065,13 +1090,48 @@ async function trustTask<Req, Resp>(
     }
     envelope.recipient = info.server_did;
 
-    if (!hasSessionKeypair()) {
-      await restoreSessionKeypair();
+    // Two signing paths, picked by which login flow produced the JWT:
+    //
+    // (1) Wallet login → the VTI browser extension's holder did:peer is the
+    //     signing authority. The wallet adds the eddsa-jcs-2022 proof
+    //     server-side from the page's perspective (it runs in the
+    //     extension's offscreen doc with the private key). The server
+    //     resolves the did:peer to verify; the dispatch_trust_task pre-check
+    //     enforces that the proof's DID == JWT.sub.
+    //
+    // (2) Passkey login → ephemeral session keypair (generated at login,
+    //     pubkey bound to the JWT by the server). dispatch_trust_task
+    //     enforces that the proof's verificationMethod is exactly the
+    //     JWT-bound `did:key:{pk}#{pk}`.
+    const method = getAuthMethod();
+    if (method === "wallet") {
+      const wallet = (
+        typeof window !== "undefined"
+          ? (window as unknown as { vtaWallet?: { signTrustTask: (p: { envelope: Record<string, unknown> }) => Promise<{ signedEnvelope: Record<string, unknown> }> } }).vtaWallet
+          : undefined
+      );
+      if (!wallet?.signTrustTask) {
+        throw new ApiError(
+          401,
+          "Wallet-authenticated session but the VTI Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
+        );
+      }
+      const signed = await wallet.signTrustTask({
+        envelope: envelope as unknown as Record<string, unknown>,
+      });
+      // Replace our envelope with the signed one (the wallet may have
+      // copied + added `proof`; the rest of the fields must be byte-
+      // identical so the server's JCS hash matches).
+      Object.assign(envelope as unknown as Record<string, unknown>, signed.signedEnvelope);
+    } else {
+      if (!hasSessionKeypair()) {
+        await restoreSessionKeypair();
+      }
+      if (!hasSessionKeypair()) {
+        await generateSessionKeypair();
+      }
+      await signEnvelope(envelope as unknown as Record<string, unknown>);
     }
-    if (!hasSessionKeypair()) {
-      await generateSessionKeypair();
-    }
-    await signEnvelope(envelope as unknown as Record<string, unknown>);
   }
 
   const respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(

@@ -29,8 +29,22 @@ export interface VtaWalletLoginResult {
   sessionId: string;
   holderDid: string;
 }
+interface VtaWalletSignTrustTaskParams {
+  envelope: Record<string, unknown>;
+}
+interface VtaWalletSignTrustTaskResult {
+  signedEnvelope: Record<string, unknown>;
+  holderDid: string;
+}
 interface VtaWalletProvider {
   login(params: VtaWalletLoginParams): Promise<VtaWalletLoginResult>;
+  /** Sign a Trust-Task envelope with the wallet's holder did:peer #key-2.
+   *  The caller sets `recipient` (audience) on the envelope before calling;
+   *  the wallet adds an `eddsa-jcs-2022` Data Integrity proof and returns the
+   *  envelope. Server verifies by resolving the did:peer. */
+  signTrustTask?(
+    params: VtaWalletSignTrustTaskParams,
+  ): Promise<VtaWalletSignTrustTaskResult>;
 }
 declare global {
   interface Window {
