@@ -80,6 +80,7 @@ async fn make_harness() -> Harness {
         vta: VtaConfig::default(),
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
+        hosting: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -111,6 +112,7 @@ async fn make_harness() -> Harness {
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     Harness { state, _dir: dir }

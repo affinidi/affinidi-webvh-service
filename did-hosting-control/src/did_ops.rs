@@ -1011,6 +1011,7 @@ mod tests_atomic {
             vta: VtaConfig::default(),
             registry: RegistryConfig::default(),
             trust_tasks: Default::default(),
+            hosting: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -1038,6 +1039,7 @@ mod tests_atomic {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            outbox_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         (state, dir)
@@ -1320,6 +1322,8 @@ mod tests_atomic {
             watchers: None,
             quota: None,
             well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
         };
         create_domain(&state.store, &entry).await.unwrap();
         name.into()
@@ -1404,6 +1408,8 @@ mod tests_atomic {
                     watchers: None,
                     quota: None,
                     well_known_enabled: false,
+                    disabled_at: None,
+                    purge_at: None,
                 },
             )
             .await

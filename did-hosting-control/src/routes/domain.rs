@@ -31,6 +31,7 @@ use did_hosting_common::server::domain::{
     self, DomainBranding, DomainEntry, DomainQuota, DomainScope, DomainStatus, DomainUrlScheme,
     normalize_domain_name,
 };
+use did_hosting_common::server::pending_purge;
 
 /// Body for both list endpoints. `default` carries the current
 /// default-domain pointer so the UI can highlight it without a second
@@ -169,6 +170,8 @@ pub async fn create_domain_route(
         watchers: req.watchers,
         quota: req.quota,
         well_known_enabled: req.well_known_enabled,
+        disabled_at: None,
+        purge_at: None,
     };
     domain::create_domain(&state.store, &entry).await?;
     if req.set_as_default {
@@ -177,10 +180,13 @@ pub async fn create_domain_route(
     let stored = domain::get_domain(&state.store, &canonical)
         .await?
         .ok_or_else(|| AppError::Internal(format!("domain '{canonical}' missing after create")))?;
+    let (sent, failed) = crate::server_push::fanout_domain_upsert(&state, &stored).await;
     info!(
         caller = %auth.0.did,
         domain = %canonical,
         set_as_default = req.set_as_default,
+        fanout_sent = sent,
+        fanout_failed = failed,
         "domain created"
     );
     Ok((StatusCode::CREATED, Json(stored)))
@@ -242,7 +248,14 @@ pub async fn update_domain_route(
         entry.well_known_enabled = wk;
     }
     domain::update_domain(&state.store, &canonical, &entry).await?;
-    info!(caller = %auth.0.did, domain = %canonical, "domain updated");
+    let (sent, failed) = crate::server_push::fanout_domain_upsert(&state, &entry).await;
+    info!(
+        caller = %auth.0.did,
+        domain = %canonical,
+        fanout_sent = sent,
+        fanout_failed = failed,
+        "domain updated"
+    );
     Ok(Json(entry))
 }
 
@@ -255,11 +268,35 @@ pub async fn disable_domain_route(
     Path(name): Path<String>,
 ) -> Result<Json<DomainEntry>, AppError> {
     let canonical = normalize_domain_name(&name)?;
-    domain::disable_domain(&state.store, &canonical).await?;
+    let grace_seconds = pending_purge::parse_grace_string(
+        &state.config.hosting.disable_purge_grace,
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "config [hosting] disable_purge_grace='{}' is invalid: {e}",
+            state.config.hosting.disable_purge_grace
+        ))
+    })?;
+    domain::disable_domain(
+        &state.store,
+        &canonical,
+        now_epoch(),
+        grace_seconds,
+        &auth.0.did,
+    )
+    .await?;
     let entry = domain::get_domain(&state.store, &canonical)
         .await?
         .ok_or_else(|| AppError::Internal(format!("domain '{canonical}' missing after disable")))?;
-    info!(caller = %auth.0.did, domain = %canonical, "domain disabled");
+    let (sent, failed) = crate::server_push::fanout_domain_upsert(&state, &entry).await;
+    info!(
+        caller = %auth.0.did,
+        domain = %canonical,
+        grace_seconds,
+        fanout_sent = sent,
+        fanout_failed = failed,
+        "domain disabled (soft-delete scheduled)"
+    );
     Ok(Json(entry))
 }
 
@@ -275,7 +312,14 @@ pub async fn enable_domain_route(
     let entry = domain::get_domain(&state.store, &canonical)
         .await?
         .ok_or_else(|| AppError::Internal(format!("domain '{canonical}' missing after enable")))?;
-    info!(caller = %auth.0.did, domain = %canonical, "domain enabled");
+    let (sent, failed) = crate::server_push::fanout_domain_upsert(&state, &entry).await;
+    info!(
+        caller = %auth.0.did,
+        domain = %canonical,
+        fanout_sent = sent,
+        fanout_failed = failed,
+        "domain enabled"
+    );
     Ok(Json(entry))
 }
 
@@ -293,6 +337,13 @@ pub async fn set_default_domain_route(
         .ok_or_else(|| {
             AppError::Internal(format!("domain '{canonical}' missing after set-default"))
         })?;
-    info!(caller = %auth.0.did, domain = %canonical, "domain set as default");
+    let (sent, failed) = crate::server_push::fanout_domain_upsert(&state, &entry).await;
+    info!(
+        caller = %auth.0.did,
+        domain = %canonical,
+        fanout_sent = sent,
+        fanout_failed = failed,
+        "domain set as default"
+    );
     Ok(Json(entry))
 }

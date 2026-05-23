@@ -16,7 +16,7 @@
  *   * inline actions: Set as default · Disable / Enable
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -34,10 +34,73 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
 import type { DomainEntry } from "../../lib/api";
 
+/** Human-readable "in 29 days, 23 hours" / "in 5 hours" / "in 12 minutes"
+ *  / "any moment now" given an absolute target epoch. Returns null if
+ *  `targetEpochSeconds` is null/undefined. */
+function formatRemaining(targetEpochSeconds: number | null): string | null {
+  if (!targetEpochSeconds) return null;
+  const remaining = targetEpochSeconds - Math.floor(Date.now() / 1000);
+  if (remaining <= 60) return "any moment now";
+  const days = Math.floor(remaining / 86400);
+  const hours = Math.floor((remaining % 86400) / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  if (days >= 1) {
+    return hours >= 1
+      ? `in ${days} day${days === 1 ? "" : "s"}, ${hours} hour${hours === 1 ? "" : "s"}`
+      : `in ${days} day${days === 1 ? "" : "s"}`;
+  }
+  if (hours >= 1) {
+    return minutes >= 1
+      ? `in ${hours} hour${hours === 1 ? "" : "s"}, ${minutes} minute${minutes === 1 ? "" : "s"}`
+      : `in ${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `in ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+/** "30 days" / "5 hours" / "12 minutes" — same buckets as
+ *  `formatRemaining` but expressed as a fixed duration rather than a
+ *  point in time. Used in the disable-confirm dialog. */
+function formatDuration(seconds: number | null): string | null {
+  if (!seconds || seconds <= 0) return null;
+  const days = Math.floor(seconds / 86400);
+  if (days >= 1) return `${days} day${days === 1 ? "" : "s"}`;
+  const hours = Math.floor(seconds / 3600);
+  if (hours >= 1) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+function formatAbsolute(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export default function DomainsScreen() {
   const { isAuthenticated, role } = useAuth();
   const api = useApi();
   const { domains, loaded, error, defaultDomain, refresh } = useDomains();
+  const [graceSeconds, setGraceSeconds] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .serverInfo()
+      .then((info) => {
+        if (!cancelled) setGraceSeconds(info.disable_purge_grace_seconds);
+      })
+      .catch(() => {
+        // Server-info is best-effort: a failure here just means we
+        // fall back to generic copy in the disable confirm.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
 
   const [showForm, setShowForm] = useState(false);
   const [newName, setNewName] = useState("");
@@ -98,27 +161,30 @@ export default function DomainsScreen() {
 
   const handleDisable = useCallback(
     (entry: DomainEntry) => {
-      showConfirm(
-        `Disable ${entry.name}?`,
-        "Resolves on this domain will return 503 with a maintenance body. " +
-          "Hosted DIDs are preserved — re-enable to restore traffic.",
-        async () => {
-          setBusy(entry.name);
-          try {
-            await api.disableDomain(entry.name);
-            await refresh();
-          } catch (e: unknown) {
-            showAlert(
-              "Disable failed",
-              e instanceof Error ? e.message : String(e),
-            );
-          } finally {
-            setBusy(null);
-          }
-        },
-      );
+      const window = formatDuration(graceSeconds);
+      const body = window
+        ? `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
+          `will be permanently removed in ${window} unless you re-enable ` +
+          `before then.`
+        : `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
+          `will be permanently removed after the configured grace period ` +
+          `unless you re-enable before then.`;
+      showConfirm(`Disable ${entry.name}?`, body, async () => {
+        setBusy(entry.name);
+        try {
+          await api.disableDomain(entry.name);
+          await refresh();
+        } catch (e: unknown) {
+          showAlert(
+            "Disable failed",
+            e instanceof Error ? e.message : String(e),
+          );
+        } finally {
+          setBusy(null);
+        }
+      });
     },
-    [api, refresh],
+    [api, refresh, graceSeconds],
   );
 
   const handleEnable = useCallback(
@@ -341,6 +407,12 @@ function DomainCard({
             })}
             {entry.wellKnownEnabled ? " · /.well-known enabled" : ""}
           </Text>
+          {disabled && entry.purgeAt ? (
+            <Text style={styles.cardWarning}>
+              Will be permanently removed {formatRemaining(entry.purgeAt)} ·{" "}
+              {formatAbsolute(entry.purgeAt)}. Re-enable to cancel.
+            </Text>
+          ) : null}
         </View>
       </View>
 
@@ -543,6 +615,12 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     fontSize: 12,
     color: colors.textTertiary,
+  },
+  cardWarning: {
+    marginTop: 6,
+    fontFamily: fonts.medium,
+    fontSize: 12,
+    color: colors.error,
   },
   defaultBadge: {
     backgroundColor: colors.tealMuted,

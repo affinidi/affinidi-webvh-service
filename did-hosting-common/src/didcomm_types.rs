@@ -88,6 +88,24 @@ pub const MSG_DOMAIN_ASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/a
 pub const MSG_DOMAIN_UNASSIGN: &str = "https://affinidi.com/webvh/1.0/domain/unassign";
 pub const MSG_DOMAIN_UNASSIGN_ACK: &str = "https://affinidi.com/webvh/1.0/domain/unassign-ack";
 
+/// Replicate a `DomainEntry` from the control plane to a server.
+/// Covers create / update / disable / enable in one message — the
+/// server reacts to the `status` + `disabled_at` / `purge_at` fields:
+///
+/// - `status: "active"` (timestamps unset) → ensure local entry is
+///   Active, cancel any pending purge.
+/// - `status: "disabled"` (timestamps set) → ensure local entry is
+///   Disabled, schedule a `disable-grace` pending_purge using the
+///   carried timestamps so the server's sweeper deletes the entry +
+///   hosted DIDs when grace expires.
+///
+/// Idempotent — re-sending the same entry is a no-op on the server.
+/// Servers that don't yet `assigned` the domain still apply the
+/// upsert so the entry is ready when they later receive a
+/// `domain/assign`.
+pub const MSG_DOMAIN_UPSERT: &str = "https://affinidi.com/webvh/1.0/domain/upsert";
+pub const MSG_DOMAIN_UPSERT_ACK: &str = "https://affinidi.com/webvh/1.0/domain/upsert-ack";
+
 /// Admin "Purge now" Trust Task (T30). Bypasses the grace period
 /// scheduled by an unassignment and deletes every DID on the named
 /// domain immediately. The receiving server audit-logs the reason as

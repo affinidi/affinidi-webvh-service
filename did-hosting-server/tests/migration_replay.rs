@@ -63,6 +63,8 @@ async fn seed_domain(store: &Store, name: &str, default: bool) {
             watchers: None,
             quota: None,
             well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
         },
     )
     .await

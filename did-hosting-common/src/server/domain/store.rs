@@ -20,7 +20,15 @@ use serde::{Deserialize, Serialize};
 use super::normalize::normalize_domain_name;
 use super::types::{DomainEntry, DomainStatus};
 use crate::server::error::AppError;
+use crate::server::pending_purge;
 use crate::server::store::{KS_DOMAINS, KS_META, KeyspaceHandle, Store};
+
+/// `pending_purge::PendingPurge::reason` value used for soft-deleted
+/// (disabled, awaiting purge) domains. Distinct from
+/// [`crate::server::pending_purge`]'s `"grace-expired"` (unassignment)
+/// so the background sweep knows to delete the entire `DomainEntry`
+/// row in addition to the hosted DID records.
+pub const DISABLE_PURGE_REASON: &str = "disable-grace";
 
 /// Storage key for the default-domain pointer in the `meta` keyspace.
 /// Co-located with the migration-runner's applied markers (also in
@@ -134,10 +142,23 @@ pub async fn update_domain(
     Ok(())
 }
 
-/// Disable a domain. Refuses if the domain is currently the default
-/// (per spec §3 "Default domain must be active" — re-point default
-/// first, then disable).
-pub async fn disable_domain(store: &Store, name: &str) -> Result<(), AppError> {
+/// Disable a domain (soft-delete). Refuses if the domain is currently
+/// the default (per spec §3 "Default domain must be active" — re-point
+/// default first, then disable).
+///
+/// Sets `disabled_at = now` and `purge_at = now + grace_seconds`, then
+/// schedules a `pending_purge` row with reason
+/// [`DISABLE_PURGE_REASON`]. The background sweep
+/// (`did-hosting-server::purge_sweep`) sees the row, waits out the
+/// grace window, then permanently removes the domain record + all
+/// hosted DIDs. Re-enabling cancels.
+pub async fn disable_domain(
+    store: &Store,
+    name: &str,
+    now_epoch: u64,
+    grace_seconds: u64,
+    scheduled_by: &str,
+) -> Result<(), AppError> {
     let canonical = normalize_domain_name(name)?;
     if let Some(current_default) = get_default_domain(store).await?
         && current_default == canonical
@@ -150,20 +171,44 @@ pub async fn disable_domain(store: &Store, name: &str) -> Result<(), AppError> {
         .await?
         .ok_or_else(|| AppError::NotFound(format!("domain '{canonical}'")))?;
     entry.status = DomainStatus::Disabled;
+    entry.disabled_at = Some(now_epoch);
+    entry.purge_at = Some(now_epoch.saturating_add(grace_seconds));
     let ks = domains_ks(store)?;
     ks.insert(canonical.as_bytes().to_vec(), &entry).await?;
+
+    pending_purge::schedule(
+        store,
+        &canonical,
+        now_epoch,
+        grace_seconds,
+        DISABLE_PURGE_REASON,
+        scheduled_by,
+    )
+    .await?;
     Ok(())
 }
 
-/// Enable a previously-disabled domain.
+/// Enable a previously-disabled domain. Cancels the pending purge if
+/// one was scheduled (the common case — `disable_domain` always
+/// schedules; missing pending row is a quiet no-op for old records
+/// disabled before this feature shipped).
 pub async fn enable_domain(store: &Store, name: &str) -> Result<(), AppError> {
     let canonical = normalize_domain_name(name)?;
     let mut entry = get_domain(store, &canonical)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("domain '{canonical}'")))?;
     entry.status = DomainStatus::Active;
+    entry.disabled_at = None;
+    entry.purge_at = None;
     let ks = domains_ks(store)?;
     ks.insert(canonical.as_bytes().to_vec(), &entry).await?;
+
+    // Best-effort cancel. A `Missing` outcome is fine — it means this
+    // domain was disabled before the soft-delete feature shipped and
+    // never had a pending row, or the sweep already cleared it (the
+    // sweep would only do that AFTER deleting the domain record, in
+    // which case `get_domain` above would have returned NotFound).
+    let _ = pending_purge::cancel(store, &canonical).await?;
     Ok(())
 }
 
@@ -278,6 +323,8 @@ mod tests {
             watchers: None,
             quota: None,
             well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
         }
     }
 
@@ -367,23 +414,32 @@ mod tests {
     async fn disable_and_re_enable_cycle() {
         let store = fjall_store().await;
         create_domain(&store, &entry("a.example")).await.unwrap();
-        disable_domain(&store, "a.example").await.unwrap();
-        assert_eq!(
-            get_domain(&store, "a.example")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            DomainStatus::Disabled
-        );
+        disable_domain(&store, "a.example", 1_000, 60, "did:example:admin")
+            .await
+            .unwrap();
+        let after_disable = get_domain(&store, "a.example").await.unwrap().unwrap();
+        assert_eq!(after_disable.status, DomainStatus::Disabled);
+        assert_eq!(after_disable.disabled_at, Some(1_000));
+        assert_eq!(after_disable.purge_at, Some(1_060));
+        let pending = pending_purge::get(&store, "a.example")
+            .await
+            .unwrap()
+            .expect("disable schedules a pending purge");
+        assert_eq!(pending.reason, DISABLE_PURGE_REASON);
+        assert_eq!(pending.scheduled_at, 1_000);
+        assert_eq!(pending.grace_seconds, 60);
+
         enable_domain(&store, "a.example").await.unwrap();
-        assert_eq!(
-            get_domain(&store, "a.example")
+        let after_enable = get_domain(&store, "a.example").await.unwrap().unwrap();
+        assert_eq!(after_enable.status, DomainStatus::Active);
+        assert_eq!(after_enable.disabled_at, None);
+        assert_eq!(after_enable.purge_at, None);
+        // Pending purge cancelled.
+        assert!(
+            pending_purge::get(&store, "a.example")
                 .await
                 .unwrap()
-                .unwrap()
-                .status,
-            DomainStatus::Active
+                .is_none()
         );
     }
 
@@ -392,7 +448,7 @@ mod tests {
         let store = fjall_store().await;
         create_domain(&store, &entry("a.example")).await.unwrap();
         set_default_domain(&store, "a.example").await.unwrap();
-        let err = disable_domain(&store, "a.example")
+        let err = disable_domain(&store, "a.example", 1, 60, "did:example:admin")
             .await
             .expect_err("disabling default must reject");
         assert!(matches!(err, AppError::Conflict(_)));

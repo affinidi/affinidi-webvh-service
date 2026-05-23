@@ -72,6 +72,21 @@ pub struct DomainEntry {
     /// Default off per spec §3 — operators opt in per-domain.
     #[serde(default)]
     pub well_known_enabled: bool,
+
+    /// Unix seconds when the domain was disabled. `None` while the
+    /// domain is `Active`. Set by `disable_domain`, cleared by
+    /// `enable_domain`. Pairs with `purge_at`: a disabled domain is
+    /// permanently removed (domain record + all hosted DIDs) at
+    /// `purge_at`; re-enabling within the grace window cancels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<u64>,
+
+    /// Unix seconds at which the disabled domain becomes eligible for
+    /// automatic deletion. Computed at disable time from
+    /// `disabled_at + hosting.disable_purge_grace`. `None` while the
+    /// domain is `Active`. The UI reads this to render the countdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_at: Option<u64>,
 }
 
 /// URL scheme used in resolution URLs for DIDs hosted on this domain.
@@ -170,6 +185,8 @@ mod tests {
                 max_total_size_in_domain: None,
             }),
             well_known_enabled: true,
+            disabled_at: None,
+            purge_at: None,
         }
     }
 
@@ -195,6 +212,8 @@ mod tests {
             watchers: None,
             quota: None,
             well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
         };
         let json = serde_json::to_string(&minimal).unwrap();
         let back: DomainEntry = serde_json::from_str(&json).unwrap();
@@ -215,6 +234,8 @@ mod tests {
             watchers: None,
             quota: None,
             well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
         };
         let json = serde_json::to_string(&minimal).unwrap();
         // `skip_serializing_if = "Option::is_none"` should keep the
@@ -224,6 +245,8 @@ mod tests {
         assert!(!json.contains("witnesses"));
         assert!(!json.contains("watchers"));
         assert!(!json.contains("quota"));
+        assert!(!json.contains("disabled_at"));
+        assert!(!json.contains("purge_at"));
     }
 
     #[test]

@@ -157,6 +157,8 @@ async fn seed_entry(store: &Store, name: &str, is_default: bool) -> Result<(), A
         watchers: None,
         quota: None,
         well_known_enabled: false,
+        disabled_at: None,
+        purge_at: None,
     };
     create_domain(store, &entry).await?;
     if is_default {

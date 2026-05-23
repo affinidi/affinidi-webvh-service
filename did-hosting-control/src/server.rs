@@ -133,6 +133,12 @@ pub struct AppState {
     /// handler looks the entry up by challenge, verifies the authcrypt
     /// sender matches the addressed holder DID, and resolves the wait.
     pub pending_confirms: PendingConfirms,
+    /// Wakes the [`crate::outbox`] worker when a new entry lands in
+    /// the durable outbound queue. The route handlers call
+    /// `outbox::enqueue_and_notify`, which writes to fjall + fires
+    /// this notify so delivery happens promptly in the happy path.
+    /// On notify-miss the worker still runs on its 30 s tick.
+    pub outbox_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -340,6 +346,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Seed registry from static config
@@ -462,6 +469,27 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         }
     });
 
+    // 5. Spawn the control-plane purge sweep. Mirrors the server-side
+    // sweep but only deletes DomainEntry rows for ripe `disable-grace`
+    // pending purges — control has no hosted DIDs to clean up.
+    let (purge_shutdown_tx, purge_shutdown_rx) = tokio::sync::watch::channel(false);
+    let purge_store = state.store.clone();
+    let purge_handle = tokio::spawn(async move {
+        crate::purge_sweep::run_purge_sweep_loop(purge_store, purge_shutdown_rx).await;
+    });
+
+    // 6. Spawn the durable outbox worker. Drains
+    // `crate::outbox::KS_OUTBOUND_QUEUE` per-target FIFO; wakes on
+    // `state.outbox_notify` (fired by every enqueue) for the low-
+    // latency happy path, falls back to a 30 s tick to retry backed-
+    // off entries.
+    let (outbox_shutdown_tx, outbox_shutdown_rx) = tokio::sync::watch::channel(false);
+    let outbox_state = state.clone();
+    let outbox_notify = state.outbox_notify.clone();
+    let outbox_handle = tokio::spawn(async move {
+        crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
+    });
+
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
@@ -470,6 +498,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     health_shutdown.cancel();
     didcomm_shutdown.cancel();
+    let _ = purge_shutdown_tx.send(true);
+    let _ = outbox_shutdown_tx.send(true);
     // DIDCommService shutdown is handled by the cancellation token
 
     let _ = rest_shutdown_tx.send(true);
@@ -498,6 +528,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             error!("failed to join storage thread: {e}");
             any_panic = true;
         }
+    }
+
+    if let Err(e) = purge_handle.await {
+        warn!("purge sweep task didn't shut down cleanly: {e}");
+    }
+
+    if let Err(e) = outbox_handle.await {
+        warn!("outbox worker didn't shut down cleanly: {e}");
     }
 
     if any_panic {

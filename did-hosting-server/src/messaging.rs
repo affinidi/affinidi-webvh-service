@@ -41,6 +41,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
         .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
         .route(MSG_DOMAIN_PURGE, handler_fn(handle_domain_purge))?
+        .route(MSG_DOMAIN_UPSERT, handler_fn(handle_domain_upsert))?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -593,6 +594,142 @@ async fn do_domain_purge(
             "domain": domain,
             "deleted": report.deleted,
             "skipped_no_domain": report.skipped_no_domain,
+        }),
+    ))
+}
+
+async fn handle_domain_upsert(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    let (response_type, response_body) = match do_domain_upsert(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.domain.internal-error", &e),
+    };
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
+/// Handle `MSG_DOMAIN_UPSERT`. Single-message replication of any
+/// `DomainEntry` mutation from the control plane (create, update,
+/// disable, enable).
+///
+/// Behaviour:
+/// - Upserts the local DomainEntry — `create_domain` if absent,
+///   `update_domain` otherwise.
+/// - If the incoming entry is `Disabled` and carries
+///   `disabled_at` + `purge_at`, schedules a `disable-grace`
+///   pending_purge so this server's sweeper eventually deletes the
+///   entry + all DIDs hosted under the domain.
+/// - If the incoming entry is `Active`, cancels any pending purge —
+///   this is how a re-enable within the grace window cancels the
+///   removal on the server side.
+///
+/// Idempotent. Re-sending the same entry produces an
+/// `already_current` status in the ack rather than churn.
+async fn do_domain_upsert(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    use did_hosting_common::server::domain::{
+        DISABLE_PURGE_REASON, DomainEntry, DomainStatus, create_domain, get_domain,
+        normalize_domain_name, update_domain,
+    };
+    use did_hosting_common::server::pending_purge;
+
+    let role = check_acl(&state.acl_ks, sender)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(role, Role::Admin | Role::Service) {
+        warn!(
+            did = sender,
+            "domain/upsert rejected: requires admin or service role"
+        );
+        return Ok(problem_report(
+            "e.p.domain.unauthorized",
+            "admin or service role required for domain upsert",
+        ));
+    }
+
+    let entry: DomainEntry = serde_json::from_value(msg.body.clone())
+        .map_err(|e| format!("malformed 'entry' in domain/upsert (expected a DomainEntry): {e}"))?;
+    let canonical = normalize_domain_name(&entry.name).map_err(|e| e.to_string())?;
+    if canonical != entry.name {
+        return Err(format!(
+            "domain/upsert sender sent non-canonical name '{}' (expected '{canonical}')",
+            entry.name
+        ));
+    }
+
+    let existed = get_domain(&state.store, &canonical)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if existed {
+        update_domain(&state.store, &canonical, &entry)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        create_domain(&state.store, &entry)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Status-driven side effects.
+    let status_str = match entry.status {
+        DomainStatus::Active => {
+            // Re-enable cancels any in-flight grace timer.
+            let _ = pending_purge::cancel(&state.store, &canonical).await;
+            "active"
+        }
+        DomainStatus::Disabled => {
+            if let (Some(disabled_at), Some(purge_at)) = (entry.disabled_at, entry.purge_at) {
+                let grace_seconds = purge_at.saturating_sub(disabled_at);
+                if let Err(e) = pending_purge::schedule(
+                    &state.store,
+                    &canonical,
+                    disabled_at,
+                    grace_seconds,
+                    DISABLE_PURGE_REASON,
+                    sender,
+                )
+                .await
+                {
+                    warn!(
+                        error = %e,
+                        domain = %canonical,
+                        "domain/upsert: failed to schedule pending purge — local entry disabled, but grace sweep won't fire"
+                    );
+                }
+            } else {
+                warn!(
+                    domain = %canonical,
+                    "domain/upsert: status=Disabled but timestamps missing — no grace timer scheduled"
+                );
+            }
+            "disabled"
+        }
+    };
+
+    let action = if existed { "updated" } else { "created" };
+    info!(
+        did = sender,
+        domain = %canonical,
+        action,
+        status = status_str,
+        "domain entry replicated"
+    );
+
+    Ok((
+        MSG_DOMAIN_UPSERT_ACK.to_string(),
+        json!({
+            "domain": canonical,
+            "action": action,
+            "status": status_str,
         }),
     ))
 }

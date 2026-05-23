@@ -28,6 +28,7 @@
 
 use std::time::Duration;
 
+use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
 use did_hosting_common::server::domain_purge::purge_domain_dids;
 use did_hosting_common::server::pending_purge;
 use did_hosting_common::server::store::Store;
@@ -71,6 +72,34 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
                     deleted = report.deleted,
                     "purge sweep: ripe entry processed"
                 );
+
+                // Soft-delete-with-grace path: the DomainEntry itself
+                // must be removed too. Unassign-grace (the other
+                // reason) keeps the DomainEntry so the operator can
+                // re-assign the domain to a different server later.
+                if entry.reason == DISABLE_PURGE_REASON {
+                    match domain::delete_domain_record(store, &entry.domain).await {
+                        Ok(()) => {
+                            info!(
+                                domain = %entry.domain,
+                                "purge sweep: disabled-domain record deleted"
+                            );
+                        }
+                        Err(e) => {
+                            // The pending entry stays — next tick
+                            // will retry. DIDs are already gone;
+                            // worst case we leave a 'Disabled' shell
+                            // entry until the operator intervenes.
+                            warn!(
+                                domain = %entry.domain,
+                                error = %e,
+                                "purge sweep: failed to delete domain record; entry retained for next tick"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 if let Err(e) = pending_purge::cancel(store, &entry.domain).await {
                     // Stale entry will be re-tried on the next tick;
                     // the second `purge_domain_dids` call is harmless
@@ -238,6 +267,129 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// `disable-grace` ripe entry → DIDs purged AND domain record
+    /// itself removed. Distinguishes the soft-delete path from the
+    /// unassignment path (which retains the DomainEntry).
+    #[tokio::test]
+    async fn sweep_deletes_domain_record_for_disable_grace() {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        use did_hosting_common::server::store::KS_DOMAINS;
+
+        let store = fjall_store().await;
+        seed(&store, "alice", "soft-delete.example").await;
+
+        // Seed the DomainEntry directly (skip the disable_domain
+        // helper to avoid the default-domain conflict check; this
+        // test just needs the row present so we can verify the
+        // sweeper deletes it).
+        let domains_ks = store.keyspace(KS_DOMAINS).unwrap();
+        let entry = DomainEntry {
+            name: "soft-delete.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Disabled,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: Some(0),
+            purge_at: Some(1),
+        };
+        domains_ks
+            .insert(b"soft-delete.example".to_vec(), &entry)
+            .await
+            .unwrap();
+
+        // Ripe disable-grace pending row.
+        schedule(
+            &store,
+            "soft-delete.example",
+            0,
+            1,
+            DISABLE_PURGE_REASON,
+            "did:example:admin",
+        )
+        .await
+        .unwrap();
+
+        let purged = run_sweep_once(&store).await;
+        assert_eq!(purged, 1);
+
+        // DIDs gone.
+        let dids_ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(
+            dids_ks
+                .get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Domain record gone.
+        assert!(
+            domain::get_domain(&store, "soft-delete.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Pending entry cleared.
+        assert!(
+            pending_purge::get(&store, "soft-delete.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Existing unassign sweep path still retains the DomainEntry —
+    /// regression guard for the new branch above.
+    #[tokio::test]
+    async fn sweep_unassign_grace_preserves_domain_record() {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        use did_hosting_common::server::store::KS_DOMAINS;
+
+        let store = fjall_store().await;
+        seed(&store, "carol", "unassign.example").await;
+
+        let domains_ks = store.keyspace(KS_DOMAINS).unwrap();
+        let entry = DomainEntry {
+            name: "unassign.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Active,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        };
+        domains_ks
+            .insert(b"unassign.example".to_vec(), &entry)
+            .await
+            .unwrap();
+
+        schedule(&store, "unassign.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        let purged = run_sweep_once(&store).await;
+        assert_eq!(purged, 1);
+
+        // DomainEntry retained.
+        assert!(
+            domain::get_domain(&store, "unassign.example")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

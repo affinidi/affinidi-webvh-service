@@ -917,6 +917,28 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         info!("DIDComm disabled in config");
     }
 
+    // 4c. Durable outbox worker. Drains the control-side outbound
+    // queue per-target; idle until DIDComm is up, then delivers
+    // every queued mutation. Spawned regardless of whether DIDComm
+    // is enabled — the worker no-ops gracefully without a service
+    // handle, and starting it eagerly avoids racing the first
+    // `notify_one`.
+    let (outbox_shutdown_tx, outbox_shutdown_rx) = watch::channel(false);
+    let outbox_handle = if let Some(state) = control_state.as_ref() {
+        let outbox_state = state.clone();
+        let outbox_notify = state.outbox_notify.clone();
+        Some(tokio::spawn(async move {
+            did_hosting_control::outbox::run_outbox_loop(
+                outbox_state,
+                outbox_notify,
+                outbox_shutdown_rx,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
+
     // Wait for HTTP server to complete (shutdown signal received)
     let _ = http_handle.await;
 
@@ -925,6 +947,14 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // 5a. Cancel DIDComm (cancellation token stops the service)
     didcomm_shutdown.cancel();
     info!("DIDComm service stopped");
+
+    let _ = outbox_shutdown_tx.send(true);
+    if let Some(handle) = outbox_handle {
+        match handle.await {
+            Ok(()) => info!("outbox worker stopped"),
+            Err(e) => warn!("outbox worker didn't shut down cleanly: {e}"),
+        }
+    }
 
     // 5b. Stop storage task (includes final flush + persist main_store)
     let _ = storage_shutdown_tx.send(true);
@@ -1239,6 +1269,8 @@ async fn build_control(
         pending_challenges: Arc::new(
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),
+        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
     };
 

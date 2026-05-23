@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
-    VtaConfig,
+    AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
+    StoreConfig, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -36,6 +36,13 @@ pub struct AppConfig {
     pub vta: VtaConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
+    /// Multi-domain hosting knobs. Today the control plane reads
+    /// `hosting.disable_purge_grace` to schedule the soft-delete
+    /// timer; `bootstrap_domains` + `unassigned_purge_grace` are
+    /// server-side concerns (replicated here for shared-store
+    /// deployments where one fjall directory backs both processes).
+    #[serde(default)]
+    pub hosting: HostingConfig,
     /// Trust Tasks (v0.7.0+) configuration.
     #[serde(default)]
     pub trust_tasks: TrustTasksConfig,

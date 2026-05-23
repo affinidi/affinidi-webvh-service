@@ -345,9 +345,7 @@ const AclEntryRow = memo(function AclEntryRow({
     <View style={styles.entryCard}>
       <View style={styles.entryInfo}>
         <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
-          <Text style={styles.entryDid} numberOfLines={1}>
-            {item.did}
-          </Text>
+          <Text style={styles.entryDid}>{item.did}</Text>
         </Link>
         <View style={styles.entryMeta}>
           <View
@@ -1303,7 +1301,10 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     color: colors.textPrimary,
     marginBottom: spacing.xs,
-  },
+    // Long did:peer values have no whitespace; allow mid-token wrapping
+    // so the card doesn't blow past its container on web.
+    wordBreak: "break-all",
+  } as any,
   entryMeta: {
     flexDirection: "row",
     alignItems: "center",

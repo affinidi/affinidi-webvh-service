@@ -256,6 +256,8 @@ fn domain(name: &str, status: DomainStatus) -> DomainEntry {
         watchers: None,
         quota: None,
         well_known_enabled: false,
+        disabled_at: None,
+        purge_at: None,
     }
 }
 
@@ -351,9 +353,15 @@ async fn resolve_side_safety_blocks_cross_domain_and_disabled_domain() {
     assert_eq!(&bytes[..], body.as_bytes());
 
     // Disable domain-a — same request, same Host, now 503 (not 404).
-    did_hosting_common::server::domain::disable_domain(&state.store, "domain-a.example")
-        .await
-        .expect("disable domain-a");
+    did_hosting_common::server::domain::disable_domain(
+        &state.store,
+        "domain-a.example",
+        0,
+        86_400,
+        "did:example:smoke",
+    )
+    .await
+    .expect("disable domain-a");
 
     let response = app
         .oneshot(

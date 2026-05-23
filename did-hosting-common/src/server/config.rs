@@ -224,10 +224,23 @@ pub struct HostingConfig {
     /// here is the canonical config-file representation.
     #[serde(default = "default_unassigned_purge_grace")]
     pub unassigned_purge_grace: String,
+
+    /// Grace period before a *disabled* domain (and every DID hosted
+    /// under it) is permanently removed. Disable is a soft-delete:
+    /// the operator gets this window to re-enable and cancel the
+    /// removal. Format matches `unassigned_purge_grace`. Default:
+    /// `"30d"` — long enough to recover from an accidental disable,
+    /// short enough that abandoned domains don't accumulate forever.
+    #[serde(default = "default_disable_purge_grace")]
+    pub disable_purge_grace: String,
 }
 
 fn default_unassigned_purge_grace() -> String {
     "2h".to_string()
+}
+
+fn default_disable_purge_grace() -> String {
+    "30d".to_string()
 }
 
 impl Default for HostingConfig {
@@ -235,6 +248,7 @@ impl Default for HostingConfig {
         Self {
             bootstrap_domains: Vec::new(),
             unassigned_purge_grace: default_unassigned_purge_grace(),
+            disable_purge_grace: default_disable_purge_grace(),
         }
     }
 }

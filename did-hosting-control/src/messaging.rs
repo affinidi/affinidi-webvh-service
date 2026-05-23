@@ -1157,6 +1157,7 @@ mod tests {
             vta: VtaConfig::default(),
             registry: RegistryConfig::default(),
             trust_tasks: Default::default(),
+            hosting: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -1184,6 +1185,7 @@ mod tests {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            outbox_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         (state, dir)
@@ -2189,6 +2191,7 @@ mod tests {
             vta: state.config.vta.clone(),
             registry: state.config.registry.clone(),
             trust_tasks: state.config.trust_tasks.clone(),
+            hosting: state.config.hosting.clone(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);

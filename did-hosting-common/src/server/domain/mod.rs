@@ -41,7 +41,7 @@ pub use safety::{
 pub use scope::{DomainResolveError, DomainScope, resolve_request_domain};
 pub use seed::{SeedOutcome, SeedTier, seed_domains_first_boot};
 pub use store::{
-    create_domain, delete_domain_record, disable_domain, enable_domain, get_default_domain,
-    get_domain, list_domains, set_default_domain, update_domain,
+    DISABLE_PURGE_REASON, create_domain, delete_domain_record, disable_domain, enable_domain,
+    get_default_domain, get_domain, list_domains, set_default_domain, update_domain,
 };
 pub use types::{DomainBranding, DomainEntry, DomainQuota, DomainStatus, DomainUrlScheme};

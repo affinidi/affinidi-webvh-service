@@ -20,8 +20,8 @@ use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAs
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, RegistryConfig, ServerConfig,
-    StoreConfig, VtaConfig,
+    AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
+    ServerConfig, StoreConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -247,6 +247,7 @@ pub async fn apply_recipe(
         },
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
+        hosting: HostingConfig::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

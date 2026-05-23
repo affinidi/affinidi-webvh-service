@@ -369,7 +369,7 @@ export default function DidList() {
                     <Text style={styles.statusPending}>Pending upload</Text>
                   ) : (
                     <View style={styles.didIdRow}>
-                      <Text style={styles.statusActive} numberOfLines={1}>
+                      <Text style={styles.statusActive}>
                         {item.didId ?? "Uploaded"}
                       </Text>
                       {item.didId && (
@@ -551,7 +551,10 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     color: colors.success,
     flexShrink: 1,
-  },
+    // Long did:peer values have no whitespace; allow mid-token wrapping
+    // so the row doesn't blow past its container on web.
+    wordBreak: "break-all",
+  } as any,
   copyButton: {
     backgroundColor: colors.bgTertiary,
     borderRadius: radii.sm,

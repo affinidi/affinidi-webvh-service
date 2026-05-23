@@ -8,8 +8,8 @@
 use crate::acl::{AclEntry, Role};
 use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, RegistryConfig, SecretsConfig,
-    ServerConfig, StoreConfig, VtaConfig,
+    AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
+    SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -243,6 +243,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         },
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
+        hosting: HostingConfig::default(),
         config_path: output_path.clone(),
     };
 
@@ -900,6 +901,7 @@ pub async fn run_setup_offline_complete(
         },
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
+        hosting: HostingConfig::default(),
         config_path: state.config_output.clone(),
     };
 

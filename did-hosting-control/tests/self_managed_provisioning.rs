@@ -65,6 +65,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         vta: VtaConfig::default(), // headline: all None
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
+        hosting: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -96,6 +97,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA

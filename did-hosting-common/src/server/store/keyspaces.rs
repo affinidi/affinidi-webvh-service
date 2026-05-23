@@ -74,3 +74,14 @@ pub const KS_ASSIGNMENTS: &str = "assignments";
 /// `pending_purges:<server>:<domain>:<scheduled_at>` — pending grace-
 /// period purges queued after a `domain/unassign/1.0` Trust Task.
 pub const KS_PENDING_PURGES: &str = "pending_purges";
+
+/// `outbox:<target_did>:<enqueue_micros>:<uuid>` — durable outbound
+/// DIDComm queue. Every control→server mutation (assign, unassign,
+/// purge, domain-upsert, sync-update, sync-delete) is persisted here
+/// before delivery is attempted. The outbox worker drains entries in
+/// per-target FIFO order; on transient failure the entry stays in the
+/// keyspace with an updated retry timestamp, so a server outage
+/// doesn't lose mutations and a control restart doesn't drop in-
+/// flight work. Receivers must remain idempotent because the
+/// delivery guarantee is at-least-once.
+pub const KS_OUTBOUND_QUEUE: &str = "outbox";

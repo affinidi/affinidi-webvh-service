@@ -48,7 +48,10 @@ export interface DomainQuota {
   maxBytes?: number | null;
 }
 
-/** Server-side `DomainEntry` (`KS_DOMAINS`). camelCase wire shape. */
+/** Server-side `DomainEntry` (`KS_DOMAINS`). The wire is snake_case (the
+ *  Rust struct has no `rename_all`); this interface is camelCase and the
+ *  raw response is run through `normalizeDomain()` at the API boundary
+ *  before reaching the UI. */
 export interface DomainEntry {
   name: string;
   label: string | null;
@@ -61,12 +64,63 @@ export interface DomainEntry {
   watchers: string[] | null;
   quota: DomainQuota | null;
   wellKnownEnabled: boolean;
+  /** Unix seconds when disable was called. Null while Active. The
+   *  domain + every hosted DID is permanently removed at `purgeAt`
+   *  unless the operator re-enables before then. */
+  disabledAt: number | null;
+  /** Unix seconds at which the disabled domain becomes eligible for
+   *  the background purge sweep. Null while Active. */
+  purgeAt: number | null;
 }
 
 export interface DomainListResponse {
   domains: DomainEntry[];
   /** Currently-elected system default; may be null on a fresh install. */
   default: string | null;
+}
+
+// snake_case → camelCase normalization at the wire boundary. The server's
+// Rust DomainEntry has no #[serde(rename_all = "camelCase")] attribute and
+// adding it would invalidate already-stored fjall records, so we hydrate
+// here instead. Accepts either case (forward-compat if the server ever
+// flips).
+function normalizeBranding(b: any): DomainBranding | null {
+  if (!b) return null;
+  return {
+    logoUrl: b.logoUrl ?? b.logo_url ?? null,
+    primaryColor: b.primaryColor ?? b.primary_color ?? null,
+    displayName: b.displayName ?? b.display_name ?? null,
+  };
+}
+function normalizeQuota(q: any): DomainQuota | null {
+  if (!q) return null;
+  return {
+    maxDids: q.maxDids ?? q.max_dids ?? null,
+    maxBytes: q.maxBytes ?? q.max_bytes ?? null,
+  };
+}
+function normalizeDomain(raw: any): DomainEntry {
+  return {
+    name: raw.name,
+    label: raw.label ?? null,
+    scheme: raw.scheme,
+    status: raw.status,
+    createdAt: raw.createdAt ?? raw.created_at,
+    defaultDomain: raw.defaultDomain ?? raw.default_domain ?? false,
+    branding: normalizeBranding(raw.branding),
+    witnesses: raw.witnesses ?? null,
+    watchers: raw.watchers ?? null,
+    quota: normalizeQuota(raw.quota),
+    wellKnownEnabled: raw.wellKnownEnabled ?? raw.well_known_enabled ?? false,
+    disabledAt: raw.disabledAt ?? raw.disabled_at ?? null,
+    purgeAt: raw.purgeAt ?? raw.purge_at ?? null,
+  };
+}
+function normalizeDomainList(raw: any): DomainListResponse {
+  return {
+    domains: (raw.domains ?? []).map(normalizeDomain),
+    default: raw.default ?? null,
+  };
 }
 
 /** Per-ACL `DomainScope`. Tagged with `kind` per spec §3 wire shape. */
@@ -438,6 +492,11 @@ export interface ServerInfoResponse {
    *  hasn't configured one (signed trust tasks will then be refused by the
    *  server). */
   server_did: string | null;
+  /** Soft-delete grace period applied when a domain is disabled, in
+   *  seconds. The Domains screen reads this to render the deletion
+   *  countdown copy. `null` if config is missing/unparseable — UI
+   *  falls back to a generic warning without a specific duration. */
+  disable_purge_grace_seconds: number | null;
 }
 
 // Cache the server-info response for the lifetime of the tab. The server's
@@ -738,12 +797,14 @@ export const api = {
   // ---- Multi-domain (v0.7) ----
 
   /** GET /api/domains — Admin only. */
-  listDomains: () => request<DomainListResponse>("/api/domains"),
+  listDomains: () =>
+    request<any>("/api/domains").then(normalizeDomainList),
 
   /** GET /api/me/domains — caller-scoped subset; returns the caller's
    * default in the `default` field (falls back to the system default
    * when the caller's scope is `All` / `Allowed` without a default). */
-  listMyDomains: () => request<DomainListResponse>("/api/me/domains"),
+  listMyDomains: () =>
+    request<any>("/api/me/domains").then(normalizeDomainList),
 
   /** POST /api/domains — Admin creates a new domain. `setAsDefault`
    * promotes it to the system default in the same call. */
@@ -758,7 +819,7 @@ export const api = {
     wellKnownEnabled?: boolean;
     setAsDefault?: boolean;
   }) =>
-    request<DomainEntry>("/api/domains", {
+    request<any>("/api/domains", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -772,7 +833,7 @@ export const api = {
         well_known_enabled: input.wellKnownEnabled,
         set_as_default: input.setAsDefault,
       }),
-    }),
+    }).then(normalizeDomain),
 
   /** PUT /api/domains/{name} — Admin updates metadata. Status,
    * default-flag, and created_at are preserved. */
@@ -788,7 +849,7 @@ export const api = {
       wellKnownEnabled: boolean;
     }>,
   ) =>
-    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}`, {
+    request<any>(`/api/domains/${encodeURIComponent(name)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -800,23 +861,23 @@ export const api = {
         quota: updates.quota,
         well_known_enabled: updates.wellKnownEnabled,
       }),
-    }),
+    }).then(normalizeDomain),
 
   disableDomain: (name: string) =>
-    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}/disable`, {
+    request<any>(`/api/domains/${encodeURIComponent(name)}/disable`, {
       method: "POST",
-    }),
+    }).then(normalizeDomain),
 
   enableDomain: (name: string) =>
-    request<DomainEntry>(`/api/domains/${encodeURIComponent(name)}/enable`, {
+    request<any>(`/api/domains/${encodeURIComponent(name)}/enable`, {
       method: "POST",
-    }),
+    }).then(normalizeDomain),
 
   setDefaultDomain: (name: string) =>
-    request<DomainEntry>(
+    request<any>(
       `/api/domains/${encodeURIComponent(name)}/set-default`,
       { method: "POST" },
-    ),
+    ).then(normalizeDomain),
 
   // ---- Registry + per-(server, domain) ops (admin) ----
 
