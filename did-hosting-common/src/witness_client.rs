@@ -66,7 +66,7 @@ impl WitnessClient {
             uuid::Uuid::new_v4().to_string(),
             "https://affinidi.com/webvh/1.0/authenticate".to_string(),
             json!({
-                "challenge": challenge_resp.data.challenge,
+                "challenge": challenge_resp.challenge,
                 "session_id": challenge_resp.session_id,
             }),
         )
@@ -91,7 +91,7 @@ impl WitnessClient {
             .await?;
 
         // 7. Store token
-        self.access_token = Some(auth_resp.data.access_token.clone());
+        self.access_token = Some(auth_resp.tokens.access_token.clone());
 
         debug!("authenticated with witness server");
 

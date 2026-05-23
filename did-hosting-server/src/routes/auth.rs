@@ -5,8 +5,8 @@ use serde::Deserialize;
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::server::didcomm_unpack;
 use did_hosting_common::{
-    AuthenticateData, AuthenticateResponse, ChallengeData, ChallengeResponse, RefreshData,
-    RefreshResponse,
+    AuthenticateResponse, ChallengeResponse, RefreshResponse, Session as WireSession, TokenBundle,
+    epoch_to_rfc3339,
 };
 
 use crate::acl::check_acl;
@@ -82,9 +82,15 @@ pub async fn challenge(
     did_hosting_common::server::metrics::inc_auth_challenge();
     info!(audit = true, did = %session.did, session_id = %session.session_id, "auth challenge issued");
 
+    // Canonical wire: { challenge, sessionId, expiresAt }. expiresAt
+    // reflects the configured challenge_ttl.
+    let expires_at_epoch = session
+        .created_at
+        .saturating_add(state.config.auth.challenge_ttl);
     Ok(Json(ChallengeResponse {
+        challenge,
         session_id,
-        data: ChallengeData { challenge },
+        expires_at: epoch_to_rfc3339(expires_at_epoch),
     }))
 }
 
@@ -189,15 +195,7 @@ pub async fn authenticate(
     did_hosting_common::server::metrics::inc_auth_success();
     info!(audit = true, did = %session.did, role = %role, session_id = %session.session_id, "authentication successful");
 
-    Ok(Json(AuthenticateResponse {
-        session_id: token_resp.session_id,
-        data: AuthenticateData {
-            access_token: token_resp.access_token,
-            access_expires_at: token_resp.access_expires_at,
-            refresh_token: token_resp.refresh_token,
-            refresh_expires_at: token_resp.refresh_expires_at,
-        },
-    }))
+    Ok(Json(token_resp.into_canonical()))
 }
 
 // ---------- POST /auth/refresh ----------
@@ -295,13 +293,7 @@ pub async fn refresh(
         "token refreshed",
     );
 
-    Ok(Json(RefreshResponse {
-        session_id: token_response.session_id,
-        data: RefreshData {
-            access_token: token_response.access_token,
-            access_expires_at: token_response.access_expires_at,
-            refresh_token: token_response.refresh_token,
-            refresh_expires_at: token_response.refresh_expires_at,
-        },
-    }))
+    // RefreshResponse is a type alias for AuthenticateResponse —
+    // same canonical { session, tokens } shape.
+    Ok(Json(token_response.into_canonical()))
 }

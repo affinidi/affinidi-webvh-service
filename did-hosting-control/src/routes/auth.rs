@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use did_hosting_common::server::auth::constant_time_eq;
-use did_hosting_common::{ChallengeData, ChallengeRequest, ChallengeResponse};
+use did_hosting_common::{ChallengeRequest, ChallengeResponse, epoch_to_rfc3339};
 
 use crate::auth::AuthClaims;
 use crate::auth::session::{self, Session, SessionState, now_epoch};
@@ -90,9 +90,14 @@ pub async fn challenge(
 
     info!(did = %req.did, session_id = %session_id, "challenge issued");
 
+    // Canonical wire: { challenge, sessionId, expiresAt }.
+    let expires_at_epoch = session
+        .created_at
+        .saturating_add(state.config.auth.challenge_ttl);
     Ok(Json(ChallengeResponse {
+        challenge,
         session_id,
-        data: ChallengeData { challenge },
+        expires_at: epoch_to_rfc3339(expires_at_epoch),
     }))
 }
 
@@ -293,15 +298,7 @@ pub async fn authenticate(
 
     info!(did = %session.did, role = %role, "authenticated via SIOPv2 id_token");
 
-    let resp = did_hosting_common::AuthenticateResponse {
-        session_id: token_response.session_id,
-        data: did_hosting_common::AuthenticateData {
-            access_token: token_response.access_token,
-            access_expires_at: token_response.access_expires_at,
-            refresh_token: token_response.refresh_token,
-            refresh_expires_at: token_response.refresh_expires_at,
-        },
-    };
+    let resp = token_response.into_canonical();
     Ok(Json(resp).into_response())
 }
 
@@ -553,13 +550,7 @@ pub async fn refresh(
 
     info!(did = %session.did, "token refreshed");
 
-    Ok(Json(did_hosting_common::RefreshResponse {
-        session_id: token_response.session_id,
-        data: did_hosting_common::RefreshData {
-            access_token: token_response.access_token,
-            access_expires_at: token_response.access_expires_at,
-            refresh_token: token_response.refresh_token,
-            refresh_expires_at: token_response.refresh_expires_at,
-        },
-    }))
+    // RefreshResponse is an alias for AuthenticateResponse — same
+    // canonical { session, tokens } shape.
+    Ok(Json(token_response.into_canonical()))
 }

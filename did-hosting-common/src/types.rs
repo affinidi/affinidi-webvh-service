@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Auth types
+//
+// Wire shapes conform to the cross-cutting `spec/auth/*/0.1` canonical
+// Trust-Task specs in the trusttasks-tf registry. Field names mirror
+// OIDC Core §2 / RFC 8176 / RFC 6749 §5.1 so off-the-shelf identity
+// libraries deserialise the payloads into their native types
+// unchanged.
 // ---------------------------------------------------------------------------
 
 /// Wire shape for `POST /api/auth/challenge`. Conforms to
@@ -16,16 +22,18 @@ pub struct ChallengeRequest {
     pub did: String,
 }
 
+/// Canonical `spec/auth/challenge/0.1#response`:
+/// `{ challenge, sessionId, expiresAt }`. Flat shape — the framework
+/// dropped the `data: {}` envelope; binary fields move to `ext` when
+/// vendor extensions are needed.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChallengeResponse {
-    pub session_id: String,
-    pub data: ChallengeData,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChallengeData {
     pub challenge: String,
+    pub session_id: String,
+    /// ISO-8601 / RFC 3339 timestamp after which the challenge MUST
+    /// NOT be honored.
+    pub expires_at: String,
 }
 
 /// Payload of the `did-hosting/auth/authenticate/1.0` Trust-Task
@@ -57,39 +65,91 @@ pub struct AuthenticatePayload {
     pub session_pubkey_b58btc: Option<String>,
 }
 
+/// Canonical `Session` from `spec/auth/_shared/0.1/session.schema.json`.
+///
+/// Aligns with OIDC Core §2 / RFC 8176:
+/// - `amr`: authentication method references. did-hosting vocabulary
+///   uses `"did"` (SIOPv2 id_token), `"passkey"` (WebAuthn assertion),
+///   `"vta"` (VTA approval token), `"cli"` (process-local synthesis).
+/// - `acr`: authentication context class. `"aal1"` for single-factor
+///   DID, `"aal2"` after a step-up (passkey or VTA approval).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub id: String,
+    pub subject: String,
+    /// ISO-8601 timestamp the session was created.
+    pub issued_at: String,
+    /// ISO-8601 timestamp the session ceases to be valid.
+    pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub amr: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acr: String,
+}
+
+/// Canonical `TokenBundle` from `spec/auth/_shared/0.1/tokens.schema.json`.
+///
+/// OAuth 2.0 (RFC 6749 §5.1) shape: `expiresIn` is seconds from
+/// issuance, not an absolute timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBundle {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_in: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_expires_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+}
+
+/// Canonical `spec/auth/authenticate/0.1#response`: `{ session, tokens }`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticateResponse {
-    pub session_id: String,
-    pub data: AuthenticateData,
+    pub session: Session,
+    pub tokens: TokenBundle,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthenticateData {
-    pub access_token: String,
-    pub access_expires_at: u64,
-    pub refresh_token: String,
-    pub refresh_expires_at: u64,
+#[cfg(feature = "server-core")]
+impl AuthenticateResponse {
+    /// Absolute Unix-second expiry of the access token, computed from
+    /// `session.issued_at + tokens.expires_in`. Returns `None` if
+    /// `session.issued_at` fails to parse as RFC 3339. Feature-gated
+    /// on `server-core` because chrono lives there in did-hosting-common.
+    pub fn access_expires_at_epoch(&self) -> Option<u64> {
+        let issued = chrono::DateTime::parse_from_rfc3339(&self.session.issued_at).ok()?;
+        let issued_epoch = u64::try_from(issued.timestamp()).ok()?;
+        Some(issued_epoch.saturating_add(self.tokens.expires_in))
+    }
+
+    /// Absolute Unix-second expiry of the refresh token, when issued.
+    pub fn refresh_expires_at_epoch(&self) -> Option<u64> {
+        let refresh_secs = self.tokens.refresh_expires_in?;
+        let issued = chrono::DateTime::parse_from_rfc3339(&self.session.issued_at).ok()?;
+        let issued_epoch = u64::try_from(issued.timestamp()).ok()?;
+        Some(issued_epoch.saturating_add(refresh_secs))
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshResponse {
-    pub session_id: String,
-    pub data: RefreshData,
-}
+/// Refresh shares the authenticate shape — same canonical
+/// `{ session, tokens }` body. Kept as a distinct type alias so
+/// handlers and clients can be explicit about which endpoint they're
+/// talking to without losing the wire-shape contract.
+pub type RefreshResponse = AuthenticateResponse;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshData {
-    pub access_token: String,
-    pub access_expires_at: u64,
-    /// New refresh token. Refresh always rotates the refresh token; the old
-    /// one is invalidated atomically and clients must use this new token for
-    /// the next refresh.
-    pub refresh_token: String,
-    pub refresh_expires_at: u64,
+/// Convert a Unix-epoch second timestamp to the RFC 3339 / ISO-8601
+/// string the canonical wire format uses. Feature-gated on
+/// `server-core` because chrono is server-only in this crate.
+#[cfg(feature = "server-core")]
+pub fn epoch_to_rfc3339(epoch_secs: u64) -> String {
+    let secs = i64::try_from(epoch_secs).unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 // ---------------------------------------------------------------------------

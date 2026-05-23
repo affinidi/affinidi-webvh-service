@@ -232,13 +232,55 @@ pub async fn cleanup_expired_sessions(
 // ---------------------------------------------------------------------------
 
 /// Response payload returned to clients after successful authentication.
+/// Carries the absolute access/refresh expiries + the JWT's AAL claims
+/// so the route handler can synthesise the canonical
+/// `AuthenticateResponse { session, tokens }` shape without
+/// re-deriving them.
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub session_id: String,
+    pub subject: String,
     pub access_token: String,
     pub access_expires_at: u64,
     pub refresh_token: String,
     pub refresh_expires_at: u64,
+    /// Issuance moment (Unix seconds). The canonical wire encodes
+    /// this as `session.issuedAt`; `expiresIn` = `access_expires_at -
+    /// issued_at`.
+    pub issued_at: u64,
+    /// Authentication methods references — `["did"]` for the
+    /// challenge-response path, augmented by step-up handlers.
+    pub amr: Vec<String>,
+    /// Authentication context class — `"aal1"` for single-factor,
+    /// `"aal2"` after step-up.
+    pub acr: String,
+}
+
+impl TokenResponse {
+    /// Convert to the canonical `AuthenticateResponse { session, tokens }`
+    /// wire shape. The route handler calls this once and returns
+    /// `Json(token_resp.into_canonical())`.
+    pub fn into_canonical(self) -> crate::AuthenticateResponse {
+        let session_expires_at_epoch = self.refresh_expires_at.max(self.access_expires_at);
+        crate::AuthenticateResponse {
+            session: crate::Session {
+                id: self.session_id,
+                subject: self.subject,
+                issued_at: crate::epoch_to_rfc3339(self.issued_at),
+                expires_at: crate::epoch_to_rfc3339(session_expires_at_epoch),
+                amr: self.amr,
+                acr: self.acr,
+            },
+            tokens: crate::TokenBundle {
+                access_token: self.access_token,
+                refresh_token: Some(self.refresh_token),
+                token_type: "Bearer".to_string(),
+                expires_in: self.access_expires_at.saturating_sub(self.issued_at),
+                refresh_expires_in: Some(self.refresh_expires_at.saturating_sub(self.issued_at)),
+                scope: Vec::new(),
+            },
+        }
+    }
 }
 
 /// Generate access + refresh tokens for an authenticated session.
@@ -301,10 +343,15 @@ pub async fn finalize_challenge_session(
 
     Ok(TokenResponse {
         session_id: session.session_id.clone(),
+        subject: session.did.clone(),
         access_token,
         access_expires_at,
         refresh_token,
         refresh_expires_at,
+        issued_at: now_epoch(),
+        // DIDComm challenge-response: single DID-key factor.
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
     })
 }
 
@@ -355,10 +402,19 @@ pub async fn create_authenticated_session(
 
     Ok(TokenResponse {
         session_id,
+        subject: did.to_string(),
         access_token,
         access_expires_at,
         refresh_token,
         refresh_expires_at,
+        issued_at: now_epoch(),
+        // create_authenticated_session is the shared SIOPv2/passkey
+        // entry; SIOPv2 callers pass session_pubkey_b58btc=None and
+        // get the DID-only factor. Passkey callers pass a key and get
+        // the same AAL — the WebAuthn factor is recorded by the
+        // passkey-finish route handler upgrading the claim.
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
     })
 }
 
@@ -391,7 +447,7 @@ pub async fn elevate_session(
         role.to_string(),
         access_expiry,
     );
-    claims.amr = amr;
+    claims.amr = amr.clone();
     claims.acr = acr.to_string();
     let access_expires_at = claims.exp;
     let token_id = claims.jti.clone();
@@ -408,9 +464,13 @@ pub async fn elevate_session(
 
     Ok(TokenResponse {
         session_id: session_id.to_string(),
+        subject: session.did.clone(),
         access_token,
         access_expires_at,
         refresh_token,
         refresh_expires_at,
+        issued_at: now_epoch(),
+        amr,
+        acr: acr.to_string(),
     })
 }
