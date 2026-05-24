@@ -41,7 +41,7 @@ pub async fn challenge(
     headers: HeaderMap,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
-    // Input validation
+    // Input validation (route-layer concern).
     if req.did.len() > 512 {
         return Err(AppError::Validation("DID exceeds maximum length".into()));
     }
@@ -56,9 +56,10 @@ pub async fn challenge(
             warn!(ip = %client_ip, error = %e, "challenge IP rate limited");
         })?;
 
-    // Reserve a pending-challenge slot. Rejects on per-DID cap or
-    // global cap; the global cap is the defence against an attacker
-    // sweeping millions of distinct DIDs.
+    // Reserve a pending-challenge slot via the O(1) tracker. Per-DID
+    // cap + global cap (against DID-sweep attacks). The canonical
+    // handler's per-DID limit is disabled in this backend; the
+    // tracker is the single source of truth.
     state
         .pending_challenges
         .try_issue(&req.did, MAX_PENDING_CHALLENGES_PER_DID)
@@ -67,41 +68,21 @@ pub async fn challenge(
             warn!(did = %req.did, error = %e, "challenge rate limited");
         })?;
 
-    let challenge_bytes = rand::random::<[u8; 32]>();
-    let challenge = challenge_bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let session_id = uuid::Uuid::new_v4().to_string();
-
-    let session = Session {
-        session_id: session_id.clone(),
-        did: req.did.clone(),
-        challenge: challenge.clone(),
-        state: SessionState::ChallengeSent,
-        created_at: now_epoch(),
-        refresh_token: None,
-        refresh_expires_at: None,
-        tee_attested: false,
-        token_id: None,
-        session_pubkey_b58btc: None,
-        // AAL is unknown at challenge time; populated on authenticate.
-        amr: Vec::new(),
-        acr: String::new(),
-    };
-
-    session::store_session(&state.sessions_ks, &session).await?;
-
-    info!(did = %req.did, session_id = %session_id, "challenge issued");
-
-    // Canonical wire: { challenge, sessionId, expiresAt }.
-    let expires_at_epoch = session
-        .created_at
-        .saturating_add(state.config.auth.challenge_ttl);
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
+    let canonical = vti_common::auth::handlers::handle_challenge(
+        &backend,
+        vti_common::auth::ChallengeInput {
+            did: req.did,
+            session_pubkey_b58btc: None,
+        },
+    )
+    .await?;
+    // did-hosting's ChallengeResponse drops the canonical
+    // `teeAttestation` field — did-hosting doesn't run in a TEE.
     Ok(Json(ChallengeResponse {
-        challenge,
-        session_id,
-        expires_at: epoch_to_rfc3339(expires_at_epoch),
+        challenge: canonical.challenge,
+        session_id: canonical.session_id,
+        expires_at: canonical.expires_at,
     }))
 }
 
@@ -129,19 +110,9 @@ pub async fn authenticate(
     use did_hosting_common::server::didcomm_unpack;
     use did_hosting_common::v1_aliases;
 
-    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+    let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
-    // ─── 1. Parse the authenticate envelope.
-    //
-    // The did-hosting task identifiers (`https://trusttasks.org/did-hosting/
-    // …`) are exact-match routed strings, *not* framework `/spec/<slug>/
-    // <ver>` `TypeUri`s. So the body cannot be deserialized as
-    // `trust_tasks_rs::TrustTask<Value>`: that type's `type_uri: TypeUri`
-    // field runs the strict `/spec/` parser and rejects our flat URI. We
-    // parse a minimal envelope by hand and match the `type` string the same
-    // way the DIDComm dispatcher matches `msg.typ` — via `v1_aliases`. A
-    // parse failure emits a routed `trust-task-error/0.1` document with
-    // `code: malformed_request` (same pattern as the /trust-tasks endpoint).
+    // ─── 1. Parse the Trust-Task envelope.
     #[derive(serde::Deserialize)]
     struct AuthEnvelope {
         #[serde(rename = "type")]
@@ -158,9 +129,6 @@ pub async fn authenticate(
         }
     };
 
-    // Envelope `type` must canonicalise to the authenticate task. Accepts
-    // both the canonical `did-hosting/auth/authenticate/1.0` URL and its
-    // legacy `affinidi.com/webvh/1.0/authenticate` alias.
     let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_0_1.as_str();
     if v1_aliases::canonicalize(&envelope.type_uri) != Some(expected_type) {
         return Ok(trust_task_malformed(&format!(
@@ -178,45 +146,20 @@ pub async fn authenticate(
         }
     };
 
-    // ─── 2–4. Verify the SIOPv2 id_token: signature over
-    //          `header.payload` against the `iss` did:key's resolved
-    //          Ed25519 authentication key, with `iss == sub`.
+    // ─── 2. SIOPv2 id_token verification (transport layer).
+    //
+    // Verifies signature against the iss did:key, checks
+    // iss == sub, returns the bound claims. Everything else —
+    // session lookup, challenge match, signer-DID-binds-to-
+    // session-DID, challenge TTL — flows through the canonical
+    // handler.
     let verified = didcomm_unpack::verify_siop_id_token(&payload.id_token, did_resolver).await?;
 
-    // ─── 6. Look up the session named by the payload's `session_id`.
-    let mut session = session::get_session(&state.sessions_ks, &payload.session_id)
-        .await?
-        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
-
-    // ─── 7. Session must be awaiting a challenge response.
-    if session.state != SessionState::ChallengeSent {
-        return Err(AppError::Authentication(
-            "session already authenticated".into(),
-        ));
-    }
-
-    // ─── 6 (cont). nonce must equal the issued challenge (constant-time).
-    if !constant_time_eq(session.challenge.as_bytes(), verified.nonce.as_bytes()) {
-        warn!(session_id = %payload.session_id, "authentication rejected: nonce mismatch");
-        return Err(AppError::Authentication("nonce mismatch".into()));
-    }
-
-    // ─── 7 (cont). Same challenge-TTL check as the legacy flow.
-    let now = now_epoch();
-    if now.saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
-        session::delete_session(&state.sessions_ks, &payload.session_id).await?;
-        // Free the pending-challenge slot so the legitimate caller
-        // can re-issue. Without this, an expired challenge would
-        // hold the slot until the per-DID cap caused subsequent
-        // challenges to fail with the wrong error.
-        state.pending_challenges.release(&session.did).await;
-        return Err(AppError::Authentication("challenge expired".into()));
-    }
-
-    // ─── 5. `aud` must equal this service's RP identifier (its own
-    //        DID, configured as `server_did`). Without a configured
-    //        server DID there is no RP identity to bind the token to,
-    //        so refuse rather than accept an unbound token.
+    // ─── 3. id_token-layer checks the canonical handler doesn't
+    //        know about: audience binding to this service's
+    //        `server_did`, plus the JWT's own iat/exp window.
+    //        These are properties of the SIOPv2 token, not the
+    //        challenge-response session.
     let rp_id = state.config.server_did.as_deref().ok_or_else(|| {
         AppError::Config("server_did not configured; cannot verify id_token `aud`".into())
     })?;
@@ -231,20 +174,7 @@ pub async fn authenticate(
         ));
     }
 
-    // ─── 8. The authenticated DID is `iss`; it must match the DID the
-    //        challenge was issued to (replaces the legacy
-    //        `sender_base != session.did` check).
-    if verified.issuer != session.did {
-        warn!(
-            expected = %session.did,
-            actual = %verified.issuer,
-            "DID mismatch in authentication",
-        );
-        return Err(AppError::Authentication("DID mismatch".into()));
-    }
-
-    // ─── 9. Token freshness: `exp` in the future, `iat` not in the
-    //        future (small skew tolerance) and not after `exp`.
+    let now = now_epoch();
     const CLOCK_SKEW_SECS: u64 = 60;
     if verified.expires_at <= now {
         return Err(AppError::Authentication("id_token has expired".into()));
@@ -260,50 +190,87 @@ pub async fn authenticate(
         ));
     }
 
-    // Determine role from ACL.
-    let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
-
-    // ─── 10. Optional: pick up the client's ephemeral session pubkey
-    // (Ed25519 multikey, base58btc-encoded with the `z` prefix).
-    // Stored on the session so `dispatch_trust_task` can verify
-    // Data Integrity proofs on REQUIRED-spec trust-task requests
-    // came from the same browser session that authenticated.
-    //
-    // We validate the prefix shape minimally — only ed25519
-    // multikey is supported today (`z6Mk` is the base58btc-encoded
-    // multicodec 0xed01 prefix). Anything else is rejected so the
-    // server doesn't accept a key shape it can't later resolve via
-    // `did:key`.
-    if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
+    // ─── 4. Session pubkey validation (route-layer concern —
+    //        the canonical handler treats it opaquely).
+    let session_pubkey_b58btc = if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
         if !pk.starts_with("z6Mk") {
             warn!(prefix = %&pk[..pk.len().min(8)], "rejected unsupported session-key shape");
             return Err(AppError::Authentication(
                 "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
             ));
         }
-        session.session_pubkey_b58btc = Some(pk.to_string());
-    }
+        Some(pk.to_string())
+    } else {
+        None
+    };
 
-    // Finalize session and issue tokens — same primitive as the legacy
-    // flow, so the JWT shape and lifetimes are unchanged.
-    let token_response = session::finalize_challenge_session(
-        &state.sessions_ks,
-        jwt_keys,
-        &mut session,
-        &role,
-        state.config.auth.access_token_expiry,
-        state.config.auth.refresh_token_expiry,
+    // ─── 5. Capture the DID up-front so we can release the
+    //        pending-challenge slot regardless of canonical-handler
+    //        outcome.
+    let signer_did = verified.issuer.clone();
+
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
+    let result = vti_common::auth::handlers::handle_authenticate(
+        &backend,
+        vti_common::auth::AuthenticateInput {
+            session_id: payload.session_id.clone(),
+            challenge: verified.nonce.clone(),
+            signer_did: signer_did.clone(),
+            // SIOPv2 / REST — no DIDComm created_time to thread.
+            created_time: None,
+            session_pubkey_b58btc,
+        },
     )
-    .await?;
+    .await;
 
-    // Free the pending-challenge slot now that the session has
-    // transitioned to Authenticated.
-    state.pending_challenges.release(&session.did).await;
+    // Always release the pending-challenge slot on success.
+    // On failure the slot remains until either the legitimate
+    // caller retries (re-issue replaces) or the session TTL
+    // sweeper reaps it — same behaviour as the pre-migration
+    // flow.
+    match result {
+        Ok(resp) => {
+            state.pending_challenges.release(&signer_did).await;
+            info!(did = %signer_did, "authenticated via SIOPv2 id_token");
+            Ok(Json(canonical_to_local_auth_response(resp)).into_response())
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    info!(did = %session.did, role = %role, "authenticated via SIOPv2 id_token");
-
-    let resp = token_response.into_canonical();
-    Ok(Json(resp).into_response())
+/// Translate the canonical
+/// `vti_common::auth::handlers::handle_*` response (shape from
+/// vti-common's internal vta-sdk pin) into did-hosting's
+/// workspace-vta-sdk-pinned wire type. Both shapes are
+/// byte-identical on the wire (same JSON via serde) so the
+/// translation is pure field-copy — but Rust treats the two
+/// versions of vta-sdk as distinct types, so we copy fields
+/// explicitly.
+///
+/// When vta-sdk consolidates onto a single published version
+/// (next vti-common publish to crates.io) this helper goes away
+/// in favour of a direct `From` impl.
+fn canonical_to_local_auth_response(
+    a: vta_sdk::protocols::auth::AuthenticateResponse,
+) -> did_hosting_common::AuthenticateResponse {
+    did_hosting_common::AuthenticateResponse {
+        session: did_hosting_common::Session {
+            id: a.session.id,
+            subject: a.session.subject,
+            issued_at: a.session.issued_at,
+            expires_at: a.session.expires_at,
+            amr: a.session.amr,
+            acr: a.session.acr,
+        },
+        tokens: did_hosting_common::TokenBundle {
+            access_token: a.tokens.access_token,
+            refresh_token: a.tokens.refresh_token,
+            token_type: a.tokens.token_type,
+            expires_in: a.tokens.expires_in,
+            refresh_expires_in: a.tokens.refresh_expires_in,
+            scope: a.tokens.scope,
+        },
+    }
 }
 
 /// Build a `trust-task-error/0.1` HTTP response for a malformed
@@ -464,18 +431,22 @@ pub async fn step_up_vta_finish(
 }
 
 /// POST /api/auth/refresh — refresh an access token.
+///
+/// Thin dispatcher: parse the JWS-signed DIDComm refresh
+/// envelope (proves the holder has the signing key, not just the
+/// bearer refresh token), then call the canonical refresh
+/// handler. The canonical handler atomically claims the
+/// refresh-token reverse-index, preserves the pre-rotation AAL,
+/// re-looks-up the ACL role, and mints a new session +
+/// access/refresh pair.
 pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<did_hosting_common::RefreshResponse>, AppError> {
     use did_hosting_common::server::didcomm_unpack;
 
-    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
+    let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
-    // Parity with server/witness: refresh requires a JWS-signed DIDComm
-    // envelope addressed by the holder of the session DID. Proves
-    // possession of the signing key, not just the bearer refresh token,
-    // so a leaked refresh token alone cannot rotate a victim's tokens.
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
@@ -489,83 +460,17 @@ pub async fn refresh(
         .body
         .get("refresh_token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
+        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?
+        .to_string();
 
-    // Atomically claim and consume the refresh-token → session_id index in
-    // a single backend operation (Redis GETDEL / DynamoDB DeleteItem with
-    // ReturnValues=ALL_OLD / fjall mutex). Exactly one concurrent request
-    // with the same token sees `Some` here, even across replicas. Losers
-    // see `None` and reject as if the token were invalid — which it now
-    // is, having been consumed by the winner.
-    let session_id = session::take_session_id_by_refresh(&state.sessions_ks, refresh_token)
-        .await?
-        .ok_or_else(|| AppError::Authentication("invalid refresh token".into()))?;
-
-    let session = session::get_session(&state.sessions_ks, &session_id)
-        .await?
-        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
-
-    // Bind the JWS signer to the session DID. Same invariant as server/witness:
-    // signing proves possession of the right key for *this* session, not just
-    // some key for some DID.
-    if sender_base != session.did {
-        warn!(
-            session_id = %session.session_id,
-            session_did = %session.did,
-            sender = %sender_base,
-            "refresh rejected: signer DID does not match session DID",
-        );
-        return Err(AppError::Authentication(
-            "signer DID does not match session DID".into(),
-        ));
-    }
-
-    // Verify session is in Authenticated state
-    if session.state != SessionState::Authenticated {
-        warn!(session_id = %session.session_id, "refresh rejected: session not authenticated");
-        return Err(AppError::Authentication("session not authenticated".into()));
-    }
-
-    // Check refresh token hasn't expired
-    if let Some(expires_at) = session.refresh_expires_at
-        && now_epoch() > expires_at
-    {
-        session::delete_session(&state.sessions_ks, &session_id).await?;
-        return Err(AppError::Authentication("refresh token expired".into()));
-    }
-
-    // Preserve the pre-rotation AAL so a step-upped session stays at
-    // aal2 across refresh. A session row written before the
-    // persistence landed has empty amr/acr — fall back to ["did"]/
-    // "aal1" which matches the pre-migration behaviour.
-    let preserved_amr_acr = if session.amr.is_empty() {
-        None
-    } else {
-        Some((session.amr.clone(), session.acr.clone()))
-    };
-
-    // Refresh rotates everything: a brand-new session id, access token, and
-    // refresh token. The old session is deleted atomically so a leaked
-    // refresh token cannot be reused.
-    session::delete_session(&state.sessions_ks, &session.session_id).await?;
-
-    let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
-
-    let token_response = session::create_authenticated_session(
-        &state.sessions_ks,
-        jwt_keys,
-        &session.did,
-        &role,
-        state.config.auth.access_token_expiry,
-        state.config.auth.refresh_token_expiry,
-        None,
-        preserved_amr_acr,
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
+    let resp = vti_common::auth::handlers::handle_refresh(
+        &backend,
+        vti_common::auth::RefreshInput {
+            refresh_token,
+            signer_did: Some(sender_base),
+        },
     )
     .await?;
-
-    info!(did = %session.did, "token refreshed");
-
-    // RefreshResponse is an alias for AuthenticateResponse — same
-    // canonical { session, tokens } shape.
-    Ok(Json(token_response.into_canonical()))
+    Ok(Json(canonical_to_local_auth_response(resp)))
 }

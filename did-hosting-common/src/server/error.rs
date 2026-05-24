@@ -108,6 +108,33 @@ pub enum QuotaKind {
     Count,
 }
 
+/// Conversion from the canonical auth-flow errors in
+/// vti-common into did-hosting's `AppError`. Mirrors the
+/// `From<AuthError> for vti_common::AppError` impl on the
+/// VTI side — the canonical /auth/* handlers raise
+/// `vti_common::AuthError` variants and each service's
+/// `AppError` knows how to render them through its own
+/// `IntoResponse` plumbing.
+impl From<vti_common::auth::backend::AuthError> for AppError {
+    fn from(e: vti_common::auth::backend::AuthError) -> Self {
+        use vti_common::auth::backend::AuthError as A;
+        match e {
+            A::Forbidden | A::DidMethodRejected => AppError::Forbidden(e.to_string()),
+            A::PendingChallengeLimitReached => AppError::Validation(e.to_string()),
+            A::SessionNotFound
+            | A::SessionStateMismatch
+            | A::ChallengeMismatch
+            | A::ChallengeExpired
+            | A::SignerMismatch
+            | A::StaleMessage
+            | A::RefreshTokenInvalid
+            | A::RefreshTokenExpired => AppError::Authentication(e.to_string()),
+            A::AttestationFailed(msg) => AppError::Internal(format!("tee attestation: {msg}")),
+            A::Internal(msg) => AppError::Internal(msg),
+        }
+    }
+}
+
 impl AppError {
     /// Create a tagged validation error.
     pub fn validation(kind: ValidationKind, msg: impl Into<String>) -> Self {

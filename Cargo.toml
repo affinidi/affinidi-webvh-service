@@ -105,8 +105,16 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK
-vta-sdk = { version = "0.6", features = [
+# VTA SDK — pinned to the same git rev as vti-common
+# (did-hosting-common/Cargo.toml) so the two crates resolve to a
+# single vta-sdk version. Without this, the cross-repo auth-
+# architecture work pulls two `vta-sdk` packages into the dep
+# graph and Rust treats their `protocols::auth::*` types as
+# distinct.
+#
+# Switches back to a crates.io dep at the same major.minor when
+# vta-sdk publishes alongside vti-common.
+vta-sdk = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", rev = "58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b", features = [
   "session",
   "provision-integration",
   "provision-client",

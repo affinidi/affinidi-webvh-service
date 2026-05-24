@@ -2735,6 +2735,7 @@ dependencies = [
  "affinidi-tdk",
  "affinidi-tdk-common",
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
@@ -2782,6 +2783,7 @@ dependencies = [
  "url",
  "uuid",
  "vta-sdk 0.6.0",
+ "vti-common",
  "webauthn-rs",
 ]
 
@@ -2825,6 +2827,7 @@ dependencies = [
  "affinidi-tdk",
  "affinidi-tdk-common",
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
@@ -2872,6 +2875,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vta-sdk 0.6.0",
+ "vti-common",
 ]
 
 [[package]]
@@ -9098,14 +9102,12 @@ dependencies = [
 [[package]]
 name = "vta-sdk"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bff1e0c2c00bc1ccdc85d380f8f3a63b1f1a420ea9e8bda3da871aa5cb108e9"
+source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b#58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b"
 dependencies = [
- "aes 0.9.0",
- "aes-gcm",
  "affinidi-crypto",
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-vc",
@@ -9113,6 +9115,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "curve25519-dalek",
+ "didwebvh-rs",
  "ed25519-dalek",
  "getrandom 0.4.2",
  "hpke",
@@ -9133,7 +9136,7 @@ dependencies = [
 [[package]]
 name = "vti-common"
 version = "0.7.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=436c110c568f2a49b806c9e53077e7dcc9671c9c#436c110c568f2a49b806c9e53077e7dcc9671c9c"
+source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b#58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b"
 dependencies = [
  "affinidi-tdk",
  "async-trait",
@@ -9157,6 +9160,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vta-sdk 0.6.0",
 ]
 
 [[package]]
@@ -9468,6 +9472,7 @@ dependencies = [
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
+ "async-trait",
  "axum",
  "axum-extra",
  "chrono",
@@ -9491,6 +9496,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vta-sdk 0.6.0",
+ "vti-common",
 ]
 
 [[package]]
