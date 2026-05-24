@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.8.0"
+version = "0.7.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-secrets-resolver",

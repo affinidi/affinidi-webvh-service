@@ -1,74 +1,6 @@
 # Changelog
 
-## 0.8.0 (unreleased)
-
-### Auth-architecture consolidation with vti-common (S1+S2+S3)
-
-did-hosting's `/auth/*` surface now dispatches through the canonical
-handlers in `vti_common::auth::handlers`. Closes the structural
-follow-ups from the May 2026 cross-system auth security review.
-
-#### Added
-
-- **`did_hosting_common::server::auth::DidHostingSessionStore`** —
-  `vti_common::auth::SessionStore` adapter over did-hosting's
-  `KeyspaceHandle`. Honours did-hosting's separate storage trait
-  (fjall, Redis, DynamoDB backends) while consuming the canonical
-  `Session` type from vti-common.
-- **`AuthBackend` impls per service**:
-  - `did_hosting_control::auth::DidHostingControlAuthBackend`
-    (REST SIOPv2; per-DID rate-limiting via the existing O(1)
-    `PendingChallengeTracker`, canonical handler's limit disabled
-    via `max_pending_challenges_per_did = 0`).
-  - `did_hosting_server::auth::DidHostingServerAuthBackend`
-    (DIDComm-only; canonical per-DID limit replaces the previous
-    O(N) prefix-scan).
-  - `webvh_witness::auth::WebvhWitnessAuthBackend`
-    (DIDComm-only; canonical per-DID limit replaces the previous
-    O(N) prefix-scan).
-- **Re-exported `Session` + `SessionState` from vti-common** —
-  `did_hosting_common::server::auth::session` now thin-wraps
-  `vti_common::auth::session::{Session, SessionState}`. Field
-  shape unchanged (the canonical type's `tee_attested` is
-  `#[serde(default)]`; did-hosting never sets it).
-- **Trust-Task URI dual-accept** — `did-hosting-server` and
-  `webvh-witness` `/auth/` + `/auth/refresh` accept both the
-  legacy `affinidi.com/webvh/1.0/...` URIs and the canonical
-  `trusttasks.org/spec/auth/{authenticate,refresh}/0.1` URIs.
-  Migration-window behaviour; drop the alias one minor release
-  after every client upgrades.
-
-#### Changed
-
-- **`From<AuthError> for AppError`** — the canonical handler's
-  typed `vti_common::auth::AuthError` variants render through
-  did-hosting's existing `IntoResponse` plumbing without
-  backend-specific glue.
-- **Cross-repo dependency** — `did-hosting-common` (and consumer
-  crates) now depend on `vti-common` via a pinned git rev during
-  the consolidation window. Switches to a crates.io dep at
-  `version = "0.7"` once vti-common 0.7 publishes.
-- **Workspace `vta-sdk` pin** moved to the same git rev so the
-  two repos resolve to a single `vta-sdk` version (rather than
-  two co-existing copies — the workspace pin + the
-  vti-common-internal pin).
-
-#### Removed
-
-- did-hosting-common's local `Session` + `SessionState` definitions.
-  Replaced by re-export from vti-common.
-- did-hosting-{control,server,witness}'s in-line `/auth/*` flow
-  logic (~250 lines). Each handler is now a thin dispatcher
-  around the canonical handler.
-
-#### Note
-
-The full operator-side documentation update — runtime config
-keys, `pnm services` topology, the new `trust_xff` flag, the
-`step_up_required` body shape — will land alongside the
-did-hosting docs refresh in the next minor.
-
-## 0.7.0 (unreleased)
+## 0.7.0 (2026-05-24)
 
 ### Added — Trust Tasks framework adoption
 
@@ -115,8 +47,9 @@ did-hosting docs refresh in the next minor.
   Constructed at startup when `did_resolver` is configured (the
   verifier shares the same DID-resolver cache as the DIDComm path).
 - **`AppConfig` gains `trust_tasks: TrustTasksConfig`.** New section
-  with a single `enforce_proofs: bool` knob (default `false`;
-  revisited in v0.8.0).
+  with a single `enforce_proofs: bool` knob (initial default `false`;
+  flipped to `true` later in this release — see *Upstream alignment*
+  below).
 - **UI ACL surface (`did-hosting-ui`) routes through `/api/trust-tasks`.**
   The four `api.{list,create,update,delete}Acl` methods plus a new
   `api.aclShow` now POST trust-task envelopes. Wire-shape translation
@@ -293,11 +226,79 @@ dispatch core:
    * The framework's `AffinidiVerifier` then does the actual
      signature verification (via the existing
      `CachedDidResolver` which already supports `did:key`).
-- **`[patch.crates-io]` rev bumped to
-  [`21db8a8`](https://github.com/trustoverip/dtgwg-trust-tasks-tf/commit/21db8a8a031a59797a2cc49ad800158e644d51e4)
-  on `dtgwg-trust-tasks-tf`.** This is the PR #33 merge commit;
-  drops along with the rest of `[patch.crates-io]` when the
-  upstream publishes to crates.io.
+- **`trust-tasks` family pinned to `0.1.1` on crates.io.** The PR #33
+  changes shipped upstream as `trust-tasks-rs` 0.1.1 (published
+  2026-05-24); the workspace dep moves to the crates.io pin and the
+  transitional `[patch.crates-io]` block has been removed.
+
+### Auth-architecture consolidation with vti-common
+
+did-hosting's `/auth/*` surface now dispatches through the canonical
+handlers in `vti_common::auth::handlers`. Closes the structural
+follow-ups from the May 2026 cross-system auth security review.
+
+#### Added
+
+- **`did_hosting_common::server::auth::DidHostingSessionStore`** —
+  `vti_common::auth::SessionStore` adapter over did-hosting's
+  `KeyspaceHandle`. Honours did-hosting's separate storage trait
+  (fjall, Redis, DynamoDB backends) while consuming the canonical
+  `Session` type from vti-common.
+- **`AuthBackend` impls per service**:
+  - `did_hosting_control::auth::DidHostingControlAuthBackend`
+    (REST SIOPv2; per-DID rate-limiting via the existing O(1)
+    `PendingChallengeTracker`, canonical handler's limit disabled
+    via `max_pending_challenges_per_did = 0`).
+  - `did_hosting_server::auth::DidHostingServerAuthBackend`
+    (DIDComm-only; canonical per-DID limit replaces the previous
+    O(N) prefix-scan).
+  - `webvh_witness::auth::WebvhWitnessAuthBackend`
+    (DIDComm-only; canonical per-DID limit replaces the previous
+    O(N) prefix-scan).
+- **Re-exported `Session` + `SessionState` from vti-common** —
+  `did_hosting_common::server::auth::session` now thin-wraps
+  `vti_common::auth::session::{Session, SessionState}`. Field
+  shape unchanged (the canonical type's `tee_attested` is
+  `#[serde(default)]`; did-hosting never sets it). The wire-shape
+  `Session` in `did_hosting_common::types` (the OIDC Core §2
+  response body) is a distinct type and is unchanged.
+- **Trust-Task URI dual-accept** — `did-hosting-server` and
+  `webvh-witness` `/auth/` + `/auth/refresh` accept both the
+  legacy `affinidi.com/webvh/1.0/...` URIs and the canonical
+  `trusttasks.org/spec/auth/{authenticate,refresh}/0.1` URIs.
+  Migration-window behaviour; drop the alias one minor release
+  after every client upgrades.
+
+#### Changed
+
+- **`From<AuthError> for AppError`** — the canonical handler's
+  typed `vti_common::auth::AuthError` variants render through
+  did-hosting's existing `IntoResponse` plumbing without
+  backend-specific glue.
+- **Cross-repo dependency** — `did-hosting-common` (and consumer
+  crates) now depend on `vti-common = "0.7"` from crates.io
+  (published 2026-05-24 alongside this release).
+- **Workspace `vta-sdk` pin** moved to `version = "0.7"` on
+  crates.io so the two repos resolve to a single `vta-sdk`
+  version (rather than two co-existing copies — the workspace
+  pin + the vti-common-internal pin).
+
+#### Removed
+
+- did-hosting-common's local *storage-side* `Session` +
+  `SessionState` definitions. Replaced by re-export from
+  vti-common. (The wire-shape `Session` in
+  `did_hosting_common::types` is unrelated and remains.)
+- did-hosting-{control,server,witness}'s in-line `/auth/*` flow
+  logic (~250 lines). Each handler is now a thin dispatcher
+  around the canonical handler.
+
+#### Note
+
+The full operator-side documentation update — runtime config
+keys, `pnm services` topology, the new `trust_xff` flag, the
+`step_up_required` body shape — lands in v0.8.0 alongside the
+broader did-hosting docs refresh.
 
 ### Changed — **BREAKING**
 
