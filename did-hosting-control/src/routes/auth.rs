@@ -82,6 +82,7 @@ pub async fn challenge(
         created_at: now_epoch(),
         refresh_token: None,
         refresh_expires_at: None,
+        tee_attested: false,
         token_id: None,
         session_pubkey_b58btc: None,
         // AAL is unknown at challenge time; populated on authenticate.

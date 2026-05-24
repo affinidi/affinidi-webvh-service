@@ -379,7 +379,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "hex",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "humantime",
  "metrics",
@@ -2501,7 +2501,7 @@ dependencies = [
  "cbc",
  "dbus",
  "fastrand",
- "hkdf",
+ "hkdf 0.12.4",
  "num",
  "once_cell",
  "sha2 0.10.9",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-secrets-resolver",
@@ -2717,6 +2717,7 @@ dependencies = [
  "url",
  "uuid",
  "vta-sdk 0.6.0",
+ "vti-common",
  "webauthn-rs",
  "webauthn-rs-proto",
  "windows-native-keyring-store",
@@ -3101,7 +3102,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf",
+ "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -4005,6 +4006,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4044,7 +4054,7 @@ dependencies = [
  "chacha20poly1305",
  "digest 0.10.7",
  "generic-array",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "p256",
  "rand_core 0.9.5",
@@ -9118,6 +9128,35 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "vti-common"
+version = "0.7.0"
+source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=436c110c568f2a49b806c9e53077e7dcc9671c9c#436c110c568f2a49b806c9e53077e7dcc9671c9c"
+dependencies = [
+ "affinidi-tdk",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "ed25519-dalek",
+ "fjall",
+ "hex",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "http-body-util",
+ "jsonwebtoken",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

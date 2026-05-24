@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-common"
 description = "WebVH Common, Common methods and structs related to WebVH Content"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -83,6 +83,19 @@ url = { workspace = true }
 # without further plumbing.
 ipnetwork = "0.21"
 vta-sdk = { workspace = true }
+
+# Cross-repo dep on the VTI Verifiable Trust Infrastructure
+# foundation crate. We consume only the canonical `Session` and
+# `SessionState` types from `vti_common::auth::session`; the
+# storage helpers and JWT machinery live on this side of the
+# dep boundary because did-hosting has its own KeyspaceHandle
+# and AppError abstractions.
+#
+# Pinned by `rev` during the S1/S2 auth-architecture
+# consolidation (see openvtc/verifiable-trust-infrastructure
+# auth-arch RFC). When vti-common 0.7 publishes to crates.io
+# this becomes a crates.io dep at the same major.minor.
+vti-common = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", rev = "436c110c568f2a49b806c9e53077e7dcc9671c9c", default-features = false }
 
 # server-core dependencies (optional)
 axum = { version = "0.8", optional = true }

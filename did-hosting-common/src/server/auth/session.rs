@@ -4,82 +4,19 @@ use crate::server::acl::Role;
 use crate::server::auth::jwt::JwtKeys;
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-/// Session lifecycle state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SessionState {
-    ChallengeSent,
-    Authenticated,
-}
-
-/// A session record stored under `session:{session_id}`.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub session_id: String,
-    pub did: String,
-    pub challenge: String,
-    pub state: SessionState,
-    pub created_at: u64,
-    pub refresh_token: Option<String>,
-    pub refresh_expires_at: Option<u64>,
-    /// Current token ID — JWT `jti` must match this to be valid. Rotated on
-    /// each token issue/refresh so old tokens are immediately invalidated.
-    #[serde(default)]
-    pub token_id: Option<String>,
-    /// Optional ephemeral session pubkey — Ed25519 multikey encoded as
-    /// base58btc with the `z` prefix (e.g. `z6MkfBwQrx…`). Set by the
-    /// client during login so the server can verify Data Integrity
-    /// proofs (`eddsa-jcs-2022`) on REQUIRED-spec trust-task requests.
-    /// The corresponding `did:key:<this>` is the verificationMethod the
-    /// client uses on every signed envelope.
-    ///
-    /// `None` when the client did not register a session pubkey
-    /// (legacy clients, backend callers signing with their own DID's
-    /// key); REQUIRED-spec dispatch then rejects proofless envelopes
-    /// per the framework's IS_PROOF_REQUIRED gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_pubkey_b58btc: Option<String>,
-    /// AAL claims persisted across token rotation. Mirrors the JWT's
-    /// `amr` / `acr` so refresh re-mints at the same authentication
-    /// level — a session that was step-upped to aal2 stays at aal2
-    /// across the 15-minute access-token rotation rather than
-    /// silently dropping back to aal1.
-    ///
-    /// `#[serde(default)]` on both: a session row written before
-    /// these fields landed deserialises with empty vector / empty
-    /// string, which the refresh handler treats as "unknown AAL —
-    /// fall back to aal1". Same behaviour as pre-migration.
-    #[serde(default)]
-    pub amr: Vec<String>,
-    #[serde(default)]
-    pub acr: String,
-}
-
-// Manual `Debug` redacts the secret fields (challenge, refresh_token, token_id)
-// so a casual `tracing::debug!(?session, …)` does not leak material a leak-
-// detector would flag. Non-secret fields (session_id, did, state, timestamps)
-// stay visible for diagnostics.
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("session_id", &self.session_id)
-            .field("did", &self.did)
-            .field("challenge", &"<redacted>")
-            .field("state", &self.state)
-            .field("created_at", &self.created_at)
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("refresh_expires_at", &self.refresh_expires_at)
-            .field("token_id", &self.token_id.as_ref().map(|_| "<redacted>"))
-            .field("session_pubkey_b58btc", &self.session_pubkey_b58btc)
-            .finish()
-    }
-}
+// Canonical Session + SessionState now live in vti-common
+// (`vti_common::auth::session`). Re-exported here so existing
+// `use crate::server::auth::session::Session` paths keep
+// compiling unchanged after the cross-repo unification.
+//
+// The storage helpers below (store_session, get_session, …)
+// keep operating on did-hosting's own `KeyspaceHandle` +
+// `AppError`; only the wire/storage shape is shared.
+pub use ::vti_common::auth::session::{Session, SessionState};
 
 fn session_key(session_id: &str) -> String {
     format!("session:{session_id}")
@@ -434,6 +371,7 @@ pub async fn create_authenticated_session(
         created_at: now_epoch(),
         refresh_token: Some(refresh_token.clone()),
         refresh_expires_at: Some(refresh_expires_at),
+        tee_attested: false,
         token_id: Some(token_id),
         session_pubkey_b58btc,
         amr: amr.clone(),

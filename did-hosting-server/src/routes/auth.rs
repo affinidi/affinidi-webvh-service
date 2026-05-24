@@ -5,8 +5,7 @@ use serde::Deserialize;
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::server::didcomm_unpack;
 use did_hosting_common::{
-    AuthenticateResponse, ChallengeResponse, RefreshResponse, Session as WireSession, TokenBundle,
-    epoch_to_rfc3339,
+    AuthenticateResponse, ChallengeResponse, RefreshResponse, epoch_to_rfc3339,
 };
 
 use crate::acl::check_acl;
@@ -72,6 +71,7 @@ pub async fn challenge(
         created_at: now_epoch(),
         refresh_token: None,
         refresh_expires_at: None,
+        tee_attested: false,
         token_id: None,
         session_pubkey_b58btc: None,
         // AAL is unknown at challenge time; populated on authenticate.

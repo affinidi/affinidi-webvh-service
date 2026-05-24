@@ -48,7 +48,7 @@ name = "did-hosting-control"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
 trust-tasks-rs = { workspace = true }

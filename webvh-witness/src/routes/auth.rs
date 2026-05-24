@@ -44,6 +44,7 @@ pub async fn challenge(
         created_at: now,
         refresh_token: None,
         refresh_expires_at: None,
+        tee_attested: false,
         token_id: None,
         session_pubkey_b58btc: None,
         amr: Vec::new(),

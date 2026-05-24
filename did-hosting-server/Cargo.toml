@@ -51,7 +51,7 @@ name = "did-hosting-server"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
