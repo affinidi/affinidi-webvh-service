@@ -9,10 +9,10 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use did_hosting_common::server::auth::constant_time_eq;
-use did_hosting_common::{ChallengeRequest, ChallengeResponse, epoch_to_rfc3339};
+use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
 use crate::auth::AuthClaims;
-use crate::auth::session::{self, Session, SessionState, now_epoch};
+use crate::auth::session::{self, now_epoch};
 use crate::error::AppError;
 use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;

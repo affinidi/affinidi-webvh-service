@@ -91,6 +91,14 @@ webvh-watcher --config watcher-config.toml
 
 See each crate's README for detailed setup instructions.
 
+> **Building with `--no-default-features`?** The DID-method
+> features (`method-webvh`, `method-web`) are part of the default
+> set on `did-hosting-server` and `did-hosting-common`. A
+> minimal build that drops them compiles fine but silently
+> 404s every public DID resolution. If you customise features,
+> opt the methods back in explicitly — see
+> [did-hosting-server/README.md](did-hosting-server/README.md#did-method-features).
+
 ### Option 3: Non-interactive / scripted setup
 
 Every `setup` subcommand accepts `--from <recipe.toml>` for CI / scripted
