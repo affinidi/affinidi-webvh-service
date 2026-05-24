@@ -52,7 +52,7 @@ path = "src/main.rs"
 
 [dependencies]
 did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
-vti-common = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", rev = "58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b", default-features = false }
+vti-common = { version = "0.7", default-features = false }
 async-trait = "0.1"
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }

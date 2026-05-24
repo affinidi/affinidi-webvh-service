@@ -2716,7 +2716,7 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
  "vti-common",
  "webauthn-rs",
  "webauthn-rs-proto",
@@ -2782,7 +2782,7 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
  "vti-common",
  "webauthn-rs",
 ]
@@ -2811,7 +2811,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
  "webvh-watcher",
  "webvh-witness",
 ]
@@ -2874,7 +2874,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
  "vti-common",
 ]
 
@@ -9105,8 +9105,9 @@ dependencies = [
 
 [[package]]
 name = "vta-sdk"
-version = "0.6.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b#58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcfddb2f41f35ad49650e63848aa32ddaecb7f24b4e2337561d7a586e2fd7faf"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -9140,7 +9141,8 @@ dependencies = [
 [[package]]
 name = "vti-common"
 version = "0.7.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b#58d8bf3bd5288792e5f104eb2bd7cb3e50d5e72b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156af7bdef1e51916492a0f501fd790197e112beae3b8fac2eed8756204ce8f"
 dependencies = [
  "affinidi-tdk",
  "async-trait",
@@ -9164,7 +9166,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
 ]
 
 [[package]]
@@ -9499,7 +9501,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk 0.6.0",
+ "vta-sdk 0.7.0",
  "vti-common",
 ]
 
