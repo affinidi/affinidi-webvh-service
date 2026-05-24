@@ -124,9 +124,11 @@ vta-sdk = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). 0.1.x pre-publication: resolved via the
-# [patch.crates-io] block below. When the upstream crates land on
-# crates.io, drop the [patch] block and these resolve normally.
+# Trust Tasks (DTGWG, ToIP). Now on crates.io at 0.1.1 (DTGWG
+# PR #36 merged + published 2026-05-24); the `[patch.crates-io]`
+# git pin that lived here through the pre-publish window is gone.
+# Bump to 0.1.x in lockstep with verifiable-trust-infrastructure
+# when upstream publishes new patch releases.
 #
 # `validate` feature: deliberately NOT enabled. The codegen-emitted
 # `Payload` structs use `#[serde(deny_unknown_fields)]` plus newtype
@@ -141,36 +143,6 @@ trust-tasks-rs = { version = "0.1", default-features = false }
 trust-tasks-https = { version = "0.1", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.1", default-features = false }
 trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
-
-[patch.crates-io]
-# Pin the trust-tasks crates to a specific upstream commit while
-# they are unpublished. Reproducible: anyone cloning this repo +
-# running `cargo build` fetches the same bytes from GitHub, no
-# sibling checkout required, no risk of CI / dev / packager
-# disagreeing on which trust-tasks bytes they consumed.
-#
-# When the upstream publishes to crates.io, drop this whole
-# [patch.crates-io] block — the workspace.dependencies version
-# pins will then resolve normally. Cargo.lock will be updated by
-# the next `cargo update`; that's the visible diff that
-# documents the transition.
-#
-# Commit chosen: PR #33 ("Harden consumer pipeline: proof-handling +
-# handler ergonomics"). 0.1.1 brings:
-#   * `consume_inbound` handler returns `ErrorResponse` (not
-#     `RejectReason`) and receives the SPEC §4.8.1 `ResolvedParties`
-#     — eliminates our hand-rolled `run_pipeline`.
-#   * `Payload::IS_PROOF_REQUIRED` codegen const — per-spec proof
-#     enforcement, replacing the IS_BEARER+verifier heuristic.
-#   * `ProofPolicy` enum (`Verify`/`RejectIfPresent`/`AcceptUnverified`)
-#     — `enforce_proofs=false` now maps to `RejectIfPresent`.
-#   * `Payload::extended_code(local)` helper — slug sourced from
-#     `TYPE_URI`, can't drift.
-#   * `DynProofVerifier` + `erase_verifier` for `Arc<dyn _>` storage.
-trust-tasks-rs = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
-trust-tasks-https = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
-trust-tasks-didcomm = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
-trust-tasks-proof = { git = "https://github.com/trustoverip/dtgwg-trust-tasks-tf.git", rev = "21db8a8a031a59797a2cc49ad800158e644d51e4" }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.
