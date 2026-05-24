@@ -75,7 +75,11 @@ pub async fn authenticate(
     let (msg, sender_base) =
         did_hosting_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
+    if !matches!(
+        msg.typ.as_str(),
+        "https://affinidi.com/webvh/1.0/authenticate"
+            | "https://trusttasks.org/spec/auth/authenticate/0.1"
+    ) {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ
@@ -120,7 +124,11 @@ pub async fn refresh(
     let (msg, sender_base) =
         did_hosting_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+    if !matches!(
+        msg.typ.as_str(),
+        "https://affinidi.com/webvh/1.0/authenticate/refresh"
+            | "https://trusttasks.org/spec/auth/refresh/0.1"
+    ) {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ
