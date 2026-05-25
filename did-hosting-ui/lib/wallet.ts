@@ -91,7 +91,7 @@ export function getApiBase(): string {
 export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
   if (!isWalletAvailable()) {
     throw new Error(
-      "VTI wallet extension is not installed (or this isn't running in a web browser).",
+      "VTA wallet extension is not installed (or this isn't running in a web browser).",
     );
   }
   return window.vtaWallet!.login({

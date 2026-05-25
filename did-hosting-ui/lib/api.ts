@@ -1174,7 +1174,7 @@ async function trustTask<Req, Resp>(
       if (!wallet?.signTrustTask) {
         throw new ApiError(
           401,
-          "Wallet-authenticated session but the VTI Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
+          "Wallet-authenticated session but the VTA Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
         );
       }
       const signed = await wallet.signTrustTask({
