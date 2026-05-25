@@ -577,6 +577,124 @@ broader did-hosting docs refresh.
   `openssl 0.10.79` and `rustls-webpki 0.103.13` advisories on the
   default-features Rust build.
 
+### Follow-ups — security review + domain UX (2026-05-25)
+
+A second pass over the v0.7.0 cut against an external security-patch
+series, plus operator-driven UX gaps surfaced once the multi-domain
+features were exercised end-to-end. The wire shape and operator-
+facing config are unchanged; these are correctness, authz, and
+log-hygiene fixes.
+
+#### Security
+
+- **DIDComm `MSG_SERVER_REGISTER` / `MSG_STATS_SYNC` now require the
+  `Service` role exactly.** Both control-plane handlers previously
+  accepted any sender in the ACL (Owner / Service / Admin). The
+  REST equivalents (`POST /api/control/register-service` /
+  `POST /api/control/stats`) are gated on `ServiceAuth` (Service-only);
+  the DIDComm transports are now aligned. The `handle_server_register`
+  case is the higher-impact half: success calls `sync_all_dids_to_server`,
+  which pushes every tenant's DID log + witness content to the caller
+  and subscribes them to all future updates — an Owner-role DID could
+  enumerate the entire fleet's hosted data via a single forged register.
+- **`MSG_SYNC_UPDATE` / `MSG_SYNC_DELETE` bound to the configured
+  `control_did`, not any Service-role DID.** `did-hosting-server`'s
+  sync handlers overwrite or delete arbitrary DIDs by body-supplied
+  mnemonic. The previous `Role::Admin | Role::Service` gate let any
+  peer server, witness, or stale Service ACL entry wipe or replace
+  any hosted DID's log/witness content. New `require_control_plane`
+  helper enforces an exact match against `config.control_did`; missing
+  `control_did` rejects all sync messages (correct — a server without
+  a control plane has no legitimate sender).
+- **`GET /api/services/overview` now requires `AdminAuth`.** Previously
+  any authenticated `AuthClaims` caller could enumerate the backend
+  service registry — internal instance URLs, instance IDs, server
+  DIDs, health status, registration timestamps. The equivalent
+  `/api/control/registry` routes have always required `AdminAuth`; the
+  overview gate is brought in line.
+- **Manual `Debug` impls on credential-bearing config types.**
+  `StoreConfig` (`redis_url`, `cosmosdb_connection_string`),
+  `WatcherEndpoint.token`, `SyncConfig.push_tokens`,
+  `SourceConfig.token`, `EnrollStartRequest.token`, and
+  `CreateInviteResponse.{token, enrollment_url}` previously
+  derived `Debug` and would render the live credential verbatim
+  in any startup `tracing::info!(?config, …)` or error-path debug
+  format. Each now redacts via `<redacted>` (count-only for the
+  `push_tokens` slice). `PlaintextSecrets` already redacted; this
+  closes the gap on every related struct.
+- **Regression test guards the DIDComm refresh signer-binding.** The
+  fix that pins a refresh token to the DIDComm sender DID lives in
+  the upstream `vti-common` crate. Added
+  `did-hosting-server/tests/refresh_signer_binding.rs` — seeds an
+  Alice-owned session, calls `handle_refresh` with a mismatched
+  signer, asserts `AppError::Authentication`. Catches a future
+  backend swap silently dropping the binding parameter.
+
+#### Fixed — domain assignment surfaces correctly in the UI
+
+- **`POST /api/control/registry/{id}/domains/{domain}/{op}` now returns
+  JSON on 202.** All three handlers (`assign`, `unassign`, `purge`)
+  previously returned bare `StatusCode::ACCEPTED` with no body. The
+  UI's `request()` helper short-circuits 204 only — on any other
+  status it validates `application/json` and throws
+  `"Expected JSON response but got unknown content type"`. Each
+  handler now returns `(StatusCode::ACCEPTED, Json(json!({…})))`
+  with the operation, instance ID, and domain so the UI gets a
+  structured ack.
+- **Control-plane DIDComm router handles `domain/{assign,unassign,purge}-ack`.**
+  Servers send these after applying the matching outbound op. The
+  router had no entries, so each ack fell through to `handle_fallback`
+  and logged `inbound DIDComm: unhandled message type — ignoring`.
+  A new `handle_domain_ack` records the ack at info-level (parallel
+  to the existing `handle_sync_ack`).
+- **`served_domains` populated end-to-end.** The control plane's
+  registry view (and the UI's "domains assigned to this server"
+  panel) showed nothing after a successful domain assign. Two-part
+  fix: `did-hosting-server`'s `register_via_didcomm` no longer
+  hardcodes `served_domains: []` (it now lists active local domains
+  from `list_domains(&state.store)`), and `handle_domain_ack` mirrors
+  each ack into the matching `ServiceInstance.served_domains` so the
+  registry updates immediately without waiting for the next server
+  boot. Restart-recovery and live-update paths converge on the same
+  identity (`sender.replace(':', "_")`, the same derivation
+  `handle_server_register` already uses).
+
+#### Added — admin escape hatch for disabled domains
+
+- **`DELETE /api/domains/{name}` (Admin-only) force-deletes a disabled
+  domain**, bypassing the `hosting.disable_purge_grace` cooling-off
+  window the background sweep otherwise waits out. Refuses when the
+  domain is Active (operator must disable first — same two-step safety
+  the UI already enforces) or when it's the current default
+  (`delete_domain_record` already gates this and surfaces as
+  `Conflict`). The pending-purge row is cancelled after the record
+  is removed so the next sweep doesn't try to delete a row that's
+  already gone. Mounted alongside the existing `PUT /domains/{name}`
+  under `TASK_DOMAIN_UPDATE_1_0` (same pattern as `/registry/{id}`
+  chaining GET+DELETE under one Trust-Task URI).
+- **`?purge_servers=true` adds one-click fleet-wide purge.** When set,
+  every registry instance whose `served_domains` lists the domain
+  receives a `domain.purge/1.0` (T30) DIDComm message before the
+  control-plane record is removed. Fire-and-forget over DIDComm;
+  the local delete proceeds without waiting for acks, and
+  `handle_domain_ack` drops the domain from `served_domains` as
+  servers ack back. Per-instance failures during fanout are logged
+  but never block the overall delete — operators can re-run the
+  per-server "Purge now" on any that missed.
+- **Three buttons on disabled domain cards.** UI gains "Delete now"
+  (record-only) and "Purge & delete" (fleet-wide) destructive buttons
+  alongside the existing "Enable". Each has a confirm dialog that
+  spells out the blast radius. The "Delete now" path is the
+  recovery route for legacy disabled domains whose `purge_at` was
+  never populated and would otherwise stay stuck forever.
+
+#### Changed
+
+- **Login UI: "Login with VTA Wallet"** replaces "Login with VTI
+  Wallet" on the button + install hint + the two extension-missing
+  error messages. Aligns the user-facing strings with the rest of
+  the codebase (`window.vtaWallet`, etc.).
+
 ## 0.6.0 (2026-05-05)
 
 ### Security
