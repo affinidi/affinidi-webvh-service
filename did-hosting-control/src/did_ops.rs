@@ -216,11 +216,16 @@ async fn resolve_path_for_create(
 /// old DID's log content, witness, and owner-index are removed and the
 /// caller becomes the new owner. Without `force`, a path collision returns
 /// `Conflict` as before.
+/// `domain` is the resolved domain to persist on the new record. `None`
+/// is accepted for callers (older DIDComm paths, tests) that don't yet
+/// route through the resolver; the M-01 backfill sweep will tag those
+/// records on next run.
 pub async fn create_did(
     auth: &AuthClaims,
     state: &AppState,
     path: Option<&str>,
     force: bool,
+    domain: Option<&str>,
 ) -> Result<RequestUriResponse, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
@@ -261,9 +266,14 @@ pub async fn create_did(
         disabled: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
-        domain: String::new(),
+        // Persist the resolved domain so the per-domain UI filters and
+        // the dashboard's per-domain stat cards see the new DID on the
+        // very next list call. Callers that pass `None` (older DIDComm
+        // paths, tests) still produce an empty string and rely on the
+        // M-01 sweep, but the REST `request_uri` handler now always
+        // resolves a concrete value up front.
+        domain: domain.unwrap_or("").to_string(),
     };
 
     let mut batch = state.store.batch();
@@ -511,8 +521,22 @@ pub async fn publish_did(
 
     record.updated_at = now_epoch();
     record.version_count += 1;
-    record.did_id = did_id_val;
+    record.did_id = did_id_val.clone();
     record.content_size = new_size;
+
+    // Backfill `record.domain` from the embedded DID's host on first
+    // publish for records that pre-date the `request_uri` resolver fix
+    // (older slots created with the buggy code path that always stored
+    // `domain: ""`). Without this the per-domain UI filter would keep
+    // hiding the DID until the M-01 sweep next runs. New DIDs created
+    // through `request_uri` already carry the resolved domain — this
+    // only mutates empty entries, so it's idempotent.
+    if record.domain.is_empty()
+        && let Some(did_id) = did_id_val.as_deref()
+        && let Ok(host) = did_hosting_common::server::domain::extract_did_host(did_id)
+    {
+        record.domain = host;
+    }
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1552,7 +1576,7 @@ mod tests_atomic {
         // Reserve the slot. create_did is the "request URI" step — it
         // doesn't write log content and shouldn't bump update counters.
         let baseline = state.stats_collector.get_aggregate().total_updates;
-        create_did(&owner_auth(owner), &state, Some(path), false)
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1595,7 +1619,7 @@ mod tests_atomic {
         let did_log = build_test_did_log("scid-fail", "control.test", path).await;
 
         // Reserve as owner-a, then have owner-b try to publish.
-        create_did(&owner_auth(owner_a), &state, Some(path), false)
+        create_did(&owner_auth(owner_a), &state, Some(path), false, None)
             .await
             .unwrap();
 

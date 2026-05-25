@@ -48,6 +48,12 @@ pub struct RequestUriRequest {
     /// (caller must be admin or current owner of that path).
     #[serde(default)]
     pub force: bool,
+    /// Optional explicit domain — same T34 resolution chain as
+    /// `register_did_atomic`: explicit → caller's ACL default → system
+    /// default → reject. Persisted on the new record so the multi-domain
+    /// filters in the UI see it on the very first list call (without
+    /// waiting for the M-01 sweep).
+    pub domain: Option<String>,
 }
 
 pub async fn request_uri(
@@ -55,11 +61,42 @@ pub async fn request_uri(
     State(state): State<AppState>,
     body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
-    let (path, force) = match body {
-        Some(Json(b)) => (b.path, b.force),
-        None => (None, false),
+    let (path, force, request_domain) = match body {
+        Some(Json(b)) => (b.path, b.force, b.domain),
+        None => (None, false, None),
     };
-    let result = did_ops::create_did(&auth, &state, path.as_deref(), force).await?;
+    // T34 domain resolution mirrors `register_did_atomic`. The reservation
+    // path historically left `record.domain` empty and relied on the M-01
+    // migration to backfill; that left the per-domain UI filter unable to
+    // surface a freshly-created DID until the next sweep. Resolve up front
+    // and persist on the record. When resolution fails (no domains
+    // configured / no default / `Allowed([])` caller with no explicit),
+    // proceed with `None`; publish-time backfill from `did_id` host
+    // will tag the record. This preserves the legacy reservation
+    // semantics for un-domained installs.
+    let acl_scope =
+        match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
+            Some(e) => e.domains,
+            None => did_hosting_common::server::domain::DomainScope::All,
+        };
+    let system_default = did_hosting_common::server::domain::get_default_domain(&state.store)
+        .await
+        .ok()
+        .flatten();
+    let resolved_domain = did_hosting_common::server::domain::resolve_request_domain(
+        request_domain.as_deref(),
+        &acl_scope,
+        system_default.as_deref(),
+    )
+    .ok();
+    let result = did_ops::create_did(
+        &auth,
+        &state,
+        path.as_deref(),
+        force,
+        resolved_domain.as_deref(),
+    )
+    .await?;
 
     // No `notify_servers_delete` on force-replace: `create_did` only
     // reserves the mnemonic, so a delete fan-out would make downstream
@@ -461,19 +498,31 @@ pub struct TimeSeriesPoint {
 pub struct TimeseriesQuery {
     #[serde(default = "default_range")]
     pub range: String,
+    /// Optional domain filter. When omitted, returns the cheap server-
+    /// wide `_all` bucket. When set, the handler enumerates every DID
+    /// whose record `domain` field matches (or whose embedded `did_id`
+    /// host resolves to the same value, for legacy/pre-backfill slots)
+    /// and sums their per-mnemonic buckets at read time. There is no
+    /// per-domain rollup at write time — the buckets are indexed by
+    /// mnemonic and aggregating on read keeps the hot path unchanged.
+    pub domain: Option<String>,
 }
 
 fn default_range() -> String {
     "24h".to_string()
 }
 
-/// GET /api/timeseries — server-wide time-series data.
+/// GET /api/timeseries — server-wide time-series data, optionally
+/// filtered to a specific hosting domain via `?domain=`.
 pub async fn get_server_timeseries(
     _auth: AuthClaims,
     State(state): State<AppState>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
-    let points = query_timeseries(&state.timeseries_ks, "_all", &params.range).await?;
+    let points = match params.domain.as_deref() {
+        None | Some("") => query_timeseries(&state.timeseries_ks, "_all", &params.range).await?,
+        Some(domain) => query_timeseries_by_domain(&state, domain, &params.range).await?,
+    };
     Ok(Json(points))
 }
 
@@ -551,6 +600,116 @@ async fn query_timeseries(
         let mut resolves = 0u64;
         let mut updates = 0u64;
         // Aggregate all 5-min buckets within this step
+        let mut bucket_ts = ts;
+        while bucket_ts < ts + step && bucket_ts <= end {
+            if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
+                resolves += r;
+                updates += u;
+            }
+            bucket_ts += 300;
+        }
+        points.push(TimeSeriesPoint {
+            timestamp: ts,
+            resolves,
+            updates,
+        });
+        ts += step;
+    }
+
+    Ok(points)
+}
+
+/// Read-time per-domain timeseries aggregation.
+///
+/// Walks the `dids` keyspace, selects every record whose `domain`
+/// matches (with a fallback to the host segment of `did_id` for slots
+/// that haven't been backfilled yet), reads each mnemonic's per-DID
+/// buckets, and sums them at the same step granularity as
+/// `query_timeseries`. Cost is O(N_dids_in_domain × buckets_in_range);
+/// the dashboard chart is not the hot path.
+async fn query_timeseries_by_domain(
+    state: &AppState,
+    domain: &str,
+    range: &str,
+) -> Result<Vec<TimeSeriesPoint>, AppError> {
+    use did_hosting_common::server::domain::extract_did_host;
+
+    // 1. Enumerate matching mnemonics. The `dids` keyspace key shape is
+    //    `did:{mnemonic}` for the record blob plus `owner:…` / content
+    //    keys; filter on the `did:` prefix and skip anything that
+    //    deserialises as something other than a `DidRecord`.
+    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+    let mut mnemonics: Vec<String> = Vec::new();
+    for (_key, value) in &raw {
+        let Ok(record) =
+            serde_json::from_slice::<did_hosting_common::did_ops::DidRecord>(value)
+        else {
+            continue;
+        };
+        let matches = if !record.domain.is_empty() {
+            record.domain == domain
+        } else if let Some(did_id) = record.did_id.as_deref() {
+            extract_did_host(did_id)
+                .map(|h| h == domain)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if matches {
+            mnemonics.push(record.mnemonic);
+        }
+    }
+
+    // 2. Fan out per-mnemonic reads and merge the bucket maps. We could
+    //    in theory short-circuit when the domain has zero DIDs, but the
+    //    empty-result path below produces the same all-zeros series the
+    //    chart already renders cleanly, so don't bother special-casing.
+    use std::collections::HashMap;
+
+    #[derive(serde::Deserialize, Default)]
+    struct BucketData {
+        r: u64,
+        u: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (duration, step) = match range {
+        "1h" => (3600u64, 300u64),
+        "7d" => (7 * 24 * 3600, 3600),
+        "30d" => (30 * 24 * 3600, 14400),
+        _ => (24 * 3600, 900),
+    };
+    let cutoff = now.saturating_sub(duration);
+    let start = cutoff / 300 * 300;
+    let end = now / 300 * 300;
+
+    let mut bucket_map: HashMap<u64, (u64, u64)> = HashMap::new();
+    for mnemonic in &mnemonics {
+        let prefix = format!("ts:{mnemonic}:");
+        let raw = state.timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
+        let prefix_len = prefix.len();
+        for (key, value) in &raw {
+            let key_str = std::str::from_utf8(key).unwrap_or_default();
+            if let Some(epoch_str) = key_str.get(prefix_len..)
+                && let Ok(epoch) = epoch_str.parse::<u64>()
+                && epoch >= cutoff
+                && let Ok(data) = serde_json::from_slice::<BucketData>(value)
+            {
+                let entry = bucket_map.entry(epoch).or_insert((0, 0));
+                entry.0 += data.r;
+                entry.1 += data.u;
+            }
+        }
+    }
+
+    let mut points = Vec::new();
+    let mut ts = start;
+    while ts <= end {
+        let mut resolves = 0u64;
+        let mut updates = 0u64;
         let mut bucket_ts = ts;
         while bucket_ts < ts + step && bucket_ts <= end {
             if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {

@@ -360,7 +360,38 @@ pub async fn dispatch_did_op(
                 .get("force")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let result = did_ops::create_did(auth, state, path, force).await?;
+            // T34 domain resolution mirrors the REST `request_uri` handler.
+            // Same chain: explicit on the wire → caller's ACL default →
+            // system default. When resolution fails (no domains
+            // configured / no default / `Allowed([])` caller with no
+            // explicit), we proceed with `None`; publish-time backfill
+            // from `did_id` host will tag the record. This keeps the
+            // legacy behaviour of un-domained installs and pre-T18
+            // tests, while still surfacing the domain on the new record
+            // for the common case where a default exists.
+            let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
+            let acl_scope = match did_hosting_common::server::acl::get_acl_entry(
+                &state.acl_ks,
+                &auth.did,
+            )
+            .await?
+            {
+                Some(e) => e.domains,
+                None => did_hosting_common::server::domain::DomainScope::All,
+            };
+            let system_default =
+                did_hosting_common::server::domain::get_default_domain(&state.store)
+                    .await
+                    .ok()
+                    .flatten();
+            let resolved_domain = did_hosting_common::server::domain::resolve_request_domain(
+                request_domain,
+                &acl_scope,
+                system_default.as_deref(),
+            )
+            .ok();
+            let result =
+                did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await?;
             // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
