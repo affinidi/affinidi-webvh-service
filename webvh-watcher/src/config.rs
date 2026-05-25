@@ -18,7 +18,7 @@ pub struct AppConfig {
     pub config_path: PathBuf,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 pub struct SyncConfig {
     /// Shared secret tokens that source servers must present when pushing.
     #[serde(default)]
@@ -31,10 +31,37 @@ pub struct SyncConfig {
     pub reconcile_interval: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+// `push_tokens` are the shared bearer secrets that gate the /sync push
+// endpoint (checked by SyncAuth via constant_time_eq). Manual Debug avoids
+// leaking the live credentials via tracing or error formatting.
+impl std::fmt::Debug for SyncConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncConfig")
+            .field(
+                "push_tokens",
+                &format_args!("[<{} redacted>]", self.push_tokens.len()),
+            )
+            .field("sources", &self.sources)
+            .field("reconcile_interval", &self.reconcile_interval)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub url: String,
     pub token: Option<String>,
+}
+
+// `token` is the bearer credential this watcher presents when pulling from a
+// source server — same redaction class as SyncConfig.push_tokens above.
+impl std::fmt::Debug for SourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceConfig")
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for AppConfig {

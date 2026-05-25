@@ -19,6 +19,25 @@ use did_hosting_common::server::problem_report::log_problem_report;
 use crate::acl::{Role, check_acl};
 use crate::server::AppState;
 
+/// Sync messages overwrite or delete arbitrary DIDs by mnemonic, so they must
+/// originate from the configured control plane — not merely any Service-role
+/// DID in the local ACL. If no `control_did` is configured all sync messages
+/// are rejected, which is correct: a server without a control plane has no
+/// legitimate sender for them.
+fn require_control_plane(sender: &str, state: &AppState) -> Result<(), (String, Value)> {
+    if state.config.control_did.as_deref() != Some(sender) {
+        warn!(
+            did = sender,
+            "sync message rejected: sender is not the configured control plane"
+        );
+        return Err(problem_report(
+            "e.p.did.unauthorized",
+            "sync messages must originate from the configured control plane",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -192,18 +211,8 @@ async fn do_sync_update(
     use crate::control_register::apply_single_update;
     use did_hosting_common::DidSyncUpdate;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "sync message rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.did.unauthorized",
-            "admin or service role required for sync messages",
-        ));
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let mnemonic = msg
@@ -264,18 +273,8 @@ async fn do_sync_delete(
 ) -> Result<(String, Value), String> {
     use crate::did_ops;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "sync message rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.did.unauthorized",
-            "admin or service role required for sync messages",
-        ));
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let mnemonic = msg

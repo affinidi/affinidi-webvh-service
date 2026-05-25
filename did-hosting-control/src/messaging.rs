@@ -631,16 +631,22 @@ async fn handle_stats_sync(
 
     let sender = require_sender(&ctx)?;
 
-    // Validate ACL
-    if check_acl(&state.acl_ks, sender).await.is_err() {
+    // Require Service role — matches REST `/api/control/stats` which is gated
+    // on ServiceAuth. An Owner-role DID must not be able to write per-DID
+    // stats deltas: doing so would let any tenant tamper with another
+    // server's resolved/update counters.
+    if !matches!(
+        check_acl(&state.acl_ks, sender).await,
+        Ok(crate::acl::Role::Service)
+    ) {
         warn!(
             did = sender,
-            "stats sync via DIDComm rejected: DID not in ACL"
+            "stats sync via DIDComm rejected: Service role required"
         );
         return Ok(Some(
             DIDCommResponse::new(
                 MSG_PROBLEM_REPORT.to_string(),
-                json!({ "code": "e.p.stats.unauthorized", "comment": "DID not in ACL" }),
+                json!({ "code": "e.p.stats.unauthorized", "comment": "service role required" }),
             )
             .thid(message.id.clone()),
         ));
@@ -770,10 +776,32 @@ async fn handle_server_register(
         "inbound DIDComm: server registration request"
     );
 
-    // Require pre-approved ACL entry — the server DID must already be in the
-    // ACL (added by an admin) before it can register.
+    // Require pre-approved ACL entry with the Service role — matches REST
+    // `/api/control/register-service` which is gated on ServiceAuth. An
+    // Owner-role DID must not be able to register as a server: registration
+    // triggers `sync_all_dids_to_server`, which would push every tenant's
+    // DID log + witness content to the caller's DIDComm inbox and add them
+    // to the active-server registry so future `notify_servers_did` updates
+    // also reach them.
     let role = match check_acl(&state.acl_ks, sender).await {
-        Ok(role) => role,
+        Ok(crate::acl::Role::Service) => crate::acl::Role::Service,
+        Ok(other) => {
+            warn!(
+                did = sender,
+                role = %other,
+                "server registration rejected: Service role required"
+            );
+            return Ok(Some(
+                DIDCommResponse::new(
+                    MSG_PROBLEM_REPORT.to_string(),
+                    json!({
+                        "code": "e.p.registration.unauthorized",
+                        "comment": "service role required to register as a server"
+                    }),
+                )
+                .thid(message.id.clone()),
+            ));
+        }
         Err(_) => {
             warn!(
                 did = sender,

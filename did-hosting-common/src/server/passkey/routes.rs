@@ -46,9 +46,21 @@ fn require_jwt_keys<S: PasskeyState>(
 // POST /auth/passkey/enroll/start
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct EnrollStartRequest {
     pub token: String,
+}
+
+// `token` is the 32-byte CSPRNG bearer secret that gates passkey enrollment;
+// redeeming it creates an ACL entry with the invite's baked-in role (up to
+// Admin). Manual Debug prevents a tracing::debug!(?req, …) from logging
+// what is effectively an account-creation credential.
+impl std::fmt::Debug for EnrollStartRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollStartRequest")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -545,11 +557,23 @@ fn default_invite_role() -> String {
     "owner".into()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct CreateInviteResponse {
     pub token: String,
     pub enrollment_url: String,
     pub expires_at: u64,
+}
+
+// Both `token` and `enrollment_url` carry the enrollment bearer secret
+// (the URL embeds the token); redact both.
+impl std::fmt::Debug for CreateInviteResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateInviteResponse")
+            .field("token", &"<redacted>")
+            .field("enrollment_url", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Core logic shared by the REST handler and CLI subcommand.

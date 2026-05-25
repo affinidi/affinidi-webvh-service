@@ -2,7 +2,7 @@
 //!
 //! These routes match what the UI expects (from `did-hosting-ui/lib/api.ts`).
 
-use crate::auth::AuthClaims;
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -688,8 +688,14 @@ pub struct AggregateStats {
 }
 
 /// GET /api/services/overview — full service topology with health and stats.
+///
+/// Admin-only: returns the same registry data that `/api/control/registry`
+/// gates behind `AdminAuth` (internal instance URLs, IDs, server DIDs, health).
+/// A non-admin DID has no business mapping the backend topology — exposing
+/// internal service URLs aids SSRF / lateral movement and the instance IDs
+/// feed directly into the `/api/proxy/{type}/{instance_id}/*` endpoint.
 pub async fn get_services_overview(
-    _auth: AuthClaims,
+    _auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<ServiceOverviewResponse>, AppError> {
     use crate::registry;
