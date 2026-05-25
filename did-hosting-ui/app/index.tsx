@@ -25,7 +25,7 @@ import type {
 export default function Dashboard() {
   const { isAuthenticated, role } = useAuth();
   const api = useApi();
-  const { currentDomain } = useDomains();
+  const { currentDomain, domains } = useDomains();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
@@ -150,6 +150,10 @@ export default function Dashboard() {
                 <Text style={styles.cardValueAccent}>{serverStats.totalDids.toLocaleString()}</Text>
               </View>
               <View style={styles.card}>
+                <Text style={styles.cardLabel}>Domains</Text>
+                <Text style={styles.cardValue}>{domains.length.toLocaleString()}</Text>
+              </View>
+              <View style={styles.card}>
                 <Text style={styles.cardLabel}>Total Resolves</Text>
                 <Text style={styles.cardValue}>{serverStats.totalResolves.toLocaleString()}</Text>
               </View>
@@ -212,7 +216,7 @@ const styles = StyleSheet.create({
   },
   section: {
     width: "100%",
-    maxWidth: 800,
+    maxWidth: 1200,
     marginTop: spacing.xl,
   },
   sectionTitle: {
@@ -228,7 +232,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginBottom: spacing.lg,
     width: "100%",
-    maxWidth: 500,
+    maxWidth: 1200,
   },
   card: {
     backgroundColor: colors.bgSecondary,
@@ -244,7 +248,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.errorBg,
     borderColor: colors.error,
     width: "100%",
-    maxWidth: 500,
+    maxWidth: 1200,
     marginBottom: spacing.lg,
   },
   cardLabel: {
@@ -295,7 +299,7 @@ const styles = StyleSheet.create({
   },
   migrationBanner: {
     width: "100%",
-    maxWidth: 800,
+    maxWidth: 1200,
     backgroundColor: "rgba(31, 229, 205, 0.08)",
     borderColor: colors.teal,
     borderWidth: 1,

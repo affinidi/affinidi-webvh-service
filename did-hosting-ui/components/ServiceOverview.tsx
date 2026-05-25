@@ -304,7 +304,7 @@ function ServiceGroup({
 const styles = StyleSheet.create({
   container: {
     width: "100%",
-    maxWidth: 800,
+    maxWidth: 1200,
   },
   loadingBox: {
     padding: spacing.xxl,
