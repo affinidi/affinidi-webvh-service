@@ -586,8 +586,11 @@ export const api = {
 
   getServicesOverview: () => request<ServiceOverview>("/api/services/overview"),
 
-  getServerTimeseries: (range: TimeRange = "24h") =>
-    request<TimeSeriesPoint[]>(`/api/timeseries?range=${range}`),
+  getServerTimeseries: (range: TimeRange = "24h", domain?: string) => {
+    const q = new URLSearchParams({ range });
+    if (domain) q.set("domain", domain);
+    return request<TimeSeriesPoint[]>(`/api/timeseries?${q.toString()}`);
+  },
 
   getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),

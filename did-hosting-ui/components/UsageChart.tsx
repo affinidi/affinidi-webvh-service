@@ -9,6 +9,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { useApi } from "./ApiProvider";
+import { useDomains } from "./DomainProvider";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { TimeSeriesPoint, TimeRange } from "../lib/api";
 
@@ -33,6 +34,11 @@ function formatTooltipLabel(label: any): string {
 
 export function UsageChart({ mnemonic }: { mnemonic?: string }) {
   const api = useApi();
+  // The dashboard variant (no `mnemonic`) follows the global domain
+  // switcher. The per-DID variant ignores it — a DID is bound to a
+  // single domain and the chart filter would only ever match or hide
+  // its own series.
+  const { currentDomain } = useDomains();
   const [range, setRange] = useState<TimeRange>("24h");
   const [data, setData] = useState<TimeSeriesPoint[]>([]);
   const [loading, setLoading] = useState(true);
@@ -43,7 +49,7 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
     setError(null);
     const fetcher = mnemonic
       ? api.getDidTimeseries(mnemonic, range)
-      : api.getServerTimeseries(range);
+      : api.getServerTimeseries(range, currentDomain ?? undefined);
     fetcher
       .then((points) => {
         setData(points);
@@ -53,7 +59,7 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
         setError(e.message);
         setLoading(false);
       });
-  }, [api, mnemonic, range]);
+  }, [api, mnemonic, range, currentDomain]);
 
   return (
     <View style={styles.card}>

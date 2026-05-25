@@ -42,7 +42,20 @@ export default function Dashboard() {
 
   const domainStats = useMemo(() => {
     if (currentDomain === null || dids === null) return null;
-    const scoped = dids.filter((d) => d.domain === currentDomain);
+    // For records that still carry an empty `domain` (legacy slots
+    // pre-M-01, plus the historical bug where create dropped the
+    // `domain` field) fall back to the host segment of the DID itself
+    // so the per-domain numbers don't read as zero in the gap between
+    // an upgrade and publish-time backfill.
+    const matchesDomain = (d: DidRecord): boolean => {
+      if (d.domain) return d.domain === currentDomain;
+      if (!d.didId) return false;
+      const parts = d.didId.split(":");
+      const host = parts[1] === "webvh" ? parts[3] : parts[2];
+      if (!host) return false;
+      return decodeURIComponent(host) === currentDomain;
+    };
+    const scoped = dids.filter(matchesDomain);
     return {
       totalDids: scoped.length,
       totalResolves: scoped.reduce((s, d) => s + d.totalResolves, 0),
