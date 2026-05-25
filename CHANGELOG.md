@@ -695,6 +695,89 @@ log-hygiene fixes.
   error messages. Aligns the user-facing strings with the rest of
   the codebase (`window.vtaWallet`, etc.).
 
+### Follow-ups — UX polish, branding, and dashboard scoping (2026-05-25)
+
+A third pass over the v0.7.0 cut driven by hands-on operator use of
+the new multi-domain features. No wire changes; everything below is
+text, layout, or client-side filtering. Same v0.7.0 dated section is
+extended because the tag still hasn't moved.
+
+#### Changed — product naming aligned to "DID Hosting"
+
+- **User-facing "WebVH" → "DID Hosting" rename.** Setup-wizard
+  headers, CLI `about` strings, the daemon/server/control ASCII-banner
+  subtitles, `Cargo.toml` `description` fields, README titles and
+  body, the DIDComm DID-management protocol document's prose and
+  Mermaid participant labels, the WebAuthn `rp_name` ("DID Hosting
+  Server"), and the `OperatorMessages` integration labels passed
+  through to the VTA's `pnm contexts create --name "..."` hint all
+  say "DID Hosting" now. Kept "WebVH" where it refers to the DID
+  method itself (`did:webvh`, WebVH log entries, WebVH spec links),
+  code identifiers (`WebVHClient`, `WebVHError`, `WebVHHosting`
+  service-type string), wire constants (JWT `aud: "WebVH"`,
+  message-type URIs under `https://affinidi.com/webvh/1.0/...`), and
+  the `webvh-watcher` / `webvh-witness` crate directories whose
+  witness/watcher concepts are themselves method-specific. The
+  rebrand is text-only — no API, ABI, or on-disk format changes.
+- **UI title "DID Hosting Manager".** Expo manifest `name`
+  (`did-hosting-ui/app.json`) updated, which drives the browser tab
+  `<title>` rendered from `dist/index.html`.
+
+#### Fixed
+
+- **Duplicate "Mediator DID" prompt during daemon setup.** Both the
+  offline-prepare and self-managed flows rendered the prompt twice
+  when the operator pasted a long mediator DID. Root cause:
+  `dialoguer`'s `Input::interact_text()` re-renders the prompt after
+  Enter to drop the bracketed default indicator, and its line-clear
+  counts logical newlines rather than terminal-wrapped visual rows
+  — so a wrapped input left the original prompt on screen while the
+  re-render landed below as if it were a second prompt. Replaced the
+  single `Input` (`.default(String::new()) + .allow_empty(true)`)
+  with a `Confirm`-then-`Input` pair: the Confirm "Configure a
+  DIDComm mediator?" is short enough to never wrap, and the
+  follow-up `Mediator DID:` Input has a short label so the re-render
+  lines up cleanly. Same shape as the existing online flow's
+  mediator selection.
+- **Domain switcher now actually scopes the DIDs list.** The
+  client-side filter accepted any DID whose `domain` field was
+  empty, so tenants whose records pre-date the M-01 migration (or
+  whose DIDs were assigned cross-domain) saw the switcher silently
+  no-op. Tightened to a strict `d.domain === currentDomain`; the
+  list page surfaces an `N unassigned DIDs hidden` hint next to the
+  filter caption so a user staring at an unexpectedly short list
+  knows there are legacy records to triage (or to switch to "All
+  domains").
+- **Dashboard stats now react to the domain switcher.** The
+  dashboard previously read `/api/stats` and rendered the
+  server-wide aggregate regardless of the active domain. When a
+  specific domain is pinned the dashboard now derives per-domain
+  numbers from the DID list: DIDs in `{domain}`, scoped resolves,
+  and scoped updates (sum of `versionCount - 1` clamped to ≥0 — the
+  in-memory updates counter isn't broken out per-domain yet).
+  "All domains" (admin) keeps the cheap `/api/stats` fast-path.
+
+#### Added — dashboard
+
+- **Domains stat card.** New card between "Total DIDs" and
+  "Total Resolves" reading the count from the existing
+  `useDomains()` provider. Always shows the total configured count;
+  it's a system-level fact rather than a per-view stat.
+- **Wider dashboard layout.** `statusRow`, `errorCard`, `section`,
+  `migrationBanner`, and the `ServiceOverview` container bumped from
+  `maxWidth: 500/800` to `1200` to match `NavBar` and the DID detail
+  page. The dashboard was the only screen still rendering inside a
+  narrow centered column on wide viewports.
+
+#### Build
+
+- **`cargo update`.** `affinidi-messaging-didcomm` 0.13.2 → 0.13.3,
+  `affinidi-messaging-mediator` 0.15.4 → 0.15.5,
+  `affinidi-messaging-sdk` 0.18.2 → 0.18.3,
+  `windows-native-keyring-store` 1.0.0 → 1.1.0. Drops unused
+  transitive deps (`aes 0.9`, `cipher 0.5`, `cpubits 0.1`,
+  `inout 0.2`, `vta-sdk 0.6` — workspace already pins 0.7).
+
 ## 0.6.0 (2026-05-05)
 
 ### Security
