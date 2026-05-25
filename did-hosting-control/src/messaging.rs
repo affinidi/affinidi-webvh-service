@@ -68,6 +68,12 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
+        // Domain-op acknowledgements from servers (assign / unassign / purge).
+        // Informational only — control treats these as fire-and-forget and
+        // derives ground truth from the server's next registration cycle.
+        .route(MSG_DOMAIN_ASSIGN_ACK, handler_fn(handle_domain_ack))?
+        .route(MSG_DOMAIN_UNASSIGN_ACK, handler_fn(handle_domain_ack))?
+        .route(MSG_DOMAIN_PURGE_ACK, handler_fn(handle_domain_ack))?
         // Trust Tasks envelope (v0.7.0+) — routes the five `acl/*`
         // ops and `trust-task-discovery` through the same handlers
         // the HTTPS transport hits at `POST /api/trust-tasks`.
@@ -614,6 +620,39 @@ async fn handle_sync_ack(
     info!(
         sender,
         mnemonic, status, ack_type, "DID sync: server acknowledged {ack_type}"
+    );
+    Ok(None)
+}
+
+/// Handler for `domain/assign-ack`, `domain/unassign-ack`, `domain/purge-ack`.
+/// Servers send these after applying the matching outbound domain op; control
+/// only needs to acknowledge receipt so the message router does not fall
+/// through to the warning logger.
+async fn handle_domain_ack(
+    ctx: HandlerContext,
+    message: Message,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
+    let status = message
+        .body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let domain = message
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let op = if message.typ.contains("assign-ack") && !message.typ.contains("unassign-ack") {
+        "assign"
+    } else if message.typ.contains("unassign-ack") {
+        "unassign"
+    } else {
+        "purge"
+    };
+    info!(
+        sender,
+        domain, status, op, "server acknowledged domain {op}"
     );
     Ok(None)
 }

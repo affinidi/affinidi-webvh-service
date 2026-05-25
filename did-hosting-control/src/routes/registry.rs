@@ -5,6 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use did_hosting_common::{DidSyncEntry, DidSyncUpdate, RegisterServiceResponse};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::auth::{AdminAuth, ServiceAuth};
@@ -134,7 +135,7 @@ pub async fn assign_domain_to_server(
     _auth: AdminAuth,
     State(state): State<AppState>,
     Path((instance_id, domain)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let instance = registry::get_instance(&state.registry_ks, &instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
@@ -156,7 +157,12 @@ pub async fn assign_domain_to_server(
         target_did,
         "MSG_DOMAIN_ASSIGN pushed to server"
     );
-    Ok(StatusCode::ACCEPTED)
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({ "status": "accepted", "operation": "assign", "instance_id": instance_id, "domain": domain }),
+        ),
+    ))
 }
 
 /// Admin trigger for `MSG_DOMAIN_UNASSIGN` (T28). Same semantics as
@@ -166,7 +172,7 @@ pub async fn unassign_domain_from_server(
     _auth: AdminAuth,
     State(state): State<AppState>,
     Path((instance_id, domain)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let instance = registry::get_instance(&state.registry_ks, &instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
@@ -188,7 +194,12 @@ pub async fn unassign_domain_from_server(
         target_did,
         "MSG_DOMAIN_UNASSIGN pushed to server"
     );
-    Ok(StatusCode::ACCEPTED)
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({ "status": "accepted", "operation": "unassign", "instance_id": instance_id, "domain": domain }),
+        ),
+    ))
 }
 
 /// Admin "Purge now" — T30. Pushes `domain/purge/1.0` to a server,
@@ -199,7 +210,7 @@ pub async fn purge_domain_on_server(
     _auth: AdminAuth,
     State(state): State<AppState>,
     Path((instance_id, domain)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let instance = registry::get_instance(&state.registry_ks, &instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
@@ -221,7 +232,12 @@ pub async fn purge_domain_on_server(
         target_did,
         "MSG_DOMAIN_PURGE pushed to server (admin Purge Now)"
     );
-    Ok(StatusCode::ACCEPTED)
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({ "status": "accepted", "operation": "purge", "instance_id": instance_id, "domain": domain }),
+        ),
+    ))
 }
 
 // ---------- POST /api/control/register-service ----------
