@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-daemon"
-description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
+description = "DID Hosting Daemon — Unified binary embedding server, witness, watcher, and control plane"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true

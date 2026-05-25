@@ -1,4 +1,4 @@
-//! DIDComm sync handlers for the WebVH server edge node.
+//! DIDComm sync handlers for the DID Hosting server edge node.
 //!
 //! The server is a read-only node that receives `sync-update` and
 //! `sync-delete` messages from the control plane via the mediator.
@@ -42,7 +42,7 @@ fn require_control_plane(sender: &str, state: &AppState) -> Result<(), (String, 
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the DIDComm router for the WebVH server.
+/// Build the DIDComm router for the DID Hosting server.
 ///
 /// Handles only sync messages from the control plane (sync-update,
 /// sync-delete) and domain assignment messages (assign / unassign,

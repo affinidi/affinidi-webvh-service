@@ -58,7 +58,7 @@ pub async fn run_wizard(
     preloaded_setup_key_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Setup Wizard");
+    eprintln!("  DID Hosting Daemon — Setup Wizard");
     eprintln!("  ============================");
     eprintln!();
     eprintln!("  The daemon runs control + server + witness + (optional) watcher");
@@ -498,7 +498,7 @@ async fn run_self_managed_setup(
     eprintln!();
     eprintln!("  DIDComm mediator. Required if you want this daemon to:");
     eprintln!("    - receive inbound DIDComm from external VTAs (tenant DID provisioning), or");
-    eprintln!("    - be registered as a webvh hosting server with a VTA");
+    eprintln!("    - be registered as a DID hosting server with a VTA");
     eprintln!("      (`vta webvh add-server` requires a DIDCommMessaging endpoint).");
     eprintln!();
     let mediator_input: String = Input::new()
@@ -728,7 +728,7 @@ pub async fn run_setup_offline_prepare(
     state_out: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Offline Setup (step 1/2)");
+    eprintln!("  DID Hosting Daemon — Offline Setup (step 1/2)");
     eprintln!("  ========================================");
     eprintln!();
 
@@ -905,7 +905,7 @@ pub async fn run_setup_offline_complete(
     state_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Offline Setup (step 2/2)");
+    eprintln!("  DID Hosting Daemon — Offline Setup (step 2/2)");
     eprintln!("  ========================================");
     eprintln!();
 

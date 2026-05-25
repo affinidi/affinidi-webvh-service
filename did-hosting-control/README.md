@@ -1,6 +1,6 @@
-# Affinidi WebVH Control Plane
+# Affinidi DID Hosting Control Plane
 
-The WebVH Control Plane is the authoritative source of truth for
+The DID Hosting Control Plane is the authoritative source of truth for
 all DID management. It handles DID lifecycle operations (create,
 publish, delete) via DIDComm and optional REST API, and pushes
 updates to server edge nodes via DIDComm through a mediator.
@@ -317,7 +317,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

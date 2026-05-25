@@ -11,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-description = "Affinidi WebVH Service. Collection of services to operate WebVH DID in production"
+description = "Affinidi DID Hosting Service. Collection of services to operate WebVH DID in production"
 edition = "2024"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
 readme = "README.md"

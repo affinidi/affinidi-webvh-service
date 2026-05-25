@@ -1,6 +1,6 @@
-# Affinidi WebVH Server
+# Affinidi DID Hosting Server
 
-The WebVH Server is a read-only DID hosting edge node for
+The DID Hosting Server is a read-only DID hosting edge node for
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
 documents publicly and receives sync updates from the
 [control plane](../did-hosting-control/) via DIDComm through a mediator.
@@ -483,7 +483,7 @@ All API endpoints are under the `/api` prefix.
 ## Performance Testing
 
 The `perf_test` example is an interactive TUI benchmarking tool
-for load-testing a running WebVH server. It sends concurrent DID
+for load-testing a running DID Hosting server. It sends concurrent DID
 resolution requests and displays real-time metrics including
 throughput, latency percentiles, network bandwidth, active
 workers, and error rates.
@@ -501,7 +501,7 @@ cargo run --example perf_test -p did-hosting-server -- [OPTIONS]
 ```
 
 The tool supports two modes: **server mode** (default) authenticates
-with a WebVH server and discovers DIDs automatically, while
+with a DID Hosting server and discovers DIDs automatically, while
 **file mode** (`--did-file`) reads `did:webvh:...` identifiers from
 a file and works against any hosted WebVH DID without needing
 ACL access.
@@ -510,7 +510,7 @@ ACL access.
 
 | Flag | Short | Default | Description |
 | ---- | ----- | ------- | ----------- |
-| `--server-url` | `-s` | `http://localhost:8530` | WebVH server URL |
+| `--server-url` | `-s` | `http://localhost:8530` | DID Hosting server URL |
 | `--rate` | `-r` | `10` | Target requests per second (adjustable at runtime) |
 | `--workers` | `-w` | `64` | Maximum concurrent in-flight requests |
 | `--timeout` | `-t` | `5` | Request timeout in seconds |
@@ -547,7 +547,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

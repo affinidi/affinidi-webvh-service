@@ -7,11 +7,7 @@ use did_hosting_server::{
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(
-    name = "did-hosting-server",
-    about = "WebVH DID Hosting Server",
-    version
-)]
+#[command(name = "did-hosting-server", about = "DID Hosting Server", version)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, global = true)]
@@ -1458,7 +1454,7 @@ fn print_banner() {
 {cyan}██║███╗██║{magenta}██╔══╝  {yellow}██╔══██╗{cyan}╚██╗ ██╔╝{magenta}██╔══██║{reset}
 {cyan}╚███╔███╔╝{magenta}███████╗{yellow}██████╔╝{cyan} ╚████╔╝ {magenta}██║  ██║{reset}
 {cyan} ╚══╝╚══╝ {magenta}╚══════╝{yellow}╚═════╝ {cyan}  ╚═══╝  {magenta}╚═╝  ╚═╝{reset}
-{dim}  WebVH Server v{version}{reset}
+{dim}  DID Hosting Server v{version}{reset}
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );

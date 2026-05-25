@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-common"
-description = "WebVH Common, Common methods and structs related to WebVH Content"
+description = "DID Hosting Common, Common methods and structs related to WebVH Content"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true

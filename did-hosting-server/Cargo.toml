@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-server"
-description = "WebVH Server, handles management and serving of WebVH Content"
+description = "DID Hosting Server, handles management and serving of WebVH Content"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true

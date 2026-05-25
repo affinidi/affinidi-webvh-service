@@ -40,7 +40,7 @@ pub fn build_webauthn(public_url: &str) -> Result<Webauthn, AppError> {
         .map_err(|e| AppError::Config(format!("failed to build WebauthnBuilder: {e}")))?;
 
     let webauthn = builder
-        .rp_name("WebVH Server")
+        .rp_name("DID Hosting Server")
         .build()
         .map_err(|e| AppError::Config(format!("failed to build Webauthn: {e}")))?;
 

@@ -3,7 +3,7 @@
 //! Problem-reports arrive as ordinary DIDComm messages; without explicit
 //! handling they fall into the generic "unknown message type" bucket and
 //! the diagnostic information they carry (`code`, `comment`, `args`,
-//! `pthid`) is silently discarded. This module gives every WebVH service a
+//! `pthid`) is silently discarded. This module gives every DID Hosting service a
 //! consistent way to log them.
 
 use affinidi_tdk::didcomm::Message;

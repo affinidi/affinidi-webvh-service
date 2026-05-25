@@ -1,10 +1,10 @@
-# Affinidi WebVH Daemon
+# Affinidi DID Hosting Daemon
 
-The WebVH Daemon is a unified binary that embeds all four WebVH
+The DID Hosting Daemon is a unified binary that embeds all four
 services — [server](../did-hosting-server/),
 [witness](../webvh-witness/), [watcher](../webvh-watcher/), and
 [control plane](../did-hosting-control/) — behind a single TCP listener.
-This is the easiest way to get started with a complete WebVH
+This is the easiest way to get started with a complete DID Hosting
 deployment.
 
 Each service is mounted at a path prefix:
@@ -313,7 +313,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

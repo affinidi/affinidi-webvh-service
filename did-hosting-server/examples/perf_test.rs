@@ -3,7 +3,7 @@
 //! A rich TUI benchmarking tool for load-testing WebVH DID resolution.
 //!
 //! Supports two modes:
-//! - **Server mode** (default): authenticates with a WebVH control plane
+//! - **Server mode** (default): authenticates with a DID Hosting control plane
 //!   (`did-hosting-control` or the `did-hosting-daemon`'s embedded control plane)
 //!   via DIDComm, lists active DIDs, and benchmarks resolution against
 //!   each DID's own hosting URL. The management endpoint
@@ -117,12 +117,12 @@ struct Args {
     /// File containing `did:webvh:...` identifiers (one per line). When
     /// provided, skips authentication and DID listing — resolution URLs
     /// are derived directly from the DIDs. Useful for testing against any
-    /// hosted WebVH server without needing ACL access. Lines starting
+    /// hosted DID Hosting server without needing ACL access. Lines starting
     /// with '#' and blank lines are ignored.
     #[arg(long, short = 'f')]
     did_file: Option<String>,
 
-    /// DID of the WebVH service we're authenticating against. Used as the
+    /// DID of the DID Hosting service we're authenticating against. Used as the
     /// DIDComm `to` field of the signed authenticate message. Required
     /// in server mode (when `--did-file` is not set).
     #[arg(long)]
@@ -1877,7 +1877,7 @@ async fn run(args: Args) -> Result<()> {
         eprintln!();
 
         if args.seed.is_none() {
-            eprintln!("  Fresh did:key generated for this run. Add it to the WebVH");
+            eprintln!("  Fresh did:key generated for this run. Add it to the DID Hosting");
             eprintln!("  control plane's ACL before continuing — e.g.:");
             eprintln!("    did-hosting-control add-acl --did {my_did}");
             eprintln!("    did-hosting-daemon  add-acl --did {my_did}");

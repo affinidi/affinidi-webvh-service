@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-control"
-description = "WebVH Control Plane — Unified management UI and service registry"
+description = "DID Hosting Control Plane — Unified management UI and service registry"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true

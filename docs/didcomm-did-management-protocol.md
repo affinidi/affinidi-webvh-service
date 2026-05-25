@@ -6,7 +6,7 @@
 
 ## Overview
 
-This document specifies a DIDComm v2 protocol for the full lifecycle management of `did:webvh` DIDs through a WebVH service. The protocol replaces the REST-based DID management endpoints with end-to-end DIDComm encrypted messaging, ensuring that all communication between the client and the WebVH server is authenticated, integrity-protected, and confidential.
+This document specifies a DIDComm v2 protocol for the full lifecycle management of `did:webvh` DIDs through a DID Hosting service. The protocol replaces the REST-based DID management endpoints with end-to-end DIDComm encrypted messaging, ensuring that all communication between the client and the DID Hosting server is authenticated, integrity-protected, and confidential.
 
 The protocol covers:
 - **Creating** a new DID (URI reservation and initial publication)
@@ -18,7 +18,7 @@ The protocol covers:
 
 ## Prerequisites
 
-- The client MUST have an authenticated session with the WebVH server, obtained via the existing [authentication protocol](../did-hosting-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
+- The client MUST have an authenticated session with the DID Hosting server, obtained via the existing [authentication protocol](../did-hosting-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
 - The client MUST possess a `did:key` identity with Ed25519 signing and X25519 key agreement keys.
 - The server MUST have a resolvable DID with key agreement capabilities for DIDComm encryption.
 
@@ -80,7 +80,7 @@ The protocol covers:
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant S as WebVH Server
+    participant S as DID Hosting Server
 
     Note over C,S: Prerequisites: Client authenticated via<br/>DIDComm challenge-response protocol
 
@@ -142,7 +142,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant S as WebVH Server
+    participant S as DID Hosting Server
 
     Note over C,S: DID Update (mnemonic already known)
 
@@ -168,7 +168,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant S as WebVH Server
+    participant S as DID Hosting Server
 
     rect rgb(230, 245, 255)
         Note over C,S: Get DID Information
@@ -192,7 +192,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant S as WebVH Server
+    participant S as DID Hosting Server
 
     rect rgb(255, 230, 230)
         Note over C,S: Delete DID
@@ -978,7 +978,7 @@ Authorization order is deliberate: caller-authorization runs *before* `new_owner
 ```mermaid
 sequenceDiagram
     participant C as Client (did:key)
-    participant S as WebVH Server (did:web)
+    participant S as DID Hosting Server (did:web)
 
     Note over C,S: Authentication (existing protocol)
     C->>S: DIDComm: authenticate challenge-response
