@@ -879,6 +879,15 @@ export const api = {
       { method: "POST" },
     ).then(normalizeDomain),
 
+  /** DELETE /api/domains/{name} — admin force-delete of a disabled
+   *  domain. Bypasses the `hosting.disable_purge_grace` cooling-off
+   *  window. Server refuses when the domain is Active or the current
+   *  default. Returns void (204 No Content). */
+  deleteDomain: (name: string) =>
+    request<void>(`/api/domains/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+
   // ---- Registry + per-(server, domain) ops (admin) ----
 
   listRegistry: () => request<ServiceInstance[]>("/api/control/registry"),

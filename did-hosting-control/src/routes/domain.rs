@@ -323,6 +323,49 @@ pub async fn enable_domain_route(
     Ok(Json(entry))
 }
 
+/// `DELETE /api/domains/{name}` — Admin force-deletes a disabled
+/// domain, bypassing the `hosting.disable_purge_grace` window the
+/// background sweep otherwise waits out.
+///
+/// Two-step safety mirrors the existing flow: the domain must already
+/// be disabled (operator already saw the "503 + cooling-off" copy and
+/// re-pointed the default if needed). Refusing on Active means a
+/// single fat-finger can't wipe a live domain. Refusing on default is
+/// enforced by `delete_domain_record` itself and surfaces as `Conflict`.
+///
+/// The pending-purge row (if any) is cancelled after the record is
+/// removed so the next sweep doesn't try to delete a row that's
+/// already gone. Hosted DIDs are NOT removed here — that's still the
+/// per-server `domain.purge` Trust Task (T30). Operators with hosted
+/// data should fire `/purge` on the affected servers first.
+pub async fn delete_domain_route(
+    auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let canonical = normalize_domain_name(&name)?;
+    let entry = domain::get_domain(&state.store, &canonical)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("domain '{canonical}'")))?;
+    if entry.status == DomainStatus::Active {
+        return Err(AppError::Conflict(format!(
+            "cannot delete '{canonical}' — domain is Active; disable it first"
+        )));
+    }
+    domain::delete_domain_record(&state.store, &canonical).await?;
+    // Best-effort: any pending_purge row was either consumed by the
+    // sweep or never scheduled (legacy disable before the feature
+    // shipped). Either way, leaving a stale row would be harmless but
+    // ugly in audit logs.
+    let _ = pending_purge::cancel(&state.store, &canonical).await;
+    info!(
+        caller = %auth.0.did,
+        domain = %canonical,
+        "domain force-deleted (admin override of grace window)"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /api/domains/{name}/set-default` — Admin makes a domain the
 /// new system default. Fails if the target is disabled (per spec).
 pub async fn set_default_domain_route(

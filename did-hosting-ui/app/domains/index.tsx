@@ -202,6 +202,33 @@ export default function DomainsScreen() {
     [api, refresh],
   );
 
+  const handleDelete = useCallback(
+    (entry: DomainEntry) => {
+      showConfirm(
+        `Delete ${entry.name} now?`,
+        `This bypasses the cooling-off window and removes the domain ` +
+          `record immediately. Hosted DIDs (if any) are not removed — ` +
+          `purge them per-server first if you want a clean wipe. This ` +
+          `cannot be undone.`,
+        async () => {
+          setBusy(entry.name);
+          try {
+            await api.deleteDomain(entry.name);
+            await refresh();
+          } catch (e: unknown) {
+            showAlert(
+              "Delete failed",
+              e instanceof Error ? e.message : String(e),
+            );
+          } finally {
+            setBusy(null);
+          }
+        },
+      );
+    },
+    [api, refresh],
+  );
+
   if (!isAuthenticated) {
     return (
       <View style={styles.containerCenter}>
@@ -338,6 +365,7 @@ export default function DomainsScreen() {
               onSetDefault={() => handleSetDefault(item)}
               onDisable={() => handleDisable(item)}
               onEnable={() => handleEnable(item)}
+              onDelete={() => handleDelete(item)}
             />
           )}
         />
@@ -353,6 +381,7 @@ function DomainCard({
   onSetDefault,
   onDisable,
   onEnable,
+  onDelete,
 }: {
   entry: DomainEntry;
   isDefault: boolean;
@@ -360,6 +389,7 @@ function DomainCard({
   onSetDefault: () => void;
   onDisable: () => void;
   onEnable: () => void;
+  onDelete: () => void;
 }) {
   const disabled = entry.status === "disabled";
   return (
@@ -430,16 +460,28 @@ function DomainCard({
           </Pressable>
         )}
         {disabled ? (
-          <Pressable
-            accessibilityRole="button"
-            onPress={onEnable}
-            disabled={busy}
-            style={[styles.buttonSecondary, busy && styles.buttonDisabled]}
-          >
-            <Text style={styles.buttonSecondaryText}>
-              {busy ? "…" : "Enable"}
-            </Text>
-          </Pressable>
+          <>
+            <Pressable
+              accessibilityRole="button"
+              onPress={onEnable}
+              disabled={busy}
+              style={[styles.buttonSecondary, busy && styles.buttonDisabled]}
+            >
+              <Text style={styles.buttonSecondaryText}>
+                {busy ? "…" : "Enable"}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={onDelete}
+              disabled={busy}
+              style={[styles.buttonDanger, busy && styles.buttonDisabled]}
+            >
+              <Text style={styles.buttonDangerText}>
+                {busy ? "…" : "Delete now"}
+              </Text>
+            </Pressable>
+          </>
         ) : (
           <Pressable
             accessibilityRole="button"
