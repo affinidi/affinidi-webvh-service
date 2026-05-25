@@ -17,10 +17,10 @@
 //! together in T33 as Trust-Task-bound endpoints.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::{AdminAuth, AuthClaims};
 use crate::error::AppError;
@@ -323,6 +323,17 @@ pub async fn enable_domain_route(
     Ok(Json(entry))
 }
 
+/// Query string for [`delete_domain_route`].
+#[derive(Debug, Deserialize)]
+pub struct DeleteDomainQuery {
+    /// When `true`, fan out a `domain.purge/1.0` (T30) DIDComm message
+    /// to every server instance whose `served_domains` lists this
+    /// domain before deleting the local record. Default `false` — the
+    /// existing "delete record only" semantics are preserved.
+    #[serde(default)]
+    pub purge_servers: bool,
+}
+
 /// `DELETE /api/domains/{name}` — Admin force-deletes a disabled
 /// domain, bypassing the `hosting.disable_purge_grace` window the
 /// background sweep otherwise waits out.
@@ -333,15 +344,22 @@ pub async fn enable_domain_route(
 /// single fat-finger can't wipe a live domain. Refusing on default is
 /// enforced by `delete_domain_record` itself and surfaces as `Conflict`.
 ///
+/// `?purge_servers=true` extends the call to a one-click "purge + delete":
+/// each registry instance whose `served_domains` includes this domain
+/// receives a `domain.purge/1.0` DIDComm message (T30) before the
+/// control-plane record is removed. The purge is fire-and-forget on
+/// the DIDComm side — `handle_domain_ack` will drop the domain out of
+/// `served_domains` as servers ack back, but the local delete proceeds
+/// without waiting.
+///
 /// The pending-purge row (if any) is cancelled after the record is
 /// removed so the next sweep doesn't try to delete a row that's
-/// already gone. Hosted DIDs are NOT removed here — that's still the
-/// per-server `domain.purge` Trust Task (T30). Operators with hosted
-/// data should fire `/purge` on the affected servers first.
+/// already gone.
 pub async fn delete_domain_route(
     auth: AdminAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Query(opts): Query<DeleteDomainQuery>,
 ) -> Result<StatusCode, AppError> {
     let canonical = normalize_domain_name(&name)?;
     let entry = domain::get_domain(&state.store, &canonical)
@@ -352,6 +370,47 @@ pub async fn delete_domain_route(
             "cannot delete '{canonical}' — domain is Active; disable it first"
         )));
     }
+
+    // Optional: fanout MSG_DOMAIN_PURGE to every server instance
+    // serving this domain. Best-effort per instance — a failure to
+    // enqueue for one server must not block the others or the local
+    // delete. Anything we miss here will surface in the audit log;
+    // operators can fire `/purge` manually on those servers.
+    let mut purged_servers: u32 = 0;
+    if opts.purge_servers {
+        match crate::registry::list_instances(&state.registry_ks).await {
+            Ok(instances) => {
+                for inst in instances {
+                    if !inst.served_domains.iter().any(|d| d == &canonical) {
+                        continue;
+                    }
+                    let Some(target_did) = inst.metadata.get("did").and_then(|v| v.as_str()) else {
+                        warn!(
+                            instance_id = %inst.instance_id,
+                            "purge fanout: instance has no `did` in metadata — skipping"
+                        );
+                        continue;
+                    };
+                    match crate::server_push::send_domain_purge(&state, target_did, &canonical)
+                        .await
+                    {
+                        Ok(()) => purged_servers += 1,
+                        Err(e) => warn!(
+                            instance_id = %inst.instance_id,
+                            target_did,
+                            error = %e,
+                            "purge fanout: send_domain_purge failed; continuing"
+                        ),
+                    }
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                "purge fanout: failed to list registry instances; skipping fanout"
+            ),
+        }
+    }
+
     domain::delete_domain_record(&state.store, &canonical).await?;
     // Best-effort: any pending_purge row was either consumed by the
     // sweep or never scheduled (legacy disable before the feature
@@ -361,6 +420,8 @@ pub async fn delete_domain_route(
     info!(
         caller = %auth.0.did,
         domain = %canonical,
+        purge_servers = opts.purge_servers,
+        purged_servers,
         "domain force-deleted (admin override of grace window)"
     );
     Ok(StatusCode::NO_CONTENT)

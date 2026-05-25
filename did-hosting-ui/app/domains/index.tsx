@@ -229,6 +229,34 @@ export default function DomainsScreen() {
     [api, refresh],
   );
 
+  const handlePurgeAndDelete = useCallback(
+    (entry: DomainEntry) => {
+      showConfirm(
+        `Purge & delete ${entry.name}?`,
+        `Every server serving this domain will receive a domain.purge ` +
+          `message — every DID hosted on the domain across the fleet ` +
+          `will be permanently removed. The control-plane domain ` +
+          `record is then deleted. Server purges are fire-and-forget ` +
+          `over DIDComm; this UI won't wait for acks. Cannot be undone.`,
+        async () => {
+          setBusy(entry.name);
+          try {
+            await api.deleteDomain(entry.name, { purgeServers: true });
+            await refresh();
+          } catch (e: unknown) {
+            showAlert(
+              "Purge & delete failed",
+              e instanceof Error ? e.message : String(e),
+            );
+          } finally {
+            setBusy(null);
+          }
+        },
+      );
+    },
+    [api, refresh],
+  );
+
   if (!isAuthenticated) {
     return (
       <View style={styles.containerCenter}>
@@ -366,6 +394,7 @@ export default function DomainsScreen() {
               onDisable={() => handleDisable(item)}
               onEnable={() => handleEnable(item)}
               onDelete={() => handleDelete(item)}
+              onPurgeAndDelete={() => handlePurgeAndDelete(item)}
             />
           )}
         />
@@ -382,6 +411,7 @@ function DomainCard({
   onDisable,
   onEnable,
   onDelete,
+  onPurgeAndDelete,
 }: {
   entry: DomainEntry;
   isDefault: boolean;
@@ -390,6 +420,7 @@ function DomainCard({
   onDisable: () => void;
   onEnable: () => void;
   onDelete: () => void;
+  onPurgeAndDelete: () => void;
 }) {
   const disabled = entry.status === "disabled";
   return (
@@ -479,6 +510,16 @@ function DomainCard({
             >
               <Text style={styles.buttonDangerText}>
                 {busy ? "…" : "Delete now"}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={onPurgeAndDelete}
+              disabled={busy}
+              style={[styles.buttonDanger, busy && styles.buttonDisabled]}
+            >
+              <Text style={styles.buttonDangerText}>
+                {busy ? "…" : "Purge & delete"}
               </Text>
             </Pressable>
           </>

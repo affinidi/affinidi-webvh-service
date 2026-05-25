@@ -882,11 +882,20 @@ export const api = {
   /** DELETE /api/domains/{name} — admin force-delete of a disabled
    *  domain. Bypasses the `hosting.disable_purge_grace` cooling-off
    *  window. Server refuses when the domain is Active or the current
-   *  default. Returns void (204 No Content). */
-  deleteDomain: (name: string) =>
-    request<void>(`/api/domains/${encodeURIComponent(name)}`, {
-      method: "DELETE",
-    }),
+   *  default. Returns void (204 No Content).
+   *
+   *  `purgeServers: true` adds the T30 `domain.purge/1.0` DIDComm
+   *  fan-out: every server instance whose `served_domains` includes
+   *  this domain gets a purge message before the control record is
+   *  removed. Fire-and-forget on the DIDComm side — the local delete
+   *  proceeds without waiting for acks. */
+  deleteDomain: (name: string, opts?: { purgeServers?: boolean }) => {
+    const qs = opts?.purgeServers ? "?purge_servers=true" : "";
+    return request<void>(
+      `/api/domains/${encodeURIComponent(name)}${qs}`,
+      { method: "DELETE" },
+    );
+  },
 
   // ---- Registry + per-(server, domain) ops (admin) ----
 
