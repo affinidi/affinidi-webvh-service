@@ -625,12 +625,19 @@ async fn handle_sync_ack(
 }
 
 /// Handler for `domain/assign-ack`, `domain/unassign-ack`, `domain/purge-ack`.
-/// Servers send these after applying the matching outbound domain op; control
-/// only needs to acknowledge receipt so the message router does not fall
-/// through to the warning logger.
+///
+/// Servers send these after applying the matching outbound domain op. The
+/// handler:
+/// 1. Logs the acknowledgement.
+/// 2. Updates the sender's `ServiceInstance.served_domains` in the registry
+///    so the UI reflects the change immediately, without waiting for the
+///    next `MSG_SERVER_REGISTER` from the server. Without this, a domain
+///    assigned to a server stays invisible in the registry view until the
+///    server restarts.
 async fn handle_domain_ack(
     ctx: HandlerContext,
     message: Message,
+    Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
     let status = message
@@ -654,6 +661,55 @@ async fn handle_domain_ack(
         sender,
         domain, status, op, "server acknowledged domain {op}"
     );
+
+    // Mirror the server's view of `served_domains` into our registry.
+    // `assigned` / `already_assigned` → add; everything else (unassign,
+    // purge, failures) → remove. We trust the ack: only servers we sent
+    // the outbound op to can reach this handler.
+    if domain == "unknown" || sender == "unknown" {
+        return Ok(None);
+    }
+    let instance_id = sender.replace(':', "_");
+    match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
+        Ok(Some(mut instance)) => {
+            let add = op == "assign" && matches!(status, "assigned" | "already_assigned");
+            let mutated = if add {
+                if !instance.served_domains.iter().any(|d| d == domain) {
+                    instance.served_domains.push(domain.to_string());
+                    instance.served_domains.sort();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                let before = instance.served_domains.len();
+                instance.served_domains.retain(|d| d != domain);
+                instance.served_domains.len() != before
+            };
+            if mutated
+                && let Err(e) =
+                    crate::registry::register_instance(&state.registry_ks, &instance).await
+            {
+                warn!(
+                    instance_id, error = %e,
+                    "failed to update served_domains after domain ack"
+                );
+            }
+        }
+        Ok(None) => {
+            // Server isn't in the registry yet (ack arrived before
+            // MSG_SERVER_REGISTER, or the operator wiped the registry).
+            // Logging only — the next register cycle will reconcile.
+            warn!(
+                instance_id,
+                "domain ack received for unregistered server — skipping registry update"
+            );
+        }
+        Err(e) => {
+            warn!(instance_id, error = %e, "failed to load instance for ack reconciliation");
+        }
+    }
+
     Ok(None)
 }
 

@@ -19,6 +19,7 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -114,6 +115,25 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     // control plane that hasn't picked up the T27 fields will simply
     // ignore them.
     let enabled_methods: Vec<&str> = did_hosting_common::method::enabled_methods().to_vec();
+
+    // Report locally-active domains so the control plane's registry view
+    // (and the UI's "domains assigned to this server" panel) reflects what
+    // this server is actually serving. Disabled domains are intentionally
+    // omitted — they're not handing out DID data publicly. Errors here are
+    // non-fatal: registration with an empty list is better than no
+    // registration at all.
+    let served_domains: Vec<String> = match list_domains(&state.store).await {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|d| matches!(d.status, DomainStatus::Active))
+            .map(|d| d.name)
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to list local domains for registration — sending empty list");
+            Vec::new()
+        }
+    };
+
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         MSG_SERVER_REGISTER.to_string(),
@@ -121,7 +141,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
             "public_url": public_url,
             "label": "did-hosting-server",
             "enabled_methods": enabled_methods,
-            "served_domains": Vec::<String>::new(),
+            "served_domains": served_domains,
             "protocol_version": "1.0",
         }),
     )
