@@ -163,15 +163,20 @@ export default function DidList() {
       minute: "2-digit",
     });
 
-  // T34/T35: filter the list to the current domain when the
-  // switcher has one pinned. "All domains" (currentDomain === null,
-  // admin-only) shows everything.
+  // Filter the list to the current domain when the switcher has one
+  // pinned. "All domains" (currentDomain === null, admin-only) shows
+  // everything. A pinned domain is strict: DIDs whose `domain` field
+  // doesn't match are hidden, including legacy records that pre-date
+  // M-01 and still carry no domain — switch to "All domains" (admin)
+  // to see those.
+  const hiddenNoDomainCount =
+    currentDomain === null
+      ? 0
+      : dids.filter((d) => !d.domain).length;
   const visibleDids =
     currentDomain === null
       ? dids
-      : dids.filter(
-          (d) => !d.domain || d.domain === currentDomain,
-        );
+      : dids.filter((d) => d.domain === currentDomain);
 
   return (
     <View style={styles.container}>
@@ -197,6 +202,11 @@ export default function DidList() {
           {currentDomain !== null && (
             <Text style={styles.filterCaption}>
               Filtered to {currentDomain}
+              {hiddenNoDomainCount > 0
+                ? ` · ${hiddenNoDomainCount} unassigned DID${
+                    hiddenNoDomainCount === 1 ? "" : "s"
+                  } hidden`
+                : ""}
             </Text>
           )}
         </View>
