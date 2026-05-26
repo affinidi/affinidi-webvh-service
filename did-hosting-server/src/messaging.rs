@@ -536,6 +536,7 @@ async fn do_domain_purge(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment;
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::domain_purge::purge_domain_dids;
     use did_hosting_common::server::pending_purge;
@@ -553,6 +554,39 @@ async fn do_domain_purge(
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/purge")?;
     let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    // Freshness check — defends against the replay-after-reassign-
+    // within-grace scenario:
+    //   1. Operator unassigns foo.example → control plane queues
+    //      purge → mediator goes down before delivery.
+    //   2. Operator changes their mind, re-assigns foo.example within
+    //      the grace window; server stores a new KS_ASSIGNMENTS row
+    //      with a fresh `assigned_at`.
+    //   3. Mediator comes back, delivers the stale purge.
+    //   4. Without this check, the data the operator chose to keep
+    //      gets wiped.
+    // If a current assignment row exists AND the message's
+    // `created_time` is older than the assignment's `assigned_at`,
+    // refuse the purge. Messages without `created_time` are treated
+    // as fresh for backwards compatibility — older DIDComm peers
+    // don't set the header, and the existing `MAX_AGE_SECS` outbox
+    // sweep already drops very stale messages on the wire.
+    if let Ok(Some(current)) = assignment::get(&state.store, &domain).await {
+        let msg_created = msg.created_time.unwrap_or(0);
+        if msg_created != 0 && msg_created < current.assigned_at {
+            warn!(
+                did = sender,
+                domain = %domain,
+                msg_created_time = msg_created,
+                assignment_assigned_at = current.assigned_at,
+                "domain/purge refused: message older than current assignment (likely a stale purge replayed after reassign-within-grace)"
+            );
+            return Ok(problem_report(
+                "e.p.domain.stale-purge",
+                "purge message predates the current assignment; refusing to wipe data that has since been re-assigned",
+            ));
+        }
+    }
 
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
