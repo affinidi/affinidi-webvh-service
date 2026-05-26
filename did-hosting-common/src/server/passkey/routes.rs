@@ -646,7 +646,7 @@ pub async fn create_invite<S: PasskeyState>(
 // DELETE /auth/passkey/invite/{token}  (admin-only) — revoke
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct InviteListItem {
     pub token: String,
     pub did: String,
@@ -659,6 +659,26 @@ pub struct InviteListItem {
     /// atomically; expired invites only disappear after a cleanup
     /// pass). Useful so admins see history instead of silent drop.
     pub expired: bool,
+}
+
+// Manual Debug. Both `token` (an unredeemed invite token grants the
+// holder a passkey enrollment on the encoded DID) and
+// `enrollment_url` (carries the same token in its query string) must
+// never reach logs. Wave-2 redacted these on `CreateInviteResponse`;
+// the list-item shape that an admin diagnostics dump might pretty-
+// print is the second leak surface to close.
+impl std::fmt::Debug for InviteListItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteListItem")
+            .field("token", &"<redacted>")
+            .field("did", &self.did)
+            .field("role", &self.role)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("enrollment_url", &"<redacted>")
+            .field("expired", &self.expired)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
