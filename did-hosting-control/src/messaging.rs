@@ -1025,7 +1025,7 @@ async fn handle_server_register(
                 .collect()
         })
         .unwrap_or_else(|| vec!["webvh".to_string()]);
-    let served_domains: Vec<String> = message
+    let claimed_served_domains: Vec<String> = message
         .body
         .get("served_domains")
         .and_then(|v| v.as_array())
@@ -1035,6 +1035,46 @@ async fn handle_server_register(
                 .collect()
         })
         .unwrap_or_default();
+    // Defense against a misbehaving server fabricating `served_domains`
+    // entries to mislead operators (and the purge-fanout in
+    // `delete_domain_route`). We intersect the self-asserted list
+    // against the control plane's authoritative DomainEntry registry,
+    // dropping names the control plane has no record of. This filters
+    // the "fabricate-a-domain-name" attack vector.
+    //
+    // KNOWN GAP (tracked for follow-up): we can't yet verify that the
+    // server is actually *authorised* to host the domains it claims —
+    // the control plane fires assign/unassign messages without
+    // recording them. A peer Service-role server could still claim to
+    // host a real but unrelated tenant's domain. Closing that gap
+    // requires a new control-plane-side dispatched-assignments table
+    // (one row per outbound MSG_DOMAIN_{ASSIGN,UNASSIGN}) the register
+    // handler can intersect against. Out of scope for this security
+    // fix; HIGH-1 (control-plane pinning on the server-side handlers)
+    // already removes the most damaging exploit (a peer issuing
+    // forged domain.purge to wipe data).
+    let served_domains: Vec<String> = if claimed_served_domains.is_empty() {
+        Vec::new()
+    } else {
+        let mut keep = Vec::with_capacity(claimed_served_domains.len());
+        for name in claimed_served_domains {
+            match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
+                Ok(Some(_)) => keep.push(name),
+                Ok(None) => warn!(
+                    did = sender,
+                    domain = %name,
+                    "register: dropping served_domains entry — control plane has no DomainEntry for this name"
+                ),
+                Err(e) => warn!(
+                    did = sender,
+                    domain = %name,
+                    error = %e,
+                    "register: failed to look up DomainEntry during served_domains validation — dropping entry"
+                ),
+            }
+        }
+        keep
+    };
     let protocol_version = message
         .body
         .get("protocol_version")
