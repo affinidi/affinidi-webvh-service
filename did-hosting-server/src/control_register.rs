@@ -119,9 +119,17 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     // Report locally-active domains so the control plane's registry view
     // (and the UI's "domains assigned to this server" panel) reflects what
     // this server is actually serving. Disabled domains are intentionally
-    // omitted — they're not handing out DID data publicly. Errors here are
-    // non-fatal: registration with an empty list is better than no
-    // registration at all.
+    // omitted — they're not handing out DID data publicly.
+    //
+    // Failures here used to silently send `served_domains: []`. Combined
+    // with the (post-MED-3) handle_domain_ack mirror logic on the
+    // control plane, a transient store error during registration
+    // would swing the registry view from "fully populated" to "empty"
+    // on every re-register, and a subsequent `?purge_servers=true`
+    // fanout would skip this server because the registry briefly
+    // lied. Instead, fail the registration attempt so the existing
+    // retry loop kicks in — registration with an outdated
+    // `served_domains` list is worse than briefly being unregistered.
     let served_domains: Vec<String> = match list_domains(&state.store).await {
         Ok(entries) => entries
             .into_iter()
@@ -129,8 +137,11 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
             .map(|d| d.name)
             .collect(),
         Err(e) => {
-            warn!(error = %e, "failed to list local domains for registration — sending empty list");
-            Vec::new()
+            warn!(
+                error = %e,
+                "failed to list local domains for registration — aborting this register attempt; retry loop will pick it up"
+            );
+            return;
         }
     };
 
