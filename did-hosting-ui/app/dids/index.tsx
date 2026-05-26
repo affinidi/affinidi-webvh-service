@@ -16,6 +16,7 @@ import { useDomains } from "../../components/DomainProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
+import { matchesDomain } from "../../lib/domain";
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
@@ -173,22 +174,10 @@ export default function DidList() {
   // host segment of the DID itself: `did:webvh:scid:HOST(:path…)` and
   // `did:web:HOST(:path…)`. Without this fallback the switcher looks
   // broken in the brief window between an operator upgrading to the
-  // fix and publish-time backfill tagging each slot.
-  const matchesDomain = (d: DidRecord, target: string): boolean => {
-    if (d.domain) return d.domain === target;
-    if (!d.didId) return false;
-    const parts = d.didId.split(":");
-    // did:webvh:<scid>:<host>:..., did:web:<host>:...
-    const host = parts[1] === "webvh" ? parts[3] : parts[2];
-    if (!host) return false;
-    // DID hosts are percent-encoded for `:` in port numbers
-    // (e.g. `localhost%3A8534`). Normalise both sides.
-    return decodeURIComponent(host) === target;
-  };
-  // Records with no domain field AND no usable did:webvh / did:web host
-  // (e.g. reservations that never published a log) are genuinely
-  // unassigned. Surface the count so a thin list doesn't look like a
-  // bug.
+  // fix and publish-time backfill tagging each slot. See
+  // `lib/domain.ts` for the shared matchesDomain / extractDidHost
+  // implementation — both this view and the dashboard's per-domain
+  // stat cards consume the same helpers.
   const hiddenNoDomainCount =
     currentDomain === null
       ? 0
