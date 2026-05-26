@@ -305,11 +305,26 @@ export async function loginWithWalletProxy(
     const text = await chRes.text();
     throw new Error(`/auth/challenge failed (${chRes.status}): ${text}`);
   }
+  // Wire-format asymmetry in did-hosting-control:
+  //   - ChallengeResponse uses camelCase (`#[serde(rename_all =
+  //     "camelCase")]` in did-hosting-common's types.rs) →
+  //     `{ challenge, sessionId, expiresAt }` on the wire.
+  //   - AuthenticatePayload has NO rename_all → still snake_case
+  //     (`{ id_token, session_id, ... }`).
+  // The original draft of this file read `session_id` from both,
+  // which left the auth POST with `session_id: undefined` and the
+  // server complaining "missing field `session_id`". Read camelCase
+  // here; emit snake_case in step 3.
   const chJson = (await chRes.json()) as {
     challenge: string;
-    session_id: string;
-    expires_at?: number;
+    sessionId: string;
+    expiresAt?: string;
   };
+  if (!chJson.sessionId || !chJson.challenge) {
+    throw new Error(
+      `/auth/challenge: malformed response (missing sessionId or challenge): ${JSON.stringify(chJson)}`,
+    );
+  }
   steps.push({
     label: "1. Fetch challenge",
     description: `Page POSTs /auth/challenge with the entry's principal DID. The RP returns a one-shot nonce bound to that DID.`,
@@ -361,7 +376,11 @@ export async function loginWithWalletProxy(
     type: AUTH_AUTHENTICATE_TYPE_URI,
     payload: {
       id_token: idTokenCompact,
-      session_id: chJson.session_id,
+      // Server expects snake_case here (no rename_all on
+      // AuthenticatePayload). Read from camelCase sessionId on
+      // chJson — that's the wire shape the challenge endpoint
+      // emits.
+      session_id: chJson.sessionId,
     },
   };
   const authRes = await fetch(`${apiBase}/auth/`, {
