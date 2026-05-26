@@ -11,7 +11,15 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { api, setAuthMethod } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import { isWalletAvailable, loginWithWallet } from "../lib/wallet";
+import {
+  isWalletAvailable,
+  isWalletProxyAvailable,
+  listProxyCandidates,
+  loginWithWallet,
+  loginWithWalletProxy,
+  type ProxyLoginViz,
+  type ProxyVaultEntry,
+} from "../lib/wallet";
 
 export default function Login() {
   const { isAuthenticated, logout } = useAuth();
@@ -22,6 +30,20 @@ export default function Login() {
   const [walletLoading, setWalletLoading] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
   const walletAvailable = isWalletAvailable();
+  const proxyAvailable = isWalletProxyAvailable();
+
+  // M2B.4 — VTA-proxied login.
+  // The user picks a did-self-issued vault entry pinned to this RP's
+  // DID; the wallet asks the VTA to mint a SIOP id_token on the
+  // entry's behalf; the page posts it to /auth/. The long-term
+  // signing key never leaves the VTA.
+  const [proxyLoading, setProxyLoading] = useState(false);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  const [proxyCandidates, setProxyCandidates] = useState<
+    ProxyVaultEntry[] | null
+  >(null);
+  const [proxyPicking, setProxyPicking] = useState(false);
+  const [proxyViz, setProxyViz] = useState<ProxyLoginViz | null>(null);
 
   const handlePasskeyLogin = async () => {
     setPasskeyLoading(true);
@@ -58,6 +80,53 @@ export default function Login() {
       setWalletError(err?.message || "Wallet login failed.");
     } finally {
       setWalletLoading(false);
+    }
+  };
+
+  // M2B.4 — VTA-proxied login. Two-stage flow because the user may
+  // have multiple did-self-issued entries pinned to this RP and we
+  // want them to pick which one.
+  const handleProxyLoginStart = async () => {
+    setProxyLoading(true);
+    setProxyError(null);
+    setProxyViz(null);
+    try {
+      const candidates = await listProxyCandidates();
+      if (candidates.length === 0) {
+        setProxyError(
+          "No did-self-issued vault entry is pinned to this RP. Open the wallet, add an entry with this RP's DID as a target, then try again.",
+        );
+        return;
+      }
+      if (candidates.length === 1) {
+        await runProxyLogin(candidates[0]!);
+      } else {
+        setProxyCandidates(candidates);
+        setProxyPicking(true);
+      }
+    } catch (err: any) {
+      setProxyError(err?.message || "Could not enumerate proxy entries.");
+    } finally {
+      setProxyLoading(false);
+    }
+  };
+
+  const runProxyLogin = async (entry: ProxyVaultEntry) => {
+    setProxyLoading(true);
+    setProxyError(null);
+    setProxyPicking(false);
+    try {
+      const outcome = await loginWithWalletProxy(entry);
+      setAuthMethod("wallet");
+      setProxyViz(outcome.viz);
+      login(outcome.result.accessToken);
+      // Don't redirect yet — let the visualization stay on screen so
+      // the user can read it. Clicking "Continue" in the viz drives
+      // the redirect.
+    } catch (err: any) {
+      setProxyError(err?.message || "VTA-proxied login failed.");
+    } finally {
+      setProxyLoading(false);
     }
   };
 
@@ -128,6 +197,31 @@ export default function Login() {
           </Text>
         )}
 
+        {proxyAvailable && (
+          <>
+            <View style={[styles.divider, { marginTop: spacing.md }]}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.dividerText}>via VTA proxy</Text>
+              <View style={styles.dividerLine} />
+            </View>
+            <Pressable
+              style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
+              onPress={handleProxyLoginStart}
+              disabled={proxyLoading}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
+              </Text>
+            </Pressable>
+            <Text style={styles.cliHint}>
+              VTA mints a SIOP id_token on a vault entry's behalf. The
+              entry's long-term signing key never leaves the VTA — the
+              page only sees the short-lived id_token.
+            </Text>
+            {proxyError && <Text style={styles.errorText}>{proxyError}</Text>}
+          </>
+        )}
+
         <View style={styles.divider}>
           <View style={styles.dividerLine} />
           <Text style={styles.dividerText}>need access?</Text>
@@ -138,6 +232,128 @@ export default function Login() {
           Ask a server admin to send you an enrollment link. Open it in this
           browser to register a passkey, then return here to log in.
         </Text>
+      </View>
+
+      {proxyPicking && proxyCandidates && (
+        <ProxyCandidatePicker
+          candidates={proxyCandidates}
+          onCancel={() => setProxyPicking(false)}
+          onPick={(entry) => void runProxyLogin(entry)}
+        />
+      )}
+
+      {proxyViz && (
+        <ProxyLoginVisualization
+          viz={proxyViz}
+          onContinue={() => router.replace("/")}
+        />
+      )}
+    </View>
+  );
+}
+
+// ─── M2B.4 picker UI ───
+// Inline modal that lets the user choose among multiple did-self-issued
+// vault entries pinned to this RP's DID. Renders the principal DID +
+// last-used timestamp so the user knows which identity they'd be acting
+// as.
+function ProxyCandidatePicker({
+  candidates,
+  onCancel,
+  onPick,
+}: {
+  candidates: ProxyVaultEntry[];
+  onCancel: () => void;
+  onPick: (entry: ProxyVaultEntry) => void;
+}) {
+  return (
+    <View style={styles.modalBackdrop}>
+      <View style={[styles.card, { maxWidth: 600 }]}>
+        <Text style={styles.title}>Pick a proxy identity</Text>
+        <Text style={styles.hint}>
+          Multiple did-self-issued vault entries are pinned to this RP. Pick
+          which one to log in as.
+        </Text>
+        {candidates.map((c) => (
+          <Pressable
+            key={c.id}
+            style={[styles.secondaryButton, { marginBottom: spacing.sm }]}
+            onPress={() => onPick(c)}
+          >
+            <Text style={styles.secondaryButtonText}>{c.label}</Text>
+            <Text style={[styles.cliHint, { marginTop: 4 }]}>{c.principalDid}</Text>
+          </Pressable>
+        ))}
+        <Pressable style={styles.dangerButton} onPress={onCancel}>
+          <Text style={styles.dangerButtonText}>Cancel</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+// ─── M2B.4 visualization ───
+// Shows the user what just happened: timeline of the three round-trips
+// (RP /auth/challenge → VTA proxy-login → RP /auth/), the decoded SIOP
+// id_token claims, the SessionBlob summary, total elapsed time. The
+// "Continue" button drives the redirect into the authenticated app.
+function ProxyLoginVisualization({
+  viz,
+  onContinue,
+}: {
+  viz: ProxyLoginViz;
+  onContinue: () => void;
+}) {
+  return (
+    <View style={styles.modalBackdrop}>
+      <View style={[styles.card, { maxWidth: 720, maxHeight: "90%" }]}>
+        <Text style={styles.title}>VTA-proxied login flow</Text>
+        <Text style={styles.hint}>
+          Authenticated in {viz.totalMs} ms. The long-term signing key for{" "}
+          <Text style={styles.mono}>{viz.chosenEntry.principalDid}</Text>{" "}
+          never left the VTA — the wallet only ever saw the short-lived id_token.
+        </Text>
+
+        <View style={styles.vizScroll}>
+          {viz.steps.map((s, i) => (
+            <View key={i} style={styles.vizStep}>
+              <View style={styles.vizStepHeader}>
+                <Text style={styles.vizStepLabel}>{s.label}</Text>
+                <Text style={styles.vizStepDuration}>{s.durationMs} ms</Text>
+              </View>
+              <Text style={styles.vizStepDesc}>{s.description}</Text>
+            </View>
+          ))}
+          {viz.idToken && (
+            <View style={styles.vizStep}>
+              <Text style={styles.vizStepLabel}>SIOP id_token claims</Text>
+              <Text style={[styles.mono, styles.vizCodeBlock]}>
+                {JSON.stringify(viz.idToken.payload, null, 2)}
+              </Text>
+            </View>
+          )}
+          {viz.sessionBlob && (
+            <View style={styles.vizStep}>
+              <Text style={styles.vizStepLabel}>SessionBlob summary</Text>
+              <Text style={styles.vizStepDesc}>
+                sessionId: <Text style={styles.mono}>{viz.sessionBlob.sessionId}</Text>
+                {"\n"}expiresAt: <Text style={styles.mono}>{viz.sessionBlob.expiresAt}</Text>
+                {viz.sessionBlob.bindOrigin && (
+                  <>
+                    {"\n"}bindOrigin:{" "}
+                    <Text style={styles.mono}>{viz.sessionBlob.bindOrigin}</Text>
+                  </>
+                )}
+                {"\n"}{viz.sessionBlob.headerCount} header(s),{" "}
+                {viz.sessionBlob.cookieCount} cookie(s)
+              </Text>
+            </View>
+          )}
+        </View>
+
+        <Pressable style={styles.button} onPress={onContinue}>
+          <Text style={styles.buttonText}>Continue</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -248,5 +464,62 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     lineHeight: 19,
     marginBottom: spacing.sm,
+  },
+  mono: {
+    fontFamily: "ui-monospace, monospace",
+    fontSize: 12,
+    color: colors.textSecondary,
+  },
+  modalBackdrop: {
+    position: "absolute" as const,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: spacing.lg,
+  },
+  vizScroll: {
+    marginTop: spacing.md,
+    marginBottom: spacing.lg,
+    gap: spacing.md,
+  },
+  vizStep: {
+    padding: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.bgPrimary,
+    gap: spacing.xs,
+  },
+  vizStepHeader: {
+    flexDirection: "row" as const,
+    justifyContent: "space-between" as const,
+    alignItems: "center" as const,
+  },
+  vizStepLabel: {
+    fontFamily: fonts.semibold,
+    fontSize: 13,
+    color: colors.textPrimary,
+  },
+  vizStepDuration: {
+    fontSize: 11,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+  },
+  vizStepDesc: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    lineHeight: 18,
+  },
+  vizCodeBlock: {
+    padding: spacing.sm,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.sm,
+    fontSize: 11,
+    lineHeight: 16,
   },
 });
