@@ -668,6 +668,8 @@ async fn handle_domain_ack(
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use crate::acl::check_acl;
+
     let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
     let status = message
         .body
@@ -693,10 +695,39 @@ async fn handle_domain_ack(
 
     // Mirror the server's view of `served_domains` into our registry.
     // `assigned` / `already_assigned` → add; everything else (unassign,
-    // purge, failures) → remove. We trust the ack: only servers we sent
-    // the outbound op to can reach this handler.
+    // purge, failures) → remove.
+    //
+    // Authz gate matches `handle_server_register`: only DIDs that
+    // resolve to `Role::Service` in the local ACL are allowed to
+    // mutate registry state via acks. The DIDComm router has no
+    // sender allowlist, so any authcrypt-capable peer could reach
+    // this handler — without the ACL check, a Service-role peer (or
+    // any other DID that managed to land on the box) could lie about
+    // its OWN served_domains: drop a domain to make the UI report it
+    // un-served (and the next purge-fanout will skip it), or claim
+    // an assigned for a domain it doesn't host.
     if domain == "unknown" || sender == "unknown" {
         return Ok(None);
+    }
+    match check_acl(&state.acl_ks, sender).await {
+        Ok(crate::acl::Role::Service) => {} // proceed
+        Ok(other) => {
+            warn!(
+                did = sender,
+                role = %other,
+                domain,
+                op,
+                "domain ack rejected: Service role required"
+            );
+            return Ok(None);
+        }
+        Err(_) => {
+            warn!(
+                did = sender,
+                domain, op, "domain ack rejected: DID not in ACL"
+            );
+            return Ok(None);
+        }
     }
     let instance_id = sender.replace(':', "_");
     match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
