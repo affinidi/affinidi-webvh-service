@@ -392,12 +392,30 @@ export async function loginWithWalletProxy(
     const text = await authRes.text();
     throw new Error(`/auth/ failed (${authRes.status}): ${text}`);
   }
+  // /auth/ returns the canonical AuthenticateResponse: `{ session,
+  // tokens }`. Both nested structs (Session, TokenBundle) have
+  // `#[serde(rename_all = "camelCase")]` upstream in did-hosting-
+  // common's types.rs, so the wire shape is fully camelCase. The
+  // earlier draft of this file parsed the response with a flat
+  // snake_case shape (`{ access_token, refresh_token, session_id }`)
+  // — every field came out `undefined`, the wallet stored
+  // `undefined` as the token, and the home page bounced back to
+  // login. Mirror the canonical shape here.
   const tokenResp = (await authRes.json()) as {
-    session_id: string;
-    access_token: string;
-    refresh_token: string;
-    refresh_expires_at?: number;
+    session: { id: string; subject: string; issuedAt: string; expiresAt: string };
+    tokens: {
+      accessToken: string;
+      refreshToken?: string;
+      tokenType: string;
+      expiresIn: number;
+      refreshExpiresIn?: number;
+    };
   };
+  if (!tokenResp.tokens?.accessToken) {
+    throw new Error(
+      `/auth/: missing tokens.accessToken in response — got ${JSON.stringify(tokenResp).slice(0, 200)}`,
+    );
+  }
   steps.push({
     label: "3. Server verifies + issues bearer",
     description: `Server resolves the entry's DID, verifies the id_token signature, checks the nonce matches the challenge it issued in step 1, and issues a bearer access token bound to the principal DID.`,
@@ -406,11 +424,11 @@ export async function loginWithWalletProxy(
       url: `${apiBase}/auth/`,
       requestBody: authEnv,
       response: {
-        session_id: tokenResp.session_id,
-        access_token: tokenResp.access_token
-          ? `${tokenResp.access_token.slice(0, 12)}…(redacted)`
-          : "",
-        refresh_expires_at: tokenResp.refresh_expires_at ?? null,
+        sessionId: tokenResp.session.id,
+        sessionSubject: tokenResp.session.subject,
+        accessToken: `${tokenResp.tokens.accessToken.slice(0, 12)}…(redacted)`,
+        tokenType: tokenResp.tokens.tokenType,
+        expiresIn: tokenResp.tokens.expiresIn,
       },
     },
   });
@@ -419,9 +437,9 @@ export async function loginWithWalletProxy(
 
   return {
     result: {
-      accessToken: tokenResp.access_token,
-      refreshToken: tokenResp.refresh_token,
-      sessionId: tokenResp.session_id,
+      accessToken: tokenResp.tokens.accessToken,
+      refreshToken: tokenResp.tokens.refreshToken ?? "",
+      sessionId: tokenResp.session.id,
       holderDid: entry.principalDid,
     },
     viz: {
