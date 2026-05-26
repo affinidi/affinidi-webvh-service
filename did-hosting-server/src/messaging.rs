@@ -1,4 +1,4 @@
-//! DIDComm sync handlers for the WebVH server edge node.
+//! DIDComm sync handlers for the DID Hosting server edge node.
 //!
 //! The server is a read-only node that receives `sync-update` and
 //! `sync-delete` messages from the control plane via the mediator.
@@ -16,14 +16,35 @@ use tracing::{info, warn};
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
 
-use crate::acl::{Role, check_acl};
+// (The ACL helpers used to be needed here for per-handler `Admin|Service` checks
+// on the domain ops; the wave-2 follow-up replaced those with
+// `require_control_plane` so the ACL surface is no longer touched from this file.)
 use crate::server::AppState;
+
+/// Sync messages overwrite or delete arbitrary DIDs by mnemonic, so they must
+/// originate from the configured control plane — not merely any Service-role
+/// DID in the local ACL. If no `control_did` is configured all sync messages
+/// are rejected, which is correct: a server without a control plane has no
+/// legitimate sender for them.
+fn require_control_plane(sender: &str, state: &AppState) -> Result<(), (String, Value)> {
+    if state.config.control_did.as_deref() != Some(sender) {
+        warn!(
+            did = sender,
+            "sync message rejected: sender is not the configured control plane"
+        );
+        return Err(problem_report(
+            "e.p.did.unauthorized",
+            "sync messages must originate from the configured control plane",
+        ));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the DIDComm router for the WebVH server.
+/// Build the DIDComm router for the DID Hosting server.
 ///
 /// Handles only sync messages from the control plane (sync-update,
 /// sync-delete) and domain assignment messages (assign / unassign,
@@ -192,18 +213,8 @@ async fn do_sync_update(
     use crate::control_register::apply_single_update;
     use did_hosting_common::DidSyncUpdate;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "sync message rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.did.unauthorized",
-            "admin or service role required for sync messages",
-        ));
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let mnemonic = msg
@@ -264,18 +275,8 @@ async fn do_sync_delete(
 ) -> Result<(String, Value), String> {
     use crate::did_ops;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "sync message rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.did.unauthorized",
-            "admin or service role required for sync messages",
-        ));
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let mnemonic = msg
@@ -360,18 +361,15 @@ async fn do_domain_assign(
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, CancelOutcome};
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/assign rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain assignment",
-        ));
+    // Domain ops are at least as destructive as sync (`domain.purge`
+    // deletes every DID under the name); apply the same control-plane
+    // pinning rather than the looser Admin|Service ACL check that
+    // accepts any peer admin / sibling service. Closes the gap where
+    // a stale admin enrollment or compromised sibling could send a
+    // forged domain.{assign,unassign,purge,upsert} and mutate this
+    // server's local assignments.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -429,18 +427,9 @@ async fn do_domain_unassign(
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, parse_grace_string};
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/unassign rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain unassignment",
-        ));
+    // See do_domain_assign — control-plane pinning, not Admin|Service.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -547,22 +536,16 @@ async fn do_domain_purge(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), String> {
+    use did_hosting_common::server::assignment;
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::domain_purge::purge_domain_dids;
     use did_hosting_common::server::pending_purge;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/purge rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain purge",
-        ));
+    // See do_domain_assign — control-plane pinning. domain.purge wipes
+    // every DID under the name; a peer admin / sibling service should
+    // never reach this handler.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -571,6 +554,39 @@ async fn do_domain_purge(
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/purge")?;
     let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+
+    // Freshness check — defends against the replay-after-reassign-
+    // within-grace scenario:
+    //   1. Operator unassigns foo.example → control plane queues
+    //      purge → mediator goes down before delivery.
+    //   2. Operator changes their mind, re-assigns foo.example within
+    //      the grace window; server stores a new KS_ASSIGNMENTS row
+    //      with a fresh `assigned_at`.
+    //   3. Mediator comes back, delivers the stale purge.
+    //   4. Without this check, the data the operator chose to keep
+    //      gets wiped.
+    // If a current assignment row exists AND the message's
+    // `created_time` is older than the assignment's `assigned_at`,
+    // refuse the purge. Messages without `created_time` are treated
+    // as fresh for backwards compatibility — older DIDComm peers
+    // don't set the header, and the existing `MAX_AGE_SECS` outbox
+    // sweep already drops very stale messages on the wire.
+    if let Ok(Some(current)) = assignment::get(&state.store, &domain).await {
+        let msg_created = msg.created_time.unwrap_or(0);
+        if msg_created != 0 && msg_created < current.assigned_at {
+            warn!(
+                did = sender,
+                domain = %domain,
+                msg_created_time = msg_created,
+                assignment_assigned_at = current.assigned_at,
+                "domain/purge refused: message older than current assignment (likely a stale purge replayed after reassign-within-grace)"
+            );
+            return Ok(problem_report(
+                "e.p.domain.stale-purge",
+                "purge message predates the current assignment; refusing to wipe data that has since been re-assigned",
+            ));
+        }
+    }
 
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
@@ -641,18 +657,11 @@ async fn do_domain_upsert(
     };
     use did_hosting_common::server::pending_purge;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/upsert rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain upsert",
-        ));
+    // See do_domain_assign — control-plane pinning. domain.upsert
+    // mutates the canonical domain record and silently changes
+    // status / metadata; restrict to the configured control plane.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let entry: DomainEntry = serde_json::from_value(msg.body.clone())

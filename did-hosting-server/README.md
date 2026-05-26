@@ -1,6 +1,6 @@
-# Affinidi WebVH Server
+# Affinidi DID Hosting Server
 
-The WebVH Server is a read-only DID hosting edge node for
+The DID Hosting Server is a read-only DID hosting edge node for
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
 documents publicly and receives sync updates from the
 [control plane](../did-hosting-control/) via DIDComm through a mediator.
@@ -266,6 +266,40 @@ cargo build -p did-hosting-server --release \
 > `store-*` features will produce a compile error (enforced by
 > `did-hosting-server/build.rs`).
 
+### DID method features
+
+The public DID-resolution routes (`GET /{mnemonic}/did.jsonl`,
+`GET /{mnemonic}/did.json`, the `.well-known` variants) are gated
+at compile time by **method features**. At least one must be
+enabled for any DID to be resolvable.
+
+| Feature        | What it enables                                       |
+| -------------- | ----------------------------------------------------- |
+| `method-webvh` | did:webvh resolution (`/did.jsonl`, `/did-witness.json`) |
+| `method-web`   | did:web resolution (`/did.json`)                      |
+
+Both ship in the default feature set, so the most common builds
+need no special handling:
+
+```bash
+cargo build -p did-hosting-server --release
+cargo install did-hosting-server
+```
+
+> **Heads-up if you build with `--no-default-features`:** the
+> method gates come off too. A build that drops `method-webvh`
+> will compile, start, load DIDs from the store, and then 404
+> every `/{mnemonic}/did.jsonl` request with an **empty response
+> body** (the per-method dispatcher in
+> `did_public::serve_public` is `#[cfg]`-gated out). If you go
+> minimal, opt the methods back in explicitly:
+>
+> ```bash
+> cargo build -p did-hosting-server --release \
+>   --no-default-features \
+>   --features "keyring,store-fjall,method-webvh,method-web"
+> ```
+
 ### Environment Variable Overrides
 
 Every config field can be overridden via environment variables
@@ -449,7 +483,7 @@ All API endpoints are under the `/api` prefix.
 ## Performance Testing
 
 The `perf_test` example is an interactive TUI benchmarking tool
-for load-testing a running WebVH server. It sends concurrent DID
+for load-testing a running DID Hosting server. It sends concurrent DID
 resolution requests and displays real-time metrics including
 throughput, latency percentiles, network bandwidth, active
 workers, and error rates.
@@ -467,7 +501,7 @@ cargo run --example perf_test -p did-hosting-server -- [OPTIONS]
 ```
 
 The tool supports two modes: **server mode** (default) authenticates
-with a WebVH server and discovers DIDs automatically, while
+with a DID Hosting server and discovers DIDs automatically, while
 **file mode** (`--did-file`) reads `did:webvh:...` identifiers from
 a file and works against any hosted WebVH DID without needing
 ACL access.
@@ -476,7 +510,7 @@ ACL access.
 
 | Flag | Short | Default | Description |
 | ---- | ----- | ------- | ----------- |
-| `--server-url` | `-s` | `http://localhost:8530` | WebVH server URL |
+| `--server-url` | `-s` | `http://localhost:8530` | DID Hosting server URL |
 | `--rate` | `-r` | `10` | Target requests per second (adjustable at runtime) |
 | `--workers` | `-w` | `64` | Maximum concurrent in-flight requests |
 | `--timeout` | `-t` | `5` | Request timeout in seconds |
@@ -513,7 +547,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

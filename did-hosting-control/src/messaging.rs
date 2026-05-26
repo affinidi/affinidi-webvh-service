@@ -68,6 +68,12 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // Sync acknowledgements from servers
         .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
         .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
+        // Domain-op acknowledgements from servers (assign / unassign / purge).
+        // Informational only — control treats these as fire-and-forget and
+        // derives ground truth from the server's next registration cycle.
+        .route(MSG_DOMAIN_ASSIGN_ACK, handler_fn(handle_domain_ack))?
+        .route(MSG_DOMAIN_UNASSIGN_ACK, handler_fn(handle_domain_ack))?
+        .route(MSG_DOMAIN_PURGE_ACK, handler_fn(handle_domain_ack))?
         // Trust Tasks envelope (v0.7.0+) — routes the five `acl/*`
         // ops and `trust-task-discovery` through the same handlers
         // the HTTPS transport hits at `POST /api/trust-tasks`.
@@ -354,7 +360,36 @@ pub async fn dispatch_did_op(
                 .get("force")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let result = did_ops::create_did(auth, state, path, force).await?;
+            // T34 domain resolution mirrors the REST `request_uri` handler.
+            // Same chain: explicit on the wire → caller's ACL default →
+            // system default. When resolution fails (no domains
+            // configured / no default / `Allowed([])` caller with no
+            // explicit), we proceed with `None`; publish-time backfill
+            // from `did_id` host will tag the record. This keeps the
+            // legacy behaviour of un-domained installs and pre-T18
+            // tests, while still surfacing the domain on the new record
+            // for the common case where a default exists.
+            let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
+            let acl_scope =
+                match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
+                    .await?
+                {
+                    Some(e) => e.domains,
+                    None => did_hosting_common::server::domain::DomainScope::All,
+                };
+            let system_default =
+                did_hosting_common::server::domain::get_default_domain(&state.store)
+                    .await
+                    .ok()
+                    .flatten();
+            let resolved_domain = did_hosting_common::server::domain::resolve_request_domain(
+                request_domain,
+                &acl_scope,
+                system_default.as_deref(),
+            )
+            .ok();
+            let result =
+                did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await?;
             // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
@@ -618,6 +653,126 @@ async fn handle_sync_ack(
     Ok(None)
 }
 
+/// Handler for `domain/assign-ack`, `domain/unassign-ack`, `domain/purge-ack`.
+///
+/// Servers send these after applying the matching outbound domain op. The
+/// handler:
+/// 1. Logs the acknowledgement.
+/// 2. Updates the sender's `ServiceInstance.served_domains` in the registry
+///    so the UI reflects the change immediately, without waiting for the
+///    next `MSG_SERVER_REGISTER` from the server. Without this, a domain
+///    assigned to a server stays invisible in the registry view until the
+///    server restarts.
+async fn handle_domain_ack(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use crate::acl::check_acl;
+
+    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
+    let status = message
+        .body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let domain = message
+        .body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let op = if message.typ.contains("assign-ack") && !message.typ.contains("unassign-ack") {
+        "assign"
+    } else if message.typ.contains("unassign-ack") {
+        "unassign"
+    } else {
+        "purge"
+    };
+    info!(
+        sender,
+        domain, status, op, "server acknowledged domain {op}"
+    );
+
+    // Mirror the server's view of `served_domains` into our registry.
+    // `assigned` / `already_assigned` → add; everything else (unassign,
+    // purge, failures) → remove.
+    //
+    // Authz gate matches `handle_server_register`: only DIDs that
+    // resolve to `Role::Service` in the local ACL are allowed to
+    // mutate registry state via acks. The DIDComm router has no
+    // sender allowlist, so any authcrypt-capable peer could reach
+    // this handler — without the ACL check, a Service-role peer (or
+    // any other DID that managed to land on the box) could lie about
+    // its OWN served_domains: drop a domain to make the UI report it
+    // un-served (and the next purge-fanout will skip it), or claim
+    // an assigned for a domain it doesn't host.
+    if domain == "unknown" || sender == "unknown" {
+        return Ok(None);
+    }
+    match check_acl(&state.acl_ks, sender).await {
+        Ok(crate::acl::Role::Service) => {} // proceed
+        Ok(other) => {
+            warn!(
+                did = sender,
+                role = %other,
+                domain,
+                op,
+                "domain ack rejected: Service role required"
+            );
+            return Ok(None);
+        }
+        Err(_) => {
+            warn!(
+                did = sender,
+                domain, op, "domain ack rejected: DID not in ACL"
+            );
+            return Ok(None);
+        }
+    }
+    let instance_id = sender.replace(':', "_");
+    match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
+        Ok(Some(mut instance)) => {
+            let add = op == "assign" && matches!(status, "assigned" | "already_assigned");
+            let mutated = if add {
+                if !instance.served_domains.iter().any(|d| d == domain) {
+                    instance.served_domains.push(domain.to_string());
+                    instance.served_domains.sort();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                let before = instance.served_domains.len();
+                instance.served_domains.retain(|d| d != domain);
+                instance.served_domains.len() != before
+            };
+            if mutated
+                && let Err(e) =
+                    crate::registry::register_instance(&state.registry_ks, &instance).await
+            {
+                warn!(
+                    instance_id, error = %e,
+                    "failed to update served_domains after domain ack"
+                );
+            }
+        }
+        Ok(None) => {
+            // Server isn't in the registry yet (ack arrived before
+            // MSG_SERVER_REGISTER, or the operator wiped the registry).
+            // Logging only — the next register cycle will reconcile.
+            warn!(
+                instance_id,
+                "domain ack received for unregistered server — skipping registry update"
+            );
+        }
+        Err(e) => {
+            warn!(instance_id, error = %e, "failed to load instance for ack reconciliation");
+        }
+    }
+
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Stats sync handler (server → control plane via DIDComm)
 // ---------------------------------------------------------------------------
@@ -631,16 +786,22 @@ async fn handle_stats_sync(
 
     let sender = require_sender(&ctx)?;
 
-    // Validate ACL
-    if check_acl(&state.acl_ks, sender).await.is_err() {
+    // Require Service role — matches REST `/api/control/stats` which is gated
+    // on ServiceAuth. An Owner-role DID must not be able to write per-DID
+    // stats deltas: doing so would let any tenant tamper with another
+    // server's resolved/update counters.
+    if !matches!(
+        check_acl(&state.acl_ks, sender).await,
+        Ok(crate::acl::Role::Service)
+    ) {
         warn!(
             did = sender,
-            "stats sync via DIDComm rejected: DID not in ACL"
+            "stats sync via DIDComm rejected: Service role required"
         );
         return Ok(Some(
             DIDCommResponse::new(
                 MSG_PROBLEM_REPORT.to_string(),
-                json!({ "code": "e.p.stats.unauthorized", "comment": "DID not in ACL" }),
+                json!({ "code": "e.p.stats.unauthorized", "comment": "service role required" }),
             )
             .thid(message.id.clone()),
         ));
@@ -770,10 +931,32 @@ async fn handle_server_register(
         "inbound DIDComm: server registration request"
     );
 
-    // Require pre-approved ACL entry — the server DID must already be in the
-    // ACL (added by an admin) before it can register.
+    // Require pre-approved ACL entry with the Service role — matches REST
+    // `/api/control/register-service` which is gated on ServiceAuth. An
+    // Owner-role DID must not be able to register as a server: registration
+    // triggers `sync_all_dids_to_server`, which would push every tenant's
+    // DID log + witness content to the caller's DIDComm inbox and add them
+    // to the active-server registry so future `notify_servers_did` updates
+    // also reach them.
     let role = match check_acl(&state.acl_ks, sender).await {
-        Ok(role) => role,
+        Ok(crate::acl::Role::Service) => crate::acl::Role::Service,
+        Ok(other) => {
+            warn!(
+                did = sender,
+                role = %other,
+                "server registration rejected: Service role required"
+            );
+            return Ok(Some(
+                DIDCommResponse::new(
+                    MSG_PROBLEM_REPORT.to_string(),
+                    json!({
+                        "code": "e.p.registration.unauthorized",
+                        "comment": "service role required to register as a server"
+                    }),
+                )
+                .thid(message.id.clone()),
+            ));
+        }
         Err(_) => {
             warn!(
                 did = sender,
@@ -842,7 +1025,7 @@ async fn handle_server_register(
                 .collect()
         })
         .unwrap_or_else(|| vec!["webvh".to_string()]);
-    let served_domains: Vec<String> = message
+    let claimed_served_domains: Vec<String> = message
         .body
         .get("served_domains")
         .and_then(|v| v.as_array())
@@ -852,6 +1035,46 @@ async fn handle_server_register(
                 .collect()
         })
         .unwrap_or_default();
+    // Defense against a misbehaving server fabricating `served_domains`
+    // entries to mislead operators (and the purge-fanout in
+    // `delete_domain_route`). We intersect the self-asserted list
+    // against the control plane's authoritative DomainEntry registry,
+    // dropping names the control plane has no record of. This filters
+    // the "fabricate-a-domain-name" attack vector.
+    //
+    // KNOWN GAP (tracked for follow-up): we can't yet verify that the
+    // server is actually *authorised* to host the domains it claims —
+    // the control plane fires assign/unassign messages without
+    // recording them. A peer Service-role server could still claim to
+    // host a real but unrelated tenant's domain. Closing that gap
+    // requires a new control-plane-side dispatched-assignments table
+    // (one row per outbound MSG_DOMAIN_{ASSIGN,UNASSIGN}) the register
+    // handler can intersect against. Out of scope for this security
+    // fix; HIGH-1 (control-plane pinning on the server-side handlers)
+    // already removes the most damaging exploit (a peer issuing
+    // forged domain.purge to wipe data).
+    let served_domains: Vec<String> = if claimed_served_domains.is_empty() {
+        Vec::new()
+    } else {
+        let mut keep = Vec::with_capacity(claimed_served_domains.len());
+        for name in claimed_served_domains {
+            match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
+                Ok(Some(_)) => keep.push(name),
+                Ok(None) => warn!(
+                    did = sender,
+                    domain = %name,
+                    "register: dropping served_domains entry — control plane has no DomainEntry for this name"
+                ),
+                Err(e) => warn!(
+                    did = sender,
+                    domain = %name,
+                    error = %e,
+                    "register: failed to look up DomainEntry during served_domains validation — dropping entry"
+                ),
+            }
+        }
+        keep
+    };
     let protocol_version = message
         .body
         .get("protocol_version")

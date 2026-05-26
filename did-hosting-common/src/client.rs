@@ -47,7 +47,7 @@ impl WebVHClient {
 
     /// Authenticate with the server using DIDComm challenge-response.
     ///
-    /// `webvh_did` is the DID of the WebVH service the client is talking
+    /// `webvh_did` is the DID of the DID Hosting service the client is talking
     /// to; it becomes the DIDComm `to` field of the signed authenticate
     /// message. Today the server only verifies the message signature
     /// against the `from` DID, but addressing the message to the service

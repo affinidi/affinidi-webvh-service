@@ -1,4 +1,4 @@
-//! WebVH Server — read-only DID-resolver edge node.
+//! DID Hosting Server — read-only DID-resolver edge node.
 //!
 //! # Stability
 //!

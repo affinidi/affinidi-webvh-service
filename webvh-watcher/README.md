@@ -162,7 +162,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

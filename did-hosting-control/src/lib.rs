@@ -1,4 +1,4 @@
-//! WebVH Control Plane — DID lifecycle management, ACL, registry, and UI.
+//! DID Hosting Control Plane — DID lifecycle management, ACL, registry, and UI.
 //!
 //! # Stability
 //!

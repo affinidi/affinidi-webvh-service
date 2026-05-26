@@ -586,8 +586,11 @@ export const api = {
 
   getServicesOverview: () => request<ServiceOverview>("/api/services/overview"),
 
-  getServerTimeseries: (range: TimeRange = "24h") =>
-    request<TimeSeriesPoint[]>(`/api/timeseries?range=${range}`),
+  getServerTimeseries: (range: TimeRange = "24h", domain?: string) => {
+    const q = new URLSearchParams({ range });
+    if (domain) q.set("domain", domain);
+    return request<TimeSeriesPoint[]>(`/api/timeseries?${q.toString()}`);
+  },
 
   getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
     request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),
@@ -878,6 +881,29 @@ export const api = {
       `/api/domains/${encodeURIComponent(name)}/set-default`,
       { method: "POST" },
     ).then(normalizeDomain),
+
+  /** DELETE /api/domains/{name} — admin force-delete of a disabled
+   *  domain. Bypasses the `hosting.disable_purge_grace` cooling-off
+   *  window. Server refuses when the domain is Active or the current
+   *  default. Returns void (204 No Content).
+   *
+   *  `purgeServers: true` adds the T30 `domain.purge/1.0` DIDComm
+   *  fan-out: every server instance whose `served_domains` includes
+   *  this domain gets a purge message before the control record is
+   *  removed. Fire-and-forget on the DIDComm side — the local delete
+   *  proceeds without waiting for acks. */
+  /** DELETE /api/domains/{name}. Requires an aal2 (stepped-up) session
+   *  per the security review — the caller MUST have already passed
+   *  the step-up flow before this resolves. Sends `confirm=<name>` as
+   *  a typo guard the server checks against the path segment. */
+  deleteDomain: (name: string, opts?: { purgeServers?: boolean }) => {
+    const params = new URLSearchParams({ confirm: name });
+    if (opts?.purgeServers) params.set("purge_servers", "true");
+    return request<void>(
+      `/api/domains/${encodeURIComponent(name)}?${params.toString()}`,
+      { method: "DELETE" },
+    );
+  },
 
   // ---- Registry + per-(server, domain) ops (admin) ----
 
@@ -1174,7 +1200,7 @@ async function trustTask<Req, Resp>(
       if (!wallet?.signTrustTask) {
         throw new ApiError(
           401,
-          "Wallet-authenticated session but the VTI Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
+          "Wallet-authenticated session but the VTA Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
         );
       }
       const signed = await wallet.signTrustTask({

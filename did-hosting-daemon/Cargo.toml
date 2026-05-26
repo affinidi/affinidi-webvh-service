@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-daemon"
-description = "WebVH Daemon — Unified binary embedding server, witness, watcher, and control plane"
+description = "DID Hosting Daemon — Unified binary embedding server, witness, watcher, and control plane"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true
@@ -77,7 +77,7 @@ name = "did-hosting-daemon"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
+did-hosting-common = { version = "0.7", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
 did-hosting-server = { version = "0.7", path = "../did-hosting-server", default-features = false }
 webvh-witness = { version = "0.7", path = "../webvh-witness", default-features = false }
 webvh-watcher = { version = "0.7", path = "../webvh-watcher", default-features = false }

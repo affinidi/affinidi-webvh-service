@@ -1,74 +1,6 @@
 # Changelog
 
-## 0.8.0 (unreleased)
-
-### Auth-architecture consolidation with vti-common (S1+S2+S3)
-
-did-hosting's `/auth/*` surface now dispatches through the canonical
-handlers in `vti_common::auth::handlers`. Closes the structural
-follow-ups from the May 2026 cross-system auth security review.
-
-#### Added
-
-- **`did_hosting_common::server::auth::DidHostingSessionStore`** —
-  `vti_common::auth::SessionStore` adapter over did-hosting's
-  `KeyspaceHandle`. Honours did-hosting's separate storage trait
-  (fjall, Redis, DynamoDB backends) while consuming the canonical
-  `Session` type from vti-common.
-- **`AuthBackend` impls per service**:
-  - `did_hosting_control::auth::DidHostingControlAuthBackend`
-    (REST SIOPv2; per-DID rate-limiting via the existing O(1)
-    `PendingChallengeTracker`, canonical handler's limit disabled
-    via `max_pending_challenges_per_did = 0`).
-  - `did_hosting_server::auth::DidHostingServerAuthBackend`
-    (DIDComm-only; canonical per-DID limit replaces the previous
-    O(N) prefix-scan).
-  - `webvh_witness::auth::WebvhWitnessAuthBackend`
-    (DIDComm-only; canonical per-DID limit replaces the previous
-    O(N) prefix-scan).
-- **Re-exported `Session` + `SessionState` from vti-common** —
-  `did_hosting_common::server::auth::session` now thin-wraps
-  `vti_common::auth::session::{Session, SessionState}`. Field
-  shape unchanged (the canonical type's `tee_attested` is
-  `#[serde(default)]`; did-hosting never sets it).
-- **Trust-Task URI dual-accept** — `did-hosting-server` and
-  `webvh-witness` `/auth/` + `/auth/refresh` accept both the
-  legacy `affinidi.com/webvh/1.0/...` URIs and the canonical
-  `trusttasks.org/spec/auth/{authenticate,refresh}/0.1` URIs.
-  Migration-window behaviour; drop the alias one minor release
-  after every client upgrades.
-
-#### Changed
-
-- **`From<AuthError> for AppError`** — the canonical handler's
-  typed `vti_common::auth::AuthError` variants render through
-  did-hosting's existing `IntoResponse` plumbing without
-  backend-specific glue.
-- **Cross-repo dependency** — `did-hosting-common` (and consumer
-  crates) now depend on `vti-common` via a pinned git rev during
-  the consolidation window. Switches to a crates.io dep at
-  `version = "0.7"` once vti-common 0.7 publishes.
-- **Workspace `vta-sdk` pin** moved to the same git rev so the
-  two repos resolve to a single `vta-sdk` version (rather than
-  two co-existing copies — the workspace pin + the
-  vti-common-internal pin).
-
-#### Removed
-
-- did-hosting-common's local `Session` + `SessionState` definitions.
-  Replaced by re-export from vti-common.
-- did-hosting-{control,server,witness}'s in-line `/auth/*` flow
-  logic (~250 lines). Each handler is now a thin dispatcher
-  around the canonical handler.
-
-#### Note
-
-The full operator-side documentation update — runtime config
-keys, `pnm services` topology, the new `trust_xff` flag, the
-`step_up_required` body shape — will land alongside the
-did-hosting docs refresh in the next minor.
-
-## 0.7.0 (unreleased)
+## 0.7.0 (2026-05-24)
 
 ### Added — Trust Tasks framework adoption
 
@@ -115,8 +47,9 @@ did-hosting docs refresh in the next minor.
   Constructed at startup when `did_resolver` is configured (the
   verifier shares the same DID-resolver cache as the DIDComm path).
 - **`AppConfig` gains `trust_tasks: TrustTasksConfig`.** New section
-  with a single `enforce_proofs: bool` knob (default `false`;
-  revisited in v0.8.0).
+  with a single `enforce_proofs: bool` knob (initial default `false`;
+  flipped to `true` later in this release — see *Upstream alignment*
+  below).
 - **UI ACL surface (`did-hosting-ui`) routes through `/api/trust-tasks`.**
   The four `api.{list,create,update,delete}Acl` methods plus a new
   `api.aclShow` now POST trust-task envelopes. Wire-shape translation
@@ -293,11 +226,79 @@ dispatch core:
    * The framework's `AffinidiVerifier` then does the actual
      signature verification (via the existing
      `CachedDidResolver` which already supports `did:key`).
-- **`[patch.crates-io]` rev bumped to
-  [`21db8a8`](https://github.com/trustoverip/dtgwg-trust-tasks-tf/commit/21db8a8a031a59797a2cc49ad800158e644d51e4)
-  on `dtgwg-trust-tasks-tf`.** This is the PR #33 merge commit;
-  drops along with the rest of `[patch.crates-io]` when the
-  upstream publishes to crates.io.
+- **`trust-tasks` family pinned to `0.1.1` on crates.io.** The PR #33
+  changes shipped upstream as `trust-tasks-rs` 0.1.1 (published
+  2026-05-24); the workspace dep moves to the crates.io pin and the
+  transitional `[patch.crates-io]` block has been removed.
+
+### Auth-architecture consolidation with vti-common
+
+did-hosting's `/auth/*` surface now dispatches through the canonical
+handlers in `vti_common::auth::handlers`. Closes the structural
+follow-ups from the May 2026 cross-system auth security review.
+
+#### Added
+
+- **`did_hosting_common::server::auth::DidHostingSessionStore`** —
+  `vti_common::auth::SessionStore` adapter over did-hosting's
+  `KeyspaceHandle`. Honours did-hosting's separate storage trait
+  (fjall, Redis, DynamoDB backends) while consuming the canonical
+  `Session` type from vti-common.
+- **`AuthBackend` impls per service**:
+  - `did_hosting_control::auth::DidHostingControlAuthBackend`
+    (REST SIOPv2; per-DID rate-limiting via the existing O(1)
+    `PendingChallengeTracker`, canonical handler's limit disabled
+    via `max_pending_challenges_per_did = 0`).
+  - `did_hosting_server::auth::DidHostingServerAuthBackend`
+    (DIDComm-only; canonical per-DID limit replaces the previous
+    O(N) prefix-scan).
+  - `webvh_witness::auth::WebvhWitnessAuthBackend`
+    (DIDComm-only; canonical per-DID limit replaces the previous
+    O(N) prefix-scan).
+- **Re-exported `Session` + `SessionState` from vti-common** —
+  `did_hosting_common::server::auth::session` now thin-wraps
+  `vti_common::auth::session::{Session, SessionState}`. Field
+  shape unchanged (the canonical type's `tee_attested` is
+  `#[serde(default)]`; did-hosting never sets it). The wire-shape
+  `Session` in `did_hosting_common::types` (the OIDC Core §2
+  response body) is a distinct type and is unchanged.
+- **Trust-Task URI dual-accept** — `did-hosting-server` and
+  `webvh-witness` `/auth/` + `/auth/refresh` accept both the
+  legacy `affinidi.com/webvh/1.0/...` URIs and the canonical
+  `trusttasks.org/spec/auth/{authenticate,refresh}/0.1` URIs.
+  Migration-window behaviour; drop the alias one minor release
+  after every client upgrades.
+
+#### Changed
+
+- **`From<AuthError> for AppError`** — the canonical handler's
+  typed `vti_common::auth::AuthError` variants render through
+  did-hosting's existing `IntoResponse` plumbing without
+  backend-specific glue.
+- **Cross-repo dependency** — `did-hosting-common` (and consumer
+  crates) now depend on `vti-common = "0.7"` from crates.io
+  (published 2026-05-24 alongside this release).
+- **Workspace `vta-sdk` pin** moved to `version = "0.7"` on
+  crates.io so the two repos resolve to a single `vta-sdk`
+  version (rather than two co-existing copies — the workspace
+  pin + the vti-common-internal pin).
+
+#### Removed
+
+- did-hosting-common's local *storage-side* `Session` +
+  `SessionState` definitions. Replaced by re-export from
+  vti-common. (The wire-shape `Session` in
+  `did_hosting_common::types` is unrelated and remains.)
+- did-hosting-{control,server,witness}'s in-line `/auth/*` flow
+  logic (~250 lines). Each handler is now a thin dispatcher
+  around the canonical handler.
+
+#### Note
+
+The full operator-side documentation update — runtime config
+keys, `pnm services` topology, the new `trust_xff` flag, the
+`step_up_required` body shape — lands in v0.8.0 alongside the
+broader did-hosting docs refresh.
 
 ### Changed — **BREAKING**
 
@@ -575,6 +576,207 @@ dispatch core:
 - `cargo update` plus the SDK upgrade close the high-severity
   `openssl 0.10.79` and `rustls-webpki 0.103.13` advisories on the
   default-features Rust build.
+
+### Follow-ups — security review + domain UX (2026-05-25)
+
+A second pass over the v0.7.0 cut against an external security-patch
+series, plus operator-driven UX gaps surfaced once the multi-domain
+features were exercised end-to-end. The wire shape and operator-
+facing config are unchanged; these are correctness, authz, and
+log-hygiene fixes.
+
+#### Security
+
+- **DIDComm `MSG_SERVER_REGISTER` / `MSG_STATS_SYNC` now require the
+  `Service` role exactly.** Both control-plane handlers previously
+  accepted any sender in the ACL (Owner / Service / Admin). The
+  REST equivalents (`POST /api/control/register-service` /
+  `POST /api/control/stats`) are gated on `ServiceAuth` (Service-only);
+  the DIDComm transports are now aligned. The `handle_server_register`
+  case is the higher-impact half: success calls `sync_all_dids_to_server`,
+  which pushes every tenant's DID log + witness content to the caller
+  and subscribes them to all future updates — an Owner-role DID could
+  enumerate the entire fleet's hosted data via a single forged register.
+- **`MSG_SYNC_UPDATE` / `MSG_SYNC_DELETE` bound to the configured
+  `control_did`, not any Service-role DID.** `did-hosting-server`'s
+  sync handlers overwrite or delete arbitrary DIDs by body-supplied
+  mnemonic. The previous `Role::Admin | Role::Service` gate let any
+  peer server, witness, or stale Service ACL entry wipe or replace
+  any hosted DID's log/witness content. New `require_control_plane`
+  helper enforces an exact match against `config.control_did`; missing
+  `control_did` rejects all sync messages (correct — a server without
+  a control plane has no legitimate sender).
+- **`GET /api/services/overview` now requires `AdminAuth`.** Previously
+  any authenticated `AuthClaims` caller could enumerate the backend
+  service registry — internal instance URLs, instance IDs, server
+  DIDs, health status, registration timestamps. The equivalent
+  `/api/control/registry` routes have always required `AdminAuth`; the
+  overview gate is brought in line.
+- **Manual `Debug` impls on credential-bearing config types.**
+  `StoreConfig` (`redis_url`, `cosmosdb_connection_string`),
+  `WatcherEndpoint.token`, `SyncConfig.push_tokens`,
+  `SourceConfig.token`, `EnrollStartRequest.token`, and
+  `CreateInviteResponse.{token, enrollment_url}` previously
+  derived `Debug` and would render the live credential verbatim
+  in any startup `tracing::info!(?config, …)` or error-path debug
+  format. Each now redacts via `<redacted>` (count-only for the
+  `push_tokens` slice). `PlaintextSecrets` already redacted; this
+  closes the gap on every related struct.
+- **Regression test guards the DIDComm refresh signer-binding.** The
+  fix that pins a refresh token to the DIDComm sender DID lives in
+  the upstream `vti-common` crate. Added
+  `did-hosting-server/tests/refresh_signer_binding.rs` — seeds an
+  Alice-owned session, calls `handle_refresh` with a mismatched
+  signer, asserts `AppError::Authentication`. Catches a future
+  backend swap silently dropping the binding parameter.
+
+#### Fixed — domain assignment surfaces correctly in the UI
+
+- **`POST /api/control/registry/{id}/domains/{domain}/{op}` now returns
+  JSON on 202.** All three handlers (`assign`, `unassign`, `purge`)
+  previously returned bare `StatusCode::ACCEPTED` with no body. The
+  UI's `request()` helper short-circuits 204 only — on any other
+  status it validates `application/json` and throws
+  `"Expected JSON response but got unknown content type"`. Each
+  handler now returns `(StatusCode::ACCEPTED, Json(json!({…})))`
+  with the operation, instance ID, and domain so the UI gets a
+  structured ack.
+- **Control-plane DIDComm router handles `domain/{assign,unassign,purge}-ack`.**
+  Servers send these after applying the matching outbound op. The
+  router had no entries, so each ack fell through to `handle_fallback`
+  and logged `inbound DIDComm: unhandled message type — ignoring`.
+  A new `handle_domain_ack` records the ack at info-level (parallel
+  to the existing `handle_sync_ack`).
+- **`served_domains` populated end-to-end.** The control plane's
+  registry view (and the UI's "domains assigned to this server"
+  panel) showed nothing after a successful domain assign. Two-part
+  fix: `did-hosting-server`'s `register_via_didcomm` no longer
+  hardcodes `served_domains: []` (it now lists active local domains
+  from `list_domains(&state.store)`), and `handle_domain_ack` mirrors
+  each ack into the matching `ServiceInstance.served_domains` so the
+  registry updates immediately without waiting for the next server
+  boot. Restart-recovery and live-update paths converge on the same
+  identity (`sender.replace(':', "_")`, the same derivation
+  `handle_server_register` already uses).
+
+#### Added — admin escape hatch for disabled domains
+
+- **`DELETE /api/domains/{name}` (Admin-only) force-deletes a disabled
+  domain**, bypassing the `hosting.disable_purge_grace` cooling-off
+  window the background sweep otherwise waits out. Refuses when the
+  domain is Active (operator must disable first — same two-step safety
+  the UI already enforces) or when it's the current default
+  (`delete_domain_record` already gates this and surfaces as
+  `Conflict`). The pending-purge row is cancelled after the record
+  is removed so the next sweep doesn't try to delete a row that's
+  already gone. Mounted alongside the existing `PUT /domains/{name}`
+  under `TASK_DOMAIN_UPDATE_1_0` (same pattern as `/registry/{id}`
+  chaining GET+DELETE under one Trust-Task URI).
+- **`?purge_servers=true` adds one-click fleet-wide purge.** When set,
+  every registry instance whose `served_domains` lists the domain
+  receives a `domain.purge/1.0` (T30) DIDComm message before the
+  control-plane record is removed. Fire-and-forget over DIDComm;
+  the local delete proceeds without waiting for acks, and
+  `handle_domain_ack` drops the domain from `served_domains` as
+  servers ack back. Per-instance failures during fanout are logged
+  but never block the overall delete — operators can re-run the
+  per-server "Purge now" on any that missed.
+- **Three buttons on disabled domain cards.** UI gains "Delete now"
+  (record-only) and "Purge & delete" (fleet-wide) destructive buttons
+  alongside the existing "Enable". Each has a confirm dialog that
+  spells out the blast radius. The "Delete now" path is the
+  recovery route for legacy disabled domains whose `purge_at` was
+  never populated and would otherwise stay stuck forever.
+
+#### Changed
+
+- **Login UI: "Login with VTA Wallet"** replaces "Login with VTI
+  Wallet" on the button + install hint + the two extension-missing
+  error messages. Aligns the user-facing strings with the rest of
+  the codebase (`window.vtaWallet`, etc.).
+
+### Follow-ups — UX polish, branding, and dashboard scoping (2026-05-25)
+
+A third pass over the v0.7.0 cut driven by hands-on operator use of
+the new multi-domain features. No wire changes; everything below is
+text, layout, or client-side filtering. Same v0.7.0 dated section is
+extended because the tag still hasn't moved.
+
+#### Changed — product naming aligned to "DID Hosting"
+
+- **User-facing "WebVH" → "DID Hosting" rename.** Setup-wizard
+  headers, CLI `about` strings, the daemon/server/control ASCII-banner
+  subtitles, `Cargo.toml` `description` fields, README titles and
+  body, the DIDComm DID-management protocol document's prose and
+  Mermaid participant labels, the WebAuthn `rp_name` ("DID Hosting
+  Server"), and the `OperatorMessages` integration labels passed
+  through to the VTA's `pnm contexts create --name "..."` hint all
+  say "DID Hosting" now. Kept "WebVH" where it refers to the DID
+  method itself (`did:webvh`, WebVH log entries, WebVH spec links),
+  code identifiers (`WebVHClient`, `WebVHError`, `WebVHHosting`
+  service-type string), wire constants (JWT `aud: "WebVH"`,
+  message-type URIs under `https://affinidi.com/webvh/1.0/...`), and
+  the `webvh-watcher` / `webvh-witness` crate directories whose
+  witness/watcher concepts are themselves method-specific. The
+  rebrand is text-only — no API, ABI, or on-disk format changes.
+- **UI title "DID Hosting Manager".** Expo manifest `name`
+  (`did-hosting-ui/app.json`) updated, which drives the browser tab
+  `<title>` rendered from `dist/index.html`.
+
+#### Fixed
+
+- **Duplicate "Mediator DID" prompt during daemon setup.** Both the
+  offline-prepare and self-managed flows rendered the prompt twice
+  when the operator pasted a long mediator DID. Root cause:
+  `dialoguer`'s `Input::interact_text()` re-renders the prompt after
+  Enter to drop the bracketed default indicator, and its line-clear
+  counts logical newlines rather than terminal-wrapped visual rows
+  — so a wrapped input left the original prompt on screen while the
+  re-render landed below as if it were a second prompt. Replaced the
+  single `Input` (`.default(String::new()) + .allow_empty(true)`)
+  with a `Confirm`-then-`Input` pair: the Confirm "Configure a
+  DIDComm mediator?" is short enough to never wrap, and the
+  follow-up `Mediator DID:` Input has a short label so the re-render
+  lines up cleanly. Same shape as the existing online flow's
+  mediator selection.
+- **Domain switcher now actually scopes the DIDs list.** The
+  client-side filter accepted any DID whose `domain` field was
+  empty, so tenants whose records pre-date the M-01 migration (or
+  whose DIDs were assigned cross-domain) saw the switcher silently
+  no-op. Tightened to a strict `d.domain === currentDomain`; the
+  list page surfaces an `N unassigned DIDs hidden` hint next to the
+  filter caption so a user staring at an unexpectedly short list
+  knows there are legacy records to triage (or to switch to "All
+  domains").
+- **Dashboard stats now react to the domain switcher.** The
+  dashboard previously read `/api/stats` and rendered the
+  server-wide aggregate regardless of the active domain. When a
+  specific domain is pinned the dashboard now derives per-domain
+  numbers from the DID list: DIDs in `{domain}`, scoped resolves,
+  and scoped updates (sum of `versionCount - 1` clamped to ≥0 — the
+  in-memory updates counter isn't broken out per-domain yet).
+  "All domains" (admin) keeps the cheap `/api/stats` fast-path.
+
+#### Added — dashboard
+
+- **Domains stat card.** New card between "Total DIDs" and
+  "Total Resolves" reading the count from the existing
+  `useDomains()` provider. Always shows the total configured count;
+  it's a system-level fact rather than a per-view stat.
+- **Wider dashboard layout.** `statusRow`, `errorCard`, `section`,
+  `migrationBanner`, and the `ServiceOverview` container bumped from
+  `maxWidth: 500/800` to `1200` to match `NavBar` and the DID detail
+  page. The dashboard was the only screen still rendering inside a
+  narrow centered column on wide viewports.
+
+#### Build
+
+- **`cargo update`.** `affinidi-messaging-didcomm` 0.13.2 → 0.13.3,
+  `affinidi-messaging-mediator` 0.15.4 → 0.15.5,
+  `affinidi-messaging-sdk` 0.18.2 → 0.18.3,
+  `windows-native-keyring-store` 1.0.0 → 1.1.0. Drops unused
+  transitive deps (`aes 0.9`, `cipher 0.5`, `cpubits 0.1`,
+  `inout 0.2`, `vta-sdk 0.6` — workspace already pins 0.7).
 
 ## 0.6.0 (2026-05-05)
 

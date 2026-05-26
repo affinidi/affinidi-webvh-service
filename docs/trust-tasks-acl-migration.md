@@ -178,12 +178,10 @@ binding spec). DIDComm carries authcrypt — the verified sender DID
 becomes the in-band `issuer` automatically. Response packs back into
 the same envelope type.
 
-> **Note**: the `trust-tasks-*` crates are pre-publication at the
-> time of v0.7.0. The workspace resolves them via `[patch.crates-io]`
-> against an upstream sibling checkout until they land on crates.io
-> — see the `[patch.crates-io]` block in the workspace
-> [`Cargo.toml`](../Cargo.toml). The links in this document point at
-> the upstream GitHub source meanwhile.
+> **Note**: the `trust-tasks-*` crates are pinned to crates.io
+> `0.1.1` (published 2026-05-24 alongside the v0.7.0 cut). The
+> transitional `[patch.crates-io]` block has been removed. Links in
+> this document point at the upstream GitHub source for context.
 
 ## Proof policy (v0.7.0)
 

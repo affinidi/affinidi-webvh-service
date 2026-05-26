@@ -1,4 +1,4 @@
-//! Prometheus metrics for WebVH services.
+//! Prometheus metrics for DID Hosting services.
 //!
 //! Gated behind the `metrics` feature flag. When enabled, provides counters
 //! for DID operations, auth events, cache performance, and stats sync.

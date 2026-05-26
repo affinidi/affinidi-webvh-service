@@ -218,7 +218,7 @@ pub fn router_without_fallback() -> Router<AppState> {
         )
         .route_with_task_permissive(
             "/domains/{name}",
-            put(domain::update_domain_route),
+            put(domain::update_domain_route).delete(domain::delete_domain_route),
             (*TASK_DOMAIN_UPDATE_1_0).clone(),
         )
         .route_with_task_permissive(

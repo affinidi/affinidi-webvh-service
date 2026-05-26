@@ -12,16 +12,16 @@ pub struct WebvhDaemonMessages;
 
 impl OperatorMessages for WebvhDaemonMessages {
     fn integration_label(&self) -> &str {
-        "WebVH daemon"
+        "DID Hosting daemon"
     }
 
     fn integration_label_lower(&self) -> &str {
-        "webvh daemon"
+        "did hosting daemon"
     }
 
     fn pnm_admin_command_hint(&self, context_id: &str, setup_did: &str) -> String {
         format!(
-            "pnm contexts create --id {context_id} --name \"WebVH daemon\" \\\n  \
+            "pnm contexts create --id {context_id} --name \"DID Hosting daemon\" \\\n  \
              --admin-did {setup_did} --admin-expires 1h"
         )
     }
@@ -32,16 +32,16 @@ pub struct WebvhServerMessages;
 
 impl OperatorMessages for WebvhServerMessages {
     fn integration_label(&self) -> &str {
-        "WebVH hosting server"
+        "DID Hosting server"
     }
 
     fn integration_label_lower(&self) -> &str {
-        "webvh hosting server"
+        "did hosting server"
     }
 
     fn pnm_admin_command_hint(&self, context_id: &str, setup_did: &str) -> String {
         format!(
-            "pnm contexts create --id {context_id} --name \"WebVH hosting server\" \\\n  \
+            "pnm contexts create --id {context_id} --name \"DID Hosting server\" \\\n  \
              --admin-did {setup_did} --admin-expires 1h"
         )
     }
@@ -52,16 +52,16 @@ pub struct WebvhControlMessages;
 
 impl OperatorMessages for WebvhControlMessages {
     fn integration_label(&self) -> &str {
-        "WebVH control plane"
+        "DID Hosting control plane"
     }
 
     fn integration_label_lower(&self) -> &str {
-        "webvh control plane"
+        "did hosting control plane"
     }
 
     fn pnm_admin_command_hint(&self, context_id: &str, setup_did: &str) -> String {
         format!(
-            "pnm contexts create --id {context_id} --name \"WebVH control plane\" \\\n  \
+            "pnm contexts create --id {context_id} --name \"DID Hosting control plane\" \\\n  \
              --admin-did {setup_did} --admin-expires 1h"
         )
     }
@@ -112,7 +112,7 @@ mod tests {
             .pnm_admin_command_hint("prod-webvh", "did:key:z6MkExampleDaemonKey");
         assert!(cmd.contains("--id prod-webvh"));
         assert!(cmd.contains("--admin-did did:key:z6MkExampleDaemonKey"));
-        assert!(cmd.contains("--name \"WebVH daemon\""));
+        assert!(cmd.contains("--name \"DID Hosting daemon\""));
         assert!(cmd.contains("--admin-expires 1h"));
     }
 
@@ -120,14 +120,14 @@ mod tests {
     fn server_command_uses_hosting_server_label() {
         let cmd = WebvhServerMessages
             .pnm_admin_command_hint("prod-webvh", "did:key:z6MkExampleServerKey");
-        assert!(cmd.contains("--name \"WebVH hosting server\""));
+        assert!(cmd.contains("--name \"DID Hosting server\""));
     }
 
     #[test]
     fn control_command_uses_control_plane_label() {
         let cmd = WebvhControlMessages
             .pnm_admin_command_hint("prod-webvh", "did:key:z6MkExampleControlKey");
-        assert!(cmd.contains("--name \"WebVH control plane\""));
+        assert!(cmd.contains("--name \"DID Hosting control plane\""));
     }
 
     #[test]

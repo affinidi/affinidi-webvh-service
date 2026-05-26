@@ -31,7 +31,7 @@ use did_hosting_common::server::store::{
 #[derive(Parser)]
 #[command(
     name = "did-hosting-daemon",
-    about = "WebVH Daemon — Unified Service",
+    about = "DID Hosting Daemon — Unified Service",
     version
 )]
 struct Cli {
@@ -2001,7 +2001,7 @@ fn print_banner() {
 {cyan}██║  ██║{magenta}██╔══██║{yellow}██╔══╝  {cyan}██║╚██╔╝██║{magenta}██║   ██║{yellow}██║╚██╗██║{reset}
 {cyan}██████╔╝{magenta}██║  ██║{yellow}███████╗{cyan}██║ ╚═╝ ██║{magenta}╚██████╔╝{yellow}██║ ╚████║{reset}
 {cyan}╚═════╝ {magenta}╚═╝  ╚═╝{yellow}╚══════╝{cyan}╚═╝     ╚═╝{magenta} ╚═════╝ {yellow}╚═╝  ╚═══╝{reset}
-{dim}  WebVH Daemon v{version}{reset}
+{dim}  DID Hosting Daemon v{version}{reset}
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );

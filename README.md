@@ -1,4 +1,4 @@
-# Affinidi WebVH Service
+# Affinidi DID Hosting Service
 
 A collection of services to operate
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs in production.
@@ -90,6 +90,14 @@ webvh-watcher --config watcher-config.toml
 ```
 
 See each crate's README for detailed setup instructions.
+
+> **Building with `--no-default-features`?** The DID-method
+> features (`method-webvh`, `method-web`) are part of the default
+> set on `did-hosting-server` and `did-hosting-common`. A
+> minimal build that drops them compiles fine but silently
+> 404s every public DID resolution. If you customise features,
+> opt the methods back in explicitly — see
+> [did-hosting-server/README.md](did-hosting-server/README.md#did-method-features).
 
 ### Option 3: Non-interactive / scripted setup
 
@@ -193,7 +201,7 @@ using [this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service codebase, you can
+If you have a technical issue with the Affinidi DID Hosting Service codebase, you can
 also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on GitHub under

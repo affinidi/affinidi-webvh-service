@@ -48,10 +48,22 @@ pub struct AppConfig {
     pub config_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct WatcherEndpoint {
     pub url: String,
     pub token: Option<String>,
+}
+
+// Manual Debug: `token` is a bearer secret used by webvh-watcher's /sync push
+// auth. Leaking it via a stray debug/trace log of the loaded config would
+// hand any reader live push credentials.
+impl std::fmt::Debug for WatcherEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatcherEndpoint")
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

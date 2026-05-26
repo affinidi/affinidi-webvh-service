@@ -46,7 +46,7 @@ pub async fn run_wizard(
     preloaded_setup_key_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Server — Setup Wizard");
+    eprintln!("  DID Hosting Server — Setup Wizard");
     eprintln!("  ===========================");
     eprintln!();
     eprintln!("  This configures a read-only server edge node that serves DID");
@@ -501,7 +501,7 @@ pub async fn run_setup_offline_prepare(
     state_out: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Server — Offline Setup (step 1/2)");
+    eprintln!("  DID Hosting Server — Offline Setup (step 1/2)");
     eprintln!("  ========================================");
     eprintln!();
     eprintln!("  Captures all server settings and writes a sealed-bundle");
@@ -691,7 +691,7 @@ pub async fn run_setup_offline_complete(
     state_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Server — Offline Setup (step 2/2)");
+    eprintln!("  DID Hosting Server — Offline Setup (step 2/2)");
     eprintln!("  ========================================");
     eprintln!();
 

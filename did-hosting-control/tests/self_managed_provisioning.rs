@@ -128,7 +128,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
     };
 
     // 5. Phase 1 — tenant requests a DID slot (analog to MSG_DID_REQUEST).
-    let request = create_did(&auth, &state, Some("tenant/alice"), false)
+    let request = create_did(&auth, &state, Some("tenant/alice"), false, None)
         .await
         .expect("create_did");
     assert_eq!(request.mnemonic, "tenant/alice");

@@ -58,7 +58,7 @@ pub async fn run_wizard(
     preloaded_setup_key_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Setup Wizard");
+    eprintln!("  DID Hosting Daemon — Setup Wizard");
     eprintln!("  ============================");
     eprintln!();
     eprintln!("  The daemon runs control + server + witness + (optional) watcher");
@@ -498,15 +498,25 @@ async fn run_self_managed_setup(
     eprintln!();
     eprintln!("  DIDComm mediator. Required if you want this daemon to:");
     eprintln!("    - receive inbound DIDComm from external VTAs (tenant DID provisioning), or");
-    eprintln!("    - be registered as a webvh hosting server with a VTA");
+    eprintln!("    - be registered as a DID hosting server with a VTA");
     eprintln!("      (`vta webvh add-server` requires a DIDCommMessaging endpoint).");
     eprintln!();
-    let mediator_input: String = Input::new()
-        .with_prompt("Mediator DID (leave blank for none)")
-        .allow_empty(true)
-        .default(String::new())
-        .interact_text()?;
-    let mediator_did = if mediator_input.trim().is_empty() {
+    // Confirm-then-Input avoids dialoguer's wrapped-line re-render bug
+    // where long DIDs entered into a single Input with `.default("")`
+    // re-render on a new visual line after Enter, looking like two prompts.
+    let want_mediator = Confirm::new()
+        .with_prompt("Configure a DIDComm mediator?")
+        .default(true)
+        .interact()?;
+    let mediator_did = if want_mediator {
+        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
+        let trimmed = did.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else {
         eprintln!();
         eprintln!("  No mediator configured. Without a mediator, the generated DID");
         eprintln!("  document will not include a DIDCommMessaging service. This");
@@ -523,8 +533,6 @@ async fn run_self_managed_setup(
             return Ok(());
         }
         None
-    } else {
-        Some(mediator_input.trim().to_string())
     };
 
     // 4. Host / port / log / data dir.
@@ -728,7 +736,7 @@ pub async fn run_setup_offline_prepare(
     state_out: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Offline Setup (step 1/2)");
+    eprintln!("  DID Hosting Daemon — Offline Setup (step 1/2)");
     eprintln!("  ========================================");
     eprintln!();
 
@@ -776,15 +784,23 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator.");
     eprintln!();
-    let mediator_raw: String = Input::new()
-        .with_prompt("Mediator DID (leave empty to skip)")
-        .default(String::new())
-        .allow_empty(true)
-        .interact_text()?;
-    let mediator_did = if mediator_raw.trim().is_empty() {
-        None
+    // Confirm-then-Input avoids dialoguer's wrapped-line re-render bug:
+    // long DIDs entered into a single Input with `.default("")` re-render
+    // on a new visual line after Enter, looking like two prompts.
+    let want_mediator = Confirm::new()
+        .with_prompt("Configure a DIDComm mediator?")
+        .default(true)
+        .interact()?;
+    let mediator_did = if want_mediator {
+        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
+        let trimmed = did.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     } else {
-        Some(mediator_raw.trim().to_string())
+        None
     };
     features.didcomm = mediator_did.is_some();
 
@@ -905,7 +921,7 @@ pub async fn run_setup_offline_complete(
     state_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
-    eprintln!("  WebVH Daemon — Offline Setup (step 2/2)");
+    eprintln!("  DID Hosting Daemon — Offline Setup (step 2/2)");
     eprintln!("  ========================================");
     eprintln!();
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "did-hosting-control",
-    about = "WebVH Control Plane — Unified Management",
+    about = "DID Hosting Control Plane — Unified Management",
     version
 )]
 struct Cli {
@@ -733,7 +733,7 @@ fn print_banner() {
 {cyan}██║    {magenta}    ██║   {yellow}██╔══██╗{cyan}██║     {reset}
 {cyan}╚██████╗{magenta}   ██║   {yellow}██║  ██║{cyan}███████╗{reset}
 {cyan} ╚═════╝{magenta}   ╚═╝   {yellow}╚═╝  ╚═╝{cyan}╚══════╝{reset}
-{dim}  WebVH Control Plane v{version}{reset}
+{dim}  DID Hosting Control Plane v{version}{reset}
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );

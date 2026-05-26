@@ -1,4 +1,4 @@
-# WebVH Service — Project Instructions
+# DID Hosting Service — Project Instructions
 
 ## did-hosting-daemon: the unified binary
 

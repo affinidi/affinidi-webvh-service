@@ -98,6 +98,30 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         ),
         Err(e) => warn!(error = %e, "store integrity check failed"),
     }
+
+    // First-boot multi-domain init (daemon parity with
+    // did-hosting-daemon/src/main.rs:544-622). Three idempotent steps:
+    //
+    //   1. seed_domains_first_boot — populates KS_DOMAINS from
+    //      `[hosting] bootstrap_domains`, falling back to legacy
+    //      `public_url` host on upgrade. Without this, the
+    //      resolve-side safety check (assert_resolution_allowed) takes
+    //      the "permissive skip" branch on every resolve and emits a
+    //      warn-log per request — annoying noise on standalone v0.6
+    //      → v0.7 upgrades.
+    //   2. seed_assignments_first_boot — same tier chain, populates
+    //      KS_ASSIGNMENTS so this server knows which domains it
+    //      serves (matters once a control plane starts driving
+    //      MSG_DOMAIN_ASSIGN / unassign).
+    //   3. MigrationRunner::run_pending — runs T13 M-01 which fills
+    //      DidRecord.domain for legacy records by parsing the
+    //      embedded did_id host. Required for write-side checks
+    //      that key on domain once domains are configured.
+    //
+    // All three are idempotent (markers in `meta` keyspace gate the
+    // migration; existing keyspace entries short-circuit the seeds),
+    // so re-running on every boot is cheap.
+    run_first_boot_init(&store, &config).await;
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
     let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
 
@@ -644,6 +668,89 @@ fn mnemonic_from_did(did: &str) -> Option<String> {
 
     let mnemonic = after_host.replace(':', "/");
     Some(mnemonic)
+}
+
+/// First-boot multi-domain init for the standalone server.
+///
+/// Mirrors the daemon's `did-hosting-daemon/src/main.rs:544-622` block
+/// so a standalone `did-hosting-server` deployment gets the same
+/// effective state on first boot. Three steps, in order:
+///
+/// 1. **Domain catalog seed** (`seed_domains_first_boot`) — populates
+///    `KS_DOMAINS` from `[hosting] bootstrap_domains` or the legacy
+///    `public_url` host. Without it, the resolve-side safety check
+///    (`assert_resolution_allowed`) takes its permissive skip branch
+///    on every resolve and emits a per-request warn-log.
+/// 2. **Assignment seed** (`seed_assignments_first_boot`) — same tier
+///    chain, populates `KS_ASSIGNMENTS`. Matters once a control plane
+///    starts driving `MSG_DOMAIN_ASSIGN` / unassign messages.
+/// 3. **Migration runner** (`MigrationRunner::run_pending`) — runs
+///    `m01_tag_did_records_with_domain` which fills
+///    `DidRecord.domain` for legacy records by parsing the embedded
+///    `did_id` host. Required for any write path that keys on
+///    `domain` once domains are configured.
+///
+/// All three are idempotent — subsequent boots short-circuit
+/// (existing keyspace entries / migration markers in `meta`) so this
+/// is cheap to call on every startup.
+///
+/// Failures log loudly but do **not** abort startup. The standalone
+/// server's design treats domain seeding as best-effort metadata: a
+/// legacy single-domain deployment without `bootstrap_domains`
+/// configured boots into the permissive-skip state (with warnings)
+/// rather than refusing to serve. The daemon's stricter
+/// `std::process::exit(1)` is appropriate there because the daemon
+/// owns the control plane and *must* have a domain catalog to make
+/// admin write paths work; the standalone server has no such
+/// guarantee.
+pub async fn run_first_boot_init(store: &Store, config: &AppConfig) {
+    // 1. Domain catalog
+    match did_hosting_common::server::domain::seed_domains_first_boot(
+        store,
+        &config.hosting.bootstrap_domains,
+        config.public_url.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => info!(
+            tier = ?outcome.tier,
+            count = outcome.final_count,
+            default = ?outcome.default,
+            "first-boot domain seed"
+        ),
+        Err(e) => warn!(error = %e, "first-boot domain seed failed"),
+    }
+
+    // 2. Per-server assignments
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    match did_hosting_common::server::assignment_seed::seed_assignments_first_boot(
+        store,
+        &config.hosting.bootstrap_domains,
+        config.public_url.as_deref(),
+        now,
+    )
+    .await
+    {
+        Ok(outcome) => info!(
+            tier = ?outcome.tier,
+            count = outcome.final_count,
+            "first-boot assignment seed"
+        ),
+        Err(e) => warn!(error = %e, "first-boot assignment seed failed"),
+    }
+
+    // 3. Storage migrations (T2 runner + T13 M-01)
+    let runner = did_hosting_common::server::migrations::MigrationRunner::new(
+        did_hosting_common::server::migrations::registry(),
+    );
+    match runner.run_pending(store).await {
+        Ok(summary) => info!(
+            applied = ?summary.applied,
+            skipped = ?summary.skipped,
+            "migration runner complete"
+        ),
+        Err(e) => warn!(error = %e, "migration runner failed"),
+    }
 }
 
 /// Verify DIDs in the store and log their status.

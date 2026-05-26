@@ -435,3 +435,145 @@ async fn public_did_resolution_sets_cors_header() {
         .unwrap();
     assert_eq!(acao, "*", "public DID resolution must allow any origin");
 }
+
+/// REGRESSION (upgrade scenario): when an operator runs
+/// `did-hosting-server` with `features.rest_api = false`, the binary
+/// assembles `router_public_only().fallback(did_public::serve_public)`
+/// (server.rs:483). A request for `/{mnemonic}/did.jsonl` must still
+/// route through `serve_public` -> `resolve_webvh::dispatch` ->
+/// `serve_content`, not fall to the default 404. This reproduces the
+/// user-reported 404 on an upgraded v0.6 -> v0.7 server.
+#[tokio::test]
+async fn rest_disabled_router_serves_public_did_via_fallback() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "mediator";
+    let body = "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:Q1:server.example.com:mediator\"}}";
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+
+    // Reproduce the EXACT layer/route ordering that run_rest_thread
+    // assembles when features.rest_api = false (server.rs:483-503):
+    // base + fallback, .with_state, TraceLayer, security_headers,
+    // public_resolution_cors, then a trailing .route("/api/health",
+    // ...) added AFTER the layers.
+    let app = did_hosting_server::routes::router_public_only()
+        .fallback(did_hosting_server::routes::did_public::serve_public)
+        .with_state(state)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ))
+        .layer(did_hosting_common::server::public_resolution_cors())
+        // Stand-in health handler; only the route SHAPE matters for
+        // reproducing the layering/ordering bug, not the body.
+        .route("/api/health", axum::routing::get(|| async { "ok" }));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "REST-disabled router must still serve /{{mnemonic}}/did.jsonl via the fallback"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], body.as_bytes());
+}
+
+/// REGRESSION (v0.6 → v0.7 upgrade parity with the daemon):
+/// `run_first_boot_init` must (1) seed `KS_DOMAINS` from
+/// `public_url` when `bootstrap_domains` is empty, (2) seed
+/// `KS_ASSIGNMENTS` from the same tier chain, and (3) run the M-01
+/// migration so legacy `DidRecord` records with `domain == ""` get
+/// their host backfilled from the embedded `did_id`.
+///
+/// Without this wire-up, an upgraded standalone server emits a
+/// per-resolve "domains keyspace is empty — skipping resolve-side
+/// safety check" warn-log and never enforces the multi-domain
+/// host-match safety check.
+#[tokio::test]
+async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
+    use did_hosting_common::did_ops::did_key;
+
+    let (state, _dir) = make_state().await;
+
+    // Plant a v0.6-shape DidRecord: `domain` empty, `did_id`
+    // populated so M-01 can derive the host from it.
+    let mnemonic = "mediator";
+    let did_id = "did:webvh:Q1:webvh.example.com:mediator";
+    let legacy = DidRecord {
+        owner: "did:example:owner".into(),
+        mnemonic: mnemonic.into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(did_id.into()),
+        content_size: 0,
+        disabled: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: String::new(), // legacy state
+    };
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &legacy)
+        .await
+        .expect("seed legacy DidRecord");
+
+    // Build a config that mirrors what an upgraded standalone server
+    // looks like: no bootstrap_domains, only the legacy public_url.
+    // The seed should fall through to tier 2 (public_url host).
+    let mut config = (*state.config).clone();
+    config.public_url = Some("https://webvh.example.com".into());
+    config.hosting.bootstrap_domains = Vec::new();
+
+    did_hosting_server::server::run_first_boot_init(&state.store, &config).await;
+
+    // 1. KS_DOMAINS now has one entry for the public_url host.
+    let domains = did_hosting_common::server::domain::list_domains(&state.store)
+        .await
+        .expect("list domains");
+    assert_eq!(domains.len(), 1, "exactly one domain seeded");
+    assert_eq!(domains[0].name, "webvh.example.com");
+
+    // 2. KS_ASSIGNMENTS has the matching assignment.
+    let assignments = did_hosting_common::server::assignment::list(&state.store)
+        .await
+        .expect("list assignments");
+    assert_eq!(assignments.len(), 1, "exactly one assignment seeded");
+    assert_eq!(assignments[0].domain, "webvh.example.com");
+
+    // 3. The legacy DidRecord got its `domain` field filled from
+    //    the embedded `did_id` host.
+    let migrated: DidRecord = state
+        .dids_ks
+        .get(did_key(mnemonic))
+        .await
+        .expect("get migrated record")
+        .expect("record present");
+    assert_eq!(migrated.domain, "webvh.example.com");
+
+    // 4. Idempotent: a second invocation is a no-op (markers in
+    //    `meta` keyspace short-circuit the migration; existing
+    //    KS_DOMAINS / KS_ASSIGNMENTS rows make the seeds report
+    //    AlreadySeeded). Just verify no panic / data drift.
+    did_hosting_server::server::run_first_boot_init(&state.store, &config).await;
+    let domains = did_hosting_common::server::domain::list_domains(&state.store)
+        .await
+        .expect("list domains after replay");
+    assert_eq!(domains.len(), 1, "second run must be a no-op");
+}

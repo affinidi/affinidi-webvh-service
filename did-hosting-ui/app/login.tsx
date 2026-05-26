@@ -183,7 +183,7 @@ export default function Login() {
             disabled={walletLoading}
           >
             <Text style={styles.secondaryButtonText}>
-              {walletLoading ? "Authenticating…" : "Login with VTI Wallet"}
+              {walletLoading ? "Authenticating…" : "Login with VTA Wallet"}
             </Text>
           </Pressable>
         )}
@@ -192,7 +192,7 @@ export default function Login() {
         )}
         {!walletAvailable && (
           <Text style={styles.cliHint}>
-            Install the VTI Wallet browser extension to sign in with your did:peer
+            Install the VTA Wallet browser extension to sign in with your did:peer
             identity (no passkey required).
           </Text>
         )}

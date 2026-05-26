@@ -1,6 +1,6 @@
-# Affinidi WebVH Common
+# Affinidi DID Hosting Common
 
-Shared library used by all WebVH service crates. This crate
+Shared library used by all DID Hosting service crates. This crate
 provides common types, traits, and modules so that services
 share a consistent implementation of cross-cutting concerns.
 
@@ -97,7 +97,7 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi WebVH Service
+If you have a technical issue with the Affinidi DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on

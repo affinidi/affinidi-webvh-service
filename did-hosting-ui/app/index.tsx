@@ -18,22 +18,49 @@ import { colors, fonts, radii, spacing } from "../lib/theme";
 import type {
   AclEntry,
   ControlPlaneConfig,
+  DidRecord,
   HealthResponse,
   ServerStats,
 } from "../lib/api";
+import { matchesDomain } from "../lib/domain";
 
 export default function Dashboard() {
   const { isAuthenticated, role } = useAuth();
   const api = useApi();
-  const { currentDomain } = useDomains();
+  const { currentDomain, domains } = useDomains();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [aclEntries, setAclEntries] = useState<AclEntry[] | null>(null);
+  // Per-domain stats are derived from the DID list. We only fetch it
+  // when a specific domain is pinned — "All domains" reads the cheap
+  // server-wide aggregate from /api/stats instead.
+  const [dids, setDids] = useState<DidRecord[] | null>(null);
 
   const isDaemon = config?.deploymentMode === "daemon";
   const isAdmin = role === "admin";
+
+  const domainStats = useMemo(() => {
+    if (currentDomain === null || dids === null) return null;
+    // Legacy slots pre-M-01 (and the historical bug where create
+    // dropped the `domain` field) carry an empty `domain`. The shared
+    // matchesDomain helper in lib/domain.ts falls back to the
+    // did_id's host segment so the per-domain numbers don't read as
+    // zero in the gap between an upgrade and publish-time backfill.
+    const scoped = dids.filter((d) => matchesDomain(d, currentDomain));
+    return {
+      totalDids: scoped.length,
+      totalResolves: scoped.reduce((s, d) => s + d.totalResolves, 0),
+      // versionCount is the length of the current log chain; subtract 1
+      // to approximate "updates beyond initial creation". DIDs that
+      // haven't uploaded a log yet (versionCount === 0) contribute 0.
+      totalUpdates: scoped.reduce(
+        (s, d) => s + Math.max(0, d.versionCount - 1),
+        0,
+      ),
+    };
+  }, [currentDomain, dids]);
 
   // Owners whose scope is unrestricted ("All") are flagged for migration:
   // v0.7 grants new Owners a scoped default, but pre-existing rows keep
@@ -74,6 +101,28 @@ export default function Dashboard() {
       .then((res) => setAclEntries(res.entries))
       .catch(() => setAclEntries(null));
   }, [api, isAuthenticated, isAdmin]);
+
+  // When a domain is pinned, pull the DID list so we can derive
+  // per-domain stat cards. "All domains" doesn't need this — the
+  // server-wide aggregate from /api/stats is shown instead.
+  useEffect(() => {
+    if (!isAuthenticated || currentDomain === null) {
+      setDids(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listDids()
+      .then((res) => {
+        if (!cancelled) setDids(res);
+      })
+      .catch(() => {
+        if (!cancelled) setDids(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, isAuthenticated, currentDomain]);
 
   if (!isAuthenticated) {
     return (
@@ -146,16 +195,32 @@ export default function Dashboard() {
           {serverStats && (
             <>
               <View style={styles.card}>
-                <Text style={styles.cardLabel}>Total DIDs</Text>
-                <Text style={styles.cardValueAccent}>{serverStats.totalDids.toLocaleString()}</Text>
+                <Text style={styles.cardLabel}>
+                  {domainStats ? `DIDs in ${currentDomain}` : "Total DIDs"}
+                </Text>
+                <Text style={styles.cardValueAccent}>
+                  {(domainStats?.totalDids ?? serverStats.totalDids).toLocaleString()}
+                </Text>
               </View>
               <View style={styles.card}>
-                <Text style={styles.cardLabel}>Total Resolves</Text>
-                <Text style={styles.cardValue}>{serverStats.totalResolves.toLocaleString()}</Text>
+                <Text style={styles.cardLabel}>Domains</Text>
+                <Text style={styles.cardValue}>{domains.length.toLocaleString()}</Text>
               </View>
               <View style={styles.card}>
-                <Text style={styles.cardLabel}>Total Updates</Text>
-                <Text style={styles.cardValue}>{serverStats.totalUpdates.toLocaleString()}</Text>
+                <Text style={styles.cardLabel}>
+                  {domainStats ? "Resolves" : "Total Resolves"}
+                </Text>
+                <Text style={styles.cardValue}>
+                  {(domainStats?.totalResolves ?? serverStats.totalResolves).toLocaleString()}
+                </Text>
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>
+                  {domainStats ? "Updates" : "Total Updates"}
+                </Text>
+                <Text style={styles.cardValue}>
+                  {(domainStats?.totalUpdates ?? serverStats.totalUpdates).toLocaleString()}
+                </Text>
               </View>
             </>
           )}
@@ -212,7 +277,7 @@ const styles = StyleSheet.create({
   },
   section: {
     width: "100%",
-    maxWidth: 800,
+    maxWidth: 1200,
     marginTop: spacing.xl,
   },
   sectionTitle: {
@@ -228,7 +293,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginBottom: spacing.lg,
     width: "100%",
-    maxWidth: 500,
+    maxWidth: 1200,
   },
   card: {
     backgroundColor: colors.bgSecondary,
@@ -244,7 +309,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.errorBg,
     borderColor: colors.error,
     width: "100%",
-    maxWidth: 500,
+    maxWidth: 1200,
     marginBottom: spacing.lg,
   },
   cardLabel: {
@@ -295,7 +360,7 @@ const styles = StyleSheet.create({
   },
   migrationBanner: {
     width: "100%",
-    maxWidth: 800,
+    maxWidth: 1200,
     backgroundColor: "rgba(31, 229, 205, 0.08)",
     borderColor: colors.teal,
     borderWidth: 1,

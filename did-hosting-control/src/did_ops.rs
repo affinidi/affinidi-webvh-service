@@ -216,11 +216,16 @@ async fn resolve_path_for_create(
 /// old DID's log content, witness, and owner-index are removed and the
 /// caller becomes the new owner. Without `force`, a path collision returns
 /// `Conflict` as before.
+/// `domain` is the resolved domain to persist on the new record. `None`
+/// is accepted for callers (older DIDComm paths, tests) that don't yet
+/// route through the resolver; the M-01 backfill sweep will tag those
+/// records on next run.
 pub async fn create_did(
     auth: &AuthClaims,
     state: &AppState,
     path: Option<&str>,
     force: bool,
+    domain: Option<&str>,
 ) -> Result<RequestUriResponse, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
@@ -261,9 +266,14 @@ pub async fn create_did(
         disabled: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
-        domain: String::new(),
+        // Persist the resolved domain so the per-domain UI filters and
+        // the dashboard's per-domain stat cards see the new DID on the
+        // very next list call. Callers that pass `None` (older DIDComm
+        // paths, tests) still produce an empty string and rely on the
+        // M-01 sweep, but the REST `request_uri` handler now always
+        // resolves a concrete value up front.
+        domain: domain.unwrap_or("").to_string(),
     };
 
     let mut batch = state.store.batch();
@@ -511,8 +521,22 @@ pub async fn publish_did(
 
     record.updated_at = now_epoch();
     record.version_count += 1;
-    record.did_id = did_id_val;
+    record.did_id = did_id_val.clone();
     record.content_size = new_size;
+
+    // Backfill `record.domain` from the embedded DID's host on first
+    // publish for records that pre-date the `request_uri` resolver fix
+    // (older slots created with the buggy code path that always stored
+    // `domain: ""`). Without this the per-domain UI filter would keep
+    // hiding the DID until the M-01 sweep next runs. New DIDs created
+    // through `request_uri` already carry the resolved domain — this
+    // only mutates empty entries, so it's idempotent.
+    if record.domain.is_empty()
+        && let Some(did_id) = did_id_val.as_deref()
+        && let Ok(host) = did_hosting_common::server::domain::extract_did_host(did_id)
+    {
+        record.domain = host;
+    }
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1552,7 +1576,7 @@ mod tests_atomic {
         // Reserve the slot. create_did is the "request URI" step — it
         // doesn't write log content and shouldn't bump update counters.
         let baseline = state.stats_collector.get_aggregate().total_updates;
-        create_did(&owner_auth(owner), &state, Some(path), false)
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1595,7 +1619,7 @@ mod tests_atomic {
         let did_log = build_test_did_log("scid-fail", "control.test", path).await;
 
         // Reserve as owner-a, then have owner-b try to publish.
-        create_did(&owner_auth(owner_a), &state, Some(path), false)
+        create_did(&owner_auth(owner_a), &state, Some(path), false, None)
             .await
             .unwrap();
 
@@ -1681,6 +1705,130 @@ mod tests_atomic {
             record.version_count, 2,
             "both register calls must have committed in sequence; got version_count={}",
             record.version_count
+        );
+    }
+
+    /// `create_did(..., Some("tenant.example"))` MUST persist the
+    /// caller-supplied domain on the DidRecord. This is the bug
+    /// b0e2fb11 fixed: previously `RequestUriRequest` had no
+    /// `domain` field, every record landed with `domain: ""`, and the
+    /// per-domain UI filters / dashboard stats hid the freshly-
+    /// created DID until the M-01 backfill sweep next ran. Pinning
+    /// the persisted value guards against the next regression in
+    /// `request_uri` / `dispatch_did_op` forgetting to thread the
+    /// resolver output through.
+    #[tokio::test]
+    async fn create_did_persists_caller_supplied_domain() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha-domain";
+
+        create_did(
+            &owner_auth(owner),
+            &state,
+            Some(path),
+            false,
+            Some("tenant.example"),
+        )
+        .await
+        .expect("create_did with domain should succeed");
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            record.domain, "tenant.example",
+            "domain on the DidRecord MUST equal the caller-supplied value"
+        );
+    }
+
+    /// `create_did(..., None)` MUST leave `domain` empty — the field
+    /// is the resolver's responsibility, not a synthetic default.
+    /// Older DIDComm paths and tests pass None; the M-01 sweep + the
+    /// publish-time backfill (see next test) populate it later.
+    #[tokio::test]
+    async fn create_did_with_no_domain_leaves_field_empty() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha-no-domain";
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .expect("create_did without domain should succeed");
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            record.domain, "",
+            "domain on the DidRecord MUST be empty when create_did was called with None"
+        );
+    }
+
+    /// `publish_did` MUST backfill `record.domain` from the
+    /// `did_id`'s host segment when the persisted field is empty —
+    /// e.g. for slots created via the older DIDComm `MSG_DID_REQUEST`
+    /// path that didn't thread a domain through. Idempotent: a
+    /// record whose `domain` is already populated is unchanged.
+    #[tokio::test]
+    async fn publish_did_backfills_empty_domain_from_did_id() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha-backfill";
+        let did_log = build_test_did_log("scid-backfill", "control.test", path).await;
+
+        // Reserve the slot with `domain: None` so the persisted value
+        // is empty (mirrors the older DIDComm path's behaviour
+        // pre-b0e2fb11).
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+        let before: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(before.domain, "", "test precondition: domain starts empty");
+
+        // Publish. The did:webvh log encodes `control.test` as the
+        // host, so the backfill should pull it through.
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+        let after: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            after.domain, "control.test",
+            "publish_did must populate domain from the did_id host segment when the persisted value is empty"
+        );
+
+        // Subsequent publishes leave the populated value alone —
+        // backfill only runs when `record.domain.is_empty()`. Confirm
+        // by re-publishing the same log and checking the field
+        // didn't change to something else (or get cleared).
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+        let after_again: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            after_again.domain, "control.test",
+            "publish_did backfill must be idempotent — a populated domain stays put"
         );
     }
 }

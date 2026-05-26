@@ -49,7 +49,7 @@ pub async fn run_setup_phase1(out_path: &Path, context_id: &str) -> Result<(), A
 
 pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), AppError> {
     eprintln!();
-    eprintln!("  WebVH Control Plane — Setup Wizard");
+    eprintln!("  DID Hosting Control Plane — Setup Wizard");
     eprintln!("  -----------------------------------");
     eprintln!();
 
@@ -561,7 +561,7 @@ pub async fn run_setup_offline_prepare(
     state_out: PathBuf,
 ) -> Result<(), AppError> {
     eprintln!();
-    eprintln!("  WebVH Control Plane — Offline Setup (step 1/2)");
+    eprintln!("  DID Hosting Control Plane — Offline Setup (step 1/2)");
     eprintln!("  -----------------------------------------------");
     eprintln!();
     eprintln!("  This step captures all local settings and writes a sealed-bundle");
@@ -797,7 +797,7 @@ pub async fn run_setup_offline_complete(
     state_path: PathBuf,
 ) -> Result<(), AppError> {
     eprintln!();
-    eprintln!("  WebVH Control Plane — Offline Setup (step 2/2)");
+    eprintln!("  DID Hosting Control Plane — Offline Setup (step 2/2)");
     eprintln!("  -----------------------------------------------");
     eprintln!();
 

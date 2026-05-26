@@ -16,6 +16,7 @@ import { useDomains } from "../../components/DomainProvider";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
+import { matchesDomain } from "../../lib/domain";
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
@@ -163,15 +164,29 @@ export default function DidList() {
       minute: "2-digit",
     });
 
-  // T34/T35: filter the list to the current domain when the
-  // switcher has one pinned. "All domains" (currentDomain === null,
-  // admin-only) shows everything.
+  // Filter the list to the current domain when the switcher has one
+  // pinned. "All domains" (currentDomain === null, admin-only) shows
+  // everything.
+  //
+  // For records that still carry an empty `domain` (legacy slots
+  // pre-M-01, plus the historical bug where the REST `request_uri`
+  // handler dropped the `domain` field on create), fall back to the
+  // host segment of the DID itself: `did:webvh:scid:HOST(:path…)` and
+  // `did:web:HOST(:path…)`. Without this fallback the switcher looks
+  // broken in the brief window between an operator upgrading to the
+  // fix and publish-time backfill tagging each slot. See
+  // `lib/domain.ts` for the shared matchesDomain / extractDidHost
+  // implementation — both this view and the dashboard's per-domain
+  // stat cards consume the same helpers.
+  const hiddenNoDomainCount =
+    currentDomain === null
+      ? 0
+      : dids.filter((d) => !d.domain && !matchesDomain(d, currentDomain))
+          .length;
   const visibleDids =
     currentDomain === null
       ? dids
-      : dids.filter(
-          (d) => !d.domain || d.domain === currentDomain,
-        );
+      : dids.filter((d) => matchesDomain(d, currentDomain));
 
   return (
     <View style={styles.container}>
@@ -197,6 +212,11 @@ export default function DidList() {
           {currentDomain !== null && (
             <Text style={styles.filterCaption}>
               Filtered to {currentDomain}
+              {hiddenNoDomainCount > 0
+                ? ` · ${hiddenNoDomainCount} unassigned DID${
+                    hiddenNoDomainCount === 1 ? "" : "s"
+                  } hidden`
+                : ""}
             </Text>
           )}
         </View>

@@ -1,6 +1,6 @@
 [package]
 name = "did-hosting-control"
-description = "WebVH Control Plane — Unified management UI and service registry"
+description = "DID Hosting Control Plane — Unified management UI and service registry"
 version = "0.7.0"
 edition.workspace = true
 authors.workspace = true
@@ -48,7 +48,7 @@ name = "did-hosting-control"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
+did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
 # vti-common consumed transitively via did-hosting-common, but
 # this crate also references `vti_common::auth::handlers::*` +
 # `AuthenticateInput` directly when dispatching to canonical

@@ -57,7 +57,7 @@ pub struct LogConfig {
     pub format: LogFormat,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct StoreConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -80,6 +80,31 @@ pub struct StoreConfig {
     /// SDK normalizes the name; see `azure_data_cosmos::Region` for the list
     /// of well-known regions.
     pub cosmosdb_region: Option<String>,
+}
+
+// `redis_url` and `cosmosdb_connection_string` can carry credentials; the
+// other backend fields are non-sensitive identifiers. Manual Debug keeps
+// startup-config logging from leaking the credential-bearing URLs.
+impl std::fmt::Debug for StoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreConfig")
+            .field("data_dir", &self.data_dir)
+            .field("redis_url", &self.redis_url.as_ref().map(|_| "<redacted>"))
+            .field("dynamodb_table_prefix", &self.dynamodb_table_prefix)
+            .field("dynamodb_region", &self.dynamodb_region)
+            .field("firestore_project", &self.firestore_project)
+            .field("firestore_database", &self.firestore_database)
+            .field(
+                "cosmosdb_connection_string",
+                &self
+                    .cosmosdb_connection_string
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("cosmosdb_database", &self.cosmosdb_database)
+            .field("cosmosdb_region", &self.cosmosdb_region)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -30,7 +30,7 @@ name = "webvh-watcher"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core"] }
+did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core"] }
 axum = "0.8"
 axum-extra = { workspace = true }
 clap = { workspace = true }

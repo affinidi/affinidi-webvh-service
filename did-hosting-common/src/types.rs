@@ -49,7 +49,7 @@ pub struct ChallengeResponse {
 /// This is the *inner* Trust-Task payload, not a top-level response
 /// type, so it intentionally does not use the `camelCase` convention
 /// the response types do.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AuthenticatePayload {
     /// SIOPv2 self-issued `id_token` — a compact EdDSA JWS
     /// (`header.payload.signature`, base64url no-pad).
@@ -63,6 +63,20 @@ pub struct AuthenticatePayload {
     /// the same browser session. Only `z6Mk…` (Ed25519) is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_pubkey_b58btc: Option<String>,
+}
+
+// Manual Debug that redacts the bearer-equivalent `id_token`. A
+// `tracing::debug!(?payload, ...)` anywhere on the auth path would
+// otherwise log the live SIOPv2 token. Same redaction pattern as
+// `CreateInviteResponse` in passkey/routes.rs (wave-2).
+impl std::fmt::Debug for AuthenticatePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatePayload")
+            .field("id_token", &"<redacted>")
+            .field("session_id", &self.session_id)
+            .field("session_pubkey_b58btc", &self.session_pubkey_b58btc)
+            .finish()
+    }
 }
 
 /// Canonical `Session` from `spec/auth/_shared/0.1/session.schema.json`.
@@ -92,7 +106,7 @@ pub struct Session {
 ///
 /// OAuth 2.0 (RFC 6749 §5.1) shape: `expiresIn` is seconds from
 /// issuance, not an absolute timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenBundle {
     pub access_token: String,
@@ -104,6 +118,26 @@ pub struct TokenBundle {
     pub refresh_expires_in: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
+}
+
+// Manual Debug. `access_token` is a live JWT; `refresh_token` extends
+// the session indefinitely if leaked. Both must never reach logs.
+// Non-secret fields stay visible so the bundle's structure is still
+// useful for diagnostics.
+impl std::fmt::Debug for TokenBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBundle")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Canonical `spec/auth/authenticate/0.1#response`: `{ session, tokens }`.

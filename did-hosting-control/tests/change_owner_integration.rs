@@ -165,7 +165,7 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
     let owner_auth = auth_for(&owner, Role::Owner);
 
     // 1. Owner creates a DID slot.
-    let create = create_did(&owner_auth, &state, Some("tenant/owner-a"), false)
+    let create = create_did(&owner_auth, &state, Some("tenant/owner-a"), false, None)
         .await
         .expect("create_did");
     assert_eq!(create.mnemonic, "tenant/owner-a");
@@ -260,7 +260,7 @@ async fn admin_can_transfer_did_owned_by_someone_else() {
     acl(&state, &target, Role::Owner).await;
 
     let owner_auth = auth_for(&owner, Role::Owner);
-    create_did(&owner_auth, &state, Some("tenant/admin-flow"), false)
+    create_did(&owner_auth, &state, Some("tenant/admin-flow"), false, None)
         .await
         .expect("create");
 
@@ -300,7 +300,7 @@ async fn stranger_cannot_change_owner_of_someone_elses_did() {
     // Stranger is intentionally not added to the ACL.
 
     let owner_auth = auth_for(&owner, Role::Owner);
-    create_did(&owner_auth, &state, Some("tenant/protected"), false)
+    create_did(&owner_auth, &state, Some("tenant/protected"), false, None)
         .await
         .expect("create");
 
@@ -336,7 +336,7 @@ async fn cannot_transfer_to_did_not_in_acl() {
     // Outsider is intentionally NOT in the ACL.
 
     let owner_auth = auth_for(&owner, Role::Owner);
-    create_did(&owner_auth, &state, Some("tenant/check-acl"), false)
+    create_did(&owner_auth, &state, Some("tenant/check-acl"), false, None)
         .await
         .expect("create");
 
@@ -365,7 +365,7 @@ async fn transfer_to_self_is_idempotent() {
     acl(&state, &owner, Role::Owner).await;
     let owner_auth = auth_for(&owner, Role::Owner);
 
-    create_did(&owner_auth, &state, Some("tenant/self"), false)
+    create_did(&owner_auth, &state, Some("tenant/self"), false, None)
         .await
         .expect("create");
 
@@ -400,7 +400,7 @@ async fn force_replace_wipes_log_and_witness_content() {
     acl(&state, &owner, Role::Owner).await;
     let owner_auth = auth_for(&owner, Role::Owner);
 
-    let create = create_did(&owner_auth, &state, Some("tenant/force"), false)
+    let create = create_did(&owner_auth, &state, Some("tenant/force"), false, None)
         .await
         .expect("create");
 
@@ -420,7 +420,7 @@ async fn force_replace_wipes_log_and_witness_content() {
         .unwrap();
 
     // Re-create the same path with force=true.
-    let replaced = create_did(&owner_auth, &state, Some("tenant/force"), true)
+    let replaced = create_did(&owner_auth, &state, Some("tenant/force"), true, None)
         .await
         .expect("force replace");
     assert_eq!(replaced.mnemonic, "tenant/force");
@@ -472,6 +472,7 @@ async fn force_replace_forbidden_for_non_owner() {
         &state,
         Some("tenant/no-takeover"),
         false,
+        None,
     )
     .await
     .expect("create");
@@ -481,6 +482,7 @@ async fn force_replace_forbidden_for_non_owner() {
         &state,
         Some("tenant/no-takeover"),
         true,
+        None,
     )
     .await
     .expect_err("non-owner force replace must fail");
@@ -518,7 +520,7 @@ async fn delete_after_transfer_clears_new_owners_index() {
     acl(&state, &new_owner, Role::Owner).await;
 
     let owner_auth = auth_for(&owner, Role::Owner);
-    create_did(&owner_auth, &state, Some("tenant/del-after"), false)
+    create_did(&owner_auth, &state, Some("tenant/del-after"), false, None)
         .await
         .expect("create");
     change_did_owner(&owner_auth, &state, "tenant/del-after", &new_owner)

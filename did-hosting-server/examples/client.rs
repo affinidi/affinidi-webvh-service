@@ -16,7 +16,7 @@ struct Cli {
     #[arg(long)]
     server_url: String,
 
-    /// DID of the WebVH service. Used as the DIDComm `to` field of the
+    /// DID of the DID Hosting service. Used as the DIDComm `to` field of the
     /// signed authenticate message.
     #[arg(long)]
     webvh_did: String,

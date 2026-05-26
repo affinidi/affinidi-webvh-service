@@ -1,13 +1,13 @@
 # Bootstrap & Startup Guide
 
-This document explains how to set up a complete WebVH environment with DIDComm-based authentication between services.
+This document explains how to set up a complete DID Hosting environment with DIDComm-based authentication between services.
 
 ## Prerequisites
 
 - VTA (Verifiable Trust Agent) credentials for each service's context
   - Each service gets its own isolated VTA context
   - Credentials are base64url-encoded strings issued by the VTA operator
-- Compiled WebVH binaries: `did-hosting-server`, `did-hosting-control`, `webvh-witness`
+- Compiled DID Hosting binaries: `did-hosting-server`, `did-hosting-control`, `webvh-witness`
 - A public URL where the server will serve DIDs (e.g., `https://did.example.com`)
 
 ## Architecture Overview
@@ -417,14 +417,14 @@ vta create-did-webvh --context ctx1 --label server
 vta create-did-webvh --context mediator --label mediator
 ```
 
-Each command prompts for a WebVH URL, creates the DID locally (serverless mode), and saves a `did.jsonl` file. When prompted, **export the secrets bundle** for each — copy the base64url output.
+Each command prompts for a DID hosting URL, creates the DID locally (serverless mode), and saves a `did.jsonl` file. When prompted, **export the secrets bundle** for each — copy the base64url output.
 
 You should now have:
 - `did-vta.jsonl` + VTA credential (from step 1)
 - `did-server.jsonl` + server secrets bundle (from step 2)
 - `did-mediator.jsonl` + mediator secrets bundle (from step 2)
 
-### Step 3: Set up the WebVH Server (offline)
+### Step 3: Set up the DID Hosting Server (offline)
 
 ```bash
 # Import the server's keys
@@ -437,7 +437,7 @@ did-hosting-server load-did --path <vta-path> --did-log did-vta.jsonl
 did-hosting-server load-did --path <mediator-path> --did-log did-mediator.jsonl
 ```
 
-### Step 4: Start the WebVH Server
+### Step 4: Start the DID Hosting Server
 
 ```bash
 did-hosting-server --config config.toml
@@ -489,7 +489,7 @@ After all services are running:
 
 All services restart cleanly during normal operations:
 
-- **WebVH server** — loads DIDs from persistent store, re-registers with control plane in background
+- **DID Hosting server** — loads DIDs from persistent store, re-registers with control plane in background
 - **Mediator** — fetches fresh secrets from VTA if available, falls back to cache if VTA is down. Resolves own DID from local document (no did-hosting-server dependency)
 - **VTA** — DIDComm retries mediator connection with backoff. REST API works immediately
 
@@ -500,9 +500,9 @@ All services restart cleanly during normal operations:
 | 1 | `vta setup` | No | None |
 | 2 | `vta create-did-webvh` (×2) | No | None |
 | 3 | `did-hosting-server import-secrets` + `load-did` (×3) | No | None |
-| 4 | Start did-hosting-server | No | WebVH |
-| 5 | `mediator-setup-vta --import-bundle` | No | WebVH |
-| 6 | Start mediator | Yes (DID resolution) | WebVH, Mediator |
+| 4 | Start did-hosting-server | No | DID Hosting |
+| 5 | `mediator-setup-vta --import-bundle` | No | DID Hosting |
+| 6 | Start mediator | Yes (DID resolution) | DID Hosting, Mediator |
 | 7 | Start VTA | Yes (DID resolution) | All |
 
 ## Verifying the Setup
