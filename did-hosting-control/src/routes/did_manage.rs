@@ -710,19 +710,20 @@ async fn query_timeseries_by_domain(
         let mut resolves = 0u64;
         let mut updates = 0u64;
         let mut bucket_ts = ts;
-        while bucket_ts < ts + step && bucket_ts <= end {
+        let bucket_window_end = ts.saturating_add(step);
+        while bucket_ts < bucket_window_end && bucket_ts <= end {
             if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
                 resolves += r;
                 updates += u;
             }
-            bucket_ts += 300;
+            bucket_ts = bucket_ts.saturating_add(300);
         }
         points.push(TimeSeriesPoint {
             timestamp: ts,
             resolves,
             updates,
         });
-        ts += step;
+        ts = ts.saturating_add(step);
     }
 
     Ok(points)
