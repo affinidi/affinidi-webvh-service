@@ -370,15 +370,13 @@ pub async fn dispatch_did_op(
             // tests, while still surfacing the domain on the new record
             // for the common case where a default exists.
             let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
-            let acl_scope = match did_hosting_common::server::acl::get_acl_entry(
-                &state.acl_ks,
-                &auth.did,
-            )
-            .await?
-            {
-                Some(e) => e.domains,
-                None => did_hosting_common::server::domain::DomainScope::All,
-            };
+            let acl_scope =
+                match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
+                    .await?
+                {
+                    Some(e) => e.domains,
+                    None => did_hosting_common::server::domain::DomainScope::All,
+                };
             let system_default =
                 did_hosting_common::server::domain::get_default_domain(&state.store)
                     .await

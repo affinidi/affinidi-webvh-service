@@ -16,7 +16,9 @@ use tracing::{info, warn};
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
 
-use crate::acl::{Role, check_acl};
+// (The ACL helpers used to be needed here for per-handler `Admin|Service` checks
+// on the domain ops; the wave-2 follow-up replaced those with
+// `require_control_plane` so the ACL surface is no longer touched from this file.)
 use crate::server::AppState;
 
 /// Sync messages overwrite or delete arbitrary DIDs by mnemonic, so they must
@@ -359,18 +361,15 @@ async fn do_domain_assign(
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, CancelOutcome};
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/assign rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain assignment",
-        ));
+    // Domain ops are at least as destructive as sync (`domain.purge`
+    // deletes every DID under the name); apply the same control-plane
+    // pinning rather than the looser Admin|Service ACL check that
+    // accepts any peer admin / sibling service. Closes the gap where
+    // a stale admin enrollment or compromised sibling could send a
+    // forged domain.{assign,unassign,purge,upsert} and mutate this
+    // server's local assignments.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -428,18 +427,9 @@ async fn do_domain_unassign(
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, parse_grace_string};
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/unassign rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain unassignment",
-        ));
+    // See do_domain_assign — control-plane pinning, not Admin|Service.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -550,18 +540,11 @@ async fn do_domain_purge(
     use did_hosting_common::server::domain_purge::purge_domain_dids;
     use did_hosting_common::server::pending_purge;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/purge rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain purge",
-        ));
+    // See do_domain_assign — control-plane pinning. domain.purge wipes
+    // every DID under the name; a peer admin / sibling service should
+    // never reach this handler.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let domain_raw = msg
@@ -640,18 +623,11 @@ async fn do_domain_upsert(
     };
     use did_hosting_common::server::pending_purge;
 
-    let role = check_acl(&state.acl_ks, sender)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Role::Admin | Role::Service) {
-        warn!(
-            did = sender,
-            "domain/upsert rejected: requires admin or service role"
-        );
-        return Ok(problem_report(
-            "e.p.domain.unauthorized",
-            "admin or service role required for domain upsert",
-        ));
+    // See do_domain_assign — control-plane pinning. domain.upsert
+    // mutates the canonical domain record and silently changes
+    // status / metadata; restrict to the configured control plane.
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
     }
 
     let entry: DomainEntry = serde_json::from_value(msg.body.clone())

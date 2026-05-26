@@ -641,8 +641,7 @@ async fn query_timeseries_by_domain(
     let raw = state.dids_ks.prefix_iter_raw("did:").await?;
     let mut mnemonics: Vec<String> = Vec::new();
     for (_key, value) in &raw {
-        let Ok(record) =
-            serde_json::from_slice::<did_hosting_common::did_ops::DidRecord>(value)
+        let Ok(record) = serde_json::from_slice::<did_hosting_common::did_ops::DidRecord>(value)
         else {
             continue;
         };
