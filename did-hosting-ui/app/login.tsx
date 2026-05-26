@@ -44,6 +44,21 @@ export default function Login() {
   >(null);
   const [proxyPicking, setProxyPicking] = useState(false);
   const [proxyViz, setProxyViz] = useState<ProxyLoginViz | null>(null);
+  // Opt-in flow visualization. Off by default — the visualization is
+  // a demo aid, not the everyday auth UX. Persists across reloads so
+  // a presenter can flip it on once for a session. Stored as a string
+  // (`"1"` / `"0"`) to keep the JSON.parse boundary trivial.
+  const VIZ_PREF_KEY = "didhosting:proxyLoginViz";
+  const [showProxyViz, setShowProxyViz] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(VIZ_PREF_KEY) === "1";
+  });
+  const toggleShowProxyViz = (next: boolean) => {
+    setShowProxyViz(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(VIZ_PREF_KEY, next ? "1" : "0");
+    }
+  };
 
   const handlePasskeyLogin = async () => {
     setPasskeyLoading(true);
@@ -118,11 +133,16 @@ export default function Login() {
     try {
       const outcome = await loginWithWalletProxy(entry);
       setAuthMethod("wallet");
-      setProxyViz(outcome.viz);
       login(outcome.result.accessToken);
-      // Don't redirect yet — let the visualization stay on screen so
-      // the user can read it. Clicking "Continue" in the viz drives
-      // the redirect.
+      // When the operator has enabled the flow visualization, stash
+      // it and let the modal hold the redirect. Otherwise (the
+      // default), go straight to the dashboard — the visualization
+      // is a demo aid, not the everyday UX.
+      if (showProxyViz) {
+        setProxyViz(outcome.viz);
+      } else {
+        router.replace("/");
+      }
     } catch (err: any) {
       setProxyError(err?.message || "VTA-proxied login failed.");
     } finally {
@@ -218,6 +238,17 @@ export default function Login() {
               entry's long-term signing key never leaves the VTA — the
               page only sees the short-lived id_token.
             </Text>
+            <Pressable
+              onPress={() => toggleShowProxyViz(!showProxyViz)}
+              style={styles.vizToggleRow}
+              accessibilityRole="checkbox"
+              accessibilityState={{ checked: showProxyViz }}
+            >
+              <Text style={styles.vizToggleBox}>{showProxyViz ? "☑" : "☐"}</Text>
+              <Text style={styles.vizToggleLabel}>
+                Show flow visualization (demo)
+              </Text>
+            </Pressable>
             {proxyError && <Text style={styles.errorText}>{proxyError}</Text>}
           </>
         )}
@@ -464,6 +495,22 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     lineHeight: 19,
     marginBottom: spacing.sm,
+  },
+  vizToggleRow: {
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    gap: spacing.xs,
+    marginTop: -spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  vizToggleBox: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  vizToggleLabel: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
   },
   mono: {
     fontFamily: "ui-monospace, monospace",
