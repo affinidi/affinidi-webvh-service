@@ -13,4 +13,4 @@ pub mod extractor {
 }
 
 pub use backend::DidHostingControlAuthBackend;
-pub use extractor::{AdminAuth, AuthClaims, ServiceAuth};
+pub use extractor::{AdminAuth, AuthClaims, ServiceAuth, StepUpAuth};

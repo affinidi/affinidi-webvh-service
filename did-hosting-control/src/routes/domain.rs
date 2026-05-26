@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::auth::{AdminAuth, AuthClaims};
+use crate::auth::{AdminAuth, AuthClaims, StepUpAuth};
 use crate::error::AppError;
 use crate::server::AppState;
 use did_hosting_common::server::acl;
@@ -332,6 +332,13 @@ pub struct DeleteDomainQuery {
     /// existing "delete record only" semantics are preserved.
     #[serde(default)]
     pub purge_servers: bool,
+    /// REQUIRED — must equal the canonical (lowercased / IDNA-folded)
+    /// domain name being deleted. Typo guard: a stolen admin token
+    /// can't fat-finger a `DELETE /api/domains/foo?purge_servers=true`
+    /// at the wrong target. Compared after `normalize_domain_name`
+    /// canonicalises both sides; an absent or mismatching value
+    /// surfaces as `400 Bad Request` before any registry I/O.
+    pub confirm: Option<String>,
 }
 
 /// `DELETE /api/domains/{name}` — Admin force-deletes a disabled
@@ -356,12 +363,43 @@ pub struct DeleteDomainQuery {
 /// removed so the next sweep doesn't try to delete a row that's
 /// already gone.
 pub async fn delete_domain_route(
-    auth: AdminAuth,
+    // **aal2 step-up required** — destructive admin override of the
+    // grace window, irreversible. A stolen `aal1` admin token must
+    // not be enough; the operator has to re-prove with the
+    // configured step-up method (WebAuthn / hardware key / passkey).
+    // Audit: every successful invocation is logged at `info!` with
+    // the caller's `aal` claim so SIEM can confirm the gate fired.
+    auth: StepUpAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Query(opts): Query<DeleteDomainQuery>,
 ) -> Result<StatusCode, AppError> {
     let canonical = normalize_domain_name(&name)?;
+
+    // Typo guard: caller MUST echo the canonical domain name back as
+    // `?confirm=<name>`. Catches the "stolen-token + scripted
+    // fanout" scenario where an attacker doesn't know which domain
+    // the operator was looking at, and the operator-by-mistake
+    // scenario where the URL was assembled with the wrong path
+    // segment. The check is after `normalize_domain_name` so the
+    // operator can supply either the IDN-encoded or the
+    // human-friendly form.
+    let confirm = opts
+        .confirm
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::Validation(
+                "missing required `confirm=<domain>` query param — see API docs for the typo guard"
+                    .into(),
+            )
+        })
+        .and_then(|c| normalize_domain_name(c).map_err(Into::into))?;
+    if confirm != canonical {
+        return Err(AppError::Validation(format!(
+            "confirm '{confirm}' does not match path '{canonical}'"
+        )));
+    }
+
     let entry = domain::get_domain(&state.store, &canonical)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("domain '{canonical}'")))?;
@@ -376,6 +414,12 @@ pub async fn delete_domain_route(
     // enqueue for one server must not block the others or the local
     // delete. Anything we miss here will surface in the audit log;
     // operators can fire `/purge` manually on those servers.
+    //
+    // Per-target audit: every successful + every failed send_domain_purge
+    // emits its own `info!`/`warn!` line with `instance_id` +
+    // `target_did` so post-hoc forensics can reconstruct exactly
+    // which servers got the message. Without this, the aggregate
+    // `purged_servers` count obscured per-server outcomes.
     let mut purged_servers: u32 = 0;
     if opts.purge_servers {
         match crate::registry::list_instances(&state.registry_ks).await {
@@ -394,7 +438,15 @@ pub async fn delete_domain_route(
                     match crate::server_push::send_domain_purge(&state, target_did, &canonical)
                         .await
                     {
-                        Ok(()) => purged_servers += 1,
+                        Ok(()) => {
+                            purged_servers += 1;
+                            info!(
+                                instance_id = %inst.instance_id,
+                                target_did,
+                                domain = %canonical,
+                                "purge fanout: send_domain_purge dispatched"
+                            );
+                        }
                         Err(e) => warn!(
                             instance_id = %inst.instance_id,
                             target_did,
@@ -419,6 +471,7 @@ pub async fn delete_domain_route(
     let _ = pending_purge::cancel(&state.store, &canonical).await;
     info!(
         caller = %auth.0.did,
+        acr = %auth.0.acr,
         domain = %canonical,
         purge_servers = opts.purge_servers,
         purged_servers,

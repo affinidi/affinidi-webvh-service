@@ -892,10 +892,15 @@ export const api = {
    *  this domain gets a purge message before the control record is
    *  removed. Fire-and-forget on the DIDComm side — the local delete
    *  proceeds without waiting for acks. */
+  /** DELETE /api/domains/{name}. Requires an aal2 (stepped-up) session
+   *  per the security review — the caller MUST have already passed
+   *  the step-up flow before this resolves. Sends `confirm=<name>` as
+   *  a typo guard the server checks against the path segment. */
   deleteDomain: (name: string, opts?: { purgeServers?: boolean }) => {
-    const qs = opts?.purgeServers ? "?purge_servers=true" : "";
+    const params = new URLSearchParams({ confirm: name });
+    if (opts?.purgeServers) params.set("purge_servers", "true");
     return request<void>(
-      `/api/domains/${encodeURIComponent(name)}${qs}`,
+      `/api/domains/${encodeURIComponent(name)}?${params.toString()}`,
       { method: "DELETE" },
     );
   },
