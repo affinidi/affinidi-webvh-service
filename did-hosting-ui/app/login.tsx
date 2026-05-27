@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -22,8 +22,7 @@ import {
 } from "../lib/wallet";
 
 export default function Login() {
-  const { isAuthenticated, logout } = useAuth();
-  const { login } = useAuth();
+  const { isAuthenticated, login } = useAuth();
   const router = useRouter();
   const [passkeyLoading, setPasskeyLoading] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
@@ -150,22 +149,24 @@ export default function Login() {
     }
   };
 
-  if (isAuthenticated) {
-    return (
-      <View style={styles.container}>
-        <View style={styles.card}>
-          <AffinidiLogo size={36} />
-          <Text style={styles.title}>Authenticated</Text>
-          <Text style={styles.hint}>
-            You are currently logged in.
-          </Text>
-          <Pressable style={styles.dangerButton} onPress={logout}>
-            <Text style={styles.dangerButtonText}>Logout</Text>
-          </Pressable>
-        </View>
-      </View>
-    );
-  }
+  // Redirect to the dashboard whenever auth state is "logged in" — UNLESS
+  // the proxy-login visualization modal is showing, in which case the
+  // user is mid-demo and the modal owns the "Continue" → redirect step.
+  //
+  // This used to be an `if (isAuthenticated) return <Authenticated />`
+  // early-return that rendered a holding-page card. That had two
+  // problems: (a) nothing in the app linked to it (the dashboard is
+  // where authenticated users belong), and (b) `runProxyLogin` calls
+  // `login()` BEFORE setting the viz state, so the holding page
+  // rendered first and the viz modal — which lives in the login
+  // form's return tree — never got to mount. Replacing with a
+  // useEffect makes the "viz first, dashboard second" ordering work
+  // and eliminates the dead screen.
+  useEffect(() => {
+    if (isAuthenticated && !proxyViz) {
+      router.replace("/");
+    }
+  }, [isAuthenticated, proxyViz, router]);
 
   return (
     <View style={styles.container}>
