@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Pressable,
 } from "react-native";
+import * as Clipboard from "expo-clipboard";
 import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
@@ -57,6 +58,39 @@ export default function Login() {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(VIZ_PREF_KEY, next ? "1" : "0");
     }
+  };
+
+  // Fetch the server's own DID so the operator can see it on the
+  // login page — they need it when granting wallet access (the DID
+  // is what the wallet pins a did-self-issued vault entry to). The
+  // /api/server-info endpoint is unauthenticated and cached at the
+  // api-client layer; mounting the login page is cheap. `null` is
+  // a legitimate response when the operator hasn't configured a
+  // server_did yet; we skip rendering the row in that case rather
+  // than showing "(unset)" — operators who haven't configured it
+  // don't need a Copy button.
+  const [serverDid, setServerDid] = useState<string | null>(null);
+  const [copiedServerDid, setCopiedServerDid] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await api.serverInfo();
+        if (!cancelled) setServerDid(info.server_did);
+      } catch {
+        // Best-effort. The login page works without the DID row.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleCopyServerDid = async () => {
+    if (!serverDid) return;
+    await Clipboard.setStringAsync(serverDid);
+    setCopiedServerDid(true);
+    setTimeout(() => setCopiedServerDid(false), 2000);
   };
 
   const handlePasskeyLogin = async () => {
@@ -176,6 +210,25 @@ export default function Login() {
         <Text style={styles.hint}>
           Use your registered passkey to authenticate with this server.
         </Text>
+
+        {serverDid && (
+          <View style={styles.serverDidRow}>
+            <View style={styles.serverDidColumn}>
+              <Text style={styles.serverDidLabel}>This server</Text>
+              <Text style={styles.serverDidValue} numberOfLines={1}>
+                {serverDid}
+              </Text>
+              <Text style={styles.serverDidHint}>
+                Grant access to this DID in your wallet to enable proxied SIOP login.
+              </Text>
+            </View>
+            <Pressable style={styles.copyButton} onPress={() => void handleCopyServerDid()}>
+              <Text style={styles.copyButtonText}>
+                {copiedServerDid ? "Copied!" : "Copy"}
+              </Text>
+            </Pressable>
+          </View>
+        )}
 
         <Pressable
           style={[styles.button, passkeyLoading && styles.disabled]}
@@ -421,6 +474,51 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     marginBottom: spacing.lg,
     lineHeight: 20,
+  },
+  serverDidRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    padding: spacing.sm,
+    marginBottom: spacing.lg,
+    backgroundColor: colors.bgTertiary,
+    borderRadius: radii.sm,
+  },
+  serverDidColumn: {
+    flex: 1,
+    minWidth: 0, // lets the DID truncate inside the row
+  },
+  serverDidLabel: {
+    fontSize: 11,
+    fontFamily: fonts.medium,
+    color: colors.textSecondary,
+    marginBottom: 2,
+  },
+  serverDidValue: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textPrimary,
+    // RN-Web only — break long DIDs gracefully when the truncation
+    // ellipsis isn't applied (e.g. when zoomed in).
+    wordBreak: "break-all",
+  } as any,
+  serverDidHint: {
+    marginTop: 4,
+    fontSize: 11,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    lineHeight: 16,
+  },
+  copyButton: {
+    backgroundColor: colors.accent,
+    borderRadius: radii.sm,
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+  },
+  copyButtonText: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.bgPrimary,
   },
   button: {
     backgroundColor: colors.accent,
