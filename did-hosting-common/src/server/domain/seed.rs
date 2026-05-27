@@ -176,9 +176,19 @@ fn now_secs() -> u64 {
 
 /// Extract the host portion of a `public_url` for the legacy fallback
 /// path. Returns `None` if the URL doesn't parse or has no host.
+///
+/// Preserves a non-default port so that a daemon hosted at
+/// `http://localhost:8534` ends up with the domain `localhost:8534`
+/// rather than the bare `localhost`. Without the port, every webvh
+/// DID minted from the same `public_url` would carry the encoded
+/// host `localhost%3A8534` and never match the stored domain.
 fn host_from_public_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
-    parsed.host_str().map(|s| s.to_lowercase())
+    let host = parsed.host_str()?.to_lowercase();
+    Some(match parsed.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
 }
 
 #[cfg(test)]
@@ -330,13 +340,26 @@ mod tests {
 
     #[test]
     fn host_extraction() {
+        // Non-default port is preserved so the seeded domain matches
+        // the host that webvh DIDs minted from the same URL embed.
         assert_eq!(
             host_from_public_url("https://example.com:8080/path"),
+            Some("example.com:8080".to_string())
+        );
+        // Default port for the scheme is dropped (url::Url::port()
+        // returns None for `https://...:443`), which is what we want
+        // — the embedded DID host won't carry it either.
+        assert_eq!(
+            host_from_public_url("https://example.com:443"),
             Some("example.com".to_string())
         );
         assert_eq!(
             host_from_public_url("http://Example.COM"),
             Some("example.com".to_string())
+        );
+        assert_eq!(
+            host_from_public_url("http://localhost:8534"),
+            Some("localhost:8534".to_string())
         );
         assert_eq!(host_from_public_url("not-a-url"), None);
     }

@@ -147,13 +147,21 @@ pub async fn seed_assignments_first_boot(
     })
 }
 
-/// Extract the host (without port) from a URL like
+/// Extract the host (with non-default port preserved) from a URL like
 /// `https://example.com:8443/foo`. Returns `None` if the URL is
 /// unparseable or has no host component.
+///
+/// Mirrors the port-preserving behaviour in
+/// [`super::domain::seed::host_from_public_url`] so the assignment
+/// seed and the domain seed agree on what to store for a
+/// `public_url` that names a non-default port.
 fn host_from_public_url(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    Some(host.to_ascii_lowercase())
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some(match parsed.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
 }
 
 #[cfg(test)]
@@ -197,7 +205,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.tier, AssignmentSeedTier::FromLegacyPublicUrl);
-        assert_eq!(outcome.domains, vec!["legacy.example.com"]);
+        // Non-default port preserved so the assignment matches the
+        // host that webvh DIDs minted from the same URL embed.
+        assert_eq!(outcome.domains, vec!["legacy.example.com:8443"]);
     }
 
     #[tokio::test]

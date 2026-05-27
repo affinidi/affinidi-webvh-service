@@ -89,10 +89,21 @@ pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
 /// Uses [`url::Host::parse`] which applies IDNA-strict + lowercase
 /// conversion. Rejects IP literals and any host containing characters
 /// outside the LDH (letters, digits, hyphens) + `.` + IDN-punycode set.
+///
+/// An optional `:port` suffix is accepted and preserved in the
+/// canonical form. The port is validated as a `1..=65535` integer
+/// and re-emitted numerically so non-canonical inputs like
+/// `example.com:08080` round-trip to `example.com:8080`. This is
+/// what makes dev / single-host daemon deployments at
+/// `http://localhost:8534` work: the embedded DID host is
+/// `localhost%3A8534`, the HTTP `Host:` header is `localhost:8534`,
+/// and the stored domain entry must be `localhost:8534` for both
+/// sides to agree.
 fn normalize_host(host: &str) -> Result<String, AppError> {
-    let parsed = url::Host::parse(host)
-        .map_err(|e| AppError::Validation(format!("malformed host '{host}': {e}")))?;
-    match parsed {
+    let (host_part, port) = split_host_port(host)?;
+    let parsed = url::Host::parse(host_part)
+        .map_err(|e| AppError::Validation(format!("malformed host '{host_part}': {e}")))?;
+    let canonical_host = match parsed {
         url::Host::Domain(s) => {
             // url::Host::parse lowercases and IDNA-encodes; double-check
             // there's no character we don't want to accept.
@@ -104,12 +115,44 @@ fn normalize_host(host: &str) -> Result<String, AppError> {
                     "host '{s}' contains characters outside LDH + '.'"
                 )));
             }
-            Ok(s)
+            s
         }
-        url::Host::Ipv4(_) | url::Host::Ipv6(_) => Err(AppError::Validation(format!(
-            "host '{host}' is an IP literal — domain names must be DNS hostnames"
-        ))),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
+            return Err(AppError::Validation(format!(
+                "host '{host_part}' is an IP literal — domain names must be DNS hostnames"
+            )));
+        }
+    };
+    Ok(match port {
+        Some(p) => format!("{canonical_host}:{p}"),
+        None => canonical_host,
+    })
+}
+
+/// Split an optional `:port` suffix from a host, validating the port
+/// as a `1..=65535` integer. Returns the bare host plus the parsed
+/// port. A bracketed IPv6 literal (`[::1]:8080`) falls through with
+/// `Some` port and the literal `[::1]` host — which `url::Host::parse`
+/// will accept as IPv6 and `normalize_host` then rejects with the
+/// usual IP-literal error.
+fn split_host_port(host: &str) -> Result<(&str, Option<u16>), AppError> {
+    let Some((h, p)) = host.rsplit_once(':') else {
+        return Ok((host, None));
+    };
+    if h.is_empty() || p.is_empty() {
+        return Err(AppError::Validation(format!(
+            "malformed host '{host}': empty host or port around ':'"
+        )));
     }
+    let n: u16 = p.parse().map_err(|_| {
+        AppError::Validation(format!(
+            "host port '{p}' must be a number between 1 and 65535"
+        ))
+    })?;
+    if n == 0 {
+        return Err(AppError::Validation("host port must not be 0".into()));
+    }
+    Ok((h, Some(n)))
 }
 
 /// Normalise the path-prefix portion (after `/`).
@@ -313,6 +356,8 @@ mod tests {
             "example.com/webvh-a",
             "example.com/tenant-a/instance-1",
             "xn--mller-kva.example",
+            "localhost:8534",
+            "example.com:8443/webvh-a",
         ] {
             let canonical = normalize_domain_name(input).expect(input);
             assert_eq!(
@@ -321,5 +366,61 @@ mod tests {
                 "non-idempotent on {input}"
             );
         }
+    }
+
+    // ---- host:port ----
+
+    #[test]
+    fn accepts_host_with_port() {
+        assert_eq!(
+            normalize_domain_name("localhost:8534").unwrap(),
+            "localhost:8534"
+        );
+        assert_eq!(
+            normalize_domain_name("example.com:8443").unwrap(),
+            "example.com:8443"
+        );
+    }
+
+    #[test]
+    fn accepts_host_with_port_and_path() {
+        assert_eq!(
+            normalize_domain_name("example.com:8443/webvh-a").unwrap(),
+            "example.com:8443/webvh-a"
+        );
+    }
+
+    #[test]
+    fn host_with_port_normalises_case_and_leading_zero() {
+        // Uppercase host with port → canonical lowercases and re-emits
+        // port numerically. Both deviations surface in one error.
+        let err =
+            normalize_domain_name("Example.com:08443").expect_err("non-canonical must reject");
+        assert_canonical_msg(&err, "example.com:8443");
+    }
+
+    #[test]
+    fn rejects_zero_port() {
+        let err = normalize_domain_name("example.com:0").expect_err("port 0 must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_overflow_port() {
+        // 65536 doesn't fit in u16.
+        let err = normalize_domain_name("example.com:65536").expect_err("overflow must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_non_numeric_port() {
+        let err = normalize_domain_name("example.com:http").expect_err("non-numeric must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_empty_port_after_colon() {
+        let err = normalize_domain_name("example.com:").expect_err("empty port must reject");
+        assert!(matches!(err, AppError::Validation(_)));
     }
 }

@@ -116,13 +116,25 @@ pub async fn assert_did_host_allowed(
 /// mismatch returns **404** (not 403) to avoid confirming the DID
 /// exists elsewhere. Same shape as `NotFound`; callers shouldn't
 /// need to distinguish "wrong domain" from "really gone".
+///
+/// The embedded host is percent-decoded before comparison: the
+/// did:webvh / did:web specs require the port colon (and any other
+/// reserved character) to be percent-encoded in the identifier
+/// (`localhost%3A8534`), while the HTTP `Host` header carries the
+/// literal form (`localhost:8534`). Without the decode the two
+/// representations of the same host never match.
 pub fn assert_request_host_matches_did(request_host: &str, did_id: &str) -> Result<(), AppError> {
-    let embedded_host = extract_did_host(did_id).map_err(|_| {
+    let embedded_host_raw = extract_did_host(did_id).map_err(|_| {
         // Storage carries an unparseable DID identifier — return 404
         // rather than 500 so the response is honest about "we can't
         // serve this".
         AppError::NotFound(format!("did identifier unparseable: {did_id}"))
     })?;
+    // Fall back to the literal segment when decoding fails — preserves
+    // the original behaviour for any DID whose host contains malformed
+    // percent escapes; the comparison just fails further down instead
+    // of silently succeeding.
+    let embedded_host = percent_decode_to_string(&embedded_host_raw).unwrap_or(embedded_host_raw);
     if request_host.eq_ignore_ascii_case(&embedded_host) {
         return Ok(());
     }
@@ -135,6 +147,32 @@ pub fn assert_request_host_matches_did(request_host: &str, did_id: &str) -> Resu
     Err(AppError::NotFound(format!(
         "no DID resolvable at host {request_host}"
     )))
+}
+
+/// Minimal percent-decoder for the resolve-side host check. Decodes
+/// any `%XX` sequence (the spec allows `%3A`, `%2F`, …); returns
+/// `None` if a `%` isn't followed by two hex digits or the result
+/// isn't valid UTF-8. Scoped tight so we don't take a new dep just
+/// to decode one segment.
+fn percent_decode_to_string(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Resolve-side check: the named domain must be `Active`. Disabled
@@ -479,6 +517,57 @@ mod tests {
         let err = assert_request_host_matches_did("example.com", "garbage")
             .expect_err("unparseable did must reject");
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn request_host_matches_did_with_encoded_port() {
+        // The webvh / web identifier encodes the port colon as `%3A`;
+        // the HTTP Host header carries the literal `:`. Must match.
+        assert!(
+            assert_request_host_matches_did("localhost:8534", "did:webvh:Q1:localhost%3A8534")
+                .is_ok()
+        );
+        assert!(
+            assert_request_host_matches_did("example.com:8443", "did:web:example.com%3A8443:user1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_host_matches_did_with_encoded_port_mismatch_yields_404() {
+        // Right host, wrong port — still a mismatch after decoding.
+        let err =
+            assert_request_host_matches_did("localhost:9999", "did:webvh:Q1:localhost%3A8534")
+                .expect_err("port mismatch must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn percent_decode_helpers() {
+        assert_eq!(
+            percent_decode_to_string("localhost%3A8534").as_deref(),
+            Some("localhost:8534")
+        );
+        // Lowercase hex.
+        assert_eq!(
+            percent_decode_to_string("localhost%3a8534").as_deref(),
+            Some("localhost:8534")
+        );
+        // No escapes — identity.
+        assert_eq!(
+            percent_decode_to_string("example.com").as_deref(),
+            Some("example.com")
+        );
+        // Multiple escapes (host%2Fpath form, though we don't mint
+        // these — exercise the general path anyway).
+        assert_eq!(
+            percent_decode_to_string("a%2Fb%3Ac").as_deref(),
+            Some("a/b:c")
+        );
+        // Malformed: trailing `%`, short escape, non-hex.
+        assert_eq!(percent_decode_to_string("bad%"), None);
+        assert_eq!(percent_decode_to_string("bad%3"), None);
+        assert_eq!(percent_decode_to_string("bad%ZZ"), None);
     }
 
     #[tokio::test]
