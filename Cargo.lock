@@ -2465,7 +2465,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4276,7 +4276,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -6343,7 +6343,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6381,7 +6381,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6815,7 +6815,7 @@ dependencies = [
  "quinn",
  "rustls 0.23.40",
  "rustls-pki-types",
- "rustls-platform-verifier 0.7.0",
+ "rustls-platform-verifier 0.6.2",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -8725,9 +8725,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-didcomm"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a95af4f00c7048bb37560cf40ab7279a079968b8cee8ad4fb41121d7a118101"
+checksum = "1db3d4c6b48474309bcca8e1e43fc6db052a3e66da9f0d1085a8515bab151d44"
 dependencies = [
  "affinidi-messaging-didcomm",
  "serde",
@@ -8739,9 +8739,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-https"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0b7851ccd9f033b964ba5533726f489cc8fe1df818b2a5e45f4a75a1c5923ce"
+checksum = "ab965205a434071ff814f009d0e1f9421abd81d022fb1cd1bd0f389f9970413f"
 dependencies = [
  "axum",
  "chrono",
@@ -8775,9 +8775,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dceed5dfb6cb55fc74f1fd1044bb16de14c45cf01ece7903655b73f6a28f620"
+checksum = "b3830755272ec1c7a8910e967ce29f9859477422fb7ca3033b3ae1574916cef7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9554,7 +9554,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

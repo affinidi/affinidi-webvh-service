@@ -392,8 +392,10 @@ pub async fn dispatch_did_op(
                 did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await?;
             // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_DID_OFFER);
             Ok((
-                MSG_DID_OFFER.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,
@@ -426,8 +428,10 @@ pub async fn dispatch_did_op(
             server_push::notify_servers_did(state, result.mnemonic.clone());
 
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_DID_REGISTER_CONFIRM);
             Ok((
-                MSG_DID_REGISTER_CONFIRM.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,
@@ -466,8 +470,10 @@ pub async fn dispatch_did_op(
 
             server_push::notify_servers_did(state, mnemonic.to_string());
 
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_DID_CONFIRM);
             Ok((
-                MSG_DID_CONFIRM.to_string(),
+                response_typ.to_string(),
                 json!({
                     "did_id": record.did_id,
                     "did_url": did_url,
@@ -587,8 +593,10 @@ pub async fn dispatch_did_op(
 
             server_push::notify_servers_delete(state, mnemonic.to_string());
 
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_DELETE_CONFIRM);
             Ok((
-                MSG_DELETE_CONFIRM.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": mnemonic,
                     "did_id": did_id,
@@ -1758,6 +1766,38 @@ mod tests {
             .expect("record persisted");
         assert_eq!(record.owner, owner);
         assert_eq!(record.version_count, 0);
+    }
+
+    /// A request bearing the canonical spec URI
+    /// (`spec/did-management/did/check-name/0.1`) routes to the same
+    /// `create_did` handler as the legacy `MSG_DID_REQUEST`, and the
+    /// response carries the spec `#response` URI rather than the legacy
+    /// `MSG_DID_OFFER` — proving inbound + outbound dialect symmetry
+    /// for spec-URI callers like the VTA's `webvh_didcomm` client.
+    #[tokio::test]
+    async fn dispatch_did_op_spec_check_name_returns_spec_response() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:spec-owner";
+        let spec_check_name = "https://trusttasks.org/spec/did-management/did/check-name/0.1";
+        let spec_response =
+            "https://trusttasks.org/spec/did-management/did/check-name/0.1#response";
+        let msg = build_msg(spec_check_name, json!({}));
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, spec_response);
+        let mnemonic = body
+            .get("mnemonic")
+            .and_then(|v| v.as_str())
+            .expect("response carries mnemonic");
+        // Record persisted under caller's ownership, same as the legacy path.
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(mnemonic))
+            .await
+            .unwrap()
+            .expect("record persisted");
+        assert_eq!(record.owner, owner);
     }
 
     /// Reserving a custom path that's already taken returns `Conflict`,

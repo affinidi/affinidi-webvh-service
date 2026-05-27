@@ -103,6 +103,23 @@ pub static TASK_CONFIRM_REQUEST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
 });
 
 // -- DID provisioning lifecycle --------------------------------------------
+//
+// Two URI generations co-exist for the DID-lifecycle operations:
+//
+// 1. The historical `did-hosting/did/*/1.0` namespace used by handlers,
+//    REST headers, and the alias table's canonical column today. These
+//    constants are suffixed `_1_0`.
+// 2. The canonical Trust-Task spec URIs under
+//    `spec/did-management/did/*/0.1` — the source of truth per
+//    `dtgwg-trust-tasks-tf`. New code SHOULD emit these; the alias
+//    table also accepts them as inbound forms so VTA and other clients
+//    that already speak spec URIs round-trip cleanly. These constants
+//    are suffixed `_0_1` and pair with a `_RESPONSE_0_1` for the
+//    framework `#response` fragment convention (SPEC §4.4.1).
+//
+// Phase 3 of the cross-repo did-management migration retires the `_1_0`
+// constants once all in-flight clients move; until then both forms are
+// supported and the alias table keeps inbound dispatch agnostic.
 
 pub static TASK_DID_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/did/request/1.0").expect("static")
@@ -163,6 +180,58 @@ pub static TASK_DID_CHANGE_OWNER_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::ne
 
 pub static TASK_DID_PROBLEM_REPORT_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/did/problem-report/1.0").expect("static")
+});
+
+// -- DID-management Trust-Task spec URIs (canonical per dtgwg-trust-tasks-tf) -
+//
+// Used by:
+//   - `v1_aliases::spec_alias_rows` so inbound dispatch accepts these
+//     as additional aliases for the existing `MSG_*` handlers.
+//   - `dispatch_did_op` response emission: when a request arrives under
+//     a spec URI, the response uses the matching `#response` form
+//     instead of the legacy paired-URL convention (MSG_DID_OFFER,
+//     MSG_DID_REGISTER_CONFIRM, etc.) — keeping older clients on the
+//     legacy responses they expect.
+
+pub static TASK_DID_CHECK_NAME_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/check-name/0.1").expect("static")
+});
+
+pub static TASK_DID_CHECK_NAME_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/check-name/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_REGISTER_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/register/0.1").expect("static")
+});
+
+pub static TASK_DID_REGISTER_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/register/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_PUBLISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/publish/0.1").expect("static")
+});
+
+pub static TASK_DID_PUBLISH_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/publish/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_DELETE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/delete/0.1").expect("static")
+});
+
+pub static TASK_DID_DELETE_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/delete/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_PROBLEM_REPORT_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/problem-report/0.1")
+        .expect("static")
 });
 
 // -- Hosting infrastructure (server registration, health, stats) ------------
@@ -404,6 +473,15 @@ mod tests {
             &TASK_DID_CHANGE_OWNER_1_0,
             &TASK_DID_CHANGE_OWNER_CONFIRM_1_0,
             &TASK_DID_PROBLEM_REPORT_1_0,
+            &TASK_DID_CHECK_NAME_0_1,
+            &TASK_DID_CHECK_NAME_RESPONSE_0_1,
+            &TASK_DID_REGISTER_0_1,
+            &TASK_DID_REGISTER_RESPONSE_0_1,
+            &TASK_DID_PUBLISH_0_1,
+            &TASK_DID_PUBLISH_RESPONSE_0_1,
+            &TASK_DID_DELETE_0_1,
+            &TASK_DID_DELETE_RESPONSE_0_1,
+            &TASK_DID_PROBLEM_REPORT_0_1,
             &TASK_SERVER_REGISTER_1_0,
             &TASK_SERVER_REGISTER_ACK_1_0,
             &TASK_SERVER_HEALTH_PING_1_0,
