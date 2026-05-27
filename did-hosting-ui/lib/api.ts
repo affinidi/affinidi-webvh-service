@@ -406,10 +406,49 @@ export function setAuthMethod(method: AuthMethod): void {
   }
 }
 
+/** DID the wallet-authenticated session is bound to. Set by the
+ *  proxy-login flow to the vault entry's `principalDid`; the wallet's
+ *  holder-login flow leaves this unset.
+ *
+ *  Trust-task signing reads this: when set, the wallet's
+ *  `signTrustTask({ asDid })` extension routes via
+ *  `vault/sign-trust-task/0.1` so the proof's `verificationMethod`
+ *  matches the session's authenticated DID at the server. Without it,
+ *  the wallet falls back to holder-signing and the server rejects with
+ *  `proof_invalid: proof verificationMethod DID does not match the
+ *  authenticated caller` (which is how this discriminator got
+ *  motivated). */
+const SESSION_PRINCIPAL_DID_KEY = "webvh_session_principal_did";
+
+export function getSessionPrincipalDid(): string | null {
+  try {
+    return localStorage.getItem(SESSION_PRINCIPAL_DID_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setSessionPrincipalDid(did: string): void {
+  try {
+    localStorage.setItem(SESSION_PRINCIPAL_DID_KEY, did);
+  } catch {
+    // ignore
+  }
+}
+
+export function clearSessionPrincipalDid(): void {
+  try {
+    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export function clearToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(AUTH_METHOD_KEY);
+    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
   } catch {
     // ignore
   }
@@ -1194,7 +1233,14 @@ async function trustTask<Req, Resp>(
     if (method === "wallet") {
       const wallet = (
         typeof window !== "undefined"
-          ? (window as unknown as { vtaWallet?: { signTrustTask: (p: { envelope: Record<string, unknown> }) => Promise<{ signedEnvelope: Record<string, unknown> }> } }).vtaWallet
+          ? (window as unknown as {
+              vtaWallet?: {
+                signTrustTask: (p: {
+                  envelope: Record<string, unknown>;
+                  asDid?: string;
+                }) => Promise<{ signedEnvelope: Record<string, unknown> }>;
+              };
+            }).vtaWallet
           : undefined
       );
       if (!wallet?.signTrustTask) {
@@ -1203,8 +1249,27 @@ async function trustTask<Req, Resp>(
           "Wallet-authenticated session but the VTA Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
         );
       }
+      // Wallet-authenticated sessions split into two cases:
+      //   - Holder login: session is bound to the wallet's holder DID,
+      //     proof.verificationMethod = that holder, matches. Pass no asDid;
+      //     wallet signs with its own holder key.
+      //   - Proxy login: session is bound to a vault entry's principalDid
+      //     (the SIOP id_token's iss/sub). Long-term key lives at the VTA,
+      //     so the wallet has to ask the VTA to sign as that DID via
+      //     vault/sign-trust-task/0.1. Without `asDid` the wallet would
+      //     sign with the holder, the server's check
+      //     `proof.verificationMethod == authenticated caller` would fail,
+      //     and we'd get `proof_invalid`.
+      const sessionPrincipalDid = getSessionPrincipalDid();
+      const envelopeWithIssuer: Record<string, unknown> = sessionPrincipalDid
+        ? {
+            ...(envelope as unknown as Record<string, unknown>),
+            issuer: sessionPrincipalDid,
+          }
+        : (envelope as unknown as Record<string, unknown>);
       const signed = await wallet.signTrustTask({
-        envelope: envelope as unknown as Record<string, unknown>,
+        envelope: envelopeWithIssuer,
+        ...(sessionPrincipalDid ? { asDid: sessionPrincipalDid } : {}),
       });
       // Replace our envelope with the signed one (the wallet may have
       // copied + added `proof`; the rest of the fields must be byte-

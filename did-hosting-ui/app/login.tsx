@@ -9,7 +9,12 @@ import * as Clipboard from "expo-clipboard";
 import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
-import { api, setAuthMethod } from "../lib/api";
+import {
+  api,
+  clearSessionPrincipalDid,
+  setAuthMethod,
+  setSessionPrincipalDid,
+} from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import {
@@ -122,6 +127,10 @@ export default function Login() {
     try {
       const result = await loginWithWallet();
       setAuthMethod("wallet");
+      // Holder login — session DID is the wallet's holder DID. Trust-task
+      // signing should NOT route via vault/sign-trust-task; clear any
+      // stale principal-DID hint from a previous proxy-login session.
+      clearSessionPrincipalDid();
       login(result.accessToken);
       router.replace("/");
     } catch (err: any) {
@@ -166,6 +175,15 @@ export default function Login() {
     try {
       const outcome = await loginWithWalletProxy(entry);
       setAuthMethod("wallet");
+      // Proxy login — session is authenticated as the entry's
+      // principalDid (the SIOP id_token's iss/sub). Subsequent
+      // trust-task signing MUST sign as this DID, not the wallet's
+      // holder; record it so api.ts's signTrustTask path threads
+      // `asDid` through to the wallet's vault/sign-trust-task call.
+      // `principalDid` is optional on ProxyVaultEntry for forward-compat,
+      // but `listProxyCandidates` already filters out entries without
+      // one — only entries that round-trip with a DID reach this path.
+      setSessionPrincipalDid(entry.principalDid!);
       login(outcome.result.accessToken);
       // When the operator has enabled the flow visualization, stash
       // it and let the modal hold the redirect. Otherwise (the
