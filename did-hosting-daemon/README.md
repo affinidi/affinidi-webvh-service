@@ -284,26 +284,9 @@ Features propagate to the underlying service crates:
 | `passkey` | Enable WebAuthn passkey auth in did-hosting-control |
 | `keyring` | OS keyring secrets backend |
 | `store-fjall` | Fjall embedded storage backend |
+| `did-methods` | Enable did:webvh + did:web resolution (route + dispatcher) |
 
-Default features: `keyring`, `store-fjall`, `ui`, `passkey`.
-
-> **DID-method features.** The daemon's `default-features = false`
-> dependency on `did-hosting-server` and `did-hosting-common` means
-> `method-webvh` / `method-web` are **not** automatically enabled
-> by `cargo install --path did-hosting-daemon`. They come on
-> implicitly via Cargo feature unification when you build the
-> whole workspace (`cargo build --workspace`), but standalone
-> binary installs should pass them explicitly:
->
-> ```bash
-> cargo install --path did-hosting-daemon \
->   --features "did-hosting-server/method-webvh,did-hosting-server/method-web,did-hosting-common/method-webvh,did-hosting-common/method-web"
-> ```
->
-> Without them, public DID resolution silently returns
-> `404 Not Found` with an empty body. See
-> [`did-hosting-server/README.md`](../did-hosting-server/README.md#did-method-features)
-> for the diagnosis.
+Default features: `keyring`, `store-fjall`, `ui`, `passkey`, `did-methods`.
 
 ## Support & feedback
 
