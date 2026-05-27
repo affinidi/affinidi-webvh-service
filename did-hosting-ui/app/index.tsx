@@ -346,6 +346,9 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: spacing.xl,
     alignItems: "center",
+    // Visual breathing room from the subtitle above — without this
+    // the button hugs "Decentralized Identity Hosting" with no gap.
+    marginTop: spacing.xl,
   },
   buttonPrimaryText: {
     color: colors.textOnAccent,
