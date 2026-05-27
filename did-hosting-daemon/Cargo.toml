@@ -13,9 +13,19 @@ publish.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "ui", "passkey"]
+default = ["keyring", "store-fjall", "ui", "passkey", "did-methods"]
 ui = ["did-hosting-control/ui"]
 passkey = ["did-hosting-control/passkey", "did-hosting-common/passkey"]
+# DID methods enabled for resolution. Default-on because a daemon without
+# any method registered silently returns 404 from `/.well-known/did.jsonl`
+# — the resolve-side route and dispatcher are both `#[cfg]`-gated. Opt out
+# only if you genuinely want a method-less binary.
+did-methods = [
+  "did-hosting-server/method-webvh",
+  "did-hosting-server/method-web",
+  "did-hosting-common/method-webvh",
+  "did-hosting-common/method-web",
+]
 keyring = [
   "did-hosting-server/keyring",
   "webvh-witness/keyring",
