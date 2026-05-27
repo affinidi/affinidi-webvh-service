@@ -211,6 +211,30 @@ export function ServiceOverviewPanel() {
             </View>
           </View>
         </View>
+
+        {/* DID methods compiled into this binary. Empty list = misbuild
+            — surface as a red banner so the operator can't miss it. */}
+        <View style={styles.methodsRow}>
+          <Text style={styles.methodsLabel}>DID methods</Text>
+          {control.enabledMethods.length === 0 ? (
+            <View style={styles.methodsEmptyBanner}>
+              <Text style={styles.methodsEmptyIcon}>{"⚠"}</Text>
+              <Text style={styles.methodsEmptyText}>
+                No DID methods compiled in — every DID op will fail.
+                Rebuild with at least one of the {"`method-*`"} cargo
+                features (e.g. {"`--features method-webvh,method-web`"}).
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.methodsChips}>
+              {control.enabledMethods.map((m) => (
+                <View key={m} style={styles.methodChip}>
+                  <Text style={styles.methodChipText}>did:{m}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
       </View>
 
       {/* Aggregate summary */}
@@ -376,6 +400,58 @@ const styles = StyleSheet.create({
   controlFlags: {
     flexDirection: "row",
     gap: spacing.xs,
+  },
+  methodsRow: {
+    marginTop: spacing.md,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    gap: spacing.sm,
+  },
+  methodsLabel: {
+    fontSize: 10,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+  },
+  methodsChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+  },
+  methodChip: {
+    backgroundColor: colors.tealMuted,
+    borderRadius: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  methodChipText: {
+    fontSize: 11,
+    fontFamily: fonts.mono,
+    color: colors.textPrimary,
+  },
+  methodsEmptyBanner: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: spacing.sm,
+    backgroundColor: colors.errorBg,
+    borderWidth: 1,
+    borderColor: colors.error,
+    borderRadius: radii.sm,
+    padding: spacing.sm,
+  },
+  methodsEmptyIcon: {
+    fontSize: 16,
+    color: colors.error,
+    marginTop: 1,
+  },
+  methodsEmptyText: {
+    flex: 1,
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.error,
+    lineHeight: 18,
   },
   flagBadge: {
     borderRadius: 4,
