@@ -19,7 +19,7 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,7 +29,7 @@ jobs:
     name: cargo clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -40,7 +40,7 @@ jobs:
     name: MSRV ${{ env.MSRV }} build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Verify Cargo.toml `rust-version` matches MSRV env var
         run: |
           declared=$(grep '^rust-version' Cargo.toml | head -n1 | sed -E 's/rust-version *= *"([^"]+)"/\1/')
@@ -97,7 +97,7 @@ jobs:
           - store: store-cosmosdb
             features: "server-core,store-cosmosdb"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build did-hosting-common with ${{ matrix.store }}
@@ -116,7 +116,7 @@ jobs:
     name: cargo test (default features)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `--locked` ensures Cargo.lock matches the workspace manifest exactly,
@@ -158,7 +158,7 @@ jobs:
     env:
       KEYRING_TEST_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux Secret Service
@@ -225,7 +225,7 @@ jobs:
             expect: fail
             expected_message: "method-webplus is not implemented in this release"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build did-hosting-common (${{ matrix.case }})
@@ -263,7 +263,7 @@ jobs:
           - gcp-secrets
           - azure-secrets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: >
@@ -274,7 +274,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -283,7 +283,7 @@ jobs:
     name: cargo publish --dry-run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # did-hosting-common is publishable on its own. The other crates depend on
