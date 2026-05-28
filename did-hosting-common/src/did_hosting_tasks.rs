@@ -441,6 +441,43 @@ pub static TASK_WEBVH_SYNC_DELETE_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|
     TrustTask::new("https://trusttasks.org/webvh/did/sync-delete-ack/1.0").expect("static")
 });
 
+// -- webvh Trust-Task spec URIs (canonical per dtgwg-trust-tasks-tf) ---------
+//
+// Same dual-URI scheme as the did-management family (see the
+// `_0_1` / `_RESPONSE_0_1` block above): each operation has a legacy
+// `webvh/did/<op>/1.0` constant paired with `*_ACK_1_0` /
+// `*_CONFIRM_1_0` (above) and a canonical spec URI under
+// `spec/webvh/<sub>/<op>/0.1` (here). The dispatcher accepts both
+// forms; the response dialect mirrors whichever form the request used.
+// Slug structure differs between legacy and spec (`webvh/did/<op>` vs
+// `spec/webvh/<sub>/<op>`) so the two `LazyLock`s sit side by side
+// with the `_1_0` / `_0_1` suffix as the disambiguator.
+
+pub static TASK_WEBVH_WITNESS_PUBLISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/witness/publish/0.1").expect("static")
+});
+
+pub static TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/witness/publish/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_WEBVH_SYNC_UPDATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/sync/update/0.1").expect("static")
+});
+
+pub static TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/sync/update/0.1#response").expect("static")
+});
+
+pub static TASK_WEBVH_SYNC_DELETE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/sync/delete/0.1").expect("static")
+});
+
+pub static TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/webvh/sync/delete/0.1#response").expect("static")
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +540,12 @@ mod tests {
             &TASK_WEBVH_SYNC_UPDATE_ACK_1_0,
             &TASK_WEBVH_SYNC_DELETE_1_0,
             &TASK_WEBVH_SYNC_DELETE_ACK_1_0,
+            &TASK_WEBVH_WITNESS_PUBLISH_0_1,
+            &TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1,
+            &TASK_WEBVH_SYNC_UPDATE_0_1,
+            &TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1,
+            &TASK_WEBVH_SYNC_DELETE_0_1,
+            &TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1,
             // T8b: REST-specific.
             &TASK_AUTH_CHALLENGE_0_1,
             &TASK_AUTH_REFRESH_0_1,
