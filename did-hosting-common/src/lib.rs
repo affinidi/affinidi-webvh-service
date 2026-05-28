@@ -8,8 +8,6 @@ pub mod didcomm_types;
 mod error;
 pub mod method;
 mod types;
-#[cfg(feature = "server-core")]
-pub mod v1_aliases;
 mod watcher_client;
 mod witness_client;
 

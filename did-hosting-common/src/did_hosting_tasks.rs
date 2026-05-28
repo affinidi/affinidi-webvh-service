@@ -185,8 +185,8 @@ pub static TASK_DID_PROBLEM_REPORT_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 // -- DID-management Trust-Task spec URIs (canonical per dtgwg-trust-tasks-tf) -
 //
 // Used by:
-//   - `v1_aliases::spec_alias_rows` so inbound dispatch accepts these
-//     as additional aliases for the existing `MSG_*` handlers.
+//   - the dispatcher's match arms (which reference `MSG_*` constants
+//     whose values now equal the canonical spec URI).
 //   - `dispatch_did_op` response emission: when a request arrives under
 //     a spec URI, the response uses the matching `#response` form
 //     instead of the legacy paired-URL convention (MSG_DID_OFFER,

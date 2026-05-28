@@ -108,7 +108,6 @@ pub async fn authenticate(
 ) -> Result<Response, AppError> {
     use did_hosting_common::AuthenticatePayload;
     use did_hosting_common::server::didcomm_unpack;
-    use did_hosting_common::v1_aliases;
 
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
@@ -130,7 +129,7 @@ pub async fn authenticate(
     };
 
     let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_0_1.as_str();
-    if v1_aliases::canonicalize(&envelope.type_uri) != Some(expected_type) {
+    if envelope.type_uri != expected_type {
         return Ok(trust_task_malformed(&format!(
             "unexpected Trust-Task type: expected {expected_type}, got {}",
             envelope.type_uri

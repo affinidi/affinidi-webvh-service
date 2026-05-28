@@ -58,15 +58,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
         .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
-        .route(
-            did_hosting_common::did_hosting_tasks::TASK_WEBVH_SYNC_UPDATE_0_1.as_str(),
-            handler_fn(handle_sync_update),
-        )?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
-        .route(
-            did_hosting_common::did_hosting_tasks::TASK_WEBVH_SYNC_DELETE_0_1.as_str(),
-            handler_fn(handle_sync_delete),
-        )?
         .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
         .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
         .route(MSG_DOMAIN_PURGE, handler_fn(handle_domain_purge))?
@@ -270,10 +262,8 @@ async fn do_sync_update(
         "applied DID sync update from control plane via mediator"
     );
 
-    let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-        .unwrap_or(MSG_SYNC_UPDATE_ACK);
     Ok((
-        response_typ.to_string(),
+        MSG_SYNC_UPDATE_ACK.to_string(),
         json!({ "mnemonic": mnemonic, "status": "applied" }),
     ))
 }
@@ -315,10 +305,8 @@ async fn do_sync_delete(
         info!(mnemonic = %mnemonic, "sync delete: DID not found locally");
     }
 
-    let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-        .unwrap_or(MSG_SYNC_DELETE_ACK);
     Ok((
-        response_typ.to_string(),
+        MSG_SYNC_DELETE_ACK.to_string(),
         json!({ "mnemonic": mnemonic, "status": "deleted" }),
     ))
 }

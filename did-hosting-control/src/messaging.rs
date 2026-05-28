@@ -349,17 +349,13 @@ pub async fn dispatch_did_op(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), AppError> {
-    // Canonicalise the incoming message type so callers can send EITHER
-    // the legacy `MSG_*` URL (under `affinidi.com/webvh/1.0/...`) or the
-    // canonical Trust-Task URL (under `trusttasks.org/{did-hosting,
-    // webvh}/...`) — both route to the same handler. The match arms
-    // below keep their existing `MSG_*` form; `to_legacy` translates
-    // canonical inbound types back to legacy before the match.
+    // Phase 3 end-state: did-hosting accepts canonical Trust-Task
+    // spec URIs only. The MSG_* constants in `didcomm_types` hold the
+    // canonical spec URI values, so the dispatcher matches `msg.typ`
+    // directly without the historical `to_legacy` translation step.
     // Unrecognised types fall through to the default arm (which emits
     // a protocol error code).
-    let typ =
-        did_hosting_common::v1_aliases::to_legacy(msg.typ.as_str()).unwrap_or(msg.typ.as_str());
-    match typ {
+    match msg.typ.as_str() {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
             let force = msg
@@ -399,10 +395,8 @@ pub async fn dispatch_did_op(
                 did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await?;
             // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_DID_OFFER);
             Ok((
-                response_typ.to_string(),
+                MSG_DID_OFFER.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,
@@ -435,10 +429,8 @@ pub async fn dispatch_did_op(
             server_push::notify_servers_did(state, result.mnemonic.clone());
 
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_DID_REGISTER_CONFIRM);
             Ok((
-                response_typ.to_string(),
+                MSG_DID_REGISTER_CONFIRM.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,
@@ -476,11 +468,8 @@ pub async fn dispatch_did_op(
             let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
             server_push::notify_servers_did(state, mnemonic.to_string());
-
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_DID_CONFIRM);
             Ok((
-                response_typ.to_string(),
+                MSG_DID_CONFIRM.to_string(),
                 json!({
                     "did_id": record.did_id,
                     "did_url": did_url,
@@ -517,11 +506,8 @@ pub async fn dispatch_did_op(
             let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
 
             server_push::notify_servers_did(state, mnemonic.to_string());
-
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_WITNESS_CONFIRM);
             Ok((
-                response_typ.to_string(),
+                MSG_WITNESS_CONFIRM.to_string(),
                 json!({
                     "mnemonic": mnemonic,
                     "witness_url": witness_url,
@@ -552,11 +538,8 @@ pub async fn dispatch_did_op(
                 .or(state.config.public_url.as_deref())
                 .unwrap_or("http://localhost");
             let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
-
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_INFO);
             Ok((
-                response_typ.to_string(),
+                MSG_INFO.to_string(),
                 json!({
                     "mnemonic": record.mnemonic,
                     "did_id": record.did_id,
@@ -592,9 +575,7 @@ pub async fn dispatch_did_op(
                     })
                 })
                 .collect();
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_LIST);
-            Ok((response_typ.to_string(), json!({ "dids": entries_json })))
+            Ok((MSG_LIST.to_string(), json!({ "dids": entries_json })))
         }
         MSG_DELETE => {
             let mnemonic = msg
@@ -605,11 +586,8 @@ pub async fn dispatch_did_op(
             let did_id = did_ops::delete_did(auth, state, mnemonic).await?;
 
             server_push::notify_servers_delete(state, mnemonic.to_string());
-
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_DELETE_CONFIRM);
             Ok((
-                response_typ.to_string(),
+                MSG_DELETE_CONFIRM.to_string(),
                 json!({
                     "mnemonic": mnemonic,
                     "did_id": did_id,
@@ -628,10 +606,8 @@ pub async fn dispatch_did_op(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'new_owner' in body".into()))?;
             let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_DID_CHANGE_OWNER_CONFIRM);
             Ok((
-                response_typ.to_string(),
+                MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
                 json!({
                     "mnemonic": record.mnemonic,
                     "owner": record.owner,
@@ -644,16 +620,13 @@ pub async fn dispatch_did_op(
             // domains. Shares its compute with the REST handler
             // `GET /api/me/domains` via `fetch_me_domains_for_caller`
             // so both transports return byte-identical payloads.
-            //
-            // Only the canonical `spec/did-management/me/domains/0.1`
-            // URI reaches this arm — there is no `affinidi.com/...`
-            // legacy form. The response always carries the spec
-            // `#response` URI (no legacy fallback exists, and
-            // `response_form_for` returns it deterministically).
             let resp = crate::routes::domain::fetch_me_domains_for_caller(auth, state).await?;
-            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
-                .unwrap_or(MSG_ME_DOMAINS);
-            Ok((response_typ.to_string(), serde_json::to_value(resp)?))
+            Ok((
+                did_hosting_common::did_hosting_tasks::TASK_ME_DOMAINS_RESPONSE_0_1
+                    .as_str()
+                    .to_string(),
+                serde_json::to_value(resp)?,
+            ))
         }
         other => Err(AppError::Validation(format!(
             "unknown message type: {other}"

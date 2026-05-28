@@ -1,36 +1,23 @@
-//! Trust-Task parity harness (T9).
+//! Trust-Task REST parity harness.
 //!
-//! Asserts that the two wire shapes — legacy (`MSG_*` DIDComm type
-//! / no REST `Trust-Task` header) and canonical (Trust-Task URL on
-//! either transport) — produce byte-equivalent observable state.
-//! The matrix is intentionally narrow: the parity guarantee comes
-//! from the `v1_aliases` table + the permissive middleware, and
-//! those have their own unit-test coverage; this harness exercises
-//! the end-to-end seam where the two wire forms reach the same
-//! handler.
+//! Asserts the two REST wire shapes — without a `Trust-Task` header
+//! and with the matching canonical Trust-Task URL on the header —
+//! produce byte-equivalent observable state on a permissive route.
+//! The DIDComm-paired auth-challenge endpoint is the representative
+//! target because it's the simplest valid POST that exercises the
+//! full middleware path.
 //!
-//! ## What's checked
+//! ## Why this scope, post-Phase-3
 //!
-//! 1. **v1_aliases bijection.** Every `MSG_*` const canonicalises
-//!    to a `TASK_*` URL, and every canonical URL round-trips back
-//!    to the same legacy `MSG_*`. Drift in either direction breaks
-//!    the dispatcher.
-//! 2. **REST permissive parity.** For a representative route, a
-//!    request *without* `Trust-Task:` and a request *with* the
-//!    matching canonical URL produce identical (status, body)
-//!    pairs.
-//! 3. **REST mismatch is held to the same standard either way.** A
-//!    bogus `Trust-Task:` value still returns 415 on a permissive
-//!    route — opting in is binding.
-//!
-//! End-to-end DIDComm parity (sending a request with legacy `typ`
-//! vs the canonical TASK_* value) requires a working mediator
-//! fixture and is tracked separately as part of the broader
-//! integration suite. The dispatcher's per-arm acceptance of both
-//! type strings is already pinned by
-//! `did_hosting_common::v1_aliases::tests::to_legacy_round_trips_via_canonical`
-//! and by `dispatch_did_op`'s call to `to_legacy` before its
-//! `match` arm — see `did-hosting-control/src/messaging.rs`.
+//! Phase 3 retired the bidirectional `v1_aliases` translation table:
+//! did-hosting now accepts canonical Trust-Task spec URIs only — the
+//! legacy `affinidi.com/webvh/1.0/*` and `did-hosting/did/*/1.0`
+//! namespaces are gone. The historical bijection unit-test for the
+//! alias table moved with it. What remains in this harness is the
+//! REST-permissive contract: a route declared `permissive` must
+//! accept *no header at all* (legacy clients pre-Trust-Task) and the
+//! matching canonical URL with byte-identical results, but reject a
+//! bogus URL with 415.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -47,7 +34,6 @@ use did_hosting_common::server::store::{
     KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
 use did_hosting_common::server::trust_task::HEADER_NAME;
-use did_hosting_common::v1_aliases::{canonicalize, to_legacy};
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::server::AppState;
 use http_body_util::BodyExt;
@@ -209,71 +195,4 @@ async fn trust_task_parity_rest_mismatched_header_returns_415() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["error"], "TrustTaskMismatch");
-}
-
-/// v1_aliases bijection: every known MSG_* round-trips through
-/// canonicalize → to_legacy → original MSG_*. A drift here means
-/// the dispatcher would silently route a canonical request to a
-/// different (or no) handler.
-#[tokio::test]
-async fn trust_task_parity_aliases_round_trip() {
-    use did_hosting_common::didcomm_types::*;
-
-    let legacy_messages = [
-        MSG_AUTHENTICATE,
-        MSG_AUTH_RESPONSE,
-        MSG_DID_REQUEST,
-        MSG_DID_OFFER,
-        MSG_DID_PUBLISH,
-        MSG_DID_CONFIRM,
-        MSG_DID_REGISTER,
-        MSG_DID_REGISTER_CONFIRM,
-        MSG_WITNESS_PUBLISH,
-        MSG_WITNESS_CONFIRM,
-        MSG_INFO_REQUEST,
-        MSG_INFO,
-        MSG_LIST_REQUEST,
-        MSG_LIST,
-        MSG_DELETE,
-        MSG_DELETE_CONFIRM,
-        MSG_DID_CHANGE_OWNER,
-        MSG_DID_CHANGE_OWNER_CONFIRM,
-        MSG_PROBLEM_REPORT,
-        MSG_SERVER_REGISTER,
-        MSG_SERVER_REGISTER_ACK,
-        MSG_HEALTH_PING,
-        MSG_HEALTH_PONG,
-        MSG_SYNC_UPDATE,
-        MSG_SYNC_UPDATE_ACK,
-        MSG_SYNC_DELETE,
-        MSG_SYNC_DELETE_ACK,
-        MSG_STATS_SYNC,
-        MSG_STATS_ACK,
-        MSG_DOMAIN_ASSIGN,
-        MSG_DOMAIN_UNASSIGN,
-        MSG_DOMAIN_PURGE,
-    ];
-
-    for legacy in legacy_messages {
-        let canonical = canonicalize(legacy)
-            .unwrap_or_else(|| panic!("legacy `{legacy}` must canonicalise — missing alias entry"));
-        // Canonical must canonicalise to itself.
-        assert_eq!(
-            canonicalize(canonical),
-            Some(canonical),
-            "canonical `{canonical}` must be idempotent"
-        );
-        // Round-trip back via to_legacy.
-        let round_trip = to_legacy(canonical)
-            .unwrap_or_else(|| panic!("canonical `{canonical}` must round-trip via to_legacy"));
-        assert_eq!(
-            round_trip, legacy,
-            "round-trip drift: {legacy} → {canonical} → {round_trip}"
-        );
-    }
-
-    // Unknown messages return None from both directions — the
-    // dispatcher's "unknown type" arm must remain reachable.
-    assert!(canonicalize("https://example.com/unknown/1.0").is_none());
-    assert!(to_legacy("https://example.com/unknown/1.0").is_none());
 }
