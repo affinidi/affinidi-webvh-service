@@ -18,7 +18,8 @@ import { Platform } from "react-native";
 
 /** A subset of the wallet provider's interface — just the SIOPv2 login.
  *  Declaring it inline keeps did-hosting-ui from depending on the extension
- *  package. The full interface lives in `@pnm/extension/provider.ts`. */
+ *  package. The full interface lives in
+ *  `@openvtc/pnm-extension/provider.ts`. */
 interface VtaWalletLoginParams {
   rpDid: string;
   baseUrl: string;
