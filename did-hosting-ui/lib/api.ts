@@ -263,6 +263,13 @@ export interface ControlInfo {
   publicUrl: string | null;
   didcommEnabled: boolean;
   totalLocalDids: number;
+  /** DID methods compiled into this control-plane binary (from
+   *  `did_hosting_common::method::enabled_methods`). Empty when the
+   *  operator built with `--no-default-features` and no `method-*`
+   *  feature — every DID op then fails; the dashboard renders a loud
+   *  warning when this list is empty so the misconfiguration is
+   *  obvious before any user hits a failure. */
+  enabledMethods: string[];
 }
 
 export interface ServiceInfo {

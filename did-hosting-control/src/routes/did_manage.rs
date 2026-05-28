@@ -807,6 +807,14 @@ pub struct ControlInfo {
     pub public_url: Option<String>,
     pub didcomm_enabled: bool,
     pub total_local_dids: u64,
+    /// DID methods compiled into this binary, as enumerated by
+    /// `did_hosting_common::method::enabled_methods()`. Each entry is a
+    /// method name (e.g. `"webvh"`, `"web"`). Empty when the operator
+    /// compiled with `--no-default-features` and no `method-*` feature
+    /// — in that case the dispatcher refuses every DID op, and the UI
+    /// renders a loud warning so the operator notices before any user
+    /// hits the failure.
+    pub enabled_methods: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -911,6 +919,7 @@ pub async fn get_services_overview(
             public_url: state.config.public_url.clone(),
             didcomm_enabled: state.config.features.didcomm,
             total_local_dids: local_dids,
+            enabled_methods: did_hosting_common::method::enabled_methods().to_vec(),
         },
         aggregate: AggregateStats {
             total_services: services.len() as u64,

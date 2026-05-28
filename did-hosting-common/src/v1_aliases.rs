@@ -23,11 +23,14 @@
 
 use crate::did_hosting_tasks::{
     TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_AUTHENTICATE_RESPONSE_0_1, TASK_DID_CHANGE_OWNER_1_0,
-    TASK_DID_CHANGE_OWNER_CONFIRM_1_0, TASK_DID_CONFIRM_1_0, TASK_DID_DELETE_1_0,
-    TASK_DID_DELETE_CONFIRM_1_0, TASK_DID_INFO_1_0, TASK_DID_INFO_REQUEST_1_0, TASK_DID_LIST_1_0,
-    TASK_DID_LIST_REQUEST_1_0, TASK_DID_OFFER_1_0, TASK_DID_PROBLEM_REPORT_1_0,
-    TASK_DID_PUBLISH_1_0, TASK_DID_REGISTER_1_0, TASK_DID_REGISTER_CONFIRM_1_0,
-    TASK_DID_REQUEST_1_0, TASK_DOMAIN_ASSIGN_1_0, TASK_DOMAIN_PURGE_1_0, TASK_DOMAIN_UNASSIGN_1_0,
+    TASK_DID_CHANGE_OWNER_CONFIRM_1_0, TASK_DID_CHECK_NAME_0_1, TASK_DID_CHECK_NAME_RESPONSE_0_1,
+    TASK_DID_CONFIRM_1_0, TASK_DID_DELETE_0_1, TASK_DID_DELETE_1_0, TASK_DID_DELETE_CONFIRM_1_0,
+    TASK_DID_DELETE_RESPONSE_0_1, TASK_DID_INFO_1_0, TASK_DID_INFO_REQUEST_1_0, TASK_DID_LIST_1_0,
+    TASK_DID_LIST_REQUEST_1_0, TASK_DID_OFFER_1_0, TASK_DID_PROBLEM_REPORT_0_1,
+    TASK_DID_PROBLEM_REPORT_1_0, TASK_DID_PUBLISH_0_1, TASK_DID_PUBLISH_1_0,
+    TASK_DID_PUBLISH_RESPONSE_0_1, TASK_DID_REGISTER_0_1, TASK_DID_REGISTER_1_0,
+    TASK_DID_REGISTER_CONFIRM_1_0, TASK_DID_REGISTER_RESPONSE_0_1, TASK_DID_REQUEST_1_0,
+    TASK_DOMAIN_ASSIGN_1_0, TASK_DOMAIN_PURGE_1_0, TASK_DOMAIN_UNASSIGN_1_0,
     TASK_SERVER_HEALTH_PING_1_0, TASK_SERVER_HEALTH_PONG_1_0, TASK_SERVER_REGISTER_1_0,
     TASK_SERVER_REGISTER_ACK_1_0, TASK_SERVER_STATS_ACK_1_0, TASK_SERVER_STATS_SYNC_1_0,
     TASK_WEBVH_SYNC_DELETE_1_0, TASK_WEBVH_SYNC_DELETE_ACK_1_0, TASK_WEBVH_SYNC_UPDATE_1_0,
@@ -107,6 +110,61 @@ fn alias_pairs() -> [(&'static str, &'static str); 32] {
     ]
 }
 
+/// did-management Trust-Task spec URIs that route to the same handlers
+/// as the legacy `MSG_*` constants above, but use the canonical
+/// `spec/did-management/did/*/0.1` namespace per
+/// `dtgwg-trust-tasks-tf`.
+///
+/// Each entry is `(spec_request_uri, paired MSG_*, spec_response_uri)`:
+///
+/// - `spec_request_uri` is recognised by [`canonicalize`] and
+///   [`to_legacy`] as an additional alias for the operation — `to_legacy`
+///   maps it back to the existing `MSG_*` so the dispatcher's match arm
+///   continues to work unchanged.
+/// - `spec_response_uri` is the framework `#response`-fragment form
+///   ([SPEC §4.4.1](https://trusttasks.org/SPEC.md#441-request-and-response-variants))
+///   the dispatcher emits *when the inbound request was the spec URI*.
+///   Requests still arriving as the legacy `MSG_*` or
+///   `did-hosting/did/*/1.0` canonical receive the legacy `MSG_*_CONFIRM`
+///   / `MSG_DID_OFFER` response they expect — see
+///   [`response_form_for`].
+///
+/// Phase 3 of the cross-repo did-management migration retires the
+/// legacy MSG_* and `did-hosting/did/*/1.0` URIs once all in-flight
+/// clients move; the spec URIs become the only form recognised.
+fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 5] {
+    [
+        (
+            TASK_DID_CHECK_NAME_0_1.as_str(),
+            MSG_DID_REQUEST,
+            TASK_DID_CHECK_NAME_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_DID_REGISTER_0_1.as_str(),
+            MSG_DID_REGISTER,
+            TASK_DID_REGISTER_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_DID_PUBLISH_0_1.as_str(),
+            MSG_DID_PUBLISH,
+            TASK_DID_PUBLISH_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_DID_DELETE_0_1.as_str(),
+            MSG_DELETE,
+            TASK_DID_DELETE_RESPONSE_0_1.as_str(),
+        ),
+        // problem-report is one-way (no paired success response); the
+        // third tuple slot still holds the spec URI itself so callers
+        // round-trip cleanly.
+        (
+            TASK_DID_PROBLEM_REPORT_0_1.as_str(),
+            MSG_PROBLEM_REPORT,
+            TASK_DID_PROBLEM_REPORT_0_1.as_str(),
+        ),
+    ]
+}
+
 /// Canonicalise an incoming message `type` to its Trust-Task URL.
 ///
 /// Returns:
@@ -122,6 +180,13 @@ pub fn canonicalize(msg_type: &str) -> Option<&'static str> {
     for (legacy, canonical) in alias_pairs() {
         if msg_type == legacy || msg_type == canonical {
             return Some(canonical);
+        }
+    }
+    // did-management Trust-Task spec URIs canonicalise to themselves —
+    // they ARE the canonical form per spec-first discipline.
+    for (spec_req, _, spec_resp) in spec_alias_rows() {
+        if msg_type == spec_req || msg_type == spec_resp {
+            return Some(spec_req);
         }
     }
     None
@@ -142,6 +207,33 @@ pub fn to_legacy(msg_type: &str) -> Option<&'static str> {
     for (legacy, canonical) in alias_pairs() {
         if msg_type == legacy || msg_type == canonical {
             return Some(legacy);
+        }
+    }
+    // did-management spec URIs route to the same MSG_* handler as the
+    // legacy/canonical pair — `dispatch_did_op` consults `to_legacy`
+    // exactly to collapse all forms back to one match arm.
+    for (spec_req, msg, _) in spec_alias_rows() {
+        if msg_type == spec_req {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// Maps a request type URI to the matching success-response URI **in
+/// the same dialect**.
+///
+/// - Spec request URI (`spec/did-management/did/*/0.1`) → spec response
+///   URI (`…#response`).
+/// - Legacy MSG_* / `did-hosting/did/*/1.0` request → `None`. Callers
+///   fall back to the historical paired response (MSG_DID_OFFER,
+///   MSG_DID_REGISTER_CONFIRM, etc.) so older clients keep working.
+///
+/// Used by `dispatch_did_op` to pick the outbound response form.
+pub fn response_form_for(req_typ: &str) -> Option<&'static str> {
+    for (spec_req, _, spec_resp) in spec_alias_rows() {
+        if req_typ == spec_req {
+            return Some(spec_resp);
         }
     }
     None
@@ -246,6 +338,67 @@ mod tests {
         for m in msgs {
             assert!(canonicalize(m).is_some(), "MSG_* `{m}` has no alias entry");
         }
+    }
+
+    #[test]
+    fn spec_uri_check_name_routes_to_msg_did_request() {
+        let spec = "https://trusttasks.org/spec/did-management/did/check-name/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_DID_REQUEST));
+        assert_eq!(canonicalize(spec), Some(spec));
+    }
+
+    #[test]
+    fn spec_uri_register_routes_to_msg_did_register() {
+        let spec = "https://trusttasks.org/spec/did-management/did/register/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_DID_REGISTER));
+        assert_eq!(canonicalize(spec), Some(spec));
+    }
+
+    #[test]
+    fn spec_uri_publish_routes_to_msg_did_publish() {
+        let spec = "https://trusttasks.org/spec/did-management/did/publish/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_DID_PUBLISH));
+        assert_eq!(canonicalize(spec), Some(spec));
+    }
+
+    #[test]
+    fn spec_uri_delete_routes_to_msg_delete() {
+        let spec = "https://trusttasks.org/spec/did-management/did/delete/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_DELETE));
+        assert_eq!(canonicalize(spec), Some(spec));
+    }
+
+    #[test]
+    fn response_form_for_spec_returns_spec_response() {
+        assert_eq!(
+            response_form_for("https://trusttasks.org/spec/did-management/did/check-name/0.1"),
+            Some("https://trusttasks.org/spec/did-management/did/check-name/0.1#response")
+        );
+        assert_eq!(
+            response_form_for("https://trusttasks.org/spec/did-management/did/register/0.1"),
+            Some("https://trusttasks.org/spec/did-management/did/register/0.1#response")
+        );
+        assert_eq!(
+            response_form_for("https://trusttasks.org/spec/did-management/did/publish/0.1"),
+            Some("https://trusttasks.org/spec/did-management/did/publish/0.1#response")
+        );
+        assert_eq!(
+            response_form_for("https://trusttasks.org/spec/did-management/did/delete/0.1"),
+            Some("https://trusttasks.org/spec/did-management/did/delete/0.1#response")
+        );
+    }
+
+    #[test]
+    fn response_form_for_legacy_returns_none() {
+        // Legacy callers fall back to MSG_*_CONFIRM / MSG_DID_OFFER —
+        // `response_form_for` returning None signals "use the historical
+        // paired-URL response".
+        assert!(response_form_for(MSG_DID_REQUEST).is_none());
+        assert!(response_form_for(MSG_DID_REGISTER).is_none());
+        assert!(response_form_for(MSG_DID_PUBLISH).is_none());
+        assert!(response_form_for(MSG_DELETE).is_none());
+        // Old `did-hosting/did/*/1.0` canonical also falls through.
+        assert!(response_form_for("https://trusttasks.org/did-hosting/did/request/1.0").is_none());
     }
 
     #[test]
