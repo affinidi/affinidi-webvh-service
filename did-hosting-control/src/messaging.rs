@@ -52,6 +52,13 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
         .route(MSG_DID_CHANGE_OWNER, handler_fn(handle_webvh_message))?
+        // me/domains — net-new DIDComm route (Phase 2a.3) bound
+        // directly to the canonical Trust-Task spec URI; no legacy
+        // `affinidi.com/...` form exists. Shares its handler logic
+        // with the REST `GET /api/me/domains` endpoint via
+        // `fetch_me_domains_for_caller` so both transports return
+        // byte-identical payloads.
+        .route(MSG_ME_DOMAINS, handler_fn(handle_webvh_message))?
         // Wallet confirmation response (RP→wallet confirm protocol).
         // The matching outbound `confirm/1.0` is sent by the REST
         // endpoint `POST /api/confirm/request`.
@@ -546,8 +553,10 @@ pub async fn dispatch_did_op(
                 .unwrap_or("http://localhost");
             let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
 
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_INFO);
             Ok((
-                MSG_INFO.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": record.mnemonic,
                     "did_id": record.did_id,
@@ -583,7 +592,9 @@ pub async fn dispatch_did_op(
                     })
                 })
                 .collect();
-            Ok((MSG_LIST.to_string(), json!({ "dids": entries_json })))
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_LIST);
+            Ok((response_typ.to_string(), json!({ "dids": entries_json })))
         }
         MSG_DELETE => {
             let mnemonic = msg
@@ -617,14 +628,32 @@ pub async fn dispatch_did_op(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'new_owner' in body".into()))?;
             let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_DID_CHANGE_OWNER_CONFIRM);
             Ok((
-                MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": record.mnemonic,
                     "owner": record.owner,
                     "updated_at": record.updated_at,
                 }),
             ))
+        }
+        MSG_ME_DOMAINS => {
+            // Net-new DIDComm route: caller-scoped view of hosting
+            // domains. Shares its compute with the REST handler
+            // `GET /api/me/domains` via `fetch_me_domains_for_caller`
+            // so both transports return byte-identical payloads.
+            //
+            // Only the canonical `spec/did-management/me/domains/0.1`
+            // URI reaches this arm — there is no `affinidi.com/...`
+            // legacy form. The response always carries the spec
+            // `#response` URI (no legacy fallback exists, and
+            // `response_form_for` returns it deterministically).
+            let resp = crate::routes::domain::fetch_me_domains_for_caller(auth, state).await?;
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_ME_DOMAINS);
+            Ok((response_typ.to_string(), serde_json::to_value(resp)?))
         }
         other => Err(AppError::Validation(format!(
             "unknown message type: {other}"

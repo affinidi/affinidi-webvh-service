@@ -40,6 +40,16 @@ pub const MSG_DID_CHANGE_OWNER_CONFIRM: &str =
     "https://affinidi.com/webvh/1.0/did/change-owner-confirm";
 pub const MSG_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/did/problem-report";
 
+/// Dispatcher key for the `me/domains` op — the caller-scoped view of
+/// hosting domains. Net-new in DIDComm form (REST has had
+/// `GET /api/me/domains` since the multi-domain release); the value
+/// is the canonical Trust-Task spec URI itself because there is no
+/// `affinidi.com/webvh/1.0/...` legacy URI for this operation. The
+/// alias-table machinery treats this as both the "legacy" identifier
+/// (for `to_legacy` / match-arm dispatch) and the canonical inbound
+/// form.
+pub const MSG_ME_DOMAINS: &str = "https://trusttasks.org/spec/did-management/me/domains/0.1";
+
 // ---------------------------------------------------------------------------
 // Server registration (server → control plane)
 // ---------------------------------------------------------------------------
