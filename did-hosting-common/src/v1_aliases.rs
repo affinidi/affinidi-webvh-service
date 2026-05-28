@@ -33,8 +33,11 @@ use crate::did_hosting_tasks::{
     TASK_DOMAIN_ASSIGN_1_0, TASK_DOMAIN_PURGE_1_0, TASK_DOMAIN_UNASSIGN_1_0,
     TASK_SERVER_HEALTH_PING_1_0, TASK_SERVER_HEALTH_PONG_1_0, TASK_SERVER_REGISTER_1_0,
     TASK_SERVER_REGISTER_ACK_1_0, TASK_SERVER_STATS_ACK_1_0, TASK_SERVER_STATS_SYNC_1_0,
-    TASK_WEBVH_SYNC_DELETE_1_0, TASK_WEBVH_SYNC_DELETE_ACK_1_0, TASK_WEBVH_SYNC_UPDATE_1_0,
-    TASK_WEBVH_SYNC_UPDATE_ACK_1_0, TASK_WEBVH_WITNESS_CONFIRM_1_0, TASK_WEBVH_WITNESS_PUBLISH_1_0,
+    TASK_WEBVH_SYNC_DELETE_0_1, TASK_WEBVH_SYNC_DELETE_1_0, TASK_WEBVH_SYNC_DELETE_ACK_1_0,
+    TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1, TASK_WEBVH_SYNC_UPDATE_0_1, TASK_WEBVH_SYNC_UPDATE_1_0,
+    TASK_WEBVH_SYNC_UPDATE_ACK_1_0, TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1,
+    TASK_WEBVH_WITNESS_CONFIRM_1_0, TASK_WEBVH_WITNESS_PUBLISH_0_1, TASK_WEBVH_WITNESS_PUBLISH_1_0,
+    TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1,
 };
 use crate::didcomm_types::{
     MSG_AUTH_RESPONSE, MSG_AUTHENTICATE, MSG_DELETE, MSG_DELETE_CONFIRM, MSG_DID_CHANGE_OWNER,
@@ -132,8 +135,9 @@ fn alias_pairs() -> [(&'static str, &'static str); 32] {
 /// Phase 3 of the cross-repo did-management migration retires the
 /// legacy MSG_* and `did-hosting/did/*/1.0` URIs once all in-flight
 /// clients move; the spec URIs become the only form recognised.
-fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 5] {
+fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 8] {
     [
+        // did-management lifecycle (Phase 2a.1)
         (
             TASK_DID_CHECK_NAME_0_1.as_str(),
             MSG_DID_REQUEST,
@@ -161,6 +165,26 @@ fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 5] {
             TASK_DID_PROBLEM_REPORT_0_1.as_str(),
             MSG_PROBLEM_REPORT,
             TASK_DID_PROBLEM_REPORT_0_1.as_str(),
+        ),
+        // webvh-specific protocol mechanics (Phase 2a.4): witness
+        // oracle publish (owner → control plane) and cross-server log
+        // replication (control plane → registered hosting servers).
+        // Same dialect-symmetric response handling as the
+        // did-management ops above.
+        (
+            TASK_WEBVH_WITNESS_PUBLISH_0_1.as_str(),
+            MSG_WITNESS_PUBLISH,
+            TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_WEBVH_SYNC_UPDATE_0_1.as_str(),
+            MSG_SYNC_UPDATE,
+            TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_WEBVH_SYNC_DELETE_0_1.as_str(),
+            MSG_SYNC_DELETE,
+            TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1.as_str(),
         ),
     ]
 }
@@ -385,6 +409,39 @@ mod tests {
         assert_eq!(
             response_form_for("https://trusttasks.org/spec/did-management/did/delete/0.1"),
             Some("https://trusttasks.org/spec/did-management/did/delete/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_witness_publish_routes_to_msg_witness_publish() {
+        let spec = "https://trusttasks.org/spec/webvh/witness/publish/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_WITNESS_PUBLISH));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/webvh/witness/publish/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_sync_update_routes_to_msg_sync_update() {
+        let spec = "https://trusttasks.org/spec/webvh/sync/update/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_SYNC_UPDATE));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/webvh/sync/update/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_sync_delete_routes_to_msg_sync_delete() {
+        let spec = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_SYNC_DELETE));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/webvh/sync/delete/0.1#response")
         );
     }
 

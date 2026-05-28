@@ -511,8 +511,10 @@ pub async fn dispatch_did_op(
 
             server_push::notify_servers_did(state, mnemonic.to_string());
 
+            let response_typ = did_hosting_common::v1_aliases::response_form_for(msg.typ.as_str())
+                .unwrap_or(MSG_WITNESS_CONFIRM);
             Ok((
-                MSG_WITNESS_CONFIRM.to_string(),
+                response_typ.to_string(),
                 json!({
                     "mnemonic": mnemonic,
                     "witness_url": witness_url,
