@@ -76,6 +76,23 @@ pub async fn list_my_domains(
     auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<DomainListResponse>, AppError> {
+    let resp = fetch_me_domains_for_caller(&auth, &state).await?;
+    Ok(Json(resp))
+}
+
+/// Shared compute for the `me/domains` projection — `GET /api/me/domains`
+/// and the DIDComm `spec/did-management/me/domains/0.1` dispatch arm
+/// both call into this so the two transports return byte-identical
+/// payloads.
+///
+/// Semantics match the REST handler above: Admin / Service / `All`
+/// scope see every domain; scoped Owners see only what their ACL
+/// permits; `default` is the caller's `AllowedWithDefault.default`
+/// when set, else the system default.
+pub(crate) async fn fetch_me_domains_for_caller(
+    auth: &AuthClaims,
+    state: &AppState,
+) -> Result<DomainListResponse, AppError> {
     let all = domain::list_domains(&state.store).await?;
 
     // Resolve the caller's ACL entry. A missing entry shouldn't
@@ -115,7 +132,7 @@ pub async fn list_my_domains(
         count = domains.len(),
         "caller listed scoped domains"
     );
-    Ok(Json(DomainListResponse { domains, default }))
+    Ok(DomainListResponse { domains, default })
 }
 
 // ===========================================================================

@@ -22,21 +22,24 @@
 //! that drift on every workspace build.
 
 use crate::did_hosting_tasks::{
-    TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_AUTHENTICATE_RESPONSE_0_1, TASK_DID_CHANGE_OWNER_1_0,
-    TASK_DID_CHANGE_OWNER_CONFIRM_1_0, TASK_DID_CHECK_NAME_0_1, TASK_DID_CHECK_NAME_RESPONSE_0_1,
+    TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_AUTHENTICATE_RESPONSE_0_1, TASK_DID_CHANGE_OWNER_0_1,
+    TASK_DID_CHANGE_OWNER_1_0, TASK_DID_CHANGE_OWNER_CONFIRM_1_0,
+    TASK_DID_CHANGE_OWNER_RESPONSE_0_1, TASK_DID_CHECK_NAME_0_1, TASK_DID_CHECK_NAME_RESPONSE_0_1,
     TASK_DID_CONFIRM_1_0, TASK_DID_DELETE_0_1, TASK_DID_DELETE_1_0, TASK_DID_DELETE_CONFIRM_1_0,
-    TASK_DID_DELETE_RESPONSE_0_1, TASK_DID_INFO_1_0, TASK_DID_INFO_REQUEST_1_0, TASK_DID_LIST_1_0,
-    TASK_DID_LIST_REQUEST_1_0, TASK_DID_OFFER_1_0, TASK_DID_PROBLEM_REPORT_0_1,
+    TASK_DID_DELETE_RESPONSE_0_1, TASK_DID_INFO_0_1, TASK_DID_INFO_1_0, TASK_DID_INFO_REQUEST_1_0,
+    TASK_DID_INFO_RESPONSE_0_1, TASK_DID_LIST_0_1, TASK_DID_LIST_1_0, TASK_DID_LIST_REQUEST_1_0,
+    TASK_DID_LIST_RESPONSE_0_1, TASK_DID_OFFER_1_0, TASK_DID_PROBLEM_REPORT_0_1,
     TASK_DID_PROBLEM_REPORT_1_0, TASK_DID_PUBLISH_0_1, TASK_DID_PUBLISH_1_0,
     TASK_DID_PUBLISH_RESPONSE_0_1, TASK_DID_REGISTER_0_1, TASK_DID_REGISTER_1_0,
     TASK_DID_REGISTER_CONFIRM_1_0, TASK_DID_REGISTER_RESPONSE_0_1, TASK_DID_REQUEST_1_0,
     TASK_DOMAIN_ASSIGN_1_0, TASK_DOMAIN_PURGE_1_0, TASK_DOMAIN_UNASSIGN_1_0,
-    TASK_SERVER_HEALTH_PING_1_0, TASK_SERVER_HEALTH_PONG_1_0, TASK_SERVER_REGISTER_1_0,
-    TASK_SERVER_REGISTER_ACK_1_0, TASK_SERVER_STATS_ACK_1_0, TASK_SERVER_STATS_SYNC_1_0,
-    TASK_WEBVH_SYNC_DELETE_0_1, TASK_WEBVH_SYNC_DELETE_1_0, TASK_WEBVH_SYNC_DELETE_ACK_1_0,
-    TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1, TASK_WEBVH_SYNC_UPDATE_0_1, TASK_WEBVH_SYNC_UPDATE_1_0,
-    TASK_WEBVH_SYNC_UPDATE_ACK_1_0, TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1,
-    TASK_WEBVH_WITNESS_CONFIRM_1_0, TASK_WEBVH_WITNESS_PUBLISH_0_1, TASK_WEBVH_WITNESS_PUBLISH_1_0,
+    TASK_ME_DOMAINS_RESPONSE_0_1, TASK_SERVER_HEALTH_PING_1_0, TASK_SERVER_HEALTH_PONG_1_0,
+    TASK_SERVER_REGISTER_1_0, TASK_SERVER_REGISTER_ACK_1_0, TASK_SERVER_STATS_ACK_1_0,
+    TASK_SERVER_STATS_SYNC_1_0, TASK_WEBVH_SYNC_DELETE_0_1, TASK_WEBVH_SYNC_DELETE_1_0,
+    TASK_WEBVH_SYNC_DELETE_ACK_1_0, TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1,
+    TASK_WEBVH_SYNC_UPDATE_0_1, TASK_WEBVH_SYNC_UPDATE_1_0, TASK_WEBVH_SYNC_UPDATE_ACK_1_0,
+    TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1, TASK_WEBVH_WITNESS_CONFIRM_1_0,
+    TASK_WEBVH_WITNESS_PUBLISH_0_1, TASK_WEBVH_WITNESS_PUBLISH_1_0,
     TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1,
 };
 use crate::didcomm_types::{
@@ -44,9 +47,10 @@ use crate::didcomm_types::{
     MSG_DID_CHANGE_OWNER_CONFIRM, MSG_DID_CONFIRM, MSG_DID_OFFER, MSG_DID_PUBLISH,
     MSG_DID_REGISTER, MSG_DID_REGISTER_CONFIRM, MSG_DID_REQUEST, MSG_DOMAIN_ASSIGN,
     MSG_DOMAIN_PURGE, MSG_DOMAIN_UNASSIGN, MSG_HEALTH_PING, MSG_HEALTH_PONG, MSG_INFO,
-    MSG_INFO_REQUEST, MSG_LIST, MSG_LIST_REQUEST, MSG_PROBLEM_REPORT, MSG_SERVER_REGISTER,
-    MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC, MSG_SYNC_DELETE, MSG_SYNC_DELETE_ACK,
-    MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK, MSG_WITNESS_CONFIRM, MSG_WITNESS_PUBLISH,
+    MSG_INFO_REQUEST, MSG_LIST, MSG_LIST_REQUEST, MSG_ME_DOMAINS, MSG_PROBLEM_REPORT,
+    MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC, MSG_SYNC_DELETE,
+    MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK, MSG_WITNESS_CONFIRM,
+    MSG_WITNESS_PUBLISH,
 };
 
 /// `(legacy MSG_* string, canonical Trust-Task URL)` pairs.
@@ -135,7 +139,7 @@ fn alias_pairs() -> [(&'static str, &'static str); 32] {
 /// Phase 3 of the cross-repo did-management migration retires the
 /// legacy MSG_* and `did-hosting/did/*/1.0` URIs once all in-flight
 /// clients move; the spec URIs become the only form recognised.
-fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 8] {
+fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 12] {
     [
         // did-management lifecycle (Phase 2a.1)
         (
@@ -185,6 +189,40 @@ fn spec_alias_rows() -> [(&'static str, &'static str, &'static str); 8] {
             TASK_WEBVH_SYNC_DELETE_0_1.as_str(),
             MSG_SYNC_DELETE,
             TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1.as_str(),
+        ),
+        // Phase 2a.2 — info / list / change-owner spec aliases. Each
+        // routes the spec URI inbound to the existing MSG_INFO_REQUEST
+        // / MSG_LIST_REQUEST / MSG_DID_CHANGE_OWNER handler; the
+        // dispatcher picks the response form via `response_form_for`
+        // so legacy senders still get MSG_INFO / MSG_LIST /
+        // MSG_DID_CHANGE_OWNER_CONFIRM and spec senders get the
+        // `#response` URI.
+        (
+            TASK_DID_INFO_0_1.as_str(),
+            MSG_INFO_REQUEST,
+            TASK_DID_INFO_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_DID_LIST_0_1.as_str(),
+            MSG_LIST_REQUEST,
+            TASK_DID_LIST_RESPONSE_0_1.as_str(),
+        ),
+        (
+            TASK_DID_CHANGE_OWNER_0_1.as_str(),
+            MSG_DID_CHANGE_OWNER,
+            TASK_DID_CHANGE_OWNER_RESPONSE_0_1.as_str(),
+        ),
+        // Phase 2a.3 — `me/domains` DIDComm dispatch. Net-new in
+        // DIDComm form (REST has had `GET /api/me/domains` since the
+        // multi-domain release); MSG_ME_DOMAINS holds the same value
+        // as the spec URI because no `affinidi.com/webvh/1.0/...`
+        // legacy URI exists for this op. The dispatcher's `MSG_ME_DOMAINS`
+        // match arm consults `fetch_me_domains_for_caller` so REST
+        // and DIDComm return byte-identical payloads.
+        (
+            MSG_ME_DOMAINS,
+            MSG_ME_DOMAINS,
+            TASK_ME_DOMAINS_RESPONSE_0_1.as_str(),
         ),
     ]
 }
@@ -271,10 +309,10 @@ mod tests {
         MSG_DID_CHANGE_OWNER_CONFIRM, MSG_DID_CONFIRM, MSG_DID_OFFER, MSG_DID_PUBLISH,
         MSG_DID_REGISTER, MSG_DID_REGISTER_CONFIRM, MSG_DID_REQUEST, MSG_DOMAIN_ASSIGN,
         MSG_DOMAIN_PURGE, MSG_DOMAIN_UNASSIGN, MSG_HEALTH_PING, MSG_HEALTH_PONG, MSG_INFO,
-        MSG_INFO_REQUEST, MSG_LIST, MSG_LIST_REQUEST, MSG_PROBLEM_REPORT, MSG_SERVER_REGISTER,
-        MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC, MSG_SYNC_DELETE,
-        MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK, MSG_WITNESS_CONFIRM,
-        MSG_WITNESS_PUBLISH,
+        MSG_INFO_REQUEST, MSG_LIST, MSG_LIST_REQUEST, MSG_ME_DOMAINS, MSG_PROBLEM_REPORT,
+        MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
+        MSG_SYNC_DELETE, MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK,
+        MSG_WITNESS_CONFIRM, MSG_WITNESS_PUBLISH,
     };
 
     #[test]
@@ -358,6 +396,7 @@ mod tests {
             MSG_DOMAIN_ASSIGN,
             MSG_DOMAIN_UNASSIGN,
             MSG_DOMAIN_PURGE,
+            MSG_ME_DOMAINS,
         ];
         for m in msgs {
             assert!(canonicalize(m).is_some(), "MSG_* `{m}` has no alias entry");
@@ -409,6 +448,56 @@ mod tests {
         assert_eq!(
             response_form_for("https://trusttasks.org/spec/did-management/did/delete/0.1"),
             Some("https://trusttasks.org/spec/did-management/did/delete/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_info_routes_to_msg_info_request() {
+        let spec = "https://trusttasks.org/spec/did-management/did/info/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_INFO_REQUEST));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/did-management/did/info/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_list_routes_to_msg_list_request() {
+        let spec = "https://trusttasks.org/spec/did-management/did/list/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_LIST_REQUEST));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/did-management/did/list/0.1#response")
+        );
+    }
+
+    #[test]
+    fn spec_uri_change_owner_routes_to_msg_did_change_owner() {
+        let spec = "https://trusttasks.org/spec/did-management/did/change-owner/0.1";
+        assert_eq!(to_legacy(spec), Some(MSG_DID_CHANGE_OWNER));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/did-management/did/change-owner/0.1#response")
+        );
+    }
+
+    /// `me/domains` is net-new in DIDComm form — both `to_legacy` and
+    /// `canonicalize` return the spec URI itself (== `MSG_ME_DOMAINS`)
+    /// because there is no `affinidi.com/...` legacy form. The
+    /// dispatcher's `MSG_ME_DOMAINS` match arm therefore fires for
+    /// the canonical inbound URI.
+    #[test]
+    fn spec_uri_me_domains_routes_to_msg_me_domains() {
+        let spec = "https://trusttasks.org/spec/did-management/me/domains/0.1";
+        assert_eq!(spec, MSG_ME_DOMAINS);
+        assert_eq!(to_legacy(spec), Some(MSG_ME_DOMAINS));
+        assert_eq!(canonicalize(spec), Some(spec));
+        assert_eq!(
+            response_form_for(spec),
+            Some("https://trusttasks.org/spec/did-management/me/domains/0.1#response")
         );
     }
 

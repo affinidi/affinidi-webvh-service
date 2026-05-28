@@ -3,7 +3,7 @@ mod auth;
 pub mod confirm;
 mod did_manage;
 mod didcomm;
-mod domain;
+pub(crate) mod domain;
 pub mod health;
 mod passkey;
 mod proxy;

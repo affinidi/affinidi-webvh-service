@@ -234,6 +234,43 @@ pub static TASK_DID_PROBLEM_REPORT_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
         .expect("static")
 });
 
+pub static TASK_DID_INFO_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/info/0.1").expect("static")
+});
+
+pub static TASK_DID_INFO_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/info/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_LIST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/list/0.1").expect("static")
+});
+
+pub static TASK_DID_LIST_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/list/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_DID_CHANGE_OWNER_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/change-owner/0.1")
+        .expect("static")
+});
+
+pub static TASK_DID_CHANGE_OWNER_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/change-owner/0.1#response")
+        .expect("static")
+});
+
+pub static TASK_ME_DOMAINS_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/me/domains/0.1").expect("static")
+});
+
+pub static TASK_ME_DOMAINS_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/me/domains/0.1#response")
+        .expect("static")
+});
+
 // -- Hosting infrastructure (server registration, health, stats) ------------
 
 pub static TASK_SERVER_REGISTER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
@@ -519,6 +556,14 @@ mod tests {
             &TASK_DID_DELETE_0_1,
             &TASK_DID_DELETE_RESPONSE_0_1,
             &TASK_DID_PROBLEM_REPORT_0_1,
+            &TASK_DID_INFO_0_1,
+            &TASK_DID_INFO_RESPONSE_0_1,
+            &TASK_DID_LIST_0_1,
+            &TASK_DID_LIST_RESPONSE_0_1,
+            &TASK_DID_CHANGE_OWNER_0_1,
+            &TASK_DID_CHANGE_OWNER_RESPONSE_0_1,
+            &TASK_ME_DOMAINS_0_1,
+            &TASK_ME_DOMAINS_RESPONSE_0_1,
             &TASK_SERVER_REGISTER_1_0,
             &TASK_SERVER_REGISTER_ACK_1_0,
             &TASK_SERVER_HEALTH_PING_1_0,
