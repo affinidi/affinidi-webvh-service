@@ -13,9 +13,14 @@ publish.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "ui", "passkey", "did-methods"]
+default = ["keyring", "store-fjall", "ui", "did-methods"]
 ui = ["did-hosting-control/ui"]
-passkey = ["did-hosting-control/passkey", "did-hosting-common/passkey"]
+# NOTE: passkey/WebAuthn is always compiled in — it arrives unconditionally
+# through the `did-hosting-control` dependency (which enables
+# `did-hosting-common/passkey` and links `webauthn-rs` non-optionally), and
+# the daemon calls `passkey::build_webauthn` without a cfg gate. There is
+# intentionally no `passkey` feature to toggle; the runtime switch is the
+# `public_url` config (WebAuthn is only initialised when it is set).
 # DID methods enabled for resolution. Default-on because a daemon without
 # any method registered silently returns 404 from `/.well-known/did.jsonl`
 # — the resolve-side route and dispatcher are both `#[cfg]`-gated. Opt out

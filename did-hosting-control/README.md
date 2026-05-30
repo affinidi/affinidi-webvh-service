@@ -191,10 +191,12 @@ The UI provides:
 
 ### Passkey Authentication
 
-When built with the `passkey` feature and a `public_url` is
-configured, the control plane supports WebAuthn passkey
-enrollment and login. This provides browser-based passwordless
-authentication alongside DIDComm challenge-response auth.
+Passkey/WebAuthn support is always compiled into the control plane.
+It is activated at runtime when a `public_url` is configured: the
+control plane then supports WebAuthn passkey enrollment and login,
+providing browser-based passwordless authentication alongside DIDComm
+challenge-response auth. Without a `public_url`, WebAuthn is not
+initialised and authentication falls back to DID challenge-response.
 
 ### Reverse Proxy
 
