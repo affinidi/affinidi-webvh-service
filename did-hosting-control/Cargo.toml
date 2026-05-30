@@ -37,7 +37,13 @@ store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
-passkey = ["did-hosting-common/passkey"]
+# NOTE: passkey/WebAuthn is always compiled into the control plane — it is
+# enabled unconditionally via the `did-hosting-common` dependency below
+# (`features = [... "passkey" ...]`) and `webauthn-rs` is a non-optional
+# dependency. There is intentionally no `passkey` feature here: the routes,
+# AppState, and `build_webauthn` are wired without any cfg gate. The real
+# on/off switch is runtime config — WebAuthn is only initialised when
+# `public_url` is set; otherwise DID challenge/response auth is used.
 
 [lib]
 name = "did_hosting_control"

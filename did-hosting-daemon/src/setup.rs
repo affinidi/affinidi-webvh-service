@@ -114,18 +114,21 @@ pub async fn run_wizard(
     // 1. Enabled services
     let (enable, mut features) = prompt_enable_and_features()?;
 
-    // 2. Public URL + derived DID path
+    // 2. Public URL + DID path. `public_url` is the bare origin (WebAuthn
+    //    RP, domain seed, config). The DID path is prompted separately and
+    //    folded back into the hosting URL handed to the VTA, so the minted
+    //    DID, the local store import, and resolution all agree on the path.
     eprintln!();
     eprintln!("  The public URL is where the daemon is reachable. The embedded");
-    eprintln!("  server hosts DID documents under this URL; the DID path is");
-    eprintln!("  derived from the URL's path component (`.well-known` when");
-    eprintln!("  there is no path).");
+    eprintln!("  server hosts the daemon's DID document at");
+    eprintln!("  <public-url>/<did-path>/did.jsonl.");
     eprintln!();
-    let public_url: String = Input::new()
+    let entered_url: String = Input::new()
         .with_prompt("Public URL (e.g. https://webvh.example.com)")
         .interact_text()?;
-    let public_url = public_url.trim_end_matches('/').to_string();
-    let did_path = derive_did_path(&public_url);
+    let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
+    let did_path = prompt_did_path(&default_did_path)?;
+    let hosting_url = hosting_url_for(&public_url, &did_path);
 
     // 3. VTA DID + context, then provision via ephemeral did:key.
     //    Headless phase 2 supplies a pre-loaded setup key, in which case
@@ -139,7 +142,7 @@ pub async fn run_wizard(
     // it can drive the VTA template choice (did-hosting-control with mediator,
     // did-hosting-daemon without). DIDComm is enabled iff a mediator was set.
     let (outcome, mediator_did) =
-        run_online_provision(&public_url, messages, preloaded_setup_key).await?;
+        run_online_provision(&hosting_url, messages, preloaded_setup_key).await?;
     features.didcomm = mediator_did.is_some();
 
     // 5. Host / port / log / data
@@ -332,7 +335,7 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), Box<dy
 ///    `did-hosting-daemon` (HTTP-only).
 /// 5. Drive `vta_sdk::provision_client::run_provision`.
 async fn run_online_provision(
-    public_url: &str,
+    hosting_url: &str,
     messages: Arc<dyn OperatorMessages>,
     preloaded_setup_key: Option<EphemeralSetupKey>,
 ) -> Result<(vta_setup::OnlineProvisionOutcome, Option<String>), Box<dyn std::error::Error>> {
@@ -382,29 +385,35 @@ async fn run_online_provision(
     };
 
     eprintln!();
+    // When the VTA advertises a mediator there are three genuine choices
+    // (use it / enter a different one / none), so a Select earns its keep.
+    // When it doesn't, a single "leave empty to skip" prompt suffices —
+    // no point asking *whether* before asking *which*.
     let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
-    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
-    if let Some(ref did) = vta_mediator {
-        mediator_options.push(format!("Use VTA's mediator ({did})"));
-    }
-    mediator_options.push("Enter a custom mediator DID".into());
-    let mediator_idx = Select::new()
-        .with_prompt("DIDComm mediator")
-        .items(&mediator_options)
-        .default(if vta_mediator.is_some() { 1 } else { 0 })
-        .interact()?;
-    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
-        None
-    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
-        vta_mediator.clone()
-    } else {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
-        if did.is_empty() { None } else { Some(did) }
+    let mediator_did = match vta_mediator {
+        Some(vm) => {
+            let options = [
+                format!("Use VTA's mediator ({vm})"),
+                "Enter a different mediator DID".to_string(),
+                "No mediator".to_string(),
+            ];
+            let idx = Select::new()
+                .with_prompt("DIDComm mediator")
+                .items(&options)
+                .default(0)
+                .interact()?;
+            match idx {
+                0 => Some(vm),
+                1 => prompt_mediator_did()?,
+                _ => None,
+            }
+        }
+        None => prompt_mediator_did()?,
     };
 
     let ask = match mediator_did.as_deref() {
-        Some(med) => ProvisionAsk::webvh_control(&context_id, public_url, med),
-        None => ProvisionAsk::webvh_daemon(&context_id, public_url),
+        Some(med) => ProvisionAsk::webvh_control(&context_id, hosting_url, med),
+        None => ProvisionAsk::webvh_daemon(&context_id, hosting_url),
     }
     .with_label(format!("did-hosting-daemon setup — {context_id}"));
 
@@ -474,19 +483,20 @@ async fn run_self_managed_setup(
     // 1. Enabled services + features.
     let (enable, features) = prompt_enable_and_features()?;
 
-    // 2. Public URL (drives the did:webvh identifier).
+    // 2. Public URL + DID path (drive the did:webvh identifier).
+    //    `public_url` is the bare origin; the DID path is prompted
+    //    separately. Self-managed builds the DID document locally from
+    //    (host, did_path), so the path is used directly — no URL folding.
     eprintln!();
     eprintln!("  The public URL is where the daemon is reachable. The daemon");
-    eprintln!("  hosts its own DID document under this URL; the DID path is");
-    eprintln!("  derived from the URL's path component (`.well-known` when");
-    eprintln!("  there is no path).");
+    eprintln!("  hosts its own DID document at <public-url>/<did-path>/did.jsonl.");
     eprintln!();
-    let public_url: String = Input::new()
+    let entered_url: String = Input::new()
         .with_prompt("Public URL (e.g. https://webvh.example.com)")
         .interact_text()?;
-    let public_url = public_url.trim_end_matches('/').to_string();
+    let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     warn_if_insecure_public_url(&public_url);
-    let did_path = derive_did_path(&public_url);
+    let did_path = prompt_did_path(&default_did_path)?;
 
     // 3. Mediator. Optional in name, but skipping it means the daemon's DID
     //    document will not advertise a DIDCommMessaging service — and the
@@ -501,38 +511,29 @@ async fn run_self_managed_setup(
     eprintln!("    - be registered as a DID hosting server with a VTA");
     eprintln!("      (`vta webvh add-server` requires a DIDCommMessaging endpoint).");
     eprintln!();
-    // Confirm-then-Input avoids dialoguer's wrapped-line re-render bug
-    // where long DIDs entered into a single Input with `.default("")`
-    // re-render on a new visual line after Enter, looking like two prompts.
-    let want_mediator = Confirm::new()
-        .with_prompt("Configure a DIDComm mediator?")
-        .default(true)
-        .interact()?;
-    let mediator_did = if want_mediator {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
-        let trimmed = did.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    } else {
-        eprintln!();
-        eprintln!("  No mediator configured. Without a mediator, the generated DID");
-        eprintln!("  document will not include a DIDCommMessaging service. This");
-        eprintln!("  daemon will not be usable as a VTA hosting server, and external");
-        eprintln!("  VTAs will not be able to send DIDComm messages to it.");
-        eprintln!();
-        let proceed = Confirm::new()
-            .with_prompt("Continue without a mediator?")
-            .default(false)
-            .interact()?;
-        if !proceed {
+    // A single "leave empty to skip" prompt — no separate yes/no first.
+    // An empty answer triggers an explicit warn-and-confirm since a
+    // mediator-less DID document can't be registered with a VTA.
+    let mediator_did = match prompt_mediator_did()? {
+        Some(did) => Some(did),
+        None => {
             eprintln!();
-            eprintln!("  Setup cancelled. Re-run and supply a mediator DID when prompted.");
-            return Ok(());
+            eprintln!("  No mediator configured. Without a mediator, the generated DID");
+            eprintln!("  document will not include a DIDCommMessaging service. This");
+            eprintln!("  daemon will not be usable as a VTA hosting server, and external");
+            eprintln!("  VTAs will not be able to send DIDComm messages to it.");
+            eprintln!();
+            let proceed = Confirm::new()
+                .with_prompt("Continue without a mediator?")
+                .default(false)
+                .interact()?;
+            if !proceed {
+                eprintln!();
+                eprintln!("  Setup cancelled. Re-run and supply a mediator DID when prompted.");
+                return Ok(());
+            }
+            None
         }
-        None
     };
 
     // 4. Host / port / log / data dir.
@@ -765,11 +766,15 @@ pub async fn run_setup_offline_prepare(
 
     let (enable, mut features) = prompt_enable_and_features()?;
 
-    let public_url: String = Input::new()
+    // `public_url` is the bare origin; the DID path is prompted separately
+    // and folded into the hosting URL embedded in the bootstrap request, so
+    // the VTA-minted DID and the phase-2 local import agree on the path.
+    let entered_url: String = Input::new()
         .with_prompt("Public URL (e.g. https://webvh.example.com)")
         .interact_text()?;
-    let public_url = public_url.trim_end_matches('/').to_string();
-    let did_path = derive_did_path(&public_url);
+    let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
+    let did_path = prompt_did_path(&default_did_path)?;
+    let hosting_url = hosting_url_for(&public_url, &did_path);
 
     eprintln!();
     eprintln!("  VTA context the integration will live in. Embedded in the");
@@ -784,24 +789,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator.");
     eprintln!();
-    // Confirm-then-Input avoids dialoguer's wrapped-line re-render bug:
-    // long DIDs entered into a single Input with `.default("")` re-render
-    // on a new visual line after Enter, looking like two prompts.
-    let want_mediator = Confirm::new()
-        .with_prompt("Configure a DIDComm mediator?")
-        .default(true)
-        .interact()?;
-    let mediator_did = if want_mediator {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
-        let trimmed = did.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    } else {
-        None
-    };
+    let mediator_did = prompt_mediator_did()?;
     features.didcomm = mediator_did.is_some();
 
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
@@ -835,9 +823,9 @@ pub async fn run_setup_offline_prepare(
     let (template_name, template_vars): (&str, Vec<(&str, &str)>) = match mediator_did.as_deref() {
         Some(med) => (
             "did-hosting-control",
-            vec![("URL", public_url.as_str()), ("MEDIATOR_DID", med)],
+            vec![("URL", hosting_url.as_str()), ("MEDIATOR_DID", med)],
         ),
-        None => ("did-hosting-daemon", vec![("URL", public_url.as_str())]),
+        None => ("did-hosting-daemon", vec![("URL", hosting_url.as_str())]),
     };
     let info = vta_setup::write_offline_bootstrap_request(
         &request_out,
@@ -1108,20 +1096,89 @@ fn prompt_admin_choice() -> Result<AdminChoice, Box<dyn std::error::Error>> {
     })
 }
 
-fn derive_did_path(public_url: &str) -> String {
-    let after_scheme = public_url
-        .find("://")
-        .map(|i| &public_url[i + 3..])
-        .unwrap_or(public_url);
-    let path = after_scheme
-        .find('/')
-        .map(|i| after_scheme[i..].trim_matches('/'))
-        .unwrap_or("");
-    if path.is_empty() {
+/// Split an operator-entered URL into its origin (`scheme://host[:port]`,
+/// trailing slash stripped) and the DID path encoded in its path
+/// component. An empty path maps to `.well-known`, the webvh root.
+///
+/// The origin becomes `config.public_url` (WebAuthn RP origin, first-boot
+/// domain seed, and the host component of the daemon's own DID); the DID
+/// path is the sub-path the daemon publishes its DID under. Folding the
+/// path back in via [`hosting_url_for`] round-trips:
+/// `split_origin_and_did_path(hosting_url_for(o, p)) == (o, p)`.
+fn split_origin_and_did_path(public_url: &str) -> (String, String) {
+    let trimmed = public_url.trim_end_matches('/');
+    let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
+    match trimmed[scheme_end..].find('/') {
+        Some(rel) => {
+            let at = scheme_end + rel;
+            let path = trimmed[at..].trim_matches('/');
+            let did_path = if path.is_empty() {
+                ".well-known".to_string()
+            } else {
+                path.to_string()
+            };
+            (trimmed[..at].to_string(), did_path)
+        }
+        None => (trimmed.to_string(), ".well-known".to_string()),
+    }
+}
+
+/// Fold a DID path back into the hosting origin so the VTA mints the DID
+/// at the matching web location (the VTA derives the DID's path segment
+/// from this URL, and the local import path must match). `.well-known`
+/// is the webvh root and carries no path segment, so the origin is
+/// returned unchanged.
+fn hosting_url_for(origin: &str, did_path: &str) -> String {
+    if did_path == ".well-known" {
+        origin.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            origin.trim_end_matches('/'),
+            did_path.trim_matches('/')
+        )
+    }
+}
+
+/// Prompt for the DID path the daemon publishes its own DID under,
+/// defaulting to `default` (the path component of the public URL, or
+/// `.well-known` when it has none). An empty entry normalises back to
+/// `.well-known`.
+fn prompt_did_path(default: &str) -> Result<String, Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  The DID path is where the daemon publishes its own DID document,");
+    eprintln!("  served at <public-url>/<did-path>/did.jsonl. Use `.well-known` for");
+    eprintln!("  the host's root DID, or a sub-path such as `dids/daemon`.");
+    eprintln!();
+    let did_path: String = Input::new()
+        .with_prompt("DID path on the server")
+        .default(default.to_string())
+        .interact_text()?;
+    let trimmed = did_path.trim().trim_matches('/');
+    Ok(if trimmed.is_empty() {
         ".well-known".to_string()
     } else {
-        path.to_string()
-    }
+        trimmed.to_string()
+    })
+}
+
+/// Single-prompt mediator entry shared by every setup flow. Returns
+/// `None` when the operator leaves it blank. Using `allow_empty` rather
+/// than a `.default("")` avoids dialoguer's wrapped-line re-render of
+/// long DIDs — the artifact that previously forced a two-step
+/// Confirm-then-Input and made the wizard look like it asked for the
+/// mediator twice.
+fn prompt_mediator_did() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let did: String = Input::new()
+        .with_prompt("Mediator DID (leave empty to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let trimmed = did.trim();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    })
 }
 
 /// Everything common to the online + offline finalisation: write
@@ -1200,4 +1257,86 @@ async fn finalize_daemon_setup(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hosting_url_for, split_origin_and_did_path};
+
+    #[test]
+    fn bare_origin_maps_to_well_known_root() {
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com"),
+            (
+                "https://webvh.example.com".to_string(),
+                ".well-known".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn trailing_slash_is_stripped() {
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com/"),
+            (
+                "https://webvh.example.com".to_string(),
+                ".well-known".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn path_component_becomes_did_path() {
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com/dids/daemon"),
+            (
+                "https://webvh.example.com".to_string(),
+                "dids/daemon".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn port_is_preserved_in_origin() {
+        assert_eq!(
+            split_origin_and_did_path("http://localhost:8534/svc"),
+            ("http://localhost:8534".to_string(), "svc".to_string())
+        );
+    }
+
+    #[test]
+    fn well_known_is_not_folded_into_url() {
+        // The webvh root carries no path segment.
+        assert_eq!(
+            hosting_url_for("https://webvh.example.com", ".well-known"),
+            "https://webvh.example.com"
+        );
+    }
+
+    #[test]
+    fn custom_path_is_folded_into_url() {
+        assert_eq!(
+            hosting_url_for("https://webvh.example.com", "dids/daemon"),
+            "https://webvh.example.com/dids/daemon"
+        );
+    }
+
+    #[test]
+    fn fold_then_split_round_trips() {
+        // The contract VTA-mode correctness depends on: the path folded
+        // into the URL (handed to the VTA) is exactly the path derived
+        // back out for the local store import.
+        for (origin, did_path) in [
+            ("https://webvh.example.com", ".well-known"),
+            ("https://webvh.example.com", "dids/daemon"),
+            ("http://localhost:8534", "svc"),
+        ] {
+            let url = hosting_url_for(origin, did_path);
+            assert_eq!(
+                split_origin_and_did_path(&url),
+                (origin.to_string(), did_path.to_string()),
+                "round-trip failed for {origin} + {did_path}"
+            );
+        }
+    }
 }

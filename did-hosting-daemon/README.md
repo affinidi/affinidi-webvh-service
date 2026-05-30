@@ -281,12 +281,15 @@ Features propagate to the underlying service crates:
 | Feature | Description |
 | ------- | ----------- |
 | `ui` | Embed the management UI in did-hosting-control |
-| `passkey` | Enable WebAuthn passkey auth in did-hosting-control |
 | `keyring` | OS keyring secrets backend |
 | `store-fjall` | Fjall embedded storage backend |
 | `did-methods` | Enable did:webvh + did:web resolution (route + dispatcher) |
 
-Default features: `keyring`, `store-fjall`, `ui`, `passkey`, `did-methods`.
+Default features: `keyring`, `store-fjall`, `ui`, `did-methods`.
+
+Passkey/WebAuthn auth is always compiled in (via the embedded control
+plane) and is not a build feature. It activates at runtime when
+`public_url` is set; otherwise login uses DID challenge-response.
 
 ## Support & feedback
 

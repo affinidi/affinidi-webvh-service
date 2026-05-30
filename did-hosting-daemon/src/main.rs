@@ -1889,7 +1889,6 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
     health::print_feature("store-fjall", cfg!(feature = "store-fjall"));
     health::print_feature("keyring", cfg!(feature = "keyring"));
     health::print_feature("ui", cfg!(feature = "ui"));
-    health::print_feature("passkey", cfg!(feature = "passkey"));
 
     let config = match config {
         Some(c) => c,

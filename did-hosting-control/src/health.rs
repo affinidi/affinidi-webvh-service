@@ -39,7 +39,6 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
     health::print_feature("aws-secrets", cfg!(feature = "aws-secrets"));
     health::print_feature("gcp-secrets", cfg!(feature = "gcp-secrets"));
     health::print_feature("ui", cfg!(feature = "ui"));
-    health::print_feature("passkey", cfg!(feature = "passkey"));
 
     let config = match config {
         Some(c) => c,
