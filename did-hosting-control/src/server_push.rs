@@ -363,7 +363,7 @@ pub async fn send_domain_upsert(
 /// applies the change to its local DomainEntry copy + grace timer.
 ///
 /// Enqueues one outbox entry per server; the worker handles delivery
-/// + retry. A registry-list failure is logged + skipped — there are
+/// and retry. A registry-list failure is logged and skipped — there are
 /// no rows to enqueue against. Returns `(enqueued, skipped)` for the
 /// caller's log line; `enqueued` is the number of outbox rows
 /// committed, NOT the number of servers that have acked.

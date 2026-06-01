@@ -12,8 +12,8 @@
 //! - **DID-mnemonic register / change-owner** (`did-hosting-control`)
 //!   — read existing record, build new record, commit batch.
 //! - **Trust Tasks ACL writes** (`server::trust_tasks` handlers
-//!   `grant` / `change-role` / `revoke`) — read entry + check policy
-//!   + commit. The race that motivated lifting this here: two
+//!   `grant` / `change-role` / `revoke`) — read entry, check policy,
+//!   commit. The race that motivated lifting this here: two
 //!   concurrent `acl/revoke` requests targeting the two remaining
 //!   Admin entries could each pass the last-authority guard (each
 //!   sees the *other* still present) and both commit, leaving the

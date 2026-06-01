@@ -338,6 +338,11 @@ pub async fn finalize_challenge_session(
 /// reads the pre-rotation session's amr/acr and passes
 /// `Some((..., ...))` so the new session row + JWT carry the same
 /// values.
+// Eight cohesive parameters shared by the DIDComm and passkey auth
+// flows; grouping them into a struct would add churn at every call
+// site for no clarity gain. (clippy::too_many_arguments is default-deny
+// as of clippy 1.96.)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_authenticated_session(
     sessions: &KeyspaceHandle,
     jwt_keys: &JwtKeys,

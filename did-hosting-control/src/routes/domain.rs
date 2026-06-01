@@ -410,7 +410,7 @@ pub async fn delete_domain_route(
                     .into(),
             )
         })
-        .and_then(|c| normalize_domain_name(c).map_err(Into::into))?;
+        .and_then(normalize_domain_name)?;
     if confirm != canonical {
         return Err(AppError::Validation(format!(
             "confirm '{confirm}' does not match path '{canonical}'"
