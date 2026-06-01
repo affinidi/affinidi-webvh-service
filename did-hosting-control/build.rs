@@ -44,6 +44,11 @@ fn main() {
 const MIN_NODE_MAJOR: u32 = 20;
 
 #[cfg(feature = "ui")]
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+#[cfg(feature = "ui")]
 fn build_ui() {
     check_node_version();
 
@@ -85,8 +90,25 @@ fn build_ui() {
         return;
     }
 
-    // Install deps if needed
-    if !ui_dir.join("node_modules").exists() {
+    // Install deps when `node_modules` is missing OR out of sync with the
+    // lockfile. npm writes `node_modules/.package-lock.json` on a successful
+    // install; if the committed `package-lock.json` is newer (e.g. a
+    // dependency bump just landed via `git pull`), the existing tree is stale
+    // and must be resynced before building — otherwise `expo export` runs
+    // against the old packages. Installing only on a missing `node_modules`
+    // silently used stale deps despite the `rerun-if-changed` on the lockfile.
+    let node_modules = ui_dir.join("node_modules");
+    let needs_install = !node_modules.exists()
+        || match (
+            mtime(&ui_dir.join("package-lock.json")),
+            mtime(&node_modules.join(".package-lock.json")),
+        ) {
+            (Some(lock), Some(installed)) => lock > installed,
+            // No install marker (older npm) but node_modules exists: assume
+            // in sync rather than reinstalling on every build.
+            _ => false,
+        };
+    if needs_install {
         run_npm(ui_dir, &["install", "--prefer-offline"]);
     }
 
