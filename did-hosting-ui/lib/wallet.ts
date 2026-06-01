@@ -235,9 +235,19 @@ function extractBearer(headerValue: string): string | null {
 function decodeJwtSegment(seg: string): Record<string, unknown> {
   const pad = "=".repeat((4 - (seg.length % 4)) % 4);
   const b64 = (seg + pad).replace(/-/g, "+").replace(/_/g, "/");
-  const json = typeof atob === "function"
-    ? atob(b64)
-    : Buffer.from(b64, "base64").toString("utf8");
+  // `atob` is present in all our target runtimes (browser + Hermes); the
+  // Node `Buffer` path is a defensive fallback. Reach it through a typed
+  // `globalThis` guard rather than the ambient Node global, which isn't
+  // resolvable under this project's bundler/react-native type resolution
+  // (and we deliberately don't pull `@types/node` into a React Native app).
+  const json =
+    typeof atob === "function"
+      ? atob(b64)
+      : (
+          globalThis as unknown as {
+            Buffer: { from(s: string, enc: string): { toString(enc: string): string } };
+          }
+        ).Buffer.from(b64, "base64").toString("utf8");
   return JSON.parse(json) as Record<string, unknown>;
 }
 
