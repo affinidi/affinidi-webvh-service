@@ -115,6 +115,7 @@ vta-sdk = { version = "0.9", features = [
   "session",
   "provision-integration",
   "provision-client",
+  "client",
 ] }
 
 # Logging / tracing

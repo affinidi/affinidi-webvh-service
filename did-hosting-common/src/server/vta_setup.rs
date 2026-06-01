@@ -206,7 +206,7 @@ pub struct OnlineProvisionOutcome {
 pub async fn online_provision_setup(
     inputs: OnlineProvisionInputs,
 ) -> Result<OnlineProvisionOutcome, Box<dyn std::error::Error>> {
-    use vta_sdk::provision_client::{VtaIntent, VtaReply, run_provision};
+    use vta_sdk::provision_client::{VtaIntent, run_provision};
 
     let OnlineProvisionInputs {
         vta_did,
@@ -238,6 +238,121 @@ pub async fn online_provision_setup(
     // operator sees the final lines before our success summary.
     let _ = drain.await;
 
+    reply_to_outcome(reply, vta_did, &setup_pk_mb)
+}
+
+/// Drive the online provision-integration round-trip *honouring the
+/// operator's explicit webvh choice already baked into `ask`*.
+///
+/// The default [`online_provision_setup`] above delegates to the SDK's
+/// `run_provision`, which always auto-picks a registered webvh hosting
+/// server (server-managed mode) and refuses to guess when 2+ are
+/// registered — it gives the operator no say in *where* their DID is
+/// published. This helper replicates `run_provision`'s orchestration but
+/// deliberately bypasses that auto-pick: on the DIDComm preflight it hands
+/// `run_provision_flight` `None`/`None` for the server/path arguments so
+/// the `WEBVH_SERVER` / `WEBVH_DOMAIN` / `WEBVH_PATH` vars already present
+/// in `ask` flow through verbatim. That makes an explicit server choice —
+/// or an explicit *serverless* choice — work on both transports.
+///
+/// The REST path needs no special handling: its one-shot attempt already
+/// forwards the ask's vars unchanged. Transport is auto-selected
+/// (DIDComm-first when both are advertised), matching `run_provision`'s
+/// default. Events are rendered to stderr for UX parity with
+/// [`online_provision_setup`].
+pub async fn online_provision_flight(
+    vta_did: String,
+    setup_key: vta_sdk::provision_client::EphemeralSetupKey,
+    ask: vta_sdk::provision_client::ProvisionAsk,
+    messages: std::sync::Arc<dyn vta_sdk::provision_client::OperatorMessages>,
+) -> Result<OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+    use vta_sdk::provision_client::{
+        VtaEvent, VtaIntent, run_connection_test, run_provision_flight,
+    };
+
+    let setup_did = setup_key.did.clone();
+    let setup_pk_mb = setup_key.private_key_multibase().to_string();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_connection_test(
+        VtaIntent::FullSetup,
+        vta_did.clone(),
+        setup_did.clone(),
+        setup_pk_mb.clone(),
+        ask.clone(),
+        None,
+        tx,
+    ));
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            // REST one-shot path completes here.
+            VtaEvent::Connected { reply, .. } => {
+                return reply_to_outcome(reply, vta_did, &setup_pk_mb);
+            }
+            VtaEvent::Failed(reason) => {
+                eprintln!();
+                eprintln!("  ✗ {reason}");
+                return Err(reason.into());
+            }
+            // DIDComm FullSetup: preflight done — drive the flight with the
+            // explicit choice baked into `ask` (None/None → no auto-pick).
+            VtaEvent::PreflightDone {
+                rest_url,
+                mediator_did,
+                ..
+            } => {
+                let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(run_provision_flight(
+                    vta_did.clone(),
+                    setup_did.clone(),
+                    setup_pk_mb.clone(),
+                    mediator_did,
+                    rest_url,
+                    ask.clone(),
+                    None,
+                    None,
+                    messages.clone(),
+                    ftx,
+                ));
+                while let Some(fev) = frx.recv().await {
+                    match fev {
+                        VtaEvent::Connected { reply, .. } => {
+                            return reply_to_outcome(reply, vta_did, &setup_pk_mb);
+                        }
+                        VtaEvent::Failed(reason) => {
+                            eprintln!();
+                            eprintln!("  ✗ {reason}");
+                            return Err(reason.into());
+                        }
+                        other => render_event_to_stderr(other),
+                    }
+                }
+                return Err("provisioning ended without a terminal event".into());
+            }
+            other => render_event_to_stderr(other),
+        }
+    }
+
+    Err("provisioning ended without a terminal event".into())
+}
+
+/// Flatten a successful `VtaReply` into the [`OnlineProvisionOutcome`]
+/// shape the wizard's persistence layer needs. Shared by
+/// [`online_provision_setup`] (the `run_provision`-based path) and
+/// [`online_provision_flight`] (the explicit-webvh-choice path) so both
+/// produce an identical outcome from the same reply.
+///
+/// `setup_pk_mb` is the ephemeral setup key's private half, used as the
+/// admin signing key when the VTA performed no admin rollover (the setup
+/// DID is then itself the long-term admin DID).
+fn reply_to_outcome(
+    reply: vta_sdk::provision_client::VtaReply,
+    vta_did: String,
+    setup_pk_mb: &str,
+) -> Result<OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+    use vta_sdk::provision_client::VtaReply;
+
     let result = match reply {
         VtaReply::Full(boxed) => *boxed,
         VtaReply::AdminOnly(_) => {
@@ -266,7 +381,7 @@ pub async fn online_provision_setup(
         Some(km) => km.signing_key.private_key_multibase.clone(),
         // No rollover happened: the setup DID *is* the long-term admin
         // DID. Fall back to the setup key's private half.
-        None => setup_pk_mb.clone(),
+        None => setup_pk_mb.to_string(),
     };
 
     let vta_url = result.payload.config.vta_url.clone();
@@ -317,34 +432,43 @@ pub fn build_vta_credential_b64(
 async fn drain_provision_events_to_stderr(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<vta_sdk::provision_client::VtaEvent>,
 ) {
+    while let Some(event) = rx.recv().await {
+        render_event_to_stderr(event);
+    }
+}
+
+/// Render a single `VtaEvent` as a one-line stderr update. Shared by
+/// [`drain_provision_events_to_stderr`] (the `run_provision` path, which
+/// drains every event including the terminal ones) and
+/// [`online_provision_flight`] (which handles `Connected`/`Failed` itself
+/// for control flow and forwards the rest here for UX parity).
+fn render_event_to_stderr(event: vta_sdk::provision_client::VtaEvent) {
     use vta_sdk::provision_client::{DiagStatus, VtaEvent};
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            VtaEvent::CheckStart(check) => {
-                eprintln!("  [..] {}", check.label());
-            }
-            VtaEvent::CheckDone(check, status) => match status {
-                DiagStatus::Pending | DiagStatus::Running => {}
-                DiagStatus::Ok(detail) => eprintln!("  [OK] {}  {detail}", check.label()),
-                DiagStatus::Skipped(detail) => eprintln!("  [--] {}  {detail}", check.label()),
-                DiagStatus::Failed(detail) => eprintln!("  [!!] {}  {detail}", check.label()),
-            },
-            VtaEvent::Resolved(_)
-            | VtaEvent::AttemptCompleted { .. }
-            | VtaEvent::PreflightDone { .. } => {
-                // These are inputs to interactive UIs (recovery prompts,
-                // did-hosting-server pickers) that the non-TUI wizards don't
-                // surface. The runner uses 0/1-server auto-pick anyway.
-            }
-            VtaEvent::Connected { protocol, .. } => {
-                eprintln!();
-                eprintln!("  Connected via {}", protocol.label());
-            }
-            VtaEvent::Failed(reason) => {
-                eprintln!();
-                eprintln!("  ✗ {reason}");
-            }
+    match event {
+        VtaEvent::CheckStart(check) => {
+            eprintln!("  [..] {}", check.label());
+        }
+        VtaEvent::CheckDone(check, status) => match status {
+            DiagStatus::Pending | DiagStatus::Running => {}
+            DiagStatus::Ok(detail) => eprintln!("  [OK] {}  {detail}", check.label()),
+            DiagStatus::Skipped(detail) => eprintln!("  [--] {}  {detail}", check.label()),
+            DiagStatus::Failed(detail) => eprintln!("  [!!] {}  {detail}", check.label()),
+        },
+        VtaEvent::Resolved(_)
+        | VtaEvent::AttemptCompleted { .. }
+        | VtaEvent::PreflightDone { .. } => {
+            // These are inputs to interactive UIs (recovery prompts,
+            // did-hosting-server pickers) that the non-TUI wizards don't
+            // surface. The runner uses 0/1-server auto-pick anyway.
+        }
+        VtaEvent::Connected { protocol, .. } => {
+            eprintln!();
+            eprintln!("  Connected via {}", protocol.label());
+        }
+        VtaEvent::Failed(reason) => {
+            eprintln!();
+            eprintln!("  ✗ {reason}");
         }
     }
 }
