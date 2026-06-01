@@ -108,11 +108,11 @@ pub async fn apply_recipe(
         recipe.identity.mediator_did.as_deref(),
     ) {
         (VtaMode::Online, Some(med)) => Some(
-            ProvisionAsk::webvh_control(&context_id, &did_hosting_url, med)
+            ProvisionAsk::did_hosting_control(&context_id, &did_hosting_url, med)
                 .with_label(format!("did-hosting-control setup — {context_id}")),
         ),
         (VtaMode::Online, None) => Some(
-            ProvisionAsk::webvh_daemon(&context_id, &did_hosting_url)
+            ProvisionAsk::did_hosting_daemon(&context_id, &did_hosting_url)
                 .with_label(format!("did-hosting-control setup — {context_id}")),
         ),
         _ => None,

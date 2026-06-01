@@ -119,7 +119,7 @@ pub async fn apply_recipe(
         .unwrap_or_else(|| "webvh".to_string());
     let ask = if recipe.deployment.vta_mode == VtaMode::Online {
         Some(
-            ProvisionAsk::webvh_daemon(&context_id, &public_url_owned)
+            ProvisionAsk::did_hosting_daemon(&context_id, &public_url_owned)
                 .with_label(format!("did-hosting-server setup — {context_id}")),
         )
     } else {

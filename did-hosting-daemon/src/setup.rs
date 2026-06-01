@@ -412,8 +412,8 @@ async fn run_online_provision(
     };
 
     let ask = match mediator_did.as_deref() {
-        Some(med) => ProvisionAsk::webvh_control(&context_id, hosting_url, med),
-        None => ProvisionAsk::webvh_daemon(&context_id, hosting_url),
+        Some(med) => ProvisionAsk::did_hosting_control(&context_id, hosting_url, med),
+        None => ProvisionAsk::did_hosting_daemon(&context_id, hosting_url),
     }
     .with_label(format!("did-hosting-daemon setup — {context_id}"));
 

@@ -115,8 +115,8 @@ pub async fn apply_recipe(
     let ask = match recipe.deployment.vta_mode {
         VtaMode::Online => Some(
             (match mediator_var {
-                Some(med) => ProvisionAsk::webvh_control(&context_id, &public_url, med),
-                None => ProvisionAsk::webvh_daemon(&context_id, &public_url),
+                Some(med) => ProvisionAsk::did_hosting_control(&context_id, &public_url, med),
+                None => ProvisionAsk::did_hosting_daemon(&context_id, &public_url),
             })
             .with_label(format!("did-hosting-daemon setup — {context_id}")),
         ),

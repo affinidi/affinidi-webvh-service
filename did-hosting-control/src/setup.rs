@@ -95,7 +95,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     };
 
     // DID hosting URL must be collected BEFORE the VTA round-trip because
-    // upstream `ProvisionAsk::webvh_control` embeds it as the
+    // upstream `ProvisionAsk::did_hosting_control` embeds it as the
     // `WebVHHosting` service endpoint in the resulting DID document.
     eprintln!();
     eprintln!("  The DID hosting URL is where your did-hosting-server serves DID documents.");
@@ -490,7 +490,7 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::webvh_control(&context_id, did_hosting_url, &mediator_did)
+    let ask = ProvisionAsk::did_hosting_control(&context_id, did_hosting_url, &mediator_did)
         .with_label(format!("did-hosting-control setup — {context_id}"));
 
     eprintln!();

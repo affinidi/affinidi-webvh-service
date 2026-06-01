@@ -117,8 +117,8 @@ pub async fn apply_recipe(
     let ask = match recipe.deployment.vta_mode {
         VtaMode::Online => Some(
             (match mediator_var {
-                Some(med) => ProvisionAsk::webvh_control(&context_id, &did_hosting_url, med),
-                None => ProvisionAsk::webvh_daemon(&context_id, &did_hosting_url),
+                Some(med) => ProvisionAsk::did_hosting_control(&context_id, &did_hosting_url, med),
+                None => ProvisionAsk::did_hosting_daemon(&context_id, &did_hosting_url),
             })
             .with_label(format!("webvh-witness setup — {context_id}")),
         ),

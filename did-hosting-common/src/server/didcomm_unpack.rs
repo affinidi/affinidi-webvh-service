@@ -150,6 +150,14 @@ pub async fn unpack_signed(
                 "message is encrypted-only; expected JWS-signed envelope".into(),
             ));
         }
+        // `UnpackResult` is `#[non_exhaustive]` as of didcomm 0.14: reject any
+        // future envelope shape we don't explicitly accept (fail closed — this
+        // is an authentication path that must only trust verified JWS signers).
+        _ => {
+            return Err(AppError::Authentication(
+                "unsupported DIDComm envelope shape; expected JWS-signed message".into(),
+            ));
+        }
     };
 
     // Signer kid is always present for Signed results; the resolver already used it.

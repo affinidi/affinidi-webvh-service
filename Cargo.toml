@@ -28,7 +28,7 @@ rust-version = "1.95.0"
 affinidi-tdk = "0.7"
 affinidi-messaging-didcomm-service = "0.3"
 affinidi-tdk-common = "0.6"
-affinidi-messaging-didcomm = "0.13"
+affinidi-messaging-didcomm = "0.14"
 affinidi-secrets-resolver = "0.5"
 
 
@@ -105,14 +105,13 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK — 0.7 on crates.io, published 2026-05-24 alongside
-# vti-common 0.7 (OpenVTC/verifiable-trust-infrastructure#113 +
-# #115). Carries the canonical SIOPv2 / RFC 6749 wire types
+# VTA SDK — 0.9 on crates.io, bumped in lockstep with vti-common 0.9.
+# Carries the canonical SIOPv2 / RFC 6749 wire types
 # (`protocols::auth::{Session, TokenBundle, AuthenticateResponse,
 # ChallengeResponse, epoch_to_rfc3339}`) that the cross-repo
-# auth-architecture work introduced. The git-pinned rev that
-# lived here through the pre-publish window is gone.
-vta-sdk = { version = "0.7", features = [
+# auth-architecture work introduced. Keep vta-sdk and vti-common
+# pinned to the same minor.
+vta-sdk = { version = "0.9", features = [
   "session",
   "provision-integration",
   "provision-client",
