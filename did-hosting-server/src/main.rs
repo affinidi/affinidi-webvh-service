@@ -521,14 +521,27 @@ async fn main() {
             public_url,
             context,
         }) => {
+            // `public_url` carries the DID path; split it back out so the
+            // shared builder folds it identically to the wizard. The server's
+            // own DID is HTTP-only (no mediator).
+            let (origin, did_path) =
+                did_hosting_common::server::setup_recipe::split_origin_and_did_path(&public_url);
+            let shape = did_hosting_common::server::vta_setup::WebvhDidShape::Hosted {
+                origin: &origin,
+                did_path: &did_path,
+                mediator_did: None,
+                remote: None,
+            };
+            let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
+                &context,
+                &shape,
+                Some(&label),
+            );
             if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
-                &label,
                 "did-hosting-server",
-                "did-hosting-daemon",
-                &[("URL", public_url.as_str())],
-                &context,
+                &ask,
             )
             .await
             {

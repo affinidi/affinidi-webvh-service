@@ -14,7 +14,7 @@ use did_hosting_common::server::setup_recipe::{
 };
 use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::vta_setup;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
@@ -84,58 +84,36 @@ pub async fn apply_recipe(
 
     let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhWitnessMessages);
 
-    let did_hosting_url = recipe
-        .identity
-        .did_hosting_url
-        .clone()
-        .unwrap_or_default()
-        .trim_end_matches('/')
-        .to_string();
     let context_id = recipe
         .vta
         .context_id
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
 
-    // The witness DID is hosted by the did-hosting-server; it doesn't host
-    // its own HTTP DID. With a mediator the DID document carries a
-    // `DIDCommMessaging` service (witness accepts inbound DIDComm). The
-    // mint template is `did-hosting-control` when a mediator exists (both
-    // HTTP + DIDComm), `did-hosting-daemon` otherwise (HTTP only).
-    let template_name = if recipe.identity.mediator_did.is_some() {
-        "did-hosting-control"
-    } else {
-        "did-hosting-daemon"
-    };
-    let url_var = did_hosting_url.as_str();
-    let mediator_var = recipe.identity.mediator_did.as_deref();
-    let template_vars: Vec<(&str, &str)> = match mediator_var {
-        Some(med) => vec![("URL", url_var), ("MEDIATOR_DID", med)],
-        None => vec![("URL", url_var)],
-    };
-
-    let ask = match recipe.deployment.vta_mode {
-        VtaMode::Online => Some(
-            (match mediator_var {
-                Some(med) => ProvisionAsk::did_hosting_control(&context_id, &did_hosting_url, med),
-                None => ProvisionAsk::did_hosting_daemon(&context_id, &did_hosting_url),
-            })
-            .with_label(format!("webvh-witness setup — {context_id}")),
-        ),
-        _ => None,
-    };
-
-    let outcome = run_vta_for_recipe(
-        &recipe,
-        ask,
-        messages,
-        setup_key,
-        template_name,
-        &template_vars,
-        Some("webvh-witness"),
-        offline_complete_seed,
+    // The witness's own DID is DIDComm-only — it carries a `DIDCommMessaging`
+    // service but no `WebVHHosting` endpoint, even though its did.jsonl is
+    // published on a did-hosting-server. The shared builder selects the
+    // `did-hosting-server` template and binds only `MEDIATOR_DID`. (The
+    // hosting location is handled by publishing the emitted log entry, not by
+    // the minted DID document.)
+    let mediator_for_template = recipe.identity.mediator_did.clone().unwrap_or_default();
+    let ask = matches!(
+        recipe.deployment.vta_mode,
+        VtaMode::Online | VtaMode::OfflinePrepare
     )
-    .await?;
+    .then(|| {
+        let shape = vta_setup::WebvhDidShape::DidcommOnly {
+            mediator_did: &mediator_for_template,
+        };
+        vta_setup::build_webvh_provision_ask(
+            &context_id,
+            &shape,
+            Some(&format!("webvh-witness setup — {context_id}")),
+        )
+    });
+
+    let outcome =
+        run_vta_for_recipe(&recipe, ask, messages, setup_key, offline_complete_seed).await?;
 
     let (
         witness_did,

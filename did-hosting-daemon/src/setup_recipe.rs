@@ -18,12 +18,13 @@ use did_hosting_common::server::setup_recipe::{
     EXIT_RECIPE_INVALID, ServiceKind, SetupRecipe, VtaMode, VtaSetupOutcome, active_backend,
     apply_env_overrides, back_up_config, derive_did_path, inspect_existing, load_recipe,
     print_recipe_banner, refuse_overwrite, require_service, resolve_admin_did,
-    resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, to_log_format,
+    resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, split_origin_and_did_path,
+    to_log_format,
 };
 use did_hosting_common::server::store::Store;
 use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::vta_setup;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::config::{DaemonConfig, EnableConfig};
 
@@ -98,42 +99,32 @@ pub async fn apply_recipe(
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
 
-    // Daemon uses `did-hosting-control` template when a mediator is given (so
-    // the DID document gets both WebVHHosting + DIDCommMessaging) and
-    // `did-hosting-daemon` template otherwise.
-    let template_name = if recipe.identity.mediator_did.is_some() {
-        "did-hosting-control"
-    } else {
-        "did-hosting-daemon"
-    };
-    let mediator_var = recipe.identity.mediator_did.as_deref();
-    let template_vars: Vec<(&str, &str)> = match mediator_var {
-        Some(med) => vec![("URL", public_url.as_str()), ("MEDIATOR_DID", med)],
-        None => vec![("URL", public_url.as_str())],
-    };
-
-    let ask = match recipe.deployment.vta_mode {
-        VtaMode::Online => Some(
-            (match mediator_var {
-                Some(med) => ProvisionAsk::did_hosting_control(&context_id, &public_url, med),
-                None => ProvisionAsk::did_hosting_daemon(&context_id, &public_url),
-            })
-            .with_label(format!("did-hosting-daemon setup — {context_id}")),
-        ),
-        _ => None,
-    };
-
-    let outcome = run_vta_for_recipe(
-        &recipe,
-        ask,
-        messages,
-        setup_key,
-        template_name,
-        &template_vars,
-        Some("did-hosting-daemon"),
-        offline_complete_seed,
+    // The daemon recipe is serverless: `public_url` carries the DID path in
+    // its path component, so split it back out and let the shared builder
+    // fold it into the minted DID's URL. With a mediator the DID document
+    // gets both WebVHHosting + DIDCommMessaging (`did-hosting-control`); else
+    // HTTP-only (`did-hosting-daemon`).
+    let (origin, did_path) = split_origin_and_did_path(&public_url);
+    let ask = matches!(
+        recipe.deployment.vta_mode,
+        VtaMode::Online | VtaMode::OfflinePrepare
     )
-    .await?;
+    .then(|| {
+        let shape = vta_setup::WebvhDidShape::Hosted {
+            origin: &origin,
+            did_path: &did_path,
+            mediator_did: recipe.identity.mediator_did.as_deref(),
+            remote: None,
+        };
+        vta_setup::build_webvh_provision_ask(
+            &context_id,
+            &shape,
+            Some(&format!("did-hosting-daemon setup — {context_id}")),
+        )
+    });
+
+    let outcome =
+        run_vta_for_recipe(&recipe, ask, messages, setup_key, offline_complete_seed).await?;
 
     let (
         server_did_opt,

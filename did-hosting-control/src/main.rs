@@ -374,17 +374,28 @@ async fn main() {
             mediator_did,
             context,
         }) => {
+            // `did_hosting_url` may already carry the DID path; split it back
+            // out so the shared builder folds it identically to the wizard.
+            let (origin, did_path) =
+                did_hosting_common::server::setup_recipe::split_origin_and_did_path(
+                    &did_hosting_url,
+                );
+            let shape = did_hosting_common::server::vta_setup::WebvhDidShape::Hosted {
+                origin: &origin,
+                did_path: &did_path,
+                mediator_did: Some(mediator_did.as_str()),
+                remote: None,
+            };
+            let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
+                &context,
+                &shape,
+                Some(&label),
+            );
             if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
-                &label,
                 "did-hosting-control",
-                "did-hosting-control",
-                &[
-                    ("URL", did_hosting_url.as_str()),
-                    ("MEDIATOR_DID", mediator_did.as_str()),
-                ],
-                &context,
+                &ask,
             )
             .await
             {

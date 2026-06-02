@@ -20,14 +20,13 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
 use did_hosting_common::server::setup_prompts;
+use did_hosting_common::server::setup_recipe::split_origin_and_did_path;
 use did_hosting_common::server::store::Store;
 use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
 use did_hosting_common::server::vta_setup;
 use serde::{Deserialize, Serialize};
 use vta_sdk::client::VtaClient;
-use vta_sdk::provision_client::{
-    EphemeralSetupKey, OperatorMessages, ProvisionAsk, ResolvedVta, resolve_vta,
-};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ResolvedVta, resolve_vta};
 
 use crate::config::{DaemonConfig, EnableConfig};
 
@@ -347,32 +346,6 @@ struct WebvhTarget {
     path: Option<String>,
 }
 
-impl WebvhTarget {
-    /// Inject this target's `WEBVH_*` vars into a `ProvisionAsk`'s
-    /// `integration_template_vars`. Serverless (`server_id == None`) is a
-    /// no-op — no vars are added and the VTA self-hosts at the `URL` var.
-    /// In server-managed mode the vars are consumed VTA-side (see
-    /// `provision_integration::webvh`) before the template renders, pinning
-    /// where the daemon's `did.jsonl` is published and the
-    /// `did:webvh:<scid>:<host>:<path>` shape. They ride in the ask and
-    /// [`vta_setup::online_provision_flight`] forwards them verbatim.
-    fn inject_into(&self, ask: &mut ProvisionAsk) {
-        use serde_json::Value as JsonValue;
-        if let Some(server) = self.server_id.as_deref() {
-            ask.integration_template_vars
-                .insert("WEBVH_SERVER".to_string(), JsonValue::String(server.into()));
-        }
-        if let Some(domain) = self.domain.as_deref() {
-            ask.integration_template_vars
-                .insert("WEBVH_DOMAIN".to_string(), JsonValue::String(domain.into()));
-        }
-        if let Some(path) = self.path.as_deref() {
-            ask.integration_template_vars
-                .insert("WEBVH_PATH".to_string(), JsonValue::String(path.into()));
-        }
-    }
-}
-
 /// Everything the online flow gathered + provisioned, handed back to
 /// `run_wizard` so it can build `DaemonConfig` and finalise.
 struct OnlineProvisionResult {
@@ -533,34 +506,40 @@ async fn run_online_provision(
     // registered hosting server. Determines the `URL` var, whether we
     // self-import the log, and which `WEBVH_*` vars ride in the ask.
     let webvh = select_webvh_target(resolved.as_ref(), &setup_key).await?;
-    let (url_var, did_path, self_host) = match webvh.server_id.as_deref() {
-        // Serverless: today's behaviour. The DID-path is a local sub-path
-        // folded into the URL var so the minted DID, the local import, and
-        // resolution all agree.
-        None => {
-            let did_path = prompt_did_path(&default_did_path)?;
-            let url_var = hosting_url_for(&public_url, &did_path);
-            (url_var, did_path, true)
-        }
-        // Server-managed: the canonical host is the remote server. The
-        // `URL` var carries the daemon's own origin (document content /
-        // WebVHHosting endpoint), and `WEBVH_*` vars (already collected in
-        // `webvh`) pin the remote publication. `did_path` is kept for
-        // record only — no local import.
-        Some(_) => {
-            let did_path = webvh.path.clone().unwrap_or_else(|| ".well-known".into());
-            (public_url.clone(), did_path, false)
-        }
+    let self_host = webvh.server_id.is_none();
+    // Serverless: the DID-path is a local sub-path the shared builder folds
+    // into the URL so the minted DID, the local import, and resolution all
+    // agree. Server-managed: the canonical host is the remote server, so
+    // `did_path` is kept for record only (no local import) and pins the
+    // remote `WEBVH_PATH`.
+    let did_path = match webvh.server_id {
+        None => prompt_did_path(&default_did_path)?,
+        Some(_) => webvh.path.clone().unwrap_or_else(|| ".well-known".into()),
     };
 
-    let mut ask = match mediator_did.as_deref() {
-        Some(med) => ProvisionAsk::did_hosting_control(&context_id, &url_var, med),
-        None => ProvisionAsk::did_hosting_daemon(&context_id, &url_var),
-    }
-    .with_label(format!("did-hosting-daemon setup — {context_id}"));
-    // Inject the operator's webvh choice. Serverless is a no-op; server-
-    // managed adds WEBVH_SERVER (+ optional WEBVH_DOMAIN) + WEBVH_PATH.
-    webvh.inject_into(&mut ask);
+    // One ask packages the daemon's own DID. Serverless folds `did_path`
+    // into the URL; server-managed keeps the daemon's origin as the document
+    // URL and rides the publication on WEBVH_SERVER/DOMAIN/PATH. With a
+    // mediator the DID also carries a DIDCommMessaging service.
+    let remote = webvh
+        .server_id
+        .as_deref()
+        .map(|server_id| vta_setup::WebvhRemoteTarget {
+            server_id,
+            domain: webvh.domain.as_deref(),
+            path: webvh.path.as_deref(),
+        });
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin: &public_url,
+        did_path: &did_path,
+        mediator_did: mediator_did.as_deref(),
+        remote,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
+        &context_id,
+        &shape,
+        Some(&format!("did-hosting-daemon setup — {context_id}")),
+    );
 
     eprintln!();
     eprintln!("  Provisioning daemon DID via VTA...");
@@ -1152,7 +1131,6 @@ pub async fn run_setup_offline_prepare(
         .interact_text()?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     let did_path = prompt_did_path(&default_did_path)?;
-    let hosting_url = hosting_url_for(&public_url, &did_path);
 
     eprintln!();
     eprintln!("  VTA context the integration will live in. Embedded in the");
@@ -1194,25 +1172,22 @@ pub async fn run_setup_offline_prepare(
     .await?;
     let admin = prompt_admin_choice()?;
 
-    // VP-framed bootstrap request. With a mediator we name the
-    // `did-hosting-control` template so the rendered DID document carries
-    // both `WebVHHosting` and `DIDCommMessaging` services; without one
-    // we fall back to `did-hosting-daemon` (HTTP-only).
-    let (template_name, template_vars): (&str, Vec<(&str, &str)>) = match mediator_did.as_deref() {
-        Some(med) => (
-            "did-hosting-control",
-            vec![("URL", hosting_url.as_str()), ("MEDIATOR_DID", med)],
-        ),
-        None => ("did-hosting-daemon", vec![("URL", hosting_url.as_str())]),
+    // One ask packages the daemon's own DID (offline is serverless — no
+    // remote target). The shared builder folds `did_path` into the URL and
+    // selects `did-hosting-control` (HTTP + DIDComm) when a mediator is set,
+    // else `did-hosting-daemon` (HTTP-only).
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin: &public_url,
+        did_path: &did_path,
+        mediator_did: mediator_did.as_deref(),
+        remote: None,
     };
-    let info = vta_setup::write_offline_bootstrap_request(
-        &request_out,
-        template_name,
-        &template_vars,
+    let ask = vta_setup::build_webvh_provision_ask(
         &context_id,
-        Some("did-hosting-daemon"),
-    )
-    .await?;
+        &shape,
+        Some(&format!("did-hosting-daemon setup — {context_id}")),
+    );
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, &ask).await?;
 
     // Persist the ephemeral seed via the chosen secret store so it
     // survives until phase 2 — no on-disk seed file.
@@ -1480,50 +1455,6 @@ fn prompt_admin_choice() -> Result<AdminChoice, Box<dyn std::error::Error>> {
     })
 }
 
-/// Split an operator-entered URL into its origin (`scheme://host[:port]`,
-/// trailing slash stripped) and the DID path encoded in its path
-/// component. An empty path maps to `.well-known`, the webvh root.
-///
-/// The origin becomes `config.public_url` (WebAuthn RP origin, first-boot
-/// domain seed, and the host component of the daemon's own DID); the DID
-/// path is the sub-path the daemon publishes its DID under. Folding the
-/// path back in via [`hosting_url_for`] round-trips:
-/// `split_origin_and_did_path(hosting_url_for(o, p)) == (o, p)`.
-fn split_origin_and_did_path(public_url: &str) -> (String, String) {
-    let trimmed = public_url.trim_end_matches('/');
-    let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
-    match trimmed[scheme_end..].find('/') {
-        Some(rel) => {
-            let at = scheme_end + rel;
-            let path = trimmed[at..].trim_matches('/');
-            let did_path = if path.is_empty() {
-                ".well-known".to_string()
-            } else {
-                path.to_string()
-            };
-            (trimmed[..at].to_string(), did_path)
-        }
-        None => (trimmed.to_string(), ".well-known".to_string()),
-    }
-}
-
-/// Fold a DID path back into the hosting origin so the VTA mints the DID
-/// at the matching web location (the VTA derives the DID's path segment
-/// from this URL, and the local import path must match). `.well-known`
-/// is the webvh root and carries no path segment, so the origin is
-/// returned unchanged.
-fn hosting_url_for(origin: &str, did_path: &str) -> String {
-    if did_path == ".well-known" {
-        origin.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            origin.trim_end_matches('/'),
-            did_path.trim_matches('/')
-        )
-    }
-}
-
 /// Prompt for the DID path the daemon publishes its own DID under,
 /// defaulting to `default` (the path component of the public URL, or
 /// `.well-known` when it has none). An empty entry normalises back to
@@ -1643,157 +1574,7 @@ async fn finalize_daemon_setup(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{WebvhTarget, hosting_url_for, split_origin_and_did_path};
-    use vta_sdk::provision_client::ProvisionAsk;
-
-    /// Serverless: the URL var folds the local DID path into the origin
-    /// (today's behaviour) and no WEBVH_* vars are injected.
-    #[test]
-    fn serverless_folds_path_and_injects_no_vars() {
-        let target = WebvhTarget::default();
-        assert!(target.server_id.is_none());
-
-        // url_var selection, mirroring run_online_provision's serverless arm.
-        let url_var = hosting_url_for("https://webvh.example.com", "dids/daemon");
-        assert_eq!(url_var, "https://webvh.example.com/dids/daemon");
-
-        let mut ask = ProvisionAsk::did_hosting_daemon("webvh", &url_var);
-        target.inject_into(&mut ask);
-        assert!(!ask.integration_template_vars.contains_key("WEBVH_SERVER"));
-        assert!(!ask.integration_template_vars.contains_key("WEBVH_DOMAIN"));
-        assert!(!ask.integration_template_vars.contains_key("WEBVH_PATH"));
-        assert_eq!(
-            ask.integration_template_vars.get("URL"),
-            Some(&serde_json::Value::String(url_var)),
-        );
-    }
-
-    /// Server-managed: the URL var is the daemon's own origin (not folded)
-    /// and WEBVH_SERVER / WEBVH_DOMAIN / WEBVH_PATH are injected.
-    #[test]
-    fn server_managed_injects_all_vars_and_keeps_origin_url() {
-        let target = WebvhTarget {
-            server_id: Some("srv-1".into()),
-            domain: Some("hosting.example.com".into()),
-            path: Some("acme".into()),
-        };
-
-        // url_var selection, mirroring run_online_provision's server arm:
-        // the daemon's own origin, NOT a folded path.
-        let url_var = "https://webvh.example.com".to_string();
-        let mut ask = ProvisionAsk::did_hosting_daemon("webvh", &url_var);
-        target.inject_into(&mut ask);
-
-        assert_eq!(
-            ask.integration_template_vars.get("WEBVH_SERVER"),
-            Some(&serde_json::Value::String("srv-1".into())),
-        );
-        assert_eq!(
-            ask.integration_template_vars.get("WEBVH_DOMAIN"),
-            Some(&serde_json::Value::String("hosting.example.com".into())),
-        );
-        assert_eq!(
-            ask.integration_template_vars.get("WEBVH_PATH"),
-            Some(&serde_json::Value::String("acme".into())),
-        );
-        assert_eq!(
-            ask.integration_template_vars.get("URL"),
-            Some(&serde_json::Value::String(url_var)),
-        );
-    }
-
-    /// Server-managed without a domain: WEBVH_DOMAIN is omitted (the server
-    /// resolves its default) while SERVER + PATH still ride.
-    #[test]
-    fn server_managed_omits_domain_when_none() {
-        let target = WebvhTarget {
-            server_id: Some("srv-1".into()),
-            domain: None,
-            path: Some("acme".into()),
-        };
-        let mut ask = ProvisionAsk::did_hosting_daemon("webvh", "https://webvh.example.com");
-        target.inject_into(&mut ask);
-        assert!(ask.integration_template_vars.contains_key("WEBVH_SERVER"));
-        assert!(!ask.integration_template_vars.contains_key("WEBVH_DOMAIN"));
-        assert!(ask.integration_template_vars.contains_key("WEBVH_PATH"));
-    }
-
-    #[test]
-    fn bare_origin_maps_to_well_known_root() {
-        assert_eq!(
-            split_origin_and_did_path("https://webvh.example.com"),
-            (
-                "https://webvh.example.com".to_string(),
-                ".well-known".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn trailing_slash_is_stripped() {
-        assert_eq!(
-            split_origin_and_did_path("https://webvh.example.com/"),
-            (
-                "https://webvh.example.com".to_string(),
-                ".well-known".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn path_component_becomes_did_path() {
-        assert_eq!(
-            split_origin_and_did_path("https://webvh.example.com/dids/daemon"),
-            (
-                "https://webvh.example.com".to_string(),
-                "dids/daemon".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn port_is_preserved_in_origin() {
-        assert_eq!(
-            split_origin_and_did_path("http://localhost:8534/svc"),
-            ("http://localhost:8534".to_string(), "svc".to_string())
-        );
-    }
-
-    #[test]
-    fn well_known_is_not_folded_into_url() {
-        // The webvh root carries no path segment.
-        assert_eq!(
-            hosting_url_for("https://webvh.example.com", ".well-known"),
-            "https://webvh.example.com"
-        );
-    }
-
-    #[test]
-    fn custom_path_is_folded_into_url() {
-        assert_eq!(
-            hosting_url_for("https://webvh.example.com", "dids/daemon"),
-            "https://webvh.example.com/dids/daemon"
-        );
-    }
-
-    #[test]
-    fn fold_then_split_round_trips() {
-        // The contract VTA-mode correctness depends on: the path folded
-        // into the URL (handed to the VTA) is exactly the path derived
-        // back out for the local store import.
-        for (origin, did_path) in [
-            ("https://webvh.example.com", ".well-known"),
-            ("https://webvh.example.com", "dids/daemon"),
-            ("http://localhost:8534", "svc"),
-        ] {
-            let url = hosting_url_for(origin, did_path);
-            assert_eq!(
-                split_origin_and_did_path(&url),
-                (origin.to_string(), did_path.to_string()),
-                "round-trip failed for {origin} + {did_path}"
-            );
-        }
-    }
-}
+// Path-folding (`hosting_url_for` / `split_origin_and_did_path`) and the
+// `WEBVH_*` injection that used to live here are now shared in
+// `did-hosting-common` (`server::setup_recipe` + `server::vta_setup`) and
+// tested alongside `build_webvh_provision_ask` there.

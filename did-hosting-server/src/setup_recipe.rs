@@ -12,10 +12,12 @@ use did_hosting_common::server::setup_recipe::{
     EXIT_RECIPE_INVALID, ServiceKind, SetupRecipe, VtaMode, VtaSetupOutcome, active_backend,
     apply_env_overrides, back_up_config, derive_did_path, inspect_existing, load_recipe,
     print_recipe_banner, refuse_overwrite, require_service, resolve_admin_did,
-    resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, to_log_format,
+    resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, split_origin_and_did_path,
+    to_log_format,
 };
 use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use did_hosting_common::server::vta_setup;
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
@@ -101,10 +103,12 @@ pub async fn apply_recipe(
 
     let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhServerMessages);
 
-    // Build the ProvisionAsk for online mode. The server wizard uses the
-    // `did-hosting-daemon` template because the server hosts its own DID
-    // documents via HTTP and doesn't need DIDComm minted into its DID
-    // document (sync uses a separate mediator_did set at runtime).
+    // One ask packages the server's own DID for both online and
+    // offline-prepare. The server hosts its own DID documents via HTTP and
+    // doesn't mint DIDComm into its DID document (sync uses a separate
+    // `mediator_did` at runtime), so it's always HTTP-only — the builder
+    // selects `did-hosting-daemon`. `public_url` carries the DID path in its
+    // path component, so split it back out and let the builder fold it in.
     let public_url_owned = recipe
         .identity
         .public_url
@@ -117,26 +121,27 @@ pub async fn apply_recipe(
         .context_id
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
-    let ask = if recipe.deployment.vta_mode == VtaMode::Online {
-        Some(
-            ProvisionAsk::did_hosting_daemon(&context_id, &public_url_owned)
-                .with_label(format!("did-hosting-server setup — {context_id}")),
-        )
-    } else {
-        None
-    };
-
-    let outcome = run_vta_for_recipe(
-        &recipe,
-        ask,
-        messages,
-        setup_key,
-        "did-hosting-daemon",
-        &[("URL", &public_url_owned)],
-        Some("did-hosting-server"),
-        offline_complete_seed,
+    let (origin, did_path) = split_origin_and_did_path(&public_url_owned);
+    let ask = matches!(
+        recipe.deployment.vta_mode,
+        VtaMode::Online | VtaMode::OfflinePrepare
     )
-    .await?;
+    .then(|| {
+        let shape = vta_setup::WebvhDidShape::Hosted {
+            origin: &origin,
+            did_path: &did_path,
+            mediator_did: None,
+            remote: None,
+        };
+        vta_setup::build_webvh_provision_ask(
+            &context_id,
+            &shape,
+            Some(&format!("did-hosting-server setup — {context_id}")),
+        )
+    });
+
+    let outcome =
+        run_vta_for_recipe(&recipe, ask, messages, setup_key, offline_complete_seed).await?;
 
     // Three terminal shapes: online, offline-complete, or offline-prepare.
     // Server has no self-managed mode (rejected by recipe validation).

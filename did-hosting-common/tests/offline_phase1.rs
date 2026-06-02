@@ -27,6 +27,7 @@ use did_hosting_common::server::setup_recipe::{
     ReprovisionSection, SecretsSection, ServerSection, ServiceKind, SetupRecipe, VtaMode,
     VtaSection, VtaSetupOutcome, WatcherSection, run_vta_for_recipe,
 };
+use did_hosting_common::server::vta_setup::{WebvhDidShape, build_webvh_provision_ask};
 use vta_sdk::provision_client::OperatorMessages;
 
 fn temp_dir() -> tempfile::TempDir {
@@ -79,23 +80,23 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
     recipe.validate().expect("recipe must validate");
 
     let messages: Arc<dyn OperatorMessages> = Arc::new(WebvhServerMessages);
-    // Vars match what did-hosting-server's setup_recipe.rs passes for the
+    // Same ask did-hosting-server's setup_recipe.rs builds for the
     // did-hosting-daemon template (URL only — no DIDComm/mediator).
     let url = recipe.identity.public_url.clone().unwrap();
-    let template_vars = [("URL", url.as_str())];
-
-    let outcome = run_vta_for_recipe(
-        &recipe,
-        None,
-        messages,
-        None,
-        "did-hosting-daemon",
-        &template_vars,
+    let ask = build_webvh_provision_ask(
+        recipe.vta.context_id.as_deref().unwrap_or("webvh"),
+        &WebvhDidShape::Hosted {
+            origin: &url,
+            did_path: ".well-known",
+            mediator_did: None,
+            remote: None,
+        },
         Some("did-hosting-server"),
-        None,
-    )
-    .await
-    .expect("offline-prepare must succeed");
+    );
+
+    let outcome = run_vta_for_recipe(&recipe, Some(ask), messages, None, None)
+        .await
+        .expect("offline-prepare must succeed");
 
     let info = match outcome {
         VtaSetupOutcome::OfflinePreparedOnly(info) => info,

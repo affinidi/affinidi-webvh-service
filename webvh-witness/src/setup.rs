@@ -17,7 +17,7 @@ use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
 use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::vta_setup;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 /// Phase 1 of the headless setup flow: mint an ephemeral did:key,
 /// persist it (chmod 0600 on Unix) under `out_path`, and print the
@@ -464,8 +464,18 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::did_hosting_server(&context_id, &mediator_did)
-        .with_label(format!("webvh-witness setup — {context_id}"));
+    // The witness's own DID is DIDComm-only (no WebVHHosting service) — it's
+    // reachable over DIDComm even though its did.jsonl is hosted on a
+    // did-hosting-server. The shared builder selects the `did-hosting-server`
+    // template.
+    let shape = vta_setup::WebvhDidShape::DidcommOnly {
+        mediator_did: &mediator_did,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
+        &context_id,
+        &shape,
+        Some(&format!("webvh-witness setup — {context_id}")),
+    );
 
     eprintln!();
     eprintln!("  Provisioning witness DID via VTA...");
@@ -675,19 +685,19 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // VP-framed bootstrap request — names the `did-hosting-server` template
-    // (DIDComm-only — witness coordination, no HTTP hosting) + binds
-    // `MEDIATOR_DID` so the VTA admin can run
-    // `vta bootstrap provision-integration --request <file>` directly.
+    // Package the bootstrap request via the shared builder — the witness DID
+    // is DIDComm-only (`did-hosting-server` template, no HTTP hosting), so it
+    // carries only `MEDIATOR_DID`. Same ask shape the online flow sends.
     let mediator_for_template = mediator_did.clone().unwrap_or_default();
-    let info = vta_setup::write_offline_bootstrap_request(
-        &request_out,
-        "did-hosting-server",
-        &[("MEDIATOR_DID", &mediator_for_template)],
+    let shape = vta_setup::WebvhDidShape::DidcommOnly {
+        mediator_did: &mediator_for_template,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
         &context_id,
-        Some("webvh-witness"),
-    )
-    .await?;
+        &shape,
+        Some(&format!("webvh-witness setup — {context_id}")),
+    );
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, &ask).await?;
     let secret_store =
         did_hosting_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
     secret_store.set_bootstrap_seed(&info.seed).await?;

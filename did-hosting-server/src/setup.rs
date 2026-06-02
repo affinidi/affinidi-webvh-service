@@ -13,8 +13,9 @@ use did_hosting_common::server::store::KS_DIDS;
 
 use did_hosting_common::server::operator_messages::WebvhServerMessages;
 use did_hosting_common::server::setup_prompts;
+use did_hosting_common::server::setup_recipe::split_origin_and_did_path;
 use did_hosting_common::server::vta_setup;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 /// Phase 1 of the headless setup flow: mint an ephemeral did:key,
 /// persist it (chmod 0600 on Unix) under `out_path`, and print the
@@ -449,8 +450,21 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::did_hosting_daemon(&context_id, public_url)
-        .with_label(format!("did-hosting-server setup — {context_id}"));
+    // The server's own DID is HTTP-only hosting (no mediator), and
+    // `public_url` carries the DID path in its path component — split it
+    // back out so the shared builder folds it into the minted DID's URL.
+    let (origin, did_path) = split_origin_and_did_path(public_url);
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin: &origin,
+        did_path: &did_path,
+        mediator_did: None,
+        remote: None,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
+        &context_id,
+        &shape,
+        Some(&format!("did-hosting-server setup — {context_id}")),
+    );
 
     eprintln!();
     eprintln!("  Provisioning server DID via VTA...");
@@ -542,8 +556,10 @@ pub async fn run_setup_offline_prepare(
         .interact_text()?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
-    // DID path derived from URL path component (matches the online wizard).
-    let did_path = derive_did_path(&public_url);
+    // Origin + DID path from the URL's path component (matches the online
+    // wizard). `public_url` (full) stays the server's identity; the split
+    // feeds the shared ask builder below.
+    let (origin, did_path) = split_origin_and_did_path(&public_url);
 
     eprintln!();
     eprintln!("  VTA context the integration will live in. Embedded in the");
@@ -605,20 +621,22 @@ pub async fn run_setup_offline_prepare(
     )
     .await?;
 
-    // Write the VP-framed bootstrap request via the shared primitive;
-    // the seed is returned in memory and persisted via the configured
-    // secret store. The VP names the `did-hosting-daemon` template (HTTP-only
-    // hosting — runtime DIDComm uses `mediator_did` separately) and
-    // binds the `URL` template variable so the rendered DID exposes a
+    // Package the bootstrap request via the shared builder — HTTP-only
+    // hosting (no mediator; runtime DIDComm uses `mediator_did` separately),
+    // the path folded into the URL so the rendered DID exposes a
     // `WebVHHosting` service at the server's public URL.
-    let info = vta_setup::write_offline_bootstrap_request(
-        &request_out,
-        "did-hosting-daemon",
-        &[("URL", &public_url)],
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin: &origin,
+        did_path: &did_path,
+        mediator_did: None,
+        remote: None,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
         &context_id,
-        Some("did-hosting-server"),
-    )
-    .await?;
+        &shape,
+        Some(&format!("did-hosting-server setup — {context_id}")),
+    );
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, &ask).await?;
     let secret_store =
         did_hosting_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
     secret_store.set_bootstrap_seed(&info.seed).await?;
@@ -850,22 +868,6 @@ pub async fn run_setup_offline_complete(
     eprintln!();
 
     Ok(())
-}
-
-fn derive_did_path(public_url: &str) -> String {
-    let after_scheme = public_url
-        .find("://")
-        .map(|i| &public_url[i + 3..])
-        .unwrap_or(public_url);
-    let path = after_scheme
-        .find('/')
-        .map(|i| after_scheme[i..].trim_matches('/'))
-        .unwrap_or("");
-    if path.is_empty() {
-        ".well-known".to_string()
-    } else {
-        path.to_string()
-    }
 }
 
 fn cleanup_offline_artifacts(state_path: &Path) {

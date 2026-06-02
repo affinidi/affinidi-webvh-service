@@ -22,7 +22,7 @@ use did_hosting_common::server::vta_setup;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 /// Phase 1 of the headless setup flow: mint an ephemeral did:key,
 /// persist it (chmod 0600 on Unix) under `out_path`, and print the
@@ -107,17 +107,21 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
-    let (mediator_did, outcome) =
-        run_online_provision(messages, preloaded_setup_key, &did_hosting_url)
-            .await
-            .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
-
-    // 4. DID path
+    // DID path must be collected BEFORE the VTA round-trip: the VTA derives
+    // the minted DID's path segment from the hosting URL it receives, so the
+    // path is folded into that URL (by `build_webvh_provision_ask`) before
+    // the DID is minted. Collected after, it could not affect the
+    // already-minted DID and the DID would fall back to the `.well-known` root.
     let did_path: String = Input::new()
         .with_prompt("DID path on the server")
         .default("services/control".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+    let (mediator_did, outcome) =
+        run_online_provision(messages, preloaded_setup_key, &did_hosting_url, &did_path)
+            .await
+            .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
 
     // 5. Persist DID log entry (if the template emitted one) so the
     //    operator can publish it on the webvh hosting server.
@@ -417,7 +421,8 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), AppErr
 async fn run_online_provision(
     messages: Arc<dyn OperatorMessages>,
     preloaded_setup_key: Option<EphemeralSetupKey>,
-    did_hosting_url: &str,
+    origin: &str,
+    did_path: &str,
 ) -> Result<(Option<String>, vta_setup::OnlineProvisionOutcome), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
@@ -490,8 +495,17 @@ async fn run_online_provision(
         }
     };
 
-    let ask = ProvisionAsk::did_hosting_control(&context_id, did_hosting_url, &mediator_did)
-        .with_label(format!("did-hosting-control setup — {context_id}"));
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin,
+        did_path,
+        mediator_did: Some(&mediator_did),
+        remote: None,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
+        &context_id,
+        &shape,
+        Some(&format!("did-hosting-control setup — {context_id}")),
+    );
 
     eprintln!();
     eprintln!("  Provisioning control plane DID via VTA...");
@@ -700,27 +714,24 @@ pub async fn run_setup_offline_prepare(
         _ => AdminChoice::Skip,
     };
 
-    // Write the VP-framed bootstrap request via the shared primitive;
-    // the seed is returned in memory and persisted via the configured
-    // secret store (no on-disk seed file). The VP names the
-    // `did-hosting-control` template (HTTP + DIDComm) + binds both `URL`
-    // (host_url for the WebVHHosting service) and `MEDIATOR_DID` (for
-    // the DIDCommMessaging service) so the VTA admin can run
-    // `vta bootstrap provision-integration --request <file>` without
-    // extra flags.
-    let mediator_for_template = mediator_did.clone().unwrap_or_default();
-    let info = vta_setup::write_offline_bootstrap_request(
-        &request_out,
-        "did-hosting-control",
-        &[
-            ("URL", did_hosting_url.as_str()),
-            ("MEDIATOR_DID", &mediator_for_template),
-        ],
+    // Package the bootstrap request via the shared builder — same ask shape
+    // the online flow sends, so the path-fold and template selection live in
+    // one place. The seed is returned in memory and persisted via the
+    // configured secret store (no on-disk seed file).
+    let shape = vta_setup::WebvhDidShape::Hosted {
+        origin: &did_hosting_url,
+        did_path: &did_path,
+        mediator_did: mediator_did.as_deref(),
+        remote: None,
+    };
+    let ask = vta_setup::build_webvh_provision_ask(
         &context_id,
-        Some("did-hosting-control"),
-    )
-    .await
-    .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
+        &shape,
+        Some(&format!("did-hosting-control setup — {context_id}")),
+    );
+    let info = vta_setup::write_offline_bootstrap_request(&request_out, &ask)
+        .await
+        .map_err(|e| AppError::Config(format!("failed to write bootstrap request: {e}")))?;
     let secret_store =
         did_hosting_common::server::secret_store::create_secret_store(&secrets, &config_output)?;
     secret_store.set_bootstrap_seed(&info.seed).await?;

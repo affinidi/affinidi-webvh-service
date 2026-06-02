@@ -57,6 +57,47 @@ pub fn derive_did_path(public_url: &str) -> String {
     }
 }
 
+/// Split an operator-entered URL into its origin (`scheme://host[:port]`,
+/// trailing slash stripped) and the DID path encoded in its path component.
+/// An empty path maps to `.well-known`, the webvh root. The inverse of
+/// [`hosting_url_for`]: `split_origin_and_did_path(hosting_url_for(o, p))
+/// == (o, p)` for any already-trimmed origin.
+pub fn split_origin_and_did_path(public_url: &str) -> (String, String) {
+    let trimmed = public_url.trim_end_matches('/');
+    let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
+    match trimmed[scheme_end..].find('/') {
+        Some(rel) => {
+            let at = scheme_end + rel;
+            let path = trimmed[at..].trim_matches('/');
+            let did_path = if path.is_empty() {
+                ".well-known".to_string()
+            } else {
+                path.to_string()
+            };
+            (trimmed[..at].to_string(), did_path)
+        }
+        None => (trimmed.to_string(), ".well-known".to_string()),
+    }
+}
+
+/// Fold a DID path back into a hosting origin so the VTA mints the DID at
+/// the matching web location. The VTA derives the DID's path segment from
+/// this URL, and the local import path must match. `.well-known` is the
+/// webvh root and carries no path segment, so the origin is returned
+/// unchanged. This is the inverse of [`derive_did_path`]:
+/// `derive_did_path(hosting_url_for(o, p)) == p` for any non-empty origin.
+pub fn hosting_url_for(origin: &str, did_path: &str) -> String {
+    if did_path == ".well-known" {
+        origin.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            origin.trim_end_matches('/'),
+            did_path.trim_matches('/')
+        )
+    }
+}
+
 /// What the recipe-driven flow needs out of the VTA round-trip when the
 /// mode is `online` — flattened so binaries don't have to plumb the SDK
 /// types around.
@@ -121,15 +162,11 @@ pub struct OfflinePreparedInfo {
 ///
 /// Errors are surfaced via [`AppError`] so binaries can map to their
 /// chosen exit codes (see [`super::exit_codes`]).
-#[allow(clippy::too_many_arguments)]
-pub async fn run_vta_for_recipe<'a>(
+pub async fn run_vta_for_recipe(
     recipe: &SetupRecipe,
     ask: Option<ProvisionAsk>,
     messages: Arc<dyn OperatorMessages>,
     setup_key: Option<EphemeralSetupKey>,
-    offline_prepare_template: &str,
-    offline_prepare_vars: &[(&'a str, &'a str)],
-    offline_prepare_label: Option<&str>,
     offline_complete_seed: Option<[u8; 32]>,
 ) -> Result<VtaSetupOutcome, AppError> {
     match recipe.deployment.vta_mode {
@@ -171,22 +208,16 @@ pub async fn run_vta_for_recipe<'a>(
                     "recipe vta.request_path is required for vta_mode = \"offline-prepare\"".into(),
                 )
             })?;
-            let context_id = recipe
-                .vta
-                .context_id
-                .clone()
-                .unwrap_or_else(|| "webvh".to_string());
-            let info = write_offline_bootstrap_request(
-                &request_path,
-                offline_prepare_template,
-                offline_prepare_vars,
-                &context_id,
-                offline_prepare_label,
-            )
-            .await
-            .map_err(|e| {
-                AppError::Config(format!("offline bootstrap-request write failed: {e}"))
+            // Offline-prepare ferries the *same* ask the online flow would
+            // send — template, vars, context, and label all ride on it.
+            let ask = ask.ok_or_else(|| {
+                AppError::Config("internal: offline-prepare mode requires a ProvisionAsk".into())
             })?;
+            let info = write_offline_bootstrap_request(&request_path, &ask)
+                .await
+                .map_err(|e| {
+                    AppError::Config(format!("offline bootstrap-request write failed: {e}"))
+                })?;
             // Surface the seed to the caller — they own the secret
             // store and persist it via `set_bootstrap_seed` so phase 2
             // can open the sealed reply. Phase 2 reads the *same*
@@ -314,5 +345,89 @@ mod tests {
             "services/control"
         );
         assert_eq!(derive_did_path("https://x.io/a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn hosting_url_for_folds_path() {
+        assert_eq!(
+            hosting_url_for("https://did.example.com", "services/control"),
+            "https://did.example.com/services/control"
+        );
+        // Trailing slashes on either side normalise away.
+        assert_eq!(
+            hosting_url_for("https://did.example.com/", "/services/control/"),
+            "https://did.example.com/services/control"
+        );
+    }
+
+    #[test]
+    fn hosting_url_for_well_known_returns_origin() {
+        assert_eq!(
+            hosting_url_for("https://did.example.com", ".well-known"),
+            "https://did.example.com"
+        );
+    }
+
+    #[test]
+    fn hosting_url_for_is_inverse_of_derive_did_path() {
+        for (origin, did_path) in [
+            ("https://did.example.com", "services/control"),
+            ("http://localhost:8532", "a/b/c"),
+            ("https://did.example.com", ".well-known"),
+        ] {
+            assert_eq!(
+                derive_did_path(&hosting_url_for(origin, did_path)),
+                did_path
+            );
+        }
+    }
+
+    #[test]
+    fn split_origin_and_did_path_cases() {
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com"),
+            (
+                "https://webvh.example.com".to_string(),
+                ".well-known".to_string()
+            )
+        );
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com/"),
+            (
+                "https://webvh.example.com".to_string(),
+                ".well-known".to_string()
+            )
+        );
+        assert_eq!(
+            split_origin_and_did_path("https://webvh.example.com/dids/daemon"),
+            (
+                "https://webvh.example.com".to_string(),
+                "dids/daemon".to_string()
+            )
+        );
+        // Port is preserved in the origin.
+        assert_eq!(
+            split_origin_and_did_path("http://localhost:8534/svc"),
+            ("http://localhost:8534".to_string(), "svc".to_string())
+        );
+    }
+
+    #[test]
+    fn fold_then_split_round_trips() {
+        // VTA-mode correctness depends on this: the path folded into the URL
+        // (handed to the VTA) is exactly the path split back out for the
+        // local store import.
+        for (origin, did_path) in [
+            ("https://webvh.example.com", ".well-known"),
+            ("https://webvh.example.com", "dids/daemon"),
+            ("http://localhost:8534", "svc"),
+        ] {
+            let url = hosting_url_for(origin, did_path);
+            assert_eq!(
+                split_origin_and_did_path(&url),
+                (origin.to_string(), did_path.to_string()),
+                "round-trip failed for {origin} + {did_path}"
+            );
+        }
     }
 }

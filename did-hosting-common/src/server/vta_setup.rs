@@ -13,6 +13,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use vta_sdk::credentials::CredentialBundle;
 
+use crate::server::setup_recipe::hosting_url_for;
+
 /// Error message rendered when an operator picks self-managed mode in a
 /// non-daemon binary (server / control / witness). Kept as a single shared
 /// constant so all three setup wizards print identical text — it's the
@@ -553,17 +555,123 @@ pub struct OfflineBootstrapResult {
     pub admin_signing_key_multibase: Option<String>,
 }
 
+/// Where a service publishes its own `did:webvh` document, and what
+/// services that DID document advertises. This is the single input that
+/// decides the VTA template + variable bindings, so every setup path —
+/// interactive or recipe-driven, online or offline — packages its DID the
+/// same way via [`build_webvh_provision_ask`].
+pub enum WebvhDidShape<'a> {
+    /// The DID advertises a `WebVHHosting` endpoint. `did_path` is folded
+    /// into `origin` via [`hosting_url_for`] so the minted DID, the local
+    /// import, and resolution all agree on the location. When `mediator_did`
+    /// is set the DID also gets a `DIDCommMessaging` service (template
+    /// `did-hosting-control`); otherwise it is HTTP-only
+    /// (`did-hosting-daemon`).
+    Hosted {
+        origin: &'a str,
+        did_path: &'a str,
+        mediator_did: Option<&'a str>,
+        /// Server-managed publication on a registered hosting server
+        /// (daemon multi-tenant / delegated hosting). When set, the minted
+        /// DID's canonical host is the remote server: `origin` becomes the
+        /// document's own `WebVHHosting` URL (no path fold), and
+        /// `WEBVH_SERVER`/`WEBVH_DOMAIN`/`WEBVH_PATH` pin the remote
+        /// publication.
+        remote: Option<WebvhRemoteTarget<'a>>,
+    },
+    /// The DID is DIDComm-only — it carries a `DIDCommMessaging` service but
+    /// no `WebVHHosting` endpoint (template `did-hosting-server`). Used by
+    /// `webvh-witness`, whose own DID is reachable only over DIDComm even
+    /// though its `did.jsonl` is hosted on a did-hosting-server.
+    DidcommOnly { mediator_did: &'a str },
+}
+
+/// Server-managed publication target — the registered hosting server (and
+/// optional tenant domain / path) a `Hosted` DID is published on instead of
+/// self-hosting. Maps to the `WEBVH_SERVER`/`WEBVH_DOMAIN`/`WEBVH_PATH`
+/// template variables.
+pub struct WebvhRemoteTarget<'a> {
+    pub server_id: &'a str,
+    pub domain: Option<&'a str>,
+    pub path: Option<&'a str>,
+}
+
+/// Build the canonical [`ProvisionAsk`] for a webvh service's own DID.
+///
+/// This is the one place template selection, path-folding, and
+/// `WEBVH_*`/`MEDIATOR_DID`/`URL` variable wiring happen. Both the online
+/// round-trip and the offline sealed-bundle request consume the result, so
+/// the two paths cannot mint structurally different DIDs.
+pub fn build_webvh_provision_ask(
+    context_id: &str,
+    shape: &WebvhDidShape<'_>,
+    label: Option<&str>,
+) -> vta_sdk::provision_client::ProvisionAsk {
+    use serde_json::Value as JsonValue;
+    use vta_sdk::provision_client::ProvisionAsk;
+
+    let mut ask = match shape {
+        WebvhDidShape::Hosted {
+            origin,
+            did_path,
+            mediator_did,
+            remote,
+        } => {
+            // Serverless folds the path into the URL so the minted DID and
+            // the local import agree. Server-managed keeps the daemon's own
+            // origin as the document URL — the path rides in WEBVH_PATH.
+            let url = match remote {
+                Some(_) => origin.trim_end_matches('/').to_string(),
+                None => hosting_url_for(origin, did_path),
+            };
+            let mut ask = match mediator_did {
+                Some(med) => ProvisionAsk::did_hosting_control(context_id, url, *med),
+                None => ProvisionAsk::did_hosting_daemon(context_id, url),
+            };
+            if let Some(r) = remote {
+                ask.integration_template_vars.insert(
+                    "WEBVH_SERVER".to_string(),
+                    JsonValue::String(r.server_id.to_string()),
+                );
+                if let Some(domain) = r.domain {
+                    ask.integration_template_vars.insert(
+                        "WEBVH_DOMAIN".to_string(),
+                        JsonValue::String(domain.to_string()),
+                    );
+                }
+                if let Some(path) = r.path {
+                    ask.integration_template_vars.insert(
+                        "WEBVH_PATH".to_string(),
+                        JsonValue::String(path.to_string()),
+                    );
+                }
+            }
+            ask
+        }
+        WebvhDidShape::DidcommOnly { mediator_did } => {
+            ProvisionAsk::did_hosting_server(context_id, *mediator_did)
+        }
+    };
+    if let Some(l) = label {
+        ask = ask.with_label(l.to_string());
+    }
+    ask
+}
+
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
-/// `template` and `vars` describe the target DID template (e.g.
-/// `did-hosting-server` + `MEDIATOR_DID`, or `did-hosting-control` + `URL` +
-/// `MEDIATOR_DID`); `context_id` is embedded as the
-/// VP's `contextHint` so the VTA admin can run `vta bootstrap
-/// provision-integration` without `--context`. The resulting
-/// **VP-framed** `BootstrapRequest` is what `vta bootstrap
-/// provision-integration` consumes on the producer side. The VP's
-/// `validUntil` is set to 7 days from now to give operators headroom
-/// for the manual seal/return round-trip.
+/// The target DID is described entirely by `ask` — the *same*
+/// [`ProvisionAsk`] the online flow would send. Build it with
+/// [`build_webvh_provision_ask`] so template selection, path-folding, and
+/// variable bindings live in one place and the online/offline paths can't
+/// drift apart. The ask's `context` becomes the VP's `contextHint` (so the
+/// VTA admin can run `vta bootstrap provision-integration` without
+/// `--context`) and its `label` is carried through for audit. The VP's
+/// `validUntil` is forced to 7 days here — longer than the online default —
+/// to give operators headroom for the manual seal/return round-trip.
+///
+/// The resulting **VP-framed** `BootstrapRequest` is what `vta bootstrap
+/// provision-integration` consumes on the producer side.
 ///
 /// The caller hands `request_path` to the VTA operator and persists the
 /// returned `seed` in their secret store via
@@ -572,23 +680,25 @@ pub struct OfflineBootstrapResult {
 /// phase 2.
 pub async fn write_offline_bootstrap_request(
     request_path: &Path,
-    template: &str,
-    vars: &[(&str, &str)],
-    context_id: &str,
-    label: Option<&str>,
+    ask: &vta_sdk::provision_client::ProvisionAsk,
 ) -> Result<OfflineRequestInfo, Box<dyn std::error::Error>> {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use vta_sdk::provision_integration::ProvisionRequestBuilder;
 
+    let template = ask.integration_template.as_deref().ok_or(
+        "ProvisionAsk has no integration template — offline bootstrap requires a minted DID",
+    )?;
+    // 7-day window: the offline ferry round-trip needs more headroom than
+    // the online default the ask carries.
     let mut builder = ProvisionRequestBuilder::new(template)
-        .context_hint(context_id)
+        .context_hint(&ask.context)
         .validity(chrono::Duration::days(7));
-    for (k, v) in vars {
-        builder = builder.var(*k, *v);
+    for (k, v) in &ask.integration_template_vars {
+        builder = builder.var(k.clone(), v.clone());
     }
-    if let Some(l) = label {
-        builder = builder.label(l);
+    if let Some(l) = &ask.label {
+        builder = builder.label(l.clone());
     }
 
     let signed = builder.sign_ephemeral().await?;
@@ -755,14 +865,11 @@ pub enum OfflineOpenNextStep<'a> {
 }
 
 /// CLI-facing wrapper around [`write_offline_bootstrap_request`]. Writes
-/// a VP-framed bootstrap request targeting `template` with the supplied
-/// `vars` bindings, persists the ephemeral seed to `seed_path`
-/// (chmod 0600 on Unix), and prints step-by-step operator instructions.
-///
-/// Each binary picks its own template + vars:
-/// - `webvh-witness` → `"did-hosting-server"` + `[("MEDIATOR_DID", ...)]`
-/// - `did-hosting-server`  → `"did-hosting-daemon"` + `[("URL", ...)]`
-/// - `did-hosting-control` → `"did-hosting-control"` + `[("URL", ...), ("MEDIATOR_DID", ...)]`
+/// the VP-framed bootstrap request for `ask`, persists the ephemeral seed
+/// to `seed_path` (chmod 0600 on Unix), and prints step-by-step operator
+/// instructions. Build `ask` with [`build_webvh_provision_ask`] so the CLI
+/// packages the DID identically to the wizard. `binary` names the calling
+/// executable for the printed `vta-open` follow-up.
 ///
 /// Note: this is the **standalone-CLI** entry point (`vta-request`) for
 /// operators managing files explicitly. The wizard's `setup-offline-prepare`
@@ -770,14 +877,11 @@ pub enum OfflineOpenNextStep<'a> {
 pub async fn run_offline_request_cli(
     out: &Path,
     seed_path: &Path,
-    label: &str,
     binary: &str,
-    template: &str,
-    vars: &[(&str, &str)],
-    context_id: &str,
+    ask: &vta_sdk::provision_client::ProvisionAsk,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info =
-        write_offline_bootstrap_request(out, template, vars, context_id, Some(label)).await?;
+    let context_id = ask.context.as_str();
+    let info = write_offline_bootstrap_request(out, ask).await?;
 
     write_secret_file_0600(seed_path, &info.seed)?;
 
@@ -1288,15 +1392,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let request_path = tmp.path().join("bootstrap-request.json");
 
-        let info = write_offline_bootstrap_request(
-            &request_path,
-            "did-hosting-server",
-            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+        let ask = build_webvh_provision_ask(
             "webvh-test-ctx",
+            &WebvhDidShape::DidcommOnly {
+                mediator_did: "did:key:z6MkMockMediator",
+            },
             Some("did-hosting-control-test"),
-        )
-        .await
-        .expect("write request");
+        );
+        let info = write_offline_bootstrap_request(&request_path, &ask)
+            .await
+            .expect("write request");
 
         // Request file: VP-framed BootstrapRequest as produced by
         // `ProvisionRequestBuilder::sign_ephemeral`.
@@ -1361,15 +1466,16 @@ mod tests {
         let request_path = tmp.path().join("bootstrap-request.json");
 
         // -------- Phase 1: webvh produces the VP-framed request ----------
-        let info = write_offline_bootstrap_request(
-            &request_path,
-            "did-hosting-server",
-            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
+        let ask = build_webvh_provision_ask(
             "webvh-roundtrip-ctx",
+            &WebvhDidShape::DidcommOnly {
+                mediator_did: "did:key:z6MkMockMediator",
+            },
             Some("roundtrip-full"),
-        )
-        .await
-        .expect("write request");
+        );
+        let info = write_offline_bootstrap_request(&request_path, &ask)
+            .await
+            .expect("write request");
 
         // -------- Phase 2: simulated VTA opens, builds, seals ------------
         // Verify the VP exactly as a real VTA would, surfacing the holder
@@ -1644,29 +1750,154 @@ mod tests {
         let r1 = tmp.path().join("r1.json");
         let r2 = tmp.path().join("r2.json");
 
-        let a = write_offline_bootstrap_request(
-            &r1,
-            "did-hosting-server",
-            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
-            "webvh-test-ctx",
-            None,
-        )
-        .await
-        .unwrap();
-        let b = write_offline_bootstrap_request(
-            &r2,
-            "did-hosting-server",
-            &[("MEDIATOR_DID", "did:key:z6MkMockMediator")],
-            "webvh-test-ctx",
-            None,
-        )
-        .await
-        .unwrap();
+        let ask = || {
+            build_webvh_provision_ask(
+                "webvh-test-ctx",
+                &WebvhDidShape::DidcommOnly {
+                    mediator_did: "did:key:z6MkMockMediator",
+                },
+                None,
+            )
+        };
+        let a = write_offline_bootstrap_request(&r1, &ask()).await.unwrap();
+        let b = write_offline_bootstrap_request(&r2, &ask()).await.unwrap();
 
         // Each call mints a fresh Ed25519 seed → different did:key,
         // different nonce, different seed.
         assert_ne!(a.client_did, b.client_did, "new keypair per call");
         assert_ne!(a.nonce, b.nonce, "new nonce per call");
         assert_ne!(a.seed, b.seed, "new seed per call");
+    }
+
+    #[test]
+    fn build_ask_hosted_serverless_folds_path_no_webvh_vars() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://did.example.com",
+                did_path: "services/control",
+                mediator_did: Some("did:key:z6MkMed"),
+                remote: None,
+            },
+            Some("lbl"),
+        );
+        assert_eq!(
+            ask.integration_template.as_deref(),
+            Some("did-hosting-control")
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("URL"),
+            Some(&serde_json::Value::String(
+                "https://did.example.com/services/control".into()
+            )),
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("MEDIATOR_DID"),
+            Some(&serde_json::Value::String("did:key:z6MkMed".into())),
+        );
+        assert!(!ask.integration_template_vars.contains_key("WEBVH_SERVER"));
+        assert_eq!(ask.label.as_deref(), Some("lbl"));
+    }
+
+    #[test]
+    fn build_ask_hosted_no_mediator_uses_daemon_template() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://did.example.com",
+                did_path: ".well-known",
+                mediator_did: None,
+                remote: None,
+            },
+            None,
+        );
+        assert_eq!(
+            ask.integration_template.as_deref(),
+            Some("did-hosting-daemon")
+        );
+        // `.well-known` carries no path segment, so the URL is the origin.
+        assert_eq!(
+            ask.integration_template_vars.get("URL"),
+            Some(&serde_json::Value::String("https://did.example.com".into())),
+        );
+    }
+
+    #[test]
+    fn build_ask_hosted_server_managed_injects_webvh_vars_and_keeps_origin() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://daemon.example.com",
+                // ignored for the URL in server-managed mode
+                did_path: "ignored",
+                mediator_did: None,
+                remote: Some(WebvhRemoteTarget {
+                    server_id: "srv-1",
+                    domain: Some("hosting.example.com"),
+                    path: Some("acme"),
+                }),
+            },
+            None,
+        );
+        // URL stays the daemon's own origin (not folded with did_path).
+        assert_eq!(
+            ask.integration_template_vars.get("URL"),
+            Some(&serde_json::Value::String(
+                "https://daemon.example.com".into()
+            )),
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("WEBVH_SERVER"),
+            Some(&serde_json::Value::String("srv-1".into())),
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("WEBVH_DOMAIN"),
+            Some(&serde_json::Value::String("hosting.example.com".into())),
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("WEBVH_PATH"),
+            Some(&serde_json::Value::String("acme".into())),
+        );
+    }
+
+    #[test]
+    fn build_ask_server_managed_omits_domain_when_none() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://daemon.example.com",
+                did_path: ".well-known",
+                mediator_did: None,
+                remote: Some(WebvhRemoteTarget {
+                    server_id: "srv-1",
+                    domain: None,
+                    path: Some("acme"),
+                }),
+            },
+            None,
+        );
+        assert!(ask.integration_template_vars.contains_key("WEBVH_SERVER"));
+        assert!(!ask.integration_template_vars.contains_key("WEBVH_DOMAIN"));
+        assert!(ask.integration_template_vars.contains_key("WEBVH_PATH"));
+    }
+
+    #[test]
+    fn build_ask_didcomm_only_uses_server_template_no_url() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::DidcommOnly {
+                mediator_did: "did:key:z6MkMed",
+            },
+            None,
+        );
+        assert_eq!(
+            ask.integration_template.as_deref(),
+            Some("did-hosting-server")
+        );
+        assert!(!ask.integration_template_vars.contains_key("URL"));
+        assert_eq!(
+            ask.integration_template_vars.get("MEDIATOR_DID"),
+            Some(&serde_json::Value::String("did:key:z6MkMed".into())),
+        );
     }
 }

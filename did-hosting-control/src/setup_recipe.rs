@@ -15,7 +15,7 @@ use did_hosting_common::server::setup_recipe::{
 };
 use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::vta_setup;
-use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages, ProvisionAsk};
+use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
@@ -93,56 +93,42 @@ pub async fn apply_recipe(
         .unwrap_or_default()
         .trim_end_matches('/')
         .to_string();
+    let did_path = recipe
+        .identity
+        .did_path
+        .clone()
+        .unwrap_or_else(|| "services/control".to_string());
     let context_id = recipe
         .vta
         .context_id
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
 
-    // Online mode mints via `did-hosting-control` template only when a mediator
-    // is configured (the template requires MEDIATOR_DID); otherwise we
-    // mint via `did-hosting-daemon` for HTTP-only and rely on runtime DIDComm
-    // wiring of `mediator_did` separately.
-    let ask = match (
+    // One ask packages the control plane's DID identically for the online
+    // round-trip and the offline sealed-bundle request — the shared builder
+    // folds `did_path` into the URL and selects `did-hosting-control`
+    // (HTTP + DIDComm) when a mediator is configured, else `did-hosting-daemon`
+    // (HTTP-only). `did_hosting_url` (bare origin) is still what lands in config.
+    let ask = matches!(
         recipe.deployment.vta_mode,
-        recipe.identity.mediator_did.as_deref(),
-    ) {
-        (VtaMode::Online, Some(med)) => Some(
-            ProvisionAsk::did_hosting_control(&context_id, &did_hosting_url, med)
-                .with_label(format!("did-hosting-control setup — {context_id}")),
-        ),
-        (VtaMode::Online, None) => Some(
-            ProvisionAsk::did_hosting_daemon(&context_id, &did_hosting_url)
-                .with_label(format!("did-hosting-control setup — {context_id}")),
-        ),
-        _ => None,
-    };
-
-    // Build the offline-prepare template + vars in named locals so the
-    // borrows live until the await point.
-    let template_name = if recipe.identity.mediator_did.is_some() {
-        "did-hosting-control"
-    } else {
-        "did-hosting-daemon"
-    };
-    let url_var = did_hosting_url.as_str();
-    let mediator_var = recipe.identity.mediator_did.as_deref();
-    let template_vars: Vec<(&str, &str)> = match mediator_var {
-        Some(med) => vec![("URL", url_var), ("MEDIATOR_DID", med)],
-        None => vec![("URL", url_var)],
-    };
-
-    let outcome = run_vta_for_recipe(
-        &recipe,
-        ask,
-        messages,
-        setup_key,
-        template_name,
-        &template_vars,
-        Some("did-hosting-control"),
-        offline_complete_seed,
+        VtaMode::Online | VtaMode::OfflinePrepare
     )
-    .await?;
+    .then(|| {
+        let shape = vta_setup::WebvhDidShape::Hosted {
+            origin: &did_hosting_url,
+            did_path: &did_path,
+            mediator_did: recipe.identity.mediator_did.as_deref(),
+            remote: None,
+        };
+        vta_setup::build_webvh_provision_ask(
+            &context_id,
+            &shape,
+            Some(&format!("did-hosting-control setup — {context_id}")),
+        )
+    });
+
+    let outcome =
+        run_vta_for_recipe(&recipe, ask, messages, setup_key, offline_complete_seed).await?;
 
     let (
         control_did,

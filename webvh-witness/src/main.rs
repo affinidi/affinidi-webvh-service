@@ -366,14 +366,21 @@ async fn main() {
             mediator_did,
             context,
         }) => {
+            // The witness DID is DIDComm-only (`did-hosting-server` template,
+            // MEDIATOR_DID only — no hosting URL).
+            let shape = did_hosting_common::server::vta_setup::WebvhDidShape::DidcommOnly {
+                mediator_did: mediator_did.as_str(),
+            };
+            let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
+                &context,
+                &shape,
+                Some(&label),
+            );
             if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
                 &out,
                 &seed,
-                &label,
                 "webvh-witness",
-                "did-hosting-server",
-                &[("MEDIATOR_DID", mediator_did.as_str())],
-                &context,
+                &ask,
             )
             .await
             {
