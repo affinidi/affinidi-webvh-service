@@ -397,9 +397,8 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did: String = Input::new()
-        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
-        .interact_text()?;
+    let vta_did =
+        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
         .default("webvh".to_string())
@@ -497,9 +496,8 @@ async fn run_online_provision(
     eprintln!("  WebAuthn RP). When self-hosting, the embedded server also");
     eprintln!("  serves the daemon's DID document at <public-url>/<did-path>/did.jsonl.");
     eprintln!();
-    let entered_url: String = Input::new()
-        .with_prompt("Public URL (e.g. https://webvh.example.com)")
-        .interact_text()?;
+    let entered_url =
+        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
 
     // Discover-first webvh publication choice: serverless (self-host) vs a
@@ -848,9 +846,8 @@ async fn run_self_managed_setup(
     eprintln!("  The public URL is where the daemon is reachable. The daemon");
     eprintln!("  hosts its own DID document at <public-url>/<did-path>/did.jsonl.");
     eprintln!();
-    let entered_url: String = Input::new()
-        .with_prompt("Public URL (e.g. https://webvh.example.com)")
-        .interact_text()?;
+    let entered_url =
+        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     warn_if_insecure_public_url(&public_url);
     let did_path = prompt_did_path(&default_did_path)?;
@@ -1126,9 +1123,8 @@ pub async fn run_setup_offline_prepare(
     // `public_url` is the bare origin; the DID path is prompted separately
     // and folded into the hosting URL embedded in the bootstrap request, so
     // the VTA-minted DID and the phase-2 local import agree on the path.
-    let entered_url: String = Input::new()
-        .with_prompt("Public URL (e.g. https://webvh.example.com)")
-        .interact_text()?;
+    let entered_url =
+        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     let did_path = prompt_did_path(&default_did_path)?;
 
@@ -1484,10 +1480,7 @@ fn prompt_did_path(default: &str) -> Result<String, Box<dyn std::error::Error>> 
 /// Confirm-then-Input and made the wizard look like it asked for the
 /// mediator twice.
 fn prompt_mediator_did() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let did: String = Input::new()
-        .with_prompt("Mediator DID (leave empty to skip)")
-        .allow_empty(true)
-        .interact_text()?;
+    let did = setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
     let trimmed = did.trim();
     Ok(if trimmed.is_empty() {
         None

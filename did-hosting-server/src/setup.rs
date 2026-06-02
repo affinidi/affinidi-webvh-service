@@ -109,9 +109,8 @@ pub async fn run_wizard(
     eprintln!("  Each server instance in a distributed deployment should have a");
     eprintln!("  unique URL and therefore a unique DID.");
     eprintln!();
-    let public_url: String = Input::new()
-        .with_prompt("Server URL (e.g. https://server1.example.com)")
-        .interact_text()?;
+    let public_url =
+        setup_prompts::prompt_long_value("Server URL (e.g. https://server1.example.com)", false)?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
     // DID path derived from the URL's path component. With a bare host
@@ -174,7 +173,7 @@ pub async fn run_wizard(
     } else if mediator_options[mediator_idx].starts_with("Use VTA") {
         vta_mediator.clone()
     } else {
-        let did: String = Input::new().with_prompt("Mediator DID").interact_text()?;
+        let did: String = setup_prompts::prompt_long_value("Mediator DID", false)?;
         if did.is_empty() { None } else { Some(did) }
     };
 
@@ -185,10 +184,7 @@ pub async fn run_wizard(
     eprintln!("  plane's DID so this server can authenticate sync messages.");
     eprintln!("  (Leave empty to configure later in config.toml)");
     eprintln!();
-    let control_did: String = Input::new()
-        .with_prompt("Control plane DID")
-        .default(String::new())
-        .interact_text()?;
+    let control_did = setup_prompts::prompt_long_value("Control plane DID", true)?;
     let control_did = if control_did.is_empty() {
         None
     } else {
@@ -408,9 +404,8 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did: String = Input::new()
-        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
-        .interact_text()?;
+    let vta_did =
+        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
         .default("webvh".to_string())
@@ -551,9 +546,8 @@ pub async fn run_setup_offline_prepare(
     }
 
     eprintln!();
-    let public_url: String = Input::new()
-        .with_prompt("Server URL (e.g. https://server1.example.com)")
-        .interact_text()?;
+    let public_url =
+        setup_prompts::prompt_long_value("Server URL (e.g. https://server1.example.com)", false)?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
     // Origin + DID path from the URL's path component (matches the online
@@ -576,10 +570,8 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
     eprintln!();
-    let mediator_raw: String = Input::new()
-        .with_prompt("Mediator DID (leave empty to skip)")
-        .default(String::new())
-        .interact_text()?;
+    let mediator_raw =
+        setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
     let mediator_did = if mediator_raw.trim().is_empty() {
         None
     } else {
@@ -587,10 +579,8 @@ pub async fn run_setup_offline_prepare(
     };
 
     eprintln!();
-    let control_did: String = Input::new()
-        .with_prompt("Control plane DID (leave empty to set later)")
-        .default(String::new())
-        .interact_text()?;
+    let control_did =
+        setup_prompts::prompt_long_value("Control plane DID (leave empty to set later)", true)?;
     let control_did = if control_did.is_empty() {
         None
     } else {

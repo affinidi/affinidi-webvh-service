@@ -124,9 +124,8 @@ pub async fn run_wizard(
     eprintln!();
     eprintln!("  The witness DID will be hosted on your did-hosting-server.");
     eprintln!();
-    let did_hosting_url: String = Input::new()
-        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
-        .interact_text()?;
+    let did_hosting_url =
+        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)?;
     let _did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
     // 5. DID path
@@ -396,9 +395,8 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did: String = Input::new()
-        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
-        .interact_text()?;
+    let vta_did =
+        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
         .default("webvh".to_string())
@@ -427,7 +425,7 @@ async fn run_online_provision(
             .clone()
             .expect("Use VTA option only present when discovered")
     } else {
-        Input::new().with_prompt("Mediator DID").interact_text()?
+        setup_prompts::prompt_long_value("Mediator DID", false)?
     };
 
     let setup_key = match preloaded_setup_key {
@@ -577,9 +575,8 @@ pub async fn run_setup_offline_prepare(
     let enable_didcomm = selected.contains(&0);
     let enable_rest_api = selected.contains(&1);
 
-    let did_hosting_url: String = Input::new()
-        .with_prompt("DID hosting URL (e.g. https://did.example.com)")
-        .interact_text()?;
+    let did_hosting_url =
+        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
     let did_path: String = Input::new()
@@ -602,10 +599,8 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
     eprintln!();
-    let mediator_raw: String = Input::new()
-        .with_prompt("Mediator DID (leave empty to skip)")
-        .default(String::new())
-        .interact_text()?;
+    let mediator_raw =
+        setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
     let mediator_did = if mediator_raw.trim().is_empty() {
         None
     } else {
