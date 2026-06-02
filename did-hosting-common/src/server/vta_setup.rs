@@ -154,7 +154,7 @@ pub struct OnlineProvisionInputs {
     /// VTA context the integration will live in.
     pub context_id: String,
     /// Pre-built `ProvisionAsk` (e.g. from
-    /// `ProvisionAsk::did_hosting_daemon` or `did_hosting_server`).
+    /// `ProvisionAsk::did_host_http` or `did_host_didcomm`).
     pub ask: vta_sdk::provision_client::ProvisionAsk,
     /// Per-binary user-facing labels and `pnm contexts create` command
     /// hint.
@@ -625,8 +625,8 @@ pub fn build_webvh_provision_ask(
                 None => hosting_url_for(origin, did_path),
             };
             let mut ask = match mediator_did {
-                Some(med) => ProvisionAsk::did_hosting_control(context_id, url, *med),
-                None => ProvisionAsk::did_hosting_daemon(context_id, url),
+                Some(med) => ProvisionAsk::did_host_http_didcomm(context_id, url, *med),
+                None => ProvisionAsk::did_host_http(context_id, url),
             };
             if let Some(r) = remote {
                 ask.integration_template_vars.insert(
@@ -649,7 +649,7 @@ pub fn build_webvh_provision_ask(
             ask
         }
         WebvhDidShape::DidcommOnly { mediator_did } => {
-            ProvisionAsk::did_hosting_server(context_id, *mediator_did)
+            ProvisionAsk::did_host_didcomm(context_id, *mediator_did)
         }
     };
     if let Some(l) = label {
