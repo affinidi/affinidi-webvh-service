@@ -778,6 +778,45 @@ extended because the tag still hasn't moved.
   transitive deps (`aes 0.9`, `cipher 0.5`, `cpubits 0.1`,
   `inout 0.2`, `vta-sdk 0.6` — workspace already pins 0.7).
 
+### Follow-ups — affinidi-messaging-didcomm 0.15 ecosystem bump (2026-06-03)
+
+A dependency-only pass over the v0.7.0 cut. No wire, API, ABI, or
+on-disk format changes; the entire move is version alignment in the
+lockfile plus three stale test assertions. Same v0.7.0 dated section
+is extended because the tag still hasn't moved.
+
+#### Build
+
+- **`affinidi-messaging-didcomm` 0.14 → 0.15.** The whole Affinidi
+  stack has to move in lockstep, otherwise two didcomm versions coexist
+  and `Message` / `UnpackMetadata` stop unifying across crate
+  boundaries (`did-hosting-control` failed to compile: the DIDComm
+  service router operates on `affinidi_tdk`'s re-export while our direct
+  dep stayed on 0.14). Only `Cargo.toml` changed (`affinidi-messaging-didcomm
+  = "0.15"`); everything else was re-locked under the existing
+  `"0.7"`/`"0.3"`/`"0.9"`/`"0.1"` pins:
+  - `affinidi-messaging-didcomm-service` 0.3.2 → 0.3.3
+  - `affinidi-tdk` 0.7.2 → 0.7.3
+  - `affinidi-messaging-sdk` 0.18.4 → 0.18.6
+  - `affinidi-did-authentication` 0.3.4 → 0.3.5,
+    `affinidi-meeting-place` 0.4.1 → 0.4.2 (both inside the tdk subtree)
+  - `trust-tasks-didcomm` 0.1.3 → 0.1.4 (the last crate holding a stray
+    didcomm 0.14.0; the lock now carries a single didcomm 0.15.0)
+  - dev-deps: `affinidi-messaging-mediator` 0.15.7 → 0.15.12 (drops the
+    stale `vta-sdk 0.7.0` + `affinidi-messaging-didcomm 0.13.3` chain),
+    `affinidi-messaging-mediator-common` 0.15.1 → 0.15.3,
+    `affinidi-messaging-test-mediator` 0.2.3 → 0.2.4
+
+#### Fixed
+
+- **Stale provision-ask template assertions.** Three
+  `did-hosting-common::server::vta_setup` tests still expected the
+  pre-rename service-named templates (`did-hosting-{control,daemon,server}`)
+  after the v0.7.0 repipe to vta-sdk's capability-named builders. Updated
+  to the values the production code now emits — `did-host-http-didcomm`,
+  `did-host-http`, `did-host-didcomm`. Pre-existing failures, unrelated
+  to the didcomm bump.
+
 ## 0.6.0 (2026-05-05)
 
 ### Security

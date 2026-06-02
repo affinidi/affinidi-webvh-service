@@ -1783,7 +1783,7 @@ mod tests {
         );
         assert_eq!(
             ask.integration_template.as_deref(),
-            Some("did-hosting-control")
+            Some("did-host-http-didcomm")
         );
         assert_eq!(
             ask.integration_template_vars.get("URL"),
@@ -1811,10 +1811,7 @@ mod tests {
             },
             None,
         );
-        assert_eq!(
-            ask.integration_template.as_deref(),
-            Some("did-hosting-daemon")
-        );
+        assert_eq!(ask.integration_template.as_deref(), Some("did-host-http"));
         // `.well-known` carries no path segment, so the URL is the origin.
         assert_eq!(
             ask.integration_template_vars.get("URL"),
@@ -1892,7 +1889,7 @@ mod tests {
         );
         assert_eq!(
             ask.integration_template.as_deref(),
-            Some("did-hosting-server")
+            Some("did-host-didcomm")
         );
         assert!(!ask.integration_template_vars.contains_key("URL"));
         assert_eq!(
