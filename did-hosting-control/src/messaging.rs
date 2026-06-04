@@ -334,6 +334,39 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
 // DID operation dispatch
 // ---------------------------------------------------------------------------
 
+/// Project a stored [`DidRecord`] into the canonical `DidRecord` wire
+/// shape used by the `did-management/did/*` Trust Task family
+/// (camelCase keys, RFC3339 timestamps).
+///
+/// `did_url` is the resolvable location of the DID log document; it is
+/// stable from the initial reservation (`versionCount: 0`) and lets the
+/// owner know where to publish and where resolvers will fetch. `didId`
+/// is only meaningful once a log entry exists, so it is emitted solely
+/// when `versionCount > 0`.
+fn spec_did_record_json(record: &did_hosting_common::did_ops::DidRecord, did_url: &str) -> Value {
+    let rfc3339 = |secs: u64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let mut rec = serde_json::Map::new();
+    rec.insert("mnemonic".into(), json!(record.mnemonic));
+    rec.insert("owner".into(), json!(record.owner));
+    rec.insert("createdAt".into(), json!(rfc3339(record.created_at)));
+    rec.insert("updatedAt".into(), json!(rfc3339(record.updated_at)));
+    rec.insert("versionCount".into(), json!(record.version_count));
+    rec.insert("method".into(), json!(record.method));
+    rec.insert("disabled".into(), json!(record.disabled));
+    rec.insert("didUrl".into(), json!(did_url));
+    if !record.domain.is_empty() {
+        rec.insert("domain".into(), json!(record.domain));
+    }
+    if let Some(did_id) = record.did_id.as_ref().filter(|_| record.version_count > 0) {
+        rec.insert("didId".into(), json!(did_id));
+    }
+    Value::Object(rec)
+}
+
 /// Single transport-agnostic dispatch table for VTA DID-management
 /// `MSG_*` types.
 ///
@@ -357,12 +390,39 @@ pub async fn dispatch_did_op(
     // a protocol error code).
     match msg.typ.as_str() {
         MSG_DID_REQUEST => {
+            // `did-management/did/check-name/0.1`. Two modes share this
+            // task (see the spec): an availability *probe* (`reserve`
+            // false/absent) that never mutates state, and a *reserve*
+            // (`reserve: true`) that atomically claims a slot. Reserve
+            // additionally supports *auto-assign*: when `path` is
+            // omitted the host generates a fresh server-side mnemonic.
             let path = msg.body.get("path").and_then(|v| v.as_str());
+            let reserve = msg
+                .body
+                .get("reserve")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let force = msg
                 .body
                 .get("force")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+
+            // Probe mode is read-only and MUST name a path — a path-less
+            // request is only meaningful as an auto-assign reservation.
+            if !reserve {
+                let path = path.ok_or_else(|| {
+                    AppError::Validation(
+                        "check-name without `reserve: true` requires a `path` to probe".into(),
+                    )
+                })?;
+                let probe = did_ops::check_name(state, path).await?;
+                return Ok((
+                    MSG_DID_OFFER.to_string(),
+                    json!({ "available": probe.available, "reserved": false }),
+                ));
+            }
+
             // T34 domain resolution mirrors the REST `request_uri` handler.
             // Same chain: explicit on the wire → caller's ACL default →
             // system default. When resolution fails (no domains
@@ -391,18 +451,40 @@ pub async fn dispatch_did_op(
                 system_default.as_deref(),
             )
             .ok();
-            let result =
-                did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await?;
+
+            // Reserve. `path == None` → auto-assign. An explicitly-named
+            // path that is already taken (without `force`) is not an
+            // error here: the spec says return `available: false,
+            // reserved: false` and DO NOT mutate. `create_did` signals
+            // that case with `Conflict`, which we translate rather than
+            // surface as a problem report.
             // No fan-out on force-replace: see `routes/did_manage::request_uri`.
-            let server_did = state.config.server_did.as_deref().unwrap_or_default();
-            Ok((
-                MSG_DID_OFFER.to_string(),
-                json!({
-                    "mnemonic": result.mnemonic,
-                    "did_url": result.did_url,
-                    "server_did": server_did,
-                }),
-            ))
+            match did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await {
+                Ok(result) => {
+                    // Read the committed record back for the canonical
+                    // response fields (timestamps, owner, version).
+                    let record: did_hosting_common::did_ops::DidRecord = state
+                        .dids_ks
+                        .get(did_key(&result.mnemonic))
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::Internal("record missing after reservation".into())
+                        })?;
+                    Ok((
+                        MSG_DID_OFFER.to_string(),
+                        json!({
+                            "available": true,
+                            "reserved": true,
+                            "record": spec_did_record_json(&record, &result.did_url),
+                        }),
+                    ))
+                }
+                Err(AppError::Conflict(_)) => Ok((
+                    MSG_DID_OFFER.to_string(),
+                    json!({ "available": false, "reserved": false }),
+                )),
+                Err(e) => Err(e),
+            }
         }
         MSG_DID_REGISTER => {
             // Atomic claim-and-publish — see did_ops::register_did_atomic.
@@ -1733,33 +1815,40 @@ mod tests {
         );
     }
 
-    /// A `MSG_DID_REQUEST` with no path generates a fresh mnemonic, persists
-    /// a `DidRecord` owned by the caller, and replies with `MSG_DID_OFFER`
-    /// carrying the wire-level fields the SDK consumes.
+    /// Auto-assign: a `check-name` with `reserve: true` and no `path`
+    /// generates a fresh mnemonic, persists a `DidRecord` owned by the
+    /// caller, and replies with `available: true, reserved: true` and a
+    /// `record` carrying the assigned `mnemonic` + `didUrl`.
     #[tokio::test]
-    async fn dispatch_did_op_did_request_generates_record_and_offer() {
+    async fn dispatch_did_op_did_request_auto_assign_reserves_record() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner-a";
-        let msg = build_msg(MSG_DID_REQUEST, json!({}));
+        let msg = build_msg(MSG_DID_REQUEST, json!({ "reserve": true }));
         let auth = owner_auth(owner);
 
         let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
         assert_eq!(typ, MSG_DID_OFFER);
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
 
-        let mnemonic = body
+        let record_json = body.get("record").expect("reserved offer carries record");
+        let mnemonic = record_json
             .get("mnemonic")
             .and_then(|v| v.as_str())
-            .expect("offer has mnemonic")
+            .expect("record has mnemonic")
             .to_string();
-        let did_url = body
-            .get("did_url")
+        let did_url = record_json
+            .get("didUrl")
             .and_then(|v| v.as_str())
-            .expect("offer has did_url");
+            .expect("record has didUrl");
         assert!(
             did_url.ends_with(&format!("/{mnemonic}/did.jsonl")),
-            "did_url shape: {did_url}"
+            "didUrl shape: {did_url}"
         );
-        assert!(body.get("server_did").is_some());
+        assert_eq!(
+            record_json.get("versionCount").and_then(|v| v.as_u64()),
+            Some(0)
+        );
 
         // Verify the record landed in the dids keyspace, owned by the caller.
         let record: DidRecord = state
@@ -1770,6 +1859,92 @@ mod tests {
             .expect("record persisted");
         assert_eq!(record.owner, owner);
         assert_eq!(record.version_count, 0);
+    }
+
+    /// Auto-assign is collision-free: two successive `reserve: true`
+    /// requests with no `path` yield two *different* mnemonics, each
+    /// persisted. Mirrors the VTA-side regression at
+    /// `vta-service/src/webvh_didcomm.rs` ("auto-assign (path == None)").
+    #[tokio::test]
+    async fn dispatch_did_op_auto_assign_yields_distinct_mnemonics() {
+        let (state, _dir) = test_state().await;
+        let auth = owner_auth("did:example:owner-a");
+        let body = json!({ "reserve": true });
+
+        let extract = |v: &Value| {
+            v.get("record")
+                .and_then(|r| r.get("mnemonic"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .expect("reserved record has mnemonic")
+        };
+        let (_t1, b1) = dispatch_did_op(&auth, &state, &build_msg(MSG_DID_REQUEST, body.clone()))
+            .await
+            .unwrap();
+        let (_t2, b2) = dispatch_did_op(&auth, &state, &build_msg(MSG_DID_REQUEST, body))
+            .await
+            .unwrap();
+        let m1 = extract(&b1);
+        let m2 = extract(&b2);
+        assert_ne!(m1, m2, "auto-assign must not collide");
+        assert!(
+            state
+                .dids_ks
+                .get::<DidRecord>(did_key(&m1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .dids_ks
+                .get::<DidRecord>(did_key(&m2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Pure availability probe (`reserve` absent) is read-only: it reports
+    /// `available` for the named path and persists nothing.
+    #[tokio::test]
+    async fn dispatch_did_op_check_name_probe_is_read_only() {
+        let (state, _dir) = test_state().await;
+        let auth = owner_auth("did:example:owner-a");
+
+        // Free path → available, not reserved, no record written.
+        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": "free-path" }));
+        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
+        assert!(body.get("record").is_none());
+        assert!(
+            state
+                .dids_ks
+                .get::<DidRecord>(did_key("free-path"))
+                .await
+                .unwrap()
+                .is_none(),
+            "probe must not reserve the path"
+        );
+
+        // Taken path → not available.
+        seed_did(&state, "did:example:owner-b", "taken-path").await;
+        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": "taken-path" }));
+        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// A path-less request without `reserve: true` has no subject to
+    /// probe and is rejected (spec §Conformance consumer rule 1).
+    #[tokio::test]
+    async fn dispatch_did_op_check_name_pathless_probe_rejected() {
+        let (state, _dir) = test_state().await;
+        let auth = owner_auth("did:example:owner-a");
+        let msg = build_msg(MSG_DID_REQUEST, json!({}));
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A request bearing the canonical spec URI
@@ -1785,15 +1960,16 @@ mod tests {
         let spec_check_name = "https://trusttasks.org/spec/did-management/did/check-name/0.1";
         let spec_response =
             "https://trusttasks.org/spec/did-management/did/check-name/0.1#response";
-        let msg = build_msg(spec_check_name, json!({}));
+        let msg = build_msg(spec_check_name, json!({ "reserve": true }));
         let auth = owner_auth(owner);
 
         let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
         assert_eq!(typ, spec_response);
         let mnemonic = body
-            .get("mnemonic")
+            .get("record")
+            .and_then(|r| r.get("mnemonic"))
             .and_then(|v| v.as_str())
-            .expect("response carries mnemonic");
+            .expect("response carries record.mnemonic");
         // Record persisted under caller's ownership, same as the legacy path.
         let record: DidRecord = state
             .dids_ks
@@ -1804,27 +1980,35 @@ mod tests {
         assert_eq!(record.owner, owner);
     }
 
-    /// Reserving a custom path that's already taken returns `Conflict`,
-    /// which the mapper sends back as `e.p.did.path-unavailable`.
+    /// Reserving an explicit custom path that's already taken (without
+    /// `force`) is NOT an error under check-name: the spec mandates
+    /// `available: false, reserved: false` with no mutation.
     #[tokio::test]
-    async fn dispatch_did_op_did_request_taken_path_conflict() {
+    async fn dispatch_did_op_did_request_taken_path_not_available() {
         let (state, _dir) = test_state().await;
         seed_did(&state, "did:example:owner-a", "shared-path").await;
 
-        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": "shared-path" }));
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "reserve": true }),
+        );
         let auth = owner_auth("did:example:owner-b");
 
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Conflict(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.path-unavailable");
+        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
+        assert!(body.get("record").is_none());
     }
 
-    /// `.well-known` is admin-only; non-admins get `Forbidden` →
-    /// `e.p.did.unauthorized`.
+    /// `.well-known` is admin-only; a non-admin reserving it gets
+    /// `Forbidden` → `e.p.did.unauthorized`.
     #[tokio::test]
     async fn dispatch_did_op_did_request_well_known_forbidden_for_owner() {
         let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": ".well-known" }));
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": ".well-known", "reserve": true }),
+        );
         let auth = owner_auth("did:example:owner-a");
 
         let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
@@ -2273,14 +2457,17 @@ mod tests {
 
         let msg = build_msg(
             MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "force": true }),
+            json!({ "path": "shared-path", "reserve": true, "force": true }),
         );
         let auth = owner_auth(owner);
 
         let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
         assert_eq!(typ, MSG_DID_OFFER);
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
-            body.get("mnemonic").and_then(|v| v.as_str()),
+            body.get("record")
+                .and_then(|r| r.get("mnemonic"))
+                .and_then(|v| v.as_str()),
             Some("shared-path")
         );
 
@@ -2310,7 +2497,7 @@ mod tests {
 
         let msg = build_msg(
             MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "force": true }),
+            json!({ "path": "shared-path", "reserve": true, "force": true }),
         );
         let auth = owner_auth("did:example:owner-b");
 
@@ -2327,7 +2514,7 @@ mod tests {
         let admin = admin_auth("did:example:admin");
         let msg = build_msg(
             MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "force": true }),
+            json!({ "path": "shared-path", "reserve": true, "force": true }),
         );
 
         let (typ, _body) = dispatch_did_op(&admin, &state, &msg).await.unwrap();
