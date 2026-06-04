@@ -526,11 +526,17 @@ pub async fn dispatch_did_op(
                 .get("mnemonic")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
+            // The v0.1 spec names the log field `didData` (camelCase, like
+            // every other did-management wire field — see register/0.1 +
+            // publish/0.1). `did_log` is the pre-v0.7 legacy alias. Accept
+            // both, preferring the canonical name, so the VTA's spec-correct
+            // `didData` body publishes and old `did_log` clients still work.
             let did_log = msg
                 .body
-                .get("did_log")
+                .get("didData")
+                .or_else(|| msg.body.get("did_log"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'did_log' in body".into()))?;
+                .ok_or_else(|| AppError::Validation("missing 'didData' in body".into()))?;
 
             did_ops::publish_did(auth, state, mnemonic, did_log).await?;
 
@@ -682,11 +688,15 @@ pub async fn dispatch_did_op(
                 .get("mnemonic")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
+            // Canonical wire field is `newOwner` (camelCase, per
+            // did-management/did/change-owner/0.1); `new_owner` is the
+            // legacy snake_case alias.
             let new_owner = msg
                 .body
-                .get("new_owner")
+                .get("newOwner")
+                .or_else(|| msg.body.get("new_owner"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'new_owner' in body".into()))?;
+                .ok_or_else(|| AppError::Validation("missing 'newOwner' in body".into()))?;
             let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
             Ok((
                 MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
@@ -1595,13 +1605,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_did_op_publish_missing_did_log_validation() {
+    async fn dispatch_did_op_publish_missing_log_field_validation() {
         let (state, _dir) = test_state().await;
         let msg = build_msg(MSG_DID_PUBLISH, json!({ "mnemonic": "alpha-beta" }));
         let auth = owner_auth("did:example:caller");
 
         let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("did_log")));
+        // The canonical (camelCase, spec) field name is surfaced.
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("didData")));
+    }
+
+    /// Contract: the publish handler reads the log from the canonical
+    /// `didData` field (camelCase, matching did-management/did/publish/0.1
+    /// and what the VTA sends). Proven by getting *past* field extraction —
+    /// the request fails later on the unknown mnemonic, not on a missing
+    /// field. Pins the VTA<->host field name so they can't drift again.
+    #[tokio::test]
+    async fn dispatch_did_op_publish_reads_did_data_field() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_DID_PUBLISH,
+            json!({ "mnemonic": "alpha-beta", "method": "webvh", "didData": "log-content" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "didData must be read (then fail on unknown mnemonic), got: {err:?}"
+        );
+    }
+
+    /// Contract: the legacy snake_case `did_log` alias still publishes, so
+    /// pre-v0.7 clients keep working.
+    #[tokio::test]
+    async fn dispatch_did_op_publish_accepts_legacy_did_log_alias() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_DID_PUBLISH,
+            json!({ "mnemonic": "alpha-beta", "did_log": "log-content" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "legacy did_log must still be read, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2323,8 +2373,9 @@ mod tests {
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
     }
 
-    /// `MSG_DID_CHANGE_OWNER` with no `new_owner` body field is a validation
-    /// error.
+    /// `MSG_DID_CHANGE_OWNER` with no new-owner body field is a validation
+    /// error surfacing the canonical camelCase field name. (The success
+    /// path below still exercises the legacy snake_case `new_owner` alias.)
     #[tokio::test]
     async fn dispatch_did_op_change_owner_missing_new_owner_validation() {
         let (state, _dir) = test_state().await;
@@ -2332,7 +2383,7 @@ mod tests {
         let auth = owner_auth("did:example:caller");
 
         let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("new_owner")));
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("newOwner")));
     }
 
     /// Owner can transfer their own DID to another ACL'd DID. Confirms the

@@ -250,7 +250,11 @@ pub struct DidRegisterRequest {
     /// Preferred T26 shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The method-specific log payload. The v0.1 Trust Task wire spells
+    /// this `didData` (camelCase, like every other did-management field);
+    /// `did_data` is accepted as a snake_case alias for REST/legacy
+    /// callers. Deserialize-only alias — serialization stays `did_data`.
+    #[serde(default, alias = "didData", skip_serializing_if = "Option::is_none")]
     pub did_data: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
@@ -394,6 +398,33 @@ mod did_register_request_tests {
             path: "alpha".into(),
             ..Default::default()
         }
+    }
+
+    /// Contract: the canonical camelCase `didData` wire field
+    /// (did-management/did/register/0.1, what the VTA sends) deserializes
+    /// into `did_data`. Pins the field name so VTA<->host can't drift.
+    #[test]
+    fn camelcase_did_data_wire_field_deserializes() {
+        let r: DidRegisterRequest = serde_json::from_value(json!({
+            "path": "alpha",
+            "method": "webvh",
+            "didData": "line1\nline2",
+        }))
+        .expect("didData must deserialize");
+        assert_eq!(r.did_data, Some(json!("line1\nline2")));
+        assert!(r.did_log.is_none());
+    }
+
+    /// The snake_case `did_data` alias keeps working for REST/legacy callers.
+    #[test]
+    fn snake_case_did_data_alias_still_deserializes() {
+        let r: DidRegisterRequest = serde_json::from_value(json!({
+            "path": "alpha",
+            "method": "webvh",
+            "did_data": "line1",
+        }))
+        .expect("did_data must deserialize");
+        assert_eq!(r.did_data, Some(json!("line1")));
     }
 
     #[test]
