@@ -275,19 +275,11 @@ impl KeyspaceOps for DynamoDbKeyspace {
                     }
                 }
             } else {
-                // Scan with begins_with filter
+                // Scan all pages and filter locally. DynamoDB Scan filters do not reduce read
+                // capacity, and client-side byte-prefix matching preserves the raw-key contract.
                 let mut last_key: Option<HashMap<String, AttributeValue>> = None;
                 loop {
-                    let mut req = self
-                        .client
-                        .scan()
-                        .table_name(&self.table)
-                        .filter_expression("begins_with(#pk, :prefix)")
-                        .expression_attribute_names("#pk", PK_ATTR)
-                        .expression_attribute_values(
-                            ":prefix",
-                            AttributeValue::B(Blob::new(prefix.clone())),
-                        );
+                    let mut req = self.client.scan().table_name(&self.table);
                     if let Some(ref key) = last_key {
                         req = req.set_exclusive_start_key(Some(key.clone()));
                     }
@@ -301,7 +293,10 @@ impl KeyspaceOps for DynamoDbKeyspace {
                             if let (Some(AttributeValue::B(pk)), Some(AttributeValue::B(val))) =
                                 (item.get(PK_ATTR), item.get(VAL_ATTR))
                             {
-                                results.push((pk.as_ref().to_vec(), val.as_ref().to_vec()));
+                                let pk = pk.as_ref();
+                                if pk.starts_with(&prefix) {
+                                    results.push((pk.to_vec(), val.as_ref().to_vec()));
+                                }
                             }
                         }
                     }
