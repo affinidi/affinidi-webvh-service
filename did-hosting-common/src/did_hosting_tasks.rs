@@ -61,15 +61,41 @@ pub static TASK_AUTH_AUTHENTICATE_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::
 /// WebAuthn assertion to elevate the current session to aal2. Same
 /// canonical spec as initial passkey login; handler dispatches on
 /// `payload.purpose == "step-up"`.
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_STEP_UP_PASSKEY_START_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_STEP_UP_PASSKEY_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
+});
+
+/// `spec/auth/passkey/login/start/0.2` (step-up purpose) — current
+/// version of the step-up passkey-assertion request. The deprecated
+/// [`TASK_AUTH_STEP_UP_PASSKEY_START_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_STEP_UP_PASSKEY_START_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.2").expect("static")
 });
 
 /// `spec/auth/passkey/login/finish/0.1` (step-up purpose) — submit
 /// the assertion; the consumer elevates the existing session rather
 /// than minting a new one.
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
+});
+
+/// `spec/auth/passkey/login/finish/0.2` (step-up purpose) — current
+/// version of the step-up assertion submission. The deprecated
+/// [`TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.2").expect("static")
 });
 
 /// `did-hosting/auth/step-up-check/1.0` — demo sensitive op gated on
@@ -84,14 +110,40 @@ pub static TASK_AUTH_STEP_UP_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 /// `spec/auth/step-up/approve-request/0.1` — RP asks the holder's
 /// VTA/wallet to ratify an AAL elevation. Sent FROM did-hosting TO
 /// the holder's VTA over DIDComm.
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_STEP_UP_VTA_START_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_STEP_UP_VTA_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-request/0.1").expect("static")
 });
 
+/// `spec/auth/step-up/approve-request/0.2` — current version of the
+/// AAL-elevation ratification request. The deprecated
+/// [`TASK_AUTH_STEP_UP_VTA_START_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_STEP_UP_VTA_START_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-request/0.2").expect("static")
+});
+
 /// `spec/auth/step-up/approve-response/0.1` — VTA/wallet returns the
 /// signed approval; the proof IS the cryptographic step-up gate.
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_STEP_UP_VTA_FINISH_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_STEP_UP_VTA_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-response/0.1").expect("static")
+});
+
+/// `spec/auth/step-up/approve-response/0.2` — current version of the
+/// signed-approval response. The deprecated
+/// [`TASK_AUTH_STEP_UP_VTA_FINISH_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_STEP_UP_VTA_FINISH_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-response/0.2").expect("static")
 });
 
 /// `spec/confirm/request/0.1` — canonical RP→wallet/VTA consent
@@ -361,11 +413,35 @@ pub static TASK_AUTH_PASSKEY_ENROLL_START_0_1: LazyLock<TrustTask> = LazyLock::n
 pub static TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/finish/0.1").expect("static")
 });
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_PASSKEY_LOGIN_START_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_PASSKEY_LOGIN_START_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").expect("static")
 });
+/// `spec/auth/passkey/login/start/0.2` — current version of the
+/// passkey-login assertion request. The deprecated
+/// [`TASK_AUTH_PASSKEY_LOGIN_START_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_PASSKEY_LOGIN_START_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.2").expect("static")
+});
+#[deprecated(
+    since = "0.8.0",
+    note = "spec bumped to 0.2; use TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2. \
+            The 0.1 URI is still accepted on inbound for backwards compatibility."
+)]
 pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.1").expect("static")
+});
+/// `spec/auth/passkey/login/finish/0.2` — current version of the
+/// passkey-login assertion submission. The deprecated
+/// [`TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1`] form is still accepted on
+/// inbound for backwards compatibility.
+pub static TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/finish/0.2").expect("static")
 });
 pub static TASK_AUTH_PASSKEY_INVITE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/auth/passkey/enroll/invite/0.1").expect("static")
@@ -524,6 +600,10 @@ mod tests {
     /// test forces every const to deref so the assertion runs at test
     /// time instead of in production.
     #[test]
+    // The deprecated `_0_1` auth consts are intentionally still listed
+    // — they remain accepted on inbound for backwards compatibility, so
+    // their URLs must keep validating alongside the current `_0_2` forms.
+    #[allow(deprecated)]
     fn every_registered_url_validates() {
         // List every const here. Adding a new TASK_* without adding it to
         // this list is the kind of drift the cross-crate invariant
@@ -598,6 +678,12 @@ mod tests {
             &TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1,
             &TASK_AUTH_PASSKEY_LOGIN_START_0_1,
             &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1,
+            &TASK_AUTH_PASSKEY_LOGIN_START_0_2,
+            &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2,
+            &TASK_AUTH_STEP_UP_PASSKEY_START_0_2,
+            &TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2,
+            &TASK_AUTH_STEP_UP_VTA_START_0_2,
+            &TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
             &TASK_AUTH_PASSKEY_INVITE_0_1,
             &TASK_ACL_LIST_1_0,
             &TASK_ACL_CREATE_1_0,

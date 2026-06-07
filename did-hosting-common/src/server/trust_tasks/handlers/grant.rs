@@ -323,6 +323,10 @@ mod tests {
             updated_at: None,
             updated_by: None,
             expires_at: None,
+            // `step_up` (added in the trust-tasks-rs 0.2 acl/grant schema)
+            // is an optional per-entry AAL hint we don't model — leave it
+            // unset so the entry translates as a plain webvh grant.
+            step_up: None,
             // Owner needs domains; we always supply it via the webvh ext
             // so the entry handler accepts it on translate.
             ext: serde_json::from_value(serde_json::json!({

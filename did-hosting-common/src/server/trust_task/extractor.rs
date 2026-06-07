@@ -82,6 +82,50 @@ pub(crate) async fn validate_header(
     Ok(next.run(request).await)
 }
 
+/// Multi-version permissive variant of [`validate_header_permissive`]:
+/// accepts the header when it exact-matches **any** of `accepted`.
+///
+/// Used by
+/// [`super::router::TrustTaskRouter::route_with_tasks_permissive`] to
+/// support a spec-version bump without breaking existing clients: the
+/// route's current (primary) Type URI sits at `accepted[0]` and any
+/// deprecated-but-still-accepted versions follow. Behaviour matches the
+/// single-task permissive form otherwise:
+///
+/// - Header absent → pass through.
+/// - Header present + matches any accepted version → pass through.
+/// - Header present + matches none → 415 `TrustTaskMismatch`, naming the
+///   primary (`accepted[0]`) as `expected`.
+/// - Header present + non-UTF-8 → 400 `Validation`.
+///
+/// `accepted` must be non-empty; the caller (the router builder) always
+/// supplies at least the primary task.
+pub(crate) async fn validate_header_permissive_any(
+    accepted: &[TrustTask],
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let Some(raw) = request.headers().get(HEADER_NAME) else {
+        // Header absent — let the request through.
+        return Ok(next.run(request).await);
+    };
+    let received = raw
+        .to_str()
+        .map_err(|_| AppError::Validation("Trust-Task header is not valid UTF-8".into()))?;
+
+    if accepted.iter().any(|t| t.as_str() == received) {
+        return Ok(next.run(request).await);
+    }
+
+    Err(AppError::TrustTaskMismatch {
+        // Name the primary (current) version as the expected one; the
+        // deprecated aliases are an accepted fallback, not the canonical
+        // identifier a client should send.
+        expected: accepted[0].as_str().to_string(),
+        received: Some(received.to_string()),
+    })
+}
+
 /// Permissive variant of [`validate_header`]: clients MAY send the
 /// `Trust-Task` header but aren't required to.
 ///
