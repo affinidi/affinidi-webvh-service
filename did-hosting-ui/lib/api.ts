@@ -1159,7 +1159,11 @@ interface SpecAclEntry {
  * `Payload::IS_PROOF_REQUIRED` const enforced authoritatively).
  *
  * `acl/list`, `acl/show`, and `trust-task-discovery` are
- * RECOMMENDED / OPTIONAL — they're accepted proofless.
+ * RECOMMENDED / OPTIONAL for *proofs* — they're accepted proofless.
+ * NOTE: this set governs proofs only. `recipient` is a separate,
+ * universally-REQUIRED field under Trust Tasks 0.2 and is set on every
+ * envelope in `trustTask()` regardless of membership here — do not fold
+ * recipient handling back into this gate.
  */
 const REQUIRED_PROOF_TYPES = new Set<string>([
   "https://trusttasks.org/spec/acl/grant/0.1",
@@ -1181,12 +1185,17 @@ const REQUIRED_PROOF_TYPES = new Set<string>([
  *
  * `issuer` stays omitted — the bearer JWT carries the caller's DID and
  * SPEC.md §4.8.1's "transport-derived fills the absent in-band" rule
- * populates the issuer server-side. `recipient` is set explicitly whenever
- * a proof is attached: SPEC §4.8.2 (audience binding) requires it on every
- * signed envelope on a non-bearer specification (acl/grant, acl/revoke,
- * acl/change-role) so the signature is bound to *this* server and can't be
- * replayed against another verifier. The proof's `verificationMethod` ties
- * the signature to the session keypair, not the JWT subject's published DID.
+ * populates the issuer server-side. `recipient`, by contrast, is set on
+ * *every* envelope: under the Trust Tasks 0.2 framework every spec the UI
+ * sends is recipient-REQUIRED (`IS_RECIPIENT_REQUIRED = true`), proofless
+ * reads (acl/list, acl/show, trust-task-discovery) included. SPEC §7.2 item
+ * 5b rejects a recipient-less document with `malformedRequest` *before* the
+ * proof is even examined, and §4.8.1 transport-fill does NOT satisfy it —
+ * the recipient must be carried in-band. For signed specs (acl/grant,
+ * acl/revoke, acl/change-role) the same field doubles as §4.8.2 audience
+ * binding so the signature is bound to *this* server and can't be replayed
+ * against another verifier. The proof's `verificationMethod` ties the
+ * signature to the session keypair, not the JWT subject's published DID.
  */
 async function trustTask<Req, Resp>(
   typeUri: string,
@@ -1209,20 +1218,23 @@ async function trustTask<Req, Resp>(
   //   3. Fall through to generate a fresh keypair (will fail server-
   //      side with `proof_invalid` because the new pubkey isn't bound
   //      to the JWT) — the failure prompts the user to log in again.
-  if (REQUIRED_PROOF_TYPES.has(typeUri)) {
-    // §4.8.2 audience binding: bind the signature to *this* server before
-    // signing. Without `recipient`, the framework rejects with
-    // `malformed_request` ("proof present with no in-band recipient on a
-    // non-bearer specification").
-    const info = await getServerInfo();
-    if (!info.server_did) {
-      throw new ApiError(
-        500,
-        "server_did is not configured — signed trust tasks cannot be sent",
-      );
-    }
-    envelope.recipient = info.server_did;
+  // §7.2 item 5b / §4.8.2 audience binding: every spec the admin UI sends is
+  // recipient-REQUIRED under Trust Tasks 0.2, so bind the audience on *every*
+  // envelope — proofless reads (acl/list, acl/show, trust-task-discovery)
+  // included. Omitting it is rejected with `malformedRequest` ("specification
+  // declares recipient REQUIRED but the document carries no in-band
+  // recipient") before the proof is ever checked.
+  const info = await getServerInfo();
+  if (!info.server_did) {
+    throw new ApiError(
+      500,
+      "server_did is not configured — trust tasks cannot be sent",
+    );
+  }
+  envelope.recipient = info.server_did;
 
+  // REQUIRED-spec envelopes additionally carry a Data Integrity proof.
+  if (REQUIRED_PROOF_TYPES.has(typeUri)) {
     // Two signing paths, picked by which login flow produced the JWT:
     //
     // (1) Wallet login → the VTI browser extension's holder did:peer is the
