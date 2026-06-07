@@ -45,6 +45,11 @@ pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 64 * 1024;
 ///   upstream service runs its own Trust-Task validation.
 /// - `/api/control/stats` — server-to-control stats sync; servers
 ///   self-identify by DID, not by Trust-Task header.
+// The deprecated `_0_1` auth consts are wired here intentionally — as
+// the accepted-but-deprecated inbound aliases alongside their `_0_2`
+// primaries — so this compatibility layer opts out of the deprecation
+// lint rather than dropping the backwards-compat routing.
+#[allow(deprecated)]
 pub fn router_without_fallback() -> Router<AppState> {
     let control: Router<AppState> = TrustTaskRouter::new()
         .route_with_task_permissive(
@@ -146,37 +151,46 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(passkey::enroll_finish::<AppState>),
             (*TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1).clone(),
         )
-        .route_with_task_permissive(
+        // Passkey login + step-up tasks moved to the 0.2 spec; the 0.1
+        // URIs stay accepted on inbound (deprecated) for backwards
+        // compatibility via `route_with_tasks_permissive`.
+        .route_with_tasks_permissive(
             "/auth/passkey/login/start",
             post(passkey::login_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_START_0_1).clone(),
+            (*TASK_AUTH_PASSKEY_LOGIN_START_0_2).clone(),
+            vec![(*TASK_AUTH_PASSKEY_LOGIN_START_0_1).clone()],
         )
-        .route_with_task_permissive(
+        .route_with_tasks_permissive(
             "/auth/passkey/login/finish",
             post(passkey::login_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1).clone(),
+            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2).clone(),
+            vec![(*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1).clone()],
         )
         // Step-up: elevate the current session to aal2 via a WebAuthn assertion.
-        .route_with_task_permissive(
+        .route_with_tasks_permissive(
             "/auth/step-up/passkey/start",
             post(passkey::step_up_start::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_START_0_1).clone(),
+            (*TASK_AUTH_STEP_UP_PASSKEY_START_0_2).clone(),
+            vec![(*TASK_AUTH_STEP_UP_PASSKEY_START_0_1).clone()],
         )
-        .route_with_task_permissive(
+        .route_with_tasks_permissive(
             "/auth/step-up/passkey/finish",
             post(passkey::step_up_finish::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1).clone(),
+            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2).clone(),
+            vec![(*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1).clone()],
         )
         // Step-up via VTA approval (wallet-driven, works cross-origin).
-        .route_with_task_permissive(
+        .route_with_tasks_permissive(
             "/auth/step-up/vta/start",
             post(auth::step_up_vta_start),
-            (*TASK_AUTH_STEP_UP_VTA_START_0_1).clone(),
+            (*TASK_AUTH_STEP_UP_VTA_START_0_2).clone(),
+            vec![(*TASK_AUTH_STEP_UP_VTA_START_0_1).clone()],
         )
-        .route_with_task_permissive(
+        .route_with_tasks_permissive(
             "/auth/step-up/vta/finish",
             post(auth::step_up_vta_finish),
-            (*TASK_AUTH_STEP_UP_VTA_FINISH_0_1).clone(),
+            (*TASK_AUTH_STEP_UP_VTA_FINISH_0_2).clone(),
+            vec![(*TASK_AUTH_STEP_UP_VTA_FINISH_0_1).clone()],
         )
         // Demo sensitive op gated on aal2 (proves the StepUpAuth gate).
         .route_with_task_permissive(

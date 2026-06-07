@@ -122,11 +122,14 @@ vta-sdk = { version = "0.9", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). Now on crates.io at 0.1.1 (DTGWG
-# PR #36 merged + published 2026-05-24); the `[patch.crates-io]`
-# git pin that lived here through the pre-publish window is gone.
-# Bump to 0.1.x in lockstep with verifiable-trust-infrastructure
-# when upstream publishes new patch releases.
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.2.x — the family moved
+# from 0.1 to 0.2 alongside the spec bump that introduced 0.2 versions
+# of several auth/step-up/device/vault/etc specs. The 0.2 framework
+# serialises StandardCode in camelCase but still reads the 0.1
+# snake_case form on inbound, so peers on either version interoperate.
+# The acl/* typed payloads we consume directly are still v0_1 in 0.2.x.
+# Bump in lockstep with verifiable-trust-infrastructure when upstream
+# publishes new releases.
 #
 # `validate` feature: deliberately NOT enabled. The codegen-emitted
 # `Payload` structs use `#[serde(deny_unknown_fields)]` plus newtype
@@ -137,10 +140,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.1", default-features = false }
-trust-tasks-https = { version = "0.1", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.1", default-features = false }
-trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.2", default-features = false }
+trust-tasks-https = { version = "0.2", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.2", default-features = false }
+trust-tasks-proof = { version = "0.2", default-features = false, features = ["affinidi"] }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.

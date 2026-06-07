@@ -112,6 +112,41 @@ where
         self
     }
 
+    /// Permissive registration that accepts **multiple** Trust-Task
+    /// versions on one route: `primary` is the route's current Type URI
+    /// and `deprecated` lists older versions still accepted on inbound.
+    ///
+    /// This is the backwards-compatible path for a spec-version bump.
+    /// When a spec moves (e.g. `…/0.1` → `…/0.2`), register the route
+    /// with the `…/0.2` const as `primary` and `vec![…/0.1]` as
+    /// `deprecated`: clients on the new version and clients still sending
+    /// the old version both pass, while a mismatch still names the
+    /// primary URI as `expected`. Permissive, like
+    /// [`Self::route_with_task_permissive`] — a request with no header
+    /// passes through unchecked during the migration window.
+    ///
+    /// [`AppError::TrustTaskMismatch`]: crate::error::AppError::TrustTaskMismatch
+    pub fn route_with_tasks_permissive(
+        mut self,
+        path: &str,
+        method_router: MethodRouter<S>,
+        primary: TrustTask,
+        deprecated: Vec<TrustTask>,
+    ) -> Self {
+        let mut accepted = Vec::with_capacity(1 + deprecated.len());
+        accepted.push(primary);
+        accepted.extend(deprecated);
+        let accepted = Arc::new(accepted);
+        let layered = method_router.layer(axum::middleware::from_fn(move |request, next| {
+            let accepted = accepted.clone();
+            async move {
+                super::extractor::validate_header_permissive_any(&accepted, request, next).await
+            }
+        }));
+        self.inner = self.inner.route(path, layered);
+        self
+    }
+
     /// Register a route that bypasses Trust-Task validation. Per spec
     /// §16.2 this is intended **only for `/health`** — operators set
     /// up monitoring against the health endpoint without having to
@@ -340,4 +375,87 @@ mod tests {
     }
 
     use super::super::HEADER_NAME;
+
+    // ---- multi-version permissive variant (spec-bump backwards compat) ----
+
+    fn make_multiversion_router() -> Router {
+        let v2 =
+            TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.2").unwrap();
+        let v1 =
+            TrustTask::new("https://trusttasks.org/spec/auth/passkey/login/start/0.1").unwrap();
+        TrustTaskRouter::new()
+            .route_with_tasks_permissive("/login/start", post(ok), v2, vec![v1])
+            .into_router()
+    }
+
+    async fn login_start_with_header(header: Option<&str>) -> StatusCode {
+        let mut builder = Request::builder().method("POST").uri("/login/start");
+        if let Some(h) = header {
+            builder = builder.header(HEADER_NAME, h);
+        }
+        make_multiversion_router()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The current (primary) version is accepted.
+    #[tokio::test]
+    async fn multiversion_accepts_primary() {
+        assert_eq!(
+            login_start_with_header(Some(
+                "https://trusttasks.org/spec/auth/passkey/login/start/0.2"
+            ))
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    /// The deprecated older version is still accepted on inbound.
+    #[tokio::test]
+    async fn multiversion_accepts_deprecated_alias() {
+        assert_eq!(
+            login_start_with_header(Some(
+                "https://trusttasks.org/spec/auth/passkey/login/start/0.1"
+            ))
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    /// Permissive: no header still passes during the migration window.
+    #[tokio::test]
+    async fn multiversion_allows_missing_header() {
+        assert_eq!(login_start_with_header(None).await, StatusCode::OK);
+    }
+
+    /// A version we don't accept (e.g. a future 0.3) is rejected, and the
+    /// mismatch names the primary as the expected identifier.
+    #[tokio::test]
+    async fn multiversion_rejects_unaccepted_version_naming_primary() {
+        let resp = make_multiversion_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/start")
+                    .header(
+                        HEADER_NAME,
+                        "https://trusttasks.org/spec/auth/passkey/login/start/0.3",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "TrustTaskMismatch");
+        assert_eq!(
+            body["expected"],
+            "https://trusttasks.org/spec/auth/passkey/login/start/0.2"
+        );
+    }
 }

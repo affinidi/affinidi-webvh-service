@@ -2438,7 +2438,10 @@ mod tests {
             resp_body["type"].as_str().unwrap(),
             "https://trusttasks.org/spec/trust-task-error/0.1"
         );
-        assert_eq!(resp_body["payload"]["code"], "malformed_request");
+        // trust-tasks-rs 0.2 serialises StandardCode in camelCase
+        // (`malformedRequest`); it still reads the 0.1 snake_case form on
+        // inbound, so peers on either version interoperate.
+        assert_eq!(resp_body["payload"]["code"], "malformedRequest");
     }
 
     #[tokio::test]
