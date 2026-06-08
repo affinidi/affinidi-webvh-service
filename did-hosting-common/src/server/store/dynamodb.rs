@@ -293,9 +293,9 @@ impl KeyspaceOps for DynamoDbKeyspace {
                             if let (Some(AttributeValue::B(pk)), Some(AttributeValue::B(val))) =
                                 (item.get(PK_ATTR), item.get(VAL_ATTR))
                             {
-                                let pk = pk.as_ref();
-                                if pk.starts_with(&prefix) {
-                                    results.push((pk.to_vec(), val.as_ref().to_vec()));
+                                let pk_bytes = pk.as_ref();
+                                if pk_bytes.starts_with(&prefix) {
+                                    results.push((pk_bytes.to_vec(), val.as_ref().to_vec()));
                                 }
                             }
                         }
