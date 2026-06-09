@@ -494,9 +494,10 @@ mod tests {
             .await
             .expect("sign");
         let mut full = signing_value;
-        full.as_object_mut()
-            .unwrap()
-            .insert("proof".to_string(), serde_json::to_value(&di_proof).unwrap());
+        full.as_object_mut().unwrap().insert(
+            "proof".to_string(),
+            serde_json::to_value(&di_proof).unwrap(),
+        );
         let doc: TrustTask<serde_json::Value> = serde_json::from_value(full).expect("proofed");
         assert!(doc.issuer.is_none(), "fixture must omit in-band issuer");
 
