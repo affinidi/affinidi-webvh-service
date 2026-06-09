@@ -40,9 +40,8 @@ use trust_tasks_rs::{ErrorPayload, ProofPolicy, RejectReason, TrustTask};
 use uuid::Uuid;
 
 use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, TrustTaskContext, dispatch_inbound,
+    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
 };
-use trust_tasks_proof::affinidi::Verifier as AffinidiVerifier;
 
 use crate::auth::AuthClaims;
 use crate::error::AppError;
@@ -174,14 +173,14 @@ pub async fn dispatch_trust_task(
     //     in `dispatch_inbound`. Silently dropping a proof would
     //     mislead the producer about the integrity guarantees of
     //     the exchange.
-    let policy: ProofPolicy<'_, AffinidiVerifier> = match (
+    let policy: ProofPolicy<'_, TransportBoundVerifier> = match (
         state.config.trust_tasks.enforce_proofs,
         state.trust_tasks_verifier.as_deref(),
     ) {
         (true, Some(v)) => ProofPolicy::Verify(v),
         _ => ProofPolicy::RejectIfPresent,
     };
-    let outcome = dispatch_inbound::<AffinidiVerifier>(&ctx, &transport, policy, doc).await;
+    let outcome = dispatch_inbound::<TransportBoundVerifier>(&ctx, &transport, policy, doc).await;
     Ok(into_response(outcome))
 }
 

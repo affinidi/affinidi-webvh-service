@@ -67,7 +67,14 @@ pub struct AppState {
     /// way for backwards compat; v0.8.0 makes the verifier mandatory
     /// for the strict-proof specs (`acl/grant`, `acl/revoke`,
     /// `acl/change-role`).
-    pub trust_tasks_verifier: Option<Arc<trust_tasks_proof::affinidi::Verifier>>,
+    /// `TransportBoundVerifier`, not the stock `affinidi::Verifier`: it
+    /// enforces the in-band issuer↔`verificationMethod` binding only when an
+    /// `issuer` is asserted, and verifies the signature alone when it is
+    /// absent. That absent case is the passkey delegation path (the
+    /// ephemeral session key signs; the JWT carries the responsible DID),
+    /// which the stock verifier rejects. See `TransportBoundVerifier` docs.
+    pub trust_tasks_verifier:
+        Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
     pub http_client: reqwest::Client,
@@ -269,9 +276,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
             Arc::new(client),
         ));
-        Arc::new(trust_tasks_proof::affinidi::Verifier::with_resolver(
-            resolver,
-        ))
+        Arc::new(
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
+                resolver,
+            ),
+        )
     });
 
     let state = AppState {

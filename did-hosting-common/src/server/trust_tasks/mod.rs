@@ -33,6 +33,9 @@
 pub mod entry;
 pub mod ext;
 pub mod handlers;
+pub mod verifier;
+
+pub use verifier::TransportBoundVerifier;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -409,6 +412,115 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// Regression for the passkey 401 (`proofInvalid` / "no in-band issuer
+    /// to bind it to"). Reproduces the delegation shape end-to-end through
+    /// the real §7.2 pipeline with proof verification ENABLED:
+    ///
+    /// * the proof is signed by an **ephemeral `did:key`** (the session key)
+    ///   that is *not* the caller's ACL identity;
+    /// * the envelope carries **no in-band `issuer`** (exactly what the UI
+    ///   sends on the passkey path);
+    /// * the transport authenticates the caller as `ADMIN_DID` (the JWT
+    ///   `sub`, an ACL admin).
+    ///
+    /// `TransportBoundVerifier` verifies the signature without demanding an
+    /// in-band issuer, `resolve_parties` transport-fills `issuer = ADMIN_DID`,
+    /// and the grant is authorised and applied. The stock `affinidi::Verifier`
+    /// would have rejected this with `proof_invalid` before the handler ran.
+    #[tokio::test]
+    async fn dispatch_inbound_accepts_session_key_proof_without_in_band_issuer() {
+        use affinidi_data_integrity::{DataIntegrityProof, DidKeyResolver, SignOptions};
+        use affinidi_secrets_resolver::secrets::Secret;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        std::mem::forget(dir);
+        let store = Store::open(&cfg).await.expect("open store");
+        let acl_ks = store.keyspace(KS_ACL).expect("acl keyspace");
+        // ADMIN_DID is the caller's real (ACL) identity — the JWT subject the
+        // transport authenticates, NOT the key that signs the proof.
+        acl::store_acl_entry(
+            &acl_ks,
+            &AclEntry {
+                did: ADMIN_DID.into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = TrustTaskContext {
+            acl_ks: &acl_ks,
+            acl_locks: &acl_locks,
+            my_vid: SERVICE_DID,
+        };
+
+        // Ephemeral "session" keypair — a did:key distinct from ADMIN_DID.
+        let secret = Secret::generate_ed25519(None, Some(&[9u8; 32]));
+        let pk_mb = secret.get_public_keymultibase().unwrap();
+        let mut signer = secret.clone();
+        signer.id = format!("did:key:{pk_mb}#{pk_mb}");
+
+        // Envelope WITHOUT an in-band issuer; recipient bound to the service.
+        let body = serde_json::json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": grant::v0_1::Payload::TYPE_URI,
+            "recipient": SERVICE_DID,
+            "issuedAt": chrono::Utc::now().to_rfc3339(),
+            "payload": {
+                "entry": {
+                    "subject": "did:web:dave.example",
+                    "role": "owner",
+                    "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } }
+                }
+            }
+        });
+        let doc_noproof: TrustTask<serde_json::Value> =
+            serde_json::from_value(body).expect("parse");
+        let signing_value = serde_json::to_value(&doc_noproof).unwrap();
+        let di_proof = DataIntegrityProof::sign(&signing_value, &signer, SignOptions::new())
+            .await
+            .expect("sign");
+        let mut full = signing_value;
+        full.as_object_mut().unwrap().insert(
+            "proof".to_string(),
+            serde_json::to_value(&di_proof).unwrap(),
+        );
+        let doc: TrustTask<serde_json::Value> = serde_json::from_value(full).expect("proofed");
+        assert!(doc.issuer.is_none(), "fixture must omit in-band issuer");
+
+        // Transport authenticates the caller as ADMIN_DID (the JWT sub).
+        let transport = InMemoryHandler::new()
+            .with_local(SERVICE_DID.to_string())
+            .with_peer(ADMIN_DID.to_string());
+        let verifier = super::TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver));
+
+        let outcome = dispatch_inbound(&ctx, &transport, ProofPolicy::Verify(&verifier), doc).await;
+
+        match outcome {
+            DispatchOutcome::Handled(resp) => {
+                assert_eq!(resp.payload["entry"]["subject"], "did:web:dave.example");
+            }
+            other => panic!("expected Handled (grant applied), got {other:?}"),
+        }
+        assert!(
+            acl::get_acl_entry(&acl_ks, "did:web:dave.example")
+                .await
+                .unwrap()
+                .is_some(),
+            "grant must be persisted — authz resolved issuer from the transport"
         );
     }
 

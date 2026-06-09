@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use azure_data_cosmos::{
-    CosmosAccountEndpoint, CosmosAccountReference, CosmosClient, Region, RoutingStrategy,
-};
+use azure_data_cosmos::query::FeedScope;
+use azure_data_cosmos::regions::Region;
+use azure_data_cosmos::{AccountEndpoint, AccountReference, CosmosClient, RoutingStrategy};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use futures::StreamExt;
@@ -81,11 +81,11 @@ impl CosmosDbBackend {
 
         let (endpoint_str, account_key) = parse_connection_string(connection_string)?;
 
-        let endpoint: CosmosAccountEndpoint = endpoint_str
+        let endpoint: AccountEndpoint = endpoint_str
             .parse()
             .map_err(|e| AppError::Store(format!("cosmosdb endpoint parse: {e}")))?;
 
-        let account = CosmosAccountReference::with_master_key(
+        let account = AccountReference::with_authentication_key(
             endpoint,
             azure_core::credentials::Secret::new(account_key),
         );
@@ -183,10 +183,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
         Box::pin(async move {
             let container = self.container().await?;
             let doc_id = encode_doc_id(&key);
-            match container
-                .read_item::<KvDoc>(PARTITION_VALUE, &doc_id, None)
-                .await
-            {
+            match container.read_item(PARTITION_VALUE, &doc_id, None).await {
                 Ok(resp) => {
                     let doc: KvDoc = resp
                         .into_model()
@@ -218,10 +215,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
         Box::pin(async move {
             let container = self.container().await?;
             let doc_id = encode_doc_id(&key);
-            match container
-                .read_item::<KvDoc>(PARTITION_VALUE, &doc_id, None)
-                .await
-            {
+            match container.read_item(PARTITION_VALUE, &doc_id, None).await {
                 Ok(_) => Ok(true),
                 Err(e) if is_not_found(&e) => Ok(false),
                 Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
@@ -271,7 +265,8 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
             let mut results = Vec::new();
             let mut pager = container
-                .query_items::<KvDoc>(query, PARTITION_VALUE, None)
+                .query_items::<KvDoc>(query, FeedScope::partition(PARTITION_VALUE), None)
+                .await
                 .map_err(|e| AppError::Store(format!("cosmosdb query: {e}")))?;
 
             while let Some(item_result) = pager.next().await {
@@ -294,9 +289,13 @@ impl KeyspaceOps for CosmosDbKeyspace {
     }
 }
 
-/// Check if an Azure error is a 404 Not Found.
-fn is_not_found(err: &azure_core::Error) -> bool {
-    err.to_string().contains("404") || err.to_string().contains("NotFound")
+/// Check if a Cosmos DB error is a 404 Not Found.
+///
+/// 0.34 surfaces typed status on `CosmosError` (`status().is_not_found()`
+/// checks HTTP 404 with no contradicting sub-status), replacing the prior
+/// stringly-typed match on `azure_core::Error`.
+fn is_not_found(err: &azure_data_cosmos::CosmosError) -> bool {
+    err.status().is_not_found()
 }
 
 // ---------------------------------------------------------------------------

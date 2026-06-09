@@ -36,7 +36,7 @@ server-core = [
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
     "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
-    "dep:trust-tasks-proof",
+    "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -94,7 +94,7 @@ vta-sdk = { workspace = true }
 # 0.7 on crates.io, published 2026-05-24 (OpenVTC PR #113 + #115).
 # The git-pinned rev that lived here through the pre-publish
 # window is gone.
-vti-common = { version = "0.9", default-features = false }
+vti-common = { version = "0.10", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)
@@ -121,15 +121,19 @@ trust-tasks-rs = { workspace = true, optional = true }
 trust-tasks-https = { workspace = true, optional = true }
 trust-tasks-didcomm = { workspace = true, optional = true }
 trust-tasks-proof = { workspace = true, optional = true }
+# Direct use by `server::trust_tasks::verifier::TransportBoundVerifier`
+# (DataIntegrityProof / VerifyOptions / resolver trait). Same major.minor as
+# `trust-tasks-proof`'s `affinidi` feature → single copy in the lock.
+affinidi-data-integrity = { workspace = true, optional = true }
 
 # store backends (optional)
 fjall = { workspace = true, optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.48", optional = true }
+firestore = { version = "0.49", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.33", features = ["key_auth"], optional = true }
-azure_core = { version = "0.35", optional = true }
+azure_data_cosmos = { version = "0.34", features = ["key_auth"], optional = true }
+azure_core = { version = "1.0", optional = true }
 
 # secret store backends (optional)
 keyring-core = { version = "1", optional = true }
@@ -138,8 +142,8 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
-azure_security_keyvault_secrets = { version = "0.14", optional = true }
-azure_identity = { version = "0.35", optional = true }
+azure_security_keyvault_secrets = { version = "1.0", optional = true }
+azure_identity = { version = "1.0", optional = true }
 
 # Setup wizard helper (optional, behind `setup-wizard` feature)
 dialoguer = { workspace = true, optional = true }
@@ -177,6 +181,10 @@ http-body-util = "0.1"
 # variants that don't carry a custom verifier impl, so the dep is
 # test-only.
 async-trait = "0.1"
+# `verifier::tests` sign real `eddsa-jcs-2022` Data Integrity proofs with a
+# generated ed25519 `did:key` to exercise the bind-when-present /
+# signature-only-when-absent paths end-to-end.
+affinidi-secrets-resolver = "0.5"
 # T51 cross-crate URL invariant test — assert client and daemon
 # constants match byte-for-byte. dev-only; doesn't enter the
 # production dep graph.

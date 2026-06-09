@@ -105,14 +105,14 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK — 0.10 on crates.io, bumped in lockstep with vti-common 0.9.1
-# (which re-pins onto vta-sdk 0.10). Carries the canonical SIOPv2 /
+# VTA SDK — 0.11 on crates.io, bumped in lockstep with vti-common 0.10
+# (which re-pins onto vta-sdk ^0.11). Carries the canonical SIOPv2 /
 # RFC 6749 wire types (`protocols::auth::{Session, TokenBundle,
 # AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`) that the
 # cross-repo auth-architecture work introduced. vta-sdk and vti-common
 # share these types and MUST move together — a mismatched pair resolves
 # to two vta-sdk copies and fails to compile (E0308 on AuthenticateResponse).
-vta-sdk = { version = "0.10", features = [
+vta-sdk = { version = "0.11", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -145,6 +145,11 @@ trust-tasks-rs = { version = "0.2", default-features = false }
 trust-tasks-https = { version = "0.2", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.2", default-features = false }
 trust-tasks-proof = { version = "0.2", default-features = false, features = ["affinidi"] }
+# Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
+# resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
+# Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the
+# signature-only-when-issuer-absent path.
+affinidi-data-integrity = "0.7"
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.
