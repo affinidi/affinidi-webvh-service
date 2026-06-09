@@ -2696,6 +2696,7 @@ dependencies = [
 name = "did-hosting-common"
 version = "0.7.0"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-secrets-resolver",
  "affinidi-tdk",

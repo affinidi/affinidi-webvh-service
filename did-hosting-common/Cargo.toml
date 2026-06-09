@@ -36,7 +36,7 @@ server-core = [
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
     "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
-    "dep:trust-tasks-proof",
+    "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -121,6 +121,10 @@ trust-tasks-rs = { workspace = true, optional = true }
 trust-tasks-https = { workspace = true, optional = true }
 trust-tasks-didcomm = { workspace = true, optional = true }
 trust-tasks-proof = { workspace = true, optional = true }
+# Direct use by `server::trust_tasks::verifier::TransportBoundVerifier`
+# (DataIntegrityProof / VerifyOptions / resolver trait). Same major.minor as
+# `trust-tasks-proof`'s `affinidi` feature → single copy in the lock.
+affinidi-data-integrity = { workspace = true, optional = true }
 
 # store backends (optional)
 fjall = { workspace = true, optional = true }
@@ -177,6 +181,10 @@ http-body-util = "0.1"
 # variants that don't carry a custom verifier impl, so the dep is
 # test-only.
 async-trait = "0.1"
+# `verifier::tests` sign real `eddsa-jcs-2022` Data Integrity proofs with a
+# generated ed25519 `did:key` to exercise the bind-when-present /
+# signature-only-when-absent paths end-to-end.
+affinidi-secrets-resolver = "0.5"
 # T51 cross-crate URL invariant test — assert client and daemon
 # constants match byte-for-byte. dev-only; doesn't enter the
 # production dep graph.

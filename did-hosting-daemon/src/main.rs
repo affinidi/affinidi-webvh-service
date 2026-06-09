@@ -1240,9 +1240,11 @@ async fn build_control(
         let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
             Arc::new(client),
         ));
-        Arc::new(trust_tasks_proof::affinidi::Verifier::with_resolver(
-            resolver,
-        ))
+        Arc::new(
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
+                resolver,
+            ),
+        )
     });
 
     let state = AppState {

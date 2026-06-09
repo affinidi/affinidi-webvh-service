@@ -145,6 +145,11 @@ trust-tasks-rs = { version = "0.2", default-features = false }
 trust-tasks-https = { version = "0.2", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.2", default-features = false }
 trust-tasks-proof = { version = "0.2", default-features = false, features = ["affinidi"] }
+# Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
+# resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
+# Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the
+# signature-only-when-issuer-absent path.
+affinidi-data-integrity = "0.7"
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.

@@ -1368,7 +1368,10 @@ pub(crate) async fn run_trust_tasks_envelope(
     // Dispatch with the configured proof verifier when the operator
     // has opted in. Mirrors `routes::trust_tasks` — both transports
     // share one proof policy.
-    let policy: trust_tasks_rs::ProofPolicy<'_, trust_tasks_proof::affinidi::Verifier> = match (
+    let policy: trust_tasks_rs::ProofPolicy<
+        '_,
+        did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+    > = match (
         state.config.trust_tasks.enforce_proofs,
         state.trust_tasks_verifier.as_deref(),
     ) {
@@ -1376,7 +1379,7 @@ pub(crate) async fn run_trust_tasks_envelope(
         _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
     };
     let outcome = did_hosting_common::server::trust_tasks::dispatch_inbound::<
-        trust_tasks_proof::affinidi::Verifier,
+        did_hosting_common::server::trust_tasks::TransportBoundVerifier,
     >(&ctx, &transport, policy, doc)
     .await;
 
