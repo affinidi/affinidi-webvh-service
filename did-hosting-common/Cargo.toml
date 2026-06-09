@@ -94,7 +94,7 @@ vta-sdk = { workspace = true }
 # 0.7 on crates.io, published 2026-05-24 (OpenVTC PR #113 + #115).
 # The git-pinned rev that lived here through the pre-publish
 # window is gone.
-vti-common = { version = "0.9", default-features = false }
+vti-common = { version = "0.10", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)
