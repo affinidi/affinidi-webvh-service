@@ -366,7 +366,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.11.3",
 ]
 
 [[package]]
@@ -2832,7 +2832,7 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.13.1",
  "vti-common",
  "webauthn-rs",
  "webauthn-rs-proto",
@@ -2898,7 +2898,7 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.13.1",
  "vti-common",
  "webauthn-rs",
 ]
@@ -2927,7 +2927,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "vta-sdk",
+ "vta-sdk 0.13.1",
  "webvh-watcher",
  "webvh-witness",
 ]
@@ -2990,7 +2990,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.13.1",
  "vti-common",
 ]
 
@@ -9265,6 +9265,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e1eba907fa2d084094060776a3652de9ea3f9b2f7fa693f590024ca10250d8f"
 dependencies = [
  "affinidi-crypto",
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-openid4vci",
+ "affinidi-openid4vp",
+ "affinidi-tdk 0.7.4",
+ "base64 0.22.1",
+ "chrono",
+ "curve25519-dalek",
+ "didwebvh-rs",
+ "ed25519-dalek",
+ "getrandom 0.4.2",
+ "multibase",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "vta-sdk"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6931405d1fe0a06d1412115d808ac7ccd620bed08e2efb78366a058ec2a69040"
+dependencies = [
+ "affinidi-crypto",
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -9289,6 +9319,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "x25519-dalek",
@@ -9297,9 +9328,9 @@ dependencies = [
 
 [[package]]
 name = "vti-common"
-version = "0.10.0"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edb0cadc396212f676478c9c430982968cddc4a6c99c74332ba8cea7603f2cb9"
+checksum = "8748cbd03dd8c9d01504ac29efd6b54eb86805169753d34f187f458efa726be0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-tdk 0.7.4",
@@ -9325,7 +9356,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.13.1",
 ]
 
 [[package]]
@@ -9660,7 +9691,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.13.1",
  "vti-common",
 ]
 
