@@ -3,6 +3,23 @@ version = 2
 ignore = [
   { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained but build-time-only — pulled in transitively via linked-data-derive (ssi-json-ld). No runtime exposure; no safe upgrade available upstream." },
   { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on the `rsa` crate. Pulled in transitively by jsonwebtoken, but webvh JWTs use Ed25519 (EdDSA), so the RSA timing sidechannel is not on any code path we exercise." },
+  # The three advisories below all live in `rustls-webpki 0.101.7`, an OLD copy
+  # pulled only via `aws-smithy-http-client -> hyper-rustls 0.24.2` deep in the
+  # AWS SDK. We don't depend on it directly and can't bump it without an
+  # upstream AWS SDK release migrating off the old rustls stack; everything we
+  # control already resolves the maintained `rustls-webpki 0.103.x`.
+  # Re-evaluate when the AWS SDK drops rustls 0.21 / hyper-rustls 0.24.
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  # Unmaintained-status advisories on transitive crates. These are not
+  # exploitable vulnerabilities — the upstreams that pull them haven't migrated
+  # yet, and we don't depend on any of them directly. Revisit as the relevant
+  # dependencies update.
+  { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
+  { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
+  { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained — transitive only (folded into rustls upstream); no direct dependency." },
+  { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained — build-time-only, transitive (no direct dependency); successor of the already-ignored proc-macro-error (RUSTSEC-2024-0370)." },
 ]
 
 [bans]

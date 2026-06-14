@@ -34,10 +34,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   msrv:
-    name: MSRV ${{ env.MSRV }} build
+    # NB: the `env` context is NOT available in `jobs.<job_id>.name` (only
+    # github/needs/strategy/matrix/inputs/vars are). Referencing `${{ env.MSRV }}`
+    # here makes GitHub reject the whole workflow at startup — no jobs run. Keep
+    # this name static; the MSRV value is asserted against Cargo.toml below.
+    name: MSRV build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,6 +58,8 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: MSRV — build workspace (default features)
         run: cargo +${{ env.MSRV }} build --workspace --locked
       - name: MSRV — build did-hosting-common with every feature combination
@@ -81,33 +89,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Storage backends are mutually exclusive at the build-script level,
-        # so each one needs its own job. Cloud backends (dynamodb, firestore,
-        # cosmosdb) compile but don't run integration tests in CI — they need
-        # external infra.
+        # Storage backends are mutually exclusive at the build-script level, so
+        # each one needs its own job. `method-webvh,method-web` are included so
+        # the method-dependent unit tests (domain::safety host extraction) run.
+        #
+        # Only the embedded fjall backend runs the unit suite (`run_tests:
+        # true`). The generic handler/ACL tests assume an isolated, empty store
+        # per test (fjall gives each a fresh temp dir); a single shared redis or
+        # a cloud emulator cross-contaminates parallel tests, so those backends
+        # are build-only here. Real backend integration tests would need
+        # per-test isolation (FLUSHDB / unique key prefixes) — out of scope.
         include:
           - store: store-fjall
-            features: "server-core,store-fjall,keyring,passkey,setup-wizard"
+            features: "server-core,store-fjall,keyring,passkey,setup-wizard,method-webvh,method-web"
+            run_tests: true
           - store: store-redis
-            features: "server-core,store-redis"
+            features: "server-core,store-redis,method-webvh,method-web"
+            run_tests: false
           - store: store-dynamodb
-            features: "server-core,store-dynamodb"
+            features: "server-core,store-dynamodb,method-webvh,method-web"
+            run_tests: false
           - store: store-firestore
-            features: "server-core,store-firestore"
+            features: "server-core,store-firestore,method-webvh,method-web"
+            run_tests: false
           - store: store-cosmosdb
-            features: "server-core,store-cosmosdb"
+            features: "server-core,store-cosmosdb,method-webvh,method-web"
+            run_tests: false
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build did-hosting-common with ${{ matrix.store }}
         run: >
           cargo build -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
       - name: Test did-hosting-common with ${{ matrix.store }}
-        # Default-feature test runs catch the bulk of the suite; here we just
-        # confirm the alternate-store build compiles + its small unit slice
-        # still passes.
+        # Only embedded fjall runs the unit suite (isolated per-test store);
+        # other backends are build-only above.
+        if: matrix.run_tests
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"
@@ -119,6 +140,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       # `--locked` ensures Cargo.lock matches the workspace manifest exactly,
       # so a transitive dep bump cannot quietly land via the test job before
       # being explicitly bumped in Cargo.toml.
@@ -175,7 +198,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            dbus-x11 gnome-keyring libsecret-1-0 libsecret-1-dev
+            dbus-x11 gnome-keyring libsecret-1-0 libsecret-1-dev \
+            libdbus-1-dev pkg-config
       - name: Run keyring round-trip on macOS
         if: matrix.os == 'macos-latest'
         run: >
@@ -237,6 +261,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build did-hosting-common (${{ matrix.case }})
         run: |
           set +e
@@ -275,6 +301,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: >
           cargo build -p did-hosting-common --no-default-features
           --features "server-core,${{ matrix.backend }}"
@@ -288,19 +316,9 @@ jobs:
         with:
           command: check
 
-  publish-dry-run:
-    name: cargo publish --dry-run
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # did-hosting-common is publishable on its own. The other crates depend on
-      # it via `version = "0.6"` + path, so cargo refuses to dry-run them
-      # until common is on crates.io. Verifying the leaf is enough to catch
-      # packaging mistakes (manifests, exclude/include, missing files) on
-      # every PR; the actual publish sequence happens manually after a tag.
-      - name: cargo package --list (sanity)
-        run: cargo package --list -p did-hosting-common
-      - name: cargo publish --dry-run (did-hosting-common)
-        run: cargo publish --dry-run --allow-dirty -p did-hosting-common
+  # NB: there is intentionally no `cargo publish --dry-run` job. The
+  # did-hosting-* crates are a deployable service, not libraries — none are
+  # published to crates.io, and did-hosting-common dev-depends on the
+  # unpublished did-hosting-client (so a dry-run can never resolve). If any
+  # crate is ever published, add a targeted job that excludes the unpublished
+  # path dev-deps.

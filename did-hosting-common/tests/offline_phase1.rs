@@ -177,6 +177,9 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
 /// cleanup (clearing an absent entry is a no-op).
 fn secrets_for_test(scope: &str) -> SecretsConfig {
     SecretsConfig {
+        // Explicitly select plaintext: this is the offline-prepare path, which
+        // must not touch the OS keyring (CI Linux has no Secret Service).
+        plaintext_mode: true,
         keyring_service: format!("did-hosting-test-{}-{}", scope, uuid::Uuid::new_v4()),
         ..SecretsConfig::default()
     }

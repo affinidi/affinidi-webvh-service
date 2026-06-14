@@ -235,10 +235,11 @@ pub fn resolve_secrets_config(
             out.keyring_service = default_keyring_service.to_string();
         }
         SecretsBackend::Plaintext => {
-            // The runtime selection precedence picks plaintext only when
-            // every other backend is unconfigured — match that by leaving
-            // the cloud/keyring fields empty. The validator already
-            // demanded `confirm_plaintext = true`.
+            // Explicitly select plaintext so a keyring-enabled build doesn't
+            // silently prefer the OS keyring (which panics on headless hosts
+            // with no Secret Service). The validator already demanded
+            // `confirm_plaintext = true`.
+            out.plaintext_mode = true;
             out.keyring_service = default_keyring_service.to_string();
         }
     }

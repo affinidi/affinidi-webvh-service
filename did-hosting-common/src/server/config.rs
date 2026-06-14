@@ -316,8 +316,16 @@ pub struct SecretsConfig {
     pub azure_secret_name: Option<String>,
     #[serde(default = "default_keyring_service")]
     pub keyring_service: String,
+    /// Explicitly select the plaintext backend even when a keyring backend is
+    /// compiled in. Without this, a keyring-enabled build always prefers the OS
+    /// keyring, which panics on a headless host with no Secret Service. The
+    /// non-interactive recipe sets this for `backend = "plaintext"`; cloud
+    /// backends (AWS/GCP/Azure), when configured, still take precedence.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plaintext_mode: bool,
     /// Plaintext secrets stored directly in the config file.
-    /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
+    /// Used when no secure backend (keyring, AWS, GCP) is compiled in, or when
+    /// `plaintext_mode` explicitly selects it.
     pub plaintext: Option<PlaintextSecrets>,
     /// Plaintext-mode-only stash for the offline-bootstrap ephemeral
     /// seed (base64url-no-pad, 32 raw bytes). Set during phase 1 of
@@ -430,10 +438,15 @@ impl Default for SecretsConfig {
             azure_vault_url: None,
             azure_secret_name: None,
             keyring_service: default_keyring_service(),
+            plaintext_mode: false,
             plaintext: None,
             plaintext_bootstrap_seed: None,
         }
     }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Apply environment variable overrides to shared config fields.
