@@ -41,6 +41,10 @@ store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
+# Generate an OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47).
+# Off by default — only the `openapi_snapshot` test and a doc-gen build need it.
+# Requires method-webvh (the well-known resolve path is documented).
+openapi = ["dep:utoipa", "method-webvh"]
 
 [lib]
 name = "did_hosting_server"
@@ -52,6 +56,8 @@ path = "src/main.rs"
 
 [dependencies]
 did-hosting-common = { version = "0.7", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
+# OpenAPI spec generation (behind the off-by-default `openapi` feature).
+utoipa = { version = "5", optional = true }
 vti-common = { version = "0.10.3", default-features = false }
 async-trait = "0.1"
 affinidi-tdk = { workspace = true }

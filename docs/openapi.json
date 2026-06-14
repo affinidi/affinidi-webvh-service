@@ -1,0 +1,377 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Affinidi DID Hosting — upload/resolve API",
+    "description": "HTTP surface of the did-hosting-server edge node: authenticated upload/introspection of did:webvh slots and public, unauthenticated DID resolution. DID lifecycle management (create/rollback/recover) happens over DIDComm on the control plane and is not part of this spec.",
+    "contact": {
+      "name": "Glenn Gore",
+      "email": "glenn@affinidi.com"
+    },
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "0.7.0"
+  },
+  "paths": {
+    "/.well-known/did.jsonl": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /.well-known/did.jsonl` — root-DID webvh log.",
+        "operationId": "serve_root_did_log",
+        "responses": {
+          "200": {
+            "description": "Root DID's did:webvh log (JSONL)",
+            "content": {
+              "application/jsonl+json": {}
+            }
+          },
+          "404": {
+            "description": "No root DID hosted on this domain"
+          }
+        }
+      }
+    },
+    "/api/dids": {
+      "get": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "list_dids",
+        "parameters": [
+          {
+            "name": "owner",
+            "in": "query",
+            "description": "Filter by owner DID (admin only)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of hosted DID slots",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/dids/{mnemonic}": {
+      "get": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "get_did",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path (mnemonic); may contain '/'",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DID metadata + log summary",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Caller not authorized for this slot"
+          },
+          "404": {
+            "description": "No such DID slot"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "upload_did",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path (mnemonic); may contain '/'",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "did:webvh log — one JSON LogEntry per line (JSONL)",
+          "content": {
+            "application/jsonl+json": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Published; content stored and watchers notified"
+          },
+          "400": {
+            "description": "Invalid did.jsonl, failed proof verification, or DID id/host mismatch"
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Caller not authorized for this slot"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "delete_did",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path (mnemonic); may contain '/'",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Soft-deleted; content retained for the recovery window"
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Caller not authorized for this slot"
+          },
+          "404": {
+            "description": "No such DID slot"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service is up; returns status + version",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/log/{mnemonic}": {
+      "get": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "get_did_log",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path (mnemonic); may contain '/'",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Parsed log entries (versionId, versionTime, state, parameters)",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Caller not authorized for this slot"
+          },
+          "404": {
+            "description": "No such DID slot"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/witness/{mnemonic}": {
+      "put": {
+        "tags": [
+          "dids"
+        ],
+        "operationId": "upload_witness",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path (mnemonic); may contain '/'",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Witness-proof document (did-witness.json) for the slot's current log",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Witness proofs stored"
+          },
+          "400": {
+            "description": "Invalid witness document"
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Caller not authorized for this slot"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/{mnemonic}/did.jsonl": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "Combined fallback handler: walks each enabled method's dispatcher\nin priority order, returning the first match.",
+        "description": "404 when no method recognises the URL. Callers expecting an SPA\n(daemon mode) check for 404 and then call the static handler.",
+        "operationId": "serve_public",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path; the published did:webvh resolves at <base>/{mnemonic}/did.jsonl",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "did:webvh log (JSONL) or did:web document for the slot",
+            "content": {
+              "application/jsonl+json": {}
+            }
+          },
+          "404": {
+            "description": "No DID hosted at this path"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "dids",
+      "description": "Authenticated DID slot management + content sync"
+    },
+    {
+      "name": "resolve",
+      "description": "Public, unauthenticated DID resolution"
+    },
+    {
+      "name": "system",
+      "description": "Health / diagnostics"
+    }
+  ]
+}

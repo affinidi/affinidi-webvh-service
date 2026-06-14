@@ -58,6 +58,19 @@ impl DidDetailResponse {
     }
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/dids/{mnemonic}",
+    tag = "dids",
+    params(("mnemonic" = String, Path, description = "Slot path (mnemonic); may contain '/'")),
+    responses(
+        (status = 200, description = "DID metadata + log summary", content_type = "application/json"),
+        (status = 401, description = "Missing/invalid bearer token"),
+        (status = 403, description = "Caller not authorized for this slot"),
+        (status = 404, description = "No such DID slot"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn get_did(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -80,6 +93,19 @@ pub async fn get_did(
 
 // ---------- GET /dids/{mnemonic}/log ----------
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/log/{mnemonic}",
+    tag = "dids",
+    params(("mnemonic" = String, Path, description = "Slot path (mnemonic); may contain '/'")),
+    responses(
+        (status = 200, description = "Parsed log entries (versionId, versionTime, state, parameters)", content_type = "application/json"),
+        (status = 401, description = "Missing/invalid bearer token"),
+        (status = 403, description = "Caller not authorized for this slot"),
+        (status = 404, description = "No such DID slot"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn get_did_log(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -92,6 +118,24 @@ pub async fn get_did_log(
 
 // ---------- PUT /dids/{mnemonic} ----------
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    put,
+    path = "/api/dids/{mnemonic}",
+    tag = "dids",
+    params(("mnemonic" = String, Path, description = "Slot path (mnemonic); may contain '/'")),
+    request_body(
+        content = String,
+        description = "did:webvh log — one JSON LogEntry per line (JSONL)",
+        content_type = "application/jsonl+json",
+    ),
+    responses(
+        (status = 204, description = "Published; content stored and watchers notified"),
+        (status = 400, description = "Invalid did.jsonl, failed proof verification, or DID id/host mismatch"),
+        (status = 401, description = "Missing/invalid bearer token"),
+        (status = 403, description = "Caller not authorized for this slot"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn upload_did(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -111,6 +155,24 @@ pub async fn upload_did(
 
 // ---------- PUT /dids/{mnemonic}/witness ----------
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    put,
+    path = "/api/witness/{mnemonic}",
+    tag = "dids",
+    params(("mnemonic" = String, Path, description = "Slot path (mnemonic); may contain '/'")),
+    request_body(
+        content = String,
+        description = "Witness-proof document (did-witness.json) for the slot's current log",
+        content_type = "application/json",
+    ),
+    responses(
+        (status = 204, description = "Witness proofs stored"),
+        (status = 400, description = "Invalid witness document"),
+        (status = 401, description = "Missing/invalid bearer token"),
+        (status = 403, description = "Caller not authorized for this slot"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn upload_witness(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -130,6 +192,19 @@ pub async fn upload_witness(
 
 // ---------- DELETE /dids/{mnemonic} ----------
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    delete,
+    path = "/api/dids/{mnemonic}",
+    tag = "dids",
+    params(("mnemonic" = String, Path, description = "Slot path (mnemonic); may contain '/'")),
+    responses(
+        (status = 204, description = "Soft-deleted; content retained for the recovery window"),
+        (status = 401, description = "Missing/invalid bearer token"),
+        (status = 403, description = "Caller not authorized for this slot"),
+        (status = 404, description = "No such DID slot"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn delete_did(
     auth: AuthClaims,
     State(state): State<AppState>,
@@ -217,6 +292,21 @@ pub struct ListDidsQuery {
     pub offset: Option<usize>,
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/dids",
+    tag = "dids",
+    params(
+        ("owner" = Option<String>, Query, description = "Filter by owner DID (admin only)"),
+        ("limit" = Option<usize>, Query, description = "Page size"),
+        ("offset" = Option<usize>, Query, description = "Page offset"),
+    ),
+    responses(
+        (status = 200, description = "List of hosted DID slots", content_type = "application/json"),
+        (status = 401, description = "Missing/invalid bearer token"),
+    ),
+    security(("bearer" = [])),
+))]
 pub async fn list_dids(
     auth: AuthClaims,
     State(state): State<AppState>,

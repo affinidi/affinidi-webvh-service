@@ -8,6 +8,9 @@ members = [
   "webvh-watcher",
   "webvh-witness",
 ]
+# `fuzz/` is a detached cargo-fuzz crate with its own [workspace]; keep it out
+# of the root workspace so normal builds never pull the nightly libfuzzer deps.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]

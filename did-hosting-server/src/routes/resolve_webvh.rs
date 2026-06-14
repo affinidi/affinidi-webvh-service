@@ -96,6 +96,15 @@ async fn serve_content(
 }
 
 /// `GET /.well-known/did.jsonl` — root-DID webvh log.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/.well-known/did.jsonl",
+    tag = "resolve",
+    responses(
+        (status = 200, description = "Root DID's did:webvh log (JSONL)", content_type = "application/jsonl+json"),
+        (status = 404, description = "No root DID hosted on this domain"),
+    ),
+))]
 pub async fn serve_root_did_log(
     State(state): State<AppState>,
     request: Request,

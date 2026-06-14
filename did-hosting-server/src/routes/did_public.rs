@@ -45,6 +45,16 @@ use crate::server::AppState;
 ///
 /// 404 when no method recognises the URL. Callers expecting an SPA
 /// (daemon mode) check for 404 and then call the static handler.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/{mnemonic}/did.jsonl",
+    tag = "resolve",
+    params(("mnemonic" = String, Path, description = "Slot path; the published did:webvh resolves at <base>/{mnemonic}/did.jsonl")),
+    responses(
+        (status = 200, description = "did:webvh log (JSONL) or did:web document for the slot", content_type = "application/jsonl+json"),
+        (status = 404, description = "No DID hosted at this path"),
+    ),
+))]
 pub async fn serve_public(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = request.into_parts();
 

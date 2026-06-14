@@ -23,6 +23,8 @@ pub mod error;
 pub mod health;
 pub mod messaging;
 pub mod mnemonic;
+#[cfg(feature = "openapi")]
+pub mod openapi;
 pub mod purge_sweep;
 pub mod routes;
 pub mod secret_store;

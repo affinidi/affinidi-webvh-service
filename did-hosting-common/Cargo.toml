@@ -171,6 +171,9 @@ dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"],
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# Deterministic versionTime stamps in the fuzz seed-corpus generator
+# (`examples/gen_corpus.rs`).
+chrono = { workspace = true }
 # Trust-Tasks router unit tests use `oneshot()` + raw body collection.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

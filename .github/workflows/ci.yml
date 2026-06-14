@@ -141,6 +141,15 @@ jobs:
         run: >
           cargo test -p did-hosting-common --locked
           --features server-core --test offline_phase1
+      # The committed OpenAPI spec (docs/openapi.json) is generated from the
+      # `#[utoipa::path]` annotations on the HTTP handlers. This drift-check
+      # fails if the annotations changed without regenerating the snapshot
+      # (UPDATE_OPENAPI=1 cargo test -p did-hosting-server --features openapi
+      # openapi_snapshot).
+      - name: OpenAPI spec in sync
+        run: >
+          cargo test -p did-hosting-server --locked
+          --features openapi openapi_snapshot_in_sync
 
   keyring-required:
     name: keyring round-trip (${{ matrix.os }})

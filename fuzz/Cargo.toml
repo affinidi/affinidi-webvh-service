@@ -1,0 +1,63 @@
+# Coverage-guided fuzzing harness for the pure `did_ops` validators
+# (issue #47, item #2).
+#
+# This is a SEPARATE crate with its own (empty) [workspace] table so it is
+# fully detached from the parent workspace — `cargo build`/`cargo test` at the
+# repo root never see it, and the nightly-only libfuzzer toolchain stays out of
+# normal CI. Run targets with `cargo +nightly fuzz run <target>` from the repo
+# root (requires `cargo install cargo-fuzz`). See README.md.
+[package]
+name = "did-hosting-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The structure-aware targets need `Arbitrary` for the log-entry graph, which
+# lives behind didwebvh-rs's off-by-default `arbitrary` feature (v0.5.5+).
+didwebvh-rs = { version = "0.5.5", features = ["arbitrary"] }
+
+# The crate under test. Default features (method-webvh + method-web) are enough
+# for `did_ops`; server-core and the store/secret backends are not pulled in.
+did-hosting-common = { path = "../did-hosting-common" }
+
+# Keep some debug info for useful crash backtraces without killing throughput.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "validate_did_jsonl"
+path = "fuzz_targets/validate_did_jsonl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_did_log_proofs"
+path = "fuzz_targets/verify_did_log_proofs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_did_log_proofs_structured"
+path = "fuzz_targets/verify_did_log_proofs_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_did_id_matches_request"
+path = "fuzz_targets/validate_did_id_matches_request.rs"
+test = false
+doc = false
+bench = false

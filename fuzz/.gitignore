@@ -1,0 +1,11 @@
+/target
+/artifacts
+/coverage
+/Cargo.lock
+
+# The fuzzer writes hash-named corpus entries (no extension) into corpus/<target>/.
+# Commit only the curated seed fixtures — ignore everything else under corpus/.
+corpus/**
+!corpus/**/
+!corpus/**/*.jsonl
+!corpus/**/*.bin

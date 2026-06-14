@@ -7,6 +7,12 @@ pub struct HealthResponse {
     version: &'static str,
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "system",
+    responses((status = 200, description = "Service is up; returns status + version", content_type = "application/json")),
+))]
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
