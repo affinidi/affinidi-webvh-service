@@ -89,21 +89,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Storage backends are mutually exclusive at the build-script level,
-        # so each one needs its own job. Cloud backends (dynamodb, firestore,
-        # cosmosdb) compile but don't run integration tests in CI — they need
-        # external infra.
+        # Storage backends are mutually exclusive at the build-script level, so
+        # each one needs its own job. `method-webvh,method-web` are included so
+        # the method-dependent unit tests (domain::safety host extraction) run.
+        #
+        # Only the embedded fjall backend runs the unit suite (`run_tests:
+        # true`). The generic handler/ACL tests assume an isolated, empty store
+        # per test (fjall gives each a fresh temp dir); a single shared redis or
+        # a cloud emulator cross-contaminates parallel tests, so those backends
+        # are build-only here. Real backend integration tests would need
+        # per-test isolation (FLUSHDB / unique key prefixes) — out of scope.
         include:
           - store: store-fjall
-            features: "server-core,store-fjall,keyring,passkey,setup-wizard"
+            features: "server-core,store-fjall,keyring,passkey,setup-wizard,method-webvh,method-web"
+            run_tests: true
           - store: store-redis
-            features: "server-core,store-redis"
+            features: "server-core,store-redis,method-webvh,method-web"
+            run_tests: false
           - store: store-dynamodb
-            features: "server-core,store-dynamodb"
+            features: "server-core,store-dynamodb,method-webvh,method-web"
+            run_tests: false
           - store: store-firestore
-            features: "server-core,store-firestore"
+            features: "server-core,store-firestore,method-webvh,method-web"
+            run_tests: false
           - store: store-cosmosdb
-            features: "server-core,store-cosmosdb"
+            features: "server-core,store-cosmosdb,method-webvh,method-web"
+            run_tests: false
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -115,9 +126,9 @@ jobs:
           cargo build -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
       - name: Test did-hosting-common with ${{ matrix.store }}
-        # Default-feature test runs catch the bulk of the suite; here we just
-        # confirm the alternate-store build compiles + its small unit slice
-        # still passes.
+        # Only embedded fjall runs the unit suite (isolated per-test store);
+        # other backends are build-only above.
+        if: matrix.run_tests
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"

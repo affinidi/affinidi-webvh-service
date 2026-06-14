@@ -219,6 +219,12 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
         return false;
     }
 
+    // Explicit plaintext selection (e.g. recipe `backend = "plaintext"`) beats a
+    // compiled-in keyring — see `create_secret_store`.
+    if secrets.plaintext_mode {
+        return true;
+    }
+
     // Keyring is only used when compiled in AND no cloud backend was selected above.
     // But it is unconditionally preferred over plaintext when compiled in.
     #[cfg(feature = "keyring")]
@@ -272,6 +278,18 @@ pub fn create_secret_store(
             )
         })?;
         let store = AzureKeyVaultStore::new(vault_url, secrets.azure_secret_name.clone().unwrap());
+        return Ok(Box::new(store));
+    }
+
+    // Explicit plaintext selection beats a compiled-in keyring. Operators on a
+    // headless host (no Secret Service) opt into plaintext via the recipe's
+    // `backend = "plaintext"` / wizard confirmation; forcing keyring there would
+    // panic at startup. Cloud backends above still take precedence when set.
+    if secrets.plaintext_mode {
+        let store = plaintext::PlaintextSecretStore::new(
+            secrets.plaintext.as_ref(),
+            config_path.to_path_buf(),
+        );
         return Ok(Box::new(store));
     }
 
