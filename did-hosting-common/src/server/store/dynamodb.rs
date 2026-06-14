@@ -244,72 +244,63 @@ impl KeyspaceOps for DynamoDbKeyspace {
         Box::pin(async move {
             ensure_table(&self.client, &self.table, &self.verified).await?;
 
+            // Single full-table Scan, filtered client-side. The table has no
+            // sort key (`pk` is the only attribute and it's the HASH key), so
+            // a Query-by-prefix isn't possible; and a Scan `begins_with`
+            // filter on a Binary `pk` is both unreliable across
+            // implementations (notably motoserver) and doesn't reduce read
+            // capacity. `filter_items_by_prefix` applies byte-prefix
+            // semantics in Rust — an empty prefix matches everything.
             let mut results = Vec::new();
-
-            if prefix.is_empty() {
-                // Full table scan
-                let mut last_key: Option<HashMap<String, AttributeValue>> = None;
-                loop {
-                    let mut req = self.client.scan().table_name(&self.table);
-                    if let Some(ref key) = last_key {
-                        req = req.set_exclusive_start_key(Some(key.clone()));
-                    }
-                    let resp = req
-                        .send()
-                        .await
-                        .map_err(|e| AppError::Store(format!("dynamodb scan: {e}")))?;
-
-                    if let Some(items) = resp.items {
-                        for item in items {
-                            if let (Some(AttributeValue::B(pk)), Some(AttributeValue::B(val))) =
-                                (item.get(PK_ATTR), item.get(VAL_ATTR))
-                            {
-                                results.push((pk.as_ref().to_vec(), val.as_ref().to_vec()));
-                            }
-                        }
-                    }
-
-                    last_key = resp.last_evaluated_key;
-                    if last_key.is_none() {
-                        break;
-                    }
+            let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let mut req = self.client.scan().table_name(&self.table);
+                if let Some(ref key) = last_key {
+                    req = req.set_exclusive_start_key(Some(key.clone()));
                 }
-            } else {
-                // Scan all pages and filter locally. DynamoDB Scan filters do not reduce read
-                // capacity, and client-side byte-prefix matching preserves the raw-key contract.
-                let mut last_key: Option<HashMap<String, AttributeValue>> = None;
-                loop {
-                    let mut req = self.client.scan().table_name(&self.table);
-                    if let Some(ref key) = last_key {
-                        req = req.set_exclusive_start_key(Some(key.clone()));
-                    }
-                    let resp = req
-                        .send()
-                        .await
-                        .map_err(|e| AppError::Store(format!("dynamodb scan: {e}")))?;
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Store(format!("dynamodb scan: {e}")))?;
 
-                    if let Some(items) = resp.items {
-                        for item in items {
-                            if let (Some(AttributeValue::B(pk)), Some(AttributeValue::B(val))) =
-                                (item.get(PK_ATTR), item.get(VAL_ATTR))
-                            {
-                                let pk_bytes = pk.as_ref();
-                                if pk_bytes.starts_with(&prefix) {
-                                    results.push((pk_bytes.to_vec(), val.as_ref().to_vec()));
-                                }
-                            }
-                        }
-                    }
+                if let Some(items) = resp.items {
+                    filter_items_by_prefix(items, &prefix, &mut results);
+                }
 
-                    last_key = resp.last_evaluated_key;
-                    if last_key.is_none() {
-                        break;
-                    }
+                last_key = resp.last_evaluated_key;
+                if last_key.is_none() {
+                    break;
                 }
             }
 
             Ok(results)
         })
+    }
+}
+
+/// Reduce one page of scanned items to the `(pk, val)` byte pairs whose key
+/// begins with `prefix`, appending them to `out`.
+///
+/// Byte-prefix semantics (`pk.starts_with(prefix)`) are applied here in Rust
+/// rather than delegated to a DynamoDB `Scan` filter expression: `begins_with`
+/// on a Binary attribute is unreliable across DynamoDB implementations
+/// (notably the motoserver emulator returns nothing), and a `Scan` filter
+/// doesn't reduce consumed read capacity anyway. An empty `prefix` matches
+/// every item. Items missing a Binary `pk`/`val` are skipped.
+fn filter_items_by_prefix(
+    items: Vec<HashMap<String, AttributeValue>>,
+    prefix: &[u8],
+    out: &mut Vec<RawKvPair>,
+) {
+    for item in items {
+        if let (Some(AttributeValue::B(pk)), Some(AttributeValue::B(val))) =
+            (item.get(PK_ATTR), item.get(VAL_ATTR))
+        {
+            let pk_bytes = pk.as_ref();
+            if pk_bytes.starts_with(prefix) {
+                out.push((pk_bytes.to_vec(), val.as_ref().to_vec()));
+            }
+        }
     }
 }
 
@@ -385,5 +376,84 @@ impl BatchOps for DynamoDbBatch {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                PK_ATTR.to_string(),
+                AttributeValue::B(Blob::new(pk.to_vec())),
+            ),
+            (
+                VAL_ATTR.to_string(),
+                AttributeValue::B(Blob::new(val.to_vec())),
+            ),
+        ])
+    }
+
+    #[test]
+    fn keeps_only_matching_prefix() {
+        let items = vec![
+            bin_item(b"did:alice", b"a"),
+            bin_item(b"did:bob", b"b"),
+            bin_item(b"owner:alice", b"o"),
+        ];
+        let mut out = Vec::new();
+        filter_items_by_prefix(items, b"did:", &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|(k, _)| k == b"did:alice"));
+        assert!(out.iter().any(|(k, _)| k == b"did:bob"));
+        assert!(out.iter().all(|(k, _)| k.starts_with(b"did:")));
+    }
+
+    #[test]
+    fn matches_non_utf8_binary_prefix() {
+        // Regression for the original bug: prefix matching is byte-oriented,
+        // not UTF-8. A prefix that isn't valid UTF-8 must still match — this
+        // is the case a DynamoDB `begins_with` filter on a Binary key got
+        // wrong under motoserver.
+        let items = vec![
+            bin_item(&[0xff, 0x00, 0x01], b"v1"),
+            bin_item(&[0xff, 0x00, 0x02], b"v2"),
+            bin_item(&[0x00, 0xff, 0x01], b"nope"),
+        ];
+        let mut out = Vec::new();
+        filter_items_by_prefix(items, &[0xff, 0x00], &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(k, _)| k.starts_with(&[0xff, 0x00])));
+    }
+
+    #[test]
+    fn empty_prefix_matches_everything() {
+        let items = vec![bin_item(b"a", b"1"), bin_item(b"\x00\x01", b"2")];
+        let mut out = Vec::new();
+        filter_items_by_prefix(items, b"", &mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn skips_items_missing_binary_attrs() {
+        // Missing val, and a String-typed pk — neither should be returned.
+        let missing_val = HashMap::from([(
+            PK_ATTR.to_string(),
+            AttributeValue::B(Blob::new(b"did:x".to_vec())),
+        )]);
+        let string_pk = HashMap::from([
+            (PK_ATTR.to_string(), AttributeValue::S("did:y".to_string())),
+            (
+                VAL_ATTR.to_string(),
+                AttributeValue::B(Blob::new(b"v".to_vec())),
+            ),
+        ]);
+        let items = vec![missing_val, string_pk, bin_item(b"did:z", b"v")];
+        let mut out = Vec::new();
+        filter_items_by_prefix(items, b"did:", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"did:z");
     }
 }
