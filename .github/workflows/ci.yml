@@ -37,7 +37,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   msrv:
-    name: MSRV ${{ env.MSRV }} build
+    # NB: the `env` context is NOT available in `jobs.<job_id>.name` (only
+    # github/needs/strategy/matrix/inputs/vars are). Referencing `${{ env.MSRV }}`
+    # here makes GitHub reject the whole workflow at startup — no jobs run. Keep
+    # this name static; the MSRV value is asserted against Cargo.toml below.
+    name: MSRV build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
