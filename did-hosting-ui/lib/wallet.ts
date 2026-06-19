@@ -16,6 +16,8 @@
 
 import { Platform } from "react-native";
 
+import { api } from "./api";
+
 /** A subset of the wallet provider's interface — just the SIOPv2 login.
  *  Declaring it inline keeps did-hosting-ui from depending on the extension
  *  package. The full interface lives in
@@ -107,15 +109,30 @@ export function isWalletAvailable(): boolean {
   );
 }
 
-/** The RP DID the wallet signs the SIOPv2 `id_token` for. Reads
- *  `EXPO_PUBLIC_RP_DID` at build time; defaults to the demo VTA so a
- *  fresh checkout works without env-var plumbing. Operators with their own
- *  VTA set the env var. */
-export function getRpDid(): string {
-  return (
-    process.env.EXPO_PUBLIC_RP_DID ??
-    "did:webvh:QmUcydmZKWsAUcuAGzyQRjXnSvnMdSRF1YM7gyhugYGS9s:webvh.storm.ws"
-  );
+/** The RP DID the wallet signs the SIOPv2 `id_token` for.
+ *
+ *  Sourced at runtime from THIS control plane's own DID via
+ *  `GET /api/server-info` (`server_did`). That is the exact value the
+ *  server compares the id_token `aud` against in `auth.rs`, so the wallet
+ *  and the verifier can never disagree — and a single prebuilt UI bundle
+ *  works against any deployment without baking a DID in at build time.
+ *  `api.serverInfo()` caches per-tab, so this is one network round-trip.
+ *
+ *  `EXPO_PUBLIC_RP_DID` remains an explicit override for the unusual case
+ *  where the wallet must target a DID other than this deployment's
+ *  control-plane DID; leave it unset to track the control plane. */
+export async function getRpDid(): Promise<string> {
+  const override = process.env.EXPO_PUBLIC_RP_DID;
+  if (override) return override;
+  const info = await api.serverInfo();
+  if (!info.server_did) {
+    throw new Error(
+      "This deployment has no server_did configured (GET /api/server-info returned null), " +
+        "so the wallet can't determine the RP DID for SIOP login. Set `server_did` in the " +
+        "control-plane config (or the CONTROL_SERVER_DID env var).",
+    );
+  }
+  return info.server_did;
 }
 
 /** API base for the wallet's SIOPv2 round-trip. The UI is served same-origin
@@ -139,7 +156,7 @@ export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
     );
   }
   return window.vtaWallet!.login({
-    rpDid: getRpDid(),
+    rpDid: await getRpDid(),
     baseUrl: getApiBase(),
   });
 }
@@ -275,7 +292,7 @@ export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
       "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
     );
   }
-  const rpDid = getRpDid();
+  const rpDid = await getRpDid();
   const wire = await window.vtaWallet!.vaultList!({
     targetDid: rpDid,
     secretKind: "did-self-issued",
@@ -300,7 +317,7 @@ export async function loginWithWalletProxy(
       "Chosen entry has no principalDid — only did-self-issued entries are supported for SIOP proxy login.",
     );
   }
-  const rpDid = getRpDid();
+  const rpDid = await getRpDid();
   const apiBase = getApiBase().replace(/\/+$/, "");
   const steps: ProxyLoginVizStep[] = [];
   const t0 = performance.now();
