@@ -18,3 +18,7 @@ webvh-ui/.expo/
 **/*.armor
 **/sealed-export.txt
 **/*-did.jsonl
+
+# Secrets and credentials
+.env
+.env.*
