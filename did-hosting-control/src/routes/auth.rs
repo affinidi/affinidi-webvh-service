@@ -111,6 +111,31 @@ pub async fn authenticate(
 
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
+    // ─── 0. Content-negotiate the request-body shape.
+    //
+    // Two authenticate dialects share this endpoint (additive — the
+    // SIOPv2 path below is the default and unchanged):
+    //
+    // - SIOPv2 id_token Trust-Task envelope `{type, payload}` — the
+    //   wallet/control contract handled inline below.
+    // - DIDComm-v2 JWS envelope — a general-JSON JWS carrying a
+    //   `signatures` array (no Trust-Task `type` field). This is what
+    //   `did-hosting-server` accepts and what a provisioning VTA sends
+    //   (`build_authenticate_message`: type
+    //   `https://trusttasks.org/spec/auth/authenticate/0.1`, body
+    //   `{session_id, challenge}`, `pack_signed` by the VTA DID). Because
+    //   the unified daemon mounts *this* control route (not the server's
+    //   `/auth/`), a VTA publish would otherwise fail with `400 missing
+    //   field type`. We detect the JWS by its top-level `signatures`
+    //   array and dispatch to the DIDComm path.
+    //
+    // A JWS envelope has no Trust-Task `type` field, and the SIOPv2
+    // envelope has no `signatures` array, so the shapes are unambiguous
+    // and neither dialect can be misrouted.
+    if is_didcomm_jws_envelope(&body) {
+        return authenticate_didcomm_jws(&state, &body, did_resolver).await;
+    }
+
     // ─── 1. Parse the Trust-Task envelope.
     #[derive(serde::Deserialize)]
     struct AuthEnvelope {
@@ -231,6 +256,102 @@ pub async fn authenticate(
         Ok(resp) => {
             state.pending_challenges.release(&signer_did).await;
             info!(did = %signer_did, "authenticated via SIOPv2 id_token");
+            Ok(Json(canonical_to_local_auth_response(resp)).into_response())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Cheap structural check: does `body` look like a DIDComm-v2 general-JSON
+/// JWS envelope (a top-level `signatures` array)?
+///
+/// The SIOPv2 Trust-Task envelope this route otherwise expects is
+/// `{type, payload}` with no `signatures` array, so a `true` here
+/// unambiguously means "route to the DIDComm-JWS path". A body that is
+/// neither shape (e.g. junk) returns `false` and falls through to the
+/// SIOPv2 parser, which emits the existing `trust-task-error` document —
+/// so the malformed-request behaviour for non-JWS bodies is unchanged.
+fn is_didcomm_jws_envelope(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("signatures")
+        .and_then(|s| s.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+}
+
+/// Authenticate via a DIDComm-v2 JWS envelope (the `did-hosting-server`
+/// contract) — the second dialect this endpoint accepts, in addition to
+/// the default SIOPv2 id_token path.
+///
+/// This mirrors `did-hosting-server`'s `routes/auth.rs::authenticate`:
+/// `unpack_signed` verifies the JWS signature and binds the *verified*
+/// signer base DID (an attacker cannot forge `from`), the message `type`
+/// must be the authenticate task URI, and the `{session_id, challenge}`
+/// body is threaded into the same canonical `handle_authenticate` the
+/// SIOPv2 path uses. The canonical handler re-looks-up the signer's ACL
+/// role, so a signer that is not in the ACL is still rejected — this
+/// path adds an accepted *envelope shape*, not a trust relaxation. The
+/// provisioning VTA is authorised only because setup seeded its ACL
+/// entry (see `acl::seed_provisioning_vta_acl`).
+async fn authenticate_didcomm_jws(
+    state: &AppState,
+    body: &[u8],
+    did_resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+) -> Result<Response, AppError> {
+    use did_hosting_common::server::didcomm_unpack;
+
+    let body_str = std::str::from_utf8(body)
+        .map_err(|e| AppError::Authentication(format!("JWS body is not valid UTF-8: {e}")))?;
+
+    let (msg, signer_did) = didcomm_unpack::unpack_signed(body_str, did_resolver).await?;
+
+    // Accept the same authenticate type URIs did-hosting-server accepts
+    // (canonical + legacy) so the VTA's envelope routes here verbatim.
+    if !matches!(
+        msg.typ.as_str(),
+        "https://affinidi.com/webvh/1.0/authenticate"
+            | "https://trusttasks.org/spec/auth/authenticate/0.1"
+    ) {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    let challenge = msg
+        .body
+        .get("challenge")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Authentication("missing challenge in message body".into()))?
+        .to_string();
+    let session_id = msg
+        .body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?
+        .to_string();
+
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)?;
+    let result = vti_common::auth::handlers::handle_authenticate(
+        &backend,
+        vti_common::auth::AuthenticateInput {
+            session_id,
+            challenge,
+            signer_did: signer_did.clone(),
+            created_time: msg.created_time,
+            session_pubkey_b58btc: None,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(resp) => {
+            // Release the pending-challenge slot on success, mirroring
+            // the SIOPv2 path's bookkeeping.
+            state.pending_challenges.release(&signer_did).await;
+            info!(did = %signer_did, "authenticated via DIDComm-JWS envelope");
             Ok(Json(canonical_to_local_auth_response(resp)).into_response())
         }
         Err(e) => Err(e),

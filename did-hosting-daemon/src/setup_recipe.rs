@@ -347,6 +347,18 @@ pub async fn apply_recipe(
         eprintln!("  [setup-recipe] admin ACL entry added for {admin_did}");
     }
 
+    // Trust the provisioning VTA to publish (idempotent, VTA-provisioned
+    // deployments only). Mirrors the interactive wizard's
+    // `finalize_daemon_setup`; see `acl::seed_provisioning_vta_acl`.
+    if let Some(vta_did) = config.vta.did.as_deref() {
+        let store = Store::open(&config.store).await?;
+        let acl_ks = store.keyspace(KS_ACL)?;
+        if did_hosting_common::server::acl::seed_provisioning_vta_acl(&acl_ks, vta_did).await? {
+            store.persist().await?;
+            eprintln!("  [setup-recipe] provisioning-VTA ACL entry added for {vta_did}");
+        }
+    }
+
     eprintln!();
     eprintln!("  [setup-recipe] setup complete");
     eprintln!();
