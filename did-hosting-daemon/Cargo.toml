@@ -51,6 +51,16 @@ azure-secrets = [
   "webvh-witness/azure-secrets",
   "did-hosting-control/azure-secrets",
 ]
+vault-secrets = [
+  "did-hosting-server/vault-secrets",
+  "webvh-witness/vault-secrets",
+  "did-hosting-control/vault-secrets",
+]
+k8s-secrets = [
+  "did-hosting-server/k8s-secrets",
+  "webvh-witness/k8s-secrets",
+  "did-hosting-control/k8s-secrets",
+]
 metrics = [
   "did-hosting-server/metrics",
   "did-hosting-control/metrics",

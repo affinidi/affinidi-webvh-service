@@ -60,6 +60,12 @@ keyring = [
 aws-secrets = ["server-core", "dep:aws-sdk-secretsmanager", "dep:aws-config"]
 gcp-secrets = ["server-core", "dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth", "dep:bytes"]
 azure-secrets = ["server-core", "dep:azure_security_keyvault_secrets", "dep:azure_identity", "dep:azure_core", "dep:futures"]
+# HashiCorp Vault (KV v2) secret backend, authenticating via Kubernetes
+# ServiceAccount JWT (default), static token, or AppRole.
+vault-secrets = ["server-core", "dep:vaultrs"]
+# Native Kubernetes `Secret` backend (in-cluster ServiceAccount or local
+# kubeconfig via `Client::try_default`).
+k8s-secrets = ["server-core", "dep:kube", "dep:k8s-openapi"]
 setup-wizard = ["server-core", "dep:dialoguer"]
 passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
 
@@ -144,6 +150,16 @@ google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 azure_security_keyvault_secrets = { version = "1.0", optional = true }
 azure_identity = { version = "1.0", optional = true }
+# HashiCorp Vault client (vault-secrets feature). KV v2 + Kubernetes /
+# token / AppRole auth methods. `rustls` is vaultrs's default TLS backend.
+vaultrs = { version = "0.8", optional = true }
+# Kubernetes Secret backend (k8s-secrets feature). Reads/writes the
+# secrets envelope from a namespaced `Secret` via the in-cluster
+# ServiceAccount or a local kubeconfig (`Client::try_default`). The
+# generated k8s-openapi API version is fine here — the core/v1 `Secret`
+# shape is long-stable.
+kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.27", features = ["latest"], optional = true }
 
 # Setup wizard helper (optional, behind `setup-wizard` feature)
 dialoguer = { workspace = true, optional = true }

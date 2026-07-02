@@ -32,6 +32,8 @@ azure-secrets = [
   "dep:futures",
   "did-hosting-common/azure-secrets",
 ]
+vault-secrets = ["did-hosting-common/vault-secrets"]
+k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
 store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]

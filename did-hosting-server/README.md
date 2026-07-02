@@ -141,6 +141,12 @@ keyring_service = "webvh"                   # OS keyring service name (default b
 # aws_region = "us-east-1"
 # gcp_project = "my-project"               # Use GCP Secret Manager instead
 # gcp_secret_name = "did-hosting-server-secrets"
+# vault_addr = "https://vault.example.com:8200"    # Use HashiCorp Vault instead
+# vault_secret_path = "webvh/server-secrets"       # KV v2 path (mount defaults to "secret")
+# vault_auth_method = "kubernetes"                 # kubernetes (default) | token | approle
+# vault_k8s_role = "did-hosting-server"            # Vault role, for kubernetes auth
+# k8s_secret_name = "did-hosting-server-secrets"   # Use a native Kubernetes Secret instead
+# k8s_namespace = "webvh"                          # optional; defaults to the pod's namespace
 
 [limits]
 upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
@@ -210,6 +216,8 @@ time via feature flags and at runtime via config/env vars.
 | AWS Secrets Manager  | `aws-secrets`   | `secrets.aws_secret_name`, `secrets.aws_region`                                |
 | GCP Secret Manager   | `gcp-secrets`   | `secrets.gcp_project`, `secrets.gcp_secret_name`                               |
 | Azure Key Vault      | `azure-secrets` | `secrets.azure_vault_url`, `secrets.azure_secret_name`                         |
+| HashiCorp Vault      | `vault-secrets` | `secrets.vault_addr`, `secrets.vault_secret_path`, `secrets.vault_auth_method` (`kubernetes`/`token`/`approle`) |
+| Kubernetes Secret    | `k8s-secrets`   | `secrets.k8s_secret_name`, `secrets.k8s_namespace`                             |
 | Plaintext (testing)  | *(default)*     | `[secrets.plaintext]` — **do not use in production**, secrets land on disk    |
 
 The server stores its key material as a JSON-serialized record
@@ -235,6 +243,12 @@ cargo build -p did-hosting-server --release --features aws-secrets
 
 # GCP Secret Manager
 cargo build -p did-hosting-server --release --features gcp-secrets
+
+# HashiCorp Vault (Kubernetes / token / AppRole auth)
+cargo build -p did-hosting-server --release --features vault-secrets
+
+# Native Kubernetes Secret
+cargo build -p did-hosting-server --release --features k8s-secrets
 
 # Multiple backends
 cargo build -p did-hosting-server --release --features "keyring,aws-secrets"

@@ -72,12 +72,18 @@ level = "info"
 access_token_expiry = 900
 refresh_token_expiry = 86400
 
-# Secret backend. Pick one — features are mutually exclusive at compile
-# time. The daemon's default features include `keyring`; cloud secret
+# Secret backend. The daemon's default features include `keyring`; other
 # backends require recompiling with `--features aws-secrets|gcp-secrets|
-# azure-secrets` and a corresponding [secrets.<backend>] section.
+# azure-secrets|vault-secrets|k8s-secrets` and setting the matching
+# `[secrets]` fields (the configured backend is selected by priority at
+# runtime). HashiCorp Vault authenticates via the pod's Kubernetes
+# ServiceAccount by default.
 [secrets]
 keyring_service = "did-hosting-daemon"
+# vault_addr = "https://vault.example.com:8200"   # --features vault-secrets
+# vault_secret_path = "webvh/daemon-secrets"
+# vault_k8s_role = "did-hosting-daemon"
+# k8s_secret_name = "did-hosting-daemon-secrets"  # --features k8s-secrets
 
 # Main store (server, watcher, control share this)
 [store]

@@ -83,6 +83,16 @@ keyring_service = "webvh"
 # gcp_secret_name   = "did-hosting-daemon-secrets"
 # azure_vault_url   = "https://my-vault.vault.azure.net/"
 # azure_secret_name = "did-hosting-daemon-secrets"
+# --- HashiCorp Vault (build with --features vault-secrets) ---
+# backend           = "vault"
+# vault_addr        = "https://vault.example.com:8200"
+# vault_secret_path = "webvh/daemon-secrets"   # defaults to the secret name if omitted
+# vault_auth_method = "kubernetes"             # kubernetes (default) | token | approle
+# vault_k8s_role    = "did-hosting-daemon"     # required for kubernetes auth
+# --- Native Kubernetes Secret (build with --features k8s-secrets) ---
+# backend         = "k8s"
+# k8s_secret_name = "did-hosting-daemon-secrets"
+# k8s_namespace   = "webvh"                    # optional; defaults to the pod's namespace
 # confirm_plaintext = true
 
 [admin]

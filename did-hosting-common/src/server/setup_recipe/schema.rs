@@ -191,10 +191,10 @@ pub struct VtaSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsSection {
-    /// Backend kind. One of: `keyring`, `aws`, `gcp`, `azure`, `plaintext`.
-    /// Defaults to `keyring`. The wizard refuses `plaintext` unless
-    /// `confirm_plaintext = true` is also set — a defence against shipping
-    /// CI recipes into production by mistake.
+    /// Backend kind. One of: `keyring`, `aws`, `gcp`, `azure`, `vault`,
+    /// `k8s`, `plaintext`. Defaults to `keyring`. The wizard refuses
+    /// `plaintext` unless `confirm_plaintext = true` is also set — a
+    /// defence against shipping CI recipes into production by mistake.
     #[serde(default)]
     pub backend: Option<SecretsBackend>,
     #[serde(default)]
@@ -211,6 +211,46 @@ pub struct SecretsSection {
     pub azure_vault_url: Option<String>,
     #[serde(default)]
     pub azure_secret_name: Option<String>,
+    // HashiCorp Vault (backend = "vault"). Only `vault_addr` is required;
+    // `vault_secret_path` defaults to the service's secret name, and the
+    // mount/auth defaults match the runtime `SecretsConfig`.
+    #[serde(default)]
+    pub vault_addr: Option<String>,
+    #[serde(default)]
+    pub vault_kv_mount: Option<String>,
+    #[serde(default)]
+    pub vault_secret_path: Option<String>,
+    #[serde(default)]
+    pub vault_secret_key: Option<String>,
+    #[serde(default)]
+    pub vault_namespace: Option<String>,
+    #[serde(default)]
+    pub vault_auth_method: Option<String>,
+    #[serde(default)]
+    pub vault_k8s_role: Option<String>,
+    #[serde(default)]
+    pub vault_k8s_mount: Option<String>,
+    #[serde(default)]
+    pub vault_k8s_jwt_path: Option<String>,
+    #[serde(default)]
+    pub vault_token: Option<String>,
+    #[serde(default)]
+    pub vault_approle_role_id: Option<String>,
+    #[serde(default)]
+    pub vault_approle_secret_id: Option<String>,
+    #[serde(default)]
+    pub vault_approle_mount: Option<String>,
+    #[serde(default)]
+    pub vault_skip_verify: Option<bool>,
+    // Native Kubernetes Secret (backend = "k8s"). `k8s_secret_name`
+    // defaults to the service's secret name; namespace defaults to the
+    // pod's namespace at runtime.
+    #[serde(default)]
+    pub k8s_secret_name: Option<String>,
+    #[serde(default)]
+    pub k8s_namespace: Option<String>,
+    #[serde(default)]
+    pub k8s_secret_key: Option<String>,
     /// Required when `backend = "plaintext"`. Acknowledges the recipe
     /// will produce a config file containing private keys in clear text.
     #[serde(default)]
@@ -224,6 +264,12 @@ pub enum SecretsBackend {
     Aws,
     Gcp,
     Azure,
+    /// HashiCorp Vault (KV v2), authenticating via Kubernetes SA JWT
+    /// (default), a static token, or AppRole.
+    Vault,
+    /// Native Kubernetes `Secret` resource.
+    #[serde(rename = "k8s", alias = "kubernetes")]
+    K8s,
     /// Stores key material directly in `config.toml`. Dev only.
     Plaintext,
 }
@@ -379,6 +425,18 @@ impl SetupRecipe {
             && !self.secrets.confirm_plaintext
         {
             return Err(RecipeError::PlaintextNotConfirmed);
+        }
+
+        // Vault needs a server address; the KV path defaults to the
+        // service's secret name and auth-method-specific fields are
+        // validated at connect time by the backend itself.
+        if matches!(self.secrets.backend, Some(SecretsBackend::Vault))
+            && self.secrets.vault_addr.is_none()
+        {
+            return Err(RecipeError::MissingField {
+                service,
+                field: "secrets.vault_addr (required for backend = \"vault\")",
+            });
         }
 
         // VTA section — required for any mode that talks to the VTA.
