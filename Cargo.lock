@@ -2989,6 +2989,7 @@ dependencies = [
  "azure_data_cosmos",
  "azure_identity",
  "azure_security_keyvault_secrets",
+ "base64 0.22.1",
  "bip39",
  "bytes",
  "chrono",

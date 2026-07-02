@@ -1564,6 +1564,22 @@ async fn finalize_daemon_setup(
         eprintln!("  Admin ACL entry added for {admin_did}");
     }
 
+    // Trust the provisioning VTA to publish. When this deployment was
+    // provisioned by a VTA (`config.vta.did` is populated for the online
+    // + offline VTA flows; `None` for self-managed setup), auto-authorise
+    // that VTA DID so the VTA→daemon publish "just works" — no manual
+    // `add-acl` for the VTA that already owns this daemon. Idempotent:
+    // skips if any entry already exists. See
+    // `acl::seed_provisioning_vta_acl` for the full rationale.
+    if let Some(vta_did) = config.vta.did.as_deref() {
+        let store = Store::open(&config.store).await?;
+        let acl_ks = store.keyspace(KS_ACL)?;
+        if did_hosting_common::server::acl::seed_provisioning_vta_acl(&acl_ks, vta_did).await? {
+            store.persist().await?;
+            eprintln!("  Provisioning-VTA ACL entry added for {vta_did}");
+        }
+    }
+
     Ok(())
 }
 

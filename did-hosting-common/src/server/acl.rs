@@ -255,6 +255,55 @@ pub async fn count_all_scoped_owners(acl: &KeyspaceHandle) -> Result<u64, AppErr
         .count() as u64)
 }
 
+/// Idempotently seed the ACL with an `Admin` entry for the VTA DID that
+/// provisioned this deployment.
+///
+/// DID hosting is *managed through the VTA*: when a VTA provisions a
+/// webvh service it pins that VTA's DID (`config.vta.did`) and holds its
+/// authorization credential. The VTA then publishes agent `did.jsonl`
+/// documents to this service over the challenge-response auth flow,
+/// authenticating as its own VTA DID. Both the challenge handler and the
+/// publish handlers gate on the ACL, so without an entry the VTA's very
+/// first `POST /api/auth/challenge` is rejected with `403 DID not in
+/// ACL`. Seeding this entry at provisioning removes the manual
+/// `add-acl --role admin` step an operator would otherwise have to run
+/// for the VTA that already owns this deployment.
+///
+/// `Admin` is deliberate: the VTA publishes DID documents it does not
+/// own the storage path for, and `Admin` is the role that bypasses the
+/// per-DID ownership check on the publish endpoints (matching the role
+/// the operator would have granted by hand).
+///
+/// **Additive + idempotent.** If *any* ACL entry already exists for the
+/// VTA DID — whether from a prior run of this seed, an operator's manual
+/// `add-acl`, or a role the operator deliberately narrowed — it is left
+/// untouched and this returns `Ok(false)`. This never clobbers an
+/// existing entry and never touches any other DID's entry, so the
+/// operator's manual ACL management and the passkey/admin bootstrap are
+/// unaffected. Returns `Ok(true)` when a fresh entry was written.
+pub async fn seed_provisioning_vta_acl(
+    acl: &KeyspaceHandle,
+    vta_did: &str,
+) -> Result<bool, AppError> {
+    if get_acl_entry(acl, vta_did).await?.is_some() {
+        // An entry already exists — respect it (idempotent + never
+        // downgrade/override an operator's deliberate choice).
+        return Ok(false);
+    }
+
+    let entry = AclEntry {
+        did: vta_did.to_string(),
+        role: Role::Admin,
+        label: Some("provisioning VTA".into()),
+        created_at: super::auth::session::now_epoch(),
+        max_total_size: None,
+        max_did_count: None,
+        domains: super::domain::DomainScope::All,
+    };
+    store_acl_entry(acl, &entry).await?;
+    Ok(true)
+}
+
 /// Check whether a DID is in the ACL and return its role.
 ///
 /// Returns `Forbidden` if the DID is not found.
@@ -571,5 +620,83 @@ mod tests {
         let store = fjall_store().await;
         let ks = store.keyspace(KS_ACL).unwrap();
         assert_eq!(count_all_scoped_owners(&ks).await.unwrap(), 0);
+    }
+
+    // ---- seed_provisioning_vta_acl (VTA-provisioned trust) -----------------
+
+    /// On a fresh ACL the provisioning VTA is authorised with an `Admin`
+    /// entry labelled "provisioning VTA", and `check_acl` then passes for
+    /// that DID — so the VTA's challenge/authenticate/publish flow is no
+    /// longer blocked by `403 DID not in ACL`.
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_creates_admin_entry() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        let created = seed_provisioning_vta_acl(&ks, vta).await.unwrap();
+        assert!(created, "a fresh entry must be written");
+
+        let entry = get_acl_entry(&ks, vta)
+            .await
+            .unwrap()
+            .expect("entry stored");
+        assert_eq!(entry.role, Role::Admin, "VTA must be Admin to publish");
+        assert_eq!(entry.label.as_deref(), Some("provisioning VTA"));
+        assert!(matches!(entry.domains, DomainScope::All));
+
+        // The publish/challenge gate now passes for the VTA DID.
+        assert_eq!(check_acl(&ks, vta).await.unwrap(), Role::Admin);
+    }
+
+    /// Idempotent: a second seed is a no-op that returns `false` and does
+    /// not alter the existing entry. Guards the online + offline setup
+    /// paths against duplicating or clobbering on re-run.
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_is_idempotent() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        assert!(seed_provisioning_vta_acl(&ks, vta).await.unwrap());
+        let created_at = get_acl_entry(&ks, vta).await.unwrap().unwrap().created_at;
+
+        // Second call: no write, no change.
+        assert!(
+            !seed_provisioning_vta_acl(&ks, vta).await.unwrap(),
+            "re-seeding an existing entry must be a no-op"
+        );
+        let entry = get_acl_entry(&ks, vta).await.unwrap().unwrap();
+        assert_eq!(
+            entry.created_at, created_at,
+            "existing entry left untouched"
+        );
+        assert_eq!(entry.role, Role::Admin);
+    }
+
+    /// An operator's deliberate ACL choice for the VTA DID (e.g. a
+    /// narrowed role set by hand) is never overridden by the seed. Proves
+    /// the seed is additive, not a relaxation/override of existing state.
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_respects_existing_operator_entry() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        // Operator pre-seeds a narrower Owner entry.
+        store_acl_entry(&ks, &entry(vta, Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+
+        assert!(
+            !seed_provisioning_vta_acl(&ks, vta).await.unwrap(),
+            "must not overwrite an operator-set entry"
+        );
+        let entry = get_acl_entry(&ks, vta).await.unwrap().unwrap();
+        assert_eq!(
+            entry.role,
+            Role::Owner,
+            "operator's role choice must be preserved"
+        );
     }
 }
