@@ -63,6 +63,28 @@ pub fn assert_acl_allows_host(acl_entry: &AclEntry, host: &str) -> Result<(), Ap
 /// Parse a DID identifier and extract its host segment via the
 /// [`DidMethod`] dispatcher.
 ///
+/// The host segment of a did:webvh / did:web identifier percent-encodes
+/// reserved characters — notably the port colon: `localhost:8534`
+/// appears in the identifier as `localhost%3A8534` (see
+/// [`crate::did::encode_host`]). This function percent-decodes the
+/// extracted host before returning, so callers always see the literal
+/// form (`localhost:8534`). That literal form is what the rest of the
+/// system stores and compares against: configured-domain entries are
+/// seeded from `public_url` in decoded form (e.g. `localhost:8534`, see
+/// the assignment / domain seed), domain-name normalisation treats the
+/// literal `:port` as canonical and rejects the `%3A` form, and the
+/// HTTP `Host` header on the resolve path carries the literal colon.
+/// Without the decode here the publish path would look up the store with
+/// the encoded key `localhost%3A8534` (missing the decoded entry) and
+/// domain normalisation would reject the stray `%` outright.
+///
+/// The decode is a no-op for hosts with no percent-escapes (real domains
+/// like `hosting.example.com`, or an already-decoded `localhost:8534`),
+/// so it's safe for every caller. If the host contains malformed
+/// percent-escapes the raw segment is returned unchanged — the
+/// downstream domain / host comparison then fails honestly rather than
+/// this function inventing a decode error.
+///
 /// Returns `Err(AppError::Validation)` on:
 /// - malformed identifier (no `did:` prefix, empty method, etc.)
 /// - unknown method (the compiled binary doesn't know about
@@ -80,7 +102,9 @@ pub fn extract_did_host(did: &str) -> Result<String, AppError> {
     let parsed = method.parse_identifier(did).map_err(|e| {
         AppError::Validation(format!("could not parse DID identifier '{did}': {e}"))
     })?;
-    Ok(parsed.domain)
+    // Percent-decode the host authority (`localhost%3A8534` → `localhost:8534`).
+    // Fall back to the raw segment on malformed escapes — see doc comment.
+    Ok(percent_decode_to_string(&parsed.domain).unwrap_or(parsed.domain))
 }
 
 /// One-shot check covering all three steps. The intended entry point
@@ -117,24 +141,21 @@ pub async fn assert_did_host_allowed(
 /// exists elsewhere. Same shape as `NotFound`; callers shouldn't
 /// need to distinguish "wrong domain" from "really gone".
 ///
-/// The embedded host is percent-decoded before comparison: the
-/// did:webvh / did:web specs require the port colon (and any other
-/// reserved character) to be percent-encoded in the identifier
-/// (`localhost%3A8534`), while the HTTP `Host` header carries the
-/// literal form (`localhost:8534`). Without the decode the two
-/// representations of the same host never match.
+/// The embedded host is percent-decoded (inside [`extract_did_host`])
+/// before comparison: the did:webvh / did:web specs require the port
+/// colon (and any other reserved character) to be percent-encoded in
+/// the identifier (`localhost%3A8534`), while the HTTP `Host` header
+/// carries the literal form (`localhost:8534`). Without the decode the
+/// two representations of the same host never match.
 pub fn assert_request_host_matches_did(request_host: &str, did_id: &str) -> Result<(), AppError> {
-    let embedded_host_raw = extract_did_host(did_id).map_err(|_| {
+    // `extract_did_host` returns the host in decoded / literal form
+    // (`localhost:8534`), matching the shape of the HTTP `Host` header.
+    let embedded_host = extract_did_host(did_id).map_err(|_| {
         // Storage carries an unparseable DID identifier — return 404
         // rather than 500 so the response is honest about "we can't
         // serve this".
         AppError::NotFound(format!("did identifier unparseable: {did_id}"))
     })?;
-    // Fall back to the literal segment when decoding fails — preserves
-    // the original behaviour for any DID whose host contains malformed
-    // percent escapes; the comparison just fails further down instead
-    // of silently succeeding.
-    let embedded_host = percent_decode_to_string(&embedded_host_raw).unwrap_or(embedded_host_raw);
     if request_host.eq_ignore_ascii_case(&embedded_host) {
         return Ok(());
     }
@@ -351,8 +372,36 @@ mod tests {
 
     #[test]
     fn extract_host_webvh_with_port_encoded() {
+        // The identifier percent-encodes the port colon as `%3A`;
+        // `extract_did_host` decodes it back to the literal form so the
+        // publish-path store lookup / domain comparison sees the same
+        // `host:port` that the domain seed stored.
         let host = extract_did_host("did:webvh:QmABC:example.com%3A8085:user1").unwrap();
-        assert_eq!(host, "example.com%3A8085");
+        assert_eq!(host, "example.com:8085");
+    }
+
+    #[test]
+    fn extract_host_webvh_with_port_encoded_localhost() {
+        // Regression for the live 400 on `PUT /api/dids/{mnemonic}`:
+        // a did:webvh log published by a VTA carries the daemon's own
+        // host as `localhost%3A8534`; it must decode to `localhost:8534`
+        // to match the seeded domain entry.
+        let host = extract_did_host("did:webvh:QmABC:localhost%3A8534:user1").unwrap();
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[test]
+    fn extract_host_webvh_with_port_encoded_lowercase_hex() {
+        // Lowercase `%3a` must decode identically to uppercase `%3A`.
+        let host = extract_did_host("did:webvh:QmABC:localhost%3a8534:user1").unwrap();
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[test]
+    fn extract_host_webvh_plain_domain_unchanged() {
+        // No percent-escapes → decode is a no-op.
+        let host = extract_did_host("did:webvh:QmABC:hosting.example.com:user1").unwrap();
+        assert_eq!(host, "hosting.example.com");
     }
 
     #[test]

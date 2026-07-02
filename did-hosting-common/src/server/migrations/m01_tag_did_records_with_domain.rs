@@ -277,7 +277,11 @@ mod tests {
         let rec = legacy_record("user1", Some("did:webvh:Q1:example.com%3A8085:user1"));
         dids.insert(did_key("user1"), &rec).await.unwrap();
         run_migration(&store).await.unwrap();
-        assert_eq!(get_rec(&store, "user1").await.domain, "example.com%3A8085");
+        // `extract_did_host` decodes the `%3A` port separator, so the
+        // backfilled `record.domain` is the literal `host:port` form —
+        // matching the configured-domain entries the timeseries / filter
+        // paths compare against.
+        assert_eq!(get_rec(&store, "user1").await.domain, "example.com:8085");
     }
 
     // ---- tier 2: fall back to system default ----
