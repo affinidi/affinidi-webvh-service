@@ -4,9 +4,13 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp-secrets")]
 pub mod gcp;
+#[cfg(feature = "k8s-secrets")]
+pub mod k8s;
 #[cfg(feature = "keyring")]
 mod keyring;
 mod plaintext;
+#[cfg(feature = "vault-secrets")]
+pub mod vault;
 #[cfg(feature = "setup-wizard")]
 pub mod wizard;
 
@@ -16,8 +20,12 @@ pub use aws::AwsSecretStore;
 pub use azure::AzureKeyVaultStore;
 #[cfg(feature = "gcp-secrets")]
 pub use gcp::GcpSecretStore;
+#[cfg(feature = "k8s-secrets")]
+pub use k8s::K8sSecretStore;
 #[cfg(feature = "keyring")]
 pub use keyring::KeyringSecretStore;
+#[cfg(feature = "vault-secrets")]
+pub use vault::VaultSecretStore;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -87,7 +95,9 @@ impl std::fmt::Debug for ServerSecrets {
 #[cfg(any(
     feature = "aws-secrets",
     feature = "gcp-secrets",
-    feature = "azure-secrets"
+    feature = "azure-secrets",
+    feature = "vault-secrets",
+    feature = "k8s-secrets"
 ))]
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSecrets {
@@ -103,7 +113,9 @@ pub(crate) struct StoredSecrets {
 #[cfg(any(
     feature = "aws-secrets",
     feature = "gcp-secrets",
-    feature = "azure-secrets"
+    feature = "azure-secrets",
+    feature = "vault-secrets",
+    feature = "k8s-secrets"
 ))]
 impl std::fmt::Debug for StoredSecrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -120,7 +132,9 @@ impl std::fmt::Debug for StoredSecrets {
 #[cfg(any(
     feature = "aws-secrets",
     feature = "gcp-secrets",
-    feature = "azure-secrets"
+    feature = "azure-secrets",
+    feature = "vault-secrets",
+    feature = "k8s-secrets"
 ))]
 impl StoredSecrets {
     /// Parse the on-the-wire shape, accepting both the new envelope and
@@ -199,8 +213,8 @@ pub trait SecretStore: Send + Sync {
 /// Returns `true` when the plaintext fallback backend will actually be used.
 ///
 /// This mirrors the priority logic in [`create_secret_store`]: AWS → GCP →
-/// keyring → plaintext. Returns `true` only when no higher-priority backend
-/// is both compiled in and configured.
+/// Azure → Vault → Kubernetes → keyring → plaintext. Returns `true` only when
+/// no higher-priority backend is both compiled in and configured.
 #[allow(unused_variables)]
 pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
     // If any secure backend is compiled in AND would be selected, not plaintext.
@@ -216,6 +230,16 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
 
     #[cfg(feature = "azure-secrets")]
     if secrets.azure_secret_name.is_some() {
+        return false;
+    }
+
+    #[cfg(feature = "vault-secrets")]
+    if secrets.vault_addr.is_some() {
+        return false;
+    }
+
+    #[cfg(feature = "k8s-secrets")]
+    if secrets.k8s_secret_name.is_some() {
         return false;
     }
 
@@ -243,8 +267,10 @@ pub fn is_plaintext_backend(secrets: &SecretsConfig) -> bool {
 /// 1. AWS Secrets Manager (if `aws-secrets` compiled + `secrets.aws_secret_name` set)
 /// 2. GCP Secret Manager (if `gcp-secrets` compiled + `secrets.gcp_secret_name` set)
 /// 3. Azure Key Vault (if `azure-secrets` compiled + `secrets.azure_secret_name` set)
-/// 4. OS keyring (if `keyring` compiled — the default)
-/// 5. Plaintext in config file (fallback when no secure backend is available)
+/// 4. HashiCorp Vault (if `vault-secrets` compiled + `secrets.vault_addr` set)
+/// 5. Kubernetes Secret (if `k8s-secrets` compiled + `secrets.k8s_secret_name` set)
+/// 6. OS keyring (if `keyring` compiled — the default)
+/// 7. Plaintext in config file (fallback when no secure backend is available)
 #[allow(unused_variables)]
 pub fn create_secret_store(
     secrets: &SecretsConfig,
@@ -278,6 +304,18 @@ pub fn create_secret_store(
             )
         })?;
         let store = AzureKeyVaultStore::new(vault_url, secrets.azure_secret_name.clone().unwrap());
+        return Ok(Box::new(store));
+    }
+
+    #[cfg(feature = "vault-secrets")]
+    if secrets.vault_addr.is_some() {
+        let store = vault::from_config(secrets)?;
+        return Ok(Box::new(store));
+    }
+
+    #[cfg(feature = "k8s-secrets")]
+    if secrets.k8s_secret_name.is_some() {
+        let store = k8s::from_config(secrets)?;
         return Ok(Box::new(store));
     }
 
@@ -315,7 +353,9 @@ pub fn create_secret_store(
     any(
         feature = "aws-secrets",
         feature = "gcp-secrets",
-        feature = "azure-secrets"
+        feature = "azure-secrets",
+        feature = "vault-secrets",
+        feature = "k8s-secrets"
     )
 ))]
 mod stored_secrets_tests {

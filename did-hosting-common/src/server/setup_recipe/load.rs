@@ -67,14 +67,18 @@ pub fn apply_env_overrides(recipe: &mut SetupRecipe) {
     }
 
     // Secrets — selection precedence matches the runtime: AWS → GCP →
-    // Azure → keyring. If multiple are set we honour the highest one
-    // (same precedence the runtime config loader uses).
+    // Azure → Vault → Kubernetes → keyring. If multiple are set we honour
+    // the highest one (same precedence the runtime config loader uses).
     if std::env::var(format!("{prefix}_SECRETS_AWS_SECRET_NAME")).is_ok() {
         recipe.secrets.backend = Some(SecretsBackend::Aws);
     } else if std::env::var(format!("{prefix}_SECRETS_GCP_SECRET_NAME")).is_ok() {
         recipe.secrets.backend = Some(SecretsBackend::Gcp);
     } else if std::env::var(format!("{prefix}_SECRETS_AZURE_SECRET_NAME")).is_ok() {
         recipe.secrets.backend = Some(SecretsBackend::Azure);
+    } else if std::env::var(format!("{prefix}_SECRETS_VAULT_ADDR")).is_ok() {
+        recipe.secrets.backend = Some(SecretsBackend::Vault);
+    } else if std::env::var(format!("{prefix}_SECRETS_K8S_SECRET_NAME")).is_ok() {
+        recipe.secrets.backend = Some(SecretsBackend::K8s);
     } else if std::env::var(format!("{prefix}_SECRETS_KEYRING_SERVICE")).is_ok() {
         recipe.secrets.backend = Some(SecretsBackend::Keyring);
     }
@@ -98,6 +102,59 @@ pub fn apply_env_overrides(recipe: &mut SetupRecipe) {
     }
     if let Some(v) = env_get(prefix, "SECRETS_AZURE_SECRET_NAME") {
         recipe.secrets.azure_secret_name = Some(v);
+    }
+    // HashiCorp Vault
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_ADDR") {
+        recipe.secrets.vault_addr = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_KV_MOUNT") {
+        recipe.secrets.vault_kv_mount = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_SECRET_PATH") {
+        recipe.secrets.vault_secret_path = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_SECRET_KEY") {
+        recipe.secrets.vault_secret_key = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_NAMESPACE") {
+        recipe.secrets.vault_namespace = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_AUTH_METHOD") {
+        recipe.secrets.vault_auth_method = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_K8S_ROLE") {
+        recipe.secrets.vault_k8s_role = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_K8S_MOUNT") {
+        recipe.secrets.vault_k8s_mount = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_K8S_JWT_PATH") {
+        recipe.secrets.vault_k8s_jwt_path = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_TOKEN") {
+        recipe.secrets.vault_token = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_APPROLE_ROLE_ID") {
+        recipe.secrets.vault_approle_role_id = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_APPROLE_SECRET_ID") {
+        recipe.secrets.vault_approle_secret_id = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_APPROLE_MOUNT") {
+        recipe.secrets.vault_approle_mount = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_VAULT_SKIP_VERIFY") {
+        recipe.secrets.vault_skip_verify = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+    }
+    // Native Kubernetes Secret
+    if let Some(v) = env_get(prefix, "SECRETS_K8S_SECRET_NAME") {
+        recipe.secrets.k8s_secret_name = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_K8S_NAMESPACE") {
+        recipe.secrets.k8s_namespace = Some(v);
+    }
+    if let Some(v) = env_get(prefix, "SECRETS_K8S_SECRET_KEY") {
+        recipe.secrets.k8s_secret_key = Some(v);
     }
 
     // Server section
@@ -234,6 +291,61 @@ pub fn resolve_secrets_config(
             );
             out.keyring_service = default_keyring_service.to_string();
         }
+        SecretsBackend::Vault => {
+            out.vault_addr = recipe.secrets.vault_addr.clone();
+            // Mirror aws/gcp/azure: the path defaults to the service's
+            // secret name when the recipe omits it.
+            out.vault_secret_path = Some(
+                recipe
+                    .secrets
+                    .vault_secret_path
+                    .clone()
+                    .unwrap_or_else(|| default_secret_name.to_string()),
+            );
+            // The remaining string fields keep their SecretsConfig defaults
+            // (mount = "secret", auth = "kubernetes", …) unless overridden.
+            if let Some(v) = recipe.secrets.vault_kv_mount.clone() {
+                out.vault_kv_mount = v;
+            }
+            if let Some(v) = recipe.secrets.vault_secret_key.clone() {
+                out.vault_secret_key = v;
+            }
+            out.vault_namespace = recipe.secrets.vault_namespace.clone();
+            if let Some(v) = recipe.secrets.vault_auth_method.clone() {
+                out.vault_auth_method = v;
+            }
+            out.vault_k8s_role = recipe.secrets.vault_k8s_role.clone();
+            if let Some(v) = recipe.secrets.vault_k8s_mount.clone() {
+                out.vault_k8s_mount = v;
+            }
+            if let Some(v) = recipe.secrets.vault_k8s_jwt_path.clone() {
+                out.vault_k8s_jwt_path = v;
+            }
+            out.vault_token = recipe.secrets.vault_token.clone();
+            out.vault_approle_role_id = recipe.secrets.vault_approle_role_id.clone();
+            out.vault_approle_secret_id = recipe.secrets.vault_approle_secret_id.clone();
+            if let Some(v) = recipe.secrets.vault_approle_mount.clone() {
+                out.vault_approle_mount = v;
+            }
+            if let Some(v) = recipe.secrets.vault_skip_verify {
+                out.vault_skip_verify = v;
+            }
+            out.keyring_service = default_keyring_service.to_string();
+        }
+        SecretsBackend::K8s => {
+            out.k8s_secret_name = Some(
+                recipe
+                    .secrets
+                    .k8s_secret_name
+                    .clone()
+                    .unwrap_or_else(|| default_secret_name.to_string()),
+            );
+            out.k8s_namespace = recipe.secrets.k8s_namespace.clone();
+            if let Some(v) = recipe.secrets.k8s_secret_key.clone() {
+                out.k8s_secret_key = v;
+            }
+            out.keyring_service = default_keyring_service.to_string();
+        }
         SecretsBackend::Plaintext => {
             // Explicitly select plaintext so a keyring-enabled build doesn't
             // silently prefer the OS keyring (which panics on headless hosts
@@ -326,6 +438,48 @@ mod tests {
         let r = fixture(ServiceKind::Server);
         let cfg = resolve_secrets_config(&r, "test-secrets", "webvh");
         assert_eq!(cfg.keyring_service, "webvh");
+    }
+
+    #[test]
+    fn resolve_secrets_vault_maps_fields_and_defaults_path() {
+        let mut r = fixture(ServiceKind::Server);
+        r.secrets.backend = Some(SecretsBackend::Vault);
+        r.secrets.vault_addr = Some("https://vault.example.com:8200".into());
+        r.secrets.vault_k8s_role = Some("did-hosting-server".into());
+        // vault_secret_path omitted → defaults to the secret name.
+        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh");
+        assert_eq!(
+            cfg.vault_addr.as_deref(),
+            Some("https://vault.example.com:8200")
+        );
+        assert_eq!(cfg.vault_secret_path.as_deref(), Some("webvh-server-secrets"));
+        assert_eq!(cfg.vault_k8s_role.as_deref(), Some("did-hosting-server"));
+        // Untouched fields keep their SecretsConfig defaults.
+        assert_eq!(cfg.vault_kv_mount, "secret");
+        assert_eq!(cfg.vault_auth_method, "kubernetes");
+    }
+
+    #[test]
+    fn resolve_secrets_k8s_defaults_secret_name() {
+        let mut r = fixture(ServiceKind::Server);
+        r.secrets.backend = Some(SecretsBackend::K8s);
+        r.secrets.k8s_namespace = Some("webvh".into());
+        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh");
+        assert_eq!(cfg.k8s_secret_name.as_deref(), Some("webvh-server-secrets"));
+        assert_eq!(cfg.k8s_namespace.as_deref(), Some("webvh"));
+        assert_eq!(cfg.k8s_secret_key, "seed");
+    }
+
+    #[test]
+    fn vault_backend_requires_addr() {
+        let mut r = fixture(ServiceKind::Server);
+        r.secrets.backend = Some(SecretsBackend::Vault);
+        // No vault_addr → validation must reject.
+        let err = r.validate().expect_err("vault without addr must fail");
+        assert!(
+            matches!(err, RecipeError::MissingField { field, .. } if field.contains("vault_addr")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

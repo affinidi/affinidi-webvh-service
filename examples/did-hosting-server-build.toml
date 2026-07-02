@@ -56,6 +56,12 @@ context_id = "webvh"
 [secrets]
 backend = "keyring"
 keyring_service = "webvh"
+# Alternative backends (build with the matching feature, then pick one):
+# backend = "aws";   aws_region = "us-east-1"; aws_secret_name = "did-hosting-server-secrets"
+# backend = "gcp";   gcp_project = "my-project"; gcp_secret_name = "did-hosting-server-secrets"
+# backend = "azure"; azure_vault_url = "https://my-vault.vault.azure.net/"; azure_secret_name = "did-hosting-server-secrets"
+# backend = "vault"; vault_addr = "https://vault.example.com:8200"; vault_secret_path = "webvh/server-secrets"; vault_auth_method = "kubernetes"; vault_k8s_role = "did-hosting-server"
+# backend = "k8s";   k8s_secret_name = "did-hosting-server-secrets"; k8s_namespace = "webvh"
 
 [admin]
 mode = "skip"

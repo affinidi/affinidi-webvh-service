@@ -20,14 +20,17 @@ use crate::server::error::AppError;
 /// Returns a populated [`SecretsConfig`]. Behaviour:
 ///
 /// 1. Lists every secrets backend compiled into the binary
-///    (`keyring`, `aws-secrets`, `gcp-secrets`, `azure-secrets`).
+///    (`keyring`, `aws-secrets`, `gcp-secrets`, `azure-secrets`,
+///    `vault-secrets`, `k8s-secrets`).
 /// 2. If none are compiled in, warns about plaintext storage and
 ///    requires explicit confirmation.
 /// 3. For cloud backends (AWS/GCP/Azure), collects connection params
 ///    (region/project/vault URL), then attempts to list existing
 ///    secrets. On success, the operator picks from the list or
 ///    enters a new name; on failure the wizard falls back to a
-///    free-text input with a warning.
+///    free-text input with a warning. HashiCorp Vault and Kubernetes
+///    Secret backends collect their connection params via free-text
+///    prompts (no server-side secret enumeration).
 #[allow(clippy::vec_init_then_push, unused_variables)]
 pub async fn prompt_secrets_backend(
     default_secret_name: &str,
@@ -48,13 +51,19 @@ pub async fn prompt_secrets_backend(
     #[cfg(feature = "azure-secrets")]
     backends.push("Azure Key Vault");
 
+    #[cfg(feature = "vault-secrets")]
+    backends.push("HashiCorp Vault");
+
+    #[cfg(feature = "k8s-secrets")]
+    backends.push("Kubernetes Secret");
+
     if backends.is_empty() {
         eprintln!();
         eprintln!("  *** WARNING: No secure secrets backend is available. ***");
         eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
         eprintln!("  This is INSECURE and should only be used for testing/development.");
         eprintln!(
-            "  For production, recompile with: keyring, aws-secrets, gcp-secrets, or azure-secrets."
+            "  For production, recompile with: keyring, aws-secrets, gcp-secrets, azure-secrets, vault-secrets, or k8s-secrets."
         );
         eprintln!();
 
@@ -66,7 +75,7 @@ pub async fn prompt_secrets_backend(
 
         if !proceed {
             return Err(AppError::Config(
-                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, gcp-secrets, or azure-secrets)".into(),
+                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, gcp-secrets, azure-secrets, vault-secrets, or k8s-secrets)".into(),
             ));
         }
 
@@ -143,6 +152,94 @@ pub async fn prompt_secrets_backend(
 
             secrets_config.azure_vault_url = Some(vault_url);
             secrets_config.azure_secret_name = Some(name);
+        }
+        #[cfg(feature = "vault-secrets")]
+        s if s.starts_with("HashiCorp") => {
+            let addr: String = Input::new()
+                .with_prompt("Vault address (e.g. https://vault.example.com:8200)")
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+            let secret_path: String = Input::new()
+                .with_prompt("KV v2 secret path (e.g. webvh/server-secrets)")
+                .default(default_secret_name.to_string())
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+            let kv_mount: String = Input::new()
+                .with_prompt("KV v2 mount path")
+                .default("secret".to_string())
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+            let auth_methods = ["kubernetes", "token", "approle"];
+            let auth_idx = Select::new()
+                .with_prompt("Vault auth method")
+                .items(auth_methods.as_slice())
+                .default(0)
+                .interact()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+            let auth_method = auth_methods[auth_idx];
+
+            match auth_method {
+                "kubernetes" => {
+                    let role: String = Input::new()
+                        .with_prompt("Vault Kubernetes auth role")
+                        .interact_text()
+                        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+                    secrets_config.vault_k8s_role = Some(role);
+                }
+                "token" => {
+                    // Prefer the VAULT_TOKEN env var over persisting a token
+                    // to the config file — leaving this empty does exactly that.
+                    let token: String = Input::new()
+                        .with_prompt("Vault token (leave empty to use the VAULT_TOKEN env var)")
+                        .default(String::new())
+                        .allow_empty(true)
+                        .interact_text()
+                        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+                    if !token.is_empty() {
+                        secrets_config.vault_token = Some(token);
+                    }
+                }
+                _ => {
+                    let role_id: String = Input::new()
+                        .with_prompt("AppRole role_id")
+                        .interact_text()
+                        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+                    let secret_id: String = Input::new()
+                        .with_prompt("AppRole secret_id")
+                        .interact_text()
+                        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+                    secrets_config.vault_approle_role_id = Some(role_id);
+                    secrets_config.vault_approle_secret_id = Some(secret_id);
+                }
+            }
+
+            secrets_config.vault_addr = Some(addr);
+            secrets_config.vault_secret_path = Some(secret_path);
+            secrets_config.vault_kv_mount = kv_mount;
+            secrets_config.vault_auth_method = auth_method.to_string();
+        }
+        #[cfg(feature = "k8s-secrets")]
+        s if s.starts_with("Kubernetes") => {
+            let name: String = Input::new()
+                .with_prompt("Kubernetes Secret name")
+                .default(default_secret_name.to_string())
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+            let namespace: String = Input::new()
+                .with_prompt("Kubernetes namespace (leave empty for the pod's default namespace)")
+                .default(String::new())
+                .allow_empty(true)
+                .interact_text()
+                .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+
+            secrets_config.k8s_secret_name = Some(name);
+            if !namespace.is_empty() {
+                secrets_config.k8s_namespace = Some(namespace);
+            }
         }
         _ => {
             // Keyring (or only available backend)
