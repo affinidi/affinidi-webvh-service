@@ -100,7 +100,12 @@ vta-sdk = { workspace = true }
 # 0.7 on crates.io, published 2026-05-24 (OpenVTC PR #113 + #115).
 # The git-pinned rev that lived here through the pre-publish
 # window is gone.
-vti-common = { version = "0.10.3", default-features = false }
+#
+# 0.11.x re-pins onto vta-sdk ^0.18 + affinidi-tdk ^0.8 — it is the
+# lever that unlocks the vta-sdk 0.18 (TSP) upgrade. Keep in lockstep
+# with the workspace `vta-sdk` pin: a mismatched pair resolves to two
+# vta-sdk copies and fails to compile (E0308 on the shared auth types).
+vti-common = { version = "0.11", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)
@@ -113,7 +118,7 @@ chrono = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tower-http = { version = "0.6", features = ["trace", "cors"], optional = true }
+tower-http = { version = "0.7", features = ["trace", "cors"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 toml = "1.0"
@@ -138,7 +143,7 @@ redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
 firestore = { version = "0.49", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.34", features = ["key_auth"], optional = true }
+azure_data_cosmos = { version = "0.36", features = ["key_auth"], optional = true }
 azure_core = { version = "1.0", optional = true }
 
 # secret store backends (optional)
@@ -158,8 +163,8 @@ vaultrs = { version = "0.8", optional = true }
 # ServiceAccount or a local kubeconfig (`Client::try_default`). The
 # generated k8s-openapi API version is fine here — the core/v1 `Secret`
 # shape is long-stable.
-kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"], optional = true }
-k8s-openapi = { version = "0.27", features = ["latest"], optional = true }
+kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.28", features = ["latest"], optional = true }
 
 # Setup wizard helper (optional, behind `setup-wizard` feature)
 dialoguer = { workspace = true, optional = true }

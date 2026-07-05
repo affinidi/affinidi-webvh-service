@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use azure_data_cosmos::query::FeedScope;
-use azure_data_cosmos::regions::Region;
+use azure_data_cosmos::FeedScope;
+use azure_data_cosmos::options::Region;
 use azure_data_cosmos::{AccountEndpoint, AccountReference, CosmosClient, RoutingStrategy};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
