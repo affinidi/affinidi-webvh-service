@@ -938,6 +938,9 @@ async fn run_self_managed_setup(
         &DidDocumentOptions {
             key_agreement_multibase: Some(&ka_pub_mb),
             mediator_endpoint: mediator_did.as_deref(),
+            // Wired to the operator's transport selection in the wizard
+            // phase; None keeps the DIDComm-only shape for now.
+            tsp_endpoint: None,
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)

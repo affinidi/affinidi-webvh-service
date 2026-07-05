@@ -73,6 +73,13 @@ pub struct DidDocumentOptions<'a> {
     /// When set, a `DIDCommMessaging` service is added so other parties
     /// know how to route messages to this DID.
     pub mediator_endpoint: Option<&'a str>,
+    /// Mediator DID (or URL) for the `TSPTransport` service endpoint.
+    /// When set, a `TSPTransport` service (`#tsp`) is added so other
+    /// parties know they can reach this DID over the Trust Spanning
+    /// Protocol. Emitted *before* `DIDCommMessaging` to match the VTA
+    /// webvh templates' canonical preference order (TSP over DIDComm) —
+    /// see `resolve_transport` / `didcomm_profile::resolve_mediator_did`.
+    pub tsp_endpoint: Option<&'a str>,
 }
 
 /// Build a standard DID document with `{SCID}` placeholders.
@@ -124,9 +131,20 @@ pub fn build_did_document(
 
     doc["verificationMethod"] = json!(vm);
 
-    // Add services. Service id is `#vta-didcomm` to match the VTA
-    // webvh VTA templates — not the older `#didcomm` convention.
+    // Add services. Service ids (`#tsp`, `#vta-didcomm`) and the
+    // ordering (TSP first, then DIDComm) match the VTA webvh templates
+    // — see `vta-sdk`'s `did-host-*didcomm.json`. The `#vta-didcomm`
+    // fragment is deliberate (not the older `#didcomm` convention).
     let mut services = vec![];
+    if let Some(tsp) = opts.tsp_endpoint {
+        // `TSPTransport`'s `serviceEndpoint` is a bare string (the
+        // mediator VID), unlike DIDComm's array-of-objects shape.
+        services.push(json!({
+            "id": format!("{did_id}#tsp"),
+            "type": "TSPTransport",
+            "serviceEndpoint": tsp,
+        }));
+    }
     if let Some(mediator) = opts.mediator_endpoint {
         services.push(json!({
             "id": format!("{did_id}#vta-didcomm"),
@@ -326,6 +344,7 @@ mod tests {
             &DidDocumentOptions {
                 key_agreement_multibase: Some("z6LSKA"),
                 mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+                ..Default::default()
             },
         );
         let did_id = doc["id"].as_str().unwrap();
@@ -369,5 +388,44 @@ mod tests {
             "did:webvh:QmMED:mediator.example.com"
         );
         assert_eq!(service[0]["serviceEndpoint"][0]["accept"][0], "didcomm/v2");
+    }
+
+    /// Locks the local builder's TSP output to the `vta-sdk`
+    /// `did-host-http-didcomm.json` / `did-host-didcomm.json` templates:
+    /// the `#tsp` `TSPTransport` service is emitted **first** (canonical
+    /// preference order), before `#vta-didcomm`, and its `serviceEndpoint`
+    /// is a bare string (the mediator VID), not the DIDComm
+    /// array-of-objects shape. Update both sides together if either moves.
+    #[test]
+    fn build_did_document_matches_webvh_tsp_template_ordering() {
+        let doc = build_did_document(
+            "example.com",
+            "control",
+            "z6MkSigning",
+            &DidDocumentOptions {
+                key_agreement_multibase: Some("z6LSKA"),
+                mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+                tsp_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+            },
+        );
+        let did_id = doc["id"].as_str().unwrap();
+        let service = doc["service"].as_array().unwrap();
+        assert_eq!(service.len(), 2, "TSP + DIDComm service entries");
+
+        // TSP first — matches the template's canonical service order.
+        assert_eq!(service[0]["id"], format!("{did_id}#tsp"));
+        assert_eq!(service[0]["type"], "TSPTransport");
+        assert_eq!(
+            service[0]["serviceEndpoint"], "did:webvh:QmMED:mediator.example.com",
+            "TSP serviceEndpoint is a bare string, not an array-of-objects"
+        );
+
+        // DIDComm second, unchanged.
+        assert_eq!(service[1]["id"], format!("{did_id}#vta-didcomm"));
+        assert_eq!(service[1]["type"], "DIDCommMessaging");
+        assert_eq!(
+            service[1]["serviceEndpoint"][0]["uri"],
+            "did:webvh:QmMED:mediator.example.com"
+        );
     }
 }

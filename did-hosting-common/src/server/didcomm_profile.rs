@@ -123,20 +123,94 @@ pub async fn resolve_mediator_did(
         }
     };
 
-    // Find the DIDCommMessaging service
-    let service = doc
+    // Find the DIDCommMessaging service endpoint URI. `get_uri()` leaves
+    // JSON quoting on Map-shaped endpoints, so trim it.
+    let mediator = doc
         .service
         .iter()
-        .find(|s| s.type_.iter().any(|t| t == "DIDCommMessaging"))?;
-
-    // Extract the URI from the service endpoint
-    let uri = service.service_endpoint.get_uri()?;
-
-    // get_uri() returns JSON-encoded strings (with quotes) for Map endpoints
-    let mediator = uri.trim_matches('"').to_string();
+        .find(|s| s.type_.iter().any(|t| t == "DIDCommMessaging"))
+        .and_then(|s| s.service_endpoint.get_uri())
+        .map(|uri| uri.trim_matches('"').to_string())?;
 
     info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
     Some(mediator)
+}
+
+/// A transport a peer's DID document advertises for reaching it.
+///
+/// The `did-hosting` workspace treats **TSP as preferred over DIDComm**
+/// when a peer advertises both — matching the canonical service order
+/// the VTA webvh templates render (`#tsp` before `#vta-didcomm`). The
+/// outbound send path ([`crate::server`] / the trust-task sender) uses
+/// [`resolve_transport`] to pick the binding; both services point at the
+/// same mediator VID, so only the *binding* differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTransport {
+    /// Trust Spanning Protocol (`TSPTransport` service).
+    Tsp,
+    /// DIDComm v2 (`DIDCommMessaging` service).
+    Didcomm,
+}
+
+/// Resolve a peer's preferred transport and its mediator endpoint from
+/// the peer's DID document.
+///
+/// Scans for a `TSPTransport` service **first**, falling back to
+/// `DIDCommMessaging`. Returns `(transport, mediator_endpoint)`, or
+/// `None` if the DID cannot be resolved or advertises neither service.
+///
+/// This is the single canonical "which transport for this peer" reader —
+/// when a DID has a `TSPTransport` service we prefer it, which is the
+/// concrete realisation of "when a DID has a TSPTransport, use that
+/// instead of DIDComm".
+pub async fn resolve_transport(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<(PeerTransport, String)> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for transport discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for transport discovery: {e}");
+            return None;
+        }
+    };
+
+    // Scan for a service of `type_name` and return its endpoint URI as a
+    // plain string. Handles both endpoint shapes the webvh templates
+    // emit: DIDComm's array-of-objects (`[{ "uri": ... }]`) and TSP's
+    // bare-string (`"did:webvh:mediator..."`) `serviceEndpoint`.
+    let find_uri = |type_name: &str| {
+        doc.service
+            .iter()
+            .find(|s| s.type_.iter().any(|t| t == type_name))
+            .and_then(|s| s.service_endpoint.get_uri())
+            .map(|uri| uri.trim_matches('"').to_string())
+    };
+
+    if let Some(tsp) = find_uri("TSPTransport") {
+        info!(peer = peer_did, mediator = %tsp, "peer advertises TSPTransport — preferring TSP");
+        return Some((PeerTransport::Tsp, tsp));
+    }
+    if let Some(didcomm) = find_uri("DIDCommMessaging") {
+        info!(peer = peer_did, mediator = %didcomm, "peer advertises DIDCommMessaging — using DIDComm");
+        return Some((PeerTransport::Didcomm, didcomm));
+    }
+    None
 }
 
 /// Wait until a DID resolves, retrying with exponential backoff.
