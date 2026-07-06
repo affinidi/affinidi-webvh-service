@@ -40,7 +40,7 @@ use trust_tasks_rs::{ErrorPayload, ProofPolicy, RejectReason, TrustTask};
 use uuid::Uuid;
 
 use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
+    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher, dispatch_inbound,
 };
 
 use crate::auth::AuthClaims;
@@ -147,6 +147,31 @@ pub async fn dispatch_trust_task(
                 return Ok(into_response(DispatchOutcome::Rejected(routed)));
             }
         }
+    }
+
+    // ─── Route by Type URI (parity with the TSP + DIDComm transports).
+    //
+    // Framework ops (ACL + discovery) run the typed §7.2 pipeline below,
+    // mapping outcomes to HTTP status codes. DID-management ops
+    // (`did/publish`, `register`, `delete`, `change-owner`, `info`,
+    // `list`, `check-name`, `witness/publish`) are bridged to
+    // `dispatch_did_op` and returned as `200` with the Trust Task response
+    // document — the problem-report shape carries any error, exactly as on
+    // the DIDComm transport (which has no HTTP status either).
+    let type_uri = doc.type_uri.to_string();
+    if !build_dispatcher()
+        .registered_uris()
+        .contains(&type_uri.as_str())
+    {
+        let value = crate::messaging::bridge_did_management(&state, &auth.did, my_vid, &doc)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&value).expect("Trust Task response serialises"),
+        )
+            .into_response());
     }
 
     // ─── 4. Build the transport adapter + context.
