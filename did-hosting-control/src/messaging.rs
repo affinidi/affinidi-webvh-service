@@ -1360,53 +1360,25 @@ pub(crate) async fn run_trust_tasks_envelope(
         .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
     let transport =
         trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
-    let ctx = did_hosting_common::server::trust_tasks::TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-    };
-    // Dispatch with the configured proof verifier when the operator
-    // has opted in. Mirrors `routes::trust_tasks` — both transports
-    // share one proof policy.
-    let policy: trust_tasks_rs::ProofPolicy<
-        '_,
-        did_hosting_common::server::trust_tasks::TransportBoundVerifier,
-    > = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
-        _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
-    };
-    let outcome = did_hosting_common::server::trust_tasks::dispatch_inbound::<
-        did_hosting_common::server::trust_tasks::TransportBoundVerifier,
-    >(&ctx, &transport, policy, doc)
-    .await;
 
-    use did_hosting_common::server::trust_tasks::DispatchOutcome;
-    let body = match outcome {
-        DispatchOutcome::Handled(resp) => {
-            serde_json::to_value(&resp).expect("response document serialises")
-        }
-        DispatchOutcome::Rejected(err) => {
-            serde_json::to_value(&err).expect("error document serialises")
-        }
-        DispatchOutcome::Suppressed => {
-            // §8.1 routing exception: don't emit any response. The
-            // DIDComm service framework accepts `Ok(None)` as
-            // fire-and-forget. Bumped to `error!` because the dispatcher
-            // is gated by `require_sender_did(true)` upstream — if we
-            // see this fire, the invariant has broken.
+    // Route through the unified trust-task dispatcher — the same entry TSP
+    // and HTTPS use. ACL + discovery ops run the typed §7.2 pipeline;
+    // DID-management ops are bridged to `dispatch_did_op`. Both are now
+    // reachable as trust-task envelopes over DIDComm, not just as `MSG_*`.
+    match dispatch_trust_task_doc(state, sender, &transport, doc).await? {
+        Some(body) => Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body))),
+        None => {
+            // SPEC §8.1 routing exception: identity-mismatch with no
+            // transport sender. Unreachable under `require_sender_did(true)`;
+            // if it fires, the invariant has broken.
             tracing::error!(
                 should_not_happen = true,
                 sender = sender,
                 "trust-tasks envelope: dispatch suppressed (identity_mismatch w/ no transport sender)"
             );
-            return Ok(None);
+            Ok(None)
         }
-    };
-
-    Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)))
+    }
 }
 
 /// Build the same body-parse `trust-task-error/0.1` document that the
@@ -1433,6 +1405,168 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
         proof: None,
         extra: Default::default(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unified trust-task dispatch (all transports)
+// ---------------------------------------------------------------------------
+
+/// The single dispatch entry for an inbound `TrustTask<Value>` document,
+/// shared by **every** transport that carries trust-task documents — TSP,
+/// the DIDComm trust-task envelope, and (behind its bearer-auth proof
+/// pre-check) HTTPS `POST /api/trust-tasks`.
+///
+/// Routes by Type URI:
+/// - Type URIs the framework dispatcher owns (ACL grant/revoke/change-role/
+///   show/list, discovery) → the typed SPEC §7.2 pipeline via
+///   [`dispatch_inbound`](did_hosting_common::server::trust_tasks::dispatch_inbound).
+/// - Everything else (the legacy DID-management ops) → [`bridge_did_management`],
+///   which reuses the transport-agnostic [`dispatch_did_op`] engine.
+///
+/// Returns the response document as a JSON value (`None` = the SPEC §8.1
+/// identity-mismatch "suppressed" case). Each transport serialises the
+/// value for its own wire (TSP → bytes, DIDComm → envelope body, HTTPS →
+/// JSON response). `transport` is the caller's [`TransportHandler`] so the
+/// framework path resolves identities with the right binding.
+pub(crate) async fn dispatch_trust_task_doc(
+    state: &AppState,
+    sender: &str,
+    transport: &(impl trust_tasks_rs::TransportHandler + Sync),
+    doc: trust_tasks_rs::TrustTask<Value>,
+) -> Result<Option<Value>, DIDCommServiceError> {
+    use did_hosting_common::server::trust_tasks::{
+        DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher,
+        dispatch_inbound,
+    };
+
+    let my_vid = state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
+
+    let type_uri = doc.type_uri.to_string();
+    let framework_owns = build_dispatcher()
+        .registered_uris()
+        .contains(&type_uri.as_str());
+
+    if !framework_owns {
+        return bridge_did_management(state, sender, my_vid, &doc)
+            .await
+            .map(Some);
+    }
+
+    let ctx = TrustTaskContext {
+        acl_ks: &state.acl_ks,
+        acl_locks: &state.acl_locks,
+        my_vid,
+    };
+    let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
+        state.config.trust_tasks.enforce_proofs,
+        state.trust_tasks_verifier.as_deref(),
+    ) {
+        (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
+        _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
+    };
+
+    let outcome = dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await;
+    let value = match outcome {
+        DispatchOutcome::Handled(resp) => {
+            serde_json::to_value(&resp).expect("response document serialises")
+        }
+        DispatchOutcome::Rejected(err) => {
+            serde_json::to_value(&err).expect("error document serialises")
+        }
+        DispatchOutcome::Suppressed => return Ok(None),
+    };
+    Ok(Some(value))
+}
+
+/// Bridge a legacy DID-management Trust Task document to the shared
+/// [`dispatch_did_op`] table.
+///
+/// The DID-management ops (`did_ops::*`) are bound to the control plane's
+/// `AppState`, so they cannot move into the crate-agnostic framework
+/// dispatcher — but `dispatch_did_op` is *already* transport-agnostic (it
+/// reads only `msg.typ` + `msg.body`). We ACL-authenticate the
+/// transport-proven sender (as the DIDComm / HTTP-signed transports do),
+/// synthesise a `Message` from the Trust Task document (`type_uri` →
+/// `typ`, `payload` → `body`), dispatch, and wrap the `(response_type,
+/// body)` back into a Trust Task `#response` document.
+pub(crate) async fn bridge_did_management(
+    state: &AppState,
+    sender: &str,
+    my_vid: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+) -> Result<Value, DIDCommServiceError> {
+    let role = match check_acl(&state.acl_ks, sender).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(sender, code = e.didcomm_code(), "trust-task DID-management: ACL denied");
+            return tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e));
+        }
+    };
+    let auth = AuthClaims {
+        did: sender.to_string(),
+        role,
+        session_id: String::new(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
+    };
+
+    // `dispatch_did_op` reads only `typ` and `body`; `id`/`from` are set for
+    // completeness / logging.
+    let msg = Message::build(doc.id.clone(), doc.type_uri.to_string(), doc.payload.clone())
+        .from(sender.to_string())
+        .finalize();
+
+    match dispatch_did_op(&auth, state, &msg).await {
+        Ok((resp_type, resp_body)) => tt_reply(doc, my_vid, sender, &resp_type, resp_body),
+        Err(e) => {
+            warn!(
+                sender,
+                code = e.didcomm_code(),
+                msg_type = %msg.typ,
+                "trust-task DID-management: protocol error"
+            );
+            tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e))
+        }
+    }
+}
+
+/// The `{code, comment}` problem-report body the DID-management protocol
+/// uses for errors, shared across transports.
+fn problem_body(e: &AppError) -> Value {
+    json!({ "code": e.didcomm_code(), "comment": e.user_message() })
+}
+
+/// Wrap a `(type_uri, payload)` DID-management response as a Trust Task
+/// document addressed back to `sender`, threaded to the request.
+fn tt_reply(
+    request: &trust_tasks_rs::TrustTask<Value>,
+    my_vid: &str,
+    sender: &str,
+    type_uri: &str,
+    payload: Value,
+) -> Result<Value, DIDCommServiceError> {
+    let type_uri = type_uri.parse().map_err(|_| {
+        DIDCommServiceError::Internal(format!("response Type URI does not parse: {type_uri}"))
+    })?;
+    let doc = trust_tasks_rs::TrustTask {
+        id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        thread_id: Some(request.id.clone()),
+        type_uri,
+        issuer: Some(my_vid.to_string()),
+        recipient: Some(sender.to_string()),
+        issued_at: Some(chrono::Utc::now()),
+        expires_at: None,
+        payload,
+        context: None,
+        proof: None,
+        extra: Default::default(),
+    };
+    Ok(serde_json::to_value(&doc).expect("Trust Task response serialises"))
 }
 
 #[cfg(test)]
@@ -2683,6 +2817,57 @@ mod tests {
         // (`malformedRequest`); it still reads the 0.1 snake_case form on
         // inbound, so peers on either version interoperate.
         assert_eq!(resp_body["payload"]["code"], "malformedRequest");
+    }
+
+    /// A DID-management op (`did/check-name`) delivered as a Trust Task
+    /// *envelope* over DIDComm is bridged to `dispatch_did_op` by the unified
+    /// `dispatch_trust_task_doc` router — proving DID-management is now a
+    /// first-class trust task over DIDComm too, not just via legacy `MSG_*`.
+    #[tokio::test]
+    async fn trust_tasks_envelope_bridges_did_management() {
+        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+
+        let (state, _dir) = test_state().await;
+        let sender = "did:example:admin";
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: sender.into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The envelope body IS the DID-management Trust Task document.
+        let msg = build_msg(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            json!({
+                "id": "urn:uuid:33333333-3333-3333-3333-333333333333",
+                "type": "https://trusttasks.org/spec/did-management/did/check-name/0.1",
+                "recipient": "did:webvh:test:control.example.com",
+                "issuedAt": "2026-07-06T00:00:00Z",
+                "payload": { "path": "bob", "reserve": false }
+            }),
+        );
+        let (resp_type, resp_body) = super::run_trust_tasks_envelope(&state, sender, &msg)
+            .await
+            .expect("dispatch ok")
+            .expect("a response is emitted");
+
+        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        assert_eq!(
+            resp_body["type"],
+            "https://trusttasks.org/spec/did-management/did/check-name/0.1#response"
+        );
+        assert_eq!(resp_body["payload"]["available"], true);
+        assert_eq!(resp_body["issuer"], "did:webvh:test:control.example.com");
+        assert_eq!(resp_body["recipient"], sender);
     }
 
     #[tokio::test]

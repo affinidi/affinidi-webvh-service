@@ -23,22 +23,13 @@
 use affinidi_messaging_didcomm_service::{
     DIDCommServiceError, HandlerContext, TspHandler, TspResponse,
 };
-use affinidi_messaging_didcomm::Message;
 use async_trait::async_trait;
-use chrono::Utc;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use did_hosting_common::didcomm_types::MSG_PROBLEM_REPORT;
-use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, TspTransportHandler,
-    build_dispatcher, dispatch_inbound,
-};
+use did_hosting_common::server::trust_tasks::TspTransportHandler;
 
-use crate::acl::check_acl;
-use crate::auth::AuthClaims;
-use crate::messaging::{body_parse_error, dispatch_did_op};
+use crate::messaging::{body_parse_error, dispatch_trust_task_doc};
 use crate::server::AppState;
 
 /// messaging-service [`TspHandler`] that dispatches inbound TSP trust-task
@@ -100,150 +91,16 @@ pub(crate) async fn run_tsp_trust_task(
         .as_deref()
         .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
 
-    // Route by Type URI. The framework dispatcher owns the ACL + discovery
-    // ops (the typed SPEC §7.2 pipeline). The legacy DID-management ops
-    // (`did/publish`, `register`, `delete`, `change-owner`,
-    // `witness/publish`, `info`, `list`, `check-name`) are dispatched by the
-    // transport-agnostic `dispatch_did_op`. Both are reachable over TSP as
-    // Trust Task documents — the same dispatch tables the DIDComm and HTTPS
-    // transports walk. This is the single trust-task entry point for TSP.
-    let type_uri = doc.type_uri.to_string();
-    let framework_owns = build_dispatcher()
-        .registered_uris()
-        .contains(&type_uri.as_str());
-
-    if !framework_owns {
-        return bridge_did_management(state, sender, my_vid, &doc)
-            .await
-            .map(Some);
-    }
-
-    // TSP authenticated the sender for us; report it as the transport peer.
+    // Dispatch through the unified trust-task router shared with the DIDComm
+    // and HTTPS transports (`messaging::dispatch_trust_task_doc`). It routes
+    // ACL + discovery ops to the typed framework pipeline and DID-management
+    // ops to `dispatch_did_op`, so every op is reachable over TSP as a Trust
+    // Task document.
     let transport = TspTransportHandler::new(my_vid.to_string(), sender.to_string());
-    let ctx = TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-    };
-    // Same proof policy as every other transport — one shared knob.
-    let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
-        _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
-    };
-
-    let outcome =
-        dispatch_inbound::<TransportBoundVerifier>(&ctx, &transport, policy, doc).await;
-
-    let body = match outcome {
-        DispatchOutcome::Handled(resp) => {
-            serde_json::to_vec(&resp).expect("response document serialises")
-        }
-        DispatchOutcome::Rejected(err) => {
-            serde_json::to_vec(&err).expect("error document serialises")
-        }
-        DispatchOutcome::Suppressed => {
-            tracing::error!(
-                should_not_happen = true,
-                sender,
-                "TSP: dispatch suppressed (identity_mismatch w/ no transport sender)"
-            );
-            return Ok(None);
-        }
-    };
-    Ok(Some(body))
-}
-
-/// Bridge a legacy DID-management Trust Task document to the shared
-/// `dispatch_did_op` table.
-///
-/// The DID-management ops (`did_ops::*`) are bound to the control plane's
-/// `AppState`, so they cannot move into the crate-agnostic framework
-/// dispatcher — but `dispatch_did_op` is *already* transport-agnostic (it
-/// reads only `msg.typ` + `msg.body`). We ACL-authenticate the TSP-proven
-/// sender, synthesise a `Message` from the Trust Task document
-/// (`type_uri` → `typ`, `payload` → `body`), dispatch, and wrap the
-/// `(response_type, body)` back into a Trust Task response document so the
-/// producer sees the same shape it gets from the DIDComm / HTTPS transports.
-async fn bridge_did_management(
-    state: &AppState,
-    sender: &str,
-    my_vid: &str,
-    doc: &trust_tasks_rs::TrustTask<Value>,
-) -> Result<Vec<u8>, DIDCommServiceError> {
-    // Authenticate the sender against the ACL, exactly as the DIDComm and
-    // HTTP-signed transports do before calling `dispatch_did_op`.
-    let role = match check_acl(&state.acl_ks, sender).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(sender, code = e.didcomm_code(), "TSP DID-management: ACL denied");
-            return tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e));
-        }
-    };
-    let auth = AuthClaims {
-        did: sender.to_string(),
-        role,
-        session_id: String::new(),
-        session_pubkey_b58btc: None,
-        amr: vec!["did".to_string()],
-        acr: "aal1".to_string(),
-    };
-
-    // `dispatch_did_op` reads only `typ` and `body`; `id`/`from` are set for
-    // completeness / logging.
-    let msg = Message::build(doc.id.clone(), doc.type_uri.to_string(), doc.payload.clone())
-        .from(sender.to_string())
-        .finalize();
-
-    match dispatch_did_op(&auth, state, &msg).await {
-        Ok((resp_type, resp_body)) => tt_reply(doc, my_vid, sender, &resp_type, resp_body),
-        Err(e) => {
-            warn!(
-                sender,
-                code = e.didcomm_code(),
-                msg_type = %msg.typ,
-                "TSP DID-management: protocol error"
-            );
-            tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e))
-        }
+    match dispatch_trust_task_doc(state, sender, &transport, doc).await? {
+        Some(value) => Ok(Some(serde_json::to_vec(&value).expect("response serialises"))),
+        None => Ok(None),
     }
-}
-
-/// The `{code, comment}` problem-report body the DID-management protocol
-/// uses for errors, shared across transports.
-fn problem_body(e: &crate::error::AppError) -> Value {
-    json!({ "code": e.didcomm_code(), "comment": e.user_message() })
-}
-
-/// Wrap a `(type_uri, payload)` DID-management response as a Trust Task
-/// document addressed back to `sender`, threaded to the request, and
-/// serialise it to bytes for the TSP reply.
-fn tt_reply(
-    request: &trust_tasks_rs::TrustTask<Value>,
-    my_vid: &str,
-    sender: &str,
-    type_uri: &str,
-    payload: Value,
-) -> Result<Vec<u8>, DIDCommServiceError> {
-    let type_uri = type_uri.parse().map_err(|_| {
-        DIDCommServiceError::Internal(format!("response Type URI does not parse: {type_uri}"))
-    })?;
-    let doc = trust_tasks_rs::TrustTask {
-        id: format!("urn:uuid:{}", Uuid::new_v4()),
-        thread_id: Some(request.id.clone()),
-        type_uri,
-        issuer: Some(my_vid.to_string()),
-        recipient: Some(sender.to_string()),
-        issued_at: Some(Utc::now()),
-        expires_at: None,
-        payload,
-        context: None,
-        proof: None,
-        extra: Default::default(),
-    };
-    Ok(serde_json::to_vec(&doc).expect("Trust Task response serialises"))
 }
 
 #[cfg(test)]
