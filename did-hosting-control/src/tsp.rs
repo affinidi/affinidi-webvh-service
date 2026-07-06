@@ -98,7 +98,9 @@ pub(crate) async fn run_tsp_trust_task(
     // Task document.
     let transport = TspTransportHandler::new(my_vid.to_string(), sender.to_string());
     match dispatch_trust_task_doc(state, sender, &transport, doc).await? {
-        Some(value) => Ok(Some(serde_json::to_vec(&value).expect("response serialises"))),
+        Some(value) => Ok(Some(
+            serde_json::to_vec(&value).expect("response serialises"),
+        )),
         None => Ok(None),
     }
 }
@@ -192,7 +194,10 @@ mod tests {
             .expect("handler does not error on bad input");
         let bytes = out.expect("a response is emitted");
         let doc: Value = serde_json::from_slice(&bytes).expect("response is JSON");
-        assert_eq!(doc["type"], "https://trusttasks.org/spec/trust-task-error/0.1");
+        assert_eq!(
+            doc["type"],
+            "https://trusttasks.org/spec/trust-task-error/0.1"
+        );
     }
 
     /// A well-formed Trust Task document is dispatched through the shared

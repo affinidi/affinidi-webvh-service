@@ -650,7 +650,10 @@ pub async fn start_didcomm_service(
     }
     .map_err(|e| AppError::Internal(format!("failed to start messaging service: {e}")))?;
 
-    info!(tsp = tsp_enabled, "messaging service started for {control_did}");
+    info!(
+        tsp = tsp_enabled,
+        "messaging service started for {control_did}"
+    );
     Ok(Some(svc))
 }
 

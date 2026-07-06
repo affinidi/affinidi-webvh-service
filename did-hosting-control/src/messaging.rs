@@ -1502,7 +1502,11 @@ pub(crate) async fn bridge_did_management(
     let role = match check_acl(&state.acl_ks, sender).await {
         Ok(r) => r,
         Err(e) => {
-            warn!(sender, code = e.didcomm_code(), "trust-task DID-management: ACL denied");
+            warn!(
+                sender,
+                code = e.didcomm_code(),
+                "trust-task DID-management: ACL denied"
+            );
             return tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e));
         }
     };
@@ -1517,9 +1521,13 @@ pub(crate) async fn bridge_did_management(
 
     // `dispatch_did_op` reads only `typ` and `body`; `id`/`from` are set for
     // completeness / logging.
-    let msg = Message::build(doc.id.clone(), doc.type_uri.to_string(), doc.payload.clone())
-        .from(sender.to_string())
-        .finalize();
+    let msg = Message::build(
+        doc.id.clone(),
+        doc.type_uri.to_string(),
+        doc.payload.clone(),
+    )
+    .from(sender.to_string())
+    .finalize();
 
     match dispatch_did_op(&auth, state, &msg).await {
         Ok((resp_type, resp_body)) => tt_reply(doc, my_vid, sender, &resp_type, resp_body),
