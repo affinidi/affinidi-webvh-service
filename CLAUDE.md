@@ -38,6 +38,13 @@ in the daemon if it falls into any of these buckets:
   inbound DIDComm listener (`build_control_router`). Any new `MSG_*`
   routed there is automatically picked up; no separate daemon wiring
   needed.
+- **TSP transport.** The daemon inherits TSP for free: it starts the
+  control plane's `start_didcomm_service`, which carries TSP on the same
+  mediator socket when `features.tsp` is set (it tracks `features.didcomm`
+  by default). Inbound TSP frames dispatch through the same
+  transport-agnostic `dispatch_inbound` core, so new Trust-Task handlers
+  are reachable over TSP with no separate daemon wiring. See
+  `docs/tsp-transport.md`.
 
 ### What the daemon intentionally does NOT mirror
 

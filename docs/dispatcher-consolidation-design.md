@@ -1,6 +1,11 @@
 # Design note — DIDComm dispatcher consolidation
 
-**Status:** proposed (not yet implemented).
+**Status:** implemented. The single `dispatch_did_op`
+(`did-hosting-control/src/messaging.rs`) is now the one per-message
+dispatch table; both the framework-routed and HTTP-signed transports call
+it, error codes flow through `AppError::didcomm_code()`, and the shared
+`ReplayCache` (`replay.rs`) gates both. A third transport (TSP) rides the
+same Trust-Tasks dispatch core — see `docs/tsp-transport.md`.
 **Closes review findings:** C1 (correctness — `MSG_DID_REGISTER`
 unreachable on the HTTP-signed path), H1 (correctness — error-code
 drift between dispatchers), M4 (design — encryption-asymmetry

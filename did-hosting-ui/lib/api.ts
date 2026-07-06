@@ -262,6 +262,7 @@ export interface ControlInfo {
   serverDid: string | null;
   publicUrl: string | null;
   didcommEnabled: boolean;
+  tspEnabled: boolean;
   totalLocalDids: number;
   /** DID methods compiled into this control-plane binary (from
    *  `did_hosting_common::method::enabled_methods`). Empty when the
@@ -346,6 +347,7 @@ export interface ControlPlaneConfig {
   publicUrl: string | null;
   didHostingUrl: string | null;
   didcommEnabled: boolean;
+  tspEnabled: boolean;
   restApiEnabled: boolean;
   listenAddress: string;
   vtaUrl: string | null;

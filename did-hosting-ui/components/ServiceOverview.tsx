@@ -209,6 +209,9 @@ export function ServiceOverviewPanel() {
             <View style={[styles.flagBadge, control.didcommEnabled ? styles.flagOn : styles.flagOff]}>
               <Text style={styles.flagText}>DIDComm</Text>
             </View>
+            <View style={[styles.flagBadge, control.tspEnabled ? styles.flagOn : styles.flagOff]}>
+              <Text style={styles.flagText}>TSP</Text>
+            </View>
           </View>
         </View>
 

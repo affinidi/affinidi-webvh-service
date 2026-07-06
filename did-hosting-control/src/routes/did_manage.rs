@@ -741,6 +741,7 @@ pub struct ConfigResponse {
     pub did_hosting_url: Option<String>,
     /// Connectivity
     pub didcomm_enabled: bool,
+    pub tsp_enabled: bool,
     pub rest_api_enabled: bool,
     pub listen_address: String,
     /// VTA
@@ -770,6 +771,7 @@ pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Jso
         public_url: c.public_url.clone(),
         did_hosting_url: c.did_hosting_url.clone(),
         didcomm_enabled: c.features.didcomm,
+        tsp_enabled: c.features.tsp,
         rest_api_enabled: c.features.rest_api,
         deployment_mode: c.features.deployment_mode.clone(),
         listen_address: format!("{}:{}", c.server.host, c.server.port),
@@ -806,6 +808,7 @@ pub struct ControlInfo {
     pub server_did: Option<String>,
     pub public_url: Option<String>,
     pub didcomm_enabled: bool,
+    pub tsp_enabled: bool,
     pub total_local_dids: u64,
     /// DID methods compiled into this binary, as enumerated by
     /// `did_hosting_common::method::enabled_methods()`. Each entry is a
@@ -918,6 +921,7 @@ pub async fn get_services_overview(
             server_did: state.config.server_did.clone(),
             public_url: state.config.public_url.clone(),
             didcomm_enabled: state.config.features.didcomm,
+            tsp_enabled: state.config.features.tsp,
             total_local_dids: local_dids,
             enabled_methods: did_hosting_common::method::enabled_methods().to_vec(),
         },
