@@ -63,14 +63,37 @@ Nodes with no mediator (HTTP-only) speak neither DIDComm nor TSP over the
 mediator; they serve DID resolution and the HTTPS Trust-Task endpoint
 only.
 
+## Unified dispatch
+
+Both TSP and the DIDComm trust-task envelope route inbound
+`TrustTask<Value>` documents through one shared entry point,
+`messaging::dispatch_trust_task_doc`, which dispatches by Type URI:
+
+- **ACL + discovery** ops → the typed framework §7.2 pipeline
+  (`dispatch_inbound`).
+- **DID-management** ops (`did/check-name`, `publish`, `register`,
+  `delete`, `change-owner`, `info`, `list`, `witness/publish`) →
+  `bridge_did_management`, which reuses the transport-agnostic
+  `dispatch_did_op` engine and wraps its reply as a Trust Task
+  `#response` document.
+
+So **every op is a first-class trust task over TSP and DIDComm** — the
+DID-management ops are reachable as trust-task documents, not only via the
+legacy `MSG_*` messages (which keep working for back-compat).
+
+`dispatch_did_op` remains the DID-management engine behind this facade:
+those ops are bound to the control plane's `AppState` and can't move into
+the crate-agnostic framework dispatcher without lifting `AppState` behind
+a context abstraction — a larger refactor with no behavioural change.
+
 ## Scope
 
 - **Inbound request/response over TSP**: fully supported — the handler's
   reply is sealed and routed back automatically.
+- **HTTPS `POST /api/trust-tasks`**: keeps its own dispatch (it maps
+  rejections to HTTP status codes, which the value-returning shared router
+  would flatten). DID-management over HTTPS remains available via
+  `POST /api/didcomm`.
 - **Proactive outbound push over TSP** (e.g. control→server sync
   updates): out of scope for now; those still use DIDComm. The framework
   has no outbound Trust-Task sender yet — see the `outbox` module.
-- **DID-management `MSG_*` ops over TSP**: these light up automatically as
-  they migrate from the legacy `dispatch_did_op` onto the framework
-  dispatcher (`dispatch_inbound`). ACL + discovery ops work over TSP
-  today.
