@@ -97,3 +97,11 @@ a context abstraction — a larger refactor with no behavioural change.
 - **Proactive outbound push over TSP** (e.g. control→server sync
   updates): out of scope for now; those still use DIDComm. The framework
   has no outbound Trust-Task sender yet — see the `outbox` module.
+- **Step-up authentication is HTTPS-only, by design.** Step-up
+  (`auth/step-up/vta/finish`) elevates a *web session's* assurance level
+  (aal1 → aal2) and binds the wallet's proof to that session via the
+  session id + the JWT-bound session pubkey. TSP has no session and no
+  JWT — every TSP message is independently VID-authenticated — so there is
+  nothing to "step up". If a future op that is gated on `aal2` must be
+  reachable over TSP, define a TSP-native assurance model at that point
+  rather than shoehorning the session-based one onto it.
