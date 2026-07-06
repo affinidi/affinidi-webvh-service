@@ -32,7 +32,10 @@ rust-version = "1.95.0"
 # 0.11 both depend on affinidi-tdk ^0.8, so all three resolve to a single
 # affinidi-tdk copy. Drop back to 0.7 only if vta-sdk/vti-common ever re-pin.
 affinidi-tdk = "0.8"
-affinidi-messaging-didcomm-service = "0.3"
+# `tsp` feature: routes inbound TSP frames on the shared mediator socket
+# to the `TspHandler`. Without it the handler is stored but never invoked
+# (the crate compiles TSP support out).
+affinidi-messaging-didcomm-service = { version = "0.3", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15"
 affinidi-secrets-resolver = "0.5"

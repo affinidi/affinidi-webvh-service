@@ -266,6 +266,7 @@ impl DaemonConfig {
     fn features_config(&self) -> FeaturesConfig {
         FeaturesConfig {
             didcomm: self.features.didcomm,
+            tsp: self.features.tsp,
             rest_api: self.features.rest_api,
             deployment_mode: "daemon".to_string(),
         }

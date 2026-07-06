@@ -1412,7 +1412,7 @@ pub(crate) async fn run_trust_tasks_envelope(
 /// Build the same body-parse `trust-task-error/0.1` document that the
 /// HTTPS transport uses, kept here so the two transports emit
 /// byte-identical error shapes for parse failures.
-fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
+pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
     use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
     let reject = RejectReason::MalformedRequest {
         reason: format!("body did not parse as a Trust Task document: {reason}"),

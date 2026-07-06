@@ -6,6 +6,13 @@ use std::path::PathBuf;
 pub struct FeaturesConfig {
     #[serde(default)]
     pub didcomm: bool,
+    /// Trust Spanning Protocol (TSP) transport. When enabled (and a
+    /// `mediator_did` is configured), the mediator listener also carries
+    /// TSP on its shared socket and the service's DID document advertises
+    /// a `TSPTransport` service. Additive with `didcomm` — a node can
+    /// speak both; TSP is preferred when a peer advertises both.
+    #[serde(default)]
+    pub tsp: bool,
     #[serde(default)]
     pub rest_api: bool,
     /// Deployment mode: "standalone" for individual services, "daemon" for unified binary.

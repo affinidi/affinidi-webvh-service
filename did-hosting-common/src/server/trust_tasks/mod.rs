@@ -33,8 +33,10 @@
 pub mod entry;
 pub mod ext;
 pub mod handlers;
+pub mod transport;
 pub mod verifier;
 
+pub use transport::{TSP_BINDING_URI, TspTransportHandler};
 pub use verifier::TransportBoundVerifier;
 
 use chrono::Utc;
