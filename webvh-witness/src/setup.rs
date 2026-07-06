@@ -191,6 +191,7 @@ pub async fn run_wizard(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: enable_didcomm,
+            tsp: enable_didcomm,
             rest_api: enable_rest_api,
             ..Default::default()
         },
@@ -811,6 +812,7 @@ pub async fn run_setup_offline_complete(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: state.enable_didcomm,
+            tsp: state.enable_didcomm,
             rest_api: state.enable_rest_api,
             ..Default::default()
         },

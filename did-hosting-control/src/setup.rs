@@ -215,6 +215,9 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: true,
+            // TSP rides with DIDComm; the control plane's VTA DID advertises
+            // both services, so enable the TSP listener alongside DIDComm.
+            tsp: true,
             rest_api: true,
             ..Default::default()
         },
@@ -875,6 +878,9 @@ pub async fn run_setup_offline_complete(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: true,
+            // TSP rides with DIDComm; the control plane's VTA DID advertises
+            // both services, so enable the TSP listener alongside DIDComm.
+            tsp: true,
             rest_api: true,
             ..Default::default()
         },

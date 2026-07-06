@@ -219,6 +219,7 @@ pub async fn apply_recipe(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: recipe.identity.mediator_did.is_some(),
+            tsp: recipe.identity.mediator_did.is_some(),
             rest_api: false,
             ..Default::default()
         },

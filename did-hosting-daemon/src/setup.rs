@@ -140,6 +140,22 @@ pub async fn run_wizard(
         self_host,
     } = result;
     features.didcomm = mediator_did.is_some();
+    // TSP rides the same mediator socket as DIDComm and the VTA DID template
+    // advertises both services, so default TSP on wherever DIDComm is on. The
+    // operator may opt the TSP *listener* out (the DID still advertises the
+    // `TSPTransport` service — that's fixed by the VTA template — so leaving
+    // it on is recommended so peers that prefer TSP can reach this node).
+    features.tsp = features.didcomm;
+    if features.didcomm {
+        features.tsp = Confirm::new()
+            .with_prompt(
+                "Enable the TSP (Trust Spanning Protocol) transport? \
+                 Recommended — peers prefer TSP over DIDComm when a DID \
+                 advertises both",
+            )
+            .default(true)
+            .interact()?;
+    }
 
     // 5. Host / port / log / data
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
@@ -938,9 +954,9 @@ async fn run_self_managed_setup(
         &DidDocumentOptions {
             key_agreement_multibase: Some(&ka_pub_mb),
             mediator_endpoint: mediator_did.as_deref(),
-            // Wired to the operator's transport selection in the wizard
-            // phase; None keeps the DIDComm-only shape for now.
-            tsp_endpoint: None,
+            // TSP rides with DIDComm: advertise `TSPTransport` at the same
+            // mediator whenever DIDComm is present (matches the VTA templates).
+            tsp_endpoint: mediator_did.as_deref(),
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
@@ -1146,6 +1162,9 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     let mediator_did = prompt_mediator_did()?;
     features.didcomm = mediator_did.is_some();
+    // TSP rides the same mediator socket as DIDComm and the VTA DID template
+    // advertises both services, so default TSP on wherever DIDComm is on.
+    features.tsp = features.didcomm;
 
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port = setup_prompts::prompt_listen_port(8534)?;

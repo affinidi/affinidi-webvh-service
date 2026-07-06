@@ -1907,6 +1907,7 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
     health::print_feature("watcher", config.enable.watcher);
     health::print_feature("control", config.enable.control);
     health::print_feature("didcomm", config.features.didcomm);
+    health::print_feature("tsp", config.features.tsp);
 
     // ── Secrets ────────────────────────────────────────────────────
     health::section("Secrets");

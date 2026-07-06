@@ -227,6 +227,7 @@ pub async fn run_wizard(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: mediator_did.is_some(),
+            tsp: mediator_did.is_some(),
             rest_api: false,
             ..Default::default()
         },
@@ -731,6 +732,7 @@ pub async fn run_setup_offline_complete(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: state.mediator_did.is_some(),
+            tsp: state.mediator_did.is_some(),
             rest_api: false,
             ..Default::default()
         },

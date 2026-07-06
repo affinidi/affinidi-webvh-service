@@ -211,10 +211,13 @@ pub async fn apply_recipe(
         watcher: recipe.daemon.enable_watcher.unwrap_or(false),
     };
 
+    let didcomm = recipe.identity.mediator_did.is_some()
+        || identity_mode == IdentityMode::SelfManaged && recipe.identity.mediator_did.is_some();
     let features = did_hosting_common::server::config::FeaturesConfig {
         rest_api: enable.control || enable.server,
-        didcomm: recipe.identity.mediator_did.is_some()
-            || identity_mode == IdentityMode::SelfManaged && recipe.identity.mediator_did.is_some(),
+        didcomm,
+        // TSP rides with DIDComm (the VTA DID template advertises both).
+        tsp: didcomm,
         ..Default::default()
     };
 

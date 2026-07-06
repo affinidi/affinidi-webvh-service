@@ -202,6 +202,7 @@ pub async fn apply_recipe(
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm: true,
+            tsp: true,
             rest_api: true,
             ..Default::default()
         },
