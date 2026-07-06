@@ -66,7 +66,11 @@ async fn assert_round_trip(store: &dyn did_hosting_common::server::secret_store:
     // Store and read back the server secrets.
     let secrets = sample_secrets();
     store.set(&secrets).await.expect("set secrets");
-    let loaded = store.get().await.expect("get secrets").expect("secrets present");
+    let loaded = store
+        .get()
+        .await
+        .expect("get secrets")
+        .expect("secrets present");
     assert_eq!(loaded.signing_key, secrets.signing_key);
     assert_eq!(loaded.key_agreement_key, secrets.key_agreement_key);
     assert_eq!(loaded.jwt_signing_key, secrets.jwt_signing_key);
@@ -80,7 +84,11 @@ async fn assert_round_trip(store: &dyn did_hosting_common::server::secret_store:
         Some(seed)
     );
     assert!(
-        store.get().await.expect("secrets survive seed write").is_some(),
+        store
+            .get()
+            .await
+            .expect("secrets survive seed write")
+            .is_some(),
         "storing the bootstrap seed must not clobber the server secrets"
     );
 
@@ -132,7 +140,9 @@ async fn vault_round_trip() {
 #[tokio::test]
 async fn k8s_round_trip() {
     if std::env::var("WEBVH_TEST_K8S").is_err() {
-        eprintln!("skipping k8s_round_trip: set WEBVH_TEST_K8S=1 (with a reachable kubeconfig) to run");
+        eprintln!(
+            "skipping k8s_round_trip: set WEBVH_TEST_K8S=1 (with a reachable kubeconfig) to run"
+        );
         return;
     }
 

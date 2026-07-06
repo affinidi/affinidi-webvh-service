@@ -121,9 +121,9 @@ impl K8sSecretStore {
     /// Persist the envelope, creating the `Secret` on first write and
     /// preserving any unrelated data keys on subsequent writes.
     async fn write_envelope(&self, env: &StoredSecrets) -> Result<(), AppError> {
-        let json = env
-            .to_json()
-            .map_err(|e| AppError::Internal(format!("envelope serialization for Kubernetes: {e}")))?;
+        let json = env.to_json().map_err(|e| {
+            AppError::Internal(format!("envelope serialization for Kubernetes: {e}"))
+        })?;
         let api = self.api().await?;
 
         match api

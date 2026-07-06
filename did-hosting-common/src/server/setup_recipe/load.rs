@@ -452,7 +452,10 @@ mod tests {
             cfg.vault_addr.as_deref(),
             Some("https://vault.example.com:8200")
         );
-        assert_eq!(cfg.vault_secret_path.as_deref(), Some("webvh-server-secrets"));
+        assert_eq!(
+            cfg.vault_secret_path.as_deref(),
+            Some("webvh-server-secrets")
+        );
         assert_eq!(cfg.vault_k8s_role.as_deref(), Some("did-hosting-server"));
         // Untouched fields keep their SecretsConfig defaults.
         assert_eq!(cfg.vault_kv_mount, "secret");
