@@ -1,0 +1,50 @@
+{
+  "holderDid": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+  "rpDid": "did:web:rp.example",
+  "request": {
+    "subject": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+    "sessionId": "sess-abc-123",
+    "challenge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "approved": {
+    "id": "cc06640f-31ec-4b7c-9e7f-a04fe679fe30",
+    "type": "https://trusttasks.org/spec/auth/step-up/approve-response/0.2",
+    "issuer": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+    "recipient": "did:web:rp.example",
+    "payload": {
+      "subject": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+      "sessionId": "sess-abc-123",
+      "challenge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approved"
+    },
+    "proof": {
+      "type": "DataIntegrityProof",
+      "cryptosuite": "eddsa-jcs-2022",
+      "verificationMethod": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR#z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+      "created": "2026-07-06T08:34:15.851Z",
+      "proofPurpose": "assertionMethod",
+      "proofValue": "zAS3FjuKEyrBrWCgpmWFFCDZtUj8dePNJqDHkd5vQyRPLgfbK3sUUoni5C9Txw4g2RgqRG3HHnGJVS9hNXKxkp1A"
+    }
+  },
+  "denied": {
+    "id": "c7cc7c79-3ef0-4053-8bc2-d235f2a832a3",
+    "type": "https://trusttasks.org/spec/auth/step-up/approve-response/0.2",
+    "issuer": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+    "recipient": "did:web:rp.example",
+    "payload": {
+      "subject": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+      "sessionId": "sess-abc-123",
+      "challenge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "denied",
+      "deniedReason": "User declined."
+    },
+    "proof": {
+      "type": "DataIntegrityProof",
+      "cryptosuite": "eddsa-jcs-2022",
+      "verificationMethod": "did:key:z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR#z6Mkfgmch6UjPCwFrCTDtFKS154aqP4o3DutNZz4t3mJQ9pR",
+      "created": "2026-07-06T08:34:15.853Z",
+      "proofPurpose": "assertionMethod",
+      "proofValue": "z2JKtq6xirF4rT7NN3xdEQPqkJSwHJYix1GWfiKv3tq3GbgrjfepSMo1Sdjt5bXnTqBEVYzDarpf874CmXvCYQVww"
+    }
+  }
+}

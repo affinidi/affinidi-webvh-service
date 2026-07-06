@@ -6,7 +6,9 @@ use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use serde_json::Value;
 use tracing::{info, warn};
+use trust_tasks_rs::{ProofVerifier, TrustTask};
 
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
@@ -440,7 +442,7 @@ pub async fn step_up_vta_start(
     auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let nonce = rand::random::<[u8; 32]>()
+    let challenge = rand::random::<[u8; 32]>()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
@@ -448,65 +450,160 @@ pub async fn step_up_vta_start(
         .sessions_ks
         .insert_raw(
             format!("stepup-nonce:{}", auth.session_id),
-            nonce.as_bytes().to_vec(),
+            challenge.as_bytes().to_vec(),
         )
         .await?;
-    Ok(Json(serde_json::json!({ "nonce": nonce })))
+    // Spec `auth/step-up/approve-request/0.2` payload fields. The subject is
+    // the session's authenticated DID; the wallet signs an approve-response
+    // that echoes `subject`/`sessionId`/`challenge` and proves control of the
+    // subject key (holder-self-signs — the VTA is no longer in the loop).
+    Ok(Json(serde_json::json!({
+        "subject": auth.did,
+        "sessionId": auth.session_id,
+        "challenge": challenge,
+        "reason": "Elevate this session to aal2",
+    })))
 }
 
-#[derive(serde::Deserialize)]
-pub struct StepUpVtaFinishRequest {
-    /// VTA-signed approval token (compact EdDSA JWS).
-    pub approval_token: String,
-}
-
-/// POST /api/auth/step-up/vta/finish — verify a VTA-signed approval and
-/// elevate the caller's session to `aal2` (`amr: [did, vta]`).
+/// POST /api/auth/step-up/vta/finish — verify the wallet's signed
+/// `auth/step-up/approve-response/0.2` document and elevate the caller's
+/// session to `aal2`.
+///
+/// Converged to the holder-self-signs model (trusttasks-tf
+/// `auth/step-up/approve-response/0.2`): the wallet — not the VTA — signs the
+/// approval with a W3C Data Integrity proof (`eddsa-jcs-2022`) over the
+/// session-subject key, and the RP verifies that proof. The proof binds the
+/// user's fresh possession of the subject DID to the step-up `challenge`; the
+/// VTA is no longer a trusted third party for step-up.
+// The `_0_1` task const is deprecated in favour of `_0_2`, but we still
+// accept the 0.1 type URI on inbound for backwards compatibility.
+#[allow(deprecated)]
 pub async fn step_up_vta_finish(
     State(state): State<AppState>,
     auth: AuthClaims,
-    Json(req): Json<StepUpVtaFinishRequest>,
+    Json(doc): Json<TrustTask<Value>>,
 ) -> Result<Json<did_hosting_common::server::auth::session::TokenResponse>, AppError> {
-    use did_hosting_common::server::didcomm_unpack;
+    use did_hosting_common::did_hosting_tasks::{
+        TASK_AUTH_STEP_UP_VTA_FINISH_0_1, TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
+    };
 
-    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
-
-    let trusted_vta = state
-        .config
-        .step_up_trusted_vta_did
-        .as_deref()
-        .ok_or_else(|| {
-            AppError::Config("step_up_trusted_vta_did not configured; VTA step-up disabled".into())
-        })?;
     let rp_id = state
         .config
         .server_did
         .as_deref()
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
 
-    let verified =
-        didcomm_unpack::verify_vta_approval_token(&req.approval_token, did_resolver).await?;
-
-    // ─── Bindings. ───
-    if verified.issuer != trusted_vta {
-        warn!(expected = %trusted_vta, actual = %verified.issuer, "step-up rejected: approval not from the trusted VTA");
-        return Err(AppError::Forbidden(
-            "approval was not issued by the trusted VTA".into(),
-        ));
+    // ─── 1. Task type: approve-response/0.2 (0.1 accepted as legacy alias).
+    let type_uri = doc.type_uri.to_string();
+    if type_uri != TASK_AUTH_STEP_UP_VTA_FINISH_0_2.as_str()
+        && type_uri != TASK_AUTH_STEP_UP_VTA_FINISH_0_1.as_str()
+    {
+        return Err(AppError::Authentication(format!(
+            "unexpected step-up document type: {type_uri}"
+        )));
     }
-    if verified.subject != auth.did {
-        warn!(authed = %auth.did, subject = %verified.subject, "step-up rejected: approval subject mismatch");
+
+    // ─── 2. Typed payload fields.
+    let payload = &doc.payload;
+    let field = |k: &str| payload.get(k).and_then(Value::as_str);
+    let subject = field("subject")
+        .ok_or_else(|| AppError::Authentication("approve-response missing subject".into()))?;
+    let session_id = field("sessionId")
+        .ok_or_else(|| AppError::Authentication("approve-response missing sessionId".into()))?;
+    let challenge = field("challenge")
+        .ok_or_else(|| AppError::Authentication("approve-response missing challenge".into()))?;
+    let decision = field("decision")
+        .ok_or_else(|| AppError::Authentication("approve-response missing decision".into()))?;
+
+    // ─── 3. A signed refusal is valid but elevates nothing.
+    if decision != "approved" {
+        return Err(AppError::Forbidden(format!(
+            "step-up not approved (decision: {decision})"
+        )));
+    }
+
+    // ─── 4. The proof is mandatory in the converged flow.
+    let proof = doc
+        .proof
+        .as_ref()
+        .ok_or_else(|| AppError::Authentication("approve-response carries no proof".into()))?;
+
+    // ─── 5. Proof-verificationMethod ↔ session binding (SECURITY), mirroring
+    //        `dispatch_trust_task`. Without this, the framework verifier would
+    //        accept a proof from ANY resolvable DID and let a holder elevate a
+    //        session belonging to a different subject.
+    match auth.session_pubkey_b58btc.as_deref() {
+        Some(pk) => {
+            let expected_vm = format!("did:key:{pk}#{pk}");
+            if proof.verification_method != expected_vm {
+                warn!(actual_vm = %proof.verification_method, %expected_vm,
+                    "step-up rejected: proof verificationMethod not bound to this session");
+                return Err(AppError::Authentication(
+                    "proof verificationMethod is not bound to this session".into(),
+                ));
+            }
+        }
+        None => {
+            let proof_did = proof
+                .verification_method
+                .split_once('#')
+                .map(|(d, _)| d)
+                .unwrap_or("");
+            if proof_did != auth.did {
+                warn!(%proof_did, authed = %auth.did,
+                    "step-up rejected: proof verificationMethod DID does not match the authenticated caller");
+                return Err(AppError::Authentication(
+                    "proof verificationMethod DID does not match the authenticated caller".into(),
+                ));
+            }
+        }
+    }
+
+    // ─── 6. Verify the eddsa-jcs-2022 signature against the resolved key.
+    let verifier = state
+        .trust_tasks_verifier
+        .as_deref()
+        .ok_or_else(|| AppError::Config("trust-tasks proof verifier not configured".into()))?;
+    verifier.verify(&doc).await.map_err(|e| {
+        warn!(error = %e, "step-up rejected: approve-response proof failed verification");
+        AppError::Authentication("approve-response proof failed verification".into())
+    })?;
+
+    // ─── 7. Framework bindings.
+    if subject != auth.did {
+        warn!(authed = %auth.did, %subject, "step-up rejected: approval subject mismatch");
         return Err(AppError::Authentication(
             "approval subject does not match the authenticated DID".into(),
         ));
     }
-    if verified.audience != rp_id {
+    if session_id != auth.session_id {
         return Err(AppError::Authentication(
-            "approval audience does not match this service".into(),
+            "approval sessionId does not match the authenticated session".into(),
         ));
     }
+    if let Some(issuer) = doc.issuer.as_deref()
+        && issuer != subject
+    {
+        return Err(AppError::Authentication(
+            "approval issuer does not match subject".into(),
+        ));
+    }
+    // Audience binding (SPEC §4.8.2): the signed `recipient` binds the proof to
+    // this RP, so an approval captured elsewhere can't be replayed here.
+    match doc.recipient.as_deref() {
+        Some(r) if r == rp_id => {}
+        _ => {
+            return Err(AppError::Authentication(
+                "approval recipient does not bind this service".into(),
+            ));
+        }
+    }
 
-    // Consume the session-bound nonce (single use).
+    // ─── 8. Consume the session-bound challenge (single use).
     let stored = state
         .sessions_ks
         .take_raw(format!("stepup-nonce:{}", auth.session_id))
@@ -515,38 +612,46 @@ pub async fn step_up_vta_finish(
             AppError::Authentication("no step-up challenge issued for this session".into())
         })?;
     let stored = String::from_utf8(stored)
-        .map_err(|e| AppError::Internal(format!("stored nonce not utf8: {e}")))?;
-    if !constant_time_eq(stored.as_bytes(), verified.nonce.as_bytes()) {
-        warn!(session_id = %auth.session_id, "step-up rejected: nonce mismatch");
-        return Err(AppError::Authentication("step-up nonce mismatch".into()));
-    }
-
-    // Freshness.
-    const CLOCK_SKEW_SECS: u64 = 60;
-    let now = now_epoch();
-    if verified.expires_at <= now {
-        return Err(AppError::Authentication("approval has expired".into()));
-    }
-    if verified.issued_at > now + CLOCK_SKEW_SECS {
+        .map_err(|e| AppError::Internal(format!("stored challenge not utf8: {e}")))?;
+    if !constant_time_eq(stored.as_bytes(), challenge.as_bytes()) {
+        warn!(session_id = %auth.session_id, "step-up rejected: challenge mismatch");
         return Err(AppError::Authentication(
-            "approval `iat` is in the future".into(),
+            "step-up challenge mismatch".into(),
         ));
     }
 
+    // ─── 9. Freshness: the proof `created` must be neither in the future nor
+    //        older than the step-up window (defence in depth on top of the
+    //        single-use challenge).
+    const CLOCK_SKEW_SECS: i64 = 60;
+    const MAX_PROOF_AGE_SECS: i64 = 300;
+    let now = now_epoch() as i64;
+    let created = proof.created.timestamp();
+    if created > now + CLOCK_SKEW_SECS {
+        return Err(AppError::Authentication(
+            "approval proof `created` is in the future".into(),
+        ));
+    }
+    if created < now - MAX_PROOF_AGE_SECS {
+        return Err(AppError::Authentication("approval proof is too old".into()));
+    }
+
+    // ─── 10. Elevate. The holder self-signed, so `amr` reflects `did` only
+    //         (the VTA is no longer part of the step-up assurance).
     let role = crate::acl::check_acl(&state.acl_ks, &auth.did).await?;
     let token_resp = session::elevate_session(
         &state.sessions_ks,
         jwt_keys,
         &auth.session_id,
         &role,
-        vec!["did".to_string(), "vta".to_string()],
+        vec!["did".to_string()],
         "aal2",
         state.config.auth.access_token_expiry,
         state.config.auth.refresh_token_expiry,
     )
     .await?;
 
-    info!(did = %auth.did, "step-up complete via VTA approval: session elevated to aal2");
+    info!(did = %auth.did, "step-up complete via wallet-signed approval: session elevated to aal2");
     Ok(Json(token_resp))
 }
 
