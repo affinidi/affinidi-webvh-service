@@ -139,7 +139,6 @@ mod tests {
             },
             server_did: Some(SERVICE_DID.into()),
             mediator_did: None,
-            step_up_trusted_vta_did: None,
             public_url: Some("http://control.test".into()),
             did_hosting_url: Some("http://control.test".into()),
             server: ServerConfig::default(),

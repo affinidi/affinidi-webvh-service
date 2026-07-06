@@ -208,7 +208,6 @@ pub async fn apply_recipe(
         },
         server_did: Some(control_did.clone()),
         mediator_did: recipe.identity.mediator_did.clone(),
-        step_up_trusted_vta_did: None,
         public_url: recipe.identity.public_url.clone(),
         did_hosting_url: Some(did_hosting_url.clone()),
         server: ServerConfig {

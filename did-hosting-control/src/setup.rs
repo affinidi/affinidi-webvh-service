@@ -223,7 +223,6 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         },
         server_did: Some(outcome.integration_did.clone()),
         mediator_did,
-        step_up_trusted_vta_did: None,
         public_url,
         did_hosting_url: Some(did_hosting_url),
         server: ServerConfig {
@@ -886,7 +885,6 @@ pub async fn run_setup_offline_complete(
         },
         server_did: Some(result.did.clone()),
         mediator_did: state.mediator_did.clone(),
-        step_up_trusted_vta_did: None,
         public_url: state.public_url.clone(),
         did_hosting_url: Some(state.did_hosting_url.clone()),
         server: ServerConfig {

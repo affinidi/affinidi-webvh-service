@@ -247,7 +247,6 @@ impl DaemonConfig {
             features: self.features_config(),
             server_did: self.server_did.clone(),
             mediator_did: self.mediator_did.clone(),
-            step_up_trusted_vta_did: None,
             public_url: self.public_url.clone(),
             did_hosting_url: self.did_hosting_url.clone(),
             server: self.server.clone(),

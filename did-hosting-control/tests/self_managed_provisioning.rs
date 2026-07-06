@@ -54,7 +54,6 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         features: FeaturesConfig::default(),
         server_did: Some("did:webvh:test:daemon.example.com".into()),
         mediator_did: None,
-        step_up_trusted_vta_did: None,
         public_url: Some("http://localhost:8534".into()),
         did_hosting_url: Some("http://localhost:8534".into()),
         server: ServerConfig::default(),
