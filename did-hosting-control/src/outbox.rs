@@ -40,6 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use did_hosting_common::server::error::AppError;
@@ -248,12 +249,20 @@ pub async fn record_failure(
     outbox_ks(store)?.insert(key, &next).await
 }
 
-/// Send one entry via the DIDComm service. Pulled out so tests can
+/// Send one entry via the messaging service. Pulled out so tests can
 /// substitute a mock service when the time comes.
+///
+/// Prefers **TSP** when the target's DID document advertises a
+/// `TSPTransport` service (peers prefer TSP over DIDComm — see
+/// `didcomm_profile::resolve_transport`), falling back to DIDComm
+/// otherwise. Over TSP the DIDComm `Message` is serialised and sent as the
+/// sealed frame payload; the receiving server's `ServerTspHandler`
+/// deserialises it back and applies it through the same `do_*` cores.
 async fn deliver(
     didcomm: &DIDCommService,
     control_did: &str,
     entry: &OutboxEntry,
+    did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
@@ -265,10 +274,22 @@ async fn deliver(
     .created_time(now_epoch())
     .finalize();
 
-    didcomm
-        .send_message("control", msg, &entry.target_did)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_transport};
+
+    match resolve_transport(&entry.target_did, did_resolver).await {
+        Some((PeerTransport::Tsp, _)) => {
+            let payload = serde_json::to_vec(&msg)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            didcomm
+                .send_tsp("control", &entry.target_did, &payload)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }
+        _ => didcomm
+            .send_message("control", msg, &entry.target_did)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
 }
 
 /// Outcome of one tick. Exposed so tests + `info!` callsites can
@@ -341,7 +362,7 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                 break;
             }
 
-            match deliver(&svc, &control_did, &entry).await {
+            match deliver(&svc, &control_did, &entry, state.did_resolver.as_ref()).await {
                 Ok(()) => {
                     info!(
                         target_did = %target,

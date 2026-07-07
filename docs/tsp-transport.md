@@ -94,9 +94,14 @@ a context abstraction — a larger refactor with no behavioural change.
   rejections to HTTP status codes, which the value-returning shared router
   would flatten). DID-management over HTTPS remains available via
   `POST /api/didcomm`.
-- **Proactive outbound push over TSP** (e.g. control→server sync
-  updates): out of scope for now; those still use DIDComm. The framework
-  has no outbound Trust-Task sender yet — see the `outbox` module.
+- **Proactive outbound push over TSP** (control→server sync/domain
+  updates): supported. The control `outbox` prefers TSP when the target
+  server advertises a `TSPTransport` service (`resolve_transport`),
+  serialising the DIDComm `Message` and sending it via `send_tsp`; the
+  server's `ServerTspHandler` deserialises it and applies it through the
+  same `do_*` cores the DIDComm listener uses. Delivery is fire-and-forget
+  (the outbox treats a successful send as delivery), so no ack is routed
+  back over TSP. Falls back to DIDComm for servers that advertise only it.
 - **Step-up authentication is HTTPS-only, by design.** Step-up
   (`auth/step-up/vta/finish`) elevates a *web session's* assurance level
   (aal1 → aal2) and binds the wallet's proof to that session via the

@@ -22,6 +22,7 @@ pub mod did_ops;
 pub mod error;
 pub mod health;
 pub mod messaging;
+pub mod tsp;
 pub mod mnemonic;
 #[cfg(feature = "openapi")]
 pub mod openapi;
