@@ -19,11 +19,11 @@
 //! `messaging::dispatch_trust_task_doc` routes the new `1.0` URIs here and
 //! everything else to the legacy bridge (deprecated over time).
 //!
-//! Migration status: **check-name, info, list, delete** are implemented.
-//! The remaining ops (publish, register, change-owner, witness-publish)
-//! follow the same shape and land one at a time behind [`owns`] — they
-//! carry the `did.jsonl` log / ownership transfer, which is the
-//! fit-for-purpose motivation the upstream record-centric payloads miss.
+//! Migration status: **check-name, info, list, delete, publish** are
+//! implemented. The remaining ops (register, change-owner, witness-publish)
+//! follow the same shape and land one at a time behind [`owns`]. Publish
+//! carries the `did.jsonl` log as a first-class typed field (`didLog`) —
+//! the fit-for-purpose motivation the upstream record-centric payloads miss.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,6 +155,30 @@ pub struct DeleteResponse {
     pub did_id: Option<String>,
 }
 
+/// `did-hosting/did/publish/1.0` — publish a signed webvh log entry for a
+/// reserved mnemonic. `didLog` is the `did.jsonl` content, first-class and
+/// typed (the fit-for-purpose motivation: the upstream record-centric
+/// payloads have nowhere to put it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishRequest {
+    pub mnemonic: String,
+    pub did_log: String,
+}
+impl trust_tasks_rs::Payload for PublishRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/publish/1.0";
+}
+
+/// `did-hosting/did/publish/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishResponse {
+    pub did_id: Option<String>,
+    pub did_url: String,
+    pub version_id: Option<String>,
+    pub version_count: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -167,6 +191,7 @@ enum DidHostingInbound {
     Info(TrustTask<InfoRequest>),
     List(TrustTask<ListRequest>),
     Delete(TrustTask<DeleteRequest>),
+    Publish(TrustTask<PublishRequest>),
 }
 
 fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
@@ -175,6 +200,7 @@ fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
         .on::<InfoRequest, _>(DidHostingInbound::Info)
         .on::<ListRequest, _>(DidHostingInbound::List)
         .on::<DeleteRequest, _>(DidHostingInbound::Delete)
+        .on::<PublishRequest, _>(DidHostingInbound::Publish)
 }
 
 /// Does the typed `did-hosting/*/1.0` protocol own this Type URI? The
@@ -202,6 +228,7 @@ where
         Ok(DidHostingInbound::Info(d)) => handle_info(state, transport, policy, d).await,
         Ok(DidHostingInbound::List(d)) => handle_list(state, transport, policy, d).await,
         Ok(DidHostingInbound::Delete(d)) => handle_delete(state, transport, policy, d).await,
+        Ok(DidHostingInbound::Publish(d)) => handle_publish(state, transport, policy, d).await,
         Err(err) => DispatchOutcome::Rejected(err),
     }
 }
@@ -456,6 +483,57 @@ where
             .map_err(|e| reject_apperror(&doc, e))?;
         crate::server_push::notify_servers_delete(&state, mnemonic.clone());
         Ok(doc.respond_with(new_id(), DeleteResponse { mnemonic, did_id }))
+    })
+    .await
+}
+
+async fn handle_publish<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<PublishRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let mnemonic = doc.payload.mnemonic.clone();
+        did_ops::publish_did(&auth, &state, &mnemonic, &doc.payload.did_log)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(&mnemonic))
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?
+            .ok_or_else(|| {
+                doc.reject_with(
+                    new_id(),
+                    ErrorPayload::new(StandardCode::InternalError)
+                        .with_message("record missing after publish"),
+                )
+            })?;
+        let base_url = state
+            .config
+            .did_hosting_url
+            .as_deref()
+            .or(state.config.public_url.as_deref())
+            .unwrap_or("http://localhost");
+        crate::server_push::notify_servers_did(&state, mnemonic.clone());
+        Ok(doc.respond_with(
+            new_id(),
+            PublishResponse {
+                did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
+                did_id: record.did_id.clone(),
+                version_id: record.did_id,
+                version_count: record.version_count,
+            },
+        ))
     })
     .await
 }
@@ -847,5 +925,48 @@ mod tests {
         assert_eq!(resp.payload["mnemonic"], mnemonic);
         let stored: Option<DidRecord> = state.dids_ks.get(did_key(&mnemonic)).await.unwrap();
         assert!(stored.is_none(), "deleted DID is gone from the store");
+    }
+
+    /// Publish routes through the typed pipeline to `did_ops::publish_did`.
+    /// A malformed log is rejected there — proving delegation (a valid
+    /// signed `did.jsonl` happy path is covered by the `did_ops` tests).
+    #[tokio::test]
+    async fn publish_malformed_log_rejected_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "pubtest").await;
+
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                PublishRequest::TYPE_URI,
+                json!({ "mnemonic": mnemonic, "didLog": "not-a-valid-jsonl-log" }),
+            ),
+        )
+        .await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected (malformed log), got {other:?}"),
+        };
+        assert!(
+            matches!(err.payload.code, trust_tasks_rs::TrustTaskCode::Standard(_)),
+            "malformed log surfaces a routed framework error: {:?}",
+            err.payload.code
+        );
+    }
+
+    #[test]
+    fn owns_recognises_all_registered_ops() {
+        for uri in [
+            CheckNameRequest::TYPE_URI,
+            InfoRequest::TYPE_URI,
+            ListRequest::TYPE_URI,
+            DeleteRequest::TYPE_URI,
+            PublishRequest::TYPE_URI,
+        ] {
+            assert!(owns(uri), "dispatcher should own {uri}");
+        }
     }
 }
