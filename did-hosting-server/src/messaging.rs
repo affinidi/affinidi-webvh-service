@@ -84,7 +84,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
 /// delivery is fire-and-forget, mirroring the control outbox's
 /// send-success-is-delivery model), or `None` for a type this server does
 /// not handle over TSP.
-pub(crate) async fn dispatch_tsp_message(
+pub async fn dispatch_tsp_message(
     state: &AppState,
     sender: &str,
     msg: &Message,
