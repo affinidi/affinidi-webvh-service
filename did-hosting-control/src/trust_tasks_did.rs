@@ -19,11 +19,12 @@
 //! `messaging::dispatch_trust_task_doc` routes the new `1.0` URIs here and
 //! everything else to the legacy bridge (deprecated over time).
 //!
-//! Migration status: **check-name, info, list, delete, publish** are
-//! implemented. The remaining ops (register, change-owner, witness-publish)
-//! follow the same shape and land one at a time behind [`owns`]. Publish
-//! carries the `did.jsonl` log as a first-class typed field (`didLog`) —
-//! the fit-for-purpose motivation the upstream record-centric payloads miss.
+//! Migration status: **all eight ops** are implemented — check-name, info,
+//! list, delete, publish, register, change-owner, witness-publish. Publish
+//! and register carry the `did.jsonl` log as a first-class typed field
+//! (`didLog`), the fit-for-purpose motivation the upstream record-centric
+//! payloads miss. The legacy `MSG_*` path (`dispatch_did_op`) remains for
+//! back-compat behind [`owns`], deprecated until clients adopt `1.0`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -179,6 +180,70 @@ pub struct PublishResponse {
     pub version_count: u64,
 }
 
+/// `did-hosting/did/register/1.0` — atomic claim-and-publish (webvh-only).
+/// `didLog` is the signed log for the freshly-claimed `path`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterRequest {
+    pub path: String,
+    pub did_log: String,
+    #[serde(default)]
+    pub force: bool,
+}
+impl trust_tasks_rs::Payload for RegisterRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/register/1.0";
+}
+
+/// `did-hosting/did/register/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterResponse {
+    pub mnemonic: String,
+    pub did_url: String,
+    pub server_did: String,
+}
+
+/// `did-hosting/did/change-owner/1.0` — transfer a DID to `newOwner`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnerRequest {
+    pub mnemonic: String,
+    pub new_owner: String,
+}
+impl trust_tasks_rs::Payload for ChangeOwnerRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/change-owner/1.0";
+}
+
+/// `did-hosting/did/change-owner/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnerResponse {
+    pub mnemonic: String,
+    pub owner: String,
+    pub updated_at: u64,
+}
+
+/// `did-hosting/webvh/witness/publish/1.0` — upload a witness proof set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessPublishRequest {
+    pub mnemonic: String,
+    /// The witness proof document (opaque JSON, serialised as-is).
+    pub witness: Value,
+}
+impl trust_tasks_rs::Payload for WitnessPublishRequest {
+    const TYPE_URI: &'static str =
+        "https://trusttasks.org/spec/did-hosting/webvh/witness/publish/1.0";
+}
+
+/// `did-hosting/webvh/witness/publish/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessPublishResponse {
+    pub mnemonic: String,
+    pub witness_url: String,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -192,6 +257,9 @@ enum DidHostingInbound {
     List(TrustTask<ListRequest>),
     Delete(TrustTask<DeleteRequest>),
     Publish(TrustTask<PublishRequest>),
+    Register(TrustTask<RegisterRequest>),
+    ChangeOwner(TrustTask<ChangeOwnerRequest>),
+    WitnessPublish(TrustTask<WitnessPublishRequest>),
 }
 
 fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
@@ -201,6 +269,9 @@ fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
         .on::<ListRequest, _>(DidHostingInbound::List)
         .on::<DeleteRequest, _>(DidHostingInbound::Delete)
         .on::<PublishRequest, _>(DidHostingInbound::Publish)
+        .on::<RegisterRequest, _>(DidHostingInbound::Register)
+        .on::<ChangeOwnerRequest, _>(DidHostingInbound::ChangeOwner)
+        .on::<WitnessPublishRequest, _>(DidHostingInbound::WitnessPublish)
 }
 
 /// Does the typed `did-hosting/*/1.0` protocol own this Type URI? The
@@ -229,6 +300,13 @@ where
         Ok(DidHostingInbound::List(d)) => handle_list(state, transport, policy, d).await,
         Ok(DidHostingInbound::Delete(d)) => handle_delete(state, transport, policy, d).await,
         Ok(DidHostingInbound::Publish(d)) => handle_publish(state, transport, policy, d).await,
+        Ok(DidHostingInbound::Register(d)) => handle_register(state, transport, policy, d).await,
+        Ok(DidHostingInbound::ChangeOwner(d)) => {
+            handle_change_owner(state, transport, policy, d).await
+        }
+        Ok(DidHostingInbound::WitnessPublish(d)) => {
+            handle_witness_publish(state, transport, policy, d).await
+        }
         Err(err) => DispatchOutcome::Rejected(err),
     }
 }
@@ -532,6 +610,127 @@ where
                 did_id: record.did_id.clone(),
                 version_id: record.did_id,
                 version_count: record.version_count,
+            },
+        ))
+    })
+    .await
+}
+
+async fn handle_register<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<RegisterRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let req = &doc.payload;
+        if req.path.is_empty() {
+            return Err(doc.reject_with(
+                new_id(),
+                ErrorPayload::new(StandardCode::MalformedRequest)
+                    .with_message("register requires a non-empty `path`"),
+            ));
+        }
+        let result = did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        crate::server_push::notify_servers_did(&state, result.mnemonic.clone());
+        let server_did = state.config.server_did.clone().unwrap_or_default();
+        Ok(doc.respond_with(
+            new_id(),
+            RegisterResponse {
+                mnemonic: result.mnemonic,
+                did_url: result.did_url,
+                server_did,
+            },
+        ))
+    })
+    .await
+}
+
+async fn handle_change_owner<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<ChangeOwnerRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let record = did_ops::change_did_owner(
+            &auth,
+            &state,
+            &doc.payload.mnemonic,
+            &doc.payload.new_owner,
+        )
+        .await
+        .map_err(|e| reject_apperror(&doc, e))?;
+        Ok(doc.respond_with(
+            new_id(),
+            ChangeOwnerResponse {
+                mnemonic: record.mnemonic,
+                owner: record.owner,
+                updated_at: record.updated_at,
+            },
+        ))
+    })
+    .await
+}
+
+async fn handle_witness_publish<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<WitnessPublishRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let mnemonic = doc.payload.mnemonic.clone();
+        let witness_str = serde_json::to_string(&doc.payload.witness).unwrap_or_default();
+        if witness_str.is_empty() || witness_str == "null" {
+            return Err(doc.reject_with(
+                new_id(),
+                ErrorPayload::new(StandardCode::MalformedRequest)
+                    .with_message("witness content cannot be empty"),
+            ));
+        }
+        did_ops::upload_witness(&auth, &state, &mnemonic, &witness_str)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        let base_url = state
+            .config
+            .did_hosting_url
+            .as_deref()
+            .or(state.config.public_url.as_deref())
+            .unwrap_or("http://localhost");
+        let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
+        crate::server_push::notify_servers_did(&state, mnemonic.clone());
+        Ok(doc.respond_with(
+            new_id(),
+            WitnessPublishResponse {
+                mnemonic,
+                witness_url,
             },
         ))
     })
@@ -965,8 +1164,83 @@ mod tests {
             ListRequest::TYPE_URI,
             DeleteRequest::TYPE_URI,
             PublishRequest::TYPE_URI,
+            RegisterRequest::TYPE_URI,
+            ChangeOwnerRequest::TYPE_URI,
+            WitnessPublishRequest::TYPE_URI,
         ] {
             assert!(owns(uri), "dispatcher should own {uri}");
         }
+    }
+
+    /// Register routes to `did_ops::register_did_atomic` — a malformed log
+    /// is rejected there (a valid signed log is covered by the did_ops
+    /// tests). Also proves the empty-path guard.
+    #[tokio::test]
+    async fn register_malformed_log_rejected_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                RegisterRequest::TYPE_URI,
+                json!({ "path": "regtest", "didLog": "garbage", "force": false }),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Rejected(_)),
+            "malformed register log is rejected"
+        );
+    }
+
+    /// Change-owner routes to `did_ops::change_did_owner`; transferring to
+    /// an unknown owner is rejected there.
+    #[tokio::test]
+    async fn change_owner_unknown_target_rejected_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "chowntest").await;
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                ChangeOwnerRequest::TYPE_URI,
+                json!({ "mnemonic": mnemonic, "newOwner": "did:web:nobody.example" }),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Rejected(_)),
+            "change to an unknown owner is rejected"
+        );
+    }
+
+    /// Witness-publish validates a non-empty witness before delegating.
+    #[tokio::test]
+    async fn witness_publish_empty_rejected_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "wittest").await;
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                WitnessPublishRequest::TYPE_URI,
+                json!({ "mnemonic": mnemonic, "witness": null }),
+            ),
+        )
+        .await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
+        );
     }
 }
