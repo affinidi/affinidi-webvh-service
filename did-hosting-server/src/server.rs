@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
@@ -449,6 +449,17 @@ pub async fn start_didcomm_service(
     )
     .await?;
 
+    // TSP rides the same mediator socket as DIDComm. When enabled, the
+    // listener carries both protocols and inbound TSP frames (sync/domain
+    // pushes from the control plane's outbox) are routed to the
+    // `ServerTspHandler`; otherwise the socket is DIDComm-only.
+    let tsp_enabled = state.config.features.tsp;
+    let protocols = if tsp_enabled {
+        Protocols::BOTH
+    } else {
+        Protocols::DIDCOMM_ONLY
+    };
+
     let listener = ListenerConfig {
         id: "server".into(),
         profile,
@@ -456,23 +467,33 @@ pub async fn start_didcomm_service(
             backoff: RetryConfig::default(),
         },
         auto_delete: true,
+        protocols,
         ..Default::default()
     };
 
     let router = messaging::build_server_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
 
-    let svc = DIDCommService::start(
-        DIDCommServiceConfig {
-            listeners: vec![listener],
-        },
-        router,
-        shutdown,
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+    let config = DIDCommServiceConfig {
+        listeners: vec![listener],
+    };
 
-    info!("DIDComm service started for {server_did}");
+    let svc = if tsp_enabled {
+        info!("starting messaging service with DIDComm + TSP on the mediator connection");
+        DIDCommService::start_with_tsp(
+            config,
+            router,
+            crate::tsp::ServerTspHandler::new(state.clone()),
+            shutdown,
+        )
+        .await
+    } else {
+        info!("starting DIDComm service with mediator connection");
+        DIDCommService::start(config, router, shutdown).await
+    }
+    .map_err(|e| AppError::Internal(format!("failed to start messaging service: {e}")))?;
+
+    info!(tsp = tsp_enabled, "messaging service started for {server_did}");
     Ok(Some(svc))
 }
 

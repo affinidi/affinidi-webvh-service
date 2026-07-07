@@ -72,6 +72,41 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .layer(middleware_fn(filtered_request_logging)))
 }
 
+/// Apply an inbound sync/domain message delivered over **TSP** by routing
+/// its `type` to the same `do_*` cores the DIDComm router uses.
+///
+/// TSP frames arrive on the shared mediator socket already sealed and with
+/// a cryptographically-authenticated `sender` — the same guarantees the
+/// DIDComm router's `require_encrypted(true).require_sender_did(true)`
+/// policy provides — and each `do_*` core additionally authorises the
+/// sender via `require_control_plane`. Returns the `(ack_type, ack_body)`
+/// the DIDComm path would reply with (the TSP handler currently drops it —
+/// delivery is fire-and-forget, mirroring the control outbox's
+/// send-success-is-delivery model), or `None` for a type this server does
+/// not handle over TSP.
+pub(crate) async fn dispatch_tsp_message(
+    state: &AppState,
+    sender: &str,
+    msg: &Message,
+) -> Option<(String, Value)> {
+    let result = match msg.typ.as_str() {
+        MSG_SYNC_UPDATE => do_sync_update(sender, state, msg).await,
+        MSG_SYNC_DELETE => do_sync_delete(sender, state, msg).await,
+        MSG_DOMAIN_ASSIGN => do_domain_assign(sender, state, msg).await,
+        MSG_DOMAIN_UNASSIGN => do_domain_unassign(sender, state, msg).await,
+        MSG_DOMAIN_PURGE => do_domain_purge(sender, state, msg).await,
+        MSG_DOMAIN_UPSERT => do_domain_upsert(sender, state, msg).await,
+        other => {
+            warn!(msg_type = other, sender, "TSP: unhandled server message type");
+            return None;
+        }
+    };
+    Some(match result {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.did.internal-error", &e),
+    })
+}
+
 /// Request logging middleware that silences noisy health/stats messages.
 async fn filtered_request_logging(
     ctx: HandlerContext,
