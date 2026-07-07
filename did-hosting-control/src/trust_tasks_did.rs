@@ -19,16 +19,17 @@
 //! `messaging::dispatch_trust_task_doc` routes the new `1.0` URIs here and
 //! everything else to the legacy bridge (deprecated over time).
 //!
-//! Migration status: **check-name** is implemented as the first op and the
-//! reference pattern; the remaining ops (publish, register, info, list,
-//! delete, change-owner, witness-publish) follow the same shape and land
-//! one at a time behind [`owns`].
+//! Migration status: **check-name, info, list, delete** are implemented.
+//! The remaining ops (publish, register, change-owner, witness-publish)
+//! follow the same shape and land one at a time behind [`owns`] — they
+//! carry the `did.jsonl` log / ownership transfer, which is the
+//! fit-for-purpose motivation the upstream record-centric payloads miss.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use trust_tasks_rs::{
-    Dispatcher, ErrorPayload, ProofPolicy, ProofVerifier, StandardCode, TransportHandler,
-    TrustTask,
+    Dispatcher, ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties,
+    StandardCode, TransportHandler, TrustTask,
 };
 
 use did_hosting_common::did_ops::{DidRecord, did_key};
@@ -90,6 +91,70 @@ pub struct CheckNameResponse {
     pub record: Option<Value>,
 }
 
+/// `did-hosting/did/info/1.0` — fetch a record + stats by mnemonic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InfoRequest {
+    pub mnemonic: String,
+}
+impl trust_tasks_rs::Payload for InfoRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/info/1.0";
+}
+
+/// `did-hosting/did/info/1.0#response`. The nested `stats` / `logMetadata`
+/// are carried as `Value` (faithful to the legacy `MSG_INFO` body).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InfoResponse {
+    pub mnemonic: String,
+    pub did_id: Option<String>,
+    pub did_url: String,
+    pub owner: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version_count: u64,
+    pub content_size: u64,
+    pub stats: Value,
+    pub log_metadata: Value,
+}
+
+/// `did-hosting/did/list/1.0` — list the caller's DIDs (admin may filter
+/// by `owner`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+impl trust_tasks_rs::Payload for ListRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/list/1.0";
+}
+
+/// `did-hosting/did/list/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResponse {
+    pub dids: Vec<Value>,
+}
+
+/// `did-hosting/did/delete/1.0` — delete a DID by mnemonic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRequest {
+    pub mnemonic: String,
+}
+impl trust_tasks_rs::Payload for DeleteRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/did/delete/1.0";
+}
+
+/// `did-hosting/did/delete/1.0#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResponse {
+    pub mnemonic: String,
+    pub did_id: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -99,10 +164,17 @@ pub struct CheckNameResponse {
 #[derive(Debug)]
 enum DidHostingInbound {
     CheckName(TrustTask<CheckNameRequest>),
+    Info(TrustTask<InfoRequest>),
+    List(TrustTask<ListRequest>),
+    Delete(TrustTask<DeleteRequest>),
 }
 
 fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
-    Dispatcher::new().on::<CheckNameRequest, _>(DidHostingInbound::CheckName)
+    Dispatcher::new()
+        .on::<CheckNameRequest, _>(DidHostingInbound::CheckName)
+        .on::<InfoRequest, _>(DidHostingInbound::Info)
+        .on::<ListRequest, _>(DidHostingInbound::List)
+        .on::<DeleteRequest, _>(DidHostingInbound::Delete)
 }
 
 /// Does the typed `did-hosting/*/1.0` protocol own this Type URI? The
@@ -127,6 +199,9 @@ where
     let error_id = new_id();
     match build_dispatcher().dispatch_or_reject(doc, error_id) {
         Ok(DidHostingInbound::CheckName(d)) => handle_check_name(state, transport, policy, d).await,
+        Ok(DidHostingInbound::Info(d)) => handle_info(state, transport, policy, d).await,
+        Ok(DidHostingInbound::List(d)) => handle_list(state, transport, policy, d).await,
+        Ok(DidHostingInbound::Delete(d)) => handle_delete(state, transport, policy, d).await,
         Err(err) => DispatchOutcome::Rejected(err),
     }
 }
@@ -269,9 +344,177 @@ where
     .await
 }
 
+async fn handle_info<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<InfoRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let mnemonic = doc.payload.mnemonic.clone();
+        let (record, log_metadata) = did_ops::get_did_info(&auth, &state, &mnemonic)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        let did_stats: did_hosting_common::DidStats = state
+            .stats_ks
+            .get(format!("stats:{mnemonic}"))
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?
+            .unwrap_or_default();
+        let base_url = state
+            .config
+            .did_hosting_url
+            .as_deref()
+            .or(state.config.public_url.as_deref())
+            .unwrap_or("http://localhost");
+        let resp = InfoResponse {
+            did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
+            mnemonic: record.mnemonic,
+            did_id: record.did_id,
+            owner: record.owner,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            version_count: record.version_count,
+            content_size: record.content_size,
+            stats: serde_json::json!({
+                "totalResolves": did_stats.total_resolves,
+                "totalUpdates": did_stats.total_updates,
+                "lastResolvedAt": did_stats.last_resolved_at,
+                "lastUpdatedAt": did_stats.last_updated_at,
+            }),
+            log_metadata: log_metadata
+                .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                .unwrap_or(Value::Null),
+        };
+        Ok(doc.respond_with(new_id(), resp))
+    })
+    .await
+}
+
+async fn handle_list<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<ListRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let entries = did_ops::list_dids(&auth, &state, doc.payload.owner.as_deref(), None, None)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        let dids: Vec<Value> = entries
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "mnemonic": e.mnemonic,
+                    "didId": e.did_id,
+                    "createdAt": e.created_at,
+                    "updatedAt": e.updated_at,
+                    "versionCount": e.version_count,
+                    "totalResolves": e.total_resolves,
+                })
+            })
+            .collect();
+        Ok(doc.respond_with(new_id(), ListResponse { dids }))
+    })
+    .await
+}
+
+async fn handle_delete<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<DeleteRequest>,
+) -> DispatchOutcome
+where
+    V: ProofVerifier + ?Sized,
+{
+    let (my_vid, state) = match resolve_state(state, &doc) {
+        Ok(v) => v,
+        Err(o) => return *o,
+    };
+    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
+        let auth = authorize(&state, &doc, &parties).await?;
+        let mnemonic = doc.payload.mnemonic.clone();
+        let did_id = did_ops::delete_did(&auth, &state, &mnemonic)
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+        crate::server_push::notify_servers_delete(&state, mnemonic.clone());
+        Ok(doc.respond_with(new_id(), DeleteResponse { mnemonic, did_id }))
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the service DID (for the pipeline's recipient anchor) and clone
+/// the `AppState` for capture into the `run_pipeline` handler closure.
+/// Returns the failure `DispatchOutcome` when no service DID is configured.
+fn resolve_state<P>(
+    state: &AppState,
+    doc: &TrustTask<P>,
+) -> Result<(String, AppState), Box<DispatchOutcome>> {
+    match state.config.server_did.as_deref() {
+        Some(v) => Ok((v.to_string(), state.clone())),
+        // Boxed: `DispatchOutcome` is a large framework enum, and clippy's
+        // `result_large_err` flags returning it unboxed in a `Result`.
+        None => Err(Box::new(DispatchOutcome::Rejected(doc.reject_with(
+            new_id(),
+            ErrorPayload::new(StandardCode::InternalError)
+                .with_message("the maintainer is not fully configured (no service DID)"),
+        )))),
+    }
+}
+
+/// Resolve the caller (framework-resolved `parties.issuer`, in-band wins)
+/// and check the maintainer ACL, returning an `AuthClaims` for the
+/// `did_ops::*` calls. The same authorisation gate the legacy transport
+/// applies before `dispatch_did_op`.
+async fn authorize<P>(
+    state: &AppState,
+    doc: &TrustTask<P>,
+    parties: &ResolvedParties,
+) -> Result<AuthClaims, ErrorResponse> {
+    let caller = parties.issuer.as_deref().ok_or_else(|| {
+        doc.reject_with(
+            new_id(),
+            ErrorPayload::new(StandardCode::PermissionDenied)
+                .with_message("inbound document has no in-band or transport-derived issuer"),
+        )
+    })?;
+    let role = check_acl(&state.acl_ks, caller).await.map_err(|_| {
+        doc.reject_with(
+            new_id(),
+            ErrorPayload::new(StandardCode::PermissionDenied)
+                .with_message("caller is not present in the maintainer's ACL"),
+        )
+    })?;
+    Ok(AuthClaims {
+        did: caller.to_string(),
+        role,
+        session_id: String::new(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
+    })
+}
 
 fn new_id() -> String {
     format!("urn:uuid:{}", uuid::Uuid::new_v4())
@@ -505,5 +748,104 @@ mod tests {
             err.payload.code,
             trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
         );
+    }
+
+    fn op_doc(type_uri: &str, payload: Value) -> TrustTask<Value> {
+        let body = json!({
+            "id": new_id(),
+            "type": type_uri,
+            "recipient": SERVICE_DID,
+            "issuedAt": "2026-07-07T00:00:00Z",
+            "payload": payload
+        });
+        serde_json::from_value(body).expect("doc parses")
+    }
+
+    fn expect_handled(outcome: DispatchOutcome) -> TrustTask<Value> {
+        match outcome {
+            DispatchOutcome::Handled(d) => d,
+            other => panic!("expected Handled, got {other:?}"),
+        }
+    }
+
+    /// Reserve a DID and return its mnemonic (setup for info/list/delete).
+    async fn reserve_did(state: &AppState, path: &str) -> String {
+        let outcome = dispatch::<TransportBoundVerifier>(
+            state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            check_name_doc(path, true),
+        )
+        .await;
+        expect_handled(outcome).payload["record"]["mnemonic"]
+            .as_str()
+            .expect("reserved record has a mnemonic")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn info_returns_record_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "infotest").await;
+
+        let resp = expect_handled(
+            dispatch::<TransportBoundVerifier>(
+                &state,
+                &transport(),
+                ProofPolicy::AcceptUnverified,
+                op_doc(InfoRequest::TYPE_URI, json!({ "mnemonic": mnemonic })),
+            )
+            .await,
+        );
+        assert_eq!(
+            resp.type_uri.to_string(),
+            format!("{}#response", InfoRequest::TYPE_URI)
+        );
+        assert_eq!(resp.payload["mnemonic"], mnemonic);
+        assert_eq!(resp.payload["owner"], ADMIN_DID);
+        assert!(resp.payload["stats"].is_object());
+    }
+
+    #[tokio::test]
+    async fn list_returns_dids_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "listtest").await;
+
+        let resp = expect_handled(
+            dispatch::<TransportBoundVerifier>(
+                &state,
+                &transport(),
+                ProofPolicy::AcceptUnverified,
+                op_doc(ListRequest::TYPE_URI, json!({})),
+            )
+            .await,
+        );
+        let dids = resp.payload["dids"].as_array().expect("dids array");
+        assert!(
+            dids.iter().any(|d| d["mnemonic"] == mnemonic),
+            "reserved DID appears in the list: {dids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_did_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "deltest").await;
+
+        let resp = expect_handled(
+            dispatch::<TransportBoundVerifier>(
+                &state,
+                &transport(),
+                ProofPolicy::AcceptUnverified,
+                op_doc(DeleteRequest::TYPE_URI, json!({ "mnemonic": mnemonic })),
+            )
+            .await,
+        );
+        assert_eq!(resp.payload["mnemonic"], mnemonic);
+        let stored: Option<DidRecord> = state.dids_ks.get(did_key(&mnemonic)).await.unwrap();
+        assert!(stored.is_none(), "deleted DID is gone from the store");
     }
 }
