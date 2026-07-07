@@ -24,11 +24,20 @@ model "here is a record", not "here is a signed log to publish".
 
 ## Approach — define our own, versioned, additive
 
-Give the **already-defined** webvh-owned Type URIs in
-`did_hosting_tasks.rs` (`https://trusttasks.org/did-hosting/did/*/1.0`)
-proper **typed `Payload` structs** that carry what the ops need, dispatch
-them through the framework's typed pipeline, and deprecate the legacy
-`MSG_*` / `spec/did-management/*/0.1` path over time.
+Define a webvh-owned, versioned family of **typed `Payload` structs** that
+carry what the ops need, dispatch them through the framework's typed
+pipeline, and deprecate the legacy `MSG_*` / `spec/did-management/*/0.1`
+path over time.
+
+> **Type URI shape.** The framework's `trust_tasks_rs::TypeUri` requires
+> the `/spec/<slug>/<major.minor>` form, so the typed URIs are
+> `https://trusttasks.org/spec/did-hosting/did/<op>/1.0` (slug
+> `did-hosting/did/<op>`). The bare `…/did-hosting/…` constants in
+> `did_hosting_tasks.rs` are valid only as *opaque* trust-task URLs (the
+> singular `trust_task::TrustTask` newtype), **not** as framework Type
+> URIs — they can't drive typed dispatch. Responses use the framework
+> convention `<request-uri>#response` (via `TrustTask::respond_with`),
+> not the separate `offer`/`confirm` URIs.
 
 - **Additive, not breaking.** The `1.0` URIs are new on the wire; the
   existing `MSG_*` path keeps working unchanged until clients opt in.

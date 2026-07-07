@@ -343,7 +343,10 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
 /// owner know where to publish and where resolvers will fetch. `didId`
 /// is only meaningful once a log entry exists, so it is emitted solely
 /// when `versionCount > 0`.
-fn spec_did_record_json(record: &did_hosting_common::did_ops::DidRecord, did_url: &str) -> Value {
+pub(crate) fn spec_did_record_json(
+    record: &did_hosting_common::did_ops::DidRecord,
+    did_url: &str,
+) -> Value {
     let rfc3339 = |secs: u64| {
         chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
             .unwrap_or_default()
@@ -1446,6 +1449,34 @@ pub(crate) async fn dispatch_trust_task_doc(
         .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
 
     let type_uri = doc.type_uri.to_string();
+
+    // Typed fit-for-purpose DID-management protocol (`did-hosting/*/1.0`).
+    // Takes precedence for its own URIs; runs the framework §7.2 pipeline
+    // with typed payloads (see `crate::trust_tasks_did`). The legacy
+    // `MSG_*` bridge below stays for back-compat, deprecated over time.
+    if crate::trust_tasks_did::owns(&type_uri) {
+        let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
+            state.config.trust_tasks.enforce_proofs,
+            state.trust_tasks_verifier.as_deref(),
+        ) {
+            (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
+            _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
+        };
+        let outcome = crate::trust_tasks_did::dispatch::<TransportBoundVerifier>(
+            state, transport, policy, doc,
+        )
+        .await;
+        return Ok(match outcome {
+            DispatchOutcome::Handled(resp) => {
+                Some(serde_json::to_value(&resp).expect("response document serialises"))
+            }
+            DispatchOutcome::Rejected(err) => {
+                Some(serde_json::to_value(&err).expect("error document serialises"))
+            }
+            DispatchOutcome::Suppressed => None,
+        });
+    }
+
     let framework_owns = build_dispatcher()
         .registered_uris()
         .contains(&type_uri.as_str());

@@ -32,4 +32,5 @@ pub mod server_push;
 pub mod setup;
 pub mod setup_recipe;
 pub mod store;
+pub mod trust_tasks_did;
 pub mod tsp;
