@@ -207,9 +207,9 @@ impl PasskeyState for AppState {
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Validate that at least one management interface is enabled
-    if !config.features.rest_api && !config.features.didcomm {
+    if !config.features.rest_api && !config.features.didcomm && !config.features.tsp {
         return Err(AppError::Config(
-            "at least one of 'rest_api' or 'didcomm' must be enabled in [features]".into(),
+            "at least one of 'rest_api', 'didcomm', or 'tsp' must be enabled in [features]".into(),
         ));
     }
 
@@ -437,9 +437,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
 
-    // 3. Start DIDComm service for inbound + outbound messages
+    // 3. Start the mediator messaging service (DIDComm and/or TSP) for
+    //    inbound + outbound messages. TSP-only deployments (didcomm off,
+    //    tsp on) must still start it.
     let didcomm_shutdown = CancellationToken::new();
-    if state.config.features.didcomm {
+    if state.config.features.didcomm || state.config.features.tsp {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => {
                 let _ = state.didcomm_service.set(svc);
@@ -606,15 +608,17 @@ pub async fn start_didcomm_service(
 
     info!("TDK profile built, configuring DIDComm listener");
 
-    // TSP rides the same mediator socket as DIDComm. When the operator has
-    // enabled it, the listener carries both protocols and inbound TSP frames
-    // are routed to the `WebvhTspHandler`; otherwise the socket is
-    // DIDComm-only (the historical default).
+    // Transport selection — DIDComm and/or TSP ride the same mediator
+    // socket. Inbound TSP frames are routed to the `WebvhTspHandler` when
+    // TSP is on. The four combinations map to the framework's `Protocols`;
+    // "neither flag set but a mediator is configured" defaults to
+    // DIDComm-only for back-compat.
+    let didcomm_enabled = state.config.features.didcomm;
     let tsp_enabled = state.config.features.tsp;
-    let protocols = if tsp_enabled {
-        Protocols::BOTH
-    } else {
-        Protocols::DIDCOMM_ONLY
+    let protocols = match (didcomm_enabled, tsp_enabled) {
+        (true, true) => Protocols::BOTH,
+        (false, true) => Protocols::TSP_ONLY,
+        _ => Protocols::DIDCOMM_ONLY,
     };
 
     let listener = ListenerConfig {

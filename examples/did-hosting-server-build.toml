@@ -28,6 +28,9 @@ data_dir = "data/did-hosting-server"
 public_url = "https://server1.example.com"
 # DIDComm mediator for runtime sync (NOT embedded in the DID document).
 # mediator_did = "did:webvh:mediator.example.com"
+# Messaging transport(s): "didcomm", "tsp", or "both" (default). Only
+# applies when `mediator_did` is set; both ride the mediator socket.
+# transport = "both"
 
 # Control plane's DID for authenticating sync messages. The server
 # refuses sync from any other DID once this is set.

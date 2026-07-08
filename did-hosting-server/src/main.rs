@@ -780,6 +780,8 @@ async fn run_recreate_did(
         &signing_secret,
         ka_secret.as_ref(),
         mediator_uri.as_deref(),
+        config.features.didcomm,
+        config.features.tsp,
         public_url,
         &mnemonic,
     )
@@ -896,6 +898,8 @@ async fn run_bootstrap_did(
             &signing_secret,
             ka_secret.as_ref(),
             mediator_uri.as_deref(),
+            config.features.didcomm,
+            config.features.tsp,
             public_url,
             &mnemonic,
         )

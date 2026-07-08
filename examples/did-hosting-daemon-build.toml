@@ -50,6 +50,11 @@ public_url = "https://daemon.example.com"
 # DIDComm mediator DID. Empty means no DIDComm — the daemon won't
 # be reachable for tenant DID provisioning over DIDComm.
 # mediator_did = "did:webvh:mediator.example.com"
+# Messaging transport(s): "didcomm", "tsp", or "both" (default). Only
+# applies when `mediator_did` is set; both ride the mediator socket. A
+# self-managed daemon's DID document advertises exactly the selected
+# transport service entries.
+# transport = "both"
 
 [vta]
 # Required for vta_mode = "online" (omit for self-managed):

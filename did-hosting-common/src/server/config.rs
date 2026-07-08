@@ -25,6 +25,55 @@ fn default_deployment_mode() -> String {
     "standalone".to_string()
 }
 
+/// Three-way messaging-transport selection used by setup wizards and
+/// recipes. TSP and DIDComm both ride the same mediator socket, so this
+/// choice is only meaningful when a `mediator_did` is configured; with no
+/// mediator the node is HTTP-only and both flags are false regardless.
+///
+/// The selection maps directly onto [`FeaturesConfig::didcomm`] /
+/// [`FeaturesConfig::tsp`], which in turn drive the listener protocol
+/// matrix and (for self-managed DIDs) which service entries the DID
+/// document advertises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSelection {
+    Didcomm,
+    Tsp,
+    Both,
+}
+
+impl TransportSelection {
+    /// `(didcomm, tsp)` feature flags for this selection.
+    pub fn as_flags(self) -> (bool, bool) {
+        match self {
+            Self::Didcomm => (true, false),
+            Self::Tsp => (false, true),
+            Self::Both => (true, true),
+        }
+    }
+
+    /// Parse a recipe `transport` string. Recognises `didcomm`, `tsp`, and
+    /// `both` (case-insensitive, `+`-joined aliases accepted).
+    pub fn parse(s: &str) -> Result<Self, AppError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "didcomm" => Ok(Self::Didcomm),
+            "tsp" => Ok(Self::Tsp),
+            "both" | "didcomm+tsp" | "tsp+didcomm" => Ok(Self::Both),
+            other => Err(AppError::Config(format!(
+                "invalid transport '{other}' (expected 'didcomm', 'tsp', or 'both')"
+            ))),
+        }
+    }
+
+    /// Canonical lower-case string, suitable for persisting into a recipe.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Didcomm => "didcomm",
+            Self::Tsp => "tsp",
+            Self::Both => "both",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
@@ -628,6 +677,7 @@ pub fn apply_env_overrides(
 
     // Features
     env_bool!(&format!("{prefix}_FEATURES_DIDCOMM"), features.didcomm);
+    env_bool!(&format!("{prefix}_FEATURES_TSP"), features.tsp);
     env_bool!(&format!("{prefix}_FEATURES_REST_API"), features.rest_api);
 
     // Server
@@ -902,5 +952,48 @@ mod tests {
             result.is_err(),
             "expected unknown mode to be rejected, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn transport_selection_flags() {
+        assert_eq!(TransportSelection::Didcomm.as_flags(), (true, false));
+        assert_eq!(TransportSelection::Tsp.as_flags(), (false, true));
+        assert_eq!(TransportSelection::Both.as_flags(), (true, true));
+    }
+
+    #[test]
+    fn transport_selection_parse_accepts_known_values() {
+        assert_eq!(
+            TransportSelection::parse("didcomm").unwrap(),
+            TransportSelection::Didcomm
+        );
+        assert_eq!(
+            TransportSelection::parse("TSP").unwrap(),
+            TransportSelection::Tsp
+        );
+        assert_eq!(
+            TransportSelection::parse(" Both ").unwrap(),
+            TransportSelection::Both
+        );
+        assert_eq!(
+            TransportSelection::parse("didcomm+tsp").unwrap(),
+            TransportSelection::Both
+        );
+    }
+
+    #[test]
+    fn transport_selection_parse_rejects_unknown() {
+        assert!(TransportSelection::parse("carrier-pigeon").is_err());
+    }
+
+    #[test]
+    fn transport_selection_str_round_trips() {
+        for sel in [
+            TransportSelection::Didcomm,
+            TransportSelection::Tsp,
+            TransportSelection::Both,
+        ] {
+            assert_eq!(TransportSelection::parse(sel.as_str()).unwrap(), sel);
+        }
     }
 }

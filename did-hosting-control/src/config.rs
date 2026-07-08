@@ -5,7 +5,7 @@ use std::path::PathBuf;
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
-    StoreConfig, VtaConfig,
+    StoreConfig, TransportSelection, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

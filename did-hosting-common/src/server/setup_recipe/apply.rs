@@ -265,6 +265,7 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
     use crate::did::{DidDocumentOptions, build_did_document, create_log_entry, encode_host};
+    use crate::server::config::TransportSelection;
 
     let public_url = recipe.identity.public_url.as_deref().ok_or_else(|| {
         AppError::Config("self-managed mode requires identity.public_url in the recipe".into())
@@ -289,16 +290,19 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
     let did_path = derive_did_path(public_url);
     let host_encoded = encode_host(public_url)
         .map_err(|e| AppError::Config(format!("failed to encode host from public URL: {e}")))?;
+    // Advertise each transport's service entry per the recipe's selection
+    // (defaults to both); both point at the same mediator socket.
+    let (advertise_didcomm, advertise_tsp) =
+        TransportSelection::parse(recipe.identity.transport.as_deref().unwrap_or("both"))?.as_flags();
+    let mediator = recipe.identity.mediator_did.as_deref();
     let doc = build_did_document(
         &host_encoded,
         &did_path,
         &signing_pub_mb,
         &DidDocumentOptions {
             key_agreement_multibase: Some(&ka_pub_mb),
-            mediator_endpoint: recipe.identity.mediator_did.as_deref(),
-            // TSP rides with DIDComm: advertise `TSPTransport` at the same
-            // mediator whenever DIDComm is present (matches the VTA templates).
-            tsp_endpoint: recipe.identity.mediator_did.as_deref(),
+            mediator_endpoint: if advertise_didcomm { mediator } else { None },
+            tsp_endpoint: if advertise_tsp { mediator } else { None },
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)

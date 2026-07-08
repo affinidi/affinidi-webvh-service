@@ -47,6 +47,10 @@ pub async fn bootstrap_root_did(
         signing_secret,
         ka_secret,
         mediator_did,
+        // Convenience wrapper: advertise both transports at the mediator
+        // (callers that need a specific transport call `bootstrap_did`).
+        true,
+        true,
         public_url,
         ".well-known",
     )
@@ -57,14 +61,21 @@ pub async fn bootstrap_root_did(
 ///
 /// The signing secret's public key is embedded in the DID document. If
 /// `ka_secret` is provided, an X25519 key agreement key is also added.
-/// If `mediator_did` is provided, a `DIDCommMessaging` service is added.
+/// If `mediator_did` is provided, a `DIDCommMessaging` service is added
+/// when `advertise_didcomm` is set and a `TSPTransport` service when
+/// `advertise_tsp` is set — both point at the same mediator (they share
+/// its socket). Gating these on the node's transport selection lets a
+/// self-managed node advertise DIDComm-only, TSP-only, or both.
 /// The resulting log entry is stored alongside a `DidRecord` with owner `"system"`.
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_did(
     store: &Store,
     dids_ks: &KeyspaceHandle,
     signing_secret: &Secret,
     ka_secret: Option<&Secret>,
     mediator_did: Option<&str>,
+    advertise_didcomm: bool,
+    advertise_tsp: bool,
     public_url: &str,
     mnemonic: &str,
 ) -> Result<BootstrapResult, AppError> {
@@ -93,11 +104,10 @@ pub async fn bootstrap_did(
         &public_key,
         &DidDocumentOptions {
             key_agreement_multibase: ka_public_key.as_deref(),
-            mediator_endpoint: mediator_did,
-            // TSP rides with DIDComm: advertise a `TSPTransport` service
-            // (pointing at the same mediator) whenever DIDComm is present,
-            // matching the VTA webvh templates.
-            tsp_endpoint: mediator_did,
+            // Advertise each transport's service entry only when selected;
+            // both point at the same mediator (shared socket).
+            mediator_endpoint: if advertise_didcomm { mediator_did } else { None },
+            tsp_endpoint: if advertise_tsp { mediator_did } else { None },
         },
     );
 

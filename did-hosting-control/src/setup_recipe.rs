@@ -199,10 +199,11 @@ pub async fn apply_recipe(
         .clone()
         .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Control));
 
+    let (didcomm, tsp) = recipe.identity.transport_flags()?;
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: true,
-            tsp: true,
+            didcomm,
+            tsp,
             rest_api: true,
             ..Default::default()
         },
