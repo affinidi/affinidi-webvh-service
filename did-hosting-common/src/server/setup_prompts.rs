@@ -17,7 +17,7 @@
 
 use dialoguer::{Input, Select};
 
-use super::config::LogFormat;
+use super::config::{LogFormat, TransportSelection};
 
 /// Prompt for a long, free-form value (DIDs, URLs) that can exceed the
 /// terminal width.
@@ -99,5 +99,29 @@ pub fn prompt_log_format() -> dialoguer::Result<LogFormat> {
     Ok(match idx {
         1 => LogFormat::Json,
         _ => LogFormat::Text,
+    })
+}
+
+/// Prompt for which messaging transport(s) the node advertises and its
+/// mediator listener carries. TSP and DIDComm share the mediator socket,
+/// so callers only invoke this when a mediator has been configured — with
+/// no mediator the node is HTTP-only. Defaults to `Both` (a node that
+/// speaks both is reachable by every peer; TSP is preferred when a peer
+/// advertises both).
+pub fn prompt_transport_selection() -> dialoguer::Result<TransportSelection> {
+    let options = [
+        "Both DIDComm and TSP (recommended)",
+        "DIDComm only",
+        "TSP only",
+    ];
+    let idx = Select::new()
+        .with_prompt("Messaging transport")
+        .items(options)
+        .default(0)
+        .interact()?;
+    Ok(match idx {
+        1 => TransportSelection::Didcomm,
+        2 => TransportSelection::Tsp,
+        _ => TransportSelection::Both,
     })
 }

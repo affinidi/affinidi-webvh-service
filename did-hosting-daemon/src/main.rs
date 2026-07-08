@@ -883,7 +883,10 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     //     Stored in the control state so server_push and handlers
     //     can send messages through the same connection.
     let didcomm_shutdown = CancellationToken::new();
-    if config.features.didcomm {
+    // Start the mediator messaging service when *either* transport is
+    // enabled — TSP-only deployments (didcomm off, tsp on) must still spin
+    // up the listener.
+    if config.features.didcomm || config.features.tsp {
         if let Some(ref mut state) = control_state {
             info!(
                 server_did = ?state.config.server_did,
@@ -1517,6 +1520,8 @@ async fn run_bootstrap_did(
             &signing_secret,
             ka_secret.as_ref(),
             mediator_uri.as_deref(),
+            config.features.didcomm,
+            config.features.tsp,
             public_url,
             &mnemonic,
         )
@@ -1662,6 +1667,8 @@ async fn run_recreate_did(
         &signing_secret,
         ka_secret.as_ref(),
         mediator_uri.as_deref(),
+        config.features.didcomm,
+        config.features.tsp,
         public_url,
         &mnemonic,
     )

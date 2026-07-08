@@ -9,7 +9,7 @@ use crate::acl::{AclEntry, Role};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
-    SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    SecretsConfig, ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -211,13 +211,18 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         vta_credential: Some(outcome.vta_credential_b64.clone()),
     };
 
-    // 14. Build and write config
+    // 14. Transport selection. The control plane always has a mediator, so
+    //     this gates which listener protocols run. (The VTA DID advertises
+    //     both service entries; peers prefer TSP when both are present.)
+    let (didcomm, tsp) = setup_prompts::prompt_transport_selection()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?
+        .as_flags();
+
+    // 15. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: true,
-            // TSP rides with DIDComm; the control plane's VTA DID advertises
-            // both services, so enable the TSP listener alongside DIDComm.
-            tsp: true,
+            didcomm,
+            tsp,
             rest_api: true,
             ..Default::default()
         },
@@ -548,6 +553,10 @@ enum AdminChoice {
     Skip,
 }
 
+fn default_transport() -> String {
+    TransportSelection::Both.as_str().to_string()
+}
+
 /// Everything the offline-prepare step captured, serialised as TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PendingSetupState {
@@ -555,6 +564,10 @@ struct PendingSetupState {
     did_hosting_url: String,
     did_path: String,
     mediator_did: Option<String>,
+    /// Transport selection (`didcomm` / `tsp` / `both`) captured at prepare
+    /// time. Only meaningful with a mediator; defaults to `both`.
+    #[serde(default = "default_transport")]
+    transport: String,
     did_log_output: PathBuf,
     public_url: Option<String>,
     host: String,
@@ -624,6 +637,14 @@ pub async fn run_setup_offline_prepare(
         None
     } else {
         Some(mediator_raw.trim().to_string())
+    };
+
+    // Transport selection only applies with a mediator (shared socket).
+    let transport = if mediator_did.is_some() {
+        setup_prompts::prompt_transport_selection()
+            .map_err(|e| AppError::Config(format!("input error: {e}")))?
+    } else {
+        TransportSelection::Both
     };
 
     let did_log_output: String = Input::new()
@@ -738,6 +759,7 @@ pub async fn run_setup_offline_prepare(
         did_hosting_url,
         did_path,
         mediator_did,
+        transport: transport.as_str().to_string(),
         did_log_output,
         public_url,
         host,
@@ -874,12 +896,11 @@ pub async fn run_setup_offline_complete(
     };
 
     // Build and write config.toml.
+    let (didcomm, tsp) = TransportSelection::parse(&state.transport)?.as_flags();
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: true,
-            // TSP rides with DIDComm; the control plane's VTA DID advertises
-            // both services, so enable the TSP listener alongside DIDComm.
-            tsp: true,
+            didcomm,
+            tsp,
             rest_api: true,
             ..Default::default()
         },

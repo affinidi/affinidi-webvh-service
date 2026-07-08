@@ -38,6 +38,12 @@ public_url = "https://control.example.com"
 # server-register / sync messages over DIDComm).
 mediator_did = "did:webvh:mediator.example.com"
 
+# Messaging transport(s) the node advertises and its mediator listener
+# carries: "didcomm", "tsp", or "both" (default). Both ride the same
+# mediator socket, so this only applies when `mediator_did` is set. TSP is
+# preferred when a peer advertises both.
+# transport = "both"
+
 [vta]
 did = "did:webvh:vta.example.com"
 context_id = "webvh"

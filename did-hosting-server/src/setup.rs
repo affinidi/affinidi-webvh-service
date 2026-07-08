@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
-    ServerConfig, StoreConfig, VtaConfig,
+    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use did_hosting_common::server::store::KS_DIDS;
@@ -177,6 +177,14 @@ pub async fn run_wizard(
         if did.is_empty() { None } else { Some(did) }
     };
 
+    // 5. Transport selection — only applies with a mediator (both TSP and
+    //    DIDComm ride the mediator socket); HTTP-only otherwise.
+    let (didcomm, tsp) = if mediator_did.is_some() {
+        setup_prompts::prompt_transport_selection()?.as_flags()
+    } else {
+        (false, false)
+    };
+
     // 6. Control plane DID (for DIDComm sync)
     eprintln!();
     eprintln!("  The control plane manages all DIDs and pushes updates to this");
@@ -226,8 +234,8 @@ pub async fn run_wizard(
     // 12. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: mediator_did.is_some(),
-            tsp: mediator_did.is_some(),
+            didcomm,
+            tsp,
             rest_api: false,
             ..Default::default()
         },
@@ -476,7 +484,6 @@ async fn run_online_provision(
     .await
 }
 
-/// Update `server_did` in the config file without clobbering other sections.
 // ---------------------------------------------------------------------------
 // Offline setup wizard (air-gapped VTA)
 //
@@ -486,12 +493,20 @@ async fn run_online_provision(
 // design rationale.
 // ---------------------------------------------------------------------------
 
+fn default_transport() -> String {
+    TransportSelection::Both.as_str().to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PendingServerSetupState {
     config_output: PathBuf,
     public_url: String,
     did_path: String,
     mediator_did: Option<String>,
+    /// Transport selection (`didcomm` / `tsp` / `both`) captured at prepare
+    /// time. Only meaningful with a mediator; defaults to `both`.
+    #[serde(default = "default_transport")]
+    transport: String,
     control_did: Option<String>,
     host: String,
     port: u16,
@@ -579,6 +594,13 @@ pub async fn run_setup_offline_prepare(
         Some(mediator_raw.trim().to_string())
     };
 
+    // Transport selection only applies with a mediator (shared socket).
+    let transport = if mediator_did.is_some() {
+        setup_prompts::prompt_transport_selection()?
+    } else {
+        TransportSelection::Both
+    };
+
     eprintln!();
     let control_did =
         setup_prompts::prompt_long_value("Control plane DID (leave empty to set later)", true)?;
@@ -637,6 +659,7 @@ pub async fn run_setup_offline_prepare(
         public_url,
         did_path,
         mediator_did,
+        transport: transport.as_str().to_string(),
         control_did,
         host,
         port,
@@ -729,10 +752,13 @@ pub async fn run_setup_offline_complete(
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
     eprintln!("  Generated JWT signing key.");
 
+    let (didcomm, tsp) = TransportSelection::parse(&state.transport)
+        .map_err(|e| format!("invalid transport in state: {e}"))?
+        .as_flags();
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: state.mediator_did.is_some(),
-            tsp: state.mediator_did.is_some(),
+            didcomm,
+            tsp,
             rest_api: false,
             ..Default::default()
         },

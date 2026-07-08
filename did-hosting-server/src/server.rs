@@ -278,9 +278,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     //    (the server's own DID needs to be resolvable for mediator auth)
     let _ = rest_ready_rx.await;
 
-    // 4. Start DIDComm service (single connection for both receiving and sending)
+    // 4. Start the mediator messaging service (DIDComm and/or TSP) — one
+    //    connection for both receiving and sending. TSP-only deployments
+    //    (didcomm off, tsp on) must still start it.
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm {
+    let didcomm_service = if state.config.features.didcomm || state.config.features.tsp {
         match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => Some(svc),
             Ok(None) => None,
@@ -449,15 +451,17 @@ pub async fn start_didcomm_service(
     )
     .await?;
 
-    // TSP rides the same mediator socket as DIDComm. When enabled, the
-    // listener carries both protocols and inbound TSP frames (sync/domain
-    // pushes from the control plane's outbox) are routed to the
-    // `ServerTspHandler`; otherwise the socket is DIDComm-only.
+    // Transport selection — DIDComm and/or TSP ride the same mediator
+    // socket. Inbound TSP frames (sync/domain pushes from the control
+    // plane's outbox) are routed to the `ServerTspHandler` when TSP is on.
+    // "neither flag set but a mediator is configured" defaults to
+    // DIDComm-only for back-compat.
+    let didcomm_enabled = state.config.features.didcomm;
     let tsp_enabled = state.config.features.tsp;
-    let protocols = if tsp_enabled {
-        Protocols::BOTH
-    } else {
-        Protocols::DIDCOMM_ONLY
+    let protocols = match (didcomm_enabled, tsp_enabled) {
+        (true, true) => Protocols::BOTH,
+        (false, true) => Protocols::TSP_ONLY,
+        _ => Protocols::DIDCOMM_ONLY,
     };
 
     let listener = ListenerConfig {

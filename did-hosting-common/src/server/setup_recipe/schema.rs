@@ -154,6 +154,12 @@ pub struct IdentitySection {
     /// mediator. Required for daemon hosting external tenant DIDs.
     #[serde(default)]
     pub mediator_did: Option<String>,
+    /// Which messaging transport(s) the node advertises and its mediator
+    /// listener carries: `didcomm`, `tsp`, or `both`. Only meaningful when
+    /// `mediator_did` is set (both ride the mediator socket). Absent /
+    /// empty defaults to `both`.
+    #[serde(default)]
+    pub transport: Option<String>,
     /// Server-only: the control plane's DID, for DIDComm sync auth.
     #[serde(default)]
     pub control_did: Option<String>,
@@ -161,6 +167,20 @@ pub struct IdentitySection {
     /// DIDComm; this is only consulted by tooling that pokes the API).
     #[serde(default)]
     pub control_url: Option<String>,
+}
+
+impl IdentitySection {
+    /// Transport feature flags `(didcomm, tsp)` implied by this identity.
+    /// Both transports ride the mediator socket, so with no `mediator_did`
+    /// the node is HTTP-only and both are false. Otherwise the `transport`
+    /// field (default `both`) selects which are enabled.
+    pub fn transport_flags(&self) -> Result<(bool, bool), crate::server::error::AppError> {
+        use crate::server::config::TransportSelection;
+        if self.mediator_did.is_none() {
+            return Ok((false, false));
+        }
+        Ok(TransportSelection::parse(self.transport.as_deref().unwrap_or("both"))?.as_flags())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

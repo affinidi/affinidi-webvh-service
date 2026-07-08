@@ -139,22 +139,19 @@ pub async fn run_wizard(
         did_path,
         self_host,
     } = result;
-    features.didcomm = mediator_did.is_some();
-    // TSP rides the same mediator socket as DIDComm and the VTA DID template
-    // advertises both services, so default TSP on wherever DIDComm is on. The
-    // operator may opt the TSP *listener* out (the DID still advertises the
-    // `TSPTransport` service — that's fixed by the VTA template — so leaving
-    // it on is recommended so peers that prefer TSP can reach this node).
-    features.tsp = features.didcomm;
-    if features.didcomm {
-        features.tsp = Confirm::new()
-            .with_prompt(
-                "Enable the TSP (Trust Spanning Protocol) transport? \
-                 Recommended — peers prefer TSP over DIDComm when a DID \
-                 advertises both",
-            )
-            .default(true)
-            .interact()?;
+    // Both TSP and DIDComm ride the mediator socket, so a transport choice
+    // only applies when a mediator was configured; otherwise the node is
+    // HTTP-only. Note: a VTA-provisioned DID document advertises both
+    // service entries (fixed by the VTA template), so this choice gates the
+    // *listener* protocols — picking TSP-only still leaves a DIDComm entry
+    // in the DID doc, but peers prefer TSP when both are advertised.
+    if mediator_did.is_some() {
+        let (didcomm, tsp) = setup_prompts::prompt_transport_selection()?.as_flags();
+        features.didcomm = didcomm;
+        features.tsp = tsp;
+    } else {
+        features.didcomm = false;
+        features.tsp = false;
     }
 
     // 5. Host / port / log / data
@@ -852,7 +849,7 @@ async fn run_self_managed_setup(
     }
 
     // 1. Enabled services + features.
-    let (enable, features) = prompt_enable_and_features()?;
+    let (enable, mut features) = prompt_enable_and_features()?;
 
     // 2. Public URL + DID path (drive the did:webvh identifier).
     //    `public_url` is the bare origin; the DID path is prompted
@@ -906,6 +903,16 @@ async fn run_self_managed_setup(
         }
     };
 
+    // 3b. Transport selection. Both TSP and DIDComm ride the mediator
+    //     socket, so this only applies when a mediator was configured; it
+    //     drives both the listener protocols and which service entries the
+    //     locally-built DID document advertises below.
+    if mediator_did.is_some() {
+        let (didcomm, tsp) = setup_prompts::prompt_transport_selection()?.as_flags();
+        features.didcomm = didcomm;
+        features.tsp = tsp;
+    }
+
     // 4. Host / port / log / data dir.
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port = setup_prompts::prompt_listen_port(8534)?;
@@ -953,10 +960,10 @@ async fn run_self_managed_setup(
         &signing_pub_mb,
         &DidDocumentOptions {
             key_agreement_multibase: Some(&ka_pub_mb),
-            mediator_endpoint: mediator_did.as_deref(),
-            // TSP rides with DIDComm: advertise `TSPTransport` at the same
-            // mediator whenever DIDComm is present (matches the VTA templates).
-            tsp_endpoint: mediator_did.as_deref(),
+            // Advertise each transport's service entry per the operator's
+            // selection; both point at the same mediator socket.
+            mediator_endpoint: if features.didcomm { mediator_did.as_deref() } else { None },
+            tsp_endpoint: if features.tsp { mediator_did.as_deref() } else { None },
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)

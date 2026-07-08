@@ -278,12 +278,33 @@ async fn deliver(
 
     match resolve_transport(&entry.target_did, did_resolver).await {
         Some((PeerTransport::Tsp, _)) => {
+            // `to_vec` borrows `msg`, so it stays owned for the DIDComm
+            // fallback below.
             let payload = serde_json::to_vec(&msg)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            didcomm
-                .send_tsp("control", &entry.target_did, &payload)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            match didcomm.send_tsp("control", &entry.target_did, &payload).await {
+                Ok(()) => Ok(()),
+                // Graceful degradation: if the TSP send fails (e.g. this
+                // node has no TSP connection, or the mediator rejects the
+                // frame), fall back to DIDComm. The VTA webvh templates
+                // advertise *both* `TSPTransport` and `DIDCommMessaging`
+                // for any mediator-connected DID, so a DIDComm endpoint is
+                // available for every TSP-advertising target. This keeps
+                // mixed / partially-upgraded fleets from getting stuck on
+                // TSP delivery failures.
+                Err(tsp_err) => {
+                    warn!(
+                        target_did = %entry.target_did,
+                        msg_type = %entry.msg_type,
+                        error = %tsp_err,
+                        "outbox: TSP send failed — falling back to DIDComm"
+                    );
+                    didcomm
+                        .send_message("control", msg, &entry.target_did)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                }
+            }
         }
         _ => didcomm
             .send_message("control", msg, &entry.target_did)

@@ -216,10 +216,11 @@ pub async fn apply_recipe(
         .clone()
         .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Server));
 
+    let (didcomm, tsp) = recipe.identity.transport_flags()?;
     let config = AppConfig {
         features: FeaturesConfig {
-            didcomm: recipe.identity.mediator_did.is_some(),
-            tsp: recipe.identity.mediator_did.is_some(),
+            didcomm,
+            tsp,
             rest_api: false,
             ..Default::default()
         },
