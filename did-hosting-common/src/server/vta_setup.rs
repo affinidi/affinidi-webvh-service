@@ -13,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use vta_sdk::credentials::CredentialBundle;
 
+use crate::server::config::TransportSelection;
 use crate::server::setup_recipe::hosting_url_for;
 
 /// Error message rendered when an operator picks self-managed mode in a
@@ -564,13 +565,20 @@ pub enum WebvhDidShape<'a> {
     /// The DID advertises a `WebVHHosting` endpoint. `did_path` is folded
     /// into `origin` via [`hosting_url_for`] so the minted DID, the local
     /// import, and resolution all agree on the location. When `mediator_did`
-    /// is set the DID also gets a `DIDCommMessaging` service (template
-    /// `did-hosting-control`); otherwise it is HTTP-only
-    /// (`did-hosting-daemon`).
+    /// is set the DID also advertises messaging transport(s) at that
+    /// mediator, selected by `transport`:
+    /// - [`TransportSelection::Both`] / [`TransportSelection::Didcomm`] →
+    ///   `did-host-http-didcomm` (advertises both TSP and DIDComm — there is
+    ///   no HTTP+DIDComm-exclusive VTA template);
+    /// - [`TransportSelection::Tsp`] → `did-host-http-tsp` (TSP only);
+    /// - no mediator → `did-host-http` (HTTP-only; `transport` is ignored).
     Hosted {
         origin: &'a str,
         did_path: &'a str,
         mediator_did: Option<&'a str>,
+        /// Which messaging transport(s) the DID advertises at `mediator_did`.
+        /// Ignored when `mediator_did` is `None`.
+        transport: TransportSelection,
         /// Server-managed publication on a registered hosting server
         /// (daemon multi-tenant / delegated hosting). When set, the minted
         /// DID's canonical host is the remote server: `origin` becomes the
@@ -615,6 +623,7 @@ pub fn build_webvh_provision_ask(
             origin,
             did_path,
             mediator_did,
+            transport,
             remote,
         } => {
             // Serverless folds the path into the URL so the minted DID and
@@ -624,9 +633,16 @@ pub fn build_webvh_provision_ask(
                 Some(_) => origin.trim_end_matches('/').to_string(),
                 None => hosting_url_for(origin, did_path),
             };
-            let mut ask = match mediator_did {
-                Some(med) => ProvisionAsk::did_host_http_didcomm(context_id, url, *med),
-                None => ProvisionAsk::did_host_http(context_id, url),
+            // Template selection: with a mediator, TSP-only advertises just
+            // `TSPTransport` (did-host-http-tsp); Both/Didcomm advertise both
+            // (did-host-http-didcomm — no HTTP+DIDComm-exclusive template
+            // exists). No mediator → HTTP-only.
+            let mut ask = match (mediator_did, transport) {
+                (Some(med), TransportSelection::Tsp) => {
+                    ProvisionAsk::did_host_http_tsp(context_id, url, *med)
+                }
+                (Some(med), _) => ProvisionAsk::did_host_http_didcomm(context_id, url, *med),
+                (None, _) => ProvisionAsk::did_host_http(context_id, url),
             };
             if let Some(r) = remote {
                 ask.integration_template_vars.insert(
@@ -1777,6 +1793,7 @@ mod tests {
                 origin: "https://did.example.com",
                 did_path: "services/control",
                 mediator_did: Some("did:key:z6MkMed"),
+                transport: TransportSelection::Both,
                 remote: None,
             },
             Some("lbl"),
@@ -1800,6 +1817,50 @@ mod tests {
     }
 
     #[test]
+    fn build_ask_hosted_tsp_only_uses_tsp_template() {
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://did.example.com",
+                did_path: "services/control",
+                mediator_did: Some("did:key:z6MkMed"),
+                transport: TransportSelection::Tsp,
+                remote: None,
+            },
+            None,
+        );
+        assert_eq!(
+            ask.integration_template.as_deref(),
+            Some("did-host-http-tsp")
+        );
+        assert_eq!(
+            ask.integration_template_vars.get("MEDIATOR_DID"),
+            Some(&serde_json::Value::String("did:key:z6MkMed".into())),
+        );
+    }
+
+    #[test]
+    fn build_ask_hosted_didcomm_selection_still_advertises_both() {
+        // No HTTP+DIDComm-exclusive template exists, so a Didcomm selection
+        // maps to the dual did-host-http-didcomm template (advertises both).
+        let ask = build_webvh_provision_ask(
+            "webvh",
+            &WebvhDidShape::Hosted {
+                origin: "https://did.example.com",
+                did_path: "services/control",
+                mediator_did: Some("did:key:z6MkMed"),
+                transport: TransportSelection::Didcomm,
+                remote: None,
+            },
+            None,
+        );
+        assert_eq!(
+            ask.integration_template.as_deref(),
+            Some("did-host-http-didcomm")
+        );
+    }
+
+    #[test]
     fn build_ask_hosted_no_mediator_uses_daemon_template() {
         let ask = build_webvh_provision_ask(
             "webvh",
@@ -1807,6 +1868,7 @@ mod tests {
                 origin: "https://did.example.com",
                 did_path: ".well-known",
                 mediator_did: None,
+                transport: TransportSelection::Both,
                 remote: None,
             },
             None,
@@ -1828,6 +1890,7 @@ mod tests {
                 // ignored for the URL in server-managed mode
                 did_path: "ignored",
                 mediator_did: None,
+                transport: TransportSelection::Both,
                 remote: Some(WebvhRemoteTarget {
                     server_id: "srv-1",
                     domain: Some("hosting.example.com"),
@@ -1865,6 +1928,7 @@ mod tests {
                 origin: "https://daemon.example.com",
                 did_path: ".well-known",
                 mediator_did: None,
+                transport: TransportSelection::Both,
                 remote: Some(WebvhRemoteTarget {
                     server_id: "srv-1",
                     domain: None,

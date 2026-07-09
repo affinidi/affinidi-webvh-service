@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use did_hosting_common::server::config::SecretsConfig;
+use did_hosting_common::server::config::{SecretsConfig, TransportSelection};
 use did_hosting_common::server::operator_messages::WebvhServerMessages;
 use did_hosting_common::server::secret_store::create_secret_store;
 use did_hosting_common::server::setup_recipe::{
@@ -89,6 +89,7 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
             origin: &url,
             did_path: ".well-known",
             mediator_did: None,
+            transport: TransportSelection::Both,
             remote: None,
         },
         Some("did-hosting-server"),

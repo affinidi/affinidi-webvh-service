@@ -109,6 +109,7 @@ pub async fn apply_recipe(
     // folds `did_path` into the URL and selects `did-hosting-control`
     // (HTTP + DIDComm) when a mediator is configured, else `did-hosting-daemon`
     // (HTTP-only). `did_hosting_url` (bare origin) is still what lands in config.
+    let transport = recipe.identity.transport_selection()?;
     let ask = matches!(
         recipe.deployment.vta_mode,
         VtaMode::Online | VtaMode::OfflinePrepare
@@ -118,6 +119,7 @@ pub async fn apply_recipe(
             origin: &did_hosting_url,
             did_path: &did_path,
             mediator_did: recipe.identity.mediator_did.as_deref(),
+            transport,
             remote: None,
         };
         vta_setup::build_webvh_provision_ask(

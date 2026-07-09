@@ -384,6 +384,9 @@ async fn main() {
                 origin: &origin,
                 did_path: &did_path,
                 mediator_did: Some(mediator_did.as_str()),
+                // The low-level offline-request CLI has no transport flag;
+                // default to advertising both (prior behaviour).
+                transport: did_hosting_common::server::config::TransportSelection::Both,
                 remote: None,
             };
             let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(

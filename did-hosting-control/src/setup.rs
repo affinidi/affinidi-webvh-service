@@ -117,10 +117,23 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    let (mediator_did, outcome) =
-        run_online_provision(messages, preloaded_setup_key, &did_hosting_url, &did_path)
-            .await
-            .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
+    // Transport selection must be collected BEFORE the VTA round-trip: it
+    // selects the DID template (TSP-only advertises only `TSPTransport`), so
+    // it has to be known when the DID is minted. Control always has a
+    // mediator, so the prompt is unconditional.
+    let transport = setup_prompts::prompt_transport_selection()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    let (didcomm, tsp) = transport.as_flags();
+
+    let (mediator_did, outcome) = run_online_provision(
+        messages,
+        preloaded_setup_key,
+        &did_hosting_url,
+        &did_path,
+        transport,
+    )
+    .await
+    .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
 
     // 5. Persist DID log entry (if the template emitted one) so the
     //    operator can publish it on the webvh hosting server.
@@ -211,13 +224,9 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         vta_credential: Some(outcome.vta_credential_b64.clone()),
     };
 
-    // 14. Transport selection. The control plane always has a mediator, so
-    //     this gates which listener protocols run. (The VTA DID advertises
-    //     both service entries; peers prefer TSP when both are present.)
-    let (didcomm, tsp) = setup_prompts::prompt_transport_selection()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?
-        .as_flags();
-
+    // Transport selection was collected before the VTA round-trip (it
+    // selects the DID template); `didcomm` / `tsp` here are that choice's
+    // flags, gating which listener protocols run.
     // 15. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
@@ -429,6 +438,7 @@ async fn run_online_provision(
     preloaded_setup_key: Option<EphemeralSetupKey>,
     origin: &str,
     did_path: &str,
+    transport: TransportSelection,
 ) -> Result<(Option<String>, vta_setup::OnlineProvisionOutcome), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
@@ -504,6 +514,7 @@ async fn run_online_provision(
         origin,
         did_path,
         mediator_did: Some(&mediator_did),
+        transport,
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(
@@ -739,6 +750,7 @@ pub async fn run_setup_offline_prepare(
         origin: &did_hosting_url,
         did_path: &did_path,
         mediator_did: mediator_did.as_deref(),
+        transport,
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(

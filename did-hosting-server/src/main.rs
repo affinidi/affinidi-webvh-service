@@ -530,6 +530,8 @@ async fn main() {
                 origin: &origin,
                 did_path: &did_path,
                 mediator_did: None,
+                // HTTP-only DID (no mediator) — transport is ignored.
+                transport: did_hosting_common::server::config::TransportSelection::Both,
                 remote: None,
             };
             let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(

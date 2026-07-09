@@ -462,6 +462,8 @@ async fn run_online_provision(
         origin: &origin,
         did_path: &did_path,
         mediator_did: None,
+        // HTTP-only DID (no mediator) — transport is ignored by the builder.
+        transport: TransportSelection::Both,
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(
@@ -642,6 +644,8 @@ pub async fn run_setup_offline_prepare(
         origin: &origin,
         did_path: &did_path,
         mediator_did: None,
+        // Server's own DID is HTTP-only, so transport is ignored here.
+        transport,
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(

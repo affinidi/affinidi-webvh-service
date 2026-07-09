@@ -51,6 +51,18 @@ impl TransportSelection {
         }
     }
 
+    /// Inverse of [`Self::as_flags`]: the selection implied by `(didcomm,
+    /// tsp)` feature flags. Returns `None` when both are false (no messaging
+    /// transport — an HTTP-only node the selection doesn't describe).
+    pub fn from_flags(didcomm: bool, tsp: bool) -> Option<Self> {
+        match (didcomm, tsp) {
+            (true, true) => Some(Self::Both),
+            (true, false) => Some(Self::Didcomm),
+            (false, true) => Some(Self::Tsp),
+            (false, false) => None,
+        }
+    }
+
     /// Parse a recipe `transport` string. Recognises `didcomm`, `tsp`, and
     /// `both` (case-insensitive, `+`-joined aliases accepted).
     pub fn parse(s: &str) -> Result<Self, AppError> {
@@ -984,6 +996,35 @@ mod tests {
     #[test]
     fn transport_selection_parse_rejects_unknown() {
         assert!(TransportSelection::parse("carrier-pigeon").is_err());
+    }
+
+    #[test]
+    fn transport_selection_from_flags() {
+        assert_eq!(
+            TransportSelection::from_flags(true, true),
+            Some(TransportSelection::Both)
+        );
+        assert_eq!(
+            TransportSelection::from_flags(true, false),
+            Some(TransportSelection::Didcomm)
+        );
+        assert_eq!(
+            TransportSelection::from_flags(false, true),
+            Some(TransportSelection::Tsp)
+        );
+        assert_eq!(TransportSelection::from_flags(false, false), None);
+    }
+
+    #[test]
+    fn transport_selection_flags_round_trip() {
+        for sel in [
+            TransportSelection::Didcomm,
+            TransportSelection::Tsp,
+            TransportSelection::Both,
+        ] {
+            let (d, t) = sel.as_flags();
+            assert_eq!(TransportSelection::from_flags(d, t), Some(sel));
+        }
     }
 
     #[test]

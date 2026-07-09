@@ -170,16 +170,27 @@ pub struct IdentitySection {
 }
 
 impl IdentitySection {
+    /// The transport selection this identity requests (`transport` field,
+    /// default `both`). Independent of `mediator_did` — describes which
+    /// transports the DID *would* advertise; the mediator gating lives in
+    /// [`Self::transport_flags`]. Used to pick the VTA DID template.
+    pub fn transport_selection(
+        &self,
+    ) -> Result<crate::server::config::TransportSelection, crate::server::error::AppError> {
+        crate::server::config::TransportSelection::parse(
+            self.transport.as_deref().unwrap_or("both"),
+        )
+    }
+
     /// Transport feature flags `(didcomm, tsp)` implied by this identity.
     /// Both transports ride the mediator socket, so with no `mediator_did`
     /// the node is HTTP-only and both are false. Otherwise the `transport`
     /// field (default `both`) selects which are enabled.
     pub fn transport_flags(&self) -> Result<(bool, bool), crate::server::error::AppError> {
-        use crate::server::config::TransportSelection;
         if self.mediator_did.is_none() {
             return Ok((false, false));
         }
-        Ok(TransportSelection::parse(self.transport.as_deref().unwrap_or("both"))?.as_flags())
+        Ok(self.transport_selection()?.as_flags())
     }
 }
 
