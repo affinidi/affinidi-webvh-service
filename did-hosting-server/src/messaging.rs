@@ -97,7 +97,10 @@ pub async fn dispatch_tsp_message(
         MSG_DOMAIN_PURGE => do_domain_purge(sender, state, msg).await,
         MSG_DOMAIN_UPSERT => do_domain_upsert(sender, state, msg).await,
         other => {
-            warn!(msg_type = other, sender, "TSP: unhandled server message type");
+            warn!(
+                msg_type = other,
+                sender, "TSP: unhandled server message type"
+            );
             return None;
         }
     };

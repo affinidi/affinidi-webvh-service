@@ -962,8 +962,16 @@ async fn run_self_managed_setup(
             key_agreement_multibase: Some(&ka_pub_mb),
             // Advertise each transport's service entry per the operator's
             // selection; both point at the same mediator socket.
-            mediator_endpoint: if features.didcomm { mediator_did.as_deref() } else { None },
-            tsp_endpoint: if features.tsp { mediator_did.as_deref() } else { None },
+            mediator_endpoint: if features.didcomm {
+                mediator_did.as_deref()
+            } else {
+                None
+            },
+            tsp_endpoint: if features.tsp {
+                mediator_did.as_deref()
+            } else {
+                None
+            },
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)

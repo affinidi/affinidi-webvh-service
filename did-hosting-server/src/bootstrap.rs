@@ -106,7 +106,11 @@ pub async fn bootstrap_did(
             key_agreement_multibase: ka_public_key.as_deref(),
             // Advertise each transport's service entry only when selected;
             // both point at the same mediator (shared socket).
-            mediator_endpoint: if advertise_didcomm { mediator_did } else { None },
+            mediator_endpoint: if advertise_didcomm {
+                mediator_did
+            } else {
+                None
+            },
             tsp_endpoint: if advertise_tsp { mediator_did } else { None },
         },
     );

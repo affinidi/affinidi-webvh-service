@@ -293,7 +293,8 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
     // Advertise each transport's service entry per the recipe's selection
     // (defaults to both); both point at the same mediator socket.
     let (advertise_didcomm, advertise_tsp) =
-        TransportSelection::parse(recipe.identity.transport.as_deref().unwrap_or("both"))?.as_flags();
+        TransportSelection::parse(recipe.identity.transport.as_deref().unwrap_or("both"))?
+            .as_flags();
     let mediator = recipe.identity.mediator_did.as_deref();
     let doc = build_did_document(
         &host_encoded,

@@ -34,9 +34,7 @@ use trust_tasks_rs::{
 };
 
 use did_hosting_common::did_ops::{DidRecord, did_key};
-use did_hosting_common::server::domain::{
-    DomainScope, get_default_domain, resolve_request_domain,
-};
+use did_hosting_common::server::domain::{DomainScope, get_default_domain, resolve_request_domain};
 use did_hosting_common::server::trust_tasks::{DispatchOutcome, run_pipeline};
 
 use crate::acl::check_acl;
@@ -329,123 +327,133 @@ where
         None => {
             // No service DID → the pipeline has no recipient anchor. Surface
             // as an internal error document rather than panicking.
-            return DispatchOutcome::Rejected(doc.reject_with(
-                new_id(),
-                ErrorPayload::new(StandardCode::InternalError)
-                    .with_message("the maintainer is not fully configured (no service DID)"),
-            ));
+            return DispatchOutcome::Rejected(
+                doc.reject_with(
+                    new_id(),
+                    ErrorPayload::new(StandardCode::InternalError)
+                        .with_message("the maintainer is not fully configured (no service DID)"),
+                ),
+            );
         }
     };
     let state = state.clone();
-    run_pipeline(transport, policy, doc, my_vid, move |doc, parties| async move {
-        // The framework resolved the caller (in-band issuer wins, transport
-        // fills in). Authorise against the maintainer's ACL — the same gate
-        // the legacy `run_webvh_dispatch` applies before `dispatch_did_op`.
-        let caller = parties.issuer.as_deref().ok_or_else(|| {
-            doc.reject_with(
-                new_id(),
-                ErrorPayload::new(StandardCode::PermissionDenied)
-                    .with_message("inbound document has no in-band or transport-derived issuer"),
-            )
-        })?;
-        let role = check_acl(&state.acl_ks, caller).await.map_err(|_| {
-            doc.reject_with(
-                new_id(),
-                ErrorPayload::new(StandardCode::PermissionDenied)
-                    .with_message("caller is not present in the maintainer's ACL"),
-            )
-        })?;
-        let auth = AuthClaims {
-            did: caller.to_string(),
-            role,
-            session_id: String::new(),
-            session_pubkey_b58btc: None,
-            amr: vec!["did".to_string()],
-            acr: "aal1".to_string(),
-        };
-        let req = &doc.payload;
-
-        // ── Probe mode: read-only, MUST name a path. ──────────────────
-        if !req.reserve {
-            let path = req.path.as_deref().ok_or_else(|| {
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        my_vid,
+        move |doc, parties| async move {
+            // The framework resolved the caller (in-band issuer wins, transport
+            // fills in). Authorise against the maintainer's ACL — the same gate
+            // the legacy `run_webvh_dispatch` applies before `dispatch_did_op`.
+            let caller = parties.issuer.as_deref().ok_or_else(|| {
                 doc.reject_with(
                     new_id(),
-                    ErrorPayload::new(StandardCode::MalformedRequest).with_message(
-                        "check-name without `reserve: true` requires a `path` to probe",
+                    ErrorPayload::new(StandardCode::PermissionDenied).with_message(
+                        "inbound document has no in-band or transport-derived issuer",
                     ),
                 )
             })?;
-            let probe = did_ops::check_name(&state, path)
-                .await
-                .map_err(|e| reject_apperror(&doc, e))?;
-            let resp = CheckNameResponse {
-                available: probe.available,
-                reserved: false,
-                record: None,
+            let role = check_acl(&state.acl_ks, caller).await.map_err(|_| {
+                doc.reject_with(
+                    new_id(),
+                    ErrorPayload::new(StandardCode::PermissionDenied)
+                        .with_message("caller is not present in the maintainer's ACL"),
+                )
+            })?;
+            let auth = AuthClaims {
+                did: caller.to_string(),
+                role,
+                session_id: String::new(),
+                session_pubkey_b58btc: None,
+                amr: vec!["did".to_string()],
+                acr: "aal1".to_string(),
             };
-            return Ok(doc.respond_with(new_id(), resp));
-        }
+            let req = &doc.payload;
 
-        // ── Reserve mode: domain resolution + atomic claim. ───────────
-        // Same chain as the legacy arm: explicit → ACL default → system
-        // default; proceed un-domained when none resolves.
-        let acl_scope = match did_hosting_common::server::acl::get_acl_entry(
-            &state.acl_ks,
-            &auth.did,
-        )
-        .await
-        .map_err(|e| reject_apperror(&doc, e))?
-        {
-            Some(e) => e.domains,
-            None => DomainScope::All,
-        };
-        let system_default = get_default_domain(&state.store).await.ok().flatten();
-        let resolved_domain =
-            resolve_request_domain(req.domain.as_deref(), &acl_scope, system_default.as_deref())
-                .ok();
-
-        match did_ops::create_did(
-            &auth,
-            &state,
-            req.path.as_deref(),
-            req.force,
-            resolved_domain.as_deref(),
-        )
-        .await
-        {
-            Ok(result) => {
-                let record: DidRecord = state
-                    .dids_ks
-                    .get(did_key(&result.mnemonic))
+            // ── Probe mode: read-only, MUST name a path. ──────────────────
+            if !req.reserve {
+                let path = req.path.as_deref().ok_or_else(|| {
+                    doc.reject_with(
+                        new_id(),
+                        ErrorPayload::new(StandardCode::MalformedRequest).with_message(
+                            "check-name without `reserve: true` requires a `path` to probe",
+                        ),
+                    )
+                })?;
+                let probe = did_ops::check_name(&state, path)
                     .await
-                    .map_err(|e| reject_apperror(&doc, e))?
-                    .ok_or_else(|| {
-                        doc.reject_with(
-                            new_id(),
-                            ErrorPayload::new(StandardCode::InternalError)
-                                .with_message("record missing after reservation"),
-                        )
-                    })?;
+                    .map_err(|e| reject_apperror(&doc, e))?;
                 let resp = CheckNameResponse {
-                    available: true,
-                    reserved: true,
-                    record: Some(spec_did_record_json(&record, &result.did_url)),
-                };
-                Ok(doc.respond_with(new_id(), resp))
-            }
-            // Spec: an already-taken path without `force` is not an error —
-            // return `available: false, reserved: false` and DO NOT mutate.
-            Err(AppError::Conflict(_)) => Ok(doc.respond_with(
-                new_id(),
-                CheckNameResponse {
-                    available: false,
+                    available: probe.available,
                     reserved: false,
                     record: None,
-                },
-            )),
-            Err(e) => Err(reject_apperror(&doc, e)),
-        }
-    })
+                };
+                return Ok(doc.respond_with(new_id(), resp));
+            }
+
+            // ── Reserve mode: domain resolution + atomic claim. ───────────
+            // Same chain as the legacy arm: explicit → ACL default → system
+            // default; proceed un-domained when none resolves.
+            let acl_scope =
+                match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
+                    .await
+                    .map_err(|e| reject_apperror(&doc, e))?
+                {
+                    Some(e) => e.domains,
+                    None => DomainScope::All,
+                };
+            let system_default = get_default_domain(&state.store).await.ok().flatten();
+            let resolved_domain = resolve_request_domain(
+                req.domain.as_deref(),
+                &acl_scope,
+                system_default.as_deref(),
+            )
+            .ok();
+
+            match did_ops::create_did(
+                &auth,
+                &state,
+                req.path.as_deref(),
+                req.force,
+                resolved_domain.as_deref(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    let record: DidRecord = state
+                        .dids_ks
+                        .get(did_key(&result.mnemonic))
+                        .await
+                        .map_err(|e| reject_apperror(&doc, e))?
+                        .ok_or_else(|| {
+                            doc.reject_with(
+                                new_id(),
+                                ErrorPayload::new(StandardCode::InternalError)
+                                    .with_message("record missing after reservation"),
+                            )
+                        })?;
+                    let resp = CheckNameResponse {
+                        available: true,
+                        reserved: true,
+                        record: Some(spec_did_record_json(&record, &result.did_url)),
+                    };
+                    Ok(doc.respond_with(new_id(), resp))
+                }
+                // Spec: an already-taken path without `force` is not an error —
+                // return `available: false, reserved: false` and DO NOT mutate.
+                Err(AppError::Conflict(_)) => Ok(doc.respond_with(
+                    new_id(),
+                    CheckNameResponse {
+                        available: false,
+                        reserved: false,
+                        record: None,
+                    },
+                )),
+                Err(e) => Err(reject_apperror(&doc, e)),
+            }
+        },
+    )
     .await
 }
 
@@ -462,45 +470,51 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let mnemonic = doc.payload.mnemonic.clone();
-        let (record, log_metadata) = did_ops::get_did_info(&auth, &state, &mnemonic)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        let did_stats: did_hosting_common::DidStats = state
-            .stats_ks
-            .get(format!("stats:{mnemonic}"))
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?
-            .unwrap_or_default();
-        let base_url = state
-            .config
-            .did_hosting_url
-            .as_deref()
-            .or(state.config.public_url.as_deref())
-            .unwrap_or("http://localhost");
-        let resp = InfoResponse {
-            did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
-            mnemonic: record.mnemonic,
-            did_id: record.did_id,
-            owner: record.owner,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            version_count: record.version_count,
-            content_size: record.content_size,
-            stats: serde_json::json!({
-                "totalResolves": did_stats.total_resolves,
-                "totalUpdates": did_stats.total_updates,
-                "lastResolvedAt": did_stats.last_resolved_at,
-                "lastUpdatedAt": did_stats.last_updated_at,
-            }),
-            log_metadata: log_metadata
-                .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null),
-        };
-        Ok(doc.respond_with(new_id(), resp))
-    })
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let mnemonic = doc.payload.mnemonic.clone();
+            let (record, log_metadata) = did_ops::get_did_info(&auth, &state, &mnemonic)
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?;
+            let did_stats: did_hosting_common::DidStats = state
+                .stats_ks
+                .get(format!("stats:{mnemonic}"))
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?
+                .unwrap_or_default();
+            let base_url = state
+                .config
+                .did_hosting_url
+                .as_deref()
+                .or(state.config.public_url.as_deref())
+                .unwrap_or("http://localhost");
+            let resp = InfoResponse {
+                did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
+                mnemonic: record.mnemonic,
+                did_id: record.did_id,
+                owner: record.owner,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+                version_count: record.version_count,
+                content_size: record.content_size,
+                stats: serde_json::json!({
+                    "totalResolves": did_stats.total_resolves,
+                    "totalUpdates": did_stats.total_updates,
+                    "lastResolvedAt": did_stats.last_resolved_at,
+                    "lastUpdatedAt": did_stats.last_updated_at,
+                }),
+                log_metadata: log_metadata
+                    .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null),
+            };
+            Ok(doc.respond_with(new_id(), resp))
+        },
+    )
     .await
 }
 
@@ -517,26 +531,33 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let entries = did_ops::list_dids(&auth, &state, doc.payload.owner.as_deref(), None, None)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        let dids: Vec<Value> = entries
-            .into_iter()
-            .map(|e| {
-                serde_json::json!({
-                    "mnemonic": e.mnemonic,
-                    "didId": e.did_id,
-                    "createdAt": e.created_at,
-                    "updatedAt": e.updated_at,
-                    "versionCount": e.version_count,
-                    "totalResolves": e.total_resolves,
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let entries =
+                did_ops::list_dids(&auth, &state, doc.payload.owner.as_deref(), None, None)
+                    .await
+                    .map_err(|e| reject_apperror(&doc, e))?;
+            let dids: Vec<Value> = entries
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "mnemonic": e.mnemonic,
+                        "didId": e.did_id,
+                        "createdAt": e.created_at,
+                        "updatedAt": e.updated_at,
+                        "versionCount": e.version_count,
+                        "totalResolves": e.total_resolves,
+                    })
                 })
-            })
-            .collect();
-        Ok(doc.respond_with(new_id(), ListResponse { dids }))
-    })
+                .collect();
+            Ok(doc.respond_with(new_id(), ListResponse { dids }))
+        },
+    )
     .await
 }
 
@@ -553,15 +574,21 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let mnemonic = doc.payload.mnemonic.clone();
-        let did_id = did_ops::delete_did(&auth, &state, &mnemonic)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        crate::server_push::notify_servers_delete(&state, mnemonic.clone());
-        Ok(doc.respond_with(new_id(), DeleteResponse { mnemonic, did_id }))
-    })
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let mnemonic = doc.payload.mnemonic.clone();
+            let did_id = did_ops::delete_did(&auth, &state, &mnemonic)
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?;
+            crate::server_push::notify_servers_delete(&state, mnemonic.clone());
+            Ok(doc.respond_with(new_id(), DeleteResponse { mnemonic, did_id }))
+        },
+    )
     .await
 }
 
@@ -578,41 +605,47 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let mnemonic = doc.payload.mnemonic.clone();
-        did_ops::publish_did(&auth, &state, &mnemonic, &doc.payload.did_log)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        let record: DidRecord = state
-            .dids_ks
-            .get(did_key(&mnemonic))
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?
-            .ok_or_else(|| {
-                doc.reject_with(
-                    new_id(),
-                    ErrorPayload::new(StandardCode::InternalError)
-                        .with_message("record missing after publish"),
-                )
-            })?;
-        let base_url = state
-            .config
-            .did_hosting_url
-            .as_deref()
-            .or(state.config.public_url.as_deref())
-            .unwrap_or("http://localhost");
-        crate::server_push::notify_servers_did(&state, mnemonic.clone());
-        Ok(doc.respond_with(
-            new_id(),
-            PublishResponse {
-                did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
-                did_id: record.did_id.clone(),
-                version_id: record.did_id,
-                version_count: record.version_count,
-            },
-        ))
-    })
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let mnemonic = doc.payload.mnemonic.clone();
+            did_ops::publish_did(&auth, &state, &mnemonic, &doc.payload.did_log)
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?;
+            let record: DidRecord = state
+                .dids_ks
+                .get(did_key(&mnemonic))
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?
+                .ok_or_else(|| {
+                    doc.reject_with(
+                        new_id(),
+                        ErrorPayload::new(StandardCode::InternalError)
+                            .with_message("record missing after publish"),
+                    )
+                })?;
+            let base_url = state
+                .config
+                .did_hosting_url
+                .as_deref()
+                .or(state.config.public_url.as_deref())
+                .unwrap_or("http://localhost");
+            crate::server_push::notify_servers_did(&state, mnemonic.clone());
+            Ok(doc.respond_with(
+                new_id(),
+                PublishResponse {
+                    did_url: format!("{base_url}/{mnemonic}/did.jsonl"),
+                    did_id: record.did_id.clone(),
+                    version_id: record.did_id,
+                    version_count: record.version_count,
+                },
+            ))
+        },
+    )
     .await
 }
 
@@ -629,30 +662,37 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let req = &doc.payload;
-        if req.path.is_empty() {
-            return Err(doc.reject_with(
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let req = &doc.payload;
+            if req.path.is_empty() {
+                return Err(doc.reject_with(
+                    new_id(),
+                    ErrorPayload::new(StandardCode::MalformedRequest)
+                        .with_message("register requires a non-empty `path`"),
+                ));
+            }
+            let result =
+                did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force)
+                    .await
+                    .map_err(|e| reject_apperror(&doc, e))?;
+            crate::server_push::notify_servers_did(&state, result.mnemonic.clone());
+            let server_did = state.config.server_did.clone().unwrap_or_default();
+            Ok(doc.respond_with(
                 new_id(),
-                ErrorPayload::new(StandardCode::MalformedRequest)
-                    .with_message("register requires a non-empty `path`"),
-            ));
-        }
-        let result = did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        crate::server_push::notify_servers_did(&state, result.mnemonic.clone());
-        let server_did = state.config.server_did.clone().unwrap_or_default();
-        Ok(doc.respond_with(
-            new_id(),
-            RegisterResponse {
-                mnemonic: result.mnemonic,
-                did_url: result.did_url,
-                server_did,
-            },
-        ))
-    })
+                RegisterResponse {
+                    mnemonic: result.mnemonic,
+                    did_url: result.did_url,
+                    server_did,
+                },
+            ))
+        },
+    )
     .await
 }
 
@@ -669,25 +709,31 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let record = did_ops::change_did_owner(
-            &auth,
-            &state,
-            &doc.payload.mnemonic,
-            &doc.payload.new_owner,
-        )
-        .await
-        .map_err(|e| reject_apperror(&doc, e))?;
-        Ok(doc.respond_with(
-            new_id(),
-            ChangeOwnerResponse {
-                mnemonic: record.mnemonic,
-                owner: record.owner,
-                updated_at: record.updated_at,
-            },
-        ))
-    })
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let record = did_ops::change_did_owner(
+                &auth,
+                &state,
+                &doc.payload.mnemonic,
+                &doc.payload.new_owner,
+            )
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
+            Ok(doc.respond_with(
+                new_id(),
+                ChangeOwnerResponse {
+                    mnemonic: record.mnemonic,
+                    owner: record.owner,
+                    updated_at: record.updated_at,
+                },
+            ))
+        },
+    )
     .await
 }
 
@@ -704,36 +750,42 @@ where
         Ok(v) => v,
         Err(o) => return *o,
     };
-    run_pipeline(transport, policy, doc, &my_vid, move |doc, parties| async move {
-        let auth = authorize(&state, &doc, &parties).await?;
-        let mnemonic = doc.payload.mnemonic.clone();
-        let witness_str = serde_json::to_string(&doc.payload.witness).unwrap_or_default();
-        if witness_str.is_empty() || witness_str == "null" {
-            return Err(doc.reject_with(
+    run_pipeline(
+        transport,
+        policy,
+        doc,
+        &my_vid,
+        move |doc, parties| async move {
+            let auth = authorize(&state, &doc, &parties).await?;
+            let mnemonic = doc.payload.mnemonic.clone();
+            let witness_str = serde_json::to_string(&doc.payload.witness).unwrap_or_default();
+            if witness_str.is_empty() || witness_str == "null" {
+                return Err(doc.reject_with(
+                    new_id(),
+                    ErrorPayload::new(StandardCode::MalformedRequest)
+                        .with_message("witness content cannot be empty"),
+                ));
+            }
+            did_ops::upload_witness(&auth, &state, &mnemonic, &witness_str)
+                .await
+                .map_err(|e| reject_apperror(&doc, e))?;
+            let base_url = state
+                .config
+                .did_hosting_url
+                .as_deref()
+                .or(state.config.public_url.as_deref())
+                .unwrap_or("http://localhost");
+            let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
+            crate::server_push::notify_servers_did(&state, mnemonic.clone());
+            Ok(doc.respond_with(
                 new_id(),
-                ErrorPayload::new(StandardCode::MalformedRequest)
-                    .with_message("witness content cannot be empty"),
-            ));
-        }
-        did_ops::upload_witness(&auth, &state, &mnemonic, &witness_str)
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-        let base_url = state
-            .config
-            .did_hosting_url
-            .as_deref()
-            .or(state.config.public_url.as_deref())
-            .unwrap_or("http://localhost");
-        let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
-        crate::server_push::notify_servers_did(&state, mnemonic.clone());
-        Ok(doc.respond_with(
-            new_id(),
-            WitnessPublishResponse {
-                mnemonic,
-                witness_url,
-            },
-        ))
-    })
+                WitnessPublishResponse {
+                    mnemonic,
+                    witness_url,
+                },
+            ))
+        },
+    )
     .await
 }
 
@@ -752,11 +804,13 @@ fn resolve_state<P>(
         Some(v) => Ok((v.to_string(), state.clone())),
         // Boxed: `DispatchOutcome` is a large framework enum, and clippy's
         // `result_large_err` flags returning it unboxed in a `Result`.
-        None => Err(Box::new(DispatchOutcome::Rejected(doc.reject_with(
-            new_id(),
-            ErrorPayload::new(StandardCode::InternalError)
-                .with_message("the maintainer is not fully configured (no service DID)"),
-        )))),
+        None => Err(Box::new(DispatchOutcome::Rejected(
+            doc.reject_with(
+                new_id(),
+                ErrorPayload::new(StandardCode::InternalError)
+                    .with_message("the maintainer is not fully configured (no service DID)"),
+            ),
+        ))),
     }
 }
 
@@ -818,7 +872,10 @@ fn reject_apperror<P>(doc: &TrustTask<P>, e: AppError) -> trust_tasks_rs::ErrorR
                 .with_message("the maintainer encountered an internal failure"),
         );
     }
-    doc.reject_with(new_id(), ErrorPayload::new(code).with_message(e.user_message()))
+    doc.reject_with(
+        new_id(),
+        ErrorPayload::new(code).with_message(e.user_message()),
+    )
 }
 
 #[cfg(test)]
@@ -938,7 +995,9 @@ mod tests {
     fn owns_recognises_did_hosting_uri() {
         assert!(owns(CheckNameRequest::TYPE_URI));
         assert!(!owns("https://trusttasks.org/spec/acl/grant/0.1"));
-        assert!(!owns("https://trusttasks.org/spec/did-management/did/publish/0.1"));
+        assert!(!owns(
+            "https://trusttasks.org/spec/did-management/did/publish/0.1"
+        ));
     }
 
     /// Probe of a free path returns `available: true, reserved: false`
@@ -995,11 +1054,7 @@ mod tests {
         let mnemonic = resp.payload["record"]["mnemonic"]
             .as_str()
             .expect("record has a mnemonic");
-        let stored: Option<DidRecord> = state
-            .dids_ks
-            .get(did_key(mnemonic))
-            .await
-            .unwrap();
+        let stored: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await.unwrap();
         assert!(stored.is_some(), "reserved DID persisted");
     }
 
