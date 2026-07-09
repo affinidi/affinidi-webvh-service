@@ -170,7 +170,9 @@ async fn tsp_unhandled_type_returns_none() {
     .finalize();
 
     assert!(
-        dispatch_tsp_message(&state, CONTROL_DID, &msg).await.is_none(),
+        dispatch_tsp_message(&state, CONTROL_DID, &msg)
+            .await
+            .is_none(),
         "an unhandled type is dropped, not mis-routed"
     );
 }

@@ -282,7 +282,10 @@ async fn deliver(
             // fallback below.
             let payload = serde_json::to_vec(&msg)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            match didcomm.send_tsp("control", &entry.target_did, &payload).await {
+            match didcomm
+                .send_tsp("control", &entry.target_did, &payload)
+                .await
+            {
                 Ok(()) => Ok(()),
                 // Graceful degradation: if the TSP send fails (e.g. this
                 // node has no TSP connection, or the mediator rejects the
