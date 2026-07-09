@@ -15,7 +15,7 @@ use dialoguer::{Confirm, Input, MultiSelect, Select};
 use did_hosting_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
-    StoreConfig, VtaConfig,
+    StoreConfig, TransportSelection, VtaConfig,
 };
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
@@ -135,24 +135,22 @@ pub async fn run_wizard(
     let OnlineProvisionResult {
         outcome,
         mediator_did,
+        transport,
         public_url,
         did_path,
         self_host,
     } = result;
-    // Both TSP and DIDComm ride the mediator socket, so a transport choice
-    // only applies when a mediator was configured; otherwise the node is
-    // HTTP-only. Note: a VTA-provisioned DID document advertises both
-    // service entries (fixed by the VTA template), so this choice gates the
-    // *listener* protocols — picking TSP-only still leaves a DIDComm entry
-    // in the DID doc, but peers prefer TSP when both are advertised.
-    if mediator_did.is_some() {
-        let (didcomm, tsp) = setup_prompts::prompt_transport_selection()?.as_flags();
-        features.didcomm = didcomm;
-        features.tsp = tsp;
+    // Transport was selected inside `run_online_provision` (before the
+    // round-trip, since it picks the DID template), gated on mediator
+    // presence there. Its flags drive the listener protocols; with no
+    // mediator both are false (HTTP-only).
+    let (didcomm, tsp) = if mediator_did.is_some() {
+        transport.as_flags()
     } else {
-        features.didcomm = false;
-        features.tsp = false;
-    }
+        (false, false)
+    };
+    features.didcomm = didcomm;
+    features.tsp = tsp;
 
     // 5. Host / port / log / data
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
@@ -367,6 +365,10 @@ struct OnlineProvisionResult {
     /// Mediator DID the operator chose, if any. Drives `features.didcomm`
     /// and selected the `did-hosting-control` vs `did-hosting-daemon` ask.
     mediator_did: Option<String>,
+    /// Transport selection collected before the round-trip (it selected the
+    /// DID template). Drives `features.didcomm` / `features.tsp`. `Both`
+    /// when no mediator (HTTP-only — the flags are then both false anyway).
+    transport: TransportSelection,
     /// The daemon's own reachable origin (`config.public_url` /
     /// `did_hosting_url`, WebAuthn RP). Independent of the DID's canonical
     /// host in server-managed mode.
@@ -500,6 +502,16 @@ async fn run_online_provision(
         None => prompt_mediator_did()?,
     };
 
+    // Transport selection must be known before the VTA round-trip: it
+    // selects the DID template (TSP-only advertises only `TSPTransport`).
+    // Only meaningful with a mediator (both ride its socket); HTTP-only
+    // nodes default to Both, which the builder ignores when no mediator.
+    let transport = if mediator_did.is_some() {
+        setup_prompts::prompt_transport_selection()?
+    } else {
+        TransportSelection::Both
+    };
+
     // The daemon's OWN reachable URL — `config.public_url` / WebAuthn RP /
     // domain seed. This is independent of the DID's canonical host: in
     // serverless that host *is* this origin; in server-managed it's the
@@ -544,6 +556,7 @@ async fn run_online_provision(
         origin: &public_url,
         did_path: &did_path,
         mediator_did: mediator_did.as_deref(),
+        transport,
         remote,
     };
     let ask = vta_setup::build_webvh_provision_ask(
@@ -561,6 +574,7 @@ async fn run_online_provision(
     Ok(OnlineProvisionResult {
         outcome,
         mediator_did,
+        transport,
         public_url,
         did_path,
         self_host,
@@ -962,8 +976,16 @@ async fn run_self_managed_setup(
             key_agreement_multibase: Some(&ka_pub_mb),
             // Advertise each transport's service entry per the operator's
             // selection; both point at the same mediator socket.
-            mediator_endpoint: if features.didcomm { mediator_did.as_deref() } else { None },
-            tsp_endpoint: if features.tsp { mediator_did.as_deref() } else { None },
+            mediator_endpoint: if features.didcomm {
+                mediator_did.as_deref()
+            } else {
+                None
+            },
+            tsp_endpoint: if features.tsp {
+                mediator_did.as_deref()
+            } else {
+                None
+            },
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
@@ -1168,10 +1190,18 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator.");
     eprintln!();
     let mediator_did = prompt_mediator_did()?;
-    features.didcomm = mediator_did.is_some();
-    // TSP rides the same mediator socket as DIDComm and the VTA DID template
-    // advertises both services, so default TSP on wherever DIDComm is on.
-    features.tsp = features.didcomm;
+    // Transport selection — only meaningful with a mediator (both TSP and
+    // DIDComm ride its socket). Drives both the listener protocols and the
+    // DID template selected for the shape below (TSP-only advertises only
+    // `TSPTransport`).
+    if mediator_did.is_some() {
+        let (didcomm, tsp) = setup_prompts::prompt_transport_selection()?.as_flags();
+        features.didcomm = didcomm;
+        features.tsp = tsp;
+    } else {
+        features.didcomm = false;
+        features.tsp = false;
+    }
 
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port = setup_prompts::prompt_listen_port(8534)?;
@@ -1205,6 +1235,10 @@ pub async fn run_setup_offline_prepare(
         origin: &public_url,
         did_path: &did_path,
         mediator_did: mediator_did.as_deref(),
+        // Offline daemon derives transport from features (set from mediator
+        // presence above); default Both if somehow unset with a mediator.
+        transport: TransportSelection::from_flags(features.didcomm, features.tsp)
+            .unwrap_or(TransportSelection::Both),
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(

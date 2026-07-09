@@ -105,6 +105,7 @@ pub async fn apply_recipe(
     // gets both WebVHHosting + DIDCommMessaging (`did-hosting-control`); else
     // HTTP-only (`did-hosting-daemon`).
     let (origin, did_path) = split_origin_and_did_path(&public_url);
+    let transport = recipe.identity.transport_selection()?;
     let ask = matches!(
         recipe.deployment.vta_mode,
         VtaMode::Online | VtaMode::OfflinePrepare
@@ -114,6 +115,7 @@ pub async fn apply_recipe(
             origin: &origin,
             did_path: &did_path,
             mediator_did: recipe.identity.mediator_did.as_deref(),
+            transport,
             remote: None,
         };
         vta_setup::build_webvh_provision_ask(

@@ -122,6 +122,9 @@ pub async fn apply_recipe(
         .clone()
         .unwrap_or_else(|| "webvh".to_string());
     let (origin, did_path) = split_origin_and_did_path(&public_url_owned);
+    // Server's own DID is HTTP-only (mediator_did: None), so `transport` is
+    // ignored by the builder; carried for shape consistency.
+    let transport = recipe.identity.transport_selection()?;
     let ask = matches!(
         recipe.deployment.vta_mode,
         VtaMode::Online | VtaMode::OfflinePrepare
@@ -131,6 +134,7 @@ pub async fn apply_recipe(
             origin: &origin,
             did_path: &did_path,
             mediator_did: None,
+            transport,
             remote: None,
         };
         vta_setup::build_webvh_provision_ask(
