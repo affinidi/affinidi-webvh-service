@@ -1027,6 +1027,13 @@ async fn handle_health_pong(
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = require_sender(&ctx)?;
     do_health_pong(&state, sender, &message.body).await;
+    crate::registry::record_inbound_transport(
+        &state.registry_ks,
+        sender,
+        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
+        crate::auth::session::now_epoch(),
+    )
+    .await;
     Ok(None)
 }
 
@@ -1228,6 +1235,15 @@ pub(crate) async fn do_server_register(
             .and_then(|p| p.advertised_services.clone()),
         services_checked_at: previous.as_ref().and_then(|p| p.services_checked_at),
         trust_task_capable,
+        // `register_instance` overwrites the whole record, so the observed-link
+        // history has to survive a re-register exactly as the badge cache does.
+        // The caller records *this* registration's inbound transport right
+        // after; the outbound side has no other source and would otherwise be
+        // blanked every time a server restarts.
+        last_inbound_transport: previous.as_ref().and_then(|p| p.last_inbound_transport),
+        last_inbound_at: previous.as_ref().and_then(|p| p.last_inbound_at),
+        last_outbound_transport: previous.as_ref().and_then(|p| p.last_outbound_transport),
+        last_outbound_at: previous.as_ref().and_then(|p| p.last_outbound_at),
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -1293,6 +1309,16 @@ async fn handle_server_register(
             json!({ "code": rej.code, "comment": rej.comment }),
         ),
     };
+
+    // A legacy registration arrived over DIDComm by construction. Recorded
+    // after `do_server_register` so the instance exists to write onto.
+    crate::registry::record_inbound_transport(
+        &state.registry_ks,
+        sender,
+        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
+        crate::auth::session::now_epoch(),
+    )
+    .await;
 
     Ok(Some(
         DIDCommResponse::new(typ, body).thid(message.id.clone()),
@@ -1538,7 +1564,12 @@ pub(crate) async fn dispatch_trust_task_doc(
     // operations that has never heard of them — and answer with a bogus
     // "unknown op" problem report.
     if crate::trust_tasks_infra::owns(&type_uri) {
-        return Ok(crate::trust_tasks_infra::dispatch(state, sender, doc).await);
+        // The dispatcher stays transport-agnostic; we only tell it which binding
+        // the document came in on so the registry can record what actually moved.
+        let via = did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
+            transport.binding_uri(),
+        );
+        return Ok(crate::trust_tasks_infra::dispatch(state, sender, via, doc).await);
     }
 
     let framework_owns = build_dispatcher()

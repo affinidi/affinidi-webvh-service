@@ -165,6 +165,32 @@ trust-task dispatcher at all, registration and health lived only on the DIDComm
 router, and a node with `TSPTransport` and DIDComm disabled could never register
 or pong — it sat in the dashboard as `Unreachable` forever.
 
+### Seeing which transport a server is actually using
+
+The Servers card shows a **Control link** block with the transport that really
+carried the last message in each direction — `↓ in` (registration, health pong)
+and `↑ out` (health ping). It is recorded, not inferred.
+
+That distinction matters. `advertisedServices` is what a peer *can* speak;
+`lastInboundTransport` / `lastOutboundTransport` are what moved. They disagree
+whenever a TSP send falls back to DIDComm, or a server registered over DIDComm
+before its document advertised a transport. Badging the advertised value as
+though it were the transport in use would quietly mislead the operator, which is
+why `send_trust_task` returns the transport that actually carried the document
+and the health loop persists *that*.
+
+Inbound is tagged from the caller's `TransportHandler::binding_uri()`, matched
+against each binding crate's own exported constant — so an unrecognised binding
+records nothing rather than being mis-attributed. Outbound is scoped to the
+health ping: it is the only outbound path on a timer, so it is the only one
+whose observation stays fresh. The outbox's sync/domain pushes also pick a
+transport per DID document, but they fire only on mutations and would leave the
+value stale for hours.
+
+A server with `trustTaskCapable: false` is always pinged over DIDComm no matter
+what it advertises; the card says so rather than leaving the operator to wonder
+why a TSP-advertising node never shows TSP.
+
 ### Two compatibility rules that look like warts
 
 **The server's TSP handler sniffs the payload.** A trust-task document is tried

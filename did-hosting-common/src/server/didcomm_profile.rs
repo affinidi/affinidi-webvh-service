@@ -152,6 +152,52 @@ pub enum PeerTransport {
     Didcomm,
 }
 
+/// A transport a message was **observed** travelling on, as opposed to
+/// [`PeerTransport`], which records what a DID document *advertises*.
+///
+/// The distinction is the whole point of persisting this. A peer that
+/// advertises `TSPTransport` may still be talked to over DIDComm — because the
+/// TSP send failed and fell back, or because it registered before it advertised
+/// anything. Reporting the advertised transport as though it were the one in
+/// use would quietly lie to the operator.
+///
+/// `Https` exists because the trust-task core is transport-agnostic and the
+/// same documents can arrive over `POST /api/trust-tasks`. No registered
+/// service instance uses it today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObservedTransport {
+    Tsp,
+    Didcomm,
+    Https,
+}
+
+impl ObservedTransport {
+    /// Map a [`trust_tasks_rs::TransportHandler::binding_uri`] to the transport
+    /// it identifies.
+    ///
+    /// Matched against the binding crates' own exported constants rather than
+    /// by substring, so a new binding shows up as `None` — an honest "we don't
+    /// know" — instead of being silently mis-attributed.
+    pub fn from_binding_uri(binding_uri: &str) -> Option<Self> {
+        match binding_uri {
+            crate::server::trust_tasks::transport::TSP_BINDING_URI => Some(Self::Tsp),
+            trust_tasks_didcomm::BINDING_URI => Some(Self::Didcomm),
+            trust_tasks_https::BINDING_URI => Some(Self::Https),
+            _ => None,
+        }
+    }
+}
+
+impl From<PeerTransport> for ObservedTransport {
+    fn from(t: PeerTransport) -> Self {
+        match t {
+            PeerTransport::Tsp => Self::Tsp,
+            PeerTransport::Didcomm => Self::Didcomm,
+        }
+    }
+}
+
 /// Resolve every service `type` a peer's DID document advertises.
 ///
 /// The network-facing counterpart to

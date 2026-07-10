@@ -34,6 +34,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
 import { ServiceBadges } from "../../components/ServiceBadges";
+import { ControlLink } from "../../components/ControlLink";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
 import type { ServiceInstance } from "../../lib/api";
@@ -308,6 +309,13 @@ function ServerCard({
               </Text>
             )}
           </View>
+          <ControlLink
+            lastInboundTransport={instance.lastInboundTransport}
+            lastInboundAt={instance.lastInboundAt}
+            lastOutboundTransport={instance.lastOutboundTransport}
+            lastOutboundAt={instance.lastOutboundAt}
+            trustTaskCapable={instance.trustTaskCapable}
+          />
           <View style={styles.metaRow}>
             {instance.enabledMethods.map((m) => (
               <View key={m} style={styles.methodBadge}>

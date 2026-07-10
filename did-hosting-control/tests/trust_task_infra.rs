@@ -119,6 +119,7 @@ async fn add_acl(state: &AppState, did: &str, role: Role) {
 use did_hosting_common::didcomm_types::{
     MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK,
 };
+use did_hosting_common::server::didcomm_profile::ObservedTransport;
 use did_hosting_common::server::trust_tasks::send::build_request;
 use did_hosting_control::registry;
 use did_hosting_control::trust_tasks_infra;
@@ -156,7 +157,7 @@ async fn register_trust_task_creates_instance_and_acks() {
         register_body(true),
     )
     .expect("build register doc");
-    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, doc)
+    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("register must produce an ack");
 
@@ -188,7 +189,7 @@ async fn register_without_capability_flag_defaults_to_legacy() {
     body.as_object_mut().unwrap().remove("trust_task_capable");
 
     let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, doc)
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("ack");
 
@@ -214,7 +215,7 @@ async fn register_trust_task_requires_service_role() {
         register_body(true),
     )
     .expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, doc)
+    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("rejection is still a document");
 
@@ -245,7 +246,7 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
         register_body(true),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, reg).await;
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), reg).await;
 
     let before = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
         .await
@@ -261,7 +262,9 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
     )
     .expect("MSG_HEALTH_PONG must parse as a #response TypeUri");
 
-    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, pong).await;
+    let resp =
+        trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), pong)
+            .await;
     assert!(resp.is_none(), "a pong is an answer, not a question");
 
     let after = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
@@ -284,4 +287,109 @@ fn owns_only_register_and_health_pong() {
     assert!(!trust_tasks_infra::owns(MSG_HEALTH_PING));
     assert!(!trust_tasks_infra::owns(MSG_SERVER_REGISTER_ACK));
     assert!(!trust_tasks_infra::owns(MSG_SYNC_UPDATE));
+}
+
+/// The registration that *enrols* the instance must itself be observed.
+///
+/// Recording inbound transport before the dispatch would find no instance to
+/// write onto, so the very message that created the server would go unrecorded
+/// and the card would read "unknown" until the first pong an interval later.
+#[tokio::test]
+async fn register_records_the_transport_it_arrived_on() {
+    let h = make_harness().await;
+    add_acl(&h.state, SERVER_DID, Role::Service).await;
+
+    let doc = build_request(
+        MSG_SERVER_REGISTER,
+        SERVER_DID,
+        CONTROL_DID,
+        register_body(true),
+    )
+    .expect("build");
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+        .await
+        .expect("ack");
+
+    let inst = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inst.last_inbound_transport, Some(ObservedTransport::Tsp));
+    assert!(inst.last_inbound_at.is_some());
+}
+
+/// A pong arriving over a different transport than the register updates the
+/// observation — this is a *last seen*, not a first-seen, value.
+#[tokio::test]
+async fn pong_updates_observed_inbound_transport() {
+    let h = make_harness().await;
+    add_acl(&h.state, SERVER_DID, Role::Service).await;
+
+    let reg = build_request(
+        MSG_SERVER_REGISTER,
+        SERVER_DID,
+        CONTROL_DID,
+        register_body(true),
+    )
+    .expect("build");
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), reg).await;
+
+    let pong = build_request(
+        MSG_HEALTH_PONG,
+        SERVER_DID,
+        CONTROL_DID,
+        json!({ "status": "ok" }),
+    )
+    .expect("build");
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), pong).await;
+
+    let inst = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inst.last_inbound_transport, Some(ObservedTransport::Tsp));
+}
+
+/// An unrecognised binding records nothing rather than guessing a transport.
+#[tokio::test]
+async fn unknown_binding_records_no_transport() {
+    let h = make_harness().await;
+    add_acl(&h.state, SERVER_DID, Role::Service).await;
+
+    let doc = build_request(
+        MSG_SERVER_REGISTER,
+        SERVER_DID,
+        CONTROL_DID,
+        register_body(true),
+    )
+    .expect("build");
+    trust_tasks_infra::dispatch(&h.state, SERVER_DID, None, doc)
+        .await
+        .expect("ack");
+
+    let inst = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inst.last_inbound_transport, None);
+}
+
+/// `ObservedTransport::from_binding_uri` maps each binding crate's own exported
+/// constant, so a new binding surfaces as `None` instead of being mis-attributed.
+#[test]
+fn binding_uris_map_to_their_transports() {
+    use did_hosting_common::server::trust_tasks::transport::TSP_BINDING_URI;
+
+    assert_eq!(
+        ObservedTransport::from_binding_uri(TSP_BINDING_URI),
+        Some(ObservedTransport::Tsp)
+    );
+    assert_eq!(
+        ObservedTransport::from_binding_uri(trust_tasks_didcomm::BINDING_URI),
+        Some(ObservedTransport::Didcomm)
+    );
+    assert_eq!(
+        ObservedTransport::from_binding_uri("https://example.com/binding/x"),
+        None
+    );
 }
