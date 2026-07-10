@@ -742,6 +742,10 @@ pub async fn seed_registry(state: &AppState) {
             advertised_services: None,
             services_checked_at: None,
             trust_task_capable: false,
+            last_inbound_transport: None,
+            last_inbound_at: None,
+            last_outbound_transport: None,
+            last_outbound_at: None,
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -972,6 +976,7 @@ pub async fn flush_stats_to_store(
 /// stops ponging and ages into `Unreachable` on the next sweep.
 async fn send_health_ping_trust_task(
     svc: &DIDCommService,
+    registry_ks: &KeyspaceHandle,
     control_did: &str,
     server_did: &str,
     inst: &registry::ServiceInstance,
@@ -993,12 +998,23 @@ async fn send_health_ping_trust_task(
     };
 
     match send_trust_task(svc, "control", control_did, server_did, &doc, did_resolver).await {
-        Ok(transport) => debug!(
-            instance_id = %inst.instance_id,
-            server_did,
-            ?transport,
-            "health ping sent as trust task"
-        ),
+        Ok(transport) => {
+            debug!(
+                instance_id = %inst.instance_id,
+                server_did,
+                ?transport,
+                "health ping sent as trust task"
+            );
+            // The transport that actually carried it — after any TSP->DIDComm
+            // fallback — not the one the DID document advertised.
+            registry::record_outbound_transport(
+                registry_ks,
+                &inst.instance_id,
+                transport.into(),
+                crate::auth::session::now_epoch(),
+            )
+            .await;
+        }
         Err(e) => debug!(
             instance_id = %inst.instance_id,
             server_did,
@@ -1038,7 +1054,15 @@ pub async fn run_health_checks(
             };
 
             if inst.trust_task_capable {
-                send_health_ping_trust_task(svc, ctrl_did, server_did, inst, did_resolver).await;
+                send_health_ping_trust_task(
+                    svc,
+                    registry_ks,
+                    ctrl_did,
+                    server_did,
+                    inst,
+                    did_resolver,
+                )
+                .await;
                 continue;
             }
 
@@ -1052,13 +1076,23 @@ pub async fn run_health_checks(
             .created_time(now)
             .finalize();
 
-            if let Err(e) = svc.send_message("control", msg, server_did).await {
-                debug!(
+            match svc.send_message("control", msg, server_did).await {
+                Ok(()) => {
+                    // A legacy ping is DIDComm by construction.
+                    registry::record_outbound_transport(
+                        registry_ks,
+                        &inst.instance_id,
+                        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
+                        now,
+                    )
+                    .await;
+                }
+                Err(e) => debug!(
                     instance_id = %inst.instance_id,
                     server_did,
                     error = %e,
                     "failed to send legacy health ping"
-                );
+                ),
             }
         }
     }

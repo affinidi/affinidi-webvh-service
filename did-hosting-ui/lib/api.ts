@@ -154,7 +154,23 @@ export interface ServiceInstance {
   advertisedServices?: string[];
   /** Epoch seconds of the last successful resolve of `advertisedServices`. */
   servicesCheckedAt?: number;
+  /** Whether this instance understands infrastructure trust tasks, so the
+   *  control plane may ping it over whichever transport its DID document
+   *  advertises. Older servers omit the flag and keep receiving legacy
+   *  DIDComm pings. */
+  trustTaskCapable?: boolean;
+  /** The transport that **actually carried** the last message in each
+   *  direction. Distinct from `advertisedServices`, which is only what the
+   *  peer says it can speak: a TSP-advertising server still reads `didcomm`
+   *  here if a TSP send fell back, or if it registered over DIDComm. */
+  lastInboundTransport?: ObservedTransport;
+  lastInboundAt?: number;
+  lastOutboundTransport?: ObservedTransport;
+  lastOutboundAt?: number;
 }
+
+/** A transport observed carrying real traffic. See `ServiceInstance`. */
+export type ObservedTransport = "tsp" | "didcomm" | "https";
 
 export interface LogMetadata {
   logEntryCount: number;
@@ -307,6 +323,11 @@ export interface ServiceInfo {
   /** See `ServiceInstance.advertisedServices`. */
   advertisedServices?: string[];
   servicesCheckedAt?: number;
+  /** See `ServiceInstance` — observed, not inferred. */
+  lastInboundTransport?: ObservedTransport;
+  lastInboundAt?: number;
+  lastOutboundTransport?: ObservedTransport;
+  lastOutboundAt?: number;
 }
 
 export interface ServiceStats {

@@ -1,7 +1,7 @@
 //! Service registry — tracks registered backend service instances.
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use did_hosting_common::server::didcomm_profile::resolve_service_types;
+use did_hosting_common::server::didcomm_profile::{ObservedTransport, resolve_service_types};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -120,6 +120,33 @@ pub struct ServiceInstance {
     /// That is the only path by which a TSP-only server is reachable at all.
     #[serde(default)]
     pub trust_task_capable: bool,
+
+    // ---- Observed link transport ----
+    //
+    // What actually moved, per direction — not what `advertised_services`
+    // says the peer *could* speak. The two disagree whenever a TSP send
+    // falls back to DIDComm, or a server registered before its document
+    // advertised a transport. Reporting the advertised value as the one in
+    // use would quietly lie to the operator, which is the whole reason
+    // these are recorded rather than inferred.
+    /// Transport the last inbound message from this instance arrived on
+    /// (registration, health pong). `None` until one arrives.
+    #[serde(default)]
+    pub last_inbound_transport: Option<ObservedTransport>,
+    /// Epoch seconds of that inbound message.
+    #[serde(default)]
+    pub last_inbound_at: Option<u64>,
+
+    /// Transport the last **health ping** to this instance actually went out
+    /// on. Scoped to the ping deliberately: it is the only outbound path that
+    /// runs on a timer, so it is the one whose observation stays fresh. The
+    /// outbox's sync/domain pushes also pick a transport per DID document, but
+    /// they fire only on mutations and would leave this stale for hours.
+    #[serde(default)]
+    pub last_outbound_transport: Option<ObservedTransport>,
+    /// Epoch seconds of that outbound ping.
+    #[serde(default)]
+    pub last_outbound_at: Option<u64>,
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -246,6 +273,54 @@ pub async fn refresh_advertised_services(
     instance.advertised_services = Some(services);
     instance.services_checked_at = Some(now);
     register_instance(registry_ks, &instance).await
+}
+
+/// Record the transport an inbound message from `sender_did` arrived on.
+///
+/// Looked up by DID rather than instance id, because the caller — a trust-task
+/// or DIDComm handler — knows only the transport-authenticated sender. A DID
+/// that maps to no registered instance is ignored: plenty of peers talk to the
+/// control plane without being servers.
+///
+/// Best-effort by design. This is observability; a failed write must never fail
+/// a registration or a health pong.
+pub async fn record_inbound_transport(
+    registry_ks: &KeyspaceHandle,
+    sender_did: &str,
+    transport: ObservedTransport,
+    now: u64,
+) {
+    let Ok(instances) = list_instances(registry_ks).await else {
+        return;
+    };
+    let Some(mut inst) = instances.into_iter().find(|i| i.did() == Some(sender_did)) else {
+        return;
+    };
+    inst.last_inbound_transport = Some(transport);
+    inst.last_inbound_at = Some(now);
+    if let Err(e) = register_instance(registry_ks, &inst).await {
+        debug!(did = sender_did, error = %e, "failed to record inbound transport");
+    }
+}
+
+/// Record the transport an outbound health ping to `instance_id` went out on.
+///
+/// Takes the transport that *actually carried* the message — after any
+/// TSP→DIDComm fallback — not the one the DID document advertised.
+pub async fn record_outbound_transport(
+    registry_ks: &KeyspaceHandle,
+    instance_id: &str,
+    transport: ObservedTransport,
+    now: u64,
+) {
+    let Ok(Some(mut inst)) = get_instance(registry_ks, instance_id).await else {
+        return;
+    };
+    inst.last_outbound_transport = Some(transport);
+    inst.last_outbound_at = Some(now);
+    if let Err(e) = register_instance(registry_ks, &inst).await {
+        debug!(instance_id, error = %e, "failed to record outbound transport");
+    }
 }
 
 /// Update the status and health check timestamp of an instance.
@@ -385,6 +460,10 @@ mod tests {
             advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
             services_checked_at: Some(1234),
             trust_task_capable: true,
+            last_inbound_transport: Some(ObservedTransport::Tsp),
+            last_inbound_at: Some(1111),
+            last_outbound_transport: Some(ObservedTransport::Didcomm),
+            last_outbound_at: Some(2222),
         };
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();
@@ -392,6 +471,14 @@ mod tests {
         assert_eq!(parsed.served_domains, original.served_domains);
         assert_eq!(parsed.advertised_services, original.advertised_services);
         assert_eq!(parsed.services_checked_at, original.services_checked_at);
+        assert_eq!(
+            parsed.last_inbound_transport,
+            original.last_inbound_transport
+        );
+        assert_eq!(
+            parsed.last_outbound_transport,
+            original.last_outbound_transport
+        );
         assert_eq!(parsed.protocol_version, original.protocol_version);
     }
 

@@ -13,6 +13,7 @@ import {
   SERVICE_TYPE_DIDCOMM,
   SERVICE_TYPE_TSP,
 } from "./ServiceBadges";
+import { ControlLink } from "./ControlLink";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { ServiceOverview, ServiceInfo } from "../lib/api";
 
@@ -171,6 +172,14 @@ function ServiceCard({ service }: { service: ServiceInfo }) {
       {/* What this instance's DID document advertises. Cached on the
           registry record; refreshed at register + health check. */}
       <ServiceBadges services={service.advertisedServices} />
+
+      {/* And what actually carried traffic, per direction. */}
+      <ControlLink
+        lastInboundTransport={service.lastInboundTransport}
+        lastInboundAt={service.lastInboundAt}
+        lastOutboundTransport={service.lastOutboundTransport}
+        lastOutboundAt={service.lastOutboundAt}
+      />
 
       <View style={styles.serviceMetaRow}>
         <Text style={styles.metaText}>

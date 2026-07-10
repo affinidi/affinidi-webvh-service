@@ -49,7 +49,9 @@ use tracing::warn;
 use did_hosting_common::didcomm_types::{
     MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK,
 };
+use did_hosting_common::server::didcomm_profile::ObservedTransport;
 
+use crate::registry;
 use crate::server::AppState;
 
 /// Does this Type URI belong to the infrastructure ops handled here?
@@ -65,7 +67,36 @@ pub fn owns(type_uri: &str) -> bool {
 ///
 /// Returns the serialised response document, or `None` when the op is terminal
 /// (a health pong is an answer, not a question).
+///
+/// `via` is the transport the document actually arrived on, derived from the
+/// caller's `TransportHandler::binding_uri()`. `None` when the binding is one
+/// we don't recognise — recorded as "unknown" rather than guessed. The dispatch
+/// itself stays transport-agnostic; this is observability only.
 pub async fn dispatch(
+    state: &AppState,
+    sender: &str,
+    via: Option<ObservedTransport>,
+    doc: trust_tasks_rs::TrustTask<Value>,
+) -> Option<Value> {
+    let response = dispatch_inner(state, sender, doc).await;
+
+    // *After* the dispatch, deliberately. A registration creates the instance,
+    // so recording beforehand would find nothing to write to and the very
+    // message that enrolled the server would go unobserved.
+    if let Some(via) = via {
+        registry::record_inbound_transport(
+            &state.registry_ks,
+            sender,
+            via,
+            crate::auth::session::now_epoch(),
+        )
+        .await;
+    }
+
+    response
+}
+
+async fn dispatch_inner(
     state: &AppState,
     sender: &str,
     doc: trust_tasks_rs::TrustTask<Value>,

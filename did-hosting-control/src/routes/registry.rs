@@ -85,6 +85,11 @@ pub async fn register(
         services_checked_at: None,
         // Unknown until the instance registers over DIDComm/TSP and declares it.
         trust_task_capable: false,
+        // Nothing has moved on this link yet.
+        last_inbound_transport: None,
+        last_inbound_at: None,
+        last_outbound_transport: None,
+        last_outbound_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -377,6 +382,10 @@ pub async fn register_service(
         advertised_services: None,
         services_checked_at: None,
         trust_task_capable: false,
+        last_inbound_transport: None,
+        last_inbound_at: None,
+        last_outbound_transport: None,
+        last_outbound_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;

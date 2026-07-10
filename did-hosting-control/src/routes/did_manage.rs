@@ -877,6 +877,20 @@ pub struct ServiceInfo {
     /// Epoch seconds of the last successful resolve of the above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services_checked_at: Option<u64>,
+    /// Transport the last inbound message from this instance arrived on, and
+    /// the last health ping to it went out on. **Observed**, not inferred from
+    /// `advertised_services` — a TSP-advertising peer still reads `didcomm`
+    /// here if that is what actually carried the traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_inbound_transport:
+        Option<did_hosting_common::server::didcomm_profile::ObservedTransport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_inbound_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outbound_transport:
+        Option<did_hosting_common::server::didcomm_profile::ObservedTransport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outbound_at: Option<u64>,
     pub last_health_check: Option<u64>,
     pub registered_at: u64,
     pub did: Option<String>,
@@ -960,6 +974,10 @@ pub async fn get_services_overview(
             stats,
             advertised_services: inst.advertised_services.clone(),
             services_checked_at: inst.services_checked_at,
+            last_inbound_transport: inst.last_inbound_transport,
+            last_inbound_at: inst.last_inbound_at,
+            last_outbound_transport: inst.last_outbound_transport,
+            last_outbound_at: inst.last_outbound_at,
         });
     }
 
