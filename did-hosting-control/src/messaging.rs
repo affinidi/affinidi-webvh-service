@@ -982,21 +982,21 @@ async fn handle_stats_sync(
 // Health pong handler (server → control plane)
 // ---------------------------------------------------------------------------
 
-async fn handle_health_pong(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+/// Transport-agnostic core of health-pong handling.
+///
+/// Reads only `(sender, body)`, so the same code marks an instance Active
+/// whether the pong arrived as a legacy `MSG_HEALTH_PONG` DIDComm message or
+/// as a `.../server/health/0.1#response` trust task over DIDComm or TSP.
+///
+/// A pong is terminal: it never produces a reply.
+pub(crate) async fn do_health_pong(state: &AppState, sender: &str, body: &Value) {
     use crate::registry::{self, ServiceStatus};
 
-    let sender = require_sender(&ctx)?;
-    let status = message
-        .body
+    let status = body
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let version = message
-        .body
+    let version = body
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
@@ -1016,7 +1016,17 @@ async fn handle_health_pong(
     {
         warn!(instance_id, error = %e, "failed to update instance status from health pong");
     }
+}
 
+/// Legacy `MSG_HEALTH_PONG` DIDComm route. Kept so an older server, which
+/// replies to a legacy ping with a legacy pong, still marks itself Active.
+async fn handle_health_pong(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    do_health_pong(&state, sender, &message.body).await;
     Ok(None)
 }
 
@@ -1024,27 +1034,44 @@ async fn handle_health_pong(
 // Server registration handler
 // ---------------------------------------------------------------------------
 
-async fn handle_server_register(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+/// A rejection the registration core can report, rendered differently by each
+/// transport: the legacy DIDComm route packs it into an `MSG_PROBLEM_REPORT`
+/// message; the trust-task route turns it into a framework `ErrorResponse`.
+pub(crate) struct RegisterRejection {
+    pub code: &'static str,
+    pub comment: String,
+}
+
+impl RegisterRejection {
+    fn new(code: &'static str, comment: impl Into<String>) -> Self {
+        Self {
+            code,
+            comment: comment.into(),
+        }
+    }
+}
+
+/// Transport-agnostic core of server registration.
+///
+/// Reads only `(sender, body)` — no `HandlerContext`, no DIDComm `Message` —
+/// so the same logic serves the legacy `MSG_SERVER_REGISTER` DIDComm route and
+/// the `.../server/register/0.1` trust task arriving over DIDComm **or** TSP.
+/// Returns the ack body on success.
+pub(crate) async fn do_server_register(
+    state: &AppState,
+    sender: &str,
+    body: &Value,
+) -> Result<Value, RegisterRejection> {
     use crate::acl::check_acl;
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
-
-    let sender = require_sender(&ctx)?;
-    info!(
-        sender = sender,
-        "inbound DIDComm: server registration request"
-    );
 
     // Require pre-approved ACL entry with the Service role — matches REST
     // `/api/control/register-service` which is gated on ServiceAuth. An
     // Owner-role DID must not be able to register as a server: registration
     // triggers `sync_all_dids_to_server`, which would push every tenant's
-    // DID log + witness content to the caller's DIDComm inbox and add them
-    // to the active-server registry so future `notify_servers_did` updates
-    // also reach them.
+    // DID log + witness content to the caller's inbox and add them to the
+    // active-server registry so future `notify_servers_did` updates also
+    // reach them.
     let role = match check_acl(&state.acl_ks, sender).await {
         Ok(crate::acl::Role::Service) => crate::acl::Role::Service,
         Ok(other) => {
@@ -1053,15 +1080,9 @@ async fn handle_server_register(
                 role = %other,
                 "server registration rejected: Service role required"
             );
-            return Ok(Some(
-                DIDCommResponse::new(
-                    MSG_PROBLEM_REPORT.to_string(),
-                    json!({
-                        "code": "e.p.registration.unauthorized",
-                        "comment": "service role required to register as a server"
-                    }),
-                )
-                .thid(message.id.clone()),
+            return Err(RegisterRejection::new(
+                "e.p.registration.unauthorized",
+                "service role required to register as a server",
             ));
         }
         Err(_) => {
@@ -1069,21 +1090,14 @@ async fn handle_server_register(
                 did = sender,
                 "server registration rejected: DID not in ACL (requires pre-approval)"
             );
-            return Ok(Some(
-                DIDCommResponse::new(
-                    MSG_PROBLEM_REPORT.to_string(),
-                    json!({
-                        "code": "e.p.registration.unauthorized",
-                        "comment": "server DID must be pre-approved in the ACL before registering"
-                    }),
-                )
-                .thid(message.id.clone()),
+            return Err(RegisterRejection::new(
+                "e.p.registration.unauthorized",
+                "server DID must be pre-approved in the ACL before registering",
             ));
         }
     };
 
-    let public_url = message
-        .body
+    let public_url = body
         .get("public_url")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
@@ -1100,30 +1114,19 @@ async fn handle_server_register(
         warn!(
             did = sender,
             requested = public_url,
-            "DIDComm server registration rejected: URL host not in registry.url_allowlist",
+            "server registration rejected: URL host not in registry.url_allowlist",
         );
-        return Ok(Some(
-            DIDCommResponse::new(
-                MSG_PROBLEM_REPORT.to_string(),
-                json!({
-                    "code": "e.p.registration.unauthorized",
-                    "comment": e.user_message(),
-                }),
-            )
-            .thid(message.id.clone()),
+        return Err(RegisterRejection::new(
+            "e.p.registration.unauthorized",
+            e.user_message(),
         ));
     }
 
-    let label = message
-        .body
-        .get("label")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let label = body.get("label").and_then(|v| v.as_str()).map(String::from);
 
     // T27: parse capability declaration. Backwards-compat: pre-T27
     // servers don't send these fields; default to webvh-only.
-    let enabled_methods: Vec<String> = message
-        .body
+    let enabled_methods: Vec<String> = body
         .get("enabled_methods")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -1132,8 +1135,7 @@ async fn handle_server_register(
                 .collect()
         })
         .unwrap_or_else(|| vec!["webvh".to_string()]);
-    let claimed_served_domains: Vec<String> = message
-        .body
+    let claimed_served_domains: Vec<String> = body
         .get("served_domains")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -1182,12 +1184,20 @@ async fn handle_server_register(
         }
         keep
     };
-    let protocol_version = message
-        .body
+    let protocol_version = body
         .get("protocol_version")
         .and_then(|v| v.as_str())
         .unwrap_or("1.0")
         .to_string();
+
+    // Self-asserted: only a server that ships the trust-task dispatcher sends
+    // this. Absent (older fleet) → false → the health loop keeps sending the
+    // legacy `MSG_HEALTH_PING`, so upgrading the control plane first never
+    // strands a server as Unreachable.
+    let trust_task_capable = body
+        .get("trust_task_capable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Use the sender DID as a stable instance ID (one registration per DID)
     let instance_id = sender.replace(':', "_");
@@ -1217,19 +1227,14 @@ async fn handle_server_register(
             .as_ref()
             .and_then(|p| p.advertised_services.clone()),
         services_checked_at: previous.as_ref().and_then(|p| p.services_checked_at),
+        trust_task_capable,
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
         warn!(did = sender, error = %e, "server registration failed");
-        return Ok(Some(
-            DIDCommResponse::new(
-                MSG_PROBLEM_REPORT.to_string(),
-                json!({
-                    "code": "e.p.registration.internal-error",
-                    "comment": e.to_string()
-                }),
-            )
-            .thid(message.id.clone()),
+        return Err(RegisterRejection::new(
+            "e.p.registration.internal-error",
+            e.to_string(),
         ));
     }
 
@@ -1238,7 +1243,7 @@ async fn handle_server_register(
         instance_id = %instance_id,
         public_url = public_url,
         role = %role,
-        "server registered via DIDComm"
+        "server registered"
     );
 
     // Cache what the registering server's DID document advertises, so the
@@ -1260,20 +1265,39 @@ async fn handle_server_register(
     }
 
     // Push all existing DIDs to the newly registered server
-    server_push::sync_all_dids_to_server(&state, sender.to_string());
+    server_push::sync_all_dids_to_server(state, sender.to_string());
 
-    Ok(Some(
-        DIDCommResponse::new(
-            MSG_SERVER_REGISTER_ACK.to_string(),
-            json!({
-                "instance_id": instance_id,
-                "status": "registered",
-            }),
-        )
-        .thid(message.id.clone()),
-    ))
+    Ok(json!({
+        "instance_id": instance_id,
+        "status": "registered",
+    }))
 }
 
+/// Legacy `MSG_SERVER_REGISTER` DIDComm route. Kept alongside the trust-task
+/// path so an older server keeps registering against a newer control plane.
+async fn handle_server_register(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    info!(
+        sender = sender,
+        "inbound DIDComm: server registration request (legacy MSG_*)"
+    );
+
+    let (typ, body) = match do_server_register(&state, sender, &message.body).await {
+        Ok(ack) => (MSG_SERVER_REGISTER_ACK.to_string(), ack),
+        Err(rej) => (
+            MSG_PROBLEM_REPORT.to_string(),
+            json!({ "code": rej.code, "comment": rej.comment }),
+        ),
+    };
+
+    Ok(Some(
+        DIDCommResponse::new(typ, body).thid(message.id.clone()),
+    ))
+}
 async fn handle_fallback(
     ctx: HandlerContext,
     message: Message,
@@ -1506,6 +1530,15 @@ pub(crate) async fn dispatch_trust_task_doc(
             }
             DispatchOutcome::Suppressed => None,
         });
+    }
+
+    // Control↔server infrastructure ops (server registration, health pong).
+    // Must be checked *before* the `bridge_did_management` fallthrough below,
+    // which would otherwise hand them to `dispatch_did_op` — a table of DID
+    // operations that has never heard of them — and answer with a bogus
+    // "unknown op" problem report.
+    if crate::trust_tasks_infra::owns(&type_uri) {
+        return Ok(crate::trust_tasks_infra::dispatch(state, sender, doc).await);
     }
 
     let framework_owns = build_dispatcher()

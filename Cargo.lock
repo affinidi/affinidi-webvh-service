@@ -2931,6 +2931,8 @@ version = "0.7.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-didcomm-service",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
@@ -3146,6 +3148,8 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "trust-tasks-didcomm",
+ "trust-tasks-rs",
  "utoipa",
  "uuid",
  "vta-sdk",

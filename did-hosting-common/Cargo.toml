@@ -37,6 +37,7 @@ server-core = [
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
     "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
     "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
+    "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -136,6 +137,15 @@ trust-tasks-proof = { workspace = true, optional = true }
 # (DataIntegrityProof / VerifyOptions / resolver trait). Same major.minor as
 # `trust-tasks-proof`'s `affinidi` feature → single copy in the lock.
 affinidi-data-integrity = { workspace = true, optional = true }
+
+# Needed by `server::trust_tasks::send` — the outbound counterpart to the
+# inbound dispatcher. It owns the "which transport does this peer speak"
+# decision (`didcomm_profile::resolve_transport`, already here) and therefore
+# has to be able to actually put bytes on either wire. Both binaries already
+# depend on these crates; hosting the helper here is what stops the control
+# plane and the server growing two divergent copies of the same rule.
+affinidi-messaging-didcomm-service = { workspace = true, optional = true }
+affinidi-messaging-didcomm = { workspace = true, optional = true }
 
 # store backends (optional)
 fjall = { workspace = true, optional = true }

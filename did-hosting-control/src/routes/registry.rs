@@ -83,6 +83,8 @@ pub async fn register(
         // MSG_SERVER_REGISTER supplies the DID and fills these in.
         advertised_services: None,
         services_checked_at: None,
+        // Unknown until the instance registers over DIDComm/TSP and declares it.
+        trust_task_capable: false,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -374,6 +376,7 @@ pub async fn register_service(
         // Filled by the resolve below, once the record exists to write onto.
         advertised_services: None,
         services_checked_at: None,
+        trust_task_capable: false,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;

@@ -56,6 +56,13 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
         .route(MSG_SERVER_REGISTER_ACK, handler_fn(handle_register_ack))?
         .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
+        // Trust-task documents carried over DIDComm. The same documents arrive
+        // over TSP as raw frames (`crate::tsp`), and both land in
+        // `trust_tasks_infra::dispatch` — that is the transport-agnostic swap.
+        .route(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            handler_fn(handle_trust_tasks_envelope),
+        )?
         .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
@@ -143,45 +150,73 @@ async fn filtered_request_logging(
 // Registration ack
 // ---------------------------------------------------------------------------
 
+/// Legacy `MSG_SERVER_REGISTER_ACK` DIDComm route. Delegates to the same core
+/// the trust-task dispatcher uses.
 async fn handle_register_ack(
     _ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let instance_id = message
-        .body
-        .get("instance_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    info!(instance_id, "registration acknowledged by control plane");
+    crate::trust_tasks_infra::do_register_ack(&message.body);
     Ok(None)
+}
+
+/// Inbound trust-task document carried in a DIDComm envelope.
+///
+/// The reply is returned rather than sent, so the messaging framework routes it
+/// back over the same connection — a ping that arrived here is ponged here.
+async fn handle_trust_tasks_envelope(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+
+    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                sender,
+                error = %e,
+                "trust-tasks envelope: inner body did not parse as TrustTask<Value>"
+            );
+            return Ok(None);
+        }
+    };
+
+    let type_uri = doc.type_uri.to_string();
+    if !crate::trust_tasks_infra::owns(&type_uri) {
+        warn!(
+            sender,
+            type_uri = %type_uri,
+            "trust-tasks envelope: server does not implement this type"
+        );
+        return Ok(None);
+    }
+
+    match crate::trust_tasks_infra::dispatch(&state, sender, doc).await {
+        Some(resp) => Ok(Some(
+            DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), resp)
+                .thid(message.id.clone()),
+        )),
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Health ping (control plane → server → control plane)
 // ---------------------------------------------------------------------------
 
+/// Legacy `MSG_HEALTH_PING` DIDComm route. Kept so an older control plane —
+/// which has no trust-task ping — still gets a pong. Delegates to the same core
+/// the trust-task dispatcher uses, so the two answers can never diverge.
 async fn handle_health_ping(
     _ctx: HandlerContext,
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let did_count = state
-        .dids_ks
-        .prefix_iter_raw("did:")
-        .await
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
-
+    let pong = crate::trust_tasks_infra::do_health_ping(&state).await;
     Ok(Some(
-        DIDCommResponse::new(
-            MSG_HEALTH_PONG.to_string(),
-            json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-                "did_count": did_count,
-            }),
-        )
-        .thid(message.id.clone()),
+        DIDCommResponse::new(MSG_HEALTH_PONG.to_string(), pong).thid(message.id.clone()),
     ))
 }
 

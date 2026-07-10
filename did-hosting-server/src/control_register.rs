@@ -20,7 +20,11 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
+use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_transport};
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
+use did_hosting_common::server::trust_tasks::send::{
+    Retry, build_request, send_trust_task_with_retry,
+};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -146,33 +150,81 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
-    let msg = Message::build(
-        uuid::Uuid::new_v4().to_string(),
-        MSG_SERVER_REGISTER.to_string(),
-        json!({
-            "public_url": public_url,
-            "label": "did-hosting-server",
-            "enabled_methods": enabled_methods,
-            "served_domains": served_domains,
-            "protocol_version": "1.0",
-        }),
-    )
-    .from(server_did.clone())
-    .to(control_did.clone())
-    .created_time(crate::auth::session::now_epoch())
-    .finalize();
+    let body = json!({
+        "public_url": public_url,
+        "label": "did-hosting-server",
+        "enabled_methods": enabled_methods,
+        "served_domains": served_domains,
+        "protocol_version": "1.0",
+        // Tells the control plane it may send infrastructure ops (health ping)
+        // as trust tasks, and therefore over whichever transport this server's
+        // DID document advertises. An older control plane ignores the field.
+        "trust_task_capable": true,
+    });
 
-    // Send with built-in retry (waits for reconnection between attempts)
-    match didcomm_svc
-        .send_message_with_retry(
-            "server",
-            msg,
-            &control_did,
-            10,
-            std::time::Duration::from_secs(5),
+    // Framing follows the transport, and for one hard reason: a **TSP-only**
+    // server has no DIDComm wire on which to send the legacy
+    // `MSG_SERVER_REGISTER` message, so its only way into the registry is a
+    // trust task over TSP. Meanwhile a DIDComm-reachable server keeps sending
+    // the legacy message, because an *older* control plane has no
+    // `trust_tasks_infra` arm and would bounce a register trust task into
+    // `bridge_did_management` — which has never heard of `server/register` —
+    // leaving the server silently unregistered.
+    //
+    // Once every control plane in a fleet understands the trust task, this
+    // branch collapses to `send_trust_task` unconditionally. Discovery
+    // (`trust-task-discovery/0.1`) is the principled way to detect that; it is
+    // deliberately not attempted here.
+    let control_speaks_tsp = matches!(
+        resolve_transport(&control_did, state.did_resolver.as_ref()).await,
+        Some((PeerTransport::Tsp, _))
+    );
+
+    let outcome = if control_speaks_tsp {
+        match build_request(MSG_SERVER_REGISTER, &server_did, &control_did, body) {
+            Ok(doc) => send_trust_task_with_retry(
+                didcomm_svc,
+                "server",
+                &server_did,
+                &control_did,
+                &doc,
+                state.did_resolver.as_ref(),
+                Retry {
+                    attempts: 10,
+                    delay: std::time::Duration::from_secs(5),
+                },
+            )
+            .await
+            .map(|transport| {
+                info!(?transport, "server registration sent as trust task");
+            }),
+            Err(e) => Err(e),
+        }
+    } else {
+        let msg = Message::build(
+            uuid::Uuid::new_v4().to_string(),
+            MSG_SERVER_REGISTER.to_string(),
+            body,
         )
-        .await
-    {
+        .from(server_did.clone())
+        .to(control_did.clone())
+        .created_time(crate::auth::session::now_epoch())
+        .finalize();
+
+        // Send with built-in retry (waits for reconnection between attempts)
+        didcomm_svc
+            .send_message_with_retry(
+                "server",
+                msg,
+                &control_did,
+                10,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    };
+
+    match outcome {
         Ok(()) => {
             REGISTERED.store(true, Ordering::Relaxed);
             info!(control_did = %control_did, "server registered with control plane");

@@ -33,5 +33,6 @@ pub mod setup;
 pub mod setup_recipe;
 pub mod stats;
 pub mod store;
+pub mod trust_tasks_infra;
 pub mod tsp;
 pub mod watcher_push;

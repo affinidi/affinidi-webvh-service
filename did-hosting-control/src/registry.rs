@@ -105,6 +105,21 @@ pub struct ServiceInstance {
     /// `advertised_services` means we have never had a successful resolve.
     #[serde(default)]
     pub services_checked_at: Option<u64>,
+
+    /// Whether this instance understands infrastructure **trust tasks**
+    /// (`.../server/health/0.1` and friends) as opposed to only the legacy
+    /// `MSG_*` DIDComm messages.
+    ///
+    /// Self-asserted by the server in its registration body. `false` for every
+    /// pre-existing record and for any server that doesn't send the flag, which
+    /// is exactly the older fleet — so the control plane keeps pinging them the
+    /// legacy way and a rolling upgrade never drops a node to `Unreachable`.
+    ///
+    /// When `true`, the health loop sends the ping as a trust task and lets
+    /// `send_trust_task` choose TSP or DIDComm from the server's DID document.
+    /// That is the only path by which a TSP-only server is reachable at all.
+    #[serde(default)]
+    pub trust_task_capable: bool,
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -369,6 +384,7 @@ mod tests {
             protocol_version: "1.1".into(),
             advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
             services_checked_at: Some(1234),
+            trust_task_capable: true,
         };
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();

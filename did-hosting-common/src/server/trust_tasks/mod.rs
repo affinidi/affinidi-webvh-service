@@ -33,6 +33,7 @@
 pub mod entry;
 pub mod ext;
 pub mod handlers;
+pub mod send;
 pub mod transport;
 pub mod verifier;
 

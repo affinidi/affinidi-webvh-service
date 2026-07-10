@@ -267,6 +267,7 @@ async fn services_overview_exposes_instance_advertised_services() {
         protocol_version: "1.0".into(),
         advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
         services_checked_at: Some(now_epoch()),
+        trust_task_capable: false,
     };
     registry::register_instance(&h.state.registry_ks, &instance)
         .await

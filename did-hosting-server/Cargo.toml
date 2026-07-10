@@ -63,6 +63,12 @@ utoipa = { version = "5", optional = true }
 vti-common = { version = "0.11", default-features = false }
 async-trait = "0.1"
 affinidi-tdk = { workspace = true }
+# Trust Tasks: the server consumes infrastructure trust tasks (health ping,
+# register ack) so those ops are reachable over TSP as well as DIDComm.
+# `trust-tasks-didcomm` is needed only for `ENVELOPE_TYPE`, the DIDComm message
+# type that carries a trust-task document.
+trust-tasks-rs = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }

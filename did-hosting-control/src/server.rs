@@ -741,6 +741,7 @@ pub async fn seed_registry(state: &AppState) {
             // re-registers over DIDComm and records one.
             advertised_services: None,
             services_checked_at: None,
+            trust_task_capable: false,
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -966,8 +967,49 @@ pub async fn flush_stats_to_store(
     Ok(())
 }
 
-/// Send DIDComm health pings to all registered instances and evaluate
-/// staleness-based status from the last received pong timestamp.
+/// Ping one trust-task-capable instance, letting its DID document choose the
+/// transport. Failures are logged, never fatal — an unreachable server simply
+/// stops ponging and ages into `Unreachable` on the next sweep.
+async fn send_health_ping_trust_task(
+    svc: &DIDCommService,
+    control_did: &str,
+    server_did: &str,
+    inst: &registry::ServiceInstance,
+    did_resolver: Option<&DIDCacheClient>,
+) {
+    use did_hosting_common::server::trust_tasks::send::{build_request, send_trust_task};
+
+    let doc = match build_request(
+        did_hosting_common::didcomm_types::MSG_HEALTH_PING,
+        control_did,
+        server_did,
+        serde_json::json!({}),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "health ping: MSG_HEALTH_PING is not a valid Type URI");
+            return;
+        }
+    };
+
+    match send_trust_task(svc, "control", control_did, server_did, &doc, did_resolver).await {
+        Ok(transport) => debug!(
+            instance_id = %inst.instance_id,
+            server_did,
+            ?transport,
+            "health ping sent as trust task"
+        ),
+        Err(e) => debug!(
+            instance_id = %inst.instance_id,
+            server_did,
+            error = %e,
+            "failed to send health ping (trust task)"
+        ),
+    }
+}
+
+/// Send health pings to all registered instances and evaluate staleness-based
+/// status from the last received pong timestamp.
 pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     didcomm: &std::sync::OnceLock<DIDCommService>,
@@ -978,13 +1020,27 @@ pub async fn run_health_checks(
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
-    // Send health pings via DIDComm (fire-and-forget — pong handler updates status)
+    // Send health pings (fire-and-forget — the pong handler updates status).
+    //
+    // Two framings, chosen per instance:
+    //
+    // - `trust_task_capable` servers get a `.../server/health/0.1` trust task,
+    //   and `send_trust_task` picks TSP or DIDComm from the *server's own DID
+    //   document*. This is the only way a TSP-only server is ever pinged.
+    // - Everything else gets the legacy `MSG_HEALTH_PING` DIDComm message. An
+    //   older server has no trust-task dispatcher, so a trust task would go
+    //   unrouted and it would decay to Unreachable on a control-plane-only
+    //   upgrade.
     if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
         for inst in &instances {
-            let server_did = match inst.metadata.get("did").and_then(|v| v.as_str()) {
-                Some(did) => did,
-                None => continue,
+            let Some(server_did) = inst.did() else {
+                continue;
             };
+
+            if inst.trust_task_capable {
+                send_health_ping_trust_task(svc, ctrl_did, server_did, inst, did_resolver).await;
+                continue;
+            }
 
             let msg = affinidi_messaging_didcomm::Message::build(
                 uuid::Uuid::new_v4().to_string(),
@@ -1001,7 +1057,7 @@ pub async fn run_health_checks(
                     instance_id = %inst.instance_id,
                     server_did,
                     error = %e,
-                    "failed to send health ping"
+                    "failed to send legacy health ping"
                 );
             }
         }

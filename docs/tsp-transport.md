@@ -124,6 +124,75 @@ An HTTP-only node — no mediator — advertises `WebVHHosting` alone and shows
 a single `Hosting` badge. Absence of `TSP` and `DIDComm` there is the
 correct reading: that node is reachable over HTTP only.
 
+## Control ↔ server infrastructure ops
+
+Server registration and health are **trust tasks**, so the binding is chosen
+from the peer's DID document rather than hard-coded.
+
+The `MSG_*` constants in `didcomm_types` are already canonical Trust-Task Type
+URIs, with the reply being the `#response` fragment of the request:
+
+```text
+MSG_SERVER_REGISTER       …/spec/did-management/server/register/0.1
+MSG_SERVER_REGISTER_ACK   …/spec/did-management/server/register/0.1#response
+MSG_HEALTH_PING           …/spec/did-management/server/health/0.1
+MSG_HEALTH_PONG           …/spec/did-management/server/health/0.1#response
+```
+
+They are reused verbatim as document Type URIs, so an op has **one identity** on
+every wire: as a DIDComm `typ`, inside a trust-task envelope, or as a raw TSP
+frame. `TrustTask::respond_with` derives the reply URI instead of restating it.
+
+> The unused `TASK_SERVER_HEALTH_PING_1_0` / `_PONG_1_0` constants in
+> `did_hosting_tasks` are **not** these. They sit on a `/did-hosting/` authority
+> with no `/spec/` segment, so they do not parse as Type URIs at all, and they
+> model the response as a separate URI rather than a fragment. They are
+> route-header decorators for the HTTPS surface. Do not promote them into the
+> document layer.
+
+Outbound goes through `trust_tasks::send::send_trust_task`, the one place that
+answers "how do I reach this peer": TSP when the peer advertises `TSPTransport`
+(the document's JSON, sealed), otherwise the document inside a
+`trust_tasks_didcomm::ENVELOPE_TYPE` DIDComm message. A TSP send that fails falls
+back to DIDComm, and the function returns the transport that *actually* carried
+the document. Inbound, both shapes converge on `trust_tasks_infra::dispatch` —
+one on the control plane, its mirror on the server. Replies are *returned*, not
+sent, so the framework routes them back over the arriving connection: a ping
+delivered over TSP is ponged over TSP, with no second resolution.
+
+This is what makes a **TSP-only server** work. Before it, the server had no
+trust-task dispatcher at all, registration and health lived only on the DIDComm
+router, and a node with `TSPTransport` and DIDComm disabled could never register
+or pong — it sat in the dashboard as `Unreachable` forever.
+
+### Two compatibility rules that look like warts
+
+**The server's TSP handler sniffs the payload.** A trust-task document is tried
+first, then a serialised DIDComm `Message` (the shape the control plane's outbox
+has always used for sync/domain pushes over TSP). The two are unambiguous, but
+not for the obvious reason — a `Message` also has top-level `id` and `type`, and
+its `type` is itself a canonical Type URI. What separates them is `payload`,
+which `TrustTask` requires and `Message` lacks. `didcomm_message_never_parses_as_a_trust_task`
+pins that; were it to stop holding, the `owns()` gate would silently swallow
+every sync push delivered over TSP.
+
+**Registration's framing follows its transport.** A TSP-only server has no
+DIDComm wire on which to send the legacy `MSG_SERVER_REGISTER`, so over TSP it
+registers as a trust task. A DIDComm-reachable server keeps sending the legacy
+message, because an *older* control plane has no `trust_tasks_infra` arm and
+would route a register trust task into `bridge_did_management` — which has never
+heard of `server/register` — leaving the server silently unregistered. Once every
+control plane in a fleet understands the task, this collapses to
+`send_trust_task` unconditionally; `trust-task-discovery/0.1` is the principled
+way to detect that, and is deliberately not attempted yet.
+
+Servers declare `trust_task_capable: true` in their registration body. The
+control plane records it on `ServiceInstance` and only then sends trust-task
+pings; everything else keeps receiving `MSG_HEALTH_PING`. Absent flag → `false`,
+so upgrading the control plane first never strands a server. Both legacy `MSG_*`
+routes stay registered on both sides and delegate to the same cores as the
+trust-task dispatchers, so the two framings cannot drift.
+
 ## Unified dispatch
 
 Both TSP and the DIDComm trust-task envelope route inbound
