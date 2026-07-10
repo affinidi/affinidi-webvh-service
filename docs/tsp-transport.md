@@ -105,6 +105,20 @@ nothing in `build_did_document`, emits a VTA service type. "VTA" names a
 provisioning mode, not a service. The `#vta-didcomm` service *id* has type
 `DIDCommMessaging` and so renders as the DIDComm badge.
 
+The spec-implied `#whois` (`LinkedVerifiablePresentation`) and `#files`
+(`relativeRef`) services are excluded. A conforming resolver synthesises
+both into every document they're absent from (`didwebvh-rs`'s
+`resolve::implicit::update_implicit_services`), so they appear on 100% of
+*resolved* webvh DIDs and on none of the stored `did.jsonl` logs. Counting
+them would put a permanent, contentless `Other` badge on every server while
+the DID list showed none — same DID, different badges. Both read paths now
+skip them, keyed on the `id` fragment, so a service an operator declares
+under their own fragment still earns its badge.
+
+An HTTP-only node — no mediator — advertises `WebVHHosting` alone and shows
+a single `Hosting` badge. Absence of `TSP` and `DIDComm` there is the
+correct reading: that node is reachable over HTTP only.
+
 ## Unified dispatch
 
 Both TSP and the DIDComm trust-task envelope route inbound

@@ -159,6 +159,13 @@ pub enum PeerTransport {
 /// already hold. Used to populate the registry's per-instance badge cache:
 /// the registry stores only a DID string, so the document has to be fetched.
 ///
+/// Skips the `#whois` / `#files` services a conforming did:webvh resolver
+/// synthesises into every document — see
+/// [`crate::did::is_implicit_webvh_service`]. They appear on 100% of resolved
+/// webvh DIDs, are absent from the stored `did.jsonl`, and carry no operator
+/// intent; reporting them would put a permanent, meaningless `Other` badge on
+/// every server while the DID list (which reads the log) showed none.
+///
 /// Returns `None` when the DID cannot be resolved — distinct from
 /// `Some(vec![])`, which means it resolved and advertises no services.
 /// Callers cache the distinction; see `ServiceInstance::advertised_services`.
@@ -190,10 +197,18 @@ pub async fn resolve_service_types(
     };
 
     // Flatten the resolved document's typed `service` array. Mirrors
-    // `did::service_types_from_doc`'s contract — document order, deduped —
-    // but over the resolver's `Service` type rather than raw JSON.
+    // `did::service_types_from_doc`'s contract — document order, deduped,
+    // implicit services skipped — but over the resolver's `Service` type
+    // rather than raw JSON.
     let mut out: Vec<String> = Vec::new();
     for svc in &doc.service {
+        let implicit = svc
+            .id
+            .as_ref()
+            .is_some_and(|id| crate::did::is_implicit_webvh_service(id.as_str()));
+        if implicit {
+            continue;
+        }
         for t in &svc.type_ {
             if !t.is_empty() && !out.iter().any(|seen| seen == t) {
                 out.push(t.clone());

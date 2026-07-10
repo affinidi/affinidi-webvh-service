@@ -176,6 +176,29 @@ pub const SERVICE_TYPE_TSP: &str = "TSPTransport";
 /// DIDComm v2 transport (`#vta-didcomm`).
 pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
 
+/// True for the services the did:webvh spec *implies* rather than the
+/// operator declaring.
+///
+/// A conforming did:webvh resolver synthesises `#whois`
+/// (`LinkedVerifiablePresentation`) and `#files` (`relativeRef`) into every
+/// resolved document when they aren't already present — see
+/// `didwebvh-rs`'s `resolve::implicit::update_implicit_services`. They are
+/// therefore on 100% of resolved webvh DIDs and carry no operator intent.
+///
+/// This matters because the two read paths disagree about them. Reading a
+/// stored `did.jsonl` (the DID-list badge cache) never sees them; resolving
+/// the DID (the registry probe, the control-plane self-check) always does.
+/// Left unfiltered, the same DID renders a spurious `Other` badge on the
+/// Servers list and none on the DID list.
+///
+/// Matched on the `id` fragment, which is how the resolver itself detects
+/// them — an operator who declares a `LinkedVerifiablePresentation` under
+/// some other fragment genuinely is advertising something, and keeps its
+/// badge.
+pub fn is_implicit_webvh_service(service_id: &str) -> bool {
+    service_id.ends_with("#whois") || service_id.ends_with("#files")
+}
+
 /// Extract the `type` of every entry in a DID document's `service` array.
 ///
 /// The single canonical reader for "what does this document advertise",
@@ -194,6 +217,11 @@ pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
 /// same TSP-over-DIDComm preference [`crate::server::didcomm_profile::resolve_transport`]
 /// applies. Duplicates are collapsed, keeping first occurrence.
 ///
+/// Spec-implied services (`#whois`, `#files`) are skipped — see
+/// [`is_implicit_webvh_service`]. Without this, resolved documents would
+/// always report two extra types that no operator declared, and the stored-log
+/// and resolved read paths would disagree about the same DID.
+///
 /// Returns an empty vector when `service` is absent, not an array, or
 /// contains no usable `type`. Callers that need to distinguish "no services"
 /// from "document unavailable" should wrap the result in an `Option`
@@ -211,6 +239,10 @@ pub fn service_types_from_doc(doc: &serde_json::Value) -> Vec<String> {
     };
 
     for svc in services {
+        let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if is_implicit_webvh_service(id) {
+            continue;
+        }
         match svc.get("type") {
             Some(serde_json::Value::String(t)) => push(t),
             Some(serde_json::Value::Array(types)) => {
@@ -578,6 +610,91 @@ mod tests {
         );
         assert!(advertises_tsp(&types));
         assert!(advertises_didcomm(&types));
+    }
+
+    /// A conforming did:webvh resolver injects `#whois`
+    /// (`LinkedVerifiablePresentation`) and `#files` (`relativeRef`) into
+    /// every document. They are not operator-declared and must not surface
+    /// as advertised services — otherwise every resolved DID grows a
+    /// permanent, meaningless `Other` badge.
+    #[test]
+    fn service_types_skips_resolver_injected_implicit_services() {
+        let did = "did:webvh:QmSCID:webvh.example.com:server1";
+        let doc = serde_json::json!({
+            "service": [
+                {
+                    "id": format!("{did}#webvh-hosting"),
+                    "type": "WebVHHosting",
+                    "serviceEndpoint": { "uri": "https://webvh.example.com/server1" }
+                },
+                {
+                    "id": format!("{did}#whois"),
+                    "type": "LinkedVerifiablePresentation",
+                    "serviceEndpoint": "https://webvh.example.com/server1/whois.vp"
+                },
+                {
+                    "id": format!("{did}#files"),
+                    "type": "relativeRef",
+                    "serviceEndpoint": "https://webvh.example.com/server1/files"
+                },
+            ]
+        });
+        assert_eq!(
+            service_types_from_doc(&doc),
+            vec!["WebVHHosting".to_string()],
+            "only the operator-declared service should surface"
+        );
+    }
+
+    /// The filter keys on the `id` fragment, not the type — an operator who
+    /// declares a `LinkedVerifiablePresentation` under their own fragment is
+    /// genuinely advertising it and keeps the badge.
+    #[test]
+    fn service_types_keeps_operator_declared_linked_vp() {
+        let did = "did:webvh:QmSCID:example.com:x";
+        let doc = serde_json::json!({
+            "service": [{
+                "id": format!("{did}#my-presentation"),
+                "type": "LinkedVerifiablePresentation",
+                "serviceEndpoint": "https://example.com/vp"
+            }]
+        });
+        assert_eq!(
+            service_types_from_doc(&doc),
+            vec!["LinkedVerifiablePresentation".to_string()]
+        );
+    }
+
+    #[test]
+    fn implicit_service_predicate_matches_only_whois_and_files() {
+        assert!(is_implicit_webvh_service("did:webvh:Q:h:p#whois"));
+        assert!(is_implicit_webvh_service("did:webvh:Q:h:p#files"));
+        assert!(!is_implicit_webvh_service("did:webvh:Q:h:p#tsp"));
+        assert!(!is_implicit_webvh_service("did:webvh:Q:h:p#vta-didcomm"));
+        assert!(!is_implicit_webvh_service("did:webvh:Q:h:p#webvh-hosting"));
+        // Substring, not suffix, must not match.
+        assert!(!is_implicit_webvh_service("did:webvh:Q:h:p#whois-extra"));
+        assert!(!is_implicit_webvh_service(""));
+    }
+
+    /// The resolver path feeds `is_implicit_webvh_service` a `Url::as_str()`,
+    /// not a raw string. Pin that the `did:` scheme round-trips its fragment
+    /// intact — otherwise the filter silently stops matching and every server
+    /// grows an `Other` badge again.
+    #[test]
+    fn implicit_predicate_matches_url_parsed_service_ids() {
+        let base =
+            "did:webvh:QmRUN4vrMp6cS1xqWSH46bCipf9W95VrFDyyFBm8XXcZ1E:webvh.storm.ws:webvh-server1";
+        for frag in ["whois", "files"] {
+            let parsed = url::Url::parse(&format!("{base}#{frag}")).expect("parse service id");
+            assert!(
+                is_implicit_webvh_service(parsed.as_str()),
+                "Url::as_str() must preserve the #{frag} fragment; got {}",
+                parsed.as_str()
+            );
+        }
+        let hosting = url::Url::parse(&format!("{base}#webvh-hosting")).expect("parse");
+        assert!(!is_implicit_webvh_service(hosting.as_str()));
     }
 
     #[test]
