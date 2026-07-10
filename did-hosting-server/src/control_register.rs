@@ -15,7 +15,8 @@ use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use did_hosting_common::DidSyncUpdate;
 use did_hosting_common::did_ops::{
-    DidRecord, content_log_key, content_witness_key, did_key, owner_key, validate_did_jsonl,
+    DidRecord, content_log_key, content_witness_key, did_key, extract_service_types, owner_key,
+    validate_did_jsonl,
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
@@ -233,6 +234,11 @@ pub async fn apply_single_update(
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+
+        // Derive from the synced log rather than trusting the control
+        // plane to send a services list — the log is the authority, and
+        // this keeps the edge node's badges consistent with what it serves.
+        services: extract_service_types(&update.log_content),
     };
 
     let mut batch = store.batch();

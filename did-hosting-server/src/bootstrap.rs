@@ -11,8 +11,8 @@ use tracing::info;
 
 use crate::auth::session::now_epoch;
 use crate::did_ops::{
-    DidRecord, content_log_key, content_witness_key, did_key, extract_did_id, owner_key,
-    validate_did_jsonl,
+    DidRecord, content_log_key, content_witness_key, did_key, extract_did_id,
+    extract_service_types, owner_key, validate_did_jsonl,
 };
 use crate::error::AppError;
 use crate::store::{KeyspaceHandle, Store};
@@ -139,6 +139,11 @@ pub async fn bootstrap_did(
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+
+        // The server's own DID — its badges (WebVHHosting, and TSP and/or
+        // DIDComm per `advertise_tsp` / `mediator_did` above) are exactly
+        // what `build_did_document` just wrote into the doc.
+        services: extract_service_types(&jsonl),
     };
 
     let mut batch = store.batch();
@@ -242,6 +247,8 @@ pub async fn import_did_at_path(
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+
+        services: extract_service_types(jsonl),
     };
 
     let mut batch = store.batch();

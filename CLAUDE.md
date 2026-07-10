@@ -74,9 +74,12 @@ sense in the all-in-one model.
   remote service instances if an operator populates
   `[[registry.instances]]` or accepts inbound `MSG_SERVER_REGISTER`
   messages — that's an unusual deployment, and in that case the
-  dashboard's "last seen" indicator will be stale until you switch to
-  standalone control or wire the loop in manually. Use standalone
-  control for managing remote services as the supported path.
+  dashboard's "last seen" indicator and each instance's advertised-service
+  badges (`ServiceInstance.advertised_services`, refreshed on the same
+  loop) will be stale until you switch to standalone control or wire the
+  loop in manually. Instances still get their badges resolved once, at
+  registration. Use standalone control for managing remote services as
+  the supported path.
 - **Self-registration with an external control plane.** A daemon does
   not register itself anywhere — it *is* the control plane.
 

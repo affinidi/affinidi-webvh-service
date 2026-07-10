@@ -64,6 +64,29 @@ pub struct DidRecord {
     /// value.
     #[serde(default)]
     pub domain: String,
+
+    /// Cached `service[].type` values from the latest log entry's DID
+    /// document, in document order. Lets `list_dids` render per-DID
+    /// service badges without reading log bytes — the whole reason the
+    /// dual storage model exists (see the module note above).
+    ///
+    /// Tri-state, and the distinction matters:
+    /// - `None` — not yet computed. Either a slot with no document
+    ///   (`create_did`, `version_count == 0`) or a legacy record written
+    ///   before this field existed. The UI renders no badges.
+    /// - `Some(vec![])` — the document was read and genuinely advertises
+    ///   no services. The UI renders no badges, same as `None`, but the
+    ///   backfill paths know not to re-read the log.
+    /// - `Some(types)` — advertised services.
+    ///
+    /// Kept fresh by every write path that touches `content_log_key`
+    /// (`register_did_atomic`, `publish_did`, the server's sync-from-control
+    /// import, bootstrap). `M-02` sweeps legacy records on server/daemon
+    /// boot; standalone control has no migration runner, so `publish_did`
+    /// self-heals `None` on the next publish — the same two-pronged shape
+    /// `domain` uses.
+    #[serde(default)]
+    pub services: Option<Vec<String>>,
 }
 
 fn default_method() -> String {
@@ -302,6 +325,20 @@ pub fn extract_did_id(jsonl_content: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract the advertised `service[].type` values from the DID document in
+/// the last non-blank line of JSONL content.
+///
+/// Returns `None` when there is no parseable log entry with a `state` — i.e.
+/// the document is unavailable, so callers must not cache an empty vector and
+/// conclude "advertises nothing". `Some(vec![])` means the document was read
+/// and carries no services. This maps directly onto [`DidRecord::services`].
+pub fn extract_service_types(jsonl_content: &str) -> Option<Vec<String>> {
+    let last_line = jsonl_content.lines().rfind(|l| !l.trim().is_empty())?;
+    let value: serde_json::Value = serde_json::from_str(last_line).ok()?;
+    let state = value.get("state")?;
+    Some(crate::did::service_types_from_doc(state))
+}
+
 /// Parse JSONL content and extract metadata from the log entries.
 pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
     let lines: Vec<&str> = jsonl_content.lines().collect();
@@ -480,6 +517,7 @@ mod tests {
             deleted_at: None,
             method: "web".into(),
             domain: "tenant-a.example.com".into(),
+            services: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: DidRecord = serde_json::from_str(&json).unwrap();

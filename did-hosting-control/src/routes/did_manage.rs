@@ -739,9 +739,15 @@ pub struct ConfigResponse {
     pub mediator_did: Option<String>,
     pub public_url: Option<String>,
     pub did_hosting_url: Option<String>,
-    /// Connectivity
+    /// Connectivity — `*_enabled` is what config turns on; `advertised_services`
+    /// is what the control DID's document tells peers. See [`ControlInfo`].
     pub didcomm_enabled: bool,
     pub tsp_enabled: bool,
+    /// `service[].type` values from the control plane's own DID document.
+    /// `None` when no control DID is configured or it wouldn't resolve.
+    /// Not sensitive — this document is published for anyone to resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertised_services: Option<Vec<String>>,
     pub rest_api_enabled: bool,
     pub listen_address: String,
     /// VTA
@@ -762,8 +768,27 @@ pub struct ConfigResponse {
     pub log_format: String,
 }
 
+/// Resolve what the control plane's own DID document advertises.
+///
+/// `None` means "unknown", and both preconditions yield it: no configured
+/// control DID, or no configured DID resolver.
+///
+/// Deliberately does **not** pass `None` through to
+/// [`resolve_service_types`], which would build a throwaway `DIDCacheClient`
+/// and hit the network. These run on request-handling paths — `GET
+/// /api/config` is reachable by every authenticated user — so that fallback
+/// would turn a page load into an unauthenticated-ish outbound fetch, once
+/// per request. With a resolver configured, the shared client's cache makes
+/// everything after the first call cheap.
+async fn control_advertised_services(state: &AppState) -> Option<Vec<String>> {
+    let did = state.config.server_did.as_deref()?;
+    let resolver = state.did_resolver.as_ref()?;
+    did_hosting_common::server::didcomm_profile::resolve_service_types(did, Some(resolver)).await
+}
+
 /// GET /api/config — return control plane configuration (non-sensitive fields only).
 pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Json<ConfigResponse> {
+    let advertised_services = control_advertised_services(&state).await;
     let c = &state.config;
     Json(ConfigResponse {
         control_did: c.server_did.clone(),
@@ -772,6 +797,7 @@ pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Jso
         did_hosting_url: c.did_hosting_url.clone(),
         didcomm_enabled: c.features.didcomm,
         tsp_enabled: c.features.tsp,
+        advertised_services,
         rest_api_enabled: c.features.rest_api,
         deployment_mode: c.features.deployment_mode.clone(),
         listen_address: format!("{}:{}", c.server.host, c.server.port),
@@ -807,8 +833,24 @@ pub struct ControlInfo {
     pub version: String,
     pub server_did: Option<String>,
     pub public_url: Option<String>,
+    /// Whether the DIDComm transport is *enabled* in config
+    /// (`features.didcomm`). What the operator asked for.
     pub didcomm_enabled: bool,
+    /// Whether the TSP transport is *enabled* in config (`features.tsp`).
     pub tsp_enabled: bool,
+    /// What the control plane's own DID document *advertises* — the
+    /// `service[].type` values peers actually see when they resolve it.
+    ///
+    /// Distinct from the two `*_enabled` flags above, and the pair can
+    /// legitimately disagree: a transport enabled but unadvertised is
+    /// unreachable to peers, and one advertised but disabled is a
+    /// black hole. The UI cross-checks them and warns on a mismatch.
+    ///
+    /// `None` when there is no configured control DID, or when it could
+    /// not be resolved — in which case the UI can't make the comparison
+    /// and says so rather than implying agreement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertised_services: Option<Vec<String>>,
     pub total_local_dids: u64,
     /// DID methods compiled into this binary, as enumerated by
     /// `did_hosting_common::method::enabled_methods()`. Each entry is a
@@ -828,6 +870,13 @@ pub struct ServiceInfo {
     pub label: Option<String>,
     pub url: String,
     pub status: String,
+    /// `service[].type` values cached off this instance's DID document.
+    /// See `registry::ServiceInstance::advertised_services`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertised_services: Option<Vec<String>>,
+    /// Epoch seconds of the last successful resolve of the above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services_checked_at: Option<u64>,
     pub last_health_check: Option<u64>,
     pub registered_at: u64,
     pub did: Option<String>,
@@ -909,11 +958,19 @@ pub async fn get_services_overview(
             registered_at: inst.registered_at,
             did: service_did,
             stats,
+            advertised_services: inst.advertised_services.clone(),
+            services_checked_at: inst.services_checked_at,
         });
     }
 
     // Count local DIDs on control plane
     let local_dids = state.dids_ks.prefix_iter_raw("did:").await?.len() as u64;
+
+    // Resolve the control plane's own DID document so the UI can compare
+    // what it *advertises* against what `features.*` says is *enabled*.
+    // Best-effort: a resolve failure yields `None`, which the UI renders as
+    // "couldn't check" rather than "nothing advertised".
+    let control_services = control_advertised_services(&state).await;
 
     Ok(Json(ServiceOverviewResponse {
         control: ControlInfo {
@@ -922,6 +979,7 @@ pub async fn get_services_overview(
             public_url: state.config.public_url.clone(),
             didcomm_enabled: state.config.features.didcomm,
             tsp_enabled: state.config.features.tsp,
+            advertised_services: control_services,
             total_local_dids: local_dids,
             enabled_methods: did_hosting_common::method::enabled_methods().to_vec(),
         },

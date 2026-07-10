@@ -42,9 +42,11 @@ use super::error::AppError;
 use super::store::{KS_META, KeyspaceHandle, Store};
 
 pub mod m01_tag_did_records_with_domain;
+pub mod m02_cache_did_record_services;
 pub mod runner;
 
 pub use m01_tag_did_records_with_domain::M01TagDidRecordsWithDomain;
+pub use m02_cache_did_record_services::M02CacheDidRecordServices;
 pub use runner::{MigrationRunner, RunSummary};
 
 /// Boxed future used by [`Migration::run`] so the trait stays object-safe
@@ -133,5 +135,8 @@ pub fn registry() -> Vec<Arc<dyn Migration>> {
     // the bottom; never reorder past a shipped release (operators'
     // stores carry `meta:migration:applied:{id}` markers that gate
     // re-runs by ID, not order).
-    vec![Arc::new(M01TagDidRecordsWithDomain)]
+    vec![
+        Arc::new(M01TagDidRecordsWithDomain),
+        Arc::new(M02CacheDidRecordServices),
+    ]
 }

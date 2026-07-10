@@ -152,6 +152,57 @@ pub enum PeerTransport {
     Didcomm,
 }
 
+/// Resolve every service `type` a peer's DID document advertises.
+///
+/// The network-facing counterpart to
+/// [`crate::did::service_types_from_doc`], which reads a document we
+/// already hold. Used to populate the registry's per-instance badge cache:
+/// the registry stores only a DID string, so the document has to be fetched.
+///
+/// Returns `None` when the DID cannot be resolved — distinct from
+/// `Some(vec![])`, which means it resolved and advertises no services.
+/// Callers cache the distinction; see `ServiceInstance::advertised_services`.
+pub async fn resolve_service_types(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<Vec<String>> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for service discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for service discovery: {e}");
+            return None;
+        }
+    };
+
+    // Flatten the resolved document's typed `service` array. Mirrors
+    // `did::service_types_from_doc`'s contract — document order, deduped —
+    // but over the resolver's `Service` type rather than raw JSON.
+    let mut out: Vec<String> = Vec::new();
+    for svc in &doc.service {
+        for t in &svc.type_ {
+            if !t.is_empty() && !out.iter().any(|seen| seen == t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Resolve a peer's preferred transport and its mediator endpoint from
 /// the peer's DID document.
 ///

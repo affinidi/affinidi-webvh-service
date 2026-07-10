@@ -10,6 +10,7 @@ import {
 import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { ServiceBadges } from "../../components/ServiceBadges";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import type { ControlPlaneConfig } from "../../lib/api";
 
@@ -129,10 +130,29 @@ export default function SettingsPage() {
         )}
       </View>
 
-      {/* Connectivity */}
+      {/* Connectivity. `*Enabled` is what config turns on; the badge row
+          below is what the control plane's DID document advertises to
+          peers. They can disagree — the dashboard's Control Plane card
+          spells out the consequences when they do. */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
         <Row label="Listen Address" value={config.listenAddress} />
+        <StatusRow label="DIDComm" enabled={config.didcommEnabled} />
+        <StatusRow label="TSP" enabled={config.tspEnabled} />
+        <StatusRow label="REST API" enabled={config.restApiEnabled} />
+        <View style={styles.row}>
+          <Text style={styles.label}>Advertised services</Text>
+          {config.advertisedServices ? (
+            <ServiceBadges
+              services={config.advertisedServices}
+              emptyLabel="none in DID document"
+            />
+          ) : (
+            <Text style={styles.advertisedUnknown}>
+              {config.controlDid ? "DID not resolved" : "no control DID"}
+            </Text>
+          )}
+        </View>
       </View>
 
       {/* VTA */}
@@ -234,6 +254,12 @@ const styles = StyleSheet.create({
     fontFamily: fonts.medium,
     color: colors.textSecondary,
     flex: 1,
+  },
+  advertisedUnknown: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    fontStyle: "italic",
   },
   value: {
     fontSize: 13,

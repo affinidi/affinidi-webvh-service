@@ -24,8 +24,8 @@ use tracing::{debug, info, warn};
 // that imports from `crate::did_ops::*` continues to work.
 pub use did_hosting_common::did_ops::{
     DidRecord, LogEntryInfo, LogMetadata, content_log_key, content_witness_key, did_key,
-    extract_did_id, extract_did_web_document, extract_log_metadata, owner_key, parse_log_entries,
-    watcher_sync_key,
+    extract_did_id, extract_did_web_document, extract_log_metadata, extract_service_types,
+    owner_key, parse_log_entries, watcher_sync_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -268,6 +268,9 @@ pub async fn create_did(
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+
+        // Empty slot — no log yet, so no document to read services from.
+        services: None,
     };
 
     let mut batch = state.store.batch();
@@ -340,6 +343,9 @@ pub async fn publish_did(
     record.version_count += 1;
     record.did_id = did_id.clone();
     record.content_size = new_size;
+    // Recompute, don't fill-if-empty: an upload can drop a service as
+    // well as add one. Also backfills legacy `None` records on next write.
+    record.services = extract_service_types(did_log);
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -527,6 +533,7 @@ pub async fn list_dids(
                 disabled: record.disabled,
                 method: (!record.method.is_empty()).then(|| record.method.clone()),
                 domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+                services: record.services,
             });
         }
     }
@@ -564,6 +571,7 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             disabled: record.disabled,
             method: (!record.method.is_empty()).then(|| record.method.clone()),
             domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+            services: record.services,
         });
     }
 
@@ -687,6 +695,8 @@ pub async fn rollback_did(
     record.did_id = new_did_id;
     record.content_size = new_size;
     record.updated_at = now_epoch();
+    // Rolling back can retract a service the dropped entry introduced.
+    record.services = extract_service_types(&truncated);
 
     let mut batch = state.store.batch();
     batch.insert_raw(

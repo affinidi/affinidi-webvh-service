@@ -174,6 +174,7 @@ async fn seed_did(state: &AppState, owner_did: &str, mnemonic: &str) {
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+        services: None,
     };
     let mut batch = state.store.batch();
     batch

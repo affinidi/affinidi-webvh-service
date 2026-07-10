@@ -1192,6 +1192,15 @@ async fn handle_server_register(
     // Use the sender DID as a stable instance ID (one registration per DID)
     let instance_id = sender.replace(':', "_");
 
+    // `register_instance` overwrites the whole record, so carry the previous
+    // badge cache forward rather than blanking it. The refresh below
+    // re-resolves and supersedes this; if that resolve fails, the operator
+    // keeps seeing the last known services instead of an empty badge row.
+    let previous = registry::get_instance(&state.registry_ks, &instance_id)
+        .await
+        .ok()
+        .flatten();
+
     let instance = ServiceInstance {
         instance_id: instance_id.clone(),
         service_type: ServiceType::Server,
@@ -1204,6 +1213,10 @@ async fn handle_server_register(
         enabled_methods,
         served_domains,
         protocol_version,
+        advertised_services: previous
+            .as_ref()
+            .and_then(|p| p.advertised_services.clone()),
+        services_checked_at: previous.as_ref().and_then(|p| p.services_checked_at),
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -1227,6 +1240,24 @@ async fn handle_server_register(
         role = %role,
         "server registered via DIDComm"
     );
+
+    // Cache what the registering server's DID document advertises, so the
+    // Servers list can badge it. Best-effort: a registration must not fail
+    // because the DID momentarily won't resolve.
+    if let Err(e) = registry::refresh_advertised_services(
+        &state.registry_ks,
+        &instance_id,
+        state.did_resolver.as_ref(),
+        crate::auth::session::now_epoch(),
+    )
+    .await
+    {
+        warn!(
+            did = sender,
+            error = %e,
+            "failed to cache advertised services for registering server"
+        );
+    }
 
     // Push all existing DIDs to the newly registered server
     server_push::sync_all_dids_to_server(&state, sender.to_string());
@@ -1726,6 +1757,7 @@ mod tests {
     /// index entries so list/info/delete dispatch arms have data to read.
     async fn seed_did(state: &AppState, owner_did: &str, mnemonic: &str) {
         let record = DidRecord {
+            services: None,
             owner: owner_did.into(),
             mnemonic: mnemonic.into(),
             created_at: 1,

@@ -8,6 +8,11 @@ import {
   ScrollView,
 } from "react-native";
 import { useApi } from "./ApiProvider";
+import {
+  ServiceBadges,
+  SERVICE_TYPE_DIDCOMM,
+  SERVICE_TYPE_TSP,
+} from "./ServiceBadges";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { ServiceOverview, ServiceInfo } from "../lib/api";
 
@@ -64,6 +69,68 @@ function TypeBadge({ type }: { type: string }) {
   );
 }
 
+/**
+ * One transport row on the control-plane card: what config enables versus
+ * what the control DID's document advertises to peers.
+ *
+ * The two can disagree, and each direction is a distinct real fault:
+ * enabled-but-unadvertised means peers never learn they can reach us that
+ * way; advertised-but-disabled means they try and get nothing. We only
+ * claim a mismatch when we actually resolved the document — `advertised`
+ * is `undefined` when the DID wouldn't resolve, and silence beats a false
+ * alarm there.
+ */
+function TransportRow({
+  label,
+  enabled,
+  advertised,
+}: {
+  label: string;
+  enabled: boolean;
+  advertised: boolean | undefined;
+}) {
+  const mismatch = advertised !== undefined && enabled !== advertised;
+
+  return (
+    <View style={styles.transportRow}>
+      <Text style={styles.transportName}>{label}</Text>
+      <View style={[styles.flagBadge, enabled ? styles.flagOn : styles.flagOff]}>
+        <Text style={styles.flagText}>{enabled ? "enabled" : "disabled"}</Text>
+      </View>
+      {advertised === undefined ? (
+        <Text style={styles.transportUnknown}>advertised: unknown</Text>
+      ) : (
+        <View
+          style={[
+            styles.flagBadge,
+            advertised ? styles.flagOn : styles.flagOff,
+            mismatch && styles.flagMismatch,
+          ]}
+        >
+          <Text style={styles.flagText}>
+            {advertised ? "advertised" : "not advertised"}
+          </Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+/** The human-readable consequence of an enabled/advertised mismatch. */
+function mismatchWarning(
+  label: string,
+  enabled: boolean,
+  advertised: boolean,
+): string | null {
+  if (enabled && !advertised) {
+    return `${label} is enabled but the control plane's DID document has no ${label} service — peers cannot discover this transport.`;
+  }
+  if (!enabled && advertised) {
+    return `The control plane's DID document advertises ${label}, but ${label} is disabled — peers that try this transport will fail.`;
+  }
+  return null;
+}
+
 function StatValue({ label, value }: { label: string; value: string | number }) {
   return (
     <View style={styles.statItem}>
@@ -101,6 +168,10 @@ function ServiceCard({ service }: { service: ServiceInfo }) {
         <Text style={styles.serviceDid} numberOfLines={1}>{shortDid}</Text>
       )}
 
+      {/* What this instance's DID document advertises. Cached on the
+          registry record; refreshed at register + health check. */}
+      <ServiceBadges services={service.advertisedServices} />
+
       <View style={styles.serviceMetaRow}>
         <Text style={styles.metaText}>
           Registered {timeAgo(service.registeredAt)}
@@ -128,7 +199,28 @@ function ServiceCard({ service }: { service: ServiceInfo }) {
   );
 }
 
-function EmptyState() {
+/**
+ * An empty registry means different things per deployment.
+ *
+ * On a standalone control plane it means nothing has connected yet \u2014 the
+ * operator has work to do. On a daemon it is the normal, self-contained
+ * state (see CLAUDE.md), so saying "no services connected" would read as a
+ * fault rather than the expected shape.
+ */
+function EmptyState({ isDaemon }: { isDaemon: boolean }) {
+  if (isDaemon) {
+    return (
+      <View style={styles.emptyCard}>
+        <Text style={styles.emptyIcon}>{"\u2713"}</Text>
+        <Text style={styles.emptyTitle}>Self-contained daemon</Text>
+        <Text style={styles.emptyHint}>
+          Server, witness, and watcher run in this process \u2014 there are no
+          remote instances to register. Registering one is supported but
+          unusual; use a standalone control plane to manage remote services.
+        </Text>
+      </View>
+    );
+  }
   return (
     <View style={styles.emptyCard}>
       <Text style={styles.emptyIcon}>{"\u26A1"}</Text>
@@ -142,7 +234,16 @@ function EmptyState() {
   );
 }
 
-export function ServiceOverviewPanel() {
+/**
+ * @param isDaemon - all-in-one deployment. The control-plane card renders
+ *   either way; this only changes how an empty registry is explained and
+ *   suppresses the service-count tiles, which are always zero there.
+ */
+export function ServiceOverviewPanel({
+  isDaemon = false,
+}: {
+  isDaemon?: boolean;
+}) {
   const api = useApi();
   const [data, setData] = useState<ServiceOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -193,6 +294,24 @@ export function ServiceOverviewPanel() {
   const witnesses = services.filter((s) => s.serviceType === "witness");
   const watchers = services.filter((s) => s.serviceType === "watcher");
 
+  // `undefined` — not just `false` — when the control DID wouldn't resolve,
+  // so `TransportRow` can stay quiet rather than reporting a false mismatch.
+  const advertised = control.advertisedServices;
+  const advertisedDidcomm = advertised?.includes(SERVICE_TYPE_DIDCOMM);
+  const advertisedTsp = advertised?.includes(SERVICE_TYPE_TSP);
+
+  const transportWarnings =
+    advertised === undefined
+      ? []
+      : ([
+          mismatchWarning("DIDComm", control.didcommEnabled, !!advertisedDidcomm),
+          mismatchWarning("TSP", control.tspEnabled, !!advertisedTsp),
+        ].filter(Boolean) as string[]);
+
+  // A daemon that *has* registered remote instances still gets the full
+  // registry view — key off the data, not the deployment mode alone.
+  const showRegistry = !isDaemon || services.length > 0;
+
   return (
     <View style={styles.container}>
       {/* Control plane header card */}
@@ -205,14 +324,33 @@ export function ServiceOverviewPanel() {
           {control.publicUrl && (
             <Text style={styles.controlUrl}>{control.publicUrl}</Text>
           )}
-          <View style={styles.controlFlags}>
-            <View style={[styles.flagBadge, control.didcommEnabled ? styles.flagOn : styles.flagOff]}>
-              <Text style={styles.flagText}>DIDComm</Text>
+        </View>
+
+        {/* Transports: config-enabled vs DID-document-advertised. */}
+        <View style={styles.transportsBlock}>
+          <TransportRow
+            label="DIDComm"
+            enabled={control.didcommEnabled}
+            advertised={advertisedDidcomm}
+          />
+          <TransportRow
+            label="TSP"
+            enabled={control.tspEnabled}
+            advertised={advertisedTsp}
+          />
+          {transportWarnings.map((w) => (
+            <View key={w} style={styles.transportWarnBanner}>
+              <Text style={styles.transportWarnIcon}>{"⚠"}</Text>
+              <Text style={styles.transportWarnText}>{w}</Text>
             </View>
-            <View style={[styles.flagBadge, control.tspEnabled ? styles.flagOn : styles.flagOff]}>
-              <Text style={styles.flagText}>TSP</Text>
-            </View>
-          </View>
+          ))}
+          {control.advertisedServices === undefined && (
+            <Text style={styles.transportUnknownNote}>
+              {control.serverDid
+                ? "Could not resolve the control plane's DID document — advertised services unknown."
+                : "No control-plane DID configured — nothing is advertised to peers."}
+            </Text>
+          )}
         </View>
 
         {/* DID methods compiled into this binary. Empty list = misbuild
@@ -240,18 +378,24 @@ export function ServiceOverviewPanel() {
         </View>
       </View>
 
-      {/* Aggregate summary */}
+      {/* Aggregate summary. The service-count tiles are meaningless on a
+          daemon with an empty registry — they'd read a constant zero — but
+          the DID / resolve / update totals are real in both modes. */}
       <View style={styles.summaryRow}>
-        <View style={styles.summaryCard}>
-          <Text style={styles.summaryValue}>{aggregate.totalServices}</Text>
-          <Text style={styles.summaryLabel}>Services</Text>
-        </View>
-        <View style={styles.summaryCard}>
-          <Text style={[styles.summaryValue, { color: colors.teal }]}>
-            {aggregate.activeServices}
-          </Text>
-          <Text style={styles.summaryLabel}>Active</Text>
-        </View>
+        {showRegistry && (
+          <>
+            <View style={styles.summaryCard}>
+              <Text style={styles.summaryValue}>{aggregate.totalServices}</Text>
+              <Text style={styles.summaryLabel}>Services</Text>
+            </View>
+            <View style={styles.summaryCard}>
+              <Text style={[styles.summaryValue, { color: colors.teal }]}>
+                {aggregate.activeServices}
+              </Text>
+              <Text style={styles.summaryLabel}>Active</Text>
+            </View>
+          </>
+        )}
         {aggregate.degradedServices > 0 && (
           <View style={styles.summaryCard}>
             <Text style={[styles.summaryValue, { color: colors.warning }]}>
@@ -290,7 +434,7 @@ export function ServiceOverviewPanel() {
 
       {/* Service groups */}
       {services.length === 0 ? (
-        <EmptyState />
+        <EmptyState isDaemon={isDaemon} />
       ) : (
         <>
           {servers.length > 0 && (
@@ -400,10 +544,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     color: colors.textSecondary,
   },
-  controlFlags: {
-    flexDirection: "row",
-    gap: spacing.xs,
-  },
   methodsRow: {
     marginTop: spacing.md,
     paddingTop: spacing.md,
@@ -467,12 +607,69 @@ const styles = StyleSheet.create({
   flagOff: {
     backgroundColor: colors.errorBg,
   },
+  /** Outlines the *advertised* badge when it disagrees with config. */
+  flagMismatch: {
+    borderWidth: 1,
+    borderColor: colors.warning,
+  },
   flagText: {
     fontSize: 10,
     fontFamily: fonts.bold,
     color: colors.textPrimary,
     textTransform: "uppercase",
     letterSpacing: 0.5,
+  },
+
+  // Transports (enabled vs advertised)
+  transportsBlock: {
+    marginTop: spacing.sm,
+    gap: 6,
+  },
+  transportRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    flexWrap: "wrap",
+  },
+  transportName: {
+    minWidth: 70,
+    fontSize: 12,
+    fontFamily: fonts.semibold,
+    color: colors.textSecondary,
+  },
+  transportUnknown: {
+    fontSize: 11,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    fontStyle: "italic",
+  },
+  transportUnknownNote: {
+    fontSize: 11,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    fontStyle: "italic",
+    marginTop: 2,
+  },
+  transportWarnBanner: {
+    flexDirection: "row",
+    gap: 6,
+    backgroundColor: "rgba(255, 181, 71, 0.12)",
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    marginTop: 2,
+  },
+  transportWarnIcon: {
+    fontSize: 12,
+    color: colors.warning,
+    marginTop: 1,
+  },
+  transportWarnText: {
+    flex: 1,
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.warning,
+    lineHeight: 18,
   },
 
   // Summary row

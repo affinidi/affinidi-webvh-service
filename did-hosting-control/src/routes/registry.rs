@@ -24,6 +24,30 @@ pub async fn list(
     Ok(Json(instances))
 }
 
+/// Refresh an instance's cached advertised services, swallowing errors.
+///
+/// Registration and health-check must not fail because a DID document was
+/// momentarily unresolvable — the badge cache is cosmetic, and
+/// `refresh_advertised_services` already preserves the prior value on a
+/// failed resolve. A store write failure is worth a log line, nothing more.
+async fn refresh_services_best_effort(state: &AppState, instance_id: &str) {
+    let now = crate::auth::session::now_epoch();
+    if let Err(e) = registry::refresh_advertised_services(
+        &state.registry_ks,
+        instance_id,
+        state.did_resolver.as_ref(),
+        now,
+    )
+    .await
+    {
+        warn!(
+            instance_id = %instance_id,
+            error = %e,
+            "failed to cache advertised services for instance"
+        );
+    }
+}
+
 // ---------- POST /api/control/registry ----------
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +78,11 @@ pub async fn register(
         enabled_methods: vec!["webvh".to_string()],
         served_domains: Vec::new(),
         protocol_version: "1.0".to_string(),
+        // No DID is recorded on this path (`metadata` is Null), so there
+        // is no document to read services from. The instance's own
+        // MSG_SERVER_REGISTER supplies the DID and fills these in.
+        advertised_services: None,
+        services_checked_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -112,6 +141,10 @@ pub async fn health_check(
     let health_interval = state.config.registry.health_check_interval.max(10);
     let status = registry::health_status_from_timestamp(&instance, now, health_interval);
     registry::update_instance_status(&state.registry_ks, &instance_id, status, now).await?;
+
+    // Re-resolve the DID document alongside the health verdict, so an
+    // operator hitting "check now" also refreshes the service badges.
+    refresh_services_best_effort(&state, &instance_id).await;
 
     let updated = registry::get_instance(&state.registry_ks, &instance_id)
         .await?
@@ -306,6 +339,10 @@ pub async fn register_service(
             "service re-registered (existing instance reactivated)"
         );
 
+        // A re-register is the one moment we know the server restarted —
+        // and a restart is when it would have picked up a new DID document.
+        refresh_services_best_effort(&state, &instance.instance_id).await;
+
         let did_updates = compute_did_sync_updates(&state, &req.preloaded_dids).await;
 
         return Ok((
@@ -334,6 +371,9 @@ pub async fn register_service(
         enabled_methods: vec!["webvh".to_string()],
         served_domains: Vec::new(),
         protocol_version: "1.0".to_string(),
+        // Filled by the resolve below, once the record exists to write onto.
+        advertised_services: None,
+        services_checked_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -344,6 +384,8 @@ pub async fn register_service(
         did = %auth.0.did,
         "service registered via DIDComm auth"
     );
+
+    refresh_services_best_effort(&state, &instance.instance_id).await;
 
     let did_updates = compute_did_sync_updates(&state, &req.preloaded_dids).await;
 

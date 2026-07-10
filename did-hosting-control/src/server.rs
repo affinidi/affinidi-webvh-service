@@ -460,6 +460,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let health_didcomm = state.didcomm_service.clone();
     let health_control_did = state.config.server_did.clone();
     let health_interval_secs = state.config.registry.health_check_interval.max(10);
+    let health_resolver = state.did_resolver.clone();
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(health_interval_secs));
         timer.tick().await; // skip first tick
@@ -471,6 +472,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                         &health_didcomm,
                         health_control_did.as_deref(),
                         health_interval_secs,
+                        health_resolver.as_ref(),
                     ).await {
                         warn!("health check error: {e}");
                     }
@@ -694,6 +696,11 @@ pub async fn seed_registry(state: &AppState) {
             enabled_methods: vec!["webvh".to_string()],
             served_domains: Vec::new(),
             protocol_version: "1.0".to_string(),
+            // Config-seeded instances carry no DID (`metadata` is Null).
+            // The health-check loop fills these once the instance
+            // re-registers over DIDComm and records one.
+            advertised_services: None,
+            services_checked_at: None,
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -926,6 +933,7 @@ pub async fn run_health_checks(
     didcomm: &std::sync::OnceLock<DIDCommService>,
     control_did: Option<&str>,
     health_interval_secs: u64,
+    did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
@@ -971,6 +979,26 @@ pub async fn run_health_checks(
             );
             registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now)
                 .await?;
+        }
+    }
+
+    // Refresh the advertised-service badge cache on the same cadence. Runs
+    // after the status sweep so a resolve stall can't delay status updates.
+    // Errors are per-instance and non-fatal — a failed resolve keeps the
+    // previous cache (see `registry::refresh_advertised_services`).
+    for inst in &instances {
+        if inst.did().is_none() {
+            continue;
+        }
+        if let Err(e) =
+            registry::refresh_advertised_services(registry_ks, &inst.instance_id, did_resolver, now)
+                .await
+        {
+            debug!(
+                instance_id = %inst.instance_id,
+                error = %e,
+                "failed to refresh advertised services"
+            );
         }
     }
     Ok(())

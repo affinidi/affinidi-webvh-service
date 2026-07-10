@@ -67,7 +67,9 @@ async fn check_did_host_safety(
 }
 
 // Re-export for convenience
-pub use did_hosting_common::did_ops::{extract_did_id, extract_log_metadata};
+pub use did_hosting_common::did_ops::{
+    extract_did_id, extract_log_metadata, extract_service_types,
+};
 
 // ---------------------------------------------------------------------------
 // JSONL validation (wraps the common version with AppError)
@@ -274,6 +276,10 @@ pub async fn create_did(
         // M-01 sweep, but the REST `request_uri` handler now always
         // resolves a concrete value up front.
         domain: domain.unwrap_or("").to_string(),
+
+        // An empty slot — no log, so no document to read services from.
+        // `publish_did` fills this on first upload.
+        services: None,
     };
 
     let mut batch = state.store.batch();
@@ -437,6 +443,8 @@ pub async fn register_did_atomic(
         // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
         domain: String::new(),
+
+        services: extract_service_types(did_log),
     };
 
     // 4. Single-batch atomic write: record, log content, owner index;
@@ -523,6 +531,14 @@ pub async fn publish_did(
     record.version_count += 1;
     record.did_id = did_id_val.clone();
     record.content_size = new_size;
+
+    // Recompute the badge cache from the document we're about to store.
+    // Unconditional, not a fill-if-empty: a publish can add or drop a
+    // service (e.g. a node that stops advertising DIDComm), so a stale
+    // non-empty cache is just as wrong as a missing one. This doubles as
+    // the standalone-control backfill for legacy `None` records — that
+    // deployment never runs the M-02 sweep, exactly as with `domain` below.
+    record.services = extract_service_types(did_log);
 
     // Backfill `record.domain` from the embedded DID's host on first
     // publish for records that pre-date the `request_uri` resolver fix
@@ -718,6 +734,7 @@ pub async fn list_dids(
                 disabled: record.disabled,
                 method: (!record.method.is_empty()).then(|| record.method.clone()),
                 domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+                services: record.services,
             });
         }
     }
@@ -757,6 +774,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             disabled: record.disabled,
             method: (!record.method.is_empty()).then(|| record.method.clone()),
             domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+            services: record.services,
         });
     }
 
@@ -916,6 +934,9 @@ pub async fn rollback_did(
     record.did_id = new_did_id;
     record.content_size = new_size;
     record.updated_at = now_epoch();
+    // Rolling back can retract a service — if the dropped entry was the
+    // one that added `TSPTransport`, the badge must go with it.
+    record.services = extract_service_types(&truncated);
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1005,6 +1026,45 @@ mod tests_atomic {
             .await
             .expect("create_log_entry");
         jsonl
+    }
+
+    /// Same as [`build_test_did_log`] but the document advertises the
+    /// requested transports, so the `services` cache has something to read.
+    async fn build_test_did_log_with_transports(
+        host_encoded: &str,
+        path: &str,
+        tsp: bool,
+        didcomm: bool,
+    ) -> String {
+        const MED: &str = "did:webvh:QmMED:mediator.example.com";
+        let signing = Secret::generate_ed25519(None, None);
+        let signing_pub_mb = signing
+            .get_public_keymultibase()
+            .expect("signing public key multibase");
+        let doc = build_did_document(
+            host_encoded,
+            path,
+            &signing_pub_mb,
+            &DidDocumentOptions {
+                key_agreement_multibase: None,
+                mediator_endpoint: didcomm.then_some(MED),
+                tsp_endpoint: tsp.then_some(MED),
+            },
+        );
+        let (_scid, jsonl) = create_log_entry(&doc, &signing)
+            .await
+            .expect("create_log_entry");
+        jsonl
+    }
+
+    async fn stored_services(state: &AppState, path: &str) -> Option<Vec<String>> {
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record");
+        record.services
     }
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
@@ -1828,6 +1888,174 @@ mod tests_atomic {
         assert_eq!(
             after_again.domain, "control.test",
             "publish_did backfill must be idempotent — a populated domain stays put"
+        );
+    }
+
+    // ---- service badge cache (DidRecord.services) ----
+
+    /// An empty slot has no document, so `services` must be `None`
+    /// ("unknown"), never `Some(vec![])` ("read it, advertises nothing").
+    #[tokio::test]
+    async fn create_did_leaves_services_unknown() {
+        let (state, _dir) = test_state().await;
+        create_did(
+            &owner_auth("did:example:owner"),
+            &state,
+            Some("slot"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_services(&state, "slot").await, None);
+    }
+
+    /// `publish_did` caches the document's services, in document order
+    /// (TSP before DIDComm, matching the VTA templates).
+    #[tokio::test]
+    async fn publish_did_caches_advertised_services() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "with-transports";
+        let did_log = build_test_did_log_with_transports("control.test", path, true, true).await;
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_services(&state, path).await,
+            None,
+            "precondition: no document yet"
+        );
+
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_services(&state, path).await,
+            Some(vec![
+                "TSPTransport".to_string(),
+                "DIDCommMessaging".to_string()
+            ])
+        );
+    }
+
+    /// A document with no services caches as `Some(vec![])` — we read it and
+    /// it advertises nothing — which is distinct from the `None` above.
+    #[tokio::test]
+    async fn publish_did_caches_empty_services_for_bare_document() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "bare";
+        let did_log = build_test_did_log("scid", "control.test", path).await;
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+
+        assert_eq!(stored_services(&state, path).await, Some(vec![]));
+    }
+
+    /// The cache is *recomputed* on every publish, not filled-if-empty. A
+    /// server that stops advertising TSP must lose the badge — a
+    /// fill-if-empty implementation would keep showing the stale one.
+    #[tokio::test]
+    async fn publish_did_retracts_a_dropped_service() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "drops-tsp";
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        let both = build_test_did_log_with_transports("control.test", path, true, true).await;
+        publish_did(&owner_auth(owner), &state, path, &both)
+            .await
+            .unwrap();
+        assert!(
+            stored_services(&state, path)
+                .await
+                .unwrap()
+                .contains(&"TSPTransport".to_string()),
+            "precondition: TSP advertised"
+        );
+
+        // Re-publish a document that advertises DIDComm only.
+        let didcomm_only =
+            build_test_did_log_with_transports("control.test", path, false, true).await;
+        publish_did(&owner_auth(owner), &state, path, &didcomm_only)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_services(&state, path).await,
+            Some(vec!["DIDCommMessaging".to_string()]),
+            "TSPTransport must be retracted once the document stops advertising it"
+        );
+    }
+
+    /// A legacy record (pre-`services`) self-heals on its next publish —
+    /// this is the standalone-control backfill, since that deployment never
+    /// runs the M-02 migration sweep.
+    #[tokio::test]
+    async fn publish_did_backfills_services_on_legacy_record() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "legacy";
+        let did_log = build_test_did_log_with_transports("control.test", path, true, false).await;
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+        // Force the on-disk record into the legacy shape.
+        let mut rec: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        rec.services = None;
+        state.dids_ks.insert(did_key(path), &rec).await.unwrap();
+
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_services(&state, path).await,
+            Some(vec!["TSPTransport".to_string()])
+        );
+    }
+
+    /// The cached services reach the wire type the DID list renders from,
+    /// without `list_dids` reading any log bytes.
+    #[tokio::test]
+    async fn list_dids_surfaces_cached_services() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "listed";
+        let did_log = build_test_did_log_with_transports("control.test", path, true, true).await;
+
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+        publish_did(&owner_auth(owner), &state, path, &did_log)
+            .await
+            .unwrap();
+
+        let entries = list_dids(&owner_auth(owner), &state, None, None, None)
+            .await
+            .expect("list_dids");
+        let entry = entries
+            .iter()
+            .find(|e| e.mnemonic == path)
+            .expect("published DID in list");
+        assert_eq!(
+            entry.services,
+            Some(vec![
+                "TSPTransport".to_string(),
+                "DIDCommMessaging".to_string()
+            ])
         );
     }
 }

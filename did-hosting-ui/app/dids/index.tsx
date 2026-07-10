@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { ServiceBadges } from "../../components/ServiceBadges";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
@@ -407,6 +408,10 @@ export default function DidList() {
                       )}
                     </View>
                   )}
+                  {/* Services the DID document advertises. Cached on the
+                      record, so this costs no extra request. Renders
+                      nothing for slots with no document yet. */}
+                  <ServiceBadges services={item.services} />
                   {showOwnerInfo && !isOwn && (
                     <Text style={styles.ownerText} numberOfLines={1}>
                       Owner: {item.owner}
