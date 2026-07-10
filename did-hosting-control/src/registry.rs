@@ -1,8 +1,12 @@
 //! Service registry — tracks registered backend service instances.
 
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use did_hosting_common::server::didcomm_profile::resolve_service_types;
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -75,6 +79,32 @@ pub struct ServiceInstance {
     /// detect old daemons that don't speak the assignment protocol).
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
+
+    // ---- Advertised-service cache ----
+    //
+    // What this instance's *DID document* says it speaks — as opposed to
+    // `enabled_methods`, which is what its *binary* was compiled with.
+    // The registry stores only a DID string (in `metadata.did`), so these
+    // are resolved from that document and cached here rather than
+    // re-resolved on every registry list.
+    //
+    // Refreshed on register and on each health check. A daemon does not
+    // run the health-check loop (see CLAUDE.md — the registry is empty in
+    // the self-contained deployment), so in that unusual configuration
+    // these refresh only on re-register.
+    /// `service[].type` values from the instance's DID document, in
+    /// document order. `None` means "not resolved" — no DID recorded, the
+    /// DID wouldn't resolve, or a pre-existing record from before this
+    /// field existed. The UI hides the badge row. `Some(vec![])` means the
+    /// document resolved and advertises no services.
+    #[serde(default)]
+    pub advertised_services: Option<Vec<String>>,
+
+    /// Epoch seconds of the last successful `advertised_services` resolve.
+    /// Lets the UI mark badges stale; `None` alongside a `None`
+    /// `advertised_services` means we have never had a successful resolve.
+    #[serde(default)]
+    pub services_checked_at: Option<u64>,
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -142,6 +172,65 @@ pub async fn list_instances_by_type(
         .into_iter()
         .filter(|i| &i.service_type == service_type)
         .collect())
+}
+
+impl ServiceInstance {
+    /// The instance's DID, as recorded under `metadata.did` by the
+    /// DIDComm registration path. `None` for REST-registered instances,
+    /// which carry no DID and therefore can never have badges.
+    pub fn did(&self) -> Option<&str> {
+        self.metadata.get("did").and_then(|v| v.as_str())
+    }
+}
+
+/// Resolve an instance's DID document and cache the services it advertises.
+///
+/// Called on registration and from the periodic health check, so badges
+/// track a server that adds or drops a transport. A no-op for instances
+/// with no `metadata.did` (the REST registration path records none), and a
+/// no-op when no DID resolver is configured — rather than let
+/// `resolve_service_types` build a throwaway `DIDCacheClient` per instance
+/// per health tick.
+///
+/// **A failed resolve leaves the previous cache in place.** A transient
+/// network blip should not blank a server's badges in the UI; instead
+/// `services_checked_at` stops advancing, which is what lets the UI mark
+/// the badges stale. Only a *successful* resolve overwrites, so a server
+/// that genuinely drops a service still converges once it's reachable.
+pub async fn refresh_advertised_services(
+    registry_ks: &KeyspaceHandle,
+    instance_id: &str,
+    did_resolver: Option<&DIDCacheClient>,
+    now: u64,
+) -> Result<(), AppError> {
+    let Some(resolver) = did_resolver else {
+        return Ok(());
+    };
+    let Some(mut instance) = get_instance(registry_ks, instance_id).await? else {
+        return Ok(());
+    };
+    let Some(did) = instance.did().map(str::to_string) else {
+        return Ok(());
+    };
+
+    let Some(services) = resolve_service_types(&did, Some(resolver)).await else {
+        debug!(
+            instance_id = %instance_id,
+            did = %did,
+            "advertised-service refresh failed to resolve; keeping previous cache"
+        );
+        return Ok(());
+    };
+
+    debug!(
+        instance_id = %instance_id,
+        did = %did,
+        services = ?services,
+        "advertised services refreshed"
+    );
+    instance.advertised_services = Some(services);
+    instance.services_checked_at = Some(now);
+    register_instance(registry_ks, &instance).await
 }
 
 /// Update the status and health check timestamp of an instance.
@@ -278,11 +367,15 @@ mod tests {
             enabled_methods: vec!["webvh".into(), "web".into()],
             served_domains: vec!["a.example".into()],
             protocol_version: "1.1".into(),
+            advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
+            services_checked_at: Some(1234),
         };
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.enabled_methods, original.enabled_methods);
         assert_eq!(parsed.served_domains, original.served_domains);
+        assert_eq!(parsed.advertised_services, original.advertised_services);
+        assert_eq!(parsed.services_checked_at, original.services_checked_at);
         assert_eq!(parsed.protocol_version, original.protocol_version);
     }
 

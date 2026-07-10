@@ -162,6 +162,78 @@ pub fn build_did_document(
     doc
 }
 
+// ---------------------------------------------------------------------------
+// Service-type introspection
+// ---------------------------------------------------------------------------
+
+/// HTTP DID-log hosting endpoint (`did-host-http*` templates).
+pub const SERVICE_TYPE_WEBVH_HOSTING: &str = "WebVHHosting";
+/// Legacy read-only alias for [`SERVICE_TYPE_WEBVH_HOSTING`]. Never written;
+/// accepted on read per `docs/did-hosting-client-crate-spec.md` §5.
+pub const SERVICE_TYPE_WEBVH_HOSTING_LEGACY: &str = "WebVHHostingService";
+/// Trust Spanning Protocol transport (`#tsp`).
+pub const SERVICE_TYPE_TSP: &str = "TSPTransport";
+/// DIDComm v2 transport (`#vta-didcomm`).
+pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
+
+/// Extract the `type` of every entry in a DID document's `service` array.
+///
+/// The single canonical reader for "what does this document advertise",
+/// shared by the DID-list badge cache, the registry's per-instance
+/// capability probe, and the control plane's advertised-vs-enabled check.
+/// It is the read-side counterpart to [`build_did_document`], which writes
+/// the same services.
+///
+/// Handles both shapes the ecosystem's templates emit: a bare string
+/// (`"type": "TSPTransport"`, the webvh `did-host-*` templates) and a
+/// single-element array (`"type": ["DIDCommMessaging"]`, `ai-agent-peer`).
+/// A service carrying several types contributes all of them.
+///
+/// Order is the document's own — the webvh templates render hosting, then
+/// TSP, then DIDComm, so callers that surface the first match inherit the
+/// same TSP-over-DIDComm preference [`crate::server::didcomm_profile::resolve_transport`]
+/// applies. Duplicates are collapsed, keeping first occurrence.
+///
+/// Returns an empty vector when `service` is absent, not an array, or
+/// contains no usable `type`. Callers that need to distinguish "no services"
+/// from "document unavailable" should wrap the result in an `Option`
+/// themselves — see `DidRecord::services`.
+pub fn service_types_from_doc(doc: &serde_json::Value) -> Vec<String> {
+    let Some(services) = doc.get("service").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |t: &str| {
+        if !t.is_empty() && !out.iter().any(|seen| seen == t) {
+            out.push(t.to_string());
+        }
+    };
+
+    for svc in services {
+        match svc.get("type") {
+            Some(serde_json::Value::String(t)) => push(t),
+            Some(serde_json::Value::Array(types)) => {
+                for t in types.iter().filter_map(|t| t.as_str()) {
+                    push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// True when `types` contains a service advertising the TSP transport.
+pub fn advertises_tsp(types: &[String]) -> bool {
+    types.iter().any(|t| t == SERVICE_TYPE_TSP)
+}
+
+/// True when `types` contains a service advertising the DIDComm transport.
+pub fn advertises_didcomm(types: &[String]) -> bool {
+    types.iter().any(|t| t == SERVICE_TYPE_DIDCOMM)
+}
+
 /// Create a WebVH log entry from a DID document and signing secret.
 ///
 /// Returns `(scid, jsonl)` where:
@@ -427,5 +499,100 @@ mod tests {
             service[1]["serviceEndpoint"][0]["uri"],
             "did:webvh:QmMED:mediator.example.com"
         );
+    }
+
+    // ---- service_types_from_doc ----
+
+    #[test]
+    fn service_types_reads_bare_string_and_array_type_shapes() {
+        // `did-host-*` templates emit a bare string; `ai-agent-peer` emits
+        // a single-element array. Both must be understood.
+        let doc = serde_json::json!({
+            "service": [
+                { "id": "#webvh-hosting", "type": "WebVHHosting" },
+                { "id": "#auth", "type": ["Authentication"] },
+            ]
+        });
+        assert_eq!(
+            service_types_from_doc(&doc),
+            vec!["WebVHHosting".to_string(), "Authentication".to_string()]
+        );
+    }
+
+    #[test]
+    fn service_types_preserves_document_order_and_dedupes() {
+        let doc = serde_json::json!({
+            "service": [
+                { "type": "TSPTransport" },
+                { "type": "DIDCommMessaging" },
+                { "type": "TSPTransport" },
+            ]
+        });
+        // TSP first (the canonical template order) and the repeat collapses.
+        assert_eq!(
+            service_types_from_doc(&doc),
+            vec!["TSPTransport".to_string(), "DIDCommMessaging".to_string()]
+        );
+    }
+
+    #[test]
+    fn service_types_handles_multi_type_service() {
+        let doc = serde_json::json!({
+            "service": [{ "type": ["TSPTransport", "DIDCommMessaging"] }]
+        });
+        let types = service_types_from_doc(&doc);
+        assert!(advertises_tsp(&types));
+        assert!(advertises_didcomm(&types));
+    }
+
+    #[test]
+    fn service_types_absent_or_malformed_yields_empty() {
+        assert!(service_types_from_doc(&serde_json::json!({})).is_empty());
+        // `service` present but not an array.
+        assert!(service_types_from_doc(&serde_json::json!({ "service": "nope" })).is_empty());
+        // Entries with no usable `type` contribute nothing.
+        let doc =
+            serde_json::json!({ "service": [{ "id": "#x" }, { "type": 42 }, { "type": "" }] });
+        assert!(service_types_from_doc(&doc).is_empty());
+    }
+
+    /// The read side must agree with the write side: whatever
+    /// `build_did_document` emits is what `service_types_from_doc` reports.
+    #[test]
+    fn service_types_round_trips_build_did_document() {
+        let doc = build_did_document(
+            "example.com",
+            "alice",
+            "z6MkTest",
+            &DidDocumentOptions {
+                key_agreement_multibase: None,
+                mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+                tsp_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+            },
+        );
+        let types = service_types_from_doc(&doc);
+        // TSP before DIDComm, matching the canonical template order.
+        assert_eq!(
+            types,
+            vec!["TSPTransport".to_string(), "DIDCommMessaging".to_string()]
+        );
+        assert!(advertises_tsp(&types));
+        assert!(advertises_didcomm(&types));
+    }
+
+    #[test]
+    fn service_types_empty_when_document_advertises_none() {
+        let doc = build_did_document(
+            "example.com",
+            "alice",
+            "z6MkTest",
+            &DidDocumentOptions {
+                key_agreement_multibase: None,
+                mediator_endpoint: None,
+                tsp_endpoint: None,
+            },
+        );
+        assert!(service_types_from_doc(&doc).is_empty());
+        assert!(!advertises_tsp(&service_types_from_doc(&doc)));
     }
 }

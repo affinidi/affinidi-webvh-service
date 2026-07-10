@@ -587,6 +587,13 @@ pub struct DidListEntry {
     /// for everything M-01 has run over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// Cached `service[].type` values from the DID document, straight
+    /// off `DidRecord::services`. Present so the list can render service
+    /// badges without reading log bytes. `None` for slots with no
+    /// document yet and for records M-02 hasn't swept; the UI hides the
+    /// badge row in both cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -732,6 +739,7 @@ mod tests {
             disabled: false,
             method: None,
             domain: None,
+            services: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
@@ -759,6 +767,7 @@ mod tests {
             disabled: false,
             method: None,
             domain: None,
+            services: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -777,6 +786,11 @@ mod tests {
             disabled: false,
             method: Some("webvh".to_string()),
             domain: Some("host.example".to_string()),
+            services: Some(vec![
+                "WebVHHosting".to_string(),
+                "TSPTransport".to_string(),
+                "DIDCommMessaging".to_string(),
+            ]),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: DidListEntry = serde_json::from_str(&json).unwrap();
@@ -784,6 +798,27 @@ mod tests {
         assert_eq!(back.version_count, 3);
         assert_eq!(back.did_id, Some("did:webvh:abc:host:path".to_string()));
         assert_eq!(back.total_resolves, 99);
+        assert_eq!(
+            back.services,
+            Some(vec![
+                "WebVHHosting".to_string(),
+                "TSPTransport".to_string(),
+                "DIDCommMessaging".to_string(),
+            ])
+        );
+    }
+
+    /// A record written before the `services` field existed must still
+    /// deserialize, landing on `None` — "not yet computed", not "no services".
+    #[test]
+    fn did_list_entry_legacy_json_has_no_services() {
+        let legacy = r#"{
+            "mnemonic": "test", "owner": "did:example:owner",
+            "createdAt": 0, "updatedAt": 0, "versionCount": 1,
+            "didId": null, "totalResolves": 0
+        }"#;
+        let back: DidListEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.services, None);
     }
 
     #[test]

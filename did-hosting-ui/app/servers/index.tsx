@@ -33,6 +33,7 @@ import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { ServiceBadges } from "../../components/ServiceBadges";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
 import type { ServiceInstance } from "../../lib/api";
@@ -289,6 +290,24 @@ function ServerCard({
           <Text style={styles.cardUrl} numberOfLines={1}>
             {instance.url}
           </Text>
+          {/* Transports/services this server's DID document advertises —
+              resolved and cached at register + health check. Distinct from
+              `enabledMethods` below, which is what its binary supports. */}
+          <View style={styles.servicesRow}>
+            <Text style={styles.servicesLabel}>Advertises</Text>
+            {instance.advertisedServices ? (
+              <ServiceBadges
+                services={instance.advertisedServices}
+                emptyLabel="no services in DID document"
+              />
+            ) : (
+              <Text style={styles.servicesUnknown}>
+                {instance.metadata?.did
+                  ? "DID not resolved yet"
+                  : "no DID recorded"}
+              </Text>
+            )}
+          </View>
           <View style={styles.metaRow}>
             {instance.enabledMethods.map((m) => (
               <View key={m} style={styles.methodBadge}>
@@ -507,6 +526,26 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontSize: 12,
     color: colors.textSecondary,
+  },
+  servicesRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+    flexWrap: "wrap",
+  },
+  servicesLabel: {
+    fontFamily: fonts.medium,
+    fontSize: 11,
+    color: colors.textTertiary,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  servicesUnknown: {
+    fontFamily: fonts.regular,
+    fontSize: 11,
+    color: colors.textTertiary,
+    fontStyle: "italic",
   },
   metaRow: {
     flexDirection: "row",

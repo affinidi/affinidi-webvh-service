@@ -289,6 +289,7 @@ async fn resolve_side_safety_blocks_cross_domain_and_disabled_domain() {
         deleted_at: None,
         method: "webvh".into(),
         domain: "domain-a.example".into(),
+        services: None,
     };
     state
         .dids_ks
@@ -527,6 +528,7 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
         deleted_at: None,
         method: "webvh".into(),
         domain: String::new(), // legacy state
+        services: None,        // legacy state
     };
     state
         .dids_ks

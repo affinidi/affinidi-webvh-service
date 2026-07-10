@@ -229,11 +229,18 @@ export default function Dashboard() {
         <ActivityIndicator color={colors.accent} size="large" />
       )}
 
-      {/* Service topology overview (standalone mode only) */}
-      {!isDaemon && (
+      {/* Control-plane transports + service topology. Rendered in both
+          modes: a daemon still has its own DID document advertising
+          DIDComm / TSP, and the operator needs to see that here. The
+          panel itself decides how much registry detail to show.
+          Admin-only — `GET /api/services/overview` is behind AdminAuth,
+          so rendering this for anyone else just yields a 403 error box. */}
+      {isAdmin && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Service Topology</Text>
-          <ServiceOverviewPanel />
+          <Text style={styles.sectionTitle}>
+            {isDaemon ? "Control Plane" : "Service Topology"}
+          </Text>
+          <ServiceOverviewPanel isDaemon={isDaemon} />
         </View>
       )}
 

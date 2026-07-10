@@ -171,6 +171,7 @@ mod tests {
             deleted_at: None,
             method: "webvh".into(),
             domain: domain.into(),
+            services: None,
         }
     }
 

@@ -90,6 +90,8 @@ fn pre_t12_record(mnemonic: &str, did_id: Option<&str>) -> DidRecord {
         method: "webvh".into(),
         // Empty domain — what M-01 fills in.
         domain: String::new(),
+        // Absent services — what M-02 fills in.
+        services: None,
     }
 }
 

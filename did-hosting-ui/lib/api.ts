@@ -28,6 +28,11 @@ export interface DidRecord {
   method?: DidMethod;
   /** Hosting domain. Filled by M-01 on legacy records. */
   domain?: string;
+  /** `service[].type` values cached off the DID document, in document
+   *  order. Absent for slots with no document yet and for legacy records
+   *  M-02 hasn't swept — render no badges in both cases. An empty array
+   *  is meaningful: the document was read and advertises nothing. */
+  services?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +147,13 @@ export interface ServiceInstance {
   enabledMethods: string[];
   servedDomains: string[];
   protocolVersion: string;
+  /** `service[].type` values resolved from this instance's DID document.
+   *  Distinct from `enabledMethods`, which is what its binary supports.
+   *  Absent when the instance has no recorded DID (REST/config
+   *  registration) or the DID has never resolved. */
+  advertisedServices?: string[];
+  /** Epoch seconds of the last successful resolve of `advertisedServices`. */
+  servicesCheckedAt?: number;
 }
 
 export interface LogMetadata {
@@ -261,8 +273,17 @@ export interface ControlInfo {
   version: string;
   serverDid: string | null;
   publicUrl: string | null;
+  /** Transport turned on in config (`features.didcomm`). */
   didcommEnabled: boolean;
+  /** Transport turned on in config (`features.tsp`). */
   tspEnabled: boolean;
+  /** What the control plane's own DID document advertises to peers.
+   *  May disagree with the `*Enabled` flags above — enabled-but-not-
+   *  advertised means peers can't reach us on that transport, and
+   *  advertised-but-not-enabled means they'll try and fail. Absent when
+   *  no control DID is configured or it wouldn't resolve, in which case
+   *  the comparison can't be made and the UI says so. */
+  advertisedServices?: string[];
   totalLocalDids: number;
   /** DID methods compiled into this control-plane binary (from
    *  `did_hosting_common::method::enabled_methods`). Empty when the
@@ -283,6 +304,9 @@ export interface ServiceInfo {
   registeredAt: number;
   did: string | null;
   stats: ServiceStats | null;
+  /** See `ServiceInstance.advertisedServices`. */
+  advertisedServices?: string[];
+  servicesCheckedAt?: number;
 }
 
 export interface ServiceStats {
@@ -348,6 +372,9 @@ export interface ControlPlaneConfig {
   didHostingUrl: string | null;
   didcommEnabled: boolean;
   tspEnabled: boolean;
+  /** `service[].type` from the control plane's own DID document. See
+   *  `ControlInfo.advertisedServices` for the enabled-vs-advertised split. */
+  advertisedServices?: string[];
   restApiEnabled: boolean;
   listenAddress: string;
   vtaUrl: string | null;

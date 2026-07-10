@@ -63,6 +63,48 @@ Nodes with no mediator (HTTP-only) speak neither DIDComm nor TSP over the
 mediator; they serve DID resolution and the HTTPS Trust-Task endpoint
 only.
 
+## Surfacing transports in the controller UI
+
+Two different facts get displayed, and they are not interchangeable:
+
+- **Enabled** — `features.didcomm` / `features.tsp`. What the operator
+  turned on in config; what this process *listens* for.
+- **Advertised** — the `service[].type` entries in the node's own DID
+  document. What peers *see* when they resolve it, and therefore what
+  they will try.
+
+The dashboard's Control Plane card shows both per transport and warns when
+they disagree, because each direction is a distinct fault:
+
+- *enabled but not advertised* — peers never discover the transport and
+  will never use it;
+- *advertised but not enabled* — peers try it and get nothing. This is
+  exactly the state the Configuration note above describes when the
+  wizard's TSP opt-out is taken against a template that advertises
+  `TSPTransport` regardless, and is why leaving TSP on is recommended.
+
+When the control plane's own DID cannot be resolved (or no DID resolver is
+configured) the comparison is impossible; the UI reports "unknown" rather
+than implying agreement. `GET /api/config` and `GET /api/services/overview`
+omit `advertisedServices` entirely in that case — an absent field means
+"not known", never "advertises nothing".
+
+Elsewhere the same `service[].type` values render as badges — `Hosting`
+(`WebVHHosting`), `TSP`, `DIDComm`, and `Other` for anything else:
+
+- **DID list** — read from `DidRecord.services`, a cache refreshed by every
+  write path that touches the DID log, so listing costs no log reads.
+  Legacy records are swept by the `M-02` migration on server/daemon boot,
+  and self-heal on their next publish on standalone control.
+- **Servers list** — read from `ServiceInstance.advertised_services`,
+  resolved from each instance's DID document at registration and refreshed
+  by the registry health-check loop.
+
+There is deliberately **no VTA badge**: no template in `vta-sdk`, and
+nothing in `build_did_document`, emits a VTA service type. "VTA" names a
+provisioning mode, not a service. The `#vta-didcomm` service *id* has type
+`DIDCommMessaging` and so renders as the DIDComm badge.
+
 ## Unified dispatch
 
 Both TSP and the DIDComm trust-task envelope route inbound
