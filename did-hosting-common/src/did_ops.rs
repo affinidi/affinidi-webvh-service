@@ -81,10 +81,11 @@ pub struct DidRecord {
     ///
     /// Kept fresh by every write path that touches `content_log_key`
     /// (`register_did_atomic`, `publish_did`, the server's sync-from-control
-    /// import, bootstrap). `M-02` sweeps legacy records on server/daemon
-    /// boot; standalone control has no migration runner, so `publish_did`
-    /// self-heals `None` on the next publish — the same two-pronged shape
-    /// `domain` uses.
+    /// import, bootstrap). `M-02` sweeps legacy records at boot on all three
+    /// deployments — server and daemon via the full migration registry,
+    /// standalone control via a runner carrying M-02 alone. `publish_did`
+    /// additionally self-heals a `None` it finds, so a record the sweep
+    /// deferred still converges.
     #[serde(default)]
     pub services: Option<Vec<String>>,
 }

@@ -31,14 +31,22 @@
 //! That is the correct terminal state for them: there is no document, and
 //! `publish_did` will fill the cache on first upload.
 //!
-//! ## Coverage caveat
+//! ## Who runs it
 //!
-//! The migration runner is invoked by `did-hosting-server` and
-//! `did-hosting-daemon` at boot, but **not** by a standalone
-//! `did-hosting-control`. Standalone control instead self-heals a `None`
-//! on the next `publish_did`. This is the same two-pronged arrangement
-//! `domain` uses (M-01 sweep + `publish_did` backfill) — see
-//! `did-hosting-control/src/did_ops.rs`.
+//! All three deployments, by two different routes:
+//!
+//! - `did-hosting-server` and `did-hosting-daemon` run the full
+//!   [`super::registry`] at boot, which includes this migration.
+//! - A standalone `did-hosting-control` has historically never invoked the
+//!   migration runner at all. Rather than switch it on wholesale — which
+//!   would also run `M-01` against stores that have never seen it, filling
+//!   `domain` from the system-default tier as a side effect — `server.rs`
+//!   constructs a runner carrying **only** this migration. It is safe to run
+//!   unattended because it writes nothing but `services`, a field read only
+//!   by the UI.
+//!
+//! `publish_did` additionally self-heals a `None` it encounters, so a record
+//! this sweep deferred (unparseable log) still converges on its next publish.
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};

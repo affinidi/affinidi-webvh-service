@@ -535,9 +535,8 @@ pub async fn publish_did(
     // Recompute the badge cache from the document we're about to store.
     // Unconditional, not a fill-if-empty: a publish can add or drop a
     // service (e.g. a node that stops advertising DIDComm), so a stale
-    // non-empty cache is just as wrong as a missing one. This doubles as
-    // the standalone-control backfill for legacy `None` records — that
-    // deployment never runs the M-02 sweep, exactly as with `domain` below.
+    // non-empty cache is just as wrong as a missing one. Also self-heals a
+    // legacy `None` if the M-02 boot sweep hasn't reached this record.
     record.services = extract_service_types(did_log);
 
     // Backfill `record.domain` from the embedded DID's host on first
@@ -1999,9 +1998,10 @@ mod tests_atomic {
         );
     }
 
-    /// A legacy record (pre-`services`) self-heals on its next publish —
-    /// this is the standalone-control backfill, since that deployment never
-    /// runs the M-02 migration sweep.
+    /// A legacy record (pre-`services`) self-heals on its next publish. The
+    /// M-02 boot sweep normally gets there first; this is the belt-and-braces
+    /// path for a record the sweep deferred (unparseable log) or one written
+    /// before the sweep ran.
     #[tokio::test]
     async fn publish_did_backfills_services_on_legacy_record() {
         let (state, _dir) = test_state().await;

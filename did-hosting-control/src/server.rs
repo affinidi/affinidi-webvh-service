@@ -358,6 +358,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
+    backfill_service_badges(&state.store).await;
+
     // Seed registry from static config
     seed_registry(&state).await;
 
@@ -661,6 +663,44 @@ pub async fn start_didcomm_service(
         "messaging service started for {control_did}"
     );
     Ok(Some(svc))
+}
+
+// ---------------------------------------------------------------------------
+// Service-badge backfill
+// ---------------------------------------------------------------------------
+
+/// Populate the per-DID service-badge cache (`DidRecord.services`) for records
+/// written before that field existed.
+///
+/// Runs **only** `M-02`, not the full [`migrations::registry`]. The standalone
+/// control plane has never invoked the migration runner, so a store here may
+/// never have seen `M-01` either — switching the whole set on as a side effect
+/// of adding badges would fill `domain` from the system-default tier on records
+/// that have gone their entire life without it. That's a separate decision with
+/// its own blast radius. `M-02` writes nothing but `services`, a field read only
+/// by the UI, so it is safe to run unattended.
+///
+/// Idempotent and marker-gated in the `meta` keyspace: one pass over the DID
+/// logs on the first boot after upgrade, a no-op on every boot after.
+///
+/// Failure is non-fatal. The daemon exits when its migrations fail, but missing
+/// badges are cosmetic and must not stop the control plane from starting —
+/// `publish_did` self-heals each record on its next publish regardless.
+pub async fn backfill_service_badges(store: &Store) {
+    use did_hosting_common::server::migrations::{M02CacheDidRecordServices, MigrationRunner};
+
+    let runner = MigrationRunner::new(vec![Arc::new(M02CacheDidRecordServices)]);
+    match runner.run_pending(store).await {
+        Ok(summary) => info!(
+            applied = ?summary.applied,
+            skipped = ?summary.skipped,
+            "service-badge backfill complete"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "service-badge backfill failed; DID badges may be missing until each DID is next published"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
