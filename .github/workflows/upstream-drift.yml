@@ -1,0 +1,55 @@
+# Upstream drift canary.
+#
+# Every job in ci.yml passes `--locked`, so CI only ever builds the exact
+# dependency set recorded in Cargo.lock. That is what we want for PR checks:
+# a green PR should mean "this diff is good", not "nobody published a bad
+# crate in the last hour".
+#
+# The cost is a blind spot. `cargo install` — how operators actually install
+# these binaries — ignores Cargo.lock and re-resolves to the newest
+# semver-compatible versions. Our upstreams (vti-common, vta-sdk) have shipped
+# source-breaking changes in *patch* releases: new public struct fields, a new
+# trait parameter. Those slip straight past a `--locked` pipeline and surface
+# for the first time on an operator's machine (see PR #74).
+#
+# This job closes the gap by resolving the way `cargo install` does. It runs on
+# a schedule rather than on PRs, so upstream churn shows up as its own alert
+# instead of failing somebody's unrelated review.
+#
+# When it goes red, the upstream has drifted. Reproduce with
+# `cargo update && cargo check --workspace --all-targets`, then either absorb
+# the change or raise the floor in the affected Cargo.toml.
+name: Upstream drift
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unlocked-resolve:
+    name: cargo check (unlocked resolve)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      # Deliberately NOT cached: the cache is keyed on Cargo.lock, which this
+      # job rewrites. A hit would defeat the point of the check.
+      - name: Re-resolve dependencies to newest semver-compatible versions
+        run: cargo update
+
+      - name: Show what moved
+        run: git --no-pager diff --stat Cargo.lock
+
+      # No `RUSTFLAGS: -D warnings` here, unlike ci.yml. A new upstream
+      # deprecation should not page anyone; only a genuine compile failure —
+      # the thing that breaks `cargo install` — should turn this red.
+      - name: Build workspace against the re-resolved graph
+        run: cargo check --workspace --all-targets
