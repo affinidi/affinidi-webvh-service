@@ -261,6 +261,7 @@ mod tests {
             challenge: String::new(),
             state: SessionState::Authenticated,
             created_at: 0,
+            last_seen: 0,
             refresh_token: None,
             refresh_expires_at: None,
             tee_attested: false,
@@ -268,6 +269,7 @@ mod tests {
             session_pubkey_b58btc: None,
             amr: Vec::new(),
             acr: String::new(),
+            acr_expires_at: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         session_id
@@ -345,6 +347,7 @@ mod tests {
             challenge: "abc".into(),
             state: SessionState::ChallengeSent,
             created_at: 0,
+            last_seen: 0,
             refresh_token: None,
             refresh_expires_at: None,
             tee_attested: false,
@@ -352,6 +355,7 @@ mod tests {
             session_pubkey_b58btc: None,
             amr: Vec::new(),
             acr: String::new(),
+            acr_expires_at: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue(&state, &session_id, "owner", "tok");

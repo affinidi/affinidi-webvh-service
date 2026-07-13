@@ -71,6 +71,7 @@ impl AuthBackend for DidHostingControlAuthBackend {
         acr: &str,
         _tee_attested: bool,
         ttl_secs: u64,
+        jti: &str,
     ) -> Result<String, Self::Error> {
         // did-hosting's Claims has no `contexts` or `tee_attested`
         // fields — both args are accepted by the canonical
@@ -84,6 +85,10 @@ impl AuthBackend for DidHostingControlAuthBackend {
         );
         claims.amr = amr.to_vec();
         claims.acr = acr.to_string();
+        // Override `new_claims`' own random `jti`: the caller pins this nonce
+        // to the session's `token_id`, and the `AuthClaims` extractor rejects
+        // any token whose `jti` doesn't match it.
+        claims.jti = jti.to_string();
         self.jwt_keys
             .encode(&claims)
             .map_err(|e| AppError::Internal(format!("jwt encode failed: {e:?}")))

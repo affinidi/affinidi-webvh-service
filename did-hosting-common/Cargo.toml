@@ -102,11 +102,14 @@ vta-sdk = { workspace = true }
 # The git-pinned rev that lived here through the pre-publish
 # window is gone.
 #
-# 0.11.x re-pins onto vta-sdk ^0.18 + affinidi-tdk ^0.8 — it is the
-# lever that unlocks the vta-sdk 0.18 (TSP) upgrade. Keep in lockstep
+# 0.11.4 re-pins onto vta-sdk ^0.19 + affinidi-tdk ^0.8. Keep in lockstep
 # with the workspace `vta-sdk` pin: a mismatched pair resolves to two
 # vta-sdk copies and fails to compile (E0308 on the shared auth types).
-vti-common = { version = "0.11", default-features = false }
+# The floor is 0.11.4, not 0.11: 0.11.3 added the `Session.last_seen` /
+# `acr_expires_at` fields we now construct, and 0.11.4 added the `jti`
+# parameter to `AuthBackend::mint_access_token` — an unlocked build
+# against an earlier 0.11.x will not compile.
+vti-common = { version = "0.11.4", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)

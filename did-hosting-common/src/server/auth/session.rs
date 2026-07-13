@@ -374,6 +374,7 @@ pub async fn create_authenticated_session(
         challenge: String::new(),
         state: SessionState::Authenticated,
         created_at: now_epoch(),
+        last_seen: now_epoch(),
         refresh_token: Some(refresh_token.clone()),
         refresh_expires_at: Some(refresh_expires_at),
         tee_attested: false,
@@ -381,6 +382,10 @@ pub async fn create_authenticated_session(
         session_pubkey_b58btc,
         amr: amr.clone(),
         acr: acr.clone(),
+        // An elevated `acr` arriving via `amr_acr_override` carries no lapse
+        // deadline: our step-up is bounded by the access token's TTL, not by
+        // vti-common's read-time downgrade in `resolve_did_session`.
+        acr_expires_at: None,
     };
 
     store_session(sessions, &session).await?;

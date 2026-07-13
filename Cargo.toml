@@ -28,8 +28,8 @@ rust-version = "1.95.0"
 [workspace.dependencies]
 
 # Affinidi Trust Development Kit
-# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.18 and vti-common
-# 0.11 both depend on affinidi-tdk ^0.8, so all three resolve to a single
+# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.19 and vti-common
+# 0.11.4 both depend on affinidi-tdk ^0.8, so all three resolve to a single
 # affinidi-tdk copy. Drop back to 0.7 only if vta-sdk/vti-common ever re-pin.
 affinidi-tdk = "0.8"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
@@ -114,8 +114,8 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK — 0.18 on crates.io, bumped in lockstep with vti-common 0.11.2
-# (which re-pins onto vta-sdk ^0.18 + affinidi-tdk ^0.8). Carries the canonical SIOPv2 /
+# VTA SDK — 0.19 on crates.io, bumped in lockstep with vti-common 0.11.4
+# (which re-pins onto vta-sdk ^0.19 + affinidi-tdk ^0.8). Carries the canonical SIOPv2 /
 # RFC 6749 wire types (`protocols::auth::{Session, TokenBundle,
 # AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`) that the
 # cross-repo auth-architecture work introduced. vta-sdk and vti-common
@@ -126,7 +126,7 @@ didwebvh-rs = "0.5"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.18", features = [
+vta-sdk = { version = "0.19", features = [
   "session",
   "provision-integration",
   "provision-client",

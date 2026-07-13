@@ -83,6 +83,43 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
     (state, dir)
 }
 
+/// `AuthBackend::mint_access_token` must stamp the `jti` the caller supplies,
+/// not the random one `JwtKeys::new_claims` generates for itself.
+///
+/// The canonical handlers mint a `token_id`, hand it to the backend as `jti`,
+/// and pin it to the session row. `AuthClaims` then rejects any token whose
+/// `jti` differs from the session's `token_id`. So a backend that ignores the
+/// argument still compiles, still returns a well-formed JWT — and every token
+/// it mints is rejected as revoked on the holder's very next request.
+#[tokio::test]
+async fn mint_access_token_stamps_the_supplied_jti() {
+    let (state, _dir) = make_state().await;
+    let backend =
+        did_hosting_server::auth::DidHostingServerAuthBackend::from_state(&state).expect("backend");
+
+    let token = backend
+        .mint_access_token(
+            "did:webvh:test:alice",
+            "session-jti-test",
+            &did_hosting_server::acl::Role::Owner,
+            &[],
+            &["did".to_string()],
+            "aal1",
+            false,
+            300,
+            "the-callers-token-id",
+        )
+        .await
+        .expect("mint");
+
+    let jwt_keys = state.jwt_keys.as_ref().expect("jwt keys");
+    let claims = jwt_keys.decode(&token).expect("decode minted token");
+    assert_eq!(
+        claims.jti, "the-callers-token-id",
+        "minted token must carry the caller's jti, else AuthClaims treats it as revoked"
+    );
+}
+
 #[tokio::test]
 async fn refresh_rejects_signer_did_mismatch() {
     let (state, _dir) = make_state().await;
@@ -102,11 +139,13 @@ async fn refresh_rejects_signer_did_mismatch() {
         challenge: String::new(),
         state: SessionState::Authenticated,
         created_at: 0,
+        last_seen: 0,
         refresh_token: Some(refresh_token.to_string()),
         refresh_expires_at: Some(u64::MAX),
         tee_attested: false,
         amr: vec!["did".to_string()],
         acr: "aal1".to_string(),
+        acr_expires_at: None,
         token_id: None,
         session_pubkey_b58btc: None,
     };
