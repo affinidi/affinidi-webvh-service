@@ -76,6 +76,20 @@ interface VtaWalletProvider {
   signTrustTask?(
     params: VtaWalletSignTrustTaskParams,
   ): Promise<VtaWalletSignTrustTaskResult>;
+  /** Propose a Trust Task for the user's VTA to execute.
+   *
+   *  The generic relay. We supply a type URI and a payload and nothing else:
+   *  the extension mints the envelope inside its own trust boundary and stamps
+   *  the origin the browser attested. We never author an envelope for the
+   *  wallet to counter-sign — a wallet that signed what we wrote would be
+   *  vouching for a document it never checked, and we are the least trusted
+   *  party in this picture.
+   *
+   *  Resolves with whatever the VTA replied, INCLUDING a refusal. */
+  requestTask?(params: {
+    type: string;
+    payload: Record<string, unknown>;
+  }): Promise<Record<string, unknown>>;
   /** Enumerate vault entries pinned to a given DID / secret kind. */
   vaultList?(params: {
     targetDid?: string;
@@ -492,5 +506,118 @@ export async function loginWithWalletProxy(
       },
       totalMs,
     },
+  };
+}
+
+
+// ─── Delegated task execution (requestTask) ───────────────────────────
+//
+// The point of this path: we do not hold the DID's update key and we never
+// will. We propose an edit; the user's VTA decides whether to make it, dry-runs
+// its own update handler to work out what the edit would actually do, and — if
+// the user's policy says so — asks a human on another device to approve it.
+//
+// This is why the hosting service needs no changes at all. It already verifies
+// the proof chain on whatever log it is handed; it never cared who submitted.
+// The trust boundary was drawn in the right place before any of this existed.
+
+/** True iff the wallet exposes the generic task relay. */
+export function isWalletTaskRelayAvailable(): boolean {
+  return isWalletAvailable() && typeof window.vtaWallet?.requestTask === "function";
+}
+
+export const WEBVH_DIDS_UPDATE_1_0 = "https://trusttasks.org/spec/webvh/dids/update/1.0";
+
+/** The VTA needs a human to approve this before it will run it. */
+export interface TaskConsentRequired {
+  kind: "consentRequired";
+  /**
+   * The salted digest of the exact payload awaiting approval.
+   *
+   * We display a prefix of this, and the approver's device displays the same
+   * prefix. The user compares them. That comparison is the only check in the
+   * whole design that survives a compromised consent surface — every other
+   * check assumes an honest device, and a device that is lying to the user can
+   * satisfy all of them. Only moving the comparison into the user's head,
+   * across two screens neither of which the attacker controls both of, catches
+   * it.
+   *
+   * Which is also why this must never be reduced to a "waiting for approval…"
+   * spinner. The code is the ceremony.
+   */
+  payloadDigest: string;
+  approverSet: string;
+  minApprovals: number;
+}
+
+export interface TaskAccepted {
+  kind: "accepted";
+  result: Record<string, unknown>;
+}
+
+export type RequestTaskOutcome = TaskAccepted | TaskConsentRequired;
+
+/** How much of the digest a human is asked to compare. */
+export const DIGEST_PREFIX_LEN = 6;
+
+export function digestPrefix(payloadDigest: string): string {
+  return payloadDigest.slice(0, DIGEST_PREFIX_LEN);
+}
+
+/**
+ * Ask the user's VTA to update a DID document.
+ *
+ * We send the document we want and the version we based it on. That
+ * `expectedVersionId` is not a formality: a human in the approval loop makes the
+ * window minutes wide, so the log really can move underneath us, and without it
+ * the VTA would happily apply our edit on top of someone else's — a lost update
+ * that every signature in the chain would still verify.
+ */
+export async function requestDidUpdate(args: {
+  did: string;
+  document: Record<string, unknown>;
+  expectedVersionId?: string;
+}): Promise<RequestTaskOutcome> {
+  const wallet = window.vtaWallet;
+  if (!wallet?.requestTask) {
+    throw new Error("This wallet does not support delegated task execution.");
+  }
+
+  const reply = await wallet.requestTask({
+    type: WEBVH_DIDS_UPDATE_1_0,
+    payload: {
+      did: args.did,
+      document: args.document,
+      ...(args.expectedVersionId ? { expectedVersionId: args.expectedVersionId } : {}),
+    },
+  });
+
+  const consent = readConsentRequired(reply);
+  if (consent) return consent;
+  return { kind: "accepted", result: reply };
+}
+
+/**
+ * Recognise a `requireConsent` refusal.
+ *
+ * It arrives as a rejection, and it would be very easy to treat it as a failure
+ * and show the user "error: consent_required". But it is not a failure — it is
+ * the flow working. It carries the digest the user must match and tells us the
+ * VTA has already sent the effects to their approving device. Rendering it as an
+ * error would strand the user at exactly the moment they were supposed to act.
+ */
+function readConsentRequired(reply: Record<string, unknown>): TaskConsentRequired | null {
+  const reason = reply?.reason;
+  if (reason !== "auth:consent_required") return null;
+
+  const details = (reply.details ?? {}) as Record<string, unknown>;
+  const payloadDigest = typeof details.payloadDigest === "string" ? details.payloadDigest : "";
+  if (!payloadDigest) return null;
+
+  return {
+    kind: "consentRequired",
+    payloadDigest,
+    approverSet: typeof details.approverSet === "string" ? details.approverSet : "",
+    minApprovals: typeof details.minApprovals === "number" ? details.minApprovals : 1,
   };
 }
