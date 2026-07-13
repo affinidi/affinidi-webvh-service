@@ -62,7 +62,7 @@ did-hosting-common = { version = "0.7", path = "../did-hosting-common", features
 # `AuthenticateInput` directly when dispatching to canonical
 # /auth/* handlers. 0.9 on crates.io alongside the did-hosting-
 # common dep at the same major.minor.
-vti-common = { version = "0.11", default-features = false }
+vti-common = { version = "0.11.4", default-features = false }
 async-trait = "0.1"
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
