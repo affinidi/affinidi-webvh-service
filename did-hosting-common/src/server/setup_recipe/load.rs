@@ -184,7 +184,7 @@ pub fn apply_env_overrides(recipe: &mut SetupRecipe) {
 fn env_get(prefix: &str, name: &str) -> Option<String> {
     std::env::var(format!("{prefix}_{name}"))
         .ok()
-        .and_then(|v| if v.is_empty() { None } else { Some(v) })
+        .filter(|v| !v.is_empty())
 }
 
 fn env_get_parsed<T: std::str::FromStr>(prefix: &str, name: &str) -> Option<T> {
