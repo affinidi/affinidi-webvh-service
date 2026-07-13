@@ -6,6 +6,7 @@ fn main() {
         std::env::var("CARGO_FEATURE_STORE_FJALL").is_ok(),
         std::env::var("CARGO_FEATURE_STORE_REDIS").is_ok(),
         std::env::var("CARGO_FEATURE_STORE_DYNAMODB").is_ok(),
+        std::env::var("CARGO_FEATURE_STORE_DYNAMODB_SINGLE").is_ok(),
         std::env::var("CARGO_FEATURE_STORE_FIRESTORE").is_ok(),
         std::env::var("CARGO_FEATURE_STORE_COSMOSDB").is_ok(),
     ];
@@ -13,13 +14,13 @@ fn main() {
     if count == 0 {
         panic!(
             "No storage backend selected. Enable exactly one: \
-             store-fjall, store-redis, store-dynamodb, store-firestore, or store-cosmosdb"
+             store-fjall, store-redis, store-dynamodb, store-dynamodb-single, store-firestore, or store-cosmosdb"
         );
     }
     if count > 1 {
         panic!(
             "Multiple storage backends selected. Enable exactly one: \
-             store-fjall, store-redis, store-dynamodb, store-firestore, or store-cosmosdb"
+             store-fjall, store-redis, store-dynamodb, store-dynamodb-single, store-firestore, or store-cosmosdb"
         );
     }
 }
