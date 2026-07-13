@@ -96,6 +96,7 @@ mod tests {
             redis_url: None,
             dynamodb_table_prefix: None,
             dynamodb_region: None,
+            dynamodb_table_name: None,
             firestore_project: None,
             firestore_database: None,
             cosmosdb_connection_string: None,

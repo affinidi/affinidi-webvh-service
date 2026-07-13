@@ -2,6 +2,8 @@
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
 mod dynamodb;
+#[cfg(feature = "store-dynamodb-single")]
+mod dynamodb_single;
 #[cfg(feature = "store-firestore")]
 mod firestore;
 #[cfg(feature = "store-fjall")]
@@ -329,6 +331,11 @@ async fn create_backend(config: &StoreConfig) -> Result<Box<dyn StorageBackend>,
     #[cfg(feature = "store-dynamodb")]
     {
         return dynamodb::DynamoDbBackend::open(config).await;
+    }
+
+    #[cfg(feature = "store-dynamodb-single")]
+    {
+        return dynamodb_single::SingleTableDynamoDbBackend::open(config).await;
     }
 
     #[cfg(feature = "store-firestore")]
