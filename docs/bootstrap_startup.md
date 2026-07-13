@@ -590,7 +590,8 @@ backends you'll use — they each pull a sizable cloud SDK.
 | `<PREFIX>_STORE_DATA_DIR` | Fjall on-disk path (default backend) |
 | `<PREFIX>_STORE_REDIS_URL` | Redis connection URL |
 | `<PREFIX>_STORE_DYNAMODB_TABLE` | DynamoDB table name |
-| `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB |
+| `<PREFIX>_STORE_DYNAMODB_TABLE_NAME` | Full DynamoDB table name for `store-dynamodb-single` (externally provisioned). Required when the feature is enabled. |
+| `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB (used by both `store-dynamodb` and `store-dynamodb-single`) |
 | `<PREFIX>_STORE_FIRESTORE_PROJECT` | GCP project ID for Firestore |
 | `<PREFIX>_STORE_FIRESTORE_DATABASE` | Firestore database id |
 | `<PREFIX>_STORE_COSMOSDB_ENDPOINT` | Cosmos DB account endpoint |
@@ -599,5 +600,5 @@ backends you'll use — they each pull a sizable cloud SDK.
 | `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
 
 Storage backends are mutually exclusive — exactly one of `store-fjall`,
-`store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
-must be enabled at build time.
+`store-redis`, `store-dynamodb`, `store-dynamodb-single`, `store-firestore`,
+`store-cosmosdb` must be enabled at build time.

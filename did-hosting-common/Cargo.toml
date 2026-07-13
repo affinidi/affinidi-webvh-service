@@ -41,6 +41,11 @@ server-core = [
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
 store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
+# Externally-provisioned single-table variant: one composite-key (pk+sk)
+# DynamoDB table replaces the 12 keyspace-per-table layout. Requires
+# `store.dynamodb_table_name` (env: <PREFIX>_STORE_DYNAMODB_TABLE_NAME).
+# Mutually exclusive with `store-dynamodb`.
+store-dynamodb-single = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
 store-firestore = ["server-core", "dep:firestore", "dep:futures"]
 store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
 # Native OS keyring secret backend.

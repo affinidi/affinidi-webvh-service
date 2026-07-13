@@ -22,6 +22,7 @@ azure-secrets = ["did-hosting-common/azure-secrets"]
 store-fjall = ["did-hosting-common/store-fjall"]
 store-redis = ["did-hosting-common/store-redis"]
 store-dynamodb = ["did-hosting-common/store-dynamodb"]
+store-dynamodb-single = ["did-hosting-common/store-dynamodb-single"]
 store-firestore = ["did-hosting-common/store-firestore"]
 store-cosmosdb = ["did-hosting-common/store-cosmosdb"]
 

@@ -74,6 +74,12 @@ store-dynamodb = [
   "webvh-watcher/store-dynamodb",
   "did-hosting-control/store-dynamodb",
 ]
+store-dynamodb-single = [
+  "did-hosting-server/store-dynamodb-single",
+  "webvh-witness/store-dynamodb-single",
+  "webvh-watcher/store-dynamodb-single",
+  "did-hosting-control/store-dynamodb-single",
+]
 store-firestore = [
   "did-hosting-server/store-firestore",
   "webvh-witness/store-firestore",

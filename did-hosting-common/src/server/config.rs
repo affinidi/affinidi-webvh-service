@@ -65,8 +65,12 @@ pub struct StoreConfig {
     pub redis_url: Option<String>,
     /// DynamoDB table name prefix (default: `"webvh"`). Used by `store-dynamodb` backend.
     pub dynamodb_table_prefix: Option<String>,
-    /// AWS region for DynamoDB. Used by `store-dynamodb` backend.
+    /// AWS region for DynamoDB. Used by `store-dynamodb` and `store-dynamodb-single` backends.
     pub dynamodb_region: Option<String>,
+    /// Full DynamoDB table name for the externally-provisioned single-table backend.
+    /// Required when the `store-dynamodb-single` feature is enabled. The table must exist —
+    /// the backend does not call `CreateTable` / `DescribeTable`.
+    pub dynamodb_table_name: Option<String>,
     /// GCP project ID for Firestore. Used by `store-firestore` backend.
     pub firestore_project: Option<String>,
     /// Firestore database name (default: `"(default)"`). Used by `store-firestore` backend.
@@ -92,6 +96,7 @@ impl std::fmt::Debug for StoreConfig {
             .field("redis_url", &self.redis_url.as_ref().map(|_| "<redacted>"))
             .field("dynamodb_table_prefix", &self.dynamodb_table_prefix)
             .field("dynamodb_region", &self.dynamodb_region)
+            .field("dynamodb_table_name", &self.dynamodb_table_name)
             .field("firestore_project", &self.firestore_project)
             .field("firestore_database", &self.firestore_database)
             .field(
@@ -294,6 +299,7 @@ impl Default for StoreConfig {
             redis_url: None,
             dynamodb_table_prefix: None,
             dynamodb_region: None,
+            dynamodb_table_name: None,
             firestore_project: None,
             firestore_database: None,
             cosmosdb_connection_string: None,
@@ -530,6 +536,10 @@ pub fn apply_env_overrides(
     env_opt!(
         &format!("{prefix}_STORE_DYNAMODB_REGION"),
         store.dynamodb_region
+    );
+    env_opt!(
+        &format!("{prefix}_STORE_DYNAMODB_TABLE_NAME"),
+        store.dynamodb_table_name
     );
     env_opt!(
         &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
