@@ -465,3 +465,134 @@ pub async fn elevate_session(
         acr: acr.to_string(),
     })
 }
+
+/// Guards the invariant that [`cleanup_expired_sessions`] silently depends on:
+/// **every session did-hosting creates carries a refresh token.**
+///
+/// The sweeper bounds an `Authenticated` session by `refresh_expires_at`, and
+/// treats `None` as *already expired* — so a refresh-less session is deleted on
+/// the very next pass, seconds after it is written.
+///
+/// That is harmless today because nothing here creates one. But vti-common has
+/// a second session shape — DID-keyed (`session_id == did`), no refresh token,
+/// reaped on an idle TTL via `Session::last_seen` — minted by its
+/// `resolve_did_session`. did-hosting does not use it: our DIDComm/TSP callers
+/// hold no session at all (trust-task handlers authorise per-message off the
+/// envelope's sender DID via the ACL), and the one DIDComm path that *does*
+/// authenticate hands back a normal token pair.
+///
+/// If someone later adopts `resolve_did_session` — say to give TSP callers
+/// step-up/AAL state — those sessions will be eaten by the sweeper the moment
+/// they are written, which is a baffling bug to debug from the symptom. These
+/// tests fail first, and point here.
+#[cfg(all(test, feature = "store-fjall"))]
+mod refresh_token_invariant {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, JwtKeys, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        let keys = JwtKeys::from_ed25519_bytes(&[11u8; 32]).unwrap();
+        (ks, keys, dir)
+    }
+
+    /// Both production creators must leave a refresh token on the row.
+    #[tokio::test]
+    async fn sessions_we_create_carry_a_refresh_token() {
+        let (ks, keys, _dir) = make_ks().await;
+
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:alice",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let stored = get_session(&ks, &created.session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(
+            stored.refresh_token.is_some() && stored.refresh_expires_at.is_some(),
+            "create_authenticated_session must leave a refresh token: cleanup_expired_sessions \
+             reaps refresh-less Authenticated sessions on the next pass"
+        );
+
+        // Step-up rotates the tokens; it must not drop the refresh token either.
+        elevate_session(
+            &ks,
+            &keys,
+            &created.session_id,
+            &Role::Owner,
+            vec!["did".to_string(), "passkey".to_string()],
+            "aal2",
+            60,
+            900,
+        )
+        .await
+        .expect("elevate");
+
+        let elevated = get_session(&ks, &created.session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(
+            elevated.refresh_token.is_some() && elevated.refresh_expires_at.is_some(),
+            "elevate_session must leave a refresh token on the row"
+        );
+    }
+
+    /// Pins *why* the invariant matters: this is the fate of a refresh-less
+    /// session under our sweeper. If you are here because you adopted
+    /// vti-common's intrinsic (DID-keyed, refresh-less) sessions, this branch
+    /// of `cleanup_expired_sessions` is what you must teach about
+    /// `Session::last_seen` and an idle TTL first.
+    #[tokio::test]
+    async fn sweeper_reaps_a_refreshless_authenticated_session_immediately() {
+        let (ks, _keys, _dir) = make_ks().await;
+
+        let intrinsic = Session {
+            session_id: "did:example:tsp-caller".to_string(),
+            did: "did:example:tsp-caller".to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
+            acr_expires_at: None,
+        };
+        store_session(&ks, &intrinsic).await.expect("store");
+
+        cleanup_expired_sessions(&ks, 300).await.expect("sweep");
+
+        assert!(
+            get_session(&ks, &intrinsic.session_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a refresh-less Authenticated session is reaped on the next sweep, however recently \
+             it was seen — teach cleanup_expired_sessions about last_seen before creating one"
+        );
+    }
+}
