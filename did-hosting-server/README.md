@@ -42,8 +42,14 @@ The binary is produced at `target/release/did-hosting-server`.
 Alternatively, you can install the server directly with Cargo:
 
 ```bash
-cargo install did-hosting-server
+cargo install did-hosting-server --locked
 ```
+
+`--locked` installs the exact dependency versions this release was built
+and tested against. Without it, Cargo ignores the published lockfile and
+re-resolves to the newest semver-compatible versions of every dependency,
+which can pull in an upstream release that has not been tested against
+this one.
 
 ### 2. Run the setup wizard
 
@@ -297,7 +303,7 @@ need no special handling:
 
 ```bash
 cargo build -p did-hosting-server --release
-cargo install did-hosting-server
+cargo install did-hosting-server --locked
 ```
 
 > **Heads-up if you build with `--no-default-features`:** the
