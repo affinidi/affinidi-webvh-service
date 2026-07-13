@@ -87,6 +87,11 @@ pub struct DidDocumentOptions<'a> {
 /// The returned JSON value uses the did:webvh identifier format with an
 /// Ed25519 verification method at `#key-0`. Additional keys and services
 /// can be added via [`DidDocumentOptions`].
+///
+/// An empty `mnemonic` builds the **root** DID for the host —
+/// `did:webvh:{SCID}:<host>` with no path segments, which per did:webvh
+/// resolves at `https://<host>/.well-known/did.jsonl`. Without this an
+/// empty mnemonic would emit a trailing `:` and a malformed identifier.
 pub fn build_did_document(
     host: &str,
     mnemonic: &str,
@@ -94,7 +99,11 @@ pub fn build_did_document(
     opts: &DidDocumentOptions<'_>,
 ) -> serde_json::Value {
     let did_path = mnemonic.replace('/', ":");
-    let did_id = format!("did:webvh:{{SCID}}:{host}:{did_path}");
+    let did_id = if did_path.is_empty() {
+        format!("did:webvh:{{SCID}}:{host}")
+    } else {
+        format!("did:webvh:{{SCID}}:{host}:{did_path}")
+    };
 
     let mut vm = vec![json!({
         "id": format!("{did_id}#key-0"),

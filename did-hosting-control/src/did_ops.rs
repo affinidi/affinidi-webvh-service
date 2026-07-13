@@ -346,7 +346,21 @@ pub async fn register_did_atomic(
     // 1. Cheap validations first — bail out before any storage I/O.
     //    Proof verification subsumes structural validation; a single
     //    pass catches both parse errors and signature failures.
-    validate_custom_path(path)?;
+    //
+    //    `.well-known` is the root slot, not a custom path: its leading
+    //    dot fails the mnemonic charset rules, so `validate_custom_path`
+    //    rejects it by design. Use the root-aware `validate_mnemonic`
+    //    (as publish / resolve / every other slot-addressed op does) and
+    //    gate root on admin, mirroring `create_did`. Registering the root
+    //    DID is how an operator who self-hosts this domain publishes the
+    //    domain's own did:webvh; the owner / `force` checks below still
+    //    decide whether an occupied root slot may be taken over.
+    if path == ".well-known" && auth.role != Role::Admin {
+        return Err(AppError::Forbidden(
+            "only admins can register the root DID".into(),
+        ));
+    }
+    validate_mnemonic(path)?;
     verify_did_log_proofs(did_log)?;
 
     let server_base_url = state
@@ -1567,6 +1581,95 @@ mod tests_atomic {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// A root did:webvh — `did:webvh:{SCID}:<host>`, no path segments,
+    /// resolving at `https://<host>/.well-known/did.jsonl` — registers at
+    /// the reserved `.well-known` slot.
+    ///
+    /// Regression: `register_did_atomic` used to validate `path` with
+    /// `validate_custom_path`, which rejects `.well-known` by design (the
+    /// leading dot is not in the `[a-z0-9-]` segment charset). An operator
+    /// self-hosting their domain therefore could not publish the domain's
+    /// own DID through register at all — every attempt came back
+    /// `e.p.did.path-invalid`, and no other `path` value works either
+    /// (empty is rejected by the dispatcher, and any legal mnemonic would
+    /// fail the DID↔path equality check below).
+    #[tokio::test]
+    async fn register_root_did_at_well_known_as_admin() {
+        let (state, _dir) = test_state().await;
+        // Empty mnemonic ⇒ root DID for the host.
+        let did_log = build_test_did_log("scid-root", "control.test", "").await;
+
+        register_did_atomic(
+            &admin_auth("did:example:admin"),
+            &state,
+            ".well-known",
+            &did_log,
+            false,
+        )
+        .await
+        .expect("admin may register the root DID at the .well-known slot");
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key(".well-known"))
+            .await
+            .unwrap()
+            .expect("root slot record written");
+        assert_eq!(record.mnemonic, ".well-known");
+        assert_eq!(
+            record.did_id.as_deref(),
+            extract_did_id(&did_log).as_deref(),
+            "the root slot must hold the registered root DID"
+        );
+    }
+
+    /// Root is admin-only, mirroring `create_did`'s carve-out — a domain's
+    /// root slot can belong to only one tenant, so an owner-role caller
+    /// must not be able to claim it.
+    #[tokio::test]
+    async fn register_root_did_forbidden_for_non_admin() {
+        let (state, _dir) = test_state().await;
+        let did_log = build_test_did_log("scid-root", "control.test", "").await;
+
+        let err = register_did_atomic(
+            &owner_auth("did:example:owner"),
+            &state,
+            ".well-known",
+            &did_log,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "non-admin root register must be Forbidden, got {err:?}"
+        );
+    }
+
+    /// The root carve-out is exactly `.well-known` and nothing else — any
+    /// other dot-prefixed path still fails the segment charset rules, even
+    /// for an admin. Guards against widening `validate_mnemonic` into a
+    /// general escape hatch.
+    #[tokio::test]
+    async fn register_rejects_other_dotted_paths_even_for_admin() {
+        let (state, _dir) = test_state().await;
+        let did_log = build_test_did_log("scid-dot", "control.test", "hidden").await;
+
+        let err = register_did_atomic(
+            &admin_auth("did:example:admin"),
+            &state,
+            ".hidden",
+            &did_log,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "dotted non-root path must still be rejected, got {err:?}"
+        );
     }
 
     /// Smoke test: the wire request type round-trips with default `force`
