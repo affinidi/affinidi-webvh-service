@@ -693,9 +693,9 @@ export default function DidDetail() {
                       Approve this on your device
                     </Text>
                     <Text style={styles.hint}>
-                      Your agent has sent this change to your approving device, with a
-                      description of what it will do. Check that the code shown there matches
-                      the one below, then approve it.
+                      {consent.sideEffects === "destructive"
+                        ? "This cannot be undone. Your agent has sent the change to your approving device, which will ask you to TYPE the code below. Do not type it from memory of this screen — read it from here, and only approve if the device shows the same code."
+                        : "Your agent has sent this change to your approving device, with a description of what it will do. Check that the code shown there matches the one below, then approve it."}
                     </Text>
                     <Text
                       style={{
