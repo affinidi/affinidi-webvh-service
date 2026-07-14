@@ -526,11 +526,21 @@ export function isWalletTaskRelayAvailable(): boolean {
   return isWalletAvailable() && typeof window.vtaWallet?.requestTask === "function";
 }
 
-export const WEBVH_DIDS_UPDATE_1_0 = "https://trusttasks.org/spec/webvh/dids/update/1.0";
+// The `vta/` segment is not decoration. The VTA dispatches on this exact string
+// (`vta-sdk::trust_tasks::TASK_WEBVH_DIDS_UPDATE_1_0`); without it the task is
+// unrecognised, so there is no class, no planner and no consent request — the
+// request simply fails as an unknown method, which looks like a transport
+// problem rather than the typo it is.
+export const WEBVH_DIDS_UPDATE_1_0 =
+  "https://trusttasks.org/spec/vta/webvh/dids/update/1.0";
 
 /** The VTA needs a human to approve this before it will run it. */
 export interface TaskConsentRequired {
   kind: "consentRequired";
+  /** The class the VTA derived from the compiled handler. `destructive` means the
+   *  approving device will require the user to TYPE the code rather than tap
+   *  approve — so we must tell them a match is expected, not merely show it. */
+  sideEffects?: string;
   /**
    * The salted digest of the exact payload awaiting approval.
    *
@@ -583,41 +593,68 @@ export async function requestDidUpdate(args: {
     throw new Error("This wallet does not support delegated task execution.");
   }
 
-  const reply = await wallet.requestTask({
+  // The wallet returns a discriminated outcome: a `requireConsent` refusal is a
+  // result, not an error. See `readOutcome`.
+  const reply = (await wallet.requestTask({
     type: WEBVH_DIDS_UPDATE_1_0,
     payload: {
       did: args.did,
       document: args.document,
       ...(args.expectedVersionId ? { expectedVersionId: args.expectedVersionId } : {}),
     },
-  });
+  })) as Record<string, unknown>;
 
-  const consent = readConsentRequired(reply);
-  if (consent) return consent;
-  return { kind: "accepted", result: reply };
+  return readOutcome(reply);
 }
 
 /**
- * Recognise a `requireConsent` refusal.
+ * Read the wallet's outcome.
  *
- * It arrives as a rejection, and it would be very easy to treat it as a failure
- * and show the user "error: consent_required". But it is not a failure — it is
- * the flow working. It carries the digest the user must match and tells us the
- * VTA has already sent the effects to their approving device. Rendering it as an
- * error would strand the user at exactly the moment they were supposed to act.
+ * A `requireConsent` refusal is not a failure — it is the flow working. It
+ * carries the digest the user must match, and it tells us the VTA has already
+ * sent the effects to their approving device. Rendering it as an error would
+ * strand the user at exactly the moment they were supposed to act.
+ *
+ * The wallet does the recognising (`@openvtc/pnm-core`'s `requestTask`), because
+ * only it sits above the transport that would otherwise throw the refusal away.
+ * We consume the outcome it hands us and do not attempt to re-derive it: the
+ * previous version of this function read a `reason` member that does not exist on
+ * the wire, which failed silently — the refusal simply looked like an ordinary
+ * error, and the code panel below was never reached.
  */
-function readConsentRequired(reply: Record<string, unknown>): TaskConsentRequired | null {
-  const reason = reply?.reason;
-  if (reason !== "auth:consent_required") return null;
+function readOutcome(reply: Record<string, unknown>): RequestTaskOutcome {
+  if (reply?.kind !== "consentRequired") {
+    return { kind: "accepted", result: reply };
+  }
 
-  const details = (reply.details ?? {}) as Record<string, unknown>;
-  const payloadDigest = typeof details.payloadDigest === "string" ? details.payloadDigest : "";
-  if (!payloadDigest) return null;
+  const payloadDigest = typeof reply.payloadDigest === "string" ? reply.payloadDigest : "";
+  if (!payloadDigest) {
+    // A refusal with nothing to match is not something we can put in front of a
+    // human. Fail loudly rather than show a blank ceremony.
+    throw new Error("Your agent asked for approval but sent no code to match.");
+  }
 
   return {
     kind: "consentRequired",
     payloadDigest,
-    approverSet: typeof details.approverSet === "string" ? details.approverSet : "",
-    minApprovals: typeof details.minApprovals === "number" ? details.minApprovals : 1,
+    approverSet: typeof reply.approverSet === "string" ? reply.approverSet : "",
+    minApprovals: typeof reply.minApprovals === "number" ? reply.minApprovals : 1,
+    // The class the VTA derived from the handler it is about to run. It is inside
+    // the signed consent request, which is the only place it can be trusted from.
+    sideEffects: sideEffectsOf(reply),
   };
+}
+
+/**
+ * The task's side-effect class, read from the executor-**signed** consent request.
+ *
+ * Not from the refusal's top level, which carries no class — and not from a
+ * registry, which is advisory and would make the "do I have to match a code?"
+ * decision downgradeable by whoever publishes it.
+ */
+function sideEffectsOf(reply: Record<string, unknown>): string | undefined {
+  const requests = Array.isArray(reply.consentRequests) ? reply.consentRequests : [];
+  const first = requests[0] as { payload?: { sideEffects?: unknown } } | undefined;
+  const level = first?.payload?.sideEffects;
+  return typeof level === "string" ? level : undefined;
 }
