@@ -248,6 +248,7 @@ pub async fn run_wizard(
             key_agreement_key: outcome.integration_ka_key_mb,
             jwt_signing_key,
             vta_credential: Some(outcome.vta_credential_b64),
+            retired: Vec::new(),
         },
         log_entry,
         &did_path,
@@ -1027,6 +1028,7 @@ async fn run_self_managed_setup(
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
+            ..Default::default()
         },
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         enable,
@@ -1044,6 +1046,7 @@ async fn run_self_managed_setup(
             key_agreement_key: ka_priv_mb,
             jwt_signing_key,
             vta_credential: None,
+            retired: Vec::new(),
         },
         Some(&jsonl),
         &did_path,
@@ -1408,6 +1411,7 @@ pub async fn run_setup_offline_complete(
             key_agreement_key: result.key_agreement_multibase,
             jwt_signing_key,
             vta_credential: None,
+            retired: Vec::new(),
         },
         result.log_entry.as_deref(),
         &state.did_path,

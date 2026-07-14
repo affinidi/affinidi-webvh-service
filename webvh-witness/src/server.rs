@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
@@ -7,7 +7,8 @@ use affinidi_messaging_didcomm_service::{
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
-use did_hosting_common::server::didcomm_profile::build_tdk_profile;
+use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
+use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS, KS_WITNESSES};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,17 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    /// The service's own DID identity — every generation of key material still
+    /// honoured, and the kids each one answers to. The two resolvers above are
+    /// cheap clones taken from this.
+    pub identity: Option<Arc<ServiceIdentity>>,
+    /// The running messaging service, once started.
+    ///
+    /// Lifted into `AppState` (it used to be a local in `run()`) so the identity
+    /// sweep can hot-swap the listener when the witness's own DID rotates:
+    /// `remove_listener` / `add_listener` take `&self`, so the *service* is
+    /// never replaced — only its one listener — and a `OnceLock` suffices.
+    pub didcomm_service: Arc<OnceLock<DIDCommService>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub signer: Arc<dyn WitnessSigner>,
 }
@@ -76,9 +88,25 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let acl_ks = store.keyspace(KS_ACL)?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
-    // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
+    // Load the service's own identity (requires server_did). Resolves the DID
+    // document for the *real* verification-method key IDs and seeds the secrets
+    // resolver under them, rather than assuming `#key-0` / `#key-1`.
+    //
+    // The witness carries no TSP listener of its own — TSP rides the control
+    // plane's mediator socket.
+    let identity = identity::load_identity(
+        config.server_did.as_deref(),
+        config.mediator_did.as_deref(),
+        identity::ProtocolSet {
+            didcomm: config.features.didcomm,
+            tsp: false,
+        },
+        &secrets,
+        &store,
+    )
+    .await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 
     // Initialize JWT keys
     let jwt_keys = init::init_jwt_keys(&secrets);
@@ -107,6 +135,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
+        identity,
+        didcomm_service: Arc::new(OnceLock::new()),
         jwt_keys,
         signer: Arc::new(LocalSigner),
     };
@@ -178,25 +208,47 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 3. Wait for REST, then start DIDComm service
     let _ = rest_ready_rx.await;
 
+    // Now that we are serving HTTP, resolve our *own* DID for the first time.
+    // A self-hosting service cannot resolve its own DID at boot — it is the thing
+    // that serves it — so `load_identity` came up on guessed `#key-0`/`#key-1`
+    // kids and persisted nothing. This is the first moment the document is
+    // fetchable, and it must run before the listener is built on the guess.
+    if let Err(e) = crate::identity_rotation::reload_now(&state).await {
+        warn!("failed to establish the service identity from its DID document: {e}");
+    }
+
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm {
-        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(svc),
-            Ok(None) => None,
-            Err(e) => {
-                warn!("failed to start DIDComm service: {e}");
-                None
+    if state.config.features.didcomm {
+        match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => {
+                let _ = state.didcomm_service.set(svc);
             }
+            Ok(None) => {}
+            Err(e) => warn!("failed to start DIDComm service: {e}"),
         }
-    } else {
-        None
-    };
+    }
+    let didcomm_service = state.didcomm_service.get();
+
+    // 4. Spawn the identity sweep. The witness hosts no DIDs, so it has no
+    // publish hook — this sweep is its *only* way to notice its own DID rotated,
+    // as well as what expires a superseded generation's key material.
+    let (identity_shutdown_tx, identity_shutdown_rx) = watch::channel(false);
+    let identity_state = state.clone();
+    let identity_handle = tokio::spawn(async move {
+        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
+            .await;
+    });
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
-    // Ordered shutdown: DIDComm -> REST -> Storage
+    // Ordered shutdown: identity -> DIDComm -> REST -> Storage
     let mut any_panic = false;
+
+    let _ = identity_shutdown_tx.send(true);
+    if let Err(e) = identity_handle.await {
+        warn!("identity sweep task didn't shut down cleanly: {e}");
+    }
 
     didcomm_shutdown.cancel();
     if let Some(svc) = didcomm_service {
@@ -246,33 +298,28 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
 async fn start_didcomm_service(
     state: &AppState,
-    secrets: &ServerSecrets,
     shutdown: CancellationToken,
 ) -> Result<Option<DIDCommService>, AppError> {
-    let server_did = match &state.config.server_did {
-        Some(did) => did.as_str(),
+    let identity = match state.identity.as_ref() {
+        Some(identity) => identity,
         None => {
             info!("DIDComm not configured — server_did not set");
             return Ok(None);
         }
     };
 
-    let mediator_did = match &state.config.mediator_did {
-        Some(did) => did.as_str(),
+    let mediator_did = match identity.mediator_did() {
+        Some(did) => did,
         None => {
             info!("mediator_did not configured — DIDComm messaging disabled");
             return Ok(None);
         }
     };
 
-    let profile = build_tdk_profile(
-        "witness",
-        server_did,
-        Some(mediator_did),
-        secrets,
-        state.did_resolver.as_ref(),
-    )
-    .await?;
+    // Carries the key material of every live generation, keyed on the kids the
+    // DID document actually resolved to — the same kids the secrets resolver
+    // was seeded with.
+    let profile = build_tdk_profile_for_identity("witness", identity, Some(&mediator_did)).await?;
 
     let listener = ListenerConfig {
         id: "witness".into(),
@@ -297,7 +344,7 @@ async fn start_didcomm_service(
     .await
     .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
 
-    info!("DIDComm service started for {server_did}");
+    info!(witness_did = %identity.did, "DIDComm service started");
     Ok(Some(svc))
 }
 

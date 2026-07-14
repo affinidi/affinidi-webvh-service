@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
@@ -12,7 +12,10 @@ use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use ipnetwork::IpNetwork;
 
 use did_hosting_common::server::auth::extractor::AuthState;
-use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
+use did_hosting_common::server::didcomm_profile::{
+    build_tdk_profile_for_identity, wait_for_did_resolution,
+};
+use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +43,20 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    /// The service's own DID identity: every generation of key material still
+    /// honoured, and the kids each one answers to. `did_resolver` and
+    /// `secrets_resolver` above are cheap clones taken from this; it is the
+    /// source of truth for which kids they answer to, and the listener's
+    /// profile is built from it so the two cannot drift apart.
+    pub identity: Option<Arc<ServiceIdentity>>,
+    /// The running messaging service, once started.
+    ///
+    /// Lifted into `AppState` (it used to be a local in `run()`, unreachable at
+    /// runtime) so listeners can be hot-swapped without bouncing the process:
+    /// `remove_listener` / `add_listener` take `&self`, which is what lets a
+    /// rotation rebuild the profile in place. A `OnceLock` suffices precisely
+    /// because the *service* is never replaced — only its listeners are.
+    pub didcomm_service: Arc<OnceLock<DIDCommService>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub signing_key_bytes: Option<[u8; 32]>,
     pub http_client: reqwest::Client,
@@ -125,9 +142,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
     let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
 
-    // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
+    // Load the service's own identity (requires server_did). Resolves the DID
+    // document for the *real* verification-method key IDs and seeds the secrets
+    // resolver under them, rather than assuming `#key-0` / `#key-1`.
+    let identity = identity::load_identity(
+        config.server_did.as_deref(),
+        config.mediator_did.as_deref(),
+        identity::ProtocolSet {
+            didcomm: config.features.didcomm,
+            tsp: config.features.tsp,
+        },
+        &secrets,
+        &store,
+    )
+    .await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 
     // Initialize JWT keys independently — needed by both DIDComm and passkey auth
     let jwt_keys = init::init_jwt_keys(&secrets);
@@ -184,6 +214,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
+        identity,
+        didcomm_service: Arc::new(OnceLock::new()),
         jwt_keys,
         signing_key_bytes,
         http_client: reqwest::Client::builder()
@@ -278,25 +310,32 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     //    (the server's own DID needs to be resolvable for mediator auth)
     let _ = rest_ready_rx.await;
 
+    // Now that we are serving HTTP, resolve our *own* DID for the first time.
+    // A self-hosting service cannot resolve its own DID at boot — it is the thing
+    // that serves it — so `load_identity` came up on guessed `#key-0`/`#key-1`
+    // kids and persisted nothing. This is the first moment the document is
+    // fetchable, and it must run before the listener is built on the guess.
+    if let Err(e) = crate::identity_rotation::reload_now(&state).await {
+        warn!("failed to establish the service identity from its DID document: {e}");
+    }
+
     // 4. Start the mediator messaging service (DIDComm and/or TSP) — one
     //    connection for both receiving and sending. TSP-only deployments
     //    (didcomm off, tsp on) must still start it.
     let didcomm_shutdown = CancellationToken::new();
-    let didcomm_service = if state.config.features.didcomm || state.config.features.tsp {
-        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => Some(svc),
-            Ok(None) => None,
-            Err(e) => {
-                warn!("failed to start DIDComm service: {e}");
-                None
+    if state.config.features.didcomm || state.config.features.tsp {
+        match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
+            Ok(Some(svc)) => {
+                let _ = state.didcomm_service.set(svc);
             }
+            Ok(None) => {}
+            Err(e) => warn!("failed to start DIDComm service: {e}"),
         }
-    } else {
-        None
-    };
+    }
+    let didcomm_service = state.didcomm_service.get();
 
     // 5. Register with control plane via DIDComm (uses the shared connection)
-    if let Some(ref svc) = didcomm_service
+    if let Some(svc) = didcomm_service
         && state.config.control_did.is_some()
     {
         let reg_state = state.clone();
@@ -310,7 +349,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let stats_sync_shutdown = CancellationToken::new();
     let didcomm_sync_interval = state.config.stats.sync_interval_secs;
     if let (Some(svc), Some(control_did), Some(server_did)) = (
-        didcomm_service.as_ref(),
+        didcomm_service,
         state.config.control_did.as_ref(),
         state.config.server_did.as_ref(),
     ) && didcomm_sync_interval > 0
@@ -340,15 +379,37 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         });
     }
 
+    // 6b. Reconnect to any mediator we rotated *away* from but whose grace period
+    // has not elapsed. Peers holding a stale DID document are still delivering
+    // there, and a restart part-way through the window must not abandon that
+    // queue. No-op unless a rotation actually changed the mediator.
+    crate::identity_rotation::resume_mediator_drains(&state);
+
+    // 7. Spawn the identity sweep. Expires generations whose grace period has
+    // elapsed (so a superseded key stops decrypting) and backstops identity
+    // changes that never came through our own publish or sync path — one
+    // applied out-of-band, or while this process was down.
+    let (identity_shutdown_tx, identity_shutdown_rx) = watch::channel(false);
+    let identity_state = state.clone();
+    let identity_handle = tokio::spawn(async move {
+        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
+            .await;
+    });
+
     // Wait for shutdown signal
     init::shutdown_signal().await;
 
-    // Ordered shutdown: stats sync → DIDComm → REST → Storage
+    // Ordered shutdown: identity → stats sync → DIDComm → REST → Storage
     let mut any_panic = false;
+
+    let _ = identity_shutdown_tx.send(true);
+    if let Err(e) = identity_handle.await {
+        warn!("identity sweep task didn't shut down cleanly: {e}");
+    }
 
     stats_sync_shutdown.cancel();
     didcomm_shutdown.cancel();
-    if let Some(ref svc) = didcomm_service {
+    if let Some(svc) = didcomm_service {
         svc.shutdown().await;
         info!("DIDComm service stopped");
     }
@@ -414,19 +475,18 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
 pub async fn start_didcomm_service(
     state: &AppState,
-    secrets: &ServerSecrets,
     shutdown: CancellationToken,
 ) -> Result<Option<DIDCommService>, AppError> {
-    let server_did = match &state.config.server_did {
-        Some(did) => did.as_str(),
+    let identity = match state.identity.as_ref() {
+        Some(identity) => identity,
         None => {
             info!("DIDComm not configured — server_did not set");
             return Ok(None);
         }
     };
 
-    let mediator_did = match &state.config.mediator_did {
-        Some(did) => did.as_str(),
+    let mediator_did = match identity.mediator_did() {
+        Some(did) => did,
         None => {
             info!("mediator_did not configured — DIDComm messaging disabled");
             return Ok(None);
@@ -438,26 +498,25 @@ pub async fn start_didcomm_service(
     // has not yet published its log, so we retry instead of starting the
     // listener against an unreachable mediator (which surfaces as a cryptic
     // "No Mediator is configured for this Profile" later).
-    if let Some(resolver) = state.did_resolver.as_ref() {
-        wait_for_did_resolution(mediator_did, "mediator", resolver, &shutdown).await?;
-    }
+    wait_for_did_resolution(&mediator_did, "mediator", &identity.did_resolver, &shutdown).await?;
 
-    let profile = build_tdk_profile(
-        "server",
-        server_did,
-        Some(mediator_did),
-        secrets,
-        state.did_resolver.as_ref(),
-    )
-    .await?;
+    // Carries the key material of every live generation, keyed on the kids the
+    // DID document actually resolved to — the same kids the secrets resolver
+    // was seeded with.
+    let profile = build_tdk_profile_for_identity("server", identity, Some(&mediator_did)).await?;
 
     // Transport selection — DIDComm and/or TSP ride the same mediator
     // socket. Inbound TSP frames (sync/domain pushes from the control
     // plane's outbox) are routed to the `ServerTspHandler` when TSP is on.
     // "neither flag set but a mediator is configured" defaults to
     // DIDComm-only for back-compat.
-    let didcomm_enabled = state.config.features.didcomm;
-    let tsp_enabled = state.config.features.tsp;
+    //
+    // The union across live generations, not just the current one's config
+    // flags — a generation retiring out of DIDComm still has peers delivering
+    // to it until it expires, and the single listener has to carry both.
+    let transports = identity.protocols();
+    let didcomm_enabled = transports.didcomm;
+    let tsp_enabled = transports.tsp;
     let protocols = match (didcomm_enabled, tsp_enabled) {
         (true, true) => Protocols::BOTH,
         (false, true) => Protocols::TSP_ONLY,
@@ -499,7 +558,8 @@ pub async fn start_didcomm_service(
 
     info!(
         tsp = tsp_enabled,
-        "messaging service started for {server_did}"
+        server_did = %identity.did,
+        "messaging service started"
     );
     Ok(Some(svc))
 }
@@ -672,31 +732,12 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
 // Auto-bootstrap
 // ---------------------------------------------------------------------------
 
-/// Extract the mnemonic (path) from a did:webvh DID string.
+/// Extract the mnemonic (path) from a `did:webvh` DID string.
 ///
-/// `did:webvh:{SCID}:{host}:{path:components}` → `path/components`
-/// Colons in the path portion are converted back to `/`.
-fn mnemonic_from_did(did: &str) -> Option<String> {
-    // did:webvh:{SCID}:{host}:{path...}
-    let rest = did.strip_prefix("did:webvh:")?;
-    let parts: Vec<&str> = rest.splitn(4, ':').collect();
-    // parts[0] = SCID, parts[1] = host (possibly with %3A port), parts[2..] = path
-    if parts.len() < 3 {
-        return None;
-    }
-    // The host may contain %3A (encoded port), which counts as one segment.
-    // After SCID and host, the remaining colon-separated segments form the path.
-    // But the host itself may have been split if it didn't contain %3A.
-    // Re-parse: skip SCID, skip host (which may contain %3A), rest is path.
-    let after_scid = rest.split_once(':')?.1; // "{host}:{path...}"
-
-    // Host is everything up to the first segment that doesn't look like a host
-    // Simpler: host is the first segment after SCID (it contains the domain)
-    let after_host = after_scid.split_once(':')?.1; // "{path...}"
-
-    let mnemonic = after_host.replace(':', "/");
-    Some(mnemonic)
-}
+/// Re-exported from `did_hosting_common::server::identity`, which needs the same
+/// parse to answer "was the DID just published our own?" — the question that
+/// gates the rotation trigger. One copy, so the two cannot drift.
+use did_hosting_common::server::identity::mnemonic_from_did;
 
 /// First-boot multi-domain init for the standalone server.
 ///

@@ -335,6 +335,12 @@ async fn do_sync_update(
         "applied DID sync update from control plane via mediator"
     );
 
+    // The second way this server's own DID can change: a control plane pushed a
+    // new log entry for it. Same rotation check as the direct publish path — an
+    // operator who rotates the server's keys through the control plane must not
+    // get a different outcome from one who publishes to the server directly.
+    crate::identity_rotation::on_did_published(state, mnemonic).await;
+
     Ok((
         MSG_SYNC_UPDATE_ACK.to_string(),
         json!({ "mnemonic": mnemonic, "status": "applied" }),

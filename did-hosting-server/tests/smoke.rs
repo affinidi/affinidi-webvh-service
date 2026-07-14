@@ -63,6 +63,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         control_url: None,
         control_did: None,
         vta: VtaConfig::default(),
+        identity: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -74,6 +75,8 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        identity: None,
+        didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
         jwt_keys: None,
         signing_key_bytes: None,
         http_client: reqwest::Client::new(),

@@ -718,6 +718,7 @@ async fn run_import_sealed(
         key_agreement_key: result.key_agreement_multibase,
         jwt_signing_key: resolved_jwt,
         vta_credential: None,
+        retired: Vec::new(),
     };
 
     secret_store.set(&server_secrets).await?;

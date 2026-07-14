@@ -174,6 +174,7 @@ pub async fn run_uninstall_unchecked(
             key_agreement_key: String::new(),
             jwt_signing_key: String::new(),
             vta_credential: None,
+            retired: Vec::new(),
         };
         if let Err(e) = store.set(&blank).await {
             eprintln!("  Warning: could not clear ServerSecrets ({e})");

@@ -261,6 +261,7 @@ pub async fn apply_recipe(
         features,
         identity: IdentityConfig {
             mode: identity_mode,
+            ..Default::default()
         },
         enable,
         config_path: recipe.output.config_path.clone(),
@@ -286,6 +287,7 @@ pub async fn apply_recipe(
         key_agreement_key: ka_priv,
         jwt_signing_key,
         vta_credential: vta_credential_b64,
+        retired: Vec::new(),
     };
     let secret_store = create_secret_store(&config.secrets, &recipe.output.config_path)?;
     secret_store.set(&server_secrets).await?;

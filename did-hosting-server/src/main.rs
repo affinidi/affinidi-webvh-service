@@ -84,6 +84,22 @@ enum Command {
     },
     /// List all access control entries
     ListAcl,
+    /// List the service's own identity generations (key material still honoured).
+    IdentityList,
+    /// Stop honouring a superseded identity generation immediately.
+    ///
+    /// The offline kill switch, for a compromised key. Messages still addressed
+    /// to that generation's key-agreement key will no longer decrypt.
+    ///
+    /// The service must be stopped (the store is exclusively locked). For a
+    /// LIVE service use the control plane's
+    /// `POST /api/identity/generations/{id}/retire` or the UI button, which
+    /// drops the key from the running process immediately.
+    IdentityRetireNow {
+        /// Generation id to retire (see `identity-list`).
+        #[arg(long)]
+        generation: u64,
+    },
     /// Remove an access control entry
     RemoveAcl {
         /// DID to remove from the ACL
@@ -398,6 +414,18 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::IdentityList) => {
+            if let Err(e) = run_identity_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::IdentityRetireNow { generation }) => {
+            if let Err(e) = run_identity_retire_now(cli.config, generation).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1194,6 +1222,7 @@ async fn run_import_secrets(
         key_agreement_key: resolved_ka,
         jwt_signing_key: resolved_jwt,
         vta_credential: resolved_vta_cred,
+        retired: Vec::new(),
     };
 
     secret_store.set(&server_secrets).await?;
@@ -1412,6 +1441,7 @@ async fn run_import_sealed(
         key_agreement_key: result.key_agreement_multibase,
         jwt_signing_key: resolved_jwt,
         vta_credential: None,
+        retired: Vec::new(),
     };
 
     secret_store.set(&server_secrets).await?;
@@ -1477,4 +1507,30 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+/// `identity-list` — show which key material this service still honours.
+async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_list_generations(&config.store).await
+}
+
+/// `identity-retire-now` — the offline kill switch.
+///
+/// Opens the store directly, so it only works against a *stopped* service. A
+/// live service must be retired through the control plane's REST endpoint (or
+/// the UI button), which drops the key from the running process's secrets
+/// resolver — deleting a record on disk would not.
+async fn run_identity_retire_now(
+    config_path: Option<PathBuf>,
+    generation: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_retire_generation(
+        &config.store,
+        &config.secrets,
+        &config.config_path,
+        generation,
+    )
+    .await
 }

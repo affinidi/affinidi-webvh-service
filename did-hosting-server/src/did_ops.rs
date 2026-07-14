@@ -377,6 +377,16 @@ pub async fn publish_did(
         "did.jsonl published"
     );
 
+    // If the DID just published was this server's *own*, its keys or services
+    // may have changed. Re-resolve and rotate the identity if so.
+    //
+    // Safe on every publish: it compares mnemonics first (no network), and a
+    // publish of our own DID that didn't change the identity resolves the
+    // document once and no-ops. It deliberately does not fail the publish — the
+    // log entry is committed and correct either way, and a rotation that cannot
+    // proceed logs loudly rather than rolling back a valid publish.
+    crate::identity_rotation::on_did_published(state, mnemonic).await;
+
     Ok(PublishDidResult {
         did_id,
         did_url,

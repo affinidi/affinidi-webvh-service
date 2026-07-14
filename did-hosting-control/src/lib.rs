@@ -17,6 +17,7 @@ pub mod error;
 #[cfg(feature = "ui")]
 pub mod frontend;
 pub mod health;
+pub mod identity_rotation;
 pub mod messaging;
 pub mod outbox;
 pub mod path_locks;

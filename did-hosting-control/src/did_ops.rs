@@ -591,6 +591,16 @@ pub async fn publish_did(
         "did.jsonl published on control plane"
     );
 
+    // If the DID just published was the service's *own*, its keys or services
+    // may have changed. Re-resolve and rotate the identity if so.
+    //
+    // Safe to call on every publish: it compares mnemonics first (no network),
+    // and a publish of our own DID that didn't change the identity resolves the
+    // document once and no-ops. It deliberately does not fail the publish — the
+    // log entry is committed and correct either way, and a rotation that can't
+    // proceed logs loudly rather than rolling back a valid publish.
+    crate::identity_rotation::on_did_published(state, mnemonic).await;
+
     Ok(())
 }
 
@@ -1108,6 +1118,7 @@ mod tests_atomic {
             registry: RegistryConfig::default(),
             trust_tasks: Default::default(),
             hosting: Default::default(),
+            identity: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -1120,6 +1131,7 @@ mod tests_atomic {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
+            identity: None,
             trust_tasks_verifier: None,
             jwt_keys: None,
             webauthn: None,

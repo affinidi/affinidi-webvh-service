@@ -18,6 +18,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod identity_rotation;
 pub mod messaging;
 pub mod routes;
 pub mod secret_store;

@@ -5,6 +5,7 @@ mod did_manage;
 mod didcomm;
 pub(crate) mod domain;
 pub mod health;
+mod identity;
 mod passkey;
 mod proxy;
 mod registry;
@@ -367,6 +368,16 @@ pub fn router_without_fallback() -> Router<AppState> {
         // Control plane (admin operations) — nested separately so the
         // /control/* prefix gates its own subset of Trust-Task URLs.
         .nest("/control", control)
+        // The service's own identity generations, and the kill switch that
+        // stops honouring a superseded one ahead of its grace period. Plain
+        // admin-gated routes rather than Trust Tasks: this is a local operator
+        // action on this process's in-memory key material, not a delegable
+        // authority that a peer could ever hold.
+        .route("/identity/generations", get(identity::list_generations))
+        .route(
+            "/identity/generations/{id}/retire",
+            post(identity::retire_generation),
+        )
         // Merge upload routes (body-limited).
         .merge(upload_routes);
 

@@ -8,7 +8,10 @@ use affinidi_messaging_didcomm_service::{
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
-use did_hosting_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
+use did_hosting_common::server::didcomm_profile::{
+    build_tdk_profile_for_identity, wait_for_did_resolution,
+};
+use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::passkey::PasskeyState;
 use did_hosting_common::server::store::{
@@ -57,6 +60,17 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    /// The service's own DID identity: every generation of key material still
+    /// honoured, and the kids each one answers to.
+    ///
+    /// `did_resolver` and `secrets_resolver` above are clones taken from this
+    /// — both are cheap (the cache client is internally `Arc`'d, the secrets
+    /// resolver already an `Arc`). They remain separate fields because most
+    /// callers want only one of them. This is the source of truth for *which
+    /// kids* those resolvers answer to, and the listener's profile is built
+    /// from it, so the two cannot drift apart the way they did when each
+    /// resolved the DID document independently.
+    pub identity: Option<Arc<ServiceIdentity>>,
     /// Trust Tasks proof verifier — backed by the
     /// `affinidi-data-integrity` crate, sharing the same
     /// [`DIDCacheClient`] as `did_resolver` for verificationMethod
@@ -228,9 +242,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // the `timeseries_ks` field doc on `AppState`.
     let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
-    // Initialize DIDComm auth infrastructure (requires server_did)
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), &secrets).await;
+    // Load the service's own identity (requires server_did). This resolves the
+    // DID document for the *real* verification-method key IDs and seeds the
+    // secrets resolver under them, rather than assuming `#key-0` / `#key-1`.
+    let identity = identity::load_identity(
+        config.server_did.as_deref(),
+        config.mediator_did.as_deref(),
+        identity::ProtocolSet {
+            didcomm: config.features.didcomm,
+            tsp: config.features.tsp,
+        },
+        &secrets,
+        &store,
+    )
+    .await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 
     // Initialize JWT keys
     let jwt_keys = init::init_jwt_keys(&secrets);
@@ -292,6 +319,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         config: Arc::new(config),
         did_resolver,
         secrets_resolver,
+        identity,
         trust_tasks_verifier,
         jwt_keys,
         webauthn,
@@ -439,12 +467,26 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
 
+    // 2b. Now that we are serving HTTP, resolve our *own* DID for the first time.
+    //
+    // A service that hosts its own DID cannot resolve it at boot — it is the
+    // thing that serves it — so `load_identity` came up on guessed
+    // `#key-0`/`#key-1` kids and deliberately persisted nothing. This is the
+    // first moment the document is actually fetchable, so it is where generation
+    // 0 gets recorded with the kids the document really uses.
+    //
+    // It must run *before* the DIDComm listener starts, or the listener's profile
+    // would be built on the guess.
+    if let Err(e) = crate::identity_rotation::reload_now(&state).await {
+        warn!("failed to establish the service identity from its DID document: {e}");
+    }
+
     // 3. Start the mediator messaging service (DIDComm and/or TSP) for
     //    inbound + outbound messages. TSP-only deployments (didcomm off,
     //    tsp on) must still start it.
     let didcomm_shutdown = CancellationToken::new();
     if state.config.features.didcomm || state.config.features.tsp {
-        match start_didcomm_service(&state, &secrets, didcomm_shutdown.clone()).await {
+        match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => {
                 let _ = state.didcomm_service.set(svc);
             }
@@ -454,6 +496,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             }
         }
     }
+
+    // 3b. Reconnect to any mediator we rotated *away* from but whose grace
+    // period has not elapsed. Peers holding a stale DID document are still
+    // delivering there, and a restart part-way through the window must not
+    // abandon that queue — which is exactly why the retiring generation (and its
+    // old mediator) is persisted. No-op in the common case: a key rotation on the
+    // same mediator strands nothing.
+    crate::identity_rotation::resume_mediator_drains(&state);
 
     // 4. Spawn DIDComm health check task (runs on main tokio runtime)
     let health_shutdown = CancellationToken::new();
@@ -493,6 +543,18 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         crate::purge_sweep::run_purge_sweep_loop(purge_store, purge_shutdown_rx).await;
     });
 
+    // 5b. Spawn the identity sweep. Expires generations whose grace period has
+    // elapsed (dropping their key material, so a superseded key stops
+    // decrypting), and doubles as the backstop for identity changes that never
+    // came through our own publish path — an out-of-band update, or one applied
+    // while this process was down.
+    let (identity_shutdown_tx, identity_shutdown_rx) = tokio::sync::watch::channel(false);
+    let identity_state = state.clone();
+    let identity_handle = tokio::spawn(async move {
+        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
+            .await;
+    });
+
     // 6. Spawn the durable outbox worker. Drains
     // `crate::outbox::KS_OUTBOUND_QUEUE` per-target FIFO; wakes on
     // `state.outbox_notify` (fired by every enqueue) for the low-
@@ -514,6 +576,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     health_shutdown.cancel();
     didcomm_shutdown.cancel();
     let _ = purge_shutdown_tx.send(true);
+    let _ = identity_shutdown_tx.send(true);
     let _ = outbox_shutdown_tx.send(true);
     // DIDCommService shutdown is handled by the cancellation token
 
@@ -549,6 +612,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("purge sweep task didn't shut down cleanly: {e}");
     }
 
+    if let Err(e) = identity_handle.await {
+        warn!("identity sweep task didn't shut down cleanly: {e}");
+    }
+
     if let Err(e) = outbox_handle.await {
         warn!("outbox worker didn't shut down cleanly: {e}");
     }
@@ -567,19 +634,18 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
 pub async fn start_didcomm_service(
     state: &AppState,
-    secrets: &ServerSecrets,
     shutdown: CancellationToken,
 ) -> Result<Option<DIDCommService>, AppError> {
-    let control_did = match &state.config.server_did {
-        Some(did) => did.as_str(),
+    let identity = match state.identity.as_ref() {
+        Some(identity) => identity,
         None => {
             info!("DIDComm not configured — server_did not set");
             return Ok(None);
         }
     };
 
-    let mediator_did = match &state.config.mediator_did {
-        Some(did) => did.as_str(),
+    let mediator_did = match identity.mediator_did() {
+        Some(did) => did,
         None => {
             info!("mediator_did not configured — DIDComm messaging disabled");
             return Ok(None);
@@ -587,8 +653,9 @@ pub async fn start_didcomm_service(
     };
 
     info!(
-        control_did = control_did,
-        mediator_did = mediator_did,
+        control_did = %identity.did,
+        mediator_did = %mediator_did,
+        generations = identity.generations().len(),
         "building TDK profile for DIDComm"
     );
 
@@ -597,18 +664,12 @@ pub async fn start_didcomm_service(
     // published its log, so we retry instead of starting the listener
     // against an unreachable mediator (which surfaces as a cryptic
     // "No Mediator is configured for this Profile" later).
-    if let Some(resolver) = state.did_resolver.as_ref() {
-        wait_for_did_resolution(mediator_did, "mediator", resolver, &shutdown).await?;
-    }
+    wait_for_did_resolution(&mediator_did, "mediator", &identity.did_resolver, &shutdown).await?;
 
-    let profile = build_tdk_profile(
-        "control",
-        control_did,
-        Some(mediator_did),
-        secrets,
-        state.did_resolver.as_ref(),
-    )
-    .await?;
+    // Carries the key material of every live generation, keyed on the kids the
+    // DID document actually resolved to — the same kids the secrets resolver
+    // was seeded with.
+    let profile = build_tdk_profile_for_identity("control", identity, Some(&mediator_did)).await?;
 
     info!("TDK profile built, configuring DIDComm listener");
 
@@ -617,9 +678,14 @@ pub async fn start_didcomm_service(
     // TSP is on. The four combinations map to the framework's `Protocols`;
     // "neither flag set but a mediator is configured" defaults to
     // DIDComm-only for back-compat.
-    let didcomm_enabled = state.config.features.didcomm;
-    let tsp_enabled = state.config.features.tsp;
-    let protocols = match (didcomm_enabled, tsp_enabled) {
+    //
+    // The union across live generations, not just the current one's config
+    // flags: a generation retiring out of DIDComm while the current identity
+    // is TSP-only still has peers delivering DIDComm to it until it expires,
+    // and the single listener has to carry both.
+    let transports = identity.protocols();
+    let tsp_enabled = transports.tsp;
+    let protocols = match (transports.didcomm, transports.tsp) {
         (true, true) => Protocols::BOTH,
         (false, true) => Protocols::TSP_ONLY,
         _ => Protocols::DIDCOMM_ONLY,
@@ -660,7 +726,8 @@ pub async fn start_didcomm_service(
 
     info!(
         tsp = tsp_enabled,
-        "messaging service started for {control_did}"
+        control_did = %identity.did,
+        "messaging service started"
     );
     Ok(Some(svc))
 }

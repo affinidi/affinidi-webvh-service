@@ -75,6 +75,20 @@ pub const KS_ASSIGNMENTS: &str = "assignments";
 /// period purges queued after a `domain/unassign/1.0` Trust Task.
 pub const KS_PENDING_PURGES: &str = "pending_purges";
 
+/// `identity:current` → the current generation id; `identity:gen:<id>` →
+/// an [`IdentityGeneration`](crate::server::identity::IdentityGeneration).
+///
+/// Records which version(s) of the service's *own* DID identity are still
+/// honoured: the resolved verification-method key IDs, the mediator, the
+/// protocol set, and (once a generation is retired) its expiry. Boot
+/// reconstructs the live set from here, because `config.toml` only ever
+/// describes the *current* identity — a retiring generation's mediator and
+/// kids exist nowhere else.
+///
+/// Metadata only. Private key material stays in the secret store, behind
+/// the keyring/KMS boundary; it is never written to a keyspace.
+pub const KS_IDENTITY: &str = "identity";
+
 /// `outbox:<target_did>:<enqueue_micros>:<uuid>` — durable outbound
 /// DIDComm queue. Every control→server mutation (assign, unassign,
 /// purge, domain-upsert, sync-update, sync-delete) is persisted here

@@ -18,6 +18,7 @@ use tracing::{Level, debug, error, info, warn};
 
 use did_hosting_common::server::config::init_tracing;
 use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::identity::ServiceIdentity;
 use did_hosting_common::server::init;
 use did_hosting_common::server::secret_store::ServerSecrets;
 use did_hosting_common::server::stats_collector::StatsCollector;
@@ -131,6 +132,22 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// List the service's own identity generations (key material still honoured).
+    IdentityList,
+    /// Stop honouring a superseded identity generation immediately.
+    ///
+    /// The offline kill switch, for a compromised key. Messages still addressed
+    /// to that generation's key-agreement key will no longer decrypt.
+    ///
+    /// The service must be stopped (the store is exclusively locked). For a
+    /// LIVE service use the control plane's
+    /// `POST /api/identity/generations/{id}/retire` or the UI button, which
+    /// drops the key from the running process immediately.
+    IdentityRetireNow {
+        /// Generation id to retire (see `identity-list`).
+        #[arg(long)]
+        generation: u64,
+    },
     /// Remove an ACL entry
     RemoveAcl {
         /// DID to remove from the ACL
@@ -328,6 +345,18 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::IdentityList) => {
+            if let Err(e) = run_identity_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::IdentityRetireNow { generation }) => {
+            if let Err(e) = run_identity_retire_now(cli.config, generation).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -694,6 +723,36 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         Arc::new(collector)
     };
 
+    // ── Phase 1.5: Load the daemon's own identity ─────────────────────
+    //
+    // One identity, shared by every embedded service.
+    //
+    // The standalone binaries each build their own DID resolver and secrets
+    // resolver, and the daemon used to do the same thing three times over —
+    // `build_server`, `build_witness` and `build_control` each called
+    // `init_didcomm_auth` with the same `server_did`, yielding three
+    // `DIDCacheClient`s and three `ThreadedSecretsResolver`s for one DID. That
+    // was already wasteful; with rotation it would be three copies of the key
+    // material a reload has to keep in step. They now share one.
+    //
+    // Loaded after `auto_bootstrap_dids`, which may have backfilled
+    // `server_did` — resolving before that would find nothing.
+    //
+    // The protocol set is the control plane's: in daemon mode the control
+    // plane owns the only DIDComm listener (see CLAUDE.md — the embedded
+    // server does not run its own).
+    let identity = did_hosting_common::server::identity::load_identity(
+        config.server_did.as_deref(),
+        config.mediator_did.as_deref(),
+        did_hosting_common::server::identity::ProtocolSet {
+            didcomm: config.features.didcomm,
+            tsp: config.features.tsp,
+        },
+        &secrets,
+        &main_store,
+    )
+    .await;
+
     // ── Phase 2: Build service routers ────────────────────────────────
 
     let mut combined: Router = Router::new();
@@ -717,6 +776,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &main_store,
             &stats_collector,
             &http_client,
+            identity.clone(),
         )
         .await
         {
@@ -734,7 +794,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &secrets, &witness_store).await {
+        match build_witness(&config, &secrets, &witness_store, identity.clone()).await {
             Ok(router) => {
                 combined = combined.nest("/witness", router);
                 enabled_services.push("witness (/witness)");
@@ -768,9 +828,8 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &secrets,
             &main_store,
             &stats_collector,
-            &stats_ks,
-            &timeseries_ks,
             &http_client,
+            identity.clone(),
         )
         .await
         {
@@ -847,6 +906,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             auth_config: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
+            control_state: control_state.clone(),
         },
         storage_shutdown_rx,
     ));
@@ -879,6 +939,20 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // may be hosted by this daemon and needs to be resolvable.
     let _ = http_ready_rx.await;
 
+    // 4a. The daemon's *own* DID is hosted by the daemon, so it was not
+    // resolvable when the identity was loaded — `load_identity` came up on
+    // guessed `#key-0`/`#key-1` kids and deliberately persisted nothing. This is
+    // the first moment the document is fetchable, so it is where generation 0 is
+    // recorded with the kids the document actually uses.
+    //
+    // Must run before the DIDComm listener starts, or its profile would be built
+    // on the guess.
+    if let Some(ref state) = control_state
+        && let Err(e) = did_hosting_control::identity_rotation::reload_now(state).await
+    {
+        warn!("failed to establish the service identity from its DID document: {e}");
+    }
+
     // 4b. DIDComm service (for VTA integration via control plane)
     //     Stored in the control state so server_push and handlers
     //     can send messages through the same connection.
@@ -895,7 +969,6 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             );
             match did_hosting_control::server::start_didcomm_service(
                 state,
-                &secrets,
                 didcomm_shutdown.clone(),
             )
             .await
@@ -987,6 +1060,12 @@ struct DaemonStorageParams {
     auth_config: did_hosting_common::server::config::AuthConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
+    /// The control plane's state, for the identity sweep.
+    ///
+    /// Daemon parity (CLAUDE.md): periodic work that standalone services spawn
+    /// as their own task lands in this unified storage task instead. `None` when
+    /// the control plane is disabled — nothing owns the identity then.
+    control_state: Option<did_hosting_control::server::AppState>,
 }
 
 async fn run_daemon_storage_task(
@@ -1008,12 +1087,24 @@ async fn run_daemon_storage_task(
     // records and clearing the pending entry.
     let mut purge_timer =
         tokio::time::interval(did_hosting_server::purge_sweep::DEFAULT_SWEEP_INTERVAL);
+    // Identity expiry — local and cheap, so it runs on the tight interval and
+    // retires a superseded key promptly. It also picks up a generation the
+    // offline CLI retired out of band.
+    let mut identity_expiry_timer =
+        tokio::time::interval(did_hosting_control::identity_rotation::SWEEP_INTERVAL);
+    // Identity reload — re-resolves our DID document over the network. Only a
+    // backstop (the publish hook catches a rotation the instant it happens), so
+    // it runs five times slower rather than burning a self-resolve every minute.
+    let mut identity_reload_timer =
+        tokio::time::interval(did_hosting_control::identity_rotation::RELOAD_INTERVAL);
 
     // Skip first ticks (immediate)
     session_timer.tick().await;
     did_timer.tick().await;
     flush_timer.tick().await;
     purge_timer.tick().await;
+    identity_expiry_timer.tick().await;
+    identity_reload_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -1057,6 +1148,18 @@ async fn run_daemon_storage_task(
                     info!(count = purged, "purge sweep tick completed");
                 }
             }
+            _ = identity_expiry_timer.tick() => {
+                if let Some(state) = params.control_state.as_ref() {
+                    did_hosting_control::identity_rotation::expire_due(state).await;
+                }
+            }
+            _ = identity_reload_timer.tick() => {
+                if let Some(state) = params.control_state.as_ref()
+                    && let Err(e) = did_hosting_control::identity_rotation::reload_now(state).await
+                {
+                    debug!("identity backstop reload failed: {e}");
+                }
+            }
             _ = shutdown_rx.changed() => {
                 info!("storage task shutting down");
                 break;
@@ -1098,6 +1201,7 @@ async fn build_server(
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
     http_client: &reqwest::Client,
+    identity: Option<Arc<ServiceIdentity>>,
 ) -> Result<(Router, did_hosting_server::server::AppState), AppError> {
     use did_hosting_server::server::AppState;
 
@@ -1106,8 +1210,8 @@ async fn build_server(
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let dids_ks = store.keyspace(KS_DIDS)?;
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
     let jwt_keys = init::init_jwt_keys(secrets);
     let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
 
@@ -1129,6 +1233,12 @@ async fn build_server(
         config: Arc::new(server_config),
         did_resolver,
         secrets_resolver,
+        identity,
+        // The daemon's embedded server does not run its own DIDComm listener —
+        // the control plane's handles the full protocol on the authoritative
+        // store (CLAUDE.md, "What the daemon intentionally does NOT mirror").
+        // The slot exists for parity with the standalone server's AppState.
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         jwt_keys,
         signing_key_bytes,
         http_client: http_client.clone(),
@@ -1149,6 +1259,7 @@ async fn build_witness(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
     store: &Store,
+    identity: Option<Arc<ServiceIdentity>>,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
     use webvh_witness::signing::LocalSigner;
@@ -1159,8 +1270,8 @@ async fn build_witness(
     let acl_ks = store.keyspace(KS_ACL)?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
     let jwt_keys = init::init_jwt_keys(secrets);
 
     let state = AppState {
@@ -1171,6 +1282,12 @@ async fn build_witness(
         config: Arc::new(witness_config),
         did_resolver,
         secrets_resolver,
+        identity,
+        // The daemon's embedded witness runs no DIDComm listener of its own —
+        // the control plane's listener carries the whole protocol. The slot
+        // exists for parity with the standalone witness's AppState, and leaving
+        // it empty is what makes the witness's rotation path an inert no-op here.
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
         jwt_keys,
         signer: Arc::new(LocalSigner),
     };
@@ -1204,21 +1321,26 @@ async fn build_control(
     secrets: &ServerSecrets,
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
-    stats_ks: &KeyspaceHandle,
-    timeseries_ks: &KeyspaceHandle,
     http_client: &reqwest::Client,
+    identity: Option<Arc<ServiceIdentity>>,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
     use did_hosting_control::server::AppState;
 
     let control_config = config.control_config();
 
+    // Opened here rather than threaded in: `keyspace()` is idempotent and
+    // cheap, and passing them as arguments pushed this past clippy's
+    // too-many-arguments bound for no benefit — the four below were always
+    // opened locally anyway.
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let registry_ks = store.keyspace(KS_REGISTRY)?;
     let dids_ks = store.keyspace(KS_DIDS)?;
+    let stats_ks = store.keyspace(KS_STATS)?;
+    let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
-    let (did_resolver, secrets_resolver) =
-        init::init_didcomm_auth(config.server_did.as_deref(), secrets).await;
+    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
     let jwt_keys = init::init_jwt_keys(secrets);
 
     // Initialize WebAuthn for passkeys
@@ -1259,14 +1381,15 @@ async fn build_control(
         config: Arc::new(control_config),
         did_resolver,
         secrets_resolver,
+        identity,
         trust_tasks_verifier,
         jwt_keys,
         webauthn,
         http_client: http_client.clone(),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: stats_collector.clone(),
-        stats_ks: stats_ks.clone(),
-        timeseries_ks: timeseries_ks.clone(),
+        stats_ks,
+        timeseries_ks,
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
@@ -1855,6 +1978,7 @@ async fn run_import_secrets(
         key_agreement_key: resolved_ka,
         jwt_signing_key: resolved_jwt,
         vta_credential: resolved_vta_cred,
+        retired: Vec::new(),
     };
 
     secret_store.set(&server_secrets).await?;
@@ -2092,4 +2216,30 @@ async fn run_remove_did(
 
     eprintln!("  DID removed.");
     Ok(())
+}
+
+/// `identity-list` — show which key material this service still honours.
+async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_list_generations(&config.store).await
+}
+
+/// `identity-retire-now` — the offline kill switch.
+///
+/// Opens the store directly, so it only works against a *stopped* service. A
+/// live service must be retired through the control plane's REST endpoint (or
+/// the UI button), which drops the key from the running process's secrets
+/// resolver — deleting a record on disk would not.
+async fn run_identity_retire_now(
+    config_path: Option<PathBuf>,
+    generation: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_retire_generation(
+        &config.store,
+        &config.secrets,
+        &config.config_path,
+        generation,
+    )
+    .await
 }

@@ -605,9 +605,55 @@ async function getServerInfo(): Promise<ServerInfoResponse> {
   return cachedServerInfo;
 }
 
+/**
+ * One version of this service's own DID identity.
+ *
+ * After a key rotation, peers holding a cached DID document keep encrypting to
+ * the *old* key-agreement key. A superseded generation therefore stays
+ * decryptable until `expiresAt`, so those messages still arrive.
+ */
+export interface IdentityGeneration {
+  id: number;
+  did: string;
+  /** The generation the DID document currently advertises. Cannot be retired. */
+  current: boolean;
+  signing_kid: string;
+  key_agreement_kid: string;
+  mediator_did: string | null;
+  didcomm: boolean;
+  tsp: boolean;
+  created_at: number;
+  /** When it stopped being current. `null` on the current generation. */
+  retired_at: number | null;
+  /** When it stops being honoured. `null` on the current generation. */
+  expires_at: number | null;
+}
+
+export interface IdentityGenerationsResponse {
+  generations: IdentityGeneration[];
+  /** How long a generation retired from now would keep being honoured. */
+  rotation_grace_secs: number;
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   serverInfo: getServerInfo,
+
+  /** This service's own identity generations. */
+  listIdentityGenerations: () =>
+    request<IdentityGenerationsResponse>("/api/identity/generations"),
+
+  /**
+   * Stop honouring a superseded generation immediately — the kill switch.
+   *
+   * Runs in-process on the control plane, so the key is dropped from the live
+   * secrets resolver before this returns. Messages still addressed to that
+   * generation's key-agreement key will no longer decrypt.
+   */
+  retireIdentityGeneration: (id: number) =>
+    request<void>(`/api/identity/generations/${id}/retire`, {
+      method: "POST",
+    }),
 
   listDids: (owner?: string) => {
     const params = owner ? `?owner=${encodeURIComponent(owner)}` : "";

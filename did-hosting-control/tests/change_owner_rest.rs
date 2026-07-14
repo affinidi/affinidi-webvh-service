@@ -80,6 +80,7 @@ async fn make_harness() -> Harness {
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
         hosting: Default::default(),
+        identity: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -94,6 +95,7 @@ async fn make_harness() -> Harness {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        identity: None,
         trust_tasks_verifier: None,
         jwt_keys: Some(jwt_keys),
         webauthn: None,

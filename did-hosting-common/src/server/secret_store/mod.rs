@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::server::config::SecretsConfig;
 use crate::server::error::AppError;
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Server secret key material stored in the secret store.
 ///
@@ -57,6 +57,62 @@ pub struct ServerSecrets {
     /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
     #[serde(default)]
     pub vta_credential: Option<String>,
+    /// Key material for identity generations that have been retired but whose
+    /// grace period has not yet elapsed.
+    ///
+    /// Peers cache DID documents, so after a key rotation they keep encrypting
+    /// to the *old* key-agreement key for a while. Inbound decryption matches
+    /// the JWE recipient `kid` against the secrets resolver rather than against
+    /// our document, so holding the old secret is exactly what lets those
+    /// messages still decrypt. See [`crate::server::identity`].
+    ///
+    /// **This lives in the same blob as the current keys on purpose.** A
+    /// rotation must move the outgoing key here in the *same* write that
+    /// installs its replacement: the secret store has no compare-and-swap, so
+    /// two separate writes leave a crash window in which the old private key is
+    /// gone from the store while peers are still encrypting to it — the precise
+    /// failure the retirement window exists to prevent. Modelled on
+    /// `vta_credential` (optional, `serde(default)`), not on the bootstrap seed,
+    /// whose lifecycle is genuinely independent of these keys.
+    ///
+    /// Empty is the steady state; `skip_serializing_if` keeps the wire format
+    /// byte-identical for deployments that have never rotated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<RetiredKeys>,
+}
+
+/// Key material for one retired identity generation, tagged with the key IDs
+/// the DID document gave it.
+///
+/// Keyed by `kid` rather than by generation id: the kid is what a `Secret` must
+/// be tagged with to be found during unpack, it is self-describing, and it
+/// avoids having to agree with a generation id that is assigned later, on a
+/// different write, in a different store.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RetiredKeys {
+    /// The `keyAgreement` verification-method id this generation's DID document
+    /// advertised. Inbound JWEs from peers with a stale document are addressed
+    /// to this.
+    pub ka_kid: String,
+    /// X25519 private key for DIDComm key agreement (multibase-encoded).
+    pub key_agreement_key: String,
+    /// The `authentication` verification-method id. Inert for DIDComm (the
+    /// outbound path does not sign), retained so a generation is fully
+    /// reconstructible.
+    pub signing_kid: String,
+    /// Ed25519 private key for DID signing (multibase-encoded).
+    pub signing_key: String,
+}
+
+impl std::fmt::Debug for RetiredKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetiredKeys")
+            .field("ka_kid", &self.ka_kid)
+            .field("key_agreement_key", &"<redacted>")
+            .field("signing_kid", &self.signing_kid)
+            .field("signing_key", &"<redacted>")
+            .finish()
+    }
 }
 
 // `Debug` is implemented manually to redact key material — derived `Debug`
@@ -71,6 +127,7 @@ impl std::fmt::Debug for ServerSecrets {
                 "vta_credential",
                 &self.vta_credential.as_ref().map(|_| "<redacted>"),
             )
+            .field("retired", &self.retired)
             .finish()
     }
 }
@@ -410,6 +467,7 @@ mod stored_secrets_tests {
             key_agreement_key: "k".into(),
             jwt_signing_key: "j".into(),
             vta_credential: None,
+            retired: Vec::new(),
         });
         let json = env.to_json().expect("serialises");
         let parsed = StoredSecrets::parse(&json).expect("re-parses");

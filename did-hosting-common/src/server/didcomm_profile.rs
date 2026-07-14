@@ -8,85 +8,12 @@
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-use affinidi_secrets_resolver::secrets::Secret;
 use affinidi_tdk_common::profiles::TDKProfile;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::error::AppError;
-use super::secret_store::ServerSecrets;
-
-/// Resolve the actual key IDs from a DID document.
-///
-/// The ATM SDK matches secrets to DID-document verification-method IDs during
-/// `pack_encrypted`. If the secrets use hardcoded fragments like `#key-0` /
-/// `#key-1` but the DID document uses multibase-encoded fragments like
-/// `#z6Mk…` / `#z6LS…`, the mediator will fail with "Unable unwrap cek".
-///
-/// Falls back to `{did}#key-0` / `{did}#key-1` when the DID cannot be resolved
-/// (e.g. the server hosts its own DID and hasn't published it yet).
-///
-/// Accepts an optional existing `DIDCacheClient` to avoid creating a throwaway
-/// resolver instance.
-pub async fn resolve_server_key_ids(
-    server_did: &str,
-    existing_resolver: Option<&DIDCacheClient>,
-) -> (String, String) {
-    let fallback_signing = format!("{server_did}#key-0");
-    let fallback_ka = format!("{server_did}#key-1");
-
-    // Use the provided resolver, or create a one-shot instance.
-    let owned;
-    let did_resolver = match existing_resolver {
-        Some(r) => r,
-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-            Ok(r) => {
-                owned = r;
-                &owned
-            }
-            Err(e) => {
-                warn!("failed to resolve DID for key IDs: {e} — using fallback");
-                return (fallback_signing, fallback_ka);
-            }
-        },
-    };
-
-    match did_resolver.resolve(server_did).await {
-        Ok(response) => {
-            let doc = &response.doc;
-
-            let ka_kid = match doc.key_agreement.first() {
-                Some(vr) => {
-                    let kid = vr.get_id().to_string();
-                    info!(kid = %kid, "DID doc keyAgreement key ID");
-                    kid
-                }
-                None => {
-                    warn!("DID document has no keyAgreement — using fallback {fallback_ka}");
-                    fallback_ka
-                }
-            };
-
-            let signing_kid = match doc.authentication.first() {
-                Some(vr) => {
-                    let kid = vr.get_id().to_string();
-                    info!(kid = %kid, "DID doc authentication key ID");
-                    kid
-                }
-                None => {
-                    warn!("DID document has no authentication — using fallback {fallback_signing}");
-                    fallback_signing
-                }
-            };
-
-            (signing_kid, ka_kid)
-        }
-        Err(e) => {
-            warn!("failed to resolve DID {server_did}: {e} — using fallback key IDs");
-            (fallback_signing, fallback_ka)
-        }
-    }
-}
+use super::identity::ServiceIdentity;
 
 /// Resolve the mediator DID from a peer's DID document.
 ///
@@ -384,56 +311,59 @@ pub async fn wait_for_did_resolution(
     }
 }
 
-/// Build a `TDKProfile` suitable for use with `DIDCommService`.
+/// Build a `TDKProfile` from an already-loaded [`ServiceIdentity`].
 ///
-/// 1. Resolves the DID document to discover actual verification-method key IDs.
-/// 2. Creates `Secret` objects from the configured private keys with the correct KIDs.
-/// 3. If `peer_did` is provided, resolves it to discover the mediator DID from
-///    its `DIDCommMessaging` service endpoint.
-/// 4. Returns a `TDKProfile` ready for `ListenerConfig`.
-pub async fn build_tdk_profile(
+/// Differs from [`build_tdk_profile`] in two ways that matter.
+///
+/// The kids are **not** re-resolved — they come from the identity's generation
+/// records. That is what keeps the listener's profile and the secrets resolver
+/// keyed on the same fragments; resolving them independently in two places is
+/// exactly how they came to disagree.
+///
+/// The profile carries the key material of **every live generation**, not just
+/// the current one. Since inbound decryption matches the JWE recipient `kid`
+/// against the secrets resolver rather than against our DID document, a message
+/// encrypted to a retired key-agreement key still decrypts for as long as its
+/// generation is live. This vector is also the only durable source of that
+/// truth: the framework re-seeds its resolver from `profile.secrets()` on every
+/// reconnect.
+pub async fn build_tdk_profile_for_identity(
     alias: &str,
-    service_did: &str,
+    identity: &ServiceIdentity,
     peer_did: Option<&str>,
-    secrets: &ServerSecrets,
-    did_resolver: Option<&DIDCacheClient>,
 ) -> Result<TDKProfile, AppError> {
-    let (signing_kid, ka_kid) = resolve_server_key_ids(service_did, did_resolver).await;
-
-    let signing_secret = Secret::from_multibase(&secrets.signing_key, Some(&signing_kid))
-        .map_err(|e| AppError::Config(format!("failed to decode signing_key: {e}")))?;
-
-    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, Some(&ka_kid))
-        .map_err(|e| AppError::Config(format!("failed to decode key_agreement_key: {e}")))?;
-
-    // Discover the actual mediator DID from the peer's DID document.
-    // Only follow one level: if the discovered endpoint is a DID, use it;
-    // if it's a URL (i.e. the peer IS the mediator), use the peer DID directly.
-    let mediator_did = if let Some(peer) = peer_did {
-        match resolve_mediator_did(peer, did_resolver).await {
-            Some(mediator) if mediator.starts_with("did:") => Some(mediator),
-            Some(_url) => {
-                // The peer's DIDCommMessaging points to a URL, meaning the
-                // peer itself is the mediator — use the peer DID directly.
-                info!("peer {peer} is a mediator (endpoint is a URL) — using it directly");
-                Some(peer.to_string())
-            }
-            None => {
-                warn!(
-                    "could not discover mediator from {peer} — \
-                     falling back to using it directly as mediator"
-                );
-                Some(peer.to_string())
-            }
-        }
-    } else {
-        None
-    };
+    let mediator_did = discover_mediator(peer_did, Some(&identity.did_resolver)).await;
 
     Ok(TDKProfile::new(
         alias,
-        service_did,
+        &identity.did,
         mediator_did.as_deref(),
-        vec![signing_secret, ka_secret],
+        identity.secrets(),
     ))
+}
+
+/// Discover the actual mediator DID from a peer's DID document.
+///
+/// Only follows one level: if the discovered endpoint is a DID, use it; if it
+/// is a URL (i.e. the peer *is* the mediator), use the peer DID directly.
+async fn discover_mediator(
+    peer_did: Option<&str>,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<String> {
+    let peer = peer_did?;
+
+    match resolve_mediator_did(peer, did_resolver).await {
+        Some(mediator) if mediator.starts_with("did:") => Some(mediator),
+        Some(_url) => {
+            info!("peer {peer} is a mediator (endpoint is a URL) — using it directly");
+            Some(peer.to_string())
+        }
+        None => {
+            warn!(
+                "could not discover mediator from {peer} — \
+                 falling back to using it directly as mediator"
+            );
+            Some(peer.to_string())
+        }
+    }
 }

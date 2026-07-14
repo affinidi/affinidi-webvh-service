@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -12,13 +12,23 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import type { ControlPlaneConfig } from "../../lib/api";
+import { showConfirm } from "../../lib/alert";
+import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
+}
+
+/** How much longer a superseded generation keeps decrypting. */
+function remainingLabel(expiresAt: number, now: number): string {
+  const left = expiresAt - now;
+  if (left <= 0) return "expiring";
+  if (left < 60) return `${left}s`;
+  if (left < 3600) return `${Math.floor(left / 60)}m`;
+  return `${Math.floor(left / 3600)}h ${Math.floor((left % 3600) / 60)}m`;
 }
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -56,6 +66,69 @@ export default function SettingsPage() {
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const [generations, setGenerations] = useState<IdentityGeneration[]>([]);
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  /** Id currently being retired, so its button can show progress. */
+  const [retiring, setRetiring] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+
+  const loadGenerations = useCallback(() => {
+    api
+      .listIdentityGenerations()
+      .then((data) => {
+        setGenerations(data.generations);
+        setIdentityError(null);
+      })
+      // A deployment with no DID configured has no generations. That is not an
+      // error worth showing — the panel simply doesn't render.
+      .catch(() => setGenerations([]));
+  }, [api]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    loadGenerations();
+  }, [isAuthenticated, loadGenerations]);
+
+  // The "honoured for" countdown is only meaningful if it actually counts down.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  /**
+   * Retire a superseded generation immediately.
+   *
+   * Spelled out rather than a bare "are you sure": this drops the key from the
+   * running service, so peers still holding the old DID document lose the
+   * ability to reach it until their cache expires. That breakage is the point
+   * when a key is compromised, but it is not something to trigger by accident.
+   */
+  const retireGeneration = (g: IdentityGeneration) => {
+    showConfirm(
+      `Retire generation ${g.id}?`,
+      `This stops honouring generation ${g.id} immediately, ahead of its grace period.\n\n` +
+        `Messages still encrypted to its key-agreement key will no longer decrypt, and peers ` +
+        `whose cached DID document still names that key will be unable to reach this service ` +
+        `until their cache expires.\n\n` +
+        `Do this if the key is compromised. Otherwise, let the grace period run out.`,
+      () => {
+        setRetiring(g.id);
+        api
+          .retireIdentityGeneration(g.id)
+          .then(() => {
+            setIdentityError(null);
+            loadGenerations();
+          })
+          .catch((e) =>
+            setIdentityError(
+              e instanceof Error ? e.message : "Failed to retire generation",
+            ),
+          )
+          .finally(() => setRetiring(null));
+      },
+    );
+  };
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -129,6 +202,55 @@ export default function SettingsPage() {
           <Row label="DID Hosting URL" value={config.didHostingUrl} />
         )}
       </View>
+
+      {/* Key generations. Only rendered when there is more than one — a
+          service that has never rotated has nothing to say here, and a
+          single-row panel would just be noise. */}
+      {generations.length > 1 && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Key Generations</Text>
+          <Text style={styles.explainer}>
+            After a key rotation, peers holding a cached copy of this
+            service&apos;s DID document keep encrypting to the old key. Superseded
+            generations stay decryptable for a grace period so those messages
+            still arrive.
+          </Text>
+
+          {generations.map((g) => (
+            <View key={g.id} style={styles.generation}>
+              <View style={styles.generationHeader}>
+                <Text style={styles.generationTitle}>
+                  Generation {g.id}
+                  {g.current ? " · current" : ""}
+                </Text>
+                {!g.current && (
+                  <Pressable
+                    style={styles.buttonDanger}
+                    disabled={retiring === g.id}
+                    onPress={() => retireGeneration(g)}
+                  >
+                    <Text style={styles.buttonDangerText}>
+                      {retiring === g.id ? "Retiring…" : "Retire now"}
+                    </Text>
+                  </Pressable>
+                )}
+              </View>
+
+              <Row label="Key agreement" value={g.key_agreement_kid} />
+              {g.expires_at !== null && (
+                <Row
+                  label="Honoured for"
+                  value={remainingLabel(g.expires_at, now)}
+                />
+              )}
+            </View>
+          ))}
+
+          {identityError && (
+            <Text style={styles.errorText}>{identityError}</Text>
+          )}
+        </View>
+      )}
 
       {/* Connectivity. `*Enabled` is what config turns on; the badge row
           below is what the control plane's DID document advertises to
@@ -302,6 +424,41 @@ const styles = StyleSheet.create({
   buttonPrimaryText: {
     color: colors.textOnAccent,
     fontSize: 14,
+    fontFamily: fonts.semibold,
+  },
+  explainer: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    marginBottom: spacing.md,
+    lineHeight: 17,
+  },
+  generation: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.md,
+    marginTop: spacing.md,
+  },
+  generationHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: spacing.xs,
+  },
+  generationTitle: {
+    fontSize: 14,
+    fontFamily: fonts.semibold,
+    color: colors.textPrimary,
+  },
+  buttonDanger: {
+    backgroundColor: colors.errorBg,
+    borderRadius: radii.md,
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+  },
+  buttonDangerText: {
+    color: colors.error,
+    fontSize: 12,
     fontFamily: fonts.semibold,
   },
   errorText: {

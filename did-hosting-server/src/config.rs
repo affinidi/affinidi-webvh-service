@@ -44,6 +44,11 @@ pub struct AppConfig {
     pub control_did: Option<String>,
     #[serde(default)]
     pub vta: VtaConfig,
+    /// How the service's own identity is produced, and how long a superseded
+    /// generation keeps being honoured after a rotation
+    /// (`identity.rotation_grace_period`).
+    #[serde(default)]
+    pub identity: did_hosting_common::server::config::IdentityConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }

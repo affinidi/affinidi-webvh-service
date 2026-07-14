@@ -281,6 +281,7 @@ mod tests {
             key_agreement_key: "z6LSagreement_test".into(),
             jwt_signing_key: "z6Mkjwt_test".into(),
             vta_credential: Some("test-vta-blob".into()),
+            retired: Vec::new(),
         };
 
         // Probe the backend with a write+delete; if the OS denies access in

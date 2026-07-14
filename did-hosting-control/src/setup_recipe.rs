@@ -237,6 +237,7 @@ pub async fn apply_recipe(
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
+        identity: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 
@@ -258,6 +259,7 @@ pub async fn apply_recipe(
         key_agreement_key: ka_priv,
         jwt_signing_key,
         vta_credential: vta_credential_b64,
+        retired: Vec::new(),
     };
     let secret_store = create_secret_store(&config)?;
     secret_store.set(&server_secrets).await?;

@@ -210,6 +210,10 @@ impl DaemonConfig {
             control_did: None,
             vta: self.vta.clone(),
             stats: did_hosting_server::config::StatsConfig::default(),
+            // Carried through for completeness. The embedded server runs no
+            // DIDComm listener of its own, so its rotation path is inert — the
+            // daemon's control plane owns the identity.
+            identity: self.identity.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -226,6 +230,10 @@ impl DaemonConfig {
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
+            // Carried through for completeness. The daemon's control plane owns
+            // the only DIDComm listener, so the embedded witness's rotation path
+            // is inert — its `didcomm_service` slot is never filled.
+            identity: self.identity.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -258,6 +266,10 @@ impl DaemonConfig {
             registry: self.registry.clone(),
             trust_tasks: did_hosting_control::config::TrustTasksConfig::default(),
             hosting: self.hosting.clone(),
+            // The daemon's control plane owns the only DIDComm listener, so it
+            // is the one that rotates — it needs the daemon's grace period, not
+            // a default.
+            identity: self.identity.clone(),
             config_path: self.config_path.clone(),
         }
     }

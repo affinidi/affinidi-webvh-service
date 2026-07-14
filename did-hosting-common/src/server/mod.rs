@@ -3,6 +3,7 @@ pub mod assignment;
 pub mod assignment_seed;
 pub mod auth;
 pub mod cli_acl;
+pub mod cli_identity;
 pub mod config;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;
@@ -10,6 +11,8 @@ pub mod domain;
 pub mod domain_purge;
 pub mod error;
 pub mod health;
+pub mod identity;
+pub mod identity_drain;
 pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;

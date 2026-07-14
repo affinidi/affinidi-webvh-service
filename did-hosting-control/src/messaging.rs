@@ -1758,6 +1758,7 @@ mod tests {
             registry: RegistryConfig::default(),
             trust_tasks: Default::default(),
             hosting: Default::default(),
+            identity: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -1770,6 +1771,7 @@ mod tests {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
+            identity: None,
             trust_tasks_verifier: None,
             jwt_keys: None,
             webauthn: None,
@@ -3024,6 +3026,7 @@ mod tests {
             registry: state.config.registry.clone(),
             trust_tasks: state.config.trust_tasks.clone(),
             hosting: state.config.hosting.clone(),
+            identity: Default::default(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);

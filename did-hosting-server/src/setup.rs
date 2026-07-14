@@ -269,6 +269,7 @@ pub async fn run_wizard(
             context_id: None,
         },
         stats: crate::config::StatsConfig::default(),
+        identity: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -282,6 +283,7 @@ pub async fn run_wizard(
         key_agreement_key: outcome.integration_ka_key_mb,
         jwt_signing_key,
         vta_credential: Some(outcome.vta_credential_b64),
+        retired: Vec::new(),
     };
 
     let secret_store = create_secret_store(&config)?;
@@ -796,6 +798,7 @@ pub async fn run_setup_offline_complete(
             context_id: None,
         },
         stats: crate::config::StatsConfig::default(),
+        identity: Default::default(),
         config_path: state.config_output.clone(),
     };
 
@@ -811,6 +814,7 @@ pub async fn run_setup_offline_complete(
         key_agreement_key: result.key_agreement_multibase,
         jwt_signing_key,
         vta_credential: None, // offline flow has no reusable VTA credential
+        retired: Vec::new(),
     };
 
     let secret_store = create_secret_store(&config)?;

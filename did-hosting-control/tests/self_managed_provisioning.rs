@@ -65,6 +65,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
         hosting: Default::default(),
+        identity: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -79,6 +80,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        identity: None,
         trust_tasks_verifier: None,
         jwt_keys: None,
         webauthn: None,

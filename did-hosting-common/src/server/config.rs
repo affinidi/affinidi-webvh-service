@@ -535,11 +535,62 @@ pub enum IdentityMode {
 }
 
 /// Identity configuration — selects how the service's own keys and DID are
-/// produced.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// produced, and how long a superseded identity keeps being honoured.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct IdentityConfig {
     #[serde(default)]
     pub mode: IdentityMode,
+
+    /// How long a superseded identity generation stays decryptable after the
+    /// DID document is updated. Format: duration string (`"1h"`, `"30m"`,
+    /// `"7d"`); `"0"` retires immediately.
+    ///
+    /// This exists because peers cache DID documents. After a key rotation they
+    /// keep encrypting to the *old* key-agreement key until their cache
+    /// expires, and those messages only decrypt while we still hold the old
+    /// secret. The window should comfortably exceed the longest DID-document
+    /// cache TTL among your peers; the resolver in this workspace defaults to
+    /// 300s, so `"1h"` is a wide margin.
+    ///
+    /// Setting `"0"` is the right choice for a **compromised** key — you want
+    /// the old key to stop being honoured at once and you accept that in-flight
+    /// messages addressed to it will fail.
+    #[serde(default = "default_rotation_grace_period")]
+    pub rotation_grace_period: String,
+}
+
+fn default_rotation_grace_period() -> String {
+    "1h".to_string()
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            mode: IdentityMode::default(),
+            rotation_grace_period: default_rotation_grace_period(),
+        }
+    }
+}
+
+impl IdentityConfig {
+    /// The grace period in seconds.
+    ///
+    /// An unparseable value falls back to the default rather than failing the
+    /// boot: a typo in a duration string should not take the service down, and
+    /// the safe direction is to keep honouring the old key for longer, not
+    /// shorter.
+    pub fn rotation_grace_secs(&self) -> u64 {
+        match crate::server::pending_purge::parse_grace_string(&self.rotation_grace_period) {
+            Ok(secs) => secs,
+            Err(e) => {
+                tracing::warn!(
+                    value = %self.rotation_grace_period,
+                    "invalid identity.rotation_grace_period ({e}) — falling back to 1h"
+                );
+                3600
+            }
+        }
+    }
 }
 
 /// Plaintext secret key material stored directly in the configuration file.
@@ -556,6 +607,13 @@ pub struct PlaintextSecrets {
     /// Optional — only present when the deployment integrates with a VTA host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vta_credential: Option<String>,
+    /// Key material for identity generations retired but not yet expired.
+    /// Mirrors `ServerSecrets::retired` — without it, a plaintext-backed
+    /// deployment would lose the outgoing key on the very write that installs
+    /// its replacement, and a restart mid-rotation could not decrypt traffic
+    /// still addressed to the old key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<crate::server::secret_store::RetiredKeys>,
 }
 
 impl std::fmt::Debug for PlaintextSecrets {
@@ -909,6 +967,7 @@ mod tests {
     fn identity_mode_serializes_kebab_case() {
         let toml_str = toml::to_string(&IdentityConfig {
             mode: IdentityMode::SelfManaged,
+            ..Default::default()
         })
         .unwrap();
         assert!(
@@ -918,6 +977,7 @@ mod tests {
 
         let toml_str = toml::to_string(&IdentityConfig {
             mode: IdentityMode::Vta,
+            ..Default::default()
         })
         .unwrap();
         assert!(
@@ -942,6 +1002,7 @@ mod tests {
     fn identity_config_round_trips() {
         let original = IdentityConfig {
             mode: IdentityMode::SelfManaged,
+            ..Default::default()
         };
         let serialized = toml::to_string(&original).unwrap();
         let deserialized: IdentityConfig = toml::from_str(&serialized).unwrap();

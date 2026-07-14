@@ -43,6 +43,7 @@ fn sample_secrets() -> ServerSecrets {
         key_agreement_key: "z6LSKeyAgreementMultibasePlaceholder".into(),
         jwt_signing_key: "z6MkJwtSigningKeyMultibasePlaceholder".into(),
         vta_credential: Some("dGVzdC1jcmVkZW50aWFs".into()),
+        retired: Vec::new(),
     }
 }
 

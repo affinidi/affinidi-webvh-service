@@ -62,6 +62,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         registry: RegistryConfig::default(),
         trust_tasks: Default::default(),
         hosting: Default::default(),
+        identity: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -74,6 +75,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
+        identity: None,
         trust_tasks_verifier: None,
         jwt_keys: None,
         webauthn: None,
