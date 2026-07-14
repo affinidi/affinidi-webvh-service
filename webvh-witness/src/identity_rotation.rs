@@ -12,15 +12,20 @@
 
 use std::time::Duration;
 
-use affinidi_messaging_didcomm_service::{ListenerConfig, Protocols, RestartPolicy, RetryConfig};
+use affinidi_messaging_didcomm_service::{
+    DIDCommService, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
+};
 use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
 use did_hosting_common::server::identity::{
-    self, DEFAULT_RELOAD_INTERVAL, DEFAULT_SWEEP_INTERVAL, ReloadOutcome,
+    self, DEFAULT_RELOAD_INTERVAL, DEFAULT_SWEEP_INTERVAL, IdentityGeneration, ReloadOutcome,
 };
+use did_hosting_common::server::identity_drain;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::error::AppError;
+use crate::messaging;
 use crate::secret_store::create_secret_store;
 use crate::server::AppState;
 
@@ -101,7 +106,18 @@ pub async fn reload_now(state: &AppState) -> Result<(), AppError> {
                 new_generation,
                 retired_generation, expires_at, "witness identity rotated — rebuilding listener"
             );
+            // Order matters: rebuild first (re-pointing the main listener at the
+            // new mediator), then drain — otherwise two connections would pull
+            // the same queue, and the mediator evicts a duplicate DID.
             rebuild_listener(state).await?;
+
+            if let Some(retired) = identity
+                .generations()
+                .into_iter()
+                .find(|g| g.id == retired_generation)
+            {
+                spawn_mediator_drain(state, retired);
+            }
         }
     }
 
@@ -156,6 +172,82 @@ async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
 
     info!("DIDComm listener rebuilt on the new identity");
     Ok(())
+}
+
+/// Start draining an old mediator, if this generation left one behind.
+///
+/// See `did_hosting_common::server::identity_drain` for why this is a second
+/// `DIDCommService` and not an HTTP poll: the poll can fetch and dispatch, but it
+/// cannot *reply*, so it would silently break every request/response protocol.
+///
+/// Only a mediator change strands a queue. A key rotation on the same mediator
+/// short-circuits here and costs nothing.
+pub fn spawn_mediator_drain(state: &AppState, generation: IdentityGeneration) {
+    let Some(identity) = state.identity.clone() else {
+        return;
+    };
+    if !identity_drain::needs_drain(&identity, &generation) {
+        return;
+    }
+    let Some(listener) = identity_drain::drain_listener_config("witness", &identity, &generation)
+    else {
+        return;
+    };
+
+    let router = match messaging::build_witness_router(state.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            identity_drain::warn_drain_failed(&generation, &e.to_string());
+            return;
+        }
+    };
+
+    let mediator = generation.mediator_did.clone().unwrap_or_default();
+    let generation_id = generation.id;
+
+    tokio::spawn(async move {
+        info!(
+            generation = generation_id,
+            mediator = %mediator,
+            "connecting to the old mediator to drain messages from peers with a stale DID document"
+        );
+
+        let shutdown = CancellationToken::new();
+        let config = identity_drain::drain_service_config(listener);
+
+        // The witness carries no TSP listener of its own — TSP rides the control
+        // plane's mediator socket — so there is no `start_with_tsp` arm here.
+        let svc = match DIDCommService::start(config, router, shutdown.clone()).await {
+            Ok(svc) => svc,
+            Err(e) => {
+                identity_drain::warn_drain_failed(&generation, &e.to_string());
+                return;
+            }
+        };
+
+        identity_drain::wait_until_generation_retires(identity, generation_id).await;
+
+        shutdown.cancel();
+        svc.shutdown().await;
+        info!(
+            generation = generation_id,
+            mediator = %mediator,
+            "old-mediator drain stopped"
+        );
+    });
+}
+
+/// Restart any drains a previous process had running.
+///
+/// A restart part-way through a drain window must reconnect to the old mediator,
+/// or the queue sitting there is abandoned for good.
+pub fn resume_mediator_drains(state: &AppState) {
+    let Some(identity) = state.identity.as_ref() else {
+        return;
+    };
+    for generation in identity_drain::generations_needing_drain(identity) {
+        spawn_mediator_drain(state, generation);
+    }
 }
 
 /// Expire generations past their grace period — and any retired out of band, by

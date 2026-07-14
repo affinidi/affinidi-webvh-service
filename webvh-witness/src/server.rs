@@ -229,6 +229,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     }
     let didcomm_service = state.didcomm_service.get();
 
+    // 3b. Reconnect to any mediator we rotated away from but whose grace period
+    // has not elapsed — a restart mid-window must not abandon that queue.
+    crate::identity_rotation::resume_mediator_drains(&state);
+
     // 4. Spawn the identity sweep. The witness hosts no DIDs, so it has no
     // publish hook — this sweep is its *only* way to notice its own DID rotated,
     // as well as what expires a superseded generation's key material.

@@ -98,10 +98,21 @@ enum Command {
     ///
     /// The service must be STOPPED (the store is exclusively locked).
     IdentityRotateKeys {
+        /// Which keys to rotate: "ka" (default), "signing", or "both".
+        ///
+        /// "ka"      — the encryption key. This is what the grace period covers.
+        /// "signing" — the DID's updateKeys: the authority to publish updates.
+        ///             Revoked IMMEDIATELY; there is no grace period for it, and
+        ///             for a compromised key that is exactly what you want.
+        #[arg(long, default_value = "ka")]
+        keys: String,
         /// X25519 key-agreement key to install (multibase). Generated if omitted.
         #[arg(long)]
         ka_key: Option<String>,
-        /// How long to keep honouring the outgoing key ("1h", "30m", "0").
+        /// Ed25519 signing key to install (multibase). Generated if omitted.
+        #[arg(long)]
+        signing_key: Option<String>,
+        /// How long to keep honouring the outgoing key-agreement key ("1h", "0").
         /// Defaults to `[identity] rotation_grace_period`.
         #[arg(long)]
         grace: Option<String>,
@@ -438,8 +449,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::IdentityRotateKeys { ka_key, grace }) => {
-            if let Err(e) = run_identity_rotate_keys(cli.config, ka_key, grace).await {
+        Some(Command::IdentityRotateKeys {
+            keys,
+            ka_key,
+            signing_key,
+            grace,
+        }) => {
+            if let Err(e) =
+                run_identity_rotate_keys(cli.config, keys, ka_key, signing_key, grace).await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1599,17 +1617,19 @@ async fn run_identity_retire_now(
     .await
 }
 
-/// `identity-rotate-keys` — rotate the service's own key-agreement key, offline.
+/// `identity-rotate-keys` — rotate the service's own keys, offline.
 ///
 /// Writes the new DID log entry, the new key material (carrying the outgoing key
 /// into the retired set in the same write), and the generation records. The
-/// service comes back up already holding both keys.
+/// service comes back up already holding both key-agreement keys.
 async fn run_identity_rotate_keys(
     config_path: Option<PathBuf>,
+    keys: String,
     ka_key: Option<String>,
+    signing_key: Option<String>,
     grace: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::identity_rotate::rotate_key_agreement_key;
+    use did_hosting_common::server::identity_rotate::{RotateKeys, rotate_keys};
     use did_hosting_common::server::secret_store::create_secret_store;
     use did_hosting_common::server::store::Store;
 
@@ -1619,6 +1639,7 @@ async fn run_identity_rotate_keys(
         .as_deref()
         .ok_or("server_did is not set — this service has no identity to rotate")?;
 
+    let which = RotateKeys::parse(&keys)?;
     let grace_secs = match grace.as_deref() {
         Some(s) => did_hosting_common::server::pending_purge::parse_grace_string(s)
             .map_err(|e| format!("invalid --grace: {e}"))?,
@@ -1628,42 +1649,59 @@ async fn run_identity_rotate_keys(
     let store = Store::open(&config.store).await?;
     let secret_store = create_secret_store(&config.secrets, &config.config_path)?;
 
-    let report = rotate_key_agreement_key(
+    let report = rotate_keys(
         &store,
         secret_store.as_ref(),
         server_did,
+        which,
         ka_key.as_deref(),
+        signing_key.as_deref(),
         grace_secs,
     )
     .await?;
 
     eprintln!();
-    eprintln!("  Rotated the key-agreement key for {}", report.did);
-    eprintln!(
-        "    new key    : {}  (generation {})",
-        report.new_ka_kid, report.new_generation
-    );
-    if grace_secs > 0 {
-        eprintln!(
-            "    retiring   : {}  (generation {}, honoured for {}m)",
-            report.retired_ka_kid,
-            report.retired_generation,
-            grace_secs / 60
-        );
-    } else {
-        eprintln!(
-            "    retiring   : {}  (RETIRED IMMEDIATELY — no grace period)",
-            report.retired_ka_kid
-        );
+    eprintln!("  Rotated keys for {}", report.did);
+
+    if report.which != RotateKeys::Signing {
+        eprintln!("    key agreement (new) : {}", report.new_ka_kid);
+        if grace_secs > 0 {
+            eprintln!(
+                "    key agreement (old) : {}  — honoured for {}m",
+                report.retired_ka_kid,
+                grace_secs / 60
+            );
+        } else {
+            eprintln!(
+                "    key agreement (old) : {}  — RETIRED IMMEDIATELY, no grace period",
+                report.retired_ka_kid
+            );
+        }
     }
-    eprintln!("    did.jsonl  : now {} entries", report.version_count);
+
+    if report.which != RotateKeys::KeyAgreement {
+        eprintln!("    signing       (new) : {}", report.new_signing_kid);
+        eprintln!("    signing       (old) : {}", report.retired_signing_kid);
+        eprintln!();
+        eprintln!("  The old signing key's authority to publish DID updates is REVOKED as of");
+        eprintln!("  this log entry — it can no longer sign an update the chain will accept.");
+        eprintln!("  There is no grace period for a signing key and there cannot be: peers");
+        eprintln!("  holding a cached DID document will reject signatures made with the new");
+        eprintln!("  key until they re-resolve.");
+    }
+
     eprintln!();
-    if grace_secs > 0 {
-        eprintln!("  Start the service. It will honour BOTH keys, so peers holding a cached");
-        eprintln!("  DID document can still reach it until the old key expires.");
+    eprintln!(
+        "    generation {} -> {}",
+        report.retired_generation, report.new_generation
+    );
+    eprintln!("    did.jsonl now has {} entries", report.version_count);
+    eprintln!();
+    if grace_secs > 0 && report.which != RotateKeys::Signing {
+        eprintln!("  Start the service. It will honour BOTH key-agreement keys, so peers");
+        eprintln!("  holding a cached DID document can still reach it until the old one expires.");
     } else {
-        eprintln!("  Start the service. Messages still encrypted to the old key will NOT");
-        eprintln!("  decrypt — peers must re-resolve the DID document first.");
+        eprintln!("  Start the service.");
     }
     eprintln!();
 

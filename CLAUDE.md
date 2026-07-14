@@ -38,6 +38,17 @@ in the daemon if it falls into any of these buckets:
   inbound DIDComm listener (`build_control_router`). Any new `MSG_*`
   routed there is automatically picked up; no separate daemon wiring
   needed.
+- **Service identity rotation.** The daemon's *own* DID identity — the
+  generation model, the rotation trigger, the expiry sweep, and the
+  old-mediator drain — is owned by the **control plane**, because in
+  daemon mode the control plane runs the only DIDComm listener. The
+  embedded server's and witness's rotation paths are inert by
+  construction: neither starts a listener, so their `didcomm_service`
+  slot stays empty and `rebuild_listener` no-ops. **Do not mirror
+  rotation into the embedded server** — the no-op falls out of the
+  daemon's existing shape and needs no conditional skip. See
+  `docs/identity-rotation-design.md`.
+
 - **TSP transport.** The daemon inherits TSP for free: it starts the
   control plane's `start_didcomm_service`, which carries TSP on the same
   mediator socket when `features.tsp` is set (it tracks `features.didcomm`

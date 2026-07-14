@@ -104,7 +104,18 @@ pub async fn handle(
             .signing_key_bytes
             .as_ref()
             .ok_or_else(|| AppError::Internal("server signing key not configured".into()))?;
-        let kid = format!("{server_did}#key-0");
+        // The kid the *document* names this key by — not a guess.
+        //
+        // This used to hardcode `#key-0`. That is only right for a DID whose
+        // document happens to use that fragment: a VTA-provisioned DID with
+        // multibase fragments already broke it, and a signing-key rotation moves
+        // it off `#key-0` by design. A signature under a kid the document does
+        // not carry is one no peer can verify.
+        let kid = state
+            .identity
+            .as_ref()
+            .map(|i| i.current().signing_kid)
+            .unwrap_or_else(|| format!("{server_did}#key-0"));
         let packed = pack::pack_signed(&response_msg, &kid, signing_key)
             .map_err(|e| AppError::Internal(format!("failed to pack DIDComm response: {e}")))?;
         return Ok((
@@ -149,7 +160,12 @@ pub async fn handle(
         .signing_key_bytes
         .as_ref()
         .ok_or_else(|| AppError::Internal("server signing key not configured".into()))?;
-    let kid = format!("{server_did}#key-0");
+    // See above — the document's kid, not a guess.
+    let kid = state
+        .identity
+        .as_ref()
+        .map(|i| i.current().signing_kid)
+        .unwrap_or_else(|| format!("{server_did}#key-0"));
     let packed = pack::pack_signed(&response_msg, &kid, signing_key)
         .map_err(|e| AppError::Internal(format!("failed to pack DIDComm response: {e}")))?;
 

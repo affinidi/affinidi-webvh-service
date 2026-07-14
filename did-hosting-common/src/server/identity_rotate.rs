@@ -48,8 +48,11 @@ use crate::server::store::{KS_DIDS, KS_IDENTITY, Store};
 /// What a rotation did, for the caller to report.
 pub struct RotationReport {
     pub did: String,
+    pub which: RotateKeys,
     pub new_ka_kid: String,
     pub retired_ka_kid: String,
+    pub new_signing_kid: String,
+    pub retired_signing_kid: String,
     pub new_generation: u64,
     pub retired_generation: u64,
     pub expires_at: u64,
@@ -148,19 +151,133 @@ fn rotate_key_agreement(doc: &Value, did_id: &str, new_ka_multibase: &str) -> (V
     (doc, new_kid)
 }
 
-/// Rotate the service's own key-agreement key.
+/// Replace the document's **signing** key — the one that authorises DID updates.
+///
+/// Rewrites `authentication` and `assertionMethod` onto a fresh fragment. The
+/// caller must also set `updateKeys` to the new public key in the log entry's
+/// parameters; that is what actually revokes the old key's authority to publish.
+fn rotate_signing(doc: &Value, did_id: &str, new_signing_multibase: &str) -> (Value, String) {
+    let mut doc = doc.clone();
+    let new_kid = format!("{did_id}#{new_signing_multibase}");
+
+    // Everything the outgoing signing key was named by. A key can appear in both
+    // `authentication` and `assertionMethod`, so collect from both.
+    let mut old_kids: Vec<String> = Vec::new();
+    for rel in ["authentication", "assertionMethod"] {
+        if let Some(refs) = doc.get(rel).and_then(Value::as_array) {
+            for r in refs.iter().filter_map(Value::as_str) {
+                if !old_kids.iter().any(|k| k == r) {
+                    old_kids.push(r.to_string());
+                }
+            }
+        }
+    }
+
+    // Anything the key-agreement relationship still points at must survive — a
+    // signing rotation must not take the encryption key with it.
+    let ka_kids: Vec<String> = doc
+        .get("keyAgreement")
+        .and_then(Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(vms) = doc
+        .get_mut("verificationMethod")
+        .and_then(Value::as_array_mut)
+    {
+        vms.retain(|vm| {
+            let Some(id) = vm.get("id").and_then(Value::as_str) else {
+                return true;
+            };
+            let is_old_signing = old_kids.iter().any(|k| k == id);
+            let still_used_for_ka = ka_kids.iter().any(|k| k == id);
+            !is_old_signing || still_used_for_ka
+        });
+        vms.push(json!({
+            "id": new_kid,
+            "type": "Multikey",
+            "controller": did_id,
+            "publicKeyMultibase": new_signing_multibase,
+        }));
+    }
+
+    doc["authentication"] = json!([new_kid]);
+    if doc.get("assertionMethod").is_some() {
+        doc["assertionMethod"] = json!([new_kid]);
+    }
+
+    (doc, new_kid)
+}
+
+/// Which keys a rotation touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateKeys {
+    /// The key-agreement (encryption) key only. The common case, and the one the
+    /// grace window is built for.
+    KeyAgreement,
+    /// The signing key only — the DID's `updateKeys`, i.e. the authority to
+    /// publish new versions of the document.
+    Signing,
+    /// Both, in one log entry.
+    Both,
+}
+
+impl RotateKeys {
+    pub fn parse(s: &str) -> Result<Self, AppError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ka" | "key-agreement" | "keyagreement" => Ok(Self::KeyAgreement),
+            "signing" | "update" => Ok(Self::Signing),
+            "both" | "all" => Ok(Self::Both),
+            other => Err(AppError::Config(format!(
+                "invalid --keys '{other}' (expected 'ka', 'signing', or 'both')"
+            ))),
+        }
+    }
+
+    fn rotates_ka(self) -> bool {
+        matches!(self, Self::KeyAgreement | Self::Both)
+    }
+
+    fn rotates_signing(self) -> bool {
+        matches!(self, Self::Signing | Self::Both)
+    }
+}
+
+/// Rotate the service's own keys.
 ///
 /// The service must be **stopped** — this writes the DID log, the secret store,
 /// and the generation records directly.
 ///
-/// `grace_secs` is how long the outgoing key keeps being honoured. `0` retires it
-/// at once (correct for a compromised key, and it means peers holding a stale
-/// document cannot reach the service until their cache expires).
-pub async fn rotate_key_agreement_key(
+/// `grace_secs` is how long the outgoing key-agreement key keeps being honoured.
+/// `0` retires it at once (correct for a compromised key, and it means peers
+/// holding a stale document cannot reach the service until their cache expires).
+///
+/// # What the grace period does and does not cover
+///
+/// It covers the **key-agreement** key: the old and new both stay loaded, so a
+/// peer with a cached document can still be decrypted. That is what the overlap
+/// is for.
+///
+/// It does **not** overlap the **signing** key, and cannot. The signing key's
+/// authority to update the DID is revoked the moment the new `updateKeys` land —
+/// which is the entire point when it is compromised, and is not something you
+/// would want to defer. The knock-on is that a peer holding a stale document will
+/// reject signatures made with the new key until it re-resolves (bounded by its
+/// cache TTL). Overlapping that would require publishing both signing keys and a
+/// *second* publish to withdraw the old one — a two-phase rotation this does not
+/// attempt, because for the case that matters (a compromised update key) you want
+/// the old key dead immediately, not in an hour.
+pub async fn rotate_keys(
     store: &Store,
     secret_store: &dyn SecretStore,
     server_did: &str,
+    which: RotateKeys,
     new_ka_key: Option<&str>,
+    new_signing_key: Option<&str>,
     grace_secs: u64,
 ) -> Result<RotationReport, AppError> {
     let Some(mnemonic) = mnemonic_from_did(server_did) else {
@@ -215,37 +332,86 @@ pub async fn rotate_key_agreement_key(
         })?
         .to_string();
 
-    // --- the incoming key -------------------------------------------------
-    let new_ka = match new_ka_key {
-        Some(multibase) => Secret::from_multibase(multibase, None)
-            .map_err(|e| AppError::Config(format!("invalid --ka-key: {e}")))?,
-        None => Secret::generate_x25519(None, None)
-            .map_err(|e| AppError::Config(format!("failed to generate an X25519 key: {e}")))?,
+    let retired_signing_kid = current_doc
+        .get("authentication")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // --- the incoming key(s) ----------------------------------------------
+    let mut new_doc = current_doc.clone();
+    let mut new_params = params.clone();
+
+    let (new_ka_kid, new_ka_multibase, new_ka_private) = if which.rotates_ka() {
+        let new_ka = match new_ka_key {
+            Some(multibase) => Secret::from_multibase(multibase, None)
+                .map_err(|e| AppError::Config(format!("invalid --ka-key: {e}")))?,
+            None => Secret::generate_x25519(None, None)
+                .map_err(|e| AppError::Config(format!("failed to generate an X25519 key: {e}")))?,
+        };
+        let multibase = new_ka
+            .get_public_keymultibase()
+            .map_err(|e| AppError::Config(format!("failed to derive the new public key: {e}")))?;
+
+        // The fresh fragment. This is what makes the grace period expressible —
+        // see the module docs.
+        let (doc, kid) = rotate_key_agreement(&new_doc, &did_id, &multibase);
+        if kid == retired_ka_kid {
+            return Err(AppError::Config(
+                "the new key-agreement key is identical to the current one — nothing to rotate"
+                    .into(),
+            ));
+        }
+        new_doc = doc;
+        let private = new_ka
+            .get_private_keymultibase()
+            .map_err(|e| AppError::Config(format!("failed to encode the new private key: {e}")))?;
+        (kid, Some(multibase), Some(private))
+    } else {
+        (retired_ka_kid.clone(), None, None)
     };
-    let new_ka_multibase = new_ka
-        .get_public_keymultibase()
-        .map_err(|e| AppError::Config(format!("failed to derive the new public key: {e}")))?;
 
-    // The fresh fragment. This is what makes the grace period expressible —
-    // see the module docs.
-    let (new_doc, new_ka_kid) = rotate_key_agreement(&current_doc, &did_id, &new_ka_multibase);
-
-    if new_ka_kid == retired_ka_kid {
-        return Err(AppError::Config(
-            "the new key-agreement key is identical to the current one — nothing to rotate".into(),
-        ));
-    }
-
-    // --- sign the new entry with the *current* update key ------------------
-    //
-    // The signing key is unchanged: this rotates the encryption key, not the
-    // authority to update the DID. didwebvh validates that the signer is
-    // authorised by the chain's active `updateKeys`.
+    // The key that will SIGN this entry. Always the *current* update key — the
+    // entry that introduces a new one must be authorised by the old one, which is
+    // what makes the rotation verifiable to anyone walking the chain.
     let signing = Secret::from_multibase(&secrets.signing_key, None)
         .map_err(|e| AppError::Config(format!("failed to decode signing_key: {e}")))?;
     let signing_multibase = signing
         .get_public_keymultibase()
         .map_err(|e| AppError::Config(format!("failed to derive the signing public key: {e}")))?;
+
+    let (new_signing_kid, new_signing_private) = if which.rotates_signing() {
+        let new_signing = match new_signing_key {
+            Some(multibase) => Secret::from_multibase(multibase, None)
+                .map_err(|e| AppError::Config(format!("invalid --signing-key: {e}")))?,
+            None => Secret::generate_ed25519(None, None),
+        };
+        let multibase = new_signing.get_public_keymultibase().map_err(|e| {
+            AppError::Config(format!("failed to derive the new signing public key: {e}"))
+        })?;
+        if multibase == signing_multibase {
+            return Err(AppError::Config(
+                "the new signing key is identical to the current one — nothing to rotate".into(),
+            ));
+        }
+
+        let (doc, kid) = rotate_signing(&new_doc, &did_id, &multibase);
+        new_doc = doc;
+
+        // This is the line that actually revokes the old key's authority. From
+        // this entry on, only the new key can sign a valid update — an attacker
+        // holding the old one can no longer publish anything the chain accepts.
+        new_params.update_keys = Some(std::sync::Arc::new(vec![multibase.into()]));
+
+        let private = new_signing.get_private_keymultibase().map_err(|e| {
+            AppError::Config(format!("failed to encode the new signing private key: {e}"))
+        })?;
+        (kid, Some(private))
+    } else {
+        (retired_signing_kid.clone(), None)
+    };
 
     // didwebvh-rs requires the signer's verification method to embed its own
     // multibase key. Mirrors `did::create_log_entry`.
@@ -255,7 +421,7 @@ pub async fn rotate_key_agreement_key(
     }
 
     state
-        .create_log_entry(None, &new_doc, &params, &signer)
+        .create_log_entry(None, &new_doc, &new_params, &signer)
         .await
         .map_err(|e| AppError::Config(format!("failed to sign the new log entry: {e}")))?;
 
@@ -294,20 +460,22 @@ pub async fn rotate_key_agreement_key(
     let expires_at = now.saturating_add(grace_secs);
 
     if grace_secs > 0 {
+        // The outgoing key material, filed under the kids the *document* named it
+        // by — that is how `secrets_for` finds it again for a retired generation.
         secrets.retired.retain(|r| r.ka_kid != retired_ka_kid);
         secrets.retired.push(RetiredKeys {
             ka_kid: retired_ka_kid.clone(),
             key_agreement_key: secrets.key_agreement_key.clone(),
-            // The signing key is unchanged by a key-agreement rotation, so the
-            // retired generation shares it. Recorded so the generation is fully
-            // reconstructible on its own.
-            signing_kid: format!("{did_id}#key-0"),
+            signing_kid: retired_signing_kid.clone(),
             signing_key: secrets.signing_key.clone(),
         });
     }
-    secrets.key_agreement_key = new_ka
-        .get_private_keymultibase()
-        .map_err(|e| AppError::Config(format!("failed to encode the new private key: {e}")))?;
+    if let Some(private) = new_ka_private {
+        secrets.key_agreement_key = private;
+    }
+    if let Some(private) = new_signing_private {
+        secrets.signing_key = private;
+    }
     secret_store.set(&secrets).await?;
 
     // 2. Generation records.
@@ -328,9 +496,14 @@ pub async fn rotate_key_agreement_key(
     let new_generation = IdentityGeneration {
         id: current.id + 1,
         did: did_id.clone(),
-        signing_kid: current.signing_kid.clone(),
+        signing_kid: new_signing_kid.clone(),
         ka_kid: new_ka_kid.clone(),
-        ka_public_multibase: Some(new_ka_multibase),
+        // Carried forward when the key-agreement key was not rotated: it is still
+        // the same key, and `None` would read as "unknown" and disarm the
+        // same-kid-rotation guard.
+        ka_public_multibase: new_ka_multibase
+            .clone()
+            .or(current.ka_public_multibase.clone()),
         mediator_did: current.mediator_did.clone(),
         protocols: current.protocols,
         created_at: now,
@@ -366,8 +539,11 @@ pub async fn rotate_key_agreement_key(
 
     Ok(RotationReport {
         did: did_id,
+        which,
         new_ka_kid,
         retired_ka_kid,
+        new_signing_kid,
+        retired_signing_kid,
         new_generation: new_generation.id,
         retired_generation: retiring.id,
         expires_at,
@@ -431,6 +607,71 @@ mod tests {
                 .any(|vm| vm["publicKeyMultibase"] == json!("z6LSnew")),
             "the new key must be published"
         );
+    }
+
+    #[test]
+    fn a_signing_rotation_moves_the_authentication_key_and_leaves_encryption_alone() {
+        // The security-critical rotation: the signing key IS the DID's
+        // `updateKeys` — the authority to publish new versions. It must move, and
+        // it must not take the encryption key with it.
+        let ka_kid = format!("{DID}#z6LSka");
+        let doc = doc_with_ka(&ka_kid, "z6LSka");
+        let (rotated, new_kid) = rotate_signing(&doc, DID, "z6MkNewSigning");
+
+        assert_eq!(new_kid, format!("{DID}#z6MkNewSigning"));
+        assert_eq!(rotated["authentication"], json!([new_kid]));
+
+        // The old signing method is gone from the document...
+        let vms = rotated["verificationMethod"].as_array().unwrap();
+        assert!(
+            !vms.iter()
+                .any(|vm| vm["id"] == json!(format!("{DID}#key-0"))),
+            "the superseded signing key must not stay published"
+        );
+
+        // ...but the key-agreement key is untouched. A signing rotation that
+        // silently dropped the encryption key would take every peer offline.
+        assert_eq!(rotated["keyAgreement"], doc["keyAgreement"]);
+        assert!(
+            vms.iter().any(|vm| vm["id"] == json!(ka_kid)),
+            "the key-agreement verification method must survive a signing rotation"
+        );
+        assert_eq!(rotated["service"], doc["service"], "services must survive");
+    }
+
+    #[test]
+    fn a_key_doing_double_duty_survives_a_signing_rotation() {
+        // A document may name one key for both authentication and keyAgreement.
+        // Removing it as "the old signing key" would silently destroy the
+        // encryption key too — so the removal is conditional on the key not still
+        // being referenced by keyAgreement.
+        let shared = format!("{DID}#z6MkShared");
+        let doc = json!({
+            "id": DID,
+            "authentication": [shared],
+            "keyAgreement": [shared],
+            "verificationMethod": [
+                { "id": shared, "type": "Multikey",
+                  "controller": DID, "publicKeyMultibase": "z6MkShared" },
+            ],
+        });
+
+        let (rotated, _) = rotate_signing(&doc, DID, "z6MkNewSigning");
+
+        let vms = rotated["verificationMethod"].as_array().unwrap();
+        assert!(
+            vms.iter().any(|vm| vm["id"] == json!(shared)),
+            "a key still referenced by keyAgreement must not be removed as a stale signing key"
+        );
+        assert_eq!(rotated["keyAgreement"], json!([shared]));
+    }
+
+    #[test]
+    fn rotate_keys_parses_the_operator_facing_names() {
+        assert_eq!(RotateKeys::parse("ka").unwrap(), RotateKeys::KeyAgreement);
+        assert_eq!(RotateKeys::parse("signing").unwrap(), RotateKeys::Signing);
+        assert_eq!(RotateKeys::parse("both").unwrap(), RotateKeys::Both);
+        assert!(RotateKeys::parse("everything").is_err());
     }
 
     #[test]
