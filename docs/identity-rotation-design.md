@@ -136,31 +136,38 @@ profile would be built on the guess.
 
 Found by running a daemon, not by any test.
 
-### Known blocker: a root DID at the `.well-known` slot is not resolvable
+### Fixed: a root DID no longer carries `.well-known` in its identifier
 
-**Pre-existing, not introduced here, and it prevents rotation entirely on
-affected deployments.**
-
-Setup mints a root DID as `did:webvh:<SCID>:<host>:.well-known` — with
-`.well-known` *inside* the DID string. Per the did:webvh spec a root DID maps to
-`/.well-known/did.jsonl` implicitly, so a conforming resolver strips the suffix
-on the round-trip and then rejects the document because its `id` no longer
-matches:
+Setup used to mint the root DID as `did:webvh:<SCID>:<host>:.well-known` — with
+the *storage slot* baked into the identifier. No conforming did:webvh resolver
+can round-trip that: it maps the pathless form to `/.well-known/did.jsonl`
+implicitly, so on the way back it strips the suffix and rejects the document
+because the `id` inside no longer matches the DID it was asked for:
 
 ```
-DID being resolved (did:webvh:Qm…:localhost%3A8534)
+DID being resolved (did:webvh:Qm…:did.example.com)
 does not match the top-level 'id' in any DIDDoc version
 ```
 
-The document is served correctly (HTTP 200) — it is the *identifier* that does
-not round-trip. Hosting the DID at a path instead (`…:<host>:daemon`) resolves
-cleanly.
+The document served fine (HTTP 200); the *identifier* was what failed. Affected
+services could never resolve their own DID, so generation 0 was never established
+and rotation could not function at all.
 
-Consequence for this feature: a service whose own DID sits at the `.well-known`
-slot can never resolve it, so generation 0 is never established and rotation
-cannot function. Left untouched here because commit #72 ("allow registering the
-root DID at the .well-known slot") deliberately shaped this area — it needs an
-owner's call, not a drive-by fix.
+`.well-known` is where the document is **stored**, not part of the DID. A root
+DID is `did:webvh:<SCID>:<host>`. Two halves of one fix:
+
+- `did::build_did_document` folds a `.well-known` mnemonic to the root, matching
+  `build_did_web_id` and `setup_recipe::apply::hosting_url_for`, which both
+  already did. It was the only one of the three that didn't.
+- `identity::mnemonic_from_did` is its inverse: a pathless DID maps back to the
+  `.well-known` slot. Without this the rotation trigger's "is this DID ours?"
+  gate returns `None` for every root DID and **silently never fires** — on the
+  most common deployment shape there is.
+
+**Not fixable in place for DIDs already minted.** The SCID is derived from the
+document, so changing the `id` means a new DID. Affected deployments must
+recreate theirs; `load_identity` now detects the shape and says so explicitly
+rather than leaving an operator chasing what looks like a network error.
 
 ## Verified by running it
 
@@ -174,7 +181,8 @@ no mediator):
 - **a restart that loads the stored generation with zero fallback warnings** —
   the durability requirement that motivated the whole design.
 
-Both of the bugs above were found this way, and by nothing else.
+The `.well-known` bug was found this way, and so was the establish-vs-rotate
+bug. Neither was caught by any test.
 
 **Not verified, and needing a real mediator:** a key rotation end-to-end (no CLI
 produces a signed v2 webvh log entry today), the listener rebuild, two-mediator

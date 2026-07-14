@@ -88,17 +88,36 @@ pub struct DidDocumentOptions<'a> {
 /// Ed25519 verification method at `#key-0`. Additional keys and services
 /// can be added via [`DidDocumentOptions`].
 ///
-/// An empty `mnemonic` builds the **root** DID for the host —
-/// `did:webvh:{SCID}:<host>` with no path segments, which per did:webvh
-/// resolves at `https://<host>/.well-known/did.jsonl`. Without this an
-/// empty mnemonic would emit a trailing `:` and a malformed identifier.
+/// An empty mnemonic — or `.well-known`, the slot the root DID is *stored*
+/// under — builds the **root** DID for the host: `did:webvh:{SCID}:<host>`
+/// with no path segments, which per did:webvh resolves at
+/// `https://<host>/.well-known/did.jsonl`.
+///
+/// `.well-known` is a storage location, not part of the identifier. Emitting it
+/// inside the DID produces an id no conforming resolver can round-trip: it maps
+/// the pathless form to `/.well-known/did.jsonl` implicitly, so on the way back
+/// it strips the suffix and then rejects the document because the `id` inside no
+/// longer matches the DID it was asked to resolve —
+///
+/// ```text
+/// DID being resolved (did:webvh:Qm…:did.example.com)
+/// does not match the top-level 'id' in any DIDDoc version
+/// ```
+///
+/// The document serves fine; the *identifier* is what fails to round-trip. This
+/// mirrors [`build_did_web_id`] and `setup_recipe::apply::hosting_url_for`,
+/// which both already fold `.well-known` to the root.
 pub fn build_did_document(
     host: &str,
     mnemonic: &str,
     public_key_multibase: &str,
     opts: &DidDocumentOptions<'_>,
 ) -> serde_json::Value {
-    let did_path = mnemonic.replace('/', ":");
+    let did_path = if mnemonic == ".well-known" {
+        String::new()
+    } else {
+        mnemonic.replace('/', ":")
+    };
     let did_id = if did_path.is_empty() {
         format!("did:webvh:{{SCID}}:{host}")
     } else {

@@ -249,21 +249,36 @@ impl ServiceIdentity {
     }
 }
 
-/// Extract the mnemonic (hosted path) from a `did:webvh` DID string.
+/// Extract the mnemonic (the slot the DID is *stored* under) from a `did:webvh`
+/// DID string.
 ///
-/// `did:webvh:{SCID}:{host}:{path:components}` → `path/components`.
+/// - `did:webvh:{SCID}:{host}:{path:components}` → `path/components`
+/// - `did:webvh:{SCID}:{host}` → `.well-known`
 ///
-/// Used to answer "is the DID that was just published *our own*?" — the
-/// question that gates the rotation trigger. Without it, every publish would
-/// re-resolve our document; with it, only publishes that could plausibly have
-/// changed our identity do.
+/// The second case is the root DID, and it is not an edge case — it is the
+/// canonical shape for a service that owns its domain. `.well-known` is where
+/// its document is *stored* (and served from), but it is not part of the
+/// identifier: did:webvh maps the pathless form to `/.well-known/did.jsonl`
+/// implicitly. This is the inverse of [`crate::did::build_did_document`].
+///
+/// Used to answer "is the DID that was just published *our own*?" — the question
+/// that gates the rotation trigger. Returning `None` for a root DID would make
+/// that gate reject every publish, and rotation would silently never fire on the
+/// most common deployment shape there is.
 pub fn mnemonic_from_did(did: &str) -> Option<String> {
     let rest = did.strip_prefix("did:webvh:")?;
-    // Skip the SCID, then the host (which may carry a `%3A`-encoded port as a
-    // single segment). What remains is the colon-joined path.
+    // Skip the SCID. What's left is `{host}` or `{host}:{path…}` — the host
+    // carries any port `%3A`-encoded, so it never contains a bare colon itself.
     let after_scid = rest.split_once(':')?.1;
-    let after_host = after_scid.split_once(':')?.1;
-    Some(after_host.replace(':', "/"))
+    if after_scid.is_empty() {
+        return None;
+    }
+
+    match after_scid.split_once(':') {
+        Some((_host, path)) if !path.is_empty() => Some(path.replace(':', "/")),
+        // Pathless (or a trailing colon): the root DID, stored at `.well-known`.
+        _ => Some(".well-known".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +359,34 @@ pub async fn resolve_identity_doc(
         ka_kid,
         ka_public_multibase,
     })
+}
+
+/// Turn one specific, unfixable-in-place misconfiguration into an actionable
+/// message instead of a cryptic resolver error.
+///
+/// Builds before this was fixed minted the root DID as
+/// `did:webvh:<scid>:<host>:.well-known` — with the *storage slot* baked into
+/// the identifier. No conforming resolver can round-trip that: it maps the
+/// pathless form to `/.well-known/did.jsonl` implicitly, so on the way back it
+/// strips the suffix and rejects the document because the `id` inside no longer
+/// matches. The document serves fine (HTTP 200); the identifier is what fails.
+///
+/// It cannot be corrected in place — the SCID is derived from the document, so
+/// changing the id means a new DID. Say that plainly rather than let the operator
+/// chase a resolution error that looks like a network problem.
+fn warn_if_well_known_in_identifier(did: &str) {
+    if !did.ends_with(":.well-known") {
+        return;
+    }
+    warn!(
+        did = did,
+        "this DID carries `.well-known` inside its identifier, which no conforming \
+         did:webvh resolver can round-trip — `.well-known` is where the document is \
+         *stored*, not part of the DID. A root DID should be `did:webvh:<scid>:<host>`. \
+         This was minted by a build predating the fix and cannot be corrected in place \
+         (the SCID is bound to the document): the DID must be recreated. Identity \
+         rotation cannot function until then."
+    );
 }
 
 /// Whether `secret` is the private half of the key the document advertises.
@@ -544,6 +587,7 @@ pub async fn load_identity(
                 "DID document not resolvable and no stored generation — \
                  falling back to #key-0/#key-1 and not persisting"
             );
+            warn_if_well_known_in_identifier(did);
             (
                 IdentityGeneration {
                     id: 0,
@@ -1350,13 +1394,51 @@ mod tests {
             Some("alice")
         );
 
-        // A DID with no hosted path has no mnemonic — must not yield `Some("")`,
-        // which would match an empty mnemonic and rotate on the wrong publish.
-        assert_eq!(mnemonic_from_did("did:webvh:QmSCID:example.com"), None);
+        // THE ROOT DID — the canonical shape for a service that owns its domain,
+        // and the one this gate has to get right. `.well-known` is where the
+        // document is *stored*, not part of the identifier. Returning `None` here
+        // would make the gate reject every publish, and rotation would silently
+        // never fire on the most common deployment there is.
+        assert_eq!(
+            mnemonic_from_did("did:webvh:QmSCID:did.example.com").as_deref(),
+            Some(".well-known")
+        );
+        assert_eq!(
+            mnemonic_from_did("did:webvh:QmSCID:localhost%3A8080").as_deref(),
+            Some(".well-known"),
+            "a root DID with a percent-encoded port is still a root DID"
+        );
 
         // Other methods are not ours.
         assert_eq!(mnemonic_from_did("did:web:example.com:alice"), None);
         assert_eq!(mnemonic_from_did("did:key:z6Mk"), None);
+        assert_eq!(mnemonic_from_did("did:webvh:QmSCID"), None, "no host");
+    }
+
+    #[test]
+    fn the_root_did_round_trips_between_identifier_and_storage_slot() {
+        // `build_did_document` and `mnemonic_from_did` are inverses, and the root
+        // DID is where they used to disagree: setup stored the document under
+        // `.well-known` *and* baked `.well-known` into the identifier, producing
+        // a DID no conforming resolver could round-trip.
+        use crate::did::{DidDocumentOptions, build_did_document};
+
+        let doc = build_did_document(
+            "did.example.com",
+            ".well-known",
+            "z6MkPubKey",
+            &DidDocumentOptions::default(),
+        );
+        let id = doc["id"].as_str().expect("id");
+
+        assert_eq!(
+            id, "did:webvh:{SCID}:did.example.com",
+            "`.well-known` is a storage slot, not part of the identifier"
+        );
+
+        // ...and back again, to the slot the document is served from.
+        let concrete = id.replace("{SCID}", "QmSCID");
+        assert_eq!(mnemonic_from_did(&concrete).as_deref(), Some(".well-known"));
     }
 
     #[test]

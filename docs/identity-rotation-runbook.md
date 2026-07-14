@@ -9,35 +9,39 @@ Design: `docs/identity-rotation-design.md`.
 
 ## 0. Preflight — do this first, it can save you the whole session
 
-### 0a. Is your service's own DID at the `.well-known` slot?
+### 0a. Does your service's own DID resolve?
 
 ```bash
 grep server_did config.toml
 ```
 
-If it ends in `:.well-known` — e.g.
-`did:webvh:QmAbc…:did.example.com:.well-known` — **stop. Rotation cannot work on
-this deployment**, and it is not because of anything in this PR.
+A **root DID must be pathless** — `did:webvh:<scid>:did.example.com`. That is the
+correct and canonical shape; its document is *stored and served* at
+`/.well-known/did.jsonl`, but `.well-known` is not part of the identifier.
 
-A conforming resolver maps a root DID to `/.well-known/did.jsonl` *implicitly*,
-so it strips the `.well-known` suffix on the round-trip and then rejects the
-document because its `id` no longer matches. The document serves fine (200); the
-*identifier* does not round-trip. Confirm with:
-
-```bash
-# Should print the establish line. If instead you see the mismatch error, this is it.
-grep -E "service identity established|does not match the top-level" <logs>
-```
-
-Failure signature:
+If your `server_did` **ends in `:.well-known`**, it was minted by a build
+predating this PR and **cannot resolve at all** — a conforming resolver strips
+the suffix on the round-trip and then rejects the document because the `id`
+inside no longer matches:
 
 ```
 DID being resolved (did:webvh:Qm…:did.example.com)
 does not match the top-level 'id' in any DIDDoc version
 ```
 
-Test against a **path-hosted** DID instead (`…:did.example.com:control`). See the
-design doc, "Known blocker".
+This PR fixes the *minting* (new DIDs come out pathless), but **an existing DID
+cannot be corrected in place** — the SCID is derived from the document, so
+changing the `id` means a new DID. Affected deployments must recreate theirs. On
+boot you will now get an explicit warning saying exactly that, instead of a
+resolution error that looks like a network problem.
+
+Confirm the identifier the document actually carries matches the DID you
+configured:
+
+```bash
+curl -s https://<host>/.well-known/did.jsonl | tail -1 | jq -r '.state.id'
+# must equal server_did, and must NOT end in :.well-known
+```
 
 ### 0b. Which secret backend?
 
