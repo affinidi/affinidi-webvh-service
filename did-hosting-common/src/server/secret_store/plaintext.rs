@@ -44,9 +44,38 @@ impl PlaintextSecretStore {
 }
 
 impl SecretStore for PlaintextSecretStore {
+    /// Read the secrets, preferring the **file** over the construction-time
+    /// snapshot.
+    ///
+    /// The snapshot comes from the `AppConfig` a caller happened to be holding,
+    /// which goes stale the moment anything writes new key material — and the
+    /// thing that writes it (`import-secrets`) runs in a *different process*.
+    /// A running service reloading its identity would otherwise read the keys it
+    /// booted with, fail to match them against the freshly-published DID
+    /// document, and refuse the rotation with a message blaming the operator for
+    /// an ordering mistake they did not make.
+    ///
+    /// This mirrors `get_bootstrap_seed`, which already re-reads the file for
+    /// exactly this reason (the offline-wizard staleness bug). The file is the
+    /// source of truth in plaintext mode; the snapshot is only a fallback for
+    /// callers constructed without a readable config path.
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>> {
-        let secrets = self.secrets.clone();
-        Box::pin(async move { Ok(secrets) })
+        let snapshot = self.secrets.clone();
+        let config_path = self.config_path.clone();
+        Box::pin(async move {
+            match read_plaintext_secrets(&config_path).await {
+                Ok(Some(from_file)) => Ok(Some(from_file)),
+                // No `[secrets.plaintext]` on disk, or the file is unreadable —
+                // fall back rather than pretending the service has no secrets.
+                Ok(None) => Ok(snapshot),
+                Err(e) => {
+                    warn!(
+                        "failed to re-read plaintext secrets from config ({e}) — using the snapshot"
+                    );
+                    Ok(snapshot)
+                }
+            }
+        })
     }
 
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>> {
@@ -133,6 +162,49 @@ impl SecretStore for PlaintextSecretStore {
         let config_path = self.config_path.clone();
         Box::pin(async move { write_plaintext_seed_field(&config_path, None).await })
     }
+}
+
+/// Read `[secrets.plaintext]` from `config_path`.
+///
+/// Returns `Ok(None)` when the file is missing or carries no plaintext secrets —
+/// the caller then falls back to its construction-time snapshot.
+async fn read_plaintext_secrets(
+    config_path: &std::path::Path,
+) -> Result<Option<ServerSecrets>, AppError> {
+    let contents = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Config(format!(
+                "failed to read config file {}: {e}",
+                config_path.display()
+            )));
+        }
+    };
+
+    let doc: toml::Value = toml::from_str(&contents).map_err(|e| {
+        AppError::Config(format!(
+            "failed to parse config file {}: {e}",
+            config_path.display()
+        ))
+    })?;
+
+    let Some(value) = doc.get("secrets").and_then(|s| s.get("plaintext")) else {
+        return Ok(None);
+    };
+
+    let plaintext: PlaintextSecrets = value
+        .clone()
+        .try_into()
+        .map_err(|e| AppError::Config(format!("failed to parse [secrets.plaintext]: {e}")))?;
+
+    Ok(Some(ServerSecrets {
+        signing_key: plaintext.signing_key,
+        key_agreement_key: plaintext.key_agreement_key,
+        jwt_signing_key: plaintext.jwt_signing_key,
+        vta_credential: plaintext.vta_credential,
+        retired: plaintext.retired,
+    }))
 }
 
 /// Read `[secrets].plaintext_bootstrap_seed` from `config_path`. Returns
