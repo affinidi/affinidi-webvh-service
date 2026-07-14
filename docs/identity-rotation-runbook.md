@@ -87,90 +87,74 @@ Seeing that warning on a restart means generation 0 never persisted.)
 
 ## 1. Key rotation, same mediator — the common case
 
-This is the one that must be seamless. Order matters, and only one order works.
-
-### Why the order
-
-`import-secrets` **overwrites** the key-agreement key in the secret store. If you
-publish the new DID document *first*, the running service re-resolves, sees a key
-it does not hold, and refuses to rotate (loudly, and correctly). If you write the
-key *first*, the running service still holds the old key in memory — which is the
-only surviving copy once the store is overwritten — and can move it into the
-retired set in the same write that installs the new one.
-
-So: **keys, then publish.** Never the reverse.
-
-### Steps
-
-**1. Generate a new X25519 key-agreement key** (and Ed25519 signing key if you are
-rotating that too), multibase-encoded.
-
-**2. Write it to the secret store — service still running.**
+This is the one that must be seamless, and there is now a single command for it.
 
 ```bash
-did-hosting-daemon --config config.toml import-secrets \
-  --signing-key "z6Mk…"  \
-  --ka-key      "z6LS…"  \
-  --force
+# Service STOPPED (the store is exclusively locked).
+did-hosting-daemon --config config.toml identity-rotate-keys --grace 1h
 ```
 
-`import-secrets` does **not** open the DID store, so it is safe against a live
-service. Nothing changes yet — the running process still uses the old keys,
-because the document still advertises them.
+It generates a new X25519 key-agreement key, publishes a signed v2 webvh log
+entry installing it **on a fresh verification-method fragment**, carries the
+outgoing key into the retired set, and records both generations. Then start the
+service — it comes back holding *both* keys.
 
-**3. Publish a new DID log entry** advertising the new verification methods
-(signed by the current `updateKeys`).
+Pass `--ka-key <multibase>` to install a specific key instead of generating one,
+and `--grace 0` to retire the old key immediately (a compromise; peers holding a
+stale document cannot reach you until their cache expires).
 
-> ⚠️ There is **no CLI for this today**. `recreate-did` mints a *new* DID (new
-> SCID), which is not a rotation. You will need to produce a v2 webvh log entry
-> with your existing tooling and `PUT` it:
->
-> ```bash
-> curl -X PUT -H "Authorization: Bearer $ADMIN_JWT" \
->   -H 'Content-Type: text/plain' \
->   --data-binary @did-v2.jsonl \
->   https://<control>/api/dids/<mnemonic>
-> ```
->
-> Building that entry is the main friction in this runbook and the strongest
-> argument for an `identity-rotate-keys` command as a follow-up.
+### Why the fresh fragment matters — read this before hand-rolling anything
 
-### What to expect
+The new key is published at `#<its own multibase>`, **not** at `#key-1` again.
+That is not cosmetic. The secrets resolver is a map keyed by kid, and inbound
+JWEs name their recipient by kid — so two keys cannot both answer to `#key-1`.
 
-The publish hook fires immediately — no waiting on a poll:
+**A rotation that reuses the fragment has no expressible grace period at all.**
+Whichever key you hold, half your peers fail. If you hand-build a v2 entry that
+reuses `#key-1`, it will appear to work and will silently cost you the entire
+overlap — which is the one thing you are trying to test. The service now detects
+this and logs `RotatedWithoutOverlap` at **error** rather than pretending
+everything is fine, but the overlap is gone either way.
+
+### Expected output
 
 ```
-INFO our own DID was published — checking for a rotation
-INFO service identity rotated — rebuilding listener
-     new_generation=1 retired_generation=0 expires_at=…
-INFO DIDComm listener rebuilt on the new identity
+  Rotated the key-agreement key for did:webvh:Qm…:did.example.com
+    new key    : did:webvh:Qm…#z6LSd5hAwQ8c…  (generation 1)
+    retiring   : did:webvh:Qm…#key-1          (generation 0, honoured for 60m)
+    did.jsonl  : now 2 entries
 ```
 
-Then:
+Then, on start:
+
+```
+INFO service identity loaded  generation=1  live_generations=2
+```
+
+**`live_generations=2` is the whole point.** Confirm:
 
 ```bash
+did-hosting-daemon --config config.toml identity-list      # stopped
+# or, live:
 curl -sH "Authorization: Bearer $ADMIN_JWT" \
   https://<control>/api/identity/generations | jq
 ```
 
-- **Two** generations.
-- Generation 1: `current: true`, `expires_at: null`, new `key_agreement_kid`.
-- Generation 0: `current: false`, `retired_at` set, `expires_at ≈ now + 3600`.
+- Generation 1: `current`, new fragment.
+- Generation 0: `retired_at` set, `expires_at ≈ now + 3600`.
 
 **The behaviour that matters:** a peer whose cached DID document still names the
 *old* key can still reach you. Verify by sending from a peer that has not
-re-resolved (or whose resolver cache you have not flushed) — it should be
-delivered and answered, not dropped.
+re-resolved — it should be delivered *and answered*, not dropped.
 
 ### Failure signatures
 
 | Log | Means |
 |---|---|
-| `REFUSED to rotate the service identity: … advertises key-agreement key … but the secret store holds a different private key` | You published before writing the key. Do step 2, then re-publish (or wait for the 5-min backstop). **The service is still running fine on the old identity** — this is the guard working. |
+| `REFUSED to rotate the service identity: … advertises key-agreement key … but the secret store holds a different private key` | The document and the secret store disagree. `identity-rotate-keys` writes both together, so you only see this if a document was published by other means. **The service is still running fine on the old identity** — this is the guard working. |
+| `identity rotated WITHOUT a grace period` | The rotation reused the verification-method fragment. See above — the overlap is gone. |
 | `service identity unchanged` | The document's kids/mediator/protocols did not actually change. |
-| `could not resolve our own DID document` | See preflight 0a. |
-
----
+| `no identity generation recorded — start the service once…` | The service has never resolved its own DID. Start it once, then rotate. |
 
 ## 2. Restart mid-window — the durability requirement
 
@@ -321,6 +305,4 @@ No mediator was available, so these are covered by unit tests and construction
 only — they are the highest-value things for you to watch:
 
 - the listener rebuild against a real mediator (§1);
-- two-mediator coexistence and the drain (§3);
-- a key rotation end-to-end (§1) — blocked on there being no CLI that emits a
-  signed v2 webvh log entry.
+- two-mediator coexistence and the drain (§3).

@@ -13,6 +13,7 @@ pub mod error;
 pub mod health;
 pub mod identity;
 pub mod identity_drain;
+pub mod identity_rotate;
 pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;
