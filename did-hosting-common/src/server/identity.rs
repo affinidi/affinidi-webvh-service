@@ -98,6 +98,22 @@ pub struct IdentityGeneration {
     /// and the reason a retired generation has to stay loaded.
     pub ka_kid: String,
 
+    /// The `publicKeyMultibase` the document advertised for `ka_kid`.
+    ///
+    /// Tracked because **a kid alone does not identify a key.** A rotation that
+    /// installs new key material under the *same* verification-method fragment
+    /// (`#key-1` → `#key-1`) changes nothing about the kid, so a diff on kids
+    /// alone reports "unchanged" while the service quietly keeps using the old
+    /// private key against a document that now advertises a different public one.
+    /// Every peer with a fresh document then fails to reach it, and the log says
+    /// everything is fine.
+    ///
+    /// `Option` for backwards compatibility: generations persisted before this
+    /// field existed deserialise with `None`, which reads as "unknown" and does
+    /// not spuriously trip the diff.
+    #[serde(default)]
+    pub ka_public_multibase: Option<String>,
+
     /// The mediator this generation's listener connects to. Taken from
     /// config, not the document — the document advertises where *peers*
     /// should deliver, which must agree, but the two are set separately.
@@ -135,6 +151,36 @@ impl IdentityGeneration {
             || self.ka_kid != other.ka_kid
             || self.mediator_did != other.mediator_did
             || self.protocols != other.protocols
+            || self.key_material_differs_from(other)
+    }
+
+    /// Whether the *key material* behind `ka_kid` changed, as opposed to the kid.
+    ///
+    /// `None` on either side means "unknown" — a generation persisted before the
+    /// public key was recorded, or a document that does not expose
+    /// `publicKeyMultibase`. Unknown must not read as "changed", or every such
+    /// deployment would rotate on its first reload.
+    pub fn key_material_differs_from(&self, other: &Self) -> bool {
+        match (&self.ka_public_multibase, &other.ka_public_multibase) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
+
+    /// A rotation that reuses the verification-method fragment.
+    ///
+    /// **No grace window is possible in this case, in principle.** The secrets
+    /// resolver is a map keyed by kid, and inbound JWEs name their recipient by
+    /// kid — so two keys cannot both answer to `#key-1`. Whichever one we hold,
+    /// half the peers fail: keep the old and anyone with a fresh document is
+    /// locked out; take the new and anyone with a stale one is.
+    ///
+    /// The service takes the new key (the document is authoritative, and the
+    /// stale half will heal as caches expire) and says loudly what it could not
+    /// do. Rotating onto a *fresh* fragment is what makes the overlap work, and
+    /// is what our own tooling emits.
+    pub fn is_same_kid_rotation(&self, other: &Self) -> bool {
+        self.ka_kid == other.ka_kid && self.key_material_differs_from(other)
     }
 }
 
@@ -594,6 +640,10 @@ pub async fn load_identity(
                     did: did.to_string(),
                     signing_kid: format!("{did}#key-0"),
                     ka_kid: format!("{did}#key-1"),
+                    // The kids here are a guess, so the key material behind them
+                    // is unknown too. `None` reads as "unknown" and never trips
+                    // the diff — the placeholder must not look like a rotation.
+                    ka_public_multibase: None,
                     mediator_did: mediator_did.map(str::to_string),
                     protocols,
                     created_at: now,
@@ -677,8 +727,6 @@ async fn resolve_current_generation(
         }
         return stored.cloned();
     };
-    let (signing_kid, ka_kid) = (doc.signing_kid, doc.ka_kid);
-
     // Carry the existing id forward. Boot reconciles the *current* generation in
     // place; assigning a fresh id and retiring the old one is a rotation, and
     // that only ever happens through `reload_service_identity`, which knows how
@@ -691,8 +739,9 @@ async fn resolve_current_generation(
     Some(IdentityGeneration {
         id,
         did: did.to_string(),
-        signing_kid,
-        ka_kid,
+        signing_kid: doc.signing_kid,
+        ka_kid: doc.ka_kid,
+        ka_public_multibase: doc.ka_public_multibase,
         mediator_did: mediator_did.map(str::to_string),
         protocols,
         created_at,
@@ -725,6 +774,21 @@ pub enum ReloadOutcome {
     /// happen to use `#key-0`/`#key-1` — would fire on the first boot of a
     /// service that has never rotated anything.
     Established { generation: u64 },
+    /// New key material arrived under the **same** verification-method id, so the
+    /// new key was adopted with **no grace period**.
+    ///
+    /// Not a shortcoming of this code — it is not expressible. A kid identifies
+    /// exactly one key: the secrets resolver is keyed by kid and inbound JWEs
+    /// name their recipient by kid, so two keys cannot both answer to `#key-1`.
+    /// Messages already encrypted to the previous key cannot be decrypted, and
+    /// peers holding a stale document cannot reach the service until their cache
+    /// expires.
+    ///
+    /// Rotate onto a *fresh* fragment to get an overlap. This variant exists so
+    /// that a rotation which cannot overlap is **loud** rather than silently
+    /// reported as "unchanged" — which is what a kid-only diff used to do, while
+    /// the service quietly kept using the old private key.
+    RotatedWithoutOverlap { generation: u64, ka_kid: String },
     /// The document could not be resolved. The current generation stands.
     Unresolvable,
     /// The document changed, but we hold no private key matching the new
@@ -803,8 +867,9 @@ pub async fn reload_service_identity(
             current.id
         },
         did: identity.did.clone(),
-        signing_kid: doc.signing_kid,
-        ka_kid: doc.ka_kid,
+        signing_kid: doc.signing_kid.clone(),
+        ka_kid: doc.ka_kid.clone(),
+        ka_public_multibase: doc.ka_public_multibase.clone(),
         mediator_did: mediator_did.map(str::to_string),
         protocols,
         created_at: now,
@@ -856,6 +921,33 @@ pub async fn reload_service_identity(
                  the DID (keys, then rotate)",
                 candidate.ka_kid
             ),
+        });
+    }
+
+    // A rotation that reused the verification-method fragment.
+    //
+    // No overlap is possible here, and not because of any shortcoming in this
+    // code: the secrets resolver is keyed by kid and inbound JWEs name their
+    // recipient by kid, so two keys cannot both answer to `#key-1`. Whichever we
+    // hold, half the peers fail.
+    //
+    // Take the new key — the document is authoritative, and peers still on the
+    // old one heal as their caches expire — and say plainly what could not be
+    // done. Rotating onto a *fresh* fragment is what makes the grace window work.
+    if current.is_same_kid_rotation(&candidate) {
+        establish_generation(identity, store, &identity_ks, &candidate, secret_store).await?;
+        warn!(
+            ka_kid = %candidate.ka_kid,
+            "the DID document rotated its key-agreement key but kept the same \
+             verification-method id ({}) — so NO grace period is possible: a kid identifies \
+             exactly one key, and messages already encrypted to the previous one cannot be \
+             decrypted. Adopted the new key; peers holding a stale document cannot reach this \
+             service until their cache expires. Rotate onto a NEW fragment to get an overlap.",
+            candidate.ka_kid
+        );
+        return Ok(ReloadOutcome::RotatedWithoutOverlap {
+            generation: candidate.id,
+            ka_kid: candidate.ka_kid,
         });
     }
 
@@ -1304,6 +1396,7 @@ mod tests {
             did: "did:webvh:example:alpha".into(),
             signing_kid: "did:webvh:example:alpha#key-0".into(),
             ka_kid: ka_kid.into(),
+            ka_public_multibase: None,
             mediator_did: Some("did:web:mediator.example".into()),
             protocols: ProtocolSet {
                 didcomm: true,
@@ -1344,6 +1437,69 @@ mod tests {
         b.created_at = 999;
         b.retired_at = Some(1000);
         assert!(!a.differs_from(&b), "id and timestamps are not identity");
+    }
+
+    #[test]
+    fn new_key_material_under_the_same_kid_is_not_reported_as_unchanged() {
+        // The silent-breakage case. Our own `build_did_document` uses fixed
+        // `#key-0`/`#key-1` fragments, so a key rotation that reuses them changes
+        // no kid at all. A diff on kids alone reports "unchanged" — and the
+        // service keeps using the OLD private key while the document advertises
+        // the NEW public one. Every peer with a fresh document is locked out, and
+        // the log says everything is fine.
+        let mut old = generation(0, "did:webvh:example:alpha#key-1");
+        old.ka_public_multibase = Some("z6LSoldkey".into());
+
+        let mut new = old.clone();
+        new.ka_public_multibase = Some("z6LSnewkey".into());
+
+        assert!(
+            old.differs_from(&new),
+            "new key material must register as a change even when the kid is identical"
+        );
+        assert!(old.is_same_kid_rotation(&new));
+    }
+
+    #[test]
+    fn a_same_kid_rotation_cannot_overlap_but_a_fresh_fragment_can() {
+        // Why our tooling must emit a NEW fragment. The secrets resolver is keyed
+        // by kid and inbound JWEs name their recipient by kid, so two keys cannot
+        // both answer to `#key-1`. Rotating onto a fresh fragment is what makes a
+        // grace window expressible at all.
+        let mut old = generation(0, "did:webvh:example:alpha#key-1");
+        old.ka_public_multibase = Some("z6LSoldkey".into());
+
+        let mut same_kid = old.clone();
+        same_kid.ka_public_multibase = Some("z6LSnewkey".into());
+        assert!(
+            same_kid.is_same_kid_rotation(&old),
+            "same fragment + new key = no overlap possible"
+        );
+
+        let mut fresh_kid = generation(1, "did:webvh:example:alpha#z6LSnewkey");
+        fresh_kid.ka_public_multibase = Some("z6LSnewkey".into());
+        assert!(old.differs_from(&fresh_kid));
+        assert!(
+            !old.is_same_kid_rotation(&fresh_kid),
+            "a fresh fragment can hold both keys at once — this is the overlapping path"
+        );
+    }
+
+    #[test]
+    fn unknown_key_material_never_trips_the_diff() {
+        // Generations persisted before the public key was recorded deserialise
+        // with `None`, and a document may not expose `publicKeyMultibase` at all.
+        // Unknown must read as "unknown", not "changed" — otherwise every such
+        // deployment would spuriously rotate on its first reload after upgrading.
+        let old = generation(0, "did:webvh:example:alpha#key-1"); // ka_public_multibase: None
+        let mut new = old.clone();
+        new.ka_public_multibase = Some("z6LSsomething".into());
+
+        assert!(!old.key_material_differs_from(&new));
+        assert!(
+            !old.differs_from(&new),
+            "unknown must not look like a rotation"
+        );
     }
 
     #[test]

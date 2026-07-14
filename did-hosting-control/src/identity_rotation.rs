@@ -104,6 +104,20 @@ pub async fn reload_now(state: &AppState) -> Result<(), AppError> {
             );
             rebuild_listener(state).await?;
         }
+        ReloadOutcome::RotatedWithoutOverlap { generation, ka_kid } => {
+            // Loud on purpose: the operator asked for a rotation and got one, but
+            // without the grace window they are almost certainly expecting.
+            error!(
+                generation,
+                ka_kid = %ka_kid,
+                "identity rotated WITHOUT a grace period — the new key-agreement key reuses the \
+                 same verification-method id, and a kid identifies exactly one key, so messages \
+                 already encrypted to the previous key CANNOT be decrypted. Peers holding a stale \
+                 DID document cannot reach this service until their cache expires. Rotate onto a \
+                 NEW fragment for a seamless cutover."
+            );
+            rebuild_listener(state).await?;
+        }
         ReloadOutcome::Unresolvable => {
             warn!("could not resolve our own DID document — identity left as-is");
         }

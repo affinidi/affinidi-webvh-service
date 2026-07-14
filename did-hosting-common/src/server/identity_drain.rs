@@ -199,6 +199,7 @@ mod tests {
             did: DID.into(),
             signing_kid: format!("{DID}#z6Mk{id}"),
             ka_kid: format!("{DID}#z6LS{id}"),
+            ka_public_multibase: None,
             mediator_did: mediator.map(str::to_string),
             protocols: ProtocolSet {
                 didcomm: true,
