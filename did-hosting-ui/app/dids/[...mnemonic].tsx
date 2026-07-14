@@ -16,6 +16,12 @@ import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
+import {
+  isWalletTaskRelayAvailable,
+  requestDidUpdate,
+  digestPrefix,
+  type TaskConsentRequired,
+} from "../../lib/wallet";
 import type { DidStats, DidDetailResponse, LogEntryInfo, WatcherSyncStatus } from "../../lib/api";
 
 // ---------------------------------------------------------------------------
@@ -46,6 +52,18 @@ export default function DidDetail() {
   const [changingOwner, setChangingOwner] = useState(false);
   const [editingDoc, setEditingDoc] = useState(false);
   const [docEditValue, setDocEditValue] = useState("");
+  // Delegated publish: the VTA holds the update key, so we propose and it decides.
+  const [publishing, setPublishing] = useState(false);
+  const [consent, setConsent] = useState<TaskConsentRequired | null>(null);
+  // The exact document the outstanding approval is bound to.
+  //
+  // The approval is bound to a digest of the payload, so a retry MUST send the
+  // identical document. If the user edits the textarea while their phone is
+  // buzzing and we then submitted the new text, the digest would not match, the
+  // grant would not be found, and the VTA would raise a fresh approval — which
+  // is the *safe* failure, but a baffling one. Pinning what was proposed keeps
+  // "I approved it" meaning what the user thinks it means.
+  const [proposed, setProposed] = useState<Record<string, unknown> | null>(null);
   const [editingParams, setEditingParams] = useState(false);
   const [paramWatchers, setParamWatchers] = useState<string[]>([]);
   const [paramWitnesses, setParamWitnesses] = useState<string[]>([]);
@@ -230,6 +248,68 @@ export default function DidDetail() {
         }
       },
     );
+  };
+
+  /**
+   * Publish the edited document through the user's agent.
+   *
+   * We do not hold this DID's update key and never will. We propose the new
+   * document; the VTA dry-runs its own update handler against the authoritative
+   * log to work out what our edit would actually do — including the update-key
+   * rotation that any document change causes, which is nowhere in what we sent
+   * and which we could not have told the user about if we tried — and then
+   * decides, per the user's policy, whether a human has to approve it.
+   */
+  const handlePublishViaVta = async (retryOf?: Record<string, unknown>) => {
+    const didId = didDetail?.didId;
+    if (!didId) {
+      showAlert("Error", "This DID has no published identifier yet.");
+      return;
+    }
+
+    let document: Record<string, unknown>;
+    if (retryOf) {
+      document = retryOf;
+    } else {
+      try {
+        document = JSON.parse(docEditValue) as Record<string, unknown>;
+      } catch {
+        showAlert("Error", "The document is not valid JSON.");
+        return;
+      }
+    }
+
+    // The version we based this edit on. A human in the approval loop makes the
+    // window minutes wide, so the log really can move underneath us; without this
+    // the VTA would apply our edit on top of someone else's and every signature in
+    // the resulting chain would still verify.
+    const latest = logEntries[logEntries.length - 1];
+    const expectedVersionId = latest?.versionId ?? undefined;
+
+    setPublishing(true);
+    try {
+      const outcome = await requestDidUpdate({
+        did: didId,
+        document,
+        ...(expectedVersionId ? { expectedVersionId } : {}),
+      });
+
+      if (outcome.kind === "consentRequired") {
+        setProposed(document);
+        setConsent(outcome);
+        return;
+      }
+
+      setConsent(null);
+      setProposed(null);
+      setEditingDoc(false);
+      showAlert("Published", "Your agent signed and published the update.");
+      loadData();
+    } catch (e: unknown) {
+      showAlert("Error", e instanceof Error ? e.message : "The update failed.");
+    } finally {
+      setPublishing(false);
+    }
   };
 
   const handleToggleDocEdit = () => {
@@ -561,12 +641,91 @@ export default function DidDetail() {
               </View>
             </View>
             {editingDoc ? (
-              <TextInput
-                style={[styles.textarea, { minHeight: 300 }]}
-                value={docEditValue}
-                onChangeText={setDocEditValue}
-                multiline
-              />
+              <>
+                <TextInput
+                  style={[styles.textarea, { minHeight: 300 }]}
+                  value={docEditValue}
+                  onChangeText={setDocEditValue}
+                  multiline
+                />
+                {isWalletTaskRelayAvailable() && (
+                  <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
+                    <Pressable
+                      style={[styles.button, publishing && styles.disabled]}
+                      onPress={() => void handlePublishViaVta()}
+                      disabled={publishing}
+                    >
+                      <Text style={styles.buttonText}>
+                        {publishing ? "Asking your agent..." : "Publish with my agent"}
+                      </Text>
+                    </Pressable>
+                    <Text style={styles.hint}>
+                      Your agent holds this DID&apos;s update key. It will work out what this
+                      change actually does before it signs anything — including effects that
+                      are not visible in the document above.
+                    </Text>
+                  </View>
+                )}
+
+                {/*
+                  The cross-device match.
+
+                  Every other check in this design assumes an honest device. Only
+                  this one survives a compromised one, because only this one moves
+                  the comparison into the user's head, across two screens that an
+                  attacker would have to control both of. It is the reason this is
+                  a code to compare and not a "waiting for approval..." spinner —
+                  a spinner is something you wait out; a code is something you
+                  check.
+                */}
+                {consent && (
+                  <View
+                    style={{
+                      marginTop: spacing.md,
+                      padding: spacing.md,
+                      borderWidth: 1,
+                      borderColor: colors.warning ?? colors.border,
+                      borderRadius: radii.sm,
+                      gap: spacing.sm,
+                    }}
+                  >
+                    <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>
+                      Approve this on your device
+                    </Text>
+                    <Text style={styles.hint}>
+                      Your agent has sent this change to your approving device, with a
+                      description of what it will do. Check that the code shown there matches
+                      the one below, then approve it.
+                    </Text>
+                    <Text
+                      style={{
+                        fontFamily: fonts.mono,
+                        fontSize: 28,
+                        letterSpacing: 6,
+                        color: colors.textPrimary,
+                        textAlign: "center",
+                        paddingVertical: spacing.sm,
+                      }}
+                      selectable
+                    >
+                      {digestPrefix(consent.payloadDigest)}
+                    </Text>
+                    <Text style={styles.hint}>
+                      If the codes differ, deny it. A code that does not match means the
+                      change your device is showing you is not the change that would be made.
+                    </Text>
+                    <Pressable
+                      style={[styles.outlineButton, publishing && styles.disabled]}
+                      onPress={() => void handlePublishViaVta(proposed ?? undefined)}
+                      disabled={publishing}
+                    >
+                      <Text style={styles.outlineButtonText}>
+                        {publishing ? "Checking..." : "I have approved it — publish"}
+                      </Text>
+                    </Pressable>
+                  </View>
+                )}
+              </>
             ) : (
               logEntries[selectedVersion]?.state && (
                 <div style={{
