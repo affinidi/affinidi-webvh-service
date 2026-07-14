@@ -1999,12 +1999,33 @@ async fn run_import_secrets(
         }
     };
 
+    // Carry forward any retired key material.
+    //
+    // `retired` holds the keys of identity generations that are superseded but
+    // still inside their grace period — the ones peers with a cached DID document
+    // are still encrypting to. Blanking it here would silently destroy that
+    // overlap: the generation records would survive, their key material would
+    // not, and the service would come back unable to decrypt traffic still
+    // addressed to the old key. The entries are keyed by kid and self-describing,
+    // so keeping them is harmless even when the imported keys are for a wholly
+    // different identity.
+    let retired = match secret_store.get().await {
+        Ok(Some(existing)) => existing.retired,
+        _ => Vec::new(),
+    };
+    if !retired.is_empty() {
+        eprintln!(
+            "  Preserving {} retired key(s) — superseded generations still inside their grace period.",
+            retired.len()
+        );
+    }
+
     let server_secrets = ServerSecrets {
         signing_key: resolved_signing,
         key_agreement_key: resolved_ka,
         jwt_signing_key: resolved_jwt,
         vta_credential: resolved_vta_cred,
-        retired: Vec::new(),
+        retired,
     };
 
     secret_store.set(&server_secrets).await?;

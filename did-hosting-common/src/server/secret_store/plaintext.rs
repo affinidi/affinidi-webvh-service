@@ -362,6 +362,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wholesale_key_import_must_carry_retired_material_forward() {
+        // `import-secrets` / `import-sealed` replace the identity's key material
+        // wholesale. They used to write `retired: Vec::new()`, which silently
+        // destroyed the overlap if run during a grace period: the generation
+        // records survived, their key material did not, and the service came back
+        // unable to decrypt traffic still addressed to the old key.
+        //
+        // This pins the shape those commands now use — read, carry `retired`
+        // forward, write — at the store layer, so a future import path that
+        // forgets it fails here rather than in production a month later.
+        use crate::server::secret_store::RetiredKeys;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "[server]\nport = 8080\n")
+            .await
+            .expect("seed config");
+        let store = PlaintextSecretStore::new(None, config_path.clone());
+
+        // A rotation has happened: the outgoing key is retired but still live.
+        let mut secrets = sample_secrets();
+        secrets.retired = vec![RetiredKeys {
+            ka_kid: "did:webvh:example:alpha#key-1".into(),
+            key_agreement_key: "z6LSold_private".into(),
+            signing_kid: "did:webvh:example:alpha#key-0".into(),
+            signing_key: "z6Mkold_private".into(),
+        }];
+        store.set(&secrets).await.expect("write rotated secrets");
+
+        // Now an operator imports fresh key material, as `import-secrets` does.
+        let existing = store.get().await.unwrap().expect("secrets present");
+        let imported = ServerSecrets {
+            signing_key: "z6MkImported".into(),
+            key_agreement_key: "z6LSImported".into(),
+            jwt_signing_key: "z6MkImportedJwt".into(),
+            vta_credential: None,
+            retired: existing.retired, // <- the line that must not be `Vec::new()`
+        };
+        store.set(&imported).await.expect("write imported secrets");
+
+        let after = store.get().await.unwrap().expect("secrets present");
+        assert_eq!(
+            after.key_agreement_key, "z6LSImported",
+            "import took effect"
+        );
+        assert_eq!(
+            after.retired.len(),
+            1,
+            "importing new keys must not destroy a live generation's key material"
+        );
+        assert_eq!(after.retired[0].key_agreement_key, "z6LSold_private");
+    }
+
+    #[tokio::test]
     async fn set_preserves_retired_key_material() {
         // A rotation writes the outgoing key into `retired` in the *same* call
         // that installs its replacement — there is no compare-and-swap, so this
