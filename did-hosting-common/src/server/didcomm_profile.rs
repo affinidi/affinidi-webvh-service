@@ -360,6 +360,95 @@ fn decide_binding(
     None
 }
 
+/// The messaging transports a DID document advertises, as a [`ProtocolSet`].
+///
+/// Resolves `did` and maps its services: a `TSPTransport` service ⇒ `tsp`, a
+/// `DIDCommMessaging` service ⇒ `didcomm`. Returns `None` when the document
+/// can't be resolved — the caller decides how to degrade.
+pub async fn advertised_protocols(
+    did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<crate::server::identity::ProtocolSet> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for advertised-transport check: {e}");
+                return None;
+            }
+        },
+    };
+    let doc = match resolver.resolve(did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {did} for advertised-transport check: {e}");
+            return None;
+        }
+    };
+    let advertises = |type_name: &str| {
+        doc.service
+            .iter()
+            .any(|s| s.type_.iter().any(|t| t == type_name))
+    };
+    Some(crate::server::identity::ProtocolSet {
+        didcomm: advertises("DIDCommMessaging"),
+        tsp: advertises("TSPTransport"),
+    })
+}
+
+/// Reconcile a node's config-derived listener protocols with what its own DID
+/// document advertises, returning the set the listener must carry.
+///
+/// The DID document is **authoritative for reachability**: peers route to a
+/// node over exactly the transport services its document advertises, so the
+/// listener has to accept every one of them. Otherwise inbound frames on an
+/// advertised-but-unhandled transport are silently dropped *and acked* — the
+/// mediator considers them delivered and the sender never learns otherwise,
+/// which is how a `features.tsp = false` node whose DID advertises
+/// `TSPTransport` loses every control→server push without an error.
+///
+/// This unions `config` (which also carries the rotation grace window across
+/// live generations) with `advertised`, and logs when the document advertises
+/// a transport the config left off — the "which must agree" invariant
+/// (`identity::IdentityGeneration`), now enforced and visible. When
+/// `advertised` is `None` (document unresolvable) the config set is returned
+/// unchanged, with a warning that the two can no longer be cross-checked.
+pub fn reconcile_listener_protocols(
+    config: crate::server::identity::ProtocolSet,
+    advertised: Option<crate::server::identity::ProtocolSet>,
+    did: &str,
+) -> crate::server::identity::ProtocolSet {
+    let Some(advertised) = advertised else {
+        warn!(
+            did = %did,
+            "could not resolve own DID document — deriving listener transports from config \
+             only; if the published DID advertises a transport this node has disabled, peers' \
+             messages on it will be dropped"
+        );
+        return config;
+    };
+    if advertised.tsp && !config.tsp {
+        warn!(
+            did = %did,
+            "DID document advertises TSPTransport but features.tsp is off — enabling the TSP \
+             listener to match the document (set features.tsp = true to silence this)"
+        );
+    }
+    if advertised.didcomm && !config.didcomm {
+        warn!(
+            did = %did,
+            "DID document advertises DIDCommMessaging but features.didcomm is off — enabling \
+             the DIDComm listener to match the document"
+        );
+    }
+    config.union(advertised)
+}
+
 /// Wait until a DID resolves, retrying with exponential backoff.
 ///
 /// Used at DIDComm startup to block until the mediator DID document is
@@ -538,5 +627,32 @@ mod tests {
             f.binding,
             Some((PeerTransport::Didcomm, CFG_MED.to_string()))
         );
+    }
+
+    fn pset(didcomm: bool, tsp: bool) -> crate::server::identity::ProtocolSet {
+        crate::server::identity::ProtocolSet { didcomm, tsp }
+    }
+
+    #[test]
+    fn reconcile_enables_advertised_transport_config_left_off() {
+        // The bug: config is DIDComm-only but the DID advertises both, so the
+        // listener must carry TSP too or silently drop (and ack) inbound TSP.
+        let got = reconcile_listener_protocols(pset(true, false), Some(pset(true, true)), "did:x");
+        assert_eq!(got, pset(true, true));
+    }
+
+    #[test]
+    fn reconcile_keeps_config_transports_not_advertised() {
+        // Config runs both (e.g. a retiring generation's grace window); the
+        // document advertises only DIDComm. The union still carries TSP — don't
+        // drop a transport peers may still deliver on.
+        let got = reconcile_listener_protocols(pset(true, true), Some(pset(true, false)), "did:x");
+        assert_eq!(got, pset(true, true));
+    }
+
+    #[test]
+    fn reconcile_falls_back_to_config_when_document_unresolvable() {
+        let cfg = pset(true, false);
+        assert_eq!(reconcile_listener_protocols(cfg, None, "did:x"), cfg);
     }
 }

@@ -9,7 +9,8 @@ use affinidi_messaging_didcomm_service::{
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
-    build_tdk_profile_for_identity, wait_for_did_resolution,
+    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
+    wait_for_did_resolution,
 };
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
@@ -691,7 +692,13 @@ pub async fn start_didcomm_service(
     // flags: a generation retiring out of DIDComm while the current identity
     // is TSP-only still has peers delivering DIDComm to it until it expires,
     // and the single listener has to carry both.
-    let transports = identity.protocols();
+    //
+    // Then reconcile against what our own DID document advertises — the document
+    // is authoritative for how peers reach us, so the listener must carry every
+    // transport it advertises or silently drop (and ack) inbound frames on the
+    // ones it doesn't.
+    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
+    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
     let tsp_enabled = transports.tsp;
     let protocols = match (transports.didcomm, transports.tsp) {
         (true, true) => Protocols::BOTH,

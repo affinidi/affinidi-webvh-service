@@ -13,7 +13,8 @@ use ipnetwork::IpNetwork;
 
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
-    build_tdk_profile_for_identity, wait_for_did_resolution,
+    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
+    wait_for_did_resolution,
 };
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
@@ -514,7 +515,15 @@ pub async fn start_didcomm_service(
     // The union across live generations, not just the current one's config
     // flags — a generation retiring out of DIDComm still has peers delivering
     // to it until it expires, and the single listener has to carry both.
-    let transports = identity.protocols();
+    //
+    // Then reconcile against what our own DID document actually advertises: the
+    // document is authoritative for how peers reach us, so the listener must
+    // carry every transport it advertises. Without this, a node whose config
+    // disables a transport its DID still advertises (e.g. `features.tsp = false`
+    // while the DID carries `TSPTransport`, since `did-host-didcomm` advertises
+    // both) silently drops — and acks — every inbound frame on that transport.
+    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
+    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
     let didcomm_enabled = transports.didcomm;
     let tsp_enabled = transports.tsp;
     let protocols = match (didcomm_enabled, tsp_enabled) {
