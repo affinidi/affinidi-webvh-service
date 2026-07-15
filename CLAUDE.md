@@ -101,3 +101,96 @@ it" should ask: *does this capability require coordinating with
 something outside this process?* If yes, it's probably one of the
 intentional omissions above. If no, it's parity work and belongs in
 `run_daemon()` or `run_daemon_storage_task`.
+
+## Cross-service networking & integration discipline
+
+This service's primary client is the VTA's `webvh_client`
+(verifiable-trust-infrastructure) — its DID publish/update/delete lifecycle
+depends on this server's exact wire behavior. Before changing any route,
+validation rule, or response shape, read the ecosystem doc set in
+`../design-docs/`:
+
+- **`vti-stack-development-guide.md`** — binding rules (R-numbers below);
+  paste its pre-merge checklist into PRs.
+- **`vti-networking-remediation-plan.md`** — deliverable **D4** covers the
+  VTA↔webvh boundary; two of its findings need server-side changes here.
+- **`vti-architectural-direction.md`** — design-level rationale.
+
+Rules that bite hardest here:
+
+- **R3.6 — the request contract includes what you *ignore*.** The VTA sends
+  `?domain=` on publish/delete as a cross-tenant safety check and documents a
+  `did-management:unknown_domain` rejection — but the handlers here have no
+  `Query` extractor, so axum silently drops it and the advertised protection
+  doesn't exist on the wire. Either enforce a parameter or coordinate its
+  removal; never silently accept-and-ignore.
+- **Validation rules are contract too:** `validate_mnemonic`'s lowercase-only
+  rule rejects every mixed-case base58 SCID, which (combined with the
+  slot-reservation requirement) makes the VTA's final-mode create impossible.
+  Changing or relying on validation behavior requires checking the VTA-side
+  callers in the same pass.
+- **R3.2 — reject unknown fields on state-changing bodies** rather than
+  ignoring them; a field a client sends and the server drops is a latent
+  cross-tenant or authorization bug.
+
+## Node DID transport model — the document is authoritative
+
+Every node (server, control, daemon, witness) mints its own `did:webvh` and
+advertises **how to reach it in that DID document**. Changes to how nodes talk
+to each other must keep the document as the source of truth.
+
+- **Advertise messaging transports, not HTTP.** A mediator-configured node's
+  DID carries only `TSPTransport` (`#tsp`) and/or `DIDCommMessaging`
+  (`#vta-didcomm`) services — **not** a `WebVHHosting` HTTP endpoint. The
+  resolution URL is derivable from the `did:webvh` identifier itself, inter-node
+  traffic is DIDComm/TSP, and clients reach the REST API by explicit config
+  (`webvh_client` takes an explicit `server_url`), so nothing discovers the
+  endpoint from the document. Only a **no-mediator (HTTP-only)** node advertises
+  `WebVHHosting`, because it has no messaging transport to advertise instead.
+
+- **One builder mints them all.** Every setup path (interactive / recipe /
+  online / offline) for server, control, and daemon packages its DID through
+  `build_webvh_provision_ask` (a `WebvhDidShape`) in `did-hosting-common`'s
+  `server::vta_setup`. Change the `Hosted` template selection there once and it
+  applies to all three binaries — don't special-case one. The transport-only
+  templates (`did-host-didcomm` / `did-host-tsp`) are still URL-hosted (the
+  `URL` var tells the VTA where to publish the log) but emit no `WebVHHosting`
+  service. No new vta-sdk template is needed for the mediator-configured shape.
+
+- **Send precedence: document → config → fail.** Outbound trust-task delivery
+  picks its binding via `resolve_send_binding` (`server::didcomm_profile`): the
+  peer's advertised `TSPTransport` (preferred) or `DIDCommMessaging` wins; if
+  the document advertises neither, the node's own configured mediator is the
+  fallback (the compatibility bridge for DIDs minted before transports were
+  published); if neither yields a binding, the send **fails** as unroutable.
+  Do **not** reintroduce a blind-DIDComm default, and do **not** add a REST tier
+  — there is no trust-task REST sender or inbound `/api/trust-tasks` route
+  *between these services*, and HTTP-only nodes are served by the pull/watcher
+  model, not a trust-task push.
+
+- **Nothing gates on `WebVHHosting`.** `resolve_send_binding` reads only the
+  messaging services; registration and health use the DIDComm identity; the
+  registry's `advertised_services` is display-only; DID resolution is
+  identifier-derived. Keep it that way — don't make behaviour depend on the
+  hosting service being present.
+
+## Gotchas worth knowing
+
+- **Wire enums are camelCase.** Vault `secretKind` values are `didSelfIssued`,
+  `didcommPeer`, `oauthTokens`, … — never kebab-case. The browser extension
+  passes a page-supplied `secretKind` verbatim, so an RP page (e.g. the login
+  UI) that sends `did-self-issued` fails schema validation at the VTA. Match the
+  shared `vault/_shared/*/vault-entry.schema.json` `SecretKind` enum exactly;
+  type the outbound filter as a union so a kebab value fails to compile.
+
+- **The `server` code is behind the `server-core` feature.** Tests for
+  `did-hosting-common`'s server modules only compile/run with
+  `--features server-core` (or `store-fjall`, which enables it). A plain
+  `cargo test -p did-hosting-common` silently skips them — and store-backed
+  tests need a `store-*` backend feature or they panic on "no storage backend".
+
+- **Versions are bumped by hand.** No release automation. On a release, bump
+  every workspace crate's `[package] version` **and** the internal path-dep
+  pins (`did-hosting-* = { version = "0.x", path = … }`) — but not external
+  crates that happen to share that number (`tower-http`, `tokio-util`) — update
+  `did-hosting-ui/package.json`, and add a grouped `CHANGELOG.md` entry.
