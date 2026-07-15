@@ -562,16 +562,21 @@ pub struct OfflineBootstrapResult {
 /// interactive or recipe-driven, online or offline — packages its DID the
 /// same way via [`build_webvh_provision_ask`].
 pub enum WebvhDidShape<'a> {
-    /// The DID advertises a `WebVHHosting` endpoint. `did_path` is folded
-    /// into `origin` via [`hosting_url_for`] so the minted DID, the local
-    /// import, and resolution all agree on the location. When `mediator_did`
-    /// is set the DID also advertises messaging transport(s) at that
-    /// mediator, selected by `transport`:
-    /// - [`TransportSelection::Both`] / [`TransportSelection::Didcomm`] →
-    ///   `did-host-http-didcomm` (advertises both TSP and DIDComm — there is
-    ///   no HTTP+DIDComm-exclusive VTA template);
-    /// - [`TransportSelection::Tsp`] → `did-host-http-tsp` (TSP only);
-    /// - no mediator → `did-host-http` (HTTP-only; `transport` is ignored).
+    /// A URL-hosted node DID. `did_path` is folded into `origin` via
+    /// [`hosting_url_for`] so the minted DID, the local import, and resolution
+    /// all agree on the location — the DID is always resolvable at its host,
+    /// which is derivable from the identifier itself.
+    ///
+    /// What the document *advertises* depends on `mediator_did`:
+    /// - `mediator_did` set → the messaging transport(s) only, per `transport`:
+    ///   [`TransportSelection::Both`]/[`TransportSelection::Didcomm`] →
+    ///   `did-host-didcomm` (TSP + DIDComm); [`TransportSelection::Tsp`] →
+    ///   `did-host-tsp` (TSP only). **No `WebVHHosting` service is emitted** —
+    ///   the HTTP endpoint is derivable and unused for discovery, so it is not
+    ///   advertised. The hosting `URL` is still passed so the VTA publishes the
+    ///   log at the right host; it just doesn't appear in the document.
+    /// - no mediator → `did-host-http` (HTTP-only): a `WebVHHosting` service is
+    ///   the node's only advertisement, since it has no messaging transport.
     Hosted {
         origin: &'a str,
         did_path: &'a str,
@@ -633,15 +638,31 @@ pub fn build_webvh_provision_ask(
                 Some(_) => origin.trim_end_matches('/').to_string(),
                 None => hosting_url_for(origin, did_path),
             };
-            // Template selection: with a mediator, TSP-only advertises just
-            // `TSPTransport` (did-host-http-tsp); Both/Didcomm advertise both
-            // (did-host-http-didcomm — no HTTP+DIDComm-exclusive template
-            // exists). No mediator → HTTP-only.
+            // Template selection. With a mediator the node advertises its
+            // messaging transport(s) and NOT a `WebVHHosting` endpoint: the DID
+            // is still URL-hosted (the VTA publishes the log at `url`, and the
+            // resolution URL is derivable from the identifier), but the HTTP
+            // endpoint is unused for discovery — inter-node traffic is
+            // DIDComm/TSP and clients reach the REST API by explicit config —
+            // so advertising it only confused readers. TSP-only → `did-host-tsp`;
+            // Both/Didcomm → `did-host-didcomm`; both carry the hosting `URL`
+            // var so the VTA knows where to publish the log, though it does not
+            // appear in the rendered document. No mediator → HTTP-only
+            // `did-host-http`, whose `WebVHHosting` service is then the node's
+            // only advertisement.
             let mut ask = match (mediator_did, transport) {
                 (Some(med), TransportSelection::Tsp) => {
-                    ProvisionAsk::did_host_http_tsp(context_id, url, *med)
+                    let mut a = ProvisionAsk::did_host_tsp(context_id, *med);
+                    a.integration_template_vars
+                        .insert("URL".to_string(), JsonValue::String(url));
+                    a
                 }
-                (Some(med), _) => ProvisionAsk::did_host_http_didcomm(context_id, url, *med),
+                (Some(med), _) => {
+                    let mut a = ProvisionAsk::did_host_didcomm(context_id, *med);
+                    a.integration_template_vars
+                        .insert("URL".to_string(), JsonValue::String(url));
+                    a
+                }
                 (None, _) => ProvisionAsk::did_host_http(context_id, url),
             };
             if let Some(r) = remote {
@@ -1798,9 +1819,12 @@ mod tests {
             },
             Some("lbl"),
         );
+        // Mediator-configured → the no-WebVHHosting DIDComm template. The DID
+        // is still URL-hosted: the `URL` var is set so the VTA publishes the
+        // log at the folded path, even though it isn't advertised as a service.
         assert_eq!(
             ask.integration_template.as_deref(),
-            Some("did-host-http-didcomm")
+            Some("did-host-didcomm")
         );
         assert_eq!(
             ask.integration_template_vars.get("URL"),
@@ -1829,20 +1853,24 @@ mod tests {
             },
             None,
         );
-        assert_eq!(
-            ask.integration_template.as_deref(),
-            Some("did-host-http-tsp")
-        );
+        assert_eq!(ask.integration_template.as_deref(), Some("did-host-tsp"));
         assert_eq!(
             ask.integration_template_vars.get("MEDIATOR_DID"),
             Some(&serde_json::Value::String("did:key:z6MkMed".into())),
         );
+        // URL-hosted even though TSP-only advertises no HTTP endpoint.
+        assert_eq!(
+            ask.integration_template_vars.get("URL"),
+            Some(&serde_json::Value::String(
+                "https://did.example.com/services/control".into()
+            )),
+        );
     }
 
     #[test]
-    fn build_ask_hosted_didcomm_selection_still_advertises_both() {
-        // No HTTP+DIDComm-exclusive template exists, so a Didcomm selection
-        // maps to the dual did-host-http-didcomm template (advertises both).
+    fn build_ask_hosted_didcomm_selection_advertises_tsp_and_didcomm() {
+        // Both/Didcomm map to did-host-didcomm, which advertises TSP + DIDComm
+        // and NO WebVHHosting endpoint.
         let ask = build_webvh_provision_ask(
             "webvh",
             &WebvhDidShape::Hosted {
@@ -1856,7 +1884,7 @@ mod tests {
         );
         assert_eq!(
             ask.integration_template.as_deref(),
-            Some("did-host-http-didcomm")
+            Some("did-host-didcomm")
         );
     }
 

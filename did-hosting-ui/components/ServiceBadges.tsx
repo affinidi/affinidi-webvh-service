@@ -24,10 +24,25 @@ export const SERVICE_TYPE_HOSTING_LEGACY = "WebVHHostingService";
 export const SERVICE_TYPE_TSP = "TSPTransport";
 export const SERVICE_TYPE_DIDCOMM = "DIDCommMessaging";
 
-export type BadgeKind = "hosting" | "tsp" | "didcomm" | "other";
+/**
+ * Service types recognised but deliberately **not** badged.
+ *
+ * `WebVHHosting` is being retired from node documents: the HTTP resolution
+ * endpoint is derivable from the DID identifier and is unused for discovery,
+ * so mediator-configured nodes no longer advertise it. Where it still appears
+ * — legacy DIDs, or HTTP-only nodes with no messaging transport — we render no
+ * chip for it rather than surfacing a "Hosting" badge (or an `Other` chip that
+ * would be more confusing). Handled the same way the resolver's implicit
+ * `#whois` / `#files` services are: known, but not shown.
+ */
+const HIDDEN_SERVICE_TYPES = new Set<string>([
+  SERVICE_TYPE_HOSTING,
+  SERVICE_TYPE_HOSTING_LEGACY,
+]);
+
+export type BadgeKind = "tsp" | "didcomm" | "other";
 
 const BADGE_LABELS: Record<BadgeKind, string> = {
-  hosting: "Hosting",
   tsp: "TSP",
   didcomm: "DIDComm",
   other: "Other",
@@ -35,7 +50,6 @@ const BADGE_LABELS: Record<BadgeKind, string> = {
 
 /** Colour per badge, so the transports stay visually distinct at a glance. */
 const BADGE_COLORS: Record<BadgeKind, { bg: string; fg: string }> = {
-  hosting: { bg: "rgba(59, 113, 255, 0.15)", fg: colors.accentHover },
   tsp: { bg: colors.tealMuted, fg: colors.teal },
   didcomm: { bg: "rgba(255, 181, 71, 0.15)", fg: colors.warning },
   other: { bg: colors.bgTertiary, fg: colors.textTertiary },
@@ -43,9 +57,6 @@ const BADGE_COLORS: Record<BadgeKind, { bg: string; fg: string }> = {
 
 function kindOf(serviceType: string): BadgeKind {
   switch (serviceType) {
-    case SERVICE_TYPE_HOSTING:
-    case SERVICE_TYPE_HOSTING_LEGACY:
-      return "hosting";
     case SERVICE_TYPE_TSP:
       return "tsp";
     case SERVICE_TYPE_DIDCOMM:
@@ -58,19 +69,23 @@ function kindOf(serviceType: string): BadgeKind {
 /**
  * Collapse raw service types into ordered, deduped badge kinds.
  *
- * Order is fixed (hosting, TSP, DIDComm, other) rather than document order,
- * so badges line up column-wise when scanning a list of DIDs. Every unknown
- * type folds into the single trailing `other` badge.
+ * Order is fixed (TSP, DIDComm, other) rather than document order, so badges
+ * line up column-wise when scanning a list of DIDs. Hidden types (see
+ * [`HIDDEN_SERVICE_TYPES`]) never produce a chip; every remaining unknown type
+ * folds into the single trailing `other` badge.
  */
 export function badgeKinds(serviceTypes: string[]): BadgeKind[] {
-  const kinds = new Set(serviceTypes.map(kindOf));
-  const ordered: BadgeKind[] = ["hosting", "tsp", "didcomm", "other"];
+  const visible = serviceTypes.filter((t) => !HIDDEN_SERVICE_TYPES.has(t));
+  const kinds = new Set(visible.map(kindOf));
+  const ordered: BadgeKind[] = ["tsp", "didcomm", "other"];
   return ordered.filter((k) => kinds.has(k));
 }
 
 /** The raw type strings that folded into the `other` badge, for the tooltip. */
 function otherTypes(serviceTypes: string[]): string[] {
-  return serviceTypes.filter((t) => kindOf(t) === "other");
+  return serviceTypes.filter(
+    (t) => !HIDDEN_SERVICE_TYPES.has(t) && kindOf(t) === "other",
+  );
 }
 
 export function ServiceBadge({
