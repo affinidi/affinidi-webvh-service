@@ -102,6 +102,14 @@ pub const MSG_SYNC_UPDATE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/up
 pub const MSG_SYNC_DELETE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
 pub const MSG_SYNC_DELETE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1#response";
 
+/// A batch of DID sync updates in a single message — `body.updates` is an array
+/// of the same shape [`MSG_SYNC_UPDATE`] carries. Collapses a bulk resync into
+/// far fewer transport frames, so the recipient's per-frame TSP reply doesn't
+/// burst past the mediator's rate limit. Only sent to servers that advertised
+/// `sync_batch` at registration; others still get one `MSG_SYNC_UPDATE` per DID.
+pub const MSG_SYNC_BATCH: &str = "https://trusttasks.org/spec/webvh/sync/batch/0.1";
+pub const MSG_SYNC_BATCH_ACK: &str = "https://trusttasks.org/spec/webvh/sync/batch/0.1#response";
+
 // ---------------------------------------------------------------------------
 // Stats (server → control plane)
 // ---------------------------------------------------------------------------

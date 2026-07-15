@@ -65,6 +65,7 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
         )?
         .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
         .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
+        .route(MSG_SYNC_BATCH, handler_fn(handle_sync_batch))?
         .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
         .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
         .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
@@ -98,6 +99,7 @@ pub async fn dispatch_tsp_message(
 ) -> Option<(String, Value)> {
     let result = match msg.typ.as_str() {
         MSG_SYNC_UPDATE => do_sync_update(sender, state, msg).await,
+        MSG_SYNC_BATCH => do_sync_batch(sender, state, msg).await,
         MSG_SYNC_DELETE => do_sync_delete(sender, state, msg).await,
         MSG_DOMAIN_ASSIGN => do_domain_assign(sender, state, msg).await,
         MSG_DOMAIN_UNASSIGN => do_domain_unassign(sender, state, msg).await,
@@ -241,6 +243,23 @@ async fn handle_sync_update(
     ))
 }
 
+async fn handle_sync_batch(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+
+    let (response_type, response_body) = match do_sync_batch(sender, &state, &message).await {
+        Ok(r) => r,
+        Err(e) => problem_report("e.p.did.internal-error", &e),
+    };
+
+    Ok(Some(
+        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+    ))
+}
+
 async fn handle_sync_delete(
     ctx: HandlerContext,
     message: Message,
@@ -283,35 +302,86 @@ async fn do_sync_update(
     state: &AppState,
     msg: &Message,
 ) -> Result<(String, Value), String> {
-    use crate::control_register::apply_single_update;
-    use did_hosting_common::DidSyncUpdate;
-
     if let Err(report) = require_control_plane(sender, state) {
         return Ok(report);
     }
+    let mnemonic = apply_sync_update_body(state, &msg.body).await?;
+    Ok((
+        MSG_SYNC_UPDATE_ACK.to_string(),
+        json!({ "mnemonic": mnemonic, "status": "applied" }),
+    ))
+}
 
-    let mnemonic = msg
+/// A batch of sync updates in one message (`body.updates[]`, each the shape
+/// [`do_sync_update`] applies).
+///
+/// Best-effort per entry: a single bad update is logged and skipped, matching
+/// the per-DID path — whose failures are fire-and-forget over TSP — so one
+/// malformed entry can't strand the rest of the batch. Anything skipped is
+/// re-sent on the next delta sync.
+async fn do_sync_batch(
+    sender: &str,
+    state: &AppState,
+    msg: &Message,
+) -> Result<(String, Value), String> {
+    if let Err(report) = require_control_plane(sender, state) {
+        return Ok(report);
+    }
+    let updates = msg
         .body
+        .get("updates")
+        .and_then(|v| v.as_array())
+        .ok_or("missing 'updates' array in sync-batch")?;
+
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for update in updates {
+        match apply_sync_update_body(state, update).await {
+            Ok(_) => applied += 1,
+            Err(e) => {
+                failed += 1;
+                warn!(error = %e, "sync-batch: skipping an update that failed to apply");
+            }
+        }
+    }
+    debug!(
+        did = sender,
+        applied,
+        failed,
+        count = updates.len(),
+        "applied DID sync batch from control plane"
+    );
+    Ok((
+        MSG_SYNC_BATCH_ACK.to_string(),
+        json!({ "applied": applied, "failed": failed }),
+    ))
+}
+
+/// Apply one sync-update body — the shape `MSG_SYNC_UPDATE` carries and each
+/// element of a `MSG_SYNC_BATCH`. Returns the mnemonic on success. Runs the
+/// own-DID rotation check, so a batched update to the server's own DID is
+/// treated exactly like a single one.
+async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String, String> {
+    use crate::control_register::apply_single_update;
+    use did_hosting_common::DidSyncUpdate;
+
+    let mnemonic = body
         .get("mnemonic")
         .and_then(|v| v.as_str())
         .ok_or("missing 'mnemonic' in sync-update")?;
-    let did_id = msg
-        .body
+    let did_id = body
         .get("did_id")
         .and_then(|v| v.as_str())
         .ok_or("missing 'did_id' in sync-update")?;
-    let log_content = msg
-        .body
+    let log_content = body
         .get("log_content")
         .and_then(|v| v.as_str())
         .ok_or("missing 'log_content' in sync-update")?;
-    let witness_content = msg
-        .body
+    let witness_content = body
         .get("witness_content")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let version_count = msg
-        .body
+    let version_count = body
         .get("version_count")
         .and_then(|v| v.as_u64())
         .ok_or("missing 'version_count' in sync-update")?;
@@ -329,25 +399,19 @@ async fn do_sync_update(
         .map_err(|e| e.to_string())?;
 
     // Duplicate of the canonical info line in
-    // `control_register::apply_single_update` (which this path calls); keep it
-    // at debug so each synced DID logs once at info, not twice.
+    // `control_register::apply_single_update`; keep it at debug so each synced
+    // DID logs once at info, not twice.
     debug!(
-        did = sender,
         mnemonic = %mnemonic,
         version_count,
         "applied DID sync update from control plane via mediator"
     );
 
     // The second way this server's own DID can change: a control plane pushed a
-    // new log entry for it. Same rotation check as the direct publish path — an
-    // operator who rotates the server's keys through the control plane must not
-    // get a different outcome from one who publishes to the server directly.
+    // new log entry for it. Same rotation check as the direct publish path.
     crate::identity_rotation::on_did_published(state, mnemonic).await;
 
-    Ok((
-        MSG_SYNC_UPDATE_ACK.to_string(),
-        json!({ "mnemonic": mnemonic, "status": "applied" }),
-    ))
+    Ok(mnemonic.to_string())
 }
 
 async fn do_sync_delete(

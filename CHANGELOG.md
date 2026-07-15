@@ -2,6 +2,21 @@
 
 ## 0.8.2 (2026-07-15)
 
+### Added
+
+- **Batched DID sync to cut the resync mediator-throttle flood.** A control
+  plane pushed one `MSG_SYNC_UPDATE` per DID, and each inbound frame draws one
+  transport-level TSP reply — so a bulk resync (a server (re)registering with
+  many DIDs behind) burst those replies straight past the mediator's rate limit,
+  logging `429 Too Many Requests` and dropping frames. Capable servers now
+  advertise `sync_batch` at registration; the control plane coalesces the
+  initial sync into `MSG_SYNC_BATCH` messages (`body.updates[]`), capped at 50
+  DIDs or 512 KB each, collapsing many frames — and their replies — into few.
+  The server applies each entry best-effort (a malformed one is skipped, not
+  fatal, and re-sent on the next delta) and returns one ack per batch. Servers
+  that don't advertise the capability still get one message per DID, so an older
+  control plane and an older server interoperate unchanged.
+
 ### Fixed
 
 - **Enforce the `?domain=` cross-tenant safety check on publish/delete.** The

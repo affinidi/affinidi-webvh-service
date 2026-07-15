@@ -1205,6 +1205,10 @@ pub(crate) async fn do_server_register(
         .get("trust_task_capable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let sync_batch_capable = body
+        .get("sync_batch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Use the sender DID as a stable instance ID (one registration per DID)
     let instance_id = sender.replace(':', "_");
@@ -1235,6 +1239,7 @@ pub(crate) async fn do_server_register(
             .and_then(|p| p.advertised_services.clone()),
         services_checked_at: previous.as_ref().and_then(|p| p.services_checked_at),
         trust_task_capable,
+        sync_batch_capable,
         // `register_instance` overwrites the whole record, so the observed-link
         // history has to survive a re-register exactly as the badge cache does.
         // The caller records *this* registration's inbound transport right

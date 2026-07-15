@@ -824,6 +824,7 @@ pub async fn seed_registry(state: &AppState) {
             advertised_services: None,
             services_checked_at: None,
             trust_task_capable: false,
+            sync_batch_capable: false,
             last_inbound_transport: None,
             last_inbound_at: None,
             last_outbound_transport: None,

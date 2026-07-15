@@ -180,6 +180,10 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         // as trust tasks, and therefore over whichever transport this server's
         // DID document advertises. An older control plane ignores the field.
         "trust_task_capable": true,
+        // Tells the control plane it may coalesce DID sync updates into
+        // `MSG_SYNC_BATCH` messages instead of one frame per DID. An older
+        // control plane ignores this and sends singles.
+        "sync_batch": true,
         // Delta-sync hint: the DIDs we already hold, so the control plane only
         // pushes changes. An older control plane ignores this and full-syncs.
         "preloaded_dids": preloaded_dids,
