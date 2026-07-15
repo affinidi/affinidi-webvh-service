@@ -63,6 +63,15 @@ pub async fn reload_now(state: &AppState) -> Result<(), AppError> {
 
     match outcome {
         ReloadOutcome::Unchanged => debug!("witness identity unchanged"),
+        ReloadOutcome::MetadataUpdated { generation } => {
+            // Not a rotation — protocols/mediator changed but the keys did not.
+            // Rebuild the listener so a transport change takes effect.
+            info!(
+                generation,
+                "witness identity metadata updated (no key rotation) — rebuilding listener"
+            );
+            rebuild_listener(state).await?;
+        }
         ReloadOutcome::Established { generation } => {
             // Not a rotation — the first real look at our own DID document, now
             // that we are serving it. The listener (if any) was built on guessed

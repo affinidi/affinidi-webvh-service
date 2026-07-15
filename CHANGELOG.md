@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 (2026-07-15)
 
 ### Fixed
 
@@ -17,12 +17,24 @@
   (the daemon and standalone-control deployments route management through the
   control plane).
 
-## 0.8.1 (2026-07-15)
+- **A metadata-only identity change no longer triggers a key rotation.** The
+  service treated any change to a generation's `protocols` or `mediator_did` —
+  e.g. enabling TSP (`features.tsp = true`) — as a rotation, because
+  `differs_from` compares those fields. With no key change, this took the
+  retirement path: it retired the current generation (starting a grace window)
+  and installed a "new" generation sharing the **same** `ka_kid`. When that
+  retired generation's grace expired, `expire_generation` deleted the key
+  material for a kid the current generation was still using — leaving the
+  service with `sender has no usable key agreement key` and a permanent mediator
+  reconnect loop, ~one grace period after the change.
 
-Boot-time and scale fixes for the distributed (control + edge server)
-deployment.
-
-### Fixed
+  A rotation (retire + grace + eventual key deletion) now happens **only when
+  the key-agreement key actually changes**. A `protocols`/`mediator_did` change
+  updates the current generation in place — same id, same keys, no retirement,
+  no grace window — and rebuilds the listener so a transport change takes
+  effect. New `ReloadOutcome::MetadataUpdated` and
+  `update_current_generation_in_place`; tests cover that the retired generation
+  and every key survive an in-place update.
 
 - **Registration no longer re-syncs every DID on every boot.** A server
   registering over TSP/DIDComm hit `sync_all_dids_to_server`, a full push of

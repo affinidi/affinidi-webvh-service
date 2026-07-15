@@ -902,6 +902,20 @@ pub enum ReloadOutcome {
         retired_generation: u64,
         expires_at: u64,
     },
+    /// The document's **non-key** attributes changed — `protocols` and/or
+    /// `mediator_did` — but the keys did not. **Not a rotation.** The current
+    /// generation is updated in place: same id, same keys, no retirement and no
+    /// grace window.
+    ///
+    /// This distinction is load-bearing. Retiring a generation here would start
+    /// a grace window on a generation that shares the *current* `ka_kid` (the
+    /// key didn't change), and its eventual expiry would delete the key
+    /// material the service is still using — leaving it with no usable
+    /// key-agreement key. A `protocols`/`mediator` change (e.g. enabling TSP)
+    /// carries no new key and no old key to preserve, so there is nothing to
+    /// rotate. The caller should still rebuild the listener, since the
+    /// transports it carries may have changed.
+    MetadataUpdated { generation: u64 },
 }
 
 /// Re-read the service's own DID document and rotate the identity if it changed.
@@ -991,6 +1005,35 @@ pub async fn reload_service_identity(
     if !current.differs_from(&candidate) {
         debug!("identity unchanged");
         return Ok(ReloadOutcome::Unchanged);
+    }
+
+    // Something changed — but is it the *key*, or only metadata? A rotation
+    // (retire + grace + eventual key deletion) is only correct when the key
+    // material changes. A `protocols`/`mediator_did` change carries no new key
+    // and no old key to preserve; retiring the current generation for it would
+    // arm a grace window whose expiry later deletes the still-in-use `ka_kid`
+    // key, leaving the service with no usable key-agreement key.
+    let key_changed = current.signing_kid != candidate.signing_kid
+        || current.ka_kid != candidate.ka_kid
+        || current.key_material_differs_from(&candidate);
+    if !key_changed {
+        // Keep the current id — this is the same generation — and update in
+        // place, preserving any live retired generations and the key material.
+        let updated = IdentityGeneration {
+            id: current.id,
+            ..candidate.clone()
+        };
+        update_current_generation_in_place(identity, store, &identity_ks, &updated).await?;
+        info!(
+            generation = updated.id,
+            didcomm = updated.protocols.didcomm,
+            tsp = updated.protocols.tsp,
+            "identity metadata changed (protocols/mediator) but keys did not — \
+             updated in place, no rotation"
+        );
+        return Ok(ReloadOutcome::MetadataUpdated {
+            generation: updated.id,
+        });
     }
 
     // Re-read the secret store. Our in-memory `ServerSecrets` is stale the
@@ -1135,6 +1178,30 @@ pub async fn reload_service_identity(
 /// use. Both have to be re-keyed onto the document's real kids — and the stale
 /// entries dropped, or an inbound JWE addressed to the real kid would find no
 /// secret while a fabricated one lingered.
+/// Update the current generation's non-key attributes (`protocols`,
+/// `mediator_did`) in place.
+///
+/// Unlike [`establish_generation`], this does **not** touch key material or the
+/// live set's retired generations: the kids are unchanged, so the secrets
+/// resolver already holds exactly the right keys, and any generation still in
+/// its grace window must keep decrypting. Only the current generation's record
+/// (store) and its in-memory copy are rewritten.
+async fn update_current_generation_in_place(
+    identity: &ServiceIdentity,
+    store: &Store,
+    identity_ks: &KeyspaceHandle,
+    updated: &IdentityGeneration,
+) -> Result<(), AppError> {
+    save_current_generation(store, identity_ks, updated).await?;
+    let mut live = identity.live.write().expect("identity lock");
+    if let Some(first) = live.generations.first_mut() {
+        *first = updated.clone();
+    } else {
+        live.generations = vec![updated.clone()];
+    }
+    Ok(())
+}
+
 async fn establish_generation(
     identity: &ServiceIdentity,
     store: &Store,
@@ -2242,5 +2309,99 @@ mod tests {
         // No auth/keyAgreement → None, so the caller falls back to the network.
         let doc = serde_json::json!({ "id": "did:webvh:Q:h:n", "service": [] });
         assert!(kids_from_document("did:webvh:Q:h:n", &doc).is_none());
+    }
+
+    #[test]
+    fn a_protocols_change_is_metadata_not_a_key_change() {
+        // The signal the rotation fix branches on: a protocols change is a real
+        // difference (a reload must act on it) but NOT a key change.
+        let (mut a, _s, _k) = keyed_generation(1, "x");
+        a.protocols = ProtocolSet {
+            didcomm: true,
+            tsp: false,
+        };
+        let mut b = a.clone();
+        b.protocols = ProtocolSet {
+            didcomm: true,
+            tsp: true,
+        };
+        assert!(
+            a.differs_from(&b),
+            "a protocols change is a real difference"
+        );
+        assert_eq!(a.signing_kid, b.signing_kid);
+        assert_eq!(a.ka_kid, b.ka_kid);
+        assert!(
+            !a.key_material_differs_from(&b),
+            "no key material changed — so it must not retire/rotate"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_update_keeps_retired_generation_and_its_key() {
+        // The outage this prevents: a protocols/mediator change was treated as a
+        // rotation, retiring a generation that shared the current `ka_kid`; when
+        // its grace expired it deleted the key the service was still using. A
+        // metadata update must leave the retired generation and every key intact.
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_IDENTITY).expect("identity keyspace");
+
+        let (current, cur_signing, cur_ka) = keyed_generation(1, "cur");
+        let (mut retired, ret_signing, ret_ka) = keyed_generation(0, "ret");
+        retired.retired_at = Some(now_epoch());
+        retired.expires_at = Some(now_epoch() + 3_600);
+
+        let identity = identity_with(
+            vec![current.clone(), retired.clone()],
+            vec![cur_signing, cur_ka, ret_signing, ret_ka],
+        )
+        .await;
+        save_current_generation(&store, &ks, &current)
+            .await
+            .expect("save current");
+
+        // Enable TSP: same id, same kids and keys, only `protocols` change.
+        let updated = IdentityGeneration {
+            protocols: ProtocolSet {
+                didcomm: true,
+                tsp: true,
+            },
+            ..current.clone()
+        };
+        update_current_generation_in_place(&identity, &store, &ks, &updated)
+            .await
+            .expect("in-place update");
+
+        let live = identity.generations();
+        assert!(
+            live.iter()
+                .any(|g| g.id == retired.id && g.retired_at.is_some()),
+            "the retired generation must survive — its premature retirement is the bug"
+        );
+        assert!(
+            identity
+                .secrets_resolver
+                .get_secret(&retired.ka_kid)
+                .await
+                .is_some(),
+            "the retired key must still decrypt"
+        );
+        let cur = live
+            .iter()
+            .find(|g| g.id == current.id)
+            .expect("current present");
+        assert!(cur.protocols.tsp, "protocols were updated");
+        assert_eq!(
+            cur.ka_kid, current.ka_kid,
+            "the key-agreement kid is unchanged"
+        );
+        assert!(
+            identity
+                .secrets_resolver
+                .get_secret(&current.ka_kid)
+                .await
+                .is_some(),
+            "the current key is still usable"
+        );
     }
 }
