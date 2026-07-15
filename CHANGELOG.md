@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Enforce the `?domain=` cross-tenant safety check on publish/delete.** The
+  VTA sends `?domain=` on `PUT`/`DELETE /api/dids/{mnemonic}` (and documents a
+  `did-management:unknown_domain` rejection), but the control-plane handlers had
+  no `Query` extractor, so axum silently dropped it — the advertised
+  cross-tenant protection did not exist on the wire. `upload_did`/`delete_did`
+  now read the parameter and `did_ops` cross-checks it against the DID's host
+  (a DID's host *is* its domain) / the slot's persisted domain, rejecting a
+  mismatch with `did-management:unknown_domain` before the log lands. Covers the
+  DIDComm trust-task path too (it resolves the domain separately and passes
+  none). The standalone `did-hosting-server` direct-publish handler is unchanged
+  (the daemon and standalone-control deployments route management through the
+  control plane).
+
 ## 0.8.1 (2026-07-15)
 
 Boot-time and scale fixes for the distributed (control + edge server)

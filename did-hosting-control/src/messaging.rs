@@ -541,7 +541,7 @@ pub async fn dispatch_did_op(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'didData' in body".into()))?;
 
-            did_ops::publish_did(auth, state, mnemonic, did_log).await?;
+            did_ops::publish_did(auth, state, mnemonic, did_log, None).await?;
 
             // Read back the record for protocol response fields
             let record: did_hosting_common::did_ops::DidRecord = state
@@ -674,7 +674,7 @@ pub async fn dispatch_did_op(
                 .get("mnemonic")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            let did_id = did_ops::delete_did(auth, state, mnemonic).await?;
+            let did_id = did_ops::delete_did(auth, state, mnemonic, None).await?;
 
             server_push::notify_servers_delete(state, mnemonic.to_string());
             Ok((
