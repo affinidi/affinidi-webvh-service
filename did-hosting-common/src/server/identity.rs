@@ -39,6 +39,7 @@ use std::sync::{Arc, RwLock};
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use didwebvh_rs::log_entry::LogEntryMethods;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -407,6 +408,75 @@ pub async fn resolve_identity_doc(
     })
 }
 
+/// Extract the identity's kids from a locally-stored `did.jsonl`, without the
+/// network.
+///
+/// The server hosts its own DID, so its store is authoritative — and at cold
+/// boot the public URL (often behind a load balancer that hasn't yet marked
+/// this instance healthy) 502s, before the HTTP listener is even up. Reading
+/// the validated current document from the local log avoids that round-trip.
+/// Mirrors [`resolve_identity_doc`]'s field extraction. Returns `None` when the
+/// log doesn't parse or has no auth/keyAgreement, so the caller falls back to
+/// the network path.
+pub fn resolve_identity_doc_from_log(did: &str, log_content: &str) -> Option<ResolvedIdentityDoc> {
+    let state = super::identity_rotate::load_validated_state(log_content).ok()?;
+    let current = state.log_entries().last()?.log_entry.get_state();
+    let resolved = kids_from_document(did, current)?;
+    debug!(
+        did = did,
+        signing = %resolved.signing_kid,
+        key_agreement = %resolved.ka_kid,
+        "resolved own DID document from the local log (no network)"
+    );
+    Some(resolved)
+}
+
+/// Pure kid extraction from a DID document JSON — the shape `build_did_document`
+/// emits (`authentication`/`keyAgreement` are arrays of bare kid strings, and
+/// `publicKeyMultibase` is a flat property on the verification method). Split
+/// out so the mapping is unit-tested without a validated log, mirroring
+/// [`resolve_identity_doc`]'s extraction. Returns `None` when the document has
+/// neither relationship, so the caller falls back to the network path.
+fn kids_from_document(did: &str, current: &serde_json::Value) -> Option<ResolvedIdentityDoc> {
+    if current.get("authentication").is_none() && current.get("keyAgreement").is_none() {
+        return None;
+    }
+    // Each relationship entry is a bare kid string or an embedded VM object.
+    let kid_of = |entry: &serde_json::Value| -> Option<String> {
+        entry
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| entry.get("id").and_then(|v| v.as_str()).map(str::to_string))
+    };
+    let signing_kid = current
+        .get("authentication")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(kid_of)
+        .unwrap_or_else(|| format!("{did}#key-0"));
+    let ka_kid = current
+        .get("keyAgreement")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(kid_of)
+        .unwrap_or_else(|| format!("{did}#key-1"));
+    let ka_public_multibase = current
+        .get("verificationMethod")
+        .and_then(|v| v.as_array())
+        .and_then(|vms| {
+            vms.iter()
+                .find(|vm| vm.get("id").and_then(|i| i.as_str()) == Some(ka_kid.as_str()))
+        })
+        .and_then(|vm| vm.get("publicKeyMultibase"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some(ResolvedIdentityDoc {
+        signing_kid,
+        ka_kid,
+        ka_public_multibase,
+    })
+}
+
 /// Turn one specific, unfixable-in-place misconfiguration into an actionable
 /// message instead of a cryptic resolver error.
 ///
@@ -605,11 +675,30 @@ pub async fn load_identity(
             Vec::new()
         });
 
+    // Read our own DID's log from the local store so identity resolution can
+    // prefer it over the network. The server hosts this DID; at cold boot the
+    // public URL (behind a load balancer) may 502 before the instance is
+    // healthy, and resolving over the wire is pointless when the authoritative
+    // copy is right here.
+    let local_log: Option<String> = match (
+        mnemonic_from_did(did),
+        store.keyspace(super::store::KS_DIDS),
+    ) {
+        (Some(mnemonic), Ok(dids_ks)) => dids_ks
+            .get_raw(crate::did_ops::content_log_key(&mnemonic))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        _ => None,
+    };
+
     let current = resolve_current_generation(
         did,
         mediator_did,
         protocols,
         &did_resolver,
+        local_log.as_deref(),
         stored.first(),
         now,
     )
@@ -714,10 +803,17 @@ async fn resolve_current_generation(
     mediator_did: Option<&str>,
     protocols: ProtocolSet,
     did_resolver: &DIDCacheClient,
+    local_log: Option<&str>,
     stored: Option<&IdentityGeneration>,
     now: u64,
 ) -> Option<IdentityGeneration> {
-    let Some(doc) = resolve_identity_doc(did, did_resolver).await else {
+    // Prefer the locally-hosted log (authoritative, and available before the
+    // HTTP listener / load balancer is), then fall back to the network resolve.
+    let resolved = match local_log.and_then(|log| resolve_identity_doc_from_log(did, log)) {
+        Some(from_log) => Some(from_log),
+        None => resolve_identity_doc(did, did_resolver).await,
+    };
+    let Some(doc) = resolved else {
         if let Some(stored) = stored {
             warn!(
                 did = did,
@@ -2117,5 +2213,34 @@ mod tests {
             live[0].id, 3,
             "the *current* generation leads, not the newest"
         );
+    }
+
+    #[test]
+    fn kids_from_document_extracts_the_did_document_shape() {
+        // The exact shape `build_did_document` emits: relationships are arrays
+        // of bare kid strings, `publicKeyMultibase` a flat VM property.
+        let did = "did:webvh:QmScid:host.example:node";
+        let doc = serde_json::json!({
+            "id": did,
+            "verificationMethod": [
+                { "id": format!("{did}#key-0"), "type": "Multikey", "publicKeyMultibase": "z6MkSign" },
+                { "id": format!("{did}#key-1"), "type": "Multikey", "publicKeyMultibase": "z6LSAgree" },
+            ],
+            "authentication": [format!("{did}#key-0")],
+            "assertionMethod": [format!("{did}#key-0")],
+            "keyAgreement": [format!("{did}#key-1")],
+        });
+
+        let got = kids_from_document(did, &doc).expect("has relationships");
+        assert_eq!(got.signing_kid, format!("{did}#key-0"));
+        assert_eq!(got.ka_kid, format!("{did}#key-1"));
+        assert_eq!(got.ka_public_multibase.as_deref(), Some("z6LSAgree"));
+    }
+
+    #[test]
+    fn kids_from_document_none_without_relationships() {
+        // No auth/keyAgreement → None, so the caller falls back to the network.
+        let doc = serde_json::json!({ "id": "did:webvh:Q:h:n", "service": [] });
+        assert!(kids_from_document("did:webvh:Q:h:n", &doc).is_none());
     }
 }

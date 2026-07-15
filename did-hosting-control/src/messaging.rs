@@ -1280,8 +1280,26 @@ pub(crate) async fn do_server_register(
         );
     }
 
-    // Push all existing DIDs to the newly registered server
-    server_push::sync_all_dids_to_server(state, sender.to_string());
+    // Sync DIDs to the newly registered server — only the ones it doesn't
+    // already have. The server reports what it holds in `preloaded_dids`
+    // (mnemonic → version_count); anything absent or stale is pushed. A client
+    // that sends no `preloaded_dids` (older server, or an empty store) gets a
+    // full push. This is what stops a reboot from re-syncing every DID.
+    let reported: std::collections::HashMap<String, u64> = body
+        .get("preloaded_dids")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let mnemonic = e.get("mnemonic")?.as_str()?.to_string();
+                    let version = e.get("version_count")?.as_u64()?;
+                    Some((mnemonic, version))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    server_push::sync_all_dids_to_server(state, sender.to_string(), reported);
 
     Ok(json!({
         "instance_id": instance_id,

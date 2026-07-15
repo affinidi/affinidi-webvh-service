@@ -21,14 +21,25 @@ use tracing::{info, warn};
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
 
-/// Enqueue every existing published DID to one server's outbox.
+/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
+/// already have at the current version.
 ///
-/// Called after a server registers so it eventually receives the full
-/// current DID set. Each DID is one outbox row — the worker drains
-/// them in enqueue order, so the server applies them in a deterministic
-/// sequence. A control restart mid-bulk-enqueue resumes from the
-/// remaining rows on the next worker tick.
-pub fn sync_all_dids_to_server(state: &AppState, server_did: String) {
+/// `reported` maps mnemonic → the `version_count` the registering server says
+/// it already holds (from the `preloaded_dids` in its register payload). Any
+/// DID at or above that version is skipped. An **empty** map means a full push
+/// — the back-compat path for a client that sends no `preloaded_dids`, and the
+/// correct behaviour for a server with an empty store.
+///
+/// Each DID is one outbox row; the worker drains them in enqueue order so the
+/// server applies them deterministically, and a control restart mid-bulk
+/// resumes from the remaining rows. Sending only the delta is what keeps a
+/// reboot from re-pushing every DID (and re-triggering the server's own-DID
+/// identity-rotation check) at thousands-of-DIDs scale.
+pub fn sync_all_dids_to_server(
+    state: &AppState,
+    server_did: String,
+    reported: std::collections::HashMap<String, u64>,
+) {
     let dids_ks = state.dids_ks.clone();
     let store = state.store.clone();
     let notify = state.outbox_notify.clone();
@@ -51,6 +62,15 @@ pub fn sync_all_dids_to_server(state: &AppState, server_did: String) {
             };
 
             if record.version_count == 0 {
+                continue;
+            }
+
+            // Delta: the registering server already has this DID at this
+            // version or newer — nothing to push.
+            if reported
+                .get(&record.mnemonic)
+                .is_some_and(|&have| have >= record.version_count)
+            {
                 continue;
             }
 

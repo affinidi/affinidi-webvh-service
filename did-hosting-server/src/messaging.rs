@@ -11,7 +11,7 @@ use affinidi_messaging_didcomm_service::{
     middleware_fn, trust_ping_handler,
 };
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
@@ -328,7 +328,10 @@ async fn do_sync_update(
         .await
         .map_err(|e| e.to_string())?;
 
-    info!(
+    // Duplicate of the canonical info line in
+    // `control_register::apply_single_update` (which this path calls); keep it
+    // at debug so each synced DID logs once at info, not twice.
+    debug!(
         did = sender,
         mnemonic = %mnemonic,
         version_count,

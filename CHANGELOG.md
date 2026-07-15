@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.1 (2026-07-15)
+
+Boot-time and scale fixes for the distributed (control + edge server)
+deployment.
+
+### Fixed
+
+- **Registration no longer re-syncs every DID on every boot.** A server
+  registering over TSP/DIDComm hit `sync_all_dids_to_server`, a full push of
+  every DID, regardless of what the server already had — so a reboot re-synced
+  the whole set (and re-triggered the server's own-DID identity-rotation check
+  each time). The server now reports what it holds in `preloaded_dids`
+  (mnemonic → version), and the control plane pushes only the delta; an older
+  server that sends none still gets a full push. This is what lets the edge
+  sync scale to thousands of DIDs.
+- **The server resolves its own DID from the local store, not the network.** At
+  cold boot the identity load resolved the server's own DID over its public URL
+  — through a load balancer that hadn't marked the instance healthy yet — and
+  logged a spurious `502`/`ERROR` before falling back. It now reads the
+  authoritative `did.jsonl` from the local store first
+  (`resolve_identity_doc_from_log`), falling back to the network only when the
+  local copy is missing.
+- **Quieter sync logging.** The per-DID `inbound TSP: server sync/domain
+  message` receipt and the duplicate `applied DID sync update … via mediator`
+  line drop to `debug`; each applied update logs once at `info`.
+
 ## 0.8.0 (2026-07-15)
 
 The theme of this release is **transport as a first-class, negotiable property

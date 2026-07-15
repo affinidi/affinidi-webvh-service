@@ -152,6 +152,24 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
+    // Report the DIDs we already hold (mnemonic → version) so the control
+    // plane sends only what we're missing or behind on, instead of re-pushing
+    // every DID on every boot. Compact by design — mnemonic + version, not the
+    // logs. A store-iteration failure degrades to an empty list, i.e. a full
+    // sync, which is safe (just not optimal).
+    let preloaded_dids: Vec<serde_json::Value> = match state.dids_ks.prefix_iter_raw("did:").await {
+        Ok(raw) => raw
+            .into_iter()
+            .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
+            .filter(|r| r.version_count > 0)
+            .map(|r| json!({ "mnemonic": r.mnemonic, "version_count": r.version_count }))
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
+            Vec::new()
+        }
+    };
+
     let body = json!({
         "public_url": public_url,
         "label": "did-hosting-server",
@@ -162,6 +180,9 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         // as trust tasks, and therefore over whichever transport this server's
         // DID document advertises. An older control plane ignores the field.
         "trust_task_capable": true,
+        // Delta-sync hint: the DIDs we already hold, so the control plane only
+        // pushes changes. An older control plane ignores this and full-syncs.
+        "preloaded_dids": preloaded_dids,
     });
 
     // Framing follows the transport, and for one hard reason: a **TSP-only**

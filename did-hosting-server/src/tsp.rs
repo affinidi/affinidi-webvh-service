@@ -35,7 +35,7 @@ use affinidi_messaging_didcomm_service::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::messaging::dispatch_tsp_message;
 use crate::server::AppState;
@@ -99,7 +99,10 @@ impl TspHandler for ServerTspHandler {
                 return Ok(None);
             }
         };
-        info!(sender = %sender_vid, msg_type = %msg.typ, "inbound TSP: server sync/domain message");
+        // Transport receipt — one per synced DID. The applied-update outcome
+        // logs at info in `control_register::apply_single_update`; keep this at
+        // debug so a bulk sync doesn't spam.
+        debug!(sender = %sender_vid, msg_type = %msg.typ, "inbound TSP: server sync/domain message");
         // Apply via the shared `do_*` cores (which authorise the sender as
         // the control plane). Fire-and-forget: the ack is dropped, mirroring
         // the outbox's send-success-is-delivery model.

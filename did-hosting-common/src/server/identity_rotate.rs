@@ -64,7 +64,7 @@ pub struct RotationReport {
 /// Mirrors `did_ops::verify_did_log_proofs`'s parse, but keeps the state so we
 /// can append to it. Validation is not optional here: appending to a chain we
 /// have not verified would let a corrupted log silently become a signed one.
-fn load_validated_state(content: &str) -> Result<DIDWebVHState, AppError> {
+pub(crate) fn load_validated_state(content: &str) -> Result<DIDWebVHState, AppError> {
     let mut state = DIDWebVHState::default();
     let mut version = None;
 
