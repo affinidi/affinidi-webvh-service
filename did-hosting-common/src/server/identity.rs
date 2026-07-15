@@ -41,7 +41,7 @@ use affinidi_tdk::secrets_resolver::secrets::Secret;
 use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use didwebvh_rs::log_entry::LogEntryMethods;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::auth::session::now_epoch;
 use super::error::AppError;
@@ -750,6 +750,34 @@ pub async fn load_identity(
         warn!("failed to persist identity generation: {e}");
     }
 
+    // Validate that the secret store actually holds the private half of the
+    // current generation's key-agreement kid. `reload_service_identity` guards
+    // this for a *rotation* (it refuses to half-rotate), but boot performs no
+    // rotation and so had no such check. If the document advertises a key this
+    // process never received, say so LOUDLY now — otherwise the service quietly
+    // runs on a retired key and collapses the moment that key's grace period
+    // elapses, ~one grace period after boot, with a cryptic "no usable key
+    // agreement key".
+    match Secret::from_multibase(&secrets.key_agreement_key, Some(&current.ka_kid)) {
+        Ok(ka) if !secret_matches_document(&ka, current.ka_public_multibase.as_deref()) => {
+            error!(
+                did = did,
+                ka_kid = %current.ka_kid,
+                "the DID document advertises a key-agreement key whose private half is NOT in \
+                 the secret store — this identity cannot decrypt or authenticate, and will fail \
+                 once any grace period elapses. Write the matching key to the secret store \
+                 (keys, then publish the DID), or re-resolve."
+            );
+        }
+        Err(e) => warn!(
+            did = did,
+            ka_kid = %current.ka_kid,
+            "could not decode the stored key-agreement key to validate it against the \
+             document: {e}"
+        ),
+        _ => {}
+    }
+
     // Every generation still inside its grace window, current first. A retired
     // generation's key material comes back from `ServerSecrets::retired` — this
     // is the restart path the whole feature exists for.
@@ -1347,8 +1375,8 @@ pub async fn run_sweep_once(
     };
 
     let current_id = live.first().map(|g| g.id);
-    let doomed: Vec<IdentityGeneration> = live
-        .into_iter()
+    let doomed_ids: Vec<u64> = live
+        .iter()
         .filter(|g| {
             // Never drop the current generation: it is the key the service is
             // actively using, and losing it would leave us unable to decrypt
@@ -1359,14 +1387,47 @@ pub async fn run_sweep_once(
             }
             !g.is_live(now) || !persisted.contains(&g.id)
         })
+        .map(|g| g.id)
         .collect();
 
-    if doomed.is_empty() {
+    if doomed_ids.is_empty() {
         return 0;
     }
 
+    // Safety net: expiring a generation removes its `ka_kid`'s key material from
+    // the resolver. Never expire one whose `ka_kid` is still used by a surviving
+    // generation — that would strip the key the survivor (usually the current
+    // generation) is still using and leave the service with no usable
+    // key-agreement key. Post-fix a retired generation never shares the current
+    // `ka_kid`; this catches leftover damage from a server that rotated wrongly
+    // before that fix, so that a grace expiry can never disarm it.
+    let surviving_ka_kids: std::collections::HashSet<&str> = live
+        .iter()
+        .filter(|g| !doomed_ids.contains(&g.id))
+        .map(|g| g.ka_kid.as_str())
+        .collect();
+    let mut to_expire: Vec<IdentityGeneration> = Vec::new();
+    let mut rescued: Vec<u64> = Vec::new();
+    for g in live.iter().filter(|g| doomed_ids.contains(&g.id)) {
+        if surviving_ka_kids.contains(g.ka_kid.as_str()) {
+            rescued.push(g.id);
+        } else {
+            to_expire.push(g.clone());
+        }
+    }
+    if !rescued.is_empty() {
+        error!(
+            ?rescued,
+            "identity sweep: NOT expiring generation(s) whose key-agreement key is still used by \
+             a surviving generation — expiring them would strip the key in active use and leave \
+             no usable key-agreement key. This indicates a same-`ka_kid` rotation that should no \
+             longer happen (see reload_service_identity's metadata-vs-key split); the shared key \
+             material stays loaded until the drift is resolved."
+        );
+    }
+
     let mut reaped = 0;
-    for generation in &doomed {
+    for generation in &to_expire {
         if let Err(e) = expire_generation(identity, store, secret_store, generation).await {
             warn!(id = generation.id, "failed to expire generation: {e}");
             continue;
@@ -2402,6 +2463,47 @@ mod tests {
                 .await
                 .is_some(),
             "the current key is still usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_never_strips_a_key_a_survivor_still_uses() {
+        // Leftover damage from a pre-fix same-`ka_kid` rotation: a retired
+        // generation shares the current generation's ka_kid. Expiring it would
+        // delete the key the service is still using — the exact mechanism behind
+        // the mediator-auth outage. The sweep must keep it and reap nothing.
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_IDENTITY).expect("identity keyspace");
+
+        let (current, signing, ka) = keyed_generation(1, "shared");
+        let mut retired = current.clone();
+        retired.id = 0;
+        retired.retired_at = Some(1);
+        retired.expires_at = Some(2); // long past its grace window
+
+        let secret_store = MockSecretStore::new(server_secrets(&signing, &ka, Vec::new()));
+        save_current_generation(&store, &ks, &current)
+            .await
+            .expect("save current");
+        ks.insert(gen_key(retired.id), &retired)
+            .await
+            .expect("save retired");
+
+        let identity =
+            identity_with(vec![current.clone(), retired.clone()], vec![signing, ka]).await;
+
+        assert_eq!(
+            run_sweep_once(&identity, &store, &secret_store).await,
+            0,
+            "must not expire a retired generation that shares the current key-agreement kid"
+        );
+        assert!(
+            identity
+                .secrets_resolver
+                .get_secret(&current.ka_kid)
+                .await
+                .is_some(),
+            "the key the current generation is using must survive the sweep"
         );
     }
 }
