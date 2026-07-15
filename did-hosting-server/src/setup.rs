@@ -140,7 +140,15 @@ pub async fn run_wizard(
         Some(path) => Some(EphemeralSetupKey::load_from(path)?),
         None => None,
     };
-    let outcome = run_online_provision(&public_url, messages, preloaded_setup_key).await?;
+    // The mediator + transport are chosen inside `run_online_provision`,
+    // before the mint, so the selection is embedded in the minted DID's
+    // service block (mediator-configured servers advertise their transports).
+    let OnlineProvision {
+        outcome,
+        mediator_did,
+        didcomm,
+        tsp,
+    } = run_online_provision(&public_url, messages, preloaded_setup_key).await?;
     let did_result_log_entry = outcome.did_log_entry.clone();
 
     if let Some(ref log_entry) = did_result_log_entry {
@@ -153,39 +161,7 @@ pub async fn run_wizard(
         eprintln!("  ---");
     }
 
-    // 4. Mediator preference (runtime DIDComm with the control plane).
-    eprintln!();
-    eprintln!("  A DIDComm mediator routes sync messages from the control plane.");
-    eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&outcome.vta_did).await;
-    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
-    if let Some(ref did) = vta_mediator {
-        mediator_options.push(format!("Use VTA's mediator ({did})"));
-    }
-    mediator_options.push("Enter a custom mediator DID".into());
-    let mediator_idx = Select::new()
-        .with_prompt("DIDComm mediator")
-        .items(&mediator_options)
-        .default(if vta_mediator.is_some() { 1 } else { 0 })
-        .interact()?;
-    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
-        None
-    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
-        vta_mediator.clone()
-    } else {
-        let did: String = setup_prompts::prompt_long_value("Mediator DID", false)?;
-        if did.is_empty() { None } else { Some(did) }
-    };
-
-    // 5. Transport selection — only applies with a mediator (both TSP and
-    //    DIDComm ride the mediator socket); HTTP-only otherwise.
-    let (didcomm, tsp) = if mediator_did.is_some() {
-        setup_prompts::prompt_transport_selection()?.as_flags()
-    } else {
-        (false, false)
-    };
-
-    // 6. Control plane DID (for DIDComm sync)
+    // 4. Control plane DID (for DIDComm sync)
     eprintln!();
     eprintln!("  The control plane manages all DIDs and pushes updates to this");
     eprintln!("  server via DIDComm through the mediator. Enter the control");
@@ -199,11 +175,11 @@ pub async fn run_wizard(
         Some(control_did)
     };
 
-    // 7. Host / Port
+    // 5. Host / Port
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port = setup_prompts::prompt_listen_port(8530)?;
 
-    // 8. Log level / format
+    // 6. Log level / format
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
         .with_prompt("Log level")
@@ -214,24 +190,24 @@ pub async fn run_wizard(
 
     let log_format = setup_prompts::prompt_log_format()?;
 
-    // 9. Data directory
+    // 7. Data directory
     let data_dir: String = Input::new()
         .with_prompt("Data directory")
         .default("data/did-hosting-server".to_string())
         .interact_text()?;
 
-    // 10. JWT signing key (always generated)
+    // 8. JWT signing key (always generated)
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
     eprintln!("  Generated JWT signing key.");
 
-    // 11. Secrets backend selection
+    // 9. Secrets backend selection
     let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
         "did-hosting-server-secrets",
         "webvh",
     )
     .await?;
 
-    // 12. Build and write config
+    // 10. Build and write config
     let config = AppConfig {
         features: FeaturesConfig {
             didcomm,
@@ -407,11 +383,24 @@ fn prompt_offline_complete_inputs() -> Result<(PathBuf, String, PathBuf), Box<dy
 /// prompt for VTA DID + context, mint an ephemeral did:key, print the
 /// operator's `pnm contexts create` command, wait for confirmation,
 /// then drive `vta_sdk::provision_client::run_provision`.
+/// What [`run_online_provision`] gathered: the VTA provision outcome plus the
+/// operator's mediator + transport choice. Both are needed downstream — the
+/// choice shapes the minted DID's service block (so a mediator-configured
+/// server advertises its transports) and populates the runtime config. The
+/// mediator is chosen here, before the mint, precisely so it can be embedded
+/// in the DID document rather than living only in config.
+struct OnlineProvision {
+    outcome: vta_setup::OnlineProvisionOutcome,
+    mediator_did: Option<String>,
+    didcomm: bool,
+    tsp: bool,
+}
+
 async fn run_online_provision(
     public_url: &str,
     messages: Arc<dyn OperatorMessages>,
     preloaded_setup_key: Option<EphemeralSetupKey>,
-) -> Result<vta_setup::OnlineProvisionOutcome, Box<dyn std::error::Error>> {
+) -> Result<OnlineProvision, Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
@@ -456,16 +445,57 @@ async fn run_online_provision(
         }
     };
 
-    // The server's own DID is HTTP-only hosting (no mediator), and
-    // `public_url` carries the DID path in its path component — split it
-    // back out so the shared builder folds it into the minted DID's URL.
+    // Mediator preference (runtime DIDComm with the control plane). Chosen
+    // here, before the mint, so the selected mediator can be embedded in the
+    // minted DID's service block — not just written to config. `vta_did` is
+    // the operator-entered VTA DID above, so its mediator is discoverable
+    // without the mint having happened.
+    eprintln!();
+    eprintln!("  A DIDComm mediator routes sync messages from the control plane.");
+    eprintln!();
+    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let mut mediator_options: Vec<String> = vec!["No mediator".into()];
+    if let Some(ref did) = vta_mediator {
+        mediator_options.push(format!("Use VTA's mediator ({did})"));
+    }
+    mediator_options.push("Enter a custom mediator DID".into());
+    let mediator_idx = Select::new()
+        .with_prompt("DIDComm mediator")
+        .items(&mediator_options)
+        .default(if vta_mediator.is_some() { 1 } else { 0 })
+        .interact()?;
+    let mediator_did = if mediator_options[mediator_idx].starts_with("No mediator") {
+        None
+    } else if mediator_options[mediator_idx].starts_with("Use VTA") {
+        vta_mediator.clone()
+    } else {
+        let did: String = setup_prompts::prompt_long_value("Mediator DID", false)?;
+        if did.is_empty() { None } else { Some(did) }
+    };
+
+    // Transport selection — only applies with a mediator (both TSP and DIDComm
+    // ride the mediator socket); HTTP-only otherwise.
+    let (didcomm, tsp) = if mediator_did.is_some() {
+        setup_prompts::prompt_transport_selection()?.as_flags()
+    } else {
+        (false, false)
+    };
+
+    // The server's own DID advertises its messaging transport(s) when a
+    // mediator is configured — the same shape the control plane and daemon
+    // already mint, so a peer resolving this DID sees how to reach it over
+    // TSP/DIDComm rather than depending on out-of-band config. With no
+    // mediator the DID stays HTTP-only (`WebVHHosting` alone). `public_url`
+    // carries the DID path in its path component — split it back out so the
+    // shared builder folds it into the minted DID's URL.
     let (origin, did_path) = split_origin_and_did_path(public_url);
     let shape = vta_setup::WebvhDidShape::Hosted {
         origin: &origin,
         did_path: &did_path,
-        mediator_did: None,
-        // HTTP-only DID (no mediator) — transport is ignored by the builder.
-        transport: TransportSelection::Both,
+        mediator_did: mediator_did.as_deref(),
+        // Advertise the transport(s) the operator just selected; ignored by
+        // the builder when no mediator is configured.
+        transport: TransportSelection::from_flags(didcomm, tsp).unwrap_or(TransportSelection::Both),
         remote: None,
     };
     let ask = vta_setup::build_webvh_provision_ask(
@@ -478,14 +508,21 @@ async fn run_online_provision(
     eprintln!("  Provisioning server DID via VTA...");
     eprintln!();
 
-    vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
+    let outcome = vta_setup::online_provision_setup(vta_setup::OnlineProvisionInputs {
         vta_did,
         context_id,
         ask,
         messages,
         setup_key,
     })
-    .await
+    .await?;
+
+    Ok(OnlineProvision {
+        outcome,
+        mediator_did,
+        didcomm,
+        tsp,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,15 +675,15 @@ pub async fn run_setup_offline_prepare(
     )
     .await?;
 
-    // Package the bootstrap request via the shared builder — HTTP-only
-    // hosting (no mediator; runtime DIDComm uses `mediator_did` separately),
-    // the path folded into the URL so the rendered DID exposes a
-    // `WebVHHosting` service at the server's public URL.
+    // Package the bootstrap request via the shared builder. The rendered DID
+    // exposes a `WebVHHosting` service at the server's public URL, and — when
+    // a mediator is configured — advertises the selected messaging
+    // transport(s) at it too, matching the online wizard and the control /
+    // daemon setups. With no mediator it stays HTTP-only.
     let shape = vta_setup::WebvhDidShape::Hosted {
         origin: &origin,
         did_path: &did_path,
-        mediator_did: None,
-        // Server's own DID is HTTP-only, so transport is ignored here.
+        mediator_did: mediator_did.as_deref(),
         transport,
         remote: None,
     };

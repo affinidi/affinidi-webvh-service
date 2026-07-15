@@ -344,6 +344,18 @@ enum Command {
         /// `vta bootstrap provision-integration` without `--context`.
         #[arg(long, default_value = "webvh")]
         context: String,
+        /// DIDComm mediator DID to advertise on this server's DID. When set,
+        /// the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging`
+        /// service at this mediator (per `--transport`), so peers can reach
+        /// the server over messaging without out-of-band config — matching
+        /// the interactive setup and the control / daemon deployments. Omit
+        /// for an HTTP-only DID.
+        #[arg(long)]
+        mediator_did: Option<String>,
+        /// Which messaging transport(s) to advertise at `--mediator-did`:
+        /// `both`, `tsp`, or `didcomm`. Ignored when no mediator is given.
+        #[arg(long, default_value = "both")]
+        transport: String,
     },
     /// Open a sealed VTA bootstrap response.
     ///
@@ -592,18 +604,28 @@ async fn main() {
             label,
             public_url,
             context,
+            mediator_did,
+            transport,
         }) => {
             // `public_url` carries the DID path; split it back out so the
-            // shared builder folds it identically to the wizard. The server's
-            // own DID is HTTP-only (no mediator).
+            // shared builder folds it identically to the wizard. The DID
+            // advertises its messaging transport(s) when `--mediator-did` is
+            // given, and stays HTTP-only otherwise.
+            let transport =
+                match did_hosting_common::server::config::TransportSelection::parse(&transport) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                };
             let (origin, did_path) =
                 did_hosting_common::server::setup_recipe::split_origin_and_did_path(&public_url);
             let shape = did_hosting_common::server::vta_setup::WebvhDidShape::Hosted {
                 origin: &origin,
                 did_path: &did_path,
-                mediator_did: None,
-                // HTTP-only DID (no mediator) — transport is ignored.
-                transport: did_hosting_common::server::config::TransportSelection::Both,
+                mediator_did: mediator_did.as_deref(),
+                transport,
                 remote: None,
             };
             let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
