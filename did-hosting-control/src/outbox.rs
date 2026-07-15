@@ -43,6 +43,7 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
+use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::{KS_OUTBOUND_QUEUE, KeyspaceHandle, Store};
 use serde::{Deserialize, Serialize};
@@ -262,6 +263,7 @@ async fn deliver(
     didcomm: &DIDCommService,
     control_did: &str,
     entry: &OutboxEntry,
+    fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let msg = Message::build(
@@ -274,9 +276,9 @@ async fn deliver(
     .created_time(now_epoch())
     .finalize();
 
-    use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_transport};
+    use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_send_binding};
 
-    match resolve_transport(&entry.target_did, did_resolver).await {
+    match resolve_send_binding(&entry.target_did, fallback, did_resolver).await {
         Some((PeerTransport::Tsp, _)) => {
             // `to_vec` borrows `msg`, so it stays owned for the DIDComm
             // fallback below.
@@ -309,10 +311,19 @@ async fn deliver(
                 }
             }
         }
-        _ => didcomm
+        Some((PeerTransport::Didcomm, _)) => didcomm
             .send_message("control", msg, &entry.target_did)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+        // No binding: target advertises no transport and control has no
+        // configured mediator to fall back on. This was previously a blind
+        // DIDComm send; it could never route, so it is now a delivery error
+        // the outbox records and retries rather than a silent black hole.
+        None => Err(format!(
+            "no route to {}: target advertises no messaging transport and no mediator is configured",
+            entry.target_did
+        )
+        .into()),
     }
 }
 
@@ -350,6 +361,13 @@ pub async fn run_tick(state: &AppState) -> TickReport {
         }
     };
 
+    // Control's own configured mediator, used as the send fallback when a
+    // target's document advertises no transport.
+    let fallback = TransportFallback::from_config(
+        state.config.mediator_did.as_deref(),
+        state.config.features.tsp,
+    );
+
     let mut report = TickReport::default();
     let now = now_epoch();
     for target in targets {
@@ -386,7 +404,15 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                 break;
             }
 
-            match deliver(&svc, &control_did, &entry, state.did_resolver.as_ref()).await {
+            match deliver(
+                &svc,
+                &control_did,
+                &entry,
+                &fallback,
+                state.did_resolver.as_ref(),
+            )
+            .await
+            {
                 Ok(()) => {
                     info!(
                         target_did = %target,

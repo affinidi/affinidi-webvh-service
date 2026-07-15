@@ -513,6 +513,13 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let health_control_did = state.config.server_did.clone();
     let health_interval_secs = state.config.registry.health_check_interval.max(10);
     let health_resolver = state.did_resolver.clone();
+    // Control's own configured mediator, used as the send fallback when a
+    // target server's document advertises no transport.
+    let health_fallback =
+        did_hosting_common::server::didcomm_profile::TransportFallback::from_config(
+            state.config.mediator_did.as_deref(),
+            state.config.features.tsp,
+        );
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(health_interval_secs));
         timer.tick().await; // skip first tick
@@ -524,6 +531,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                         &health_didcomm,
                         health_control_did.as_deref(),
                         health_interval_secs,
+                        &health_fallback,
                         health_resolver.as_ref(),
                     ).await {
                         warn!("health check error: {e}");
@@ -1047,6 +1055,7 @@ async fn send_health_ping_trust_task(
     control_did: &str,
     server_did: &str,
     inst: &registry::ServiceInstance,
+    fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
 ) {
     use did_hosting_common::server::trust_tasks::send::{build_request, send_trust_task};
@@ -1064,7 +1073,17 @@ async fn send_health_ping_trust_task(
         }
     };
 
-    match send_trust_task(svc, "control", control_did, server_did, &doc, did_resolver).await {
+    match send_trust_task(
+        svc,
+        "control",
+        control_did,
+        server_did,
+        &doc,
+        fallback,
+        did_resolver,
+    )
+    .await
+    {
         Ok(transport) => {
             debug!(
                 instance_id = %inst.instance_id,
@@ -1098,6 +1117,7 @@ pub async fn run_health_checks(
     didcomm: &std::sync::OnceLock<DIDCommService>,
     control_did: Option<&str>,
     health_interval_secs: u64,
+    fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
@@ -1127,6 +1147,7 @@ pub async fn run_health_checks(
                     ctrl_did,
                     server_did,
                     inst,
+                    fallback,
                     did_resolver,
                 )
                 .await;

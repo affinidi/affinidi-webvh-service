@@ -20,7 +20,9 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_transport};
+use did_hosting_common::server::didcomm_profile::{
+    PeerTransport, TransportFallback, resolve_transport,
+};
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use did_hosting_common::server::trust_tasks::send::{
     Retry, build_request, send_trust_task_with_retry,
@@ -180,6 +182,13 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         Some((PeerTransport::Tsp, _))
     );
 
+    // This node's configured mediator, used as the send fallback when the
+    // peer's document advertises no transport (see `resolve_send_binding`).
+    let fallback = TransportFallback::from_config(
+        state.config.mediator_did.as_deref(),
+        state.config.features.tsp,
+    );
+
     let outcome = if control_speaks_tsp {
         match build_request(MSG_SERVER_REGISTER, &server_did, &control_did, body) {
             Ok(doc) => send_trust_task_with_retry(
@@ -188,6 +197,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
                 &server_did,
                 &control_did,
                 &doc,
+                &fallback,
                 state.did_resolver.as_ref(),
                 Retry {
                     attempts: 10,

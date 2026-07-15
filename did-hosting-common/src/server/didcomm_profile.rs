@@ -252,6 +252,114 @@ pub async fn resolve_transport(
     None
 }
 
+/// The node's locally-configured messaging fallback, applied when a peer's
+/// DID document advertises no `TSPTransport`/`DIDCommMessaging` service.
+///
+/// This is the compatibility bridge for the "DID document is authoritative"
+/// model: before transports were published in documents, control↔server
+/// links worked because both ends shared a mediator and messages were sent
+/// over DIDComm regardless of what the document said. That behaviour is
+/// preserved here — a node with a mediator configured keeps reaching
+/// doc-silent peers over its own mediator — while a node with no mediator
+/// (which could never have spoken DIDComm) yields no binding and the caller
+/// treats the peer as unroutable, rather than silently attempting a DIDComm
+/// send that cannot route. (There is no REST tier: no trust-task REST sender
+/// or server-side inbound route exists; HTTP-only nodes are served by the
+/// pull/watcher model, not a trust-task push.)
+///
+/// `binding` is the node's *own* mediator VID plus the transport it prefers
+/// (TSP when `features.tsp`, else DIDComm). It is `None` on HTTP-only nodes.
+#[derive(Debug, Clone, Default)]
+pub struct TransportFallback {
+    /// The node's configured `(preferred transport, mediator VID)`, or `None`
+    /// when the node has no mediator configured.
+    pub binding: Option<(PeerTransport, String)>,
+}
+
+impl TransportFallback {
+    /// Build from a node's configured mediator and transport preference.
+    ///
+    /// `prefer_tsp` should track `features.tsp`; when the node advertises both
+    /// transports it prefers TSP, matching [`resolve_transport`]'s document
+    /// ordering. Returns an empty fallback (no binding) when `mediator_did` is
+    /// `None`, so HTTP-only nodes yield no binding at all.
+    pub fn from_config(mediator_did: Option<&str>, prefer_tsp: bool) -> Self {
+        let binding = mediator_did.map(|m| {
+            let t = if prefer_tsp {
+                PeerTransport::Tsp
+            } else {
+                PeerTransport::Didcomm
+            };
+            (t, m.to_string())
+        });
+        Self { binding }
+    }
+}
+
+/// Decide how to reach `peer_did` with a trust task, applying the
+/// **DID-document-authoritative** precedence:
+///
+/// 1. **DID document** — a `TSPTransport` (preferred) or `DIDCommMessaging`
+///    service is the authoritative statement of how to reach the peer.
+/// 2. **Config fallback** — if the document advertises neither, use the local
+///    node's configured mediator ([`TransportFallback`]). Preserves existing
+///    shared-mediator deployments whose documents predate published transports.
+/// 3. **Fail** — `None` when the peer advertises no messaging service and the
+///    node has no configured mediator. The caller treats this as an unroutable
+///    peer rather than blindly attempting a send that cannot succeed.
+///
+/// The return shape matches [`resolve_transport`] — `(transport, mediator VID)`
+/// — so it drops into the existing send paths unchanged; the only addition is
+/// the config tier between the document and failure. The document is resolved
+/// once; the config tier still applies when the document fails to resolve
+/// entirely (the shared-mediator case).
+pub async fn resolve_send_binding(
+    peer_did: &str,
+    fallback: &TransportFallback,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<(PeerTransport, String)> {
+    decide_binding(
+        peer_did,
+        resolve_transport(peer_did, did_resolver).await,
+        fallback,
+    )
+}
+
+/// The pure precedence ladder behind [`resolve_send_binding`], split out so
+/// the ordering can be tested without a live DID resolver. `from_doc` is what
+/// the peer's document advertised (via [`resolve_transport`]), or `None` when
+/// it advertised no messaging service or failed to resolve.
+fn decide_binding(
+    peer_did: &str,
+    from_doc: Option<(PeerTransport, String)>,
+    fallback: &TransportFallback,
+) -> Option<(PeerTransport, String)> {
+    // 1. DID document — authoritative.
+    if let Some((transport, mediator)) = from_doc {
+        info!(peer = peer_did, ?transport, mediator = %mediator, "send-binding: using document-advertised transport");
+        return Some((transport, mediator));
+    }
+
+    // 2. Config fallback — the node's own configured mediator.
+    if let Some((transport, mediator)) = &fallback.binding {
+        info!(
+            peer = peer_did,
+            ?transport,
+            mediator = %mediator,
+            "send-binding: document silent — using configured mediator fallback"
+        );
+        return Some((*transport, mediator.clone()));
+    }
+
+    // 3. Fail — unroutable.
+    warn!(
+        peer = peer_did,
+        "send-binding: peer advertises no messaging service and no mediator is \
+         configured — cannot route (peer is unreachable for trust-task push)"
+    );
+    None
+}
+
 /// Wait until a DID resolves, retrying with exponential backoff.
 ///
 /// Used at DIDComm startup to block until the mediator DID document is
@@ -365,5 +473,70 @@ async fn discover_mediator(
             );
             Some(peer.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PEER: &str = "did:webvh:Qm:peer.example";
+    const DOC_MED: &str = "did:web:mediator.doc.example";
+    const CFG_MED: &str = "did:web:mediator.config.example";
+
+    fn cfg(mediator: Option<&str>, prefer_tsp: bool) -> TransportFallback {
+        TransportFallback::from_config(mediator, prefer_tsp)
+    }
+
+    #[test]
+    fn tier1_document_transport_wins_over_config() {
+        // The document advertises a transport and config also has a mediator:
+        // the document is authoritative and its binding wins.
+        let tsp = decide_binding(
+            PEER,
+            Some((PeerTransport::Tsp, DOC_MED.into())),
+            &cfg(Some(CFG_MED), false),
+        );
+        assert_eq!(tsp, Some((PeerTransport::Tsp, DOC_MED.into())));
+
+        let didcomm = decide_binding(
+            PEER,
+            Some((PeerTransport::Didcomm, DOC_MED.into())),
+            &cfg(Some(CFG_MED), true),
+        );
+        assert_eq!(didcomm, Some((PeerTransport::Didcomm, DOC_MED.into())));
+    }
+
+    #[test]
+    fn tier2_config_fallback_used_when_document_silent() {
+        // Document advertises no messaging service; the configured mediator
+        // is used — this is the compatibility bridge for pre-transport DIDs.
+        // `prefer_tsp` picks the binding.
+        let tsp = decide_binding(PEER, None, &cfg(Some(CFG_MED), true));
+        assert_eq!(tsp, Some((PeerTransport::Tsp, CFG_MED.into())));
+
+        let didcomm = decide_binding(PEER, None, &cfg(Some(CFG_MED), false));
+        assert_eq!(didcomm, Some((PeerTransport::Didcomm, CFG_MED.into())));
+    }
+
+    #[test]
+    fn tier3_none_when_nothing_routes() {
+        // No document messaging service and no configured mediator: unroutable.
+        // The caller must not blindly attempt a send (the old blind-DIDComm
+        // behaviour this replaces).
+        let got = decide_binding(PEER, None, &cfg(None, false));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn from_config_empty_without_mediator() {
+        assert!(TransportFallback::from_config(None, true).binding.is_none());
+        let f = TransportFallback::from_config(Some(CFG_MED), true);
+        assert_eq!(f.binding, Some((PeerTransport::Tsp, CFG_MED.to_string())));
+        let f = TransportFallback::from_config(Some(CFG_MED), false);
+        assert_eq!(
+            f.binding,
+            Some((PeerTransport::Didcomm, CFG_MED.to_string()))
+        );
     }
 }

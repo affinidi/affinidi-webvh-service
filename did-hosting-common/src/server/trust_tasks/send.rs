@@ -20,15 +20,24 @@
 //! unit: the same Type URI, the same payload, the same handler — only the
 //! binding differs, chosen by what the recipient says it speaks.
 //!
-//! ## Why the DIDComm arm is the default rather than an error
+//! ## Transport precedence: document, then config, then fail
 //!
-//! `resolve_transport` returns `None` when a DID resolves but advertises
-//! neither transport service, and also when it doesn't resolve at all. Both
-//! collapse into the DIDComm arm here. That is deliberate and matches
-//! [`crate::server::didcomm_profile::resolve_transport`]'s existing consumers:
-//! a mediator-connected peer is reachable over DIDComm whether or not its
-//! document says so, and refusing to send would strand every DID minted before
-//! transports were advertised at all.
+//! The binding is chosen by
+//! [`crate::server::didcomm_profile::resolve_send_binding`], which treats the
+//! peer's **DID document as authoritative** (`TSPTransport` preferred, else
+//! `DIDCommMessaging`) and falls back to this node's configured mediator only
+//! when the document advertises neither — the compatibility bridge for DIDs
+//! minted before transports were published, which worked precisely because the
+//! two ends shared a mediator.
+//!
+//! When neither the document nor config yields a binding, the send **fails**
+//! rather than blindly attempting DIDComm. The former blind-DIDComm default
+//! only ever routed because a mediator existed; a node with no mediator could
+//! not have reached the peer that way regardless, so an explicit error is the
+//! honest outcome and lets the caller (outbox retry, health loop) record an
+//! unroutable peer instead of swallowing a send that cannot succeed. (There is
+//! deliberately no REST tier: no trust-task REST sender or server-side inbound
+//! route exists — HTTP-only nodes are served by the pull/watcher model.)
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::Message;
@@ -36,7 +45,7 @@ use affinidi_messaging_didcomm_service::DIDCommService;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::server::didcomm_profile::{PeerTransport, resolve_transport};
+use crate::server::didcomm_profile::{PeerTransport, TransportFallback, resolve_send_binding};
 
 /// Boxed transport error — mirrors the outbox's error type so `deliver()` can
 /// eventually be rewritten on top of this without changing its signature.
@@ -58,9 +67,10 @@ pub async fn send_trust_task(
     from: &str,
     to: &str,
     doc: &trust_tasks_rs::TrustTask<Value>,
+    fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<PeerTransport, SendError> {
-    match resolve_transport(to, did_resolver).await {
+    match resolve_send_binding(to, fallback, did_resolver).await {
         Some((PeerTransport::Tsp, _)) => {
             let payload = serde_json::to_vec(doc)?;
             match didcomm.send_tsp(listener_id, to, &payload).await {
@@ -84,10 +94,19 @@ pub async fn send_trust_task(
                 }
             }
         }
-        _ => {
+        Some((PeerTransport::Didcomm, _)) => {
             send_over_didcomm(didcomm, listener_id, from, to, doc).await?;
             Ok(PeerTransport::Didcomm)
         }
+        // No binding: the peer advertises no messaging transport AND this node
+        // has no configured mediator to fall back on. This replaces the former
+        // blind-DIDComm default — a send here could never route, so we surface
+        // it as an error the caller (outbox retry, health loop) can record
+        // rather than swallowing it into a DIDComm attempt that hangs or drops.
+        None => Err(format!(
+            "no route to {to}: peer advertises no messaging transport and no mediator is configured"
+        )
+        .into()),
     }
 }
 
@@ -97,19 +116,24 @@ pub async fn send_trust_task(
 /// boot races its own DIDComm connection. Note the retry wraps the *whole*
 /// transport decision, so a peer that becomes TSP-reachable between attempts is
 /// picked up on the next one.
+// One over clippy's 7-arg threshold: a thin retry wrapper that mirrors
+// `send_trust_task`'s parameters plus a `Retry`. Bundling them into a struct
+// would only move the same values around at every call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_trust_task_with_retry(
     didcomm: &DIDCommService,
     listener_id: &str,
     from: &str,
     to: &str,
     doc: &trust_tasks_rs::TrustTask<Value>,
+    fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
     retry: Retry,
 ) -> Result<PeerTransport, SendError> {
     let attempts = retry.attempts.max(1);
     let mut last: Option<SendError> = None;
     for attempt in 1..=attempts {
-        match send_trust_task(didcomm, listener_id, from, to, doc, did_resolver).await {
+        match send_trust_task(didcomm, listener_id, from, to, doc, fallback, did_resolver).await {
             Ok(t) => return Ok(t),
             Err(e) => {
                 debug!(
