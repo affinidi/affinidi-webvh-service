@@ -74,6 +74,7 @@ jobs:
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
+                     store-dynamodb-single \
                      store-firestore store-cosmosdb passkey \
                      setup-wizard metrics \
                      method-webvh method-web; do
@@ -109,6 +110,9 @@ jobs:
           - store: store-dynamodb
             features: "server-core,store-dynamodb,method-webvh,method-web"
             run_tests: false
+          - store: store-dynamodb-single
+            features: "server-core,store-dynamodb-single,method-webvh,method-web"
+            run_tests: false
           - store: store-firestore
             features: "server-core,store-firestore,method-webvh,method-web"
             run_tests: false
@@ -132,6 +136,33 @@ jobs:
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"
+
+  test-dynamodb-single:
+    name: cargo test (store-dynamodb-single integration)
+    runs-on: ubuntu-latest
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build did-hosting-common with store-dynamodb-single
+        run: >
+          cargo build -p did-hosting-common --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+      - name: Run single-table DynamoDB integration tests
+        env:
+          DYNAMODB_SINGLE_TEST_ENDPOINT: http://localhost:8000
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: >
+          cargo test -p did-hosting-common --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+          --test dynamodb_single_table
 
   test-default:
     name: cargo test (default features)
