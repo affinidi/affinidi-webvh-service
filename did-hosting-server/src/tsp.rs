@@ -35,7 +35,7 @@ use affinidi_messaging_didcomm_service::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::messaging::dispatch_tsp_message;
 use crate::server::AppState;
@@ -64,7 +64,11 @@ impl TspHandler for ServerTspHandler {
         if let Ok(doc) = serde_json::from_slice::<trust_tasks_rs::TrustTask<Value>>(&payload) {
             let type_uri = doc.type_uri.to_string();
             if crate::trust_tasks_infra::owns(&type_uri) {
-                info!(sender = %sender_vid, %type_uri, "inbound TSP: trust task");
+                // Infra trust tasks are the periodic health ping (~every 60s)
+                // and the register ack — routine liveness traffic, not events.
+                // Keep the receipt at debug; the meaningful outcomes (server
+                // registered, health status changes) log at info elsewhere.
+                debug!(sender = %sender_vid, %type_uri, "inbound TSP: trust task");
                 return Ok(
                     match crate::trust_tasks_infra::dispatch(&self.state, &sender_vid, doc).await {
                         Some(resp) => Some(TspResponse::new(
