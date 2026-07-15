@@ -22,6 +22,16 @@ fn clean_mnemonic(m: &str) -> &str {
     m.trim_start_matches('/')
 }
 
+/// The optional `?domain=` query the VTA sends on publish/delete as a
+/// cross-tenant safety check (a DID's host IS its domain). `did_ops`
+/// cross-checks it against the DID/slot and rejects a mismatch with
+/// `did-management:unknown_domain`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DomainQuery {
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
 // ---------- POST /api/dids/check ----------
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +261,7 @@ pub async fn upload_did(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
+    Query(dq): Query<DomainQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, AppError> {
@@ -281,7 +292,7 @@ pub async fn upload_did(
         )));
     }
 
-    did_ops::publish_did(&auth, &state, mnemonic, &body).await?;
+    did_ops::publish_did(&auth, &state, mnemonic, &body, dq.domain.as_deref()).await?;
     server_push::notify_servers_did(&state, mnemonic.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
@@ -306,9 +317,10 @@ pub async fn delete_did(
     auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
+    Query(dq): Query<DomainQuery>,
 ) -> Result<StatusCode, AppError> {
     let mnemonic = clean_mnemonic(&mnemonic);
-    did_ops::delete_did(&auth, &state, mnemonic).await?;
+    did_ops::delete_did(&auth, &state, mnemonic, dq.domain.as_deref()).await?;
     server_push::notify_servers_delete(&state, mnemonic.to_string());
     Ok(StatusCode::NO_CONTENT)
 }

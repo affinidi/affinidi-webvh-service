@@ -582,7 +582,7 @@ where
         move |doc, parties| async move {
             let auth = authorize(&state, &doc, &parties).await?;
             let mnemonic = doc.payload.mnemonic.clone();
-            let did_id = did_ops::delete_did(&auth, &state, &mnemonic)
+            let did_id = did_ops::delete_did(&auth, &state, &mnemonic, None)
                 .await
                 .map_err(|e| reject_apperror(&doc, e))?;
             crate::server_push::notify_servers_delete(&state, mnemonic.clone());
@@ -613,7 +613,7 @@ where
         move |doc, parties| async move {
             let auth = authorize(&state, &doc, &parties).await?;
             let mnemonic = doc.payload.mnemonic.clone();
-            did_ops::publish_did(&auth, &state, &mnemonic, &doc.payload.did_log)
+            did_ops::publish_did(&auth, &state, &mnemonic, &doc.payload.did_log, None)
                 .await
                 .map_err(|e| reject_apperror(&doc, e))?;
             let record: DidRecord = state

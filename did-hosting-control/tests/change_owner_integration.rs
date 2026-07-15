@@ -529,7 +529,7 @@ async fn delete_after_transfer_clears_new_owners_index() {
         .expect("transfer");
 
     let new_owner_auth = auth_for(&new_owner, Role::Owner);
-    delete_did(&new_owner_auth, &state, "tenant/del-after")
+    delete_did(&new_owner_auth, &state, "tenant/del-after", None)
         .await
         .expect("new owner deletes");
 

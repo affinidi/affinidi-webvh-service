@@ -515,6 +515,7 @@ pub async fn publish_did(
     state: &AppState,
     mnemonic: &str,
     did_log: &str,
+    request_domain: Option<&str>,
 ) -> Result<(), AppError> {
     use crate::auth::session::now_epoch;
 
@@ -539,6 +540,24 @@ pub async fn publish_did(
     // record's old `did_id`.
     if let Some(did_id) = did_id_val.as_deref() {
         check_did_host_safety(state, auth, did_id).await?;
+    }
+
+    // Cross-check the caller's explicit `?domain=` against the DID's actual
+    // host (a DID's host IS its domain). The VTA re-sends its intended domain
+    // on publish to catch a misconfigured caller before the log lands on the
+    // wrong tenant's slot; without this check the parameter was silently
+    // ignored and the advertised `did-management:unknown_domain` rejection did
+    // not exist on the wire.
+    if let Some(requested) = request_domain.filter(|d| !d.is_empty())
+        && let Some(did_id) = did_id_val.as_deref()
+    {
+        let host = did_hosting_common::server::domain::extract_did_host(did_id)?;
+        if !requested.eq_ignore_ascii_case(&host) {
+            return Err(AppError::Validation(format!(
+                "did-management:unknown_domain — requested domain `{requested}` does \
+                 not match the DID's host `{host}`",
+            )));
+        }
     }
 
     record.updated_at = now_epoch();
@@ -814,11 +833,34 @@ pub async fn delete_did(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
+    request_domain: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     validate_mnemonic(mnemonic)?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let did_id = record.did_id.clone();
+
+    // Cross-check the caller's explicit `?domain=` against the slot's domain
+    // before deleting — same `did-management:unknown_domain` guard as publish,
+    // so a misconfigured caller can't delete the wrong tenant's slot. Prefer
+    // the persisted `record.domain`; fall back to the DID's embedded host for
+    // legacy slots that never had a domain resolved.
+    if let Some(requested) = request_domain.filter(|d| !d.is_empty()) {
+        let slot_domain = if !record.domain.is_empty() {
+            record.domain.clone()
+        } else {
+            did_id
+                .as_deref()
+                .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+                .unwrap_or_default()
+        };
+        if !slot_domain.is_empty() && !requested.eq_ignore_ascii_case(&slot_domain) {
+            return Err(AppError::Validation(format!(
+                "did-management:unknown_domain — requested domain `{requested}` does \
+                 not match the slot's domain `{slot_domain}`",
+            )));
+        }
+    }
 
     let mut batch = state.store.batch();
     batch.remove(&state.dids_ks, did_key(mnemonic));
@@ -1759,7 +1801,7 @@ mod tests_atomic {
         );
 
         // Publish flips the counter.
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1769,13 +1811,59 @@ mod tests_atomic {
         );
 
         // Republishing advances again.
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
         assert_eq!(
             state.stats_collector.get_aggregate().total_updates,
             baseline + 2,
             "subsequent publishes must keep advancing total_updates"
+        );
+    }
+
+    /// F5: the caller's explicit `?domain=` is cross-checked against the DID's
+    /// host (a DID's host IS its domain). A mismatch is rejected as
+    /// `did-management:unknown_domain`; a match or an omitted domain publishes.
+    #[tokio::test]
+    async fn publish_cross_checks_explicit_domain_against_did_host() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "domain-xcheck";
+        // The DID's host — i.e. its domain — is `control.test`.
+        let did_log = build_test_did_log("scid-domain", "control.test", path).await;
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        // No domain stated → unchanged behaviour: publishes.
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+            .await
+            .expect("omitted domain still publishes");
+
+        // Matching domain → publishes.
+        publish_did(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            Some("control.test"),
+        )
+        .await
+        .expect("matching domain publishes");
+
+        // Mismatched domain → rejected before the log lands.
+        let err = publish_did(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            Some("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("unknown_domain")),
+            "mismatched domain must be rejected as unknown_domain, got {err:?}"
         );
     }
 
@@ -1797,7 +1885,7 @@ mod tests_atomic {
             .unwrap();
 
         let baseline = state.stats_collector.get_aggregate().total_updates;
-        let err = publish_did(&owner_auth(owner_b), &state, path, &did_log)
+        let err = publish_did(&owner_auth(owner_b), &state, path, &did_log, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
@@ -1808,7 +1896,7 @@ mod tests_atomic {
         );
 
         // Validation failure on the JSONL body — still no counter movement.
-        let err = publish_did(&owner_auth(owner_a), &state, path, "not-jsonl")
+        let err = publish_did(&owner_auth(owner_a), &state, path, "not-jsonl", None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
@@ -1972,7 +2060,7 @@ mod tests_atomic {
 
         // Publish. The did:webvh log encodes `control.test` as the
         // host, so the backfill should pull it through.
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
         let after: DidRecord = state
@@ -1990,7 +2078,7 @@ mod tests_atomic {
         // backfill only runs when `record.domain.is_empty()`. Confirm
         // by re-publishing the same log and checking the field
         // didn't change to something else (or get cleared).
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
         let after_again: DidRecord = state
@@ -2042,7 +2130,7 @@ mod tests_atomic {
             "precondition: no document yet"
         );
 
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
 
@@ -2067,7 +2155,7 @@ mod tests_atomic {
         create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
 
@@ -2088,7 +2176,7 @@ mod tests_atomic {
             .unwrap();
 
         let both = build_test_did_log_with_transports("control.test", path, true, true).await;
-        publish_did(&owner_auth(owner), &state, path, &both)
+        publish_did(&owner_auth(owner), &state, path, &both, None)
             .await
             .unwrap();
         assert!(
@@ -2102,7 +2190,7 @@ mod tests_atomic {
         // Re-publish a document that advertises DIDComm only.
         let didcomm_only =
             build_test_did_log_with_transports("control.test", path, false, true).await;
-        publish_did(&owner_auth(owner), &state, path, &didcomm_only)
+        publish_did(&owner_auth(owner), &state, path, &didcomm_only, None)
             .await
             .unwrap();
 
@@ -2132,7 +2220,7 @@ mod tests_atomic {
         rec.services = None;
         state.dids_ks.insert(did_key(path), &rec).await.unwrap();
 
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
 
@@ -2154,7 +2242,7 @@ mod tests_atomic {
         create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
-        publish_did(&owner_auth(owner), &state, path, &did_log)
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
             .await
             .unwrap();
 

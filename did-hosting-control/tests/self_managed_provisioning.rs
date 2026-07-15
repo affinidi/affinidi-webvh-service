@@ -155,7 +155,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         .await
         .expect("create log entry");
 
-    publish_did(&auth, &state, &request.mnemonic, &jsonl)
+    publish_did(&auth, &state, &request.mnemonic, &jsonl, None)
         .await
         .expect("publish_did");
 
