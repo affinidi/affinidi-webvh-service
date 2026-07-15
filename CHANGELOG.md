@@ -36,6 +36,16 @@
   `update_current_generation_in_place`; tests cover that the retired generation
   and every key survive an in-place update.
 
+- **Two safety nets around identity key material** (defence-in-depth for the
+  above). (1) Boot now validates that the secret store holds the private half of
+  the current generation's advertised key-agreement kid — the guard
+  `reload_service_identity` applies to a rotation, which boot lacked — and logs
+  loudly on a mismatch instead of running on a retired key and collapsing a
+  grace period later. (2) The expiry sweep never expires a generation whose
+  `ka_kid` is still used by a surviving generation, so a grace expiry can never
+  strip the key in active use and leave the service with no usable
+  key-agreement key.
+
 - **Registration no longer re-syncs every DID on every boot.** A server
   registering over TSP/DIDComm hit `sync_all_dids_to_server`, a full push of
   every DID, regardless of what the server already had — so a reboot re-synced
