@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-daemon"
 description = "DID Hosting Daemon — Unified binary embedding server, witness, watcher, and control plane"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -102,11 +102,11 @@ name = "did-hosting-daemon"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.7", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
-did-hosting-server = { version = "0.7", path = "../did-hosting-server", default-features = false }
-webvh-witness = { version = "0.7", path = "../webvh-witness", default-features = false }
-webvh-watcher = { version = "0.7", path = "../webvh-watcher", default-features = false }
-did-hosting-control = { version = "0.7", path = "../did-hosting-control", default-features = false }
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
+did-hosting-server = { version = "0.8", path = "../did-hosting-server", default-features = false }
+webvh-witness = { version = "0.8", path = "../webvh-witness", default-features = false }
+webvh-watcher = { version = "0.8", path = "../webvh-watcher", default-features = false }
+did-hosting-control = { version = "0.8", path = "../did-hosting-control", default-features = false }
 # Trust Tasks proof verifier — daemon's `build_control` constructs
 # `AppState.trust_tasks_verifier` directly, so it needs the type to
 # be visible. Kept aligned with the workspace pin in case did-hosting-control
