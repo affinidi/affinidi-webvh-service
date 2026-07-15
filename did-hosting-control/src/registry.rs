@@ -121,6 +121,14 @@ pub struct ServiceInstance {
     #[serde(default)]
     pub trust_task_capable: bool,
 
+    /// When `true`, the control plane may coalesce bulk DID sync updates into
+    /// `MSG_SYNC_BATCH` messages for this server instead of one frame per DID —
+    /// which is what keeps the server's per-frame TSP reply from bursting past
+    /// the mediator's rate limit on a resync. Servers registered before this
+    /// existed default to `false` and keep getting one message per DID.
+    #[serde(default)]
+    pub sync_batch_capable: bool,
+
     // ---- Observed link transport ----
     //
     // What actually moved, per direction — not what `advertised_services`
@@ -460,6 +468,7 @@ mod tests {
             advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
             services_checked_at: Some(1234),
             trust_task_capable: true,
+            sync_batch_capable: true,
             last_inbound_transport: Some(ObservedTransport::Tsp),
             last_inbound_at: Some(1111),
             last_outbound_transport: Some(ObservedTransport::Didcomm),

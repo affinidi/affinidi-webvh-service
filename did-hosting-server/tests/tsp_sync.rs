@@ -17,7 +17,9 @@ use affinidi_messaging_didcomm::Message;
 use affinidi_secrets_resolver::secrets::Secret;
 use did_hosting_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use did_hosting_common::did_ops::{DidRecord, did_key};
-use did_hosting_common::didcomm_types::{MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK};
+use did_hosting_common::didcomm_types::{
+    MSG_SYNC_BATCH, MSG_SYNC_BATCH_ACK, MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK,
+};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
@@ -135,6 +137,104 @@ async fn tsp_sync_update_from_control_plane_is_applied() {
     let stored: Option<DidRecord> = state.dids_ks.get(did_key("alice")).await.unwrap();
     assert!(stored.is_some(), "the synced DID landed in the store");
     assert_eq!(stored.unwrap().version_count, 1);
+}
+
+fn sync_update_entry(mnemonic: &str, did_id: &str, log_content: &str) -> serde_json::Value {
+    json!({
+        "mnemonic": mnemonic,
+        "did_id": did_id,
+        "log_content": log_content,
+        "version_count": 1,
+    })
+}
+
+fn sync_batch_msg(updates: Vec<serde_json::Value>) -> Message {
+    Message::build(
+        uuid::Uuid::new_v4().to_string(),
+        MSG_SYNC_BATCH.to_string(),
+        json!({ "updates": updates }),
+    )
+    .from(CONTROL_DID.to_string())
+    .to(SERVER_DID.to_string())
+    .finalize()
+}
+
+/// A batch of sync-updates from the control plane applies every entry: the
+/// batch ack reports the count and each DID lands in the store. This is the
+/// path that collapses a bulk resync into one transport frame.
+#[tokio::test]
+async fn tsp_sync_batch_from_control_plane_is_applied() {
+    let (state, _dir) = make_state().await;
+    let (alice_id, alice_log) = valid_did_log("alice").await;
+    let (bob_id, bob_log) = valid_did_log("bob").await;
+    let msg = sync_batch_msg(vec![
+        sync_update_entry("alice", &alice_id, &alice_log),
+        sync_update_entry("bob", &bob_id, &bob_log),
+    ]);
+
+    let (resp_type, resp_body) = dispatch_tsp_message(&state, CONTROL_DID, &msg)
+        .await
+        .expect("sync-batch produces a response");
+
+    assert_eq!(resp_type, MSG_SYNC_BATCH_ACK, "batch ack returned");
+    assert_eq!(resp_body["applied"], 2);
+    assert_eq!(resp_body["failed"], 0);
+
+    for m in ["alice", "bob"] {
+        let stored: Option<DidRecord> = state.dids_ks.get(did_key(m)).await.unwrap();
+        assert!(stored.is_some(), "batched DID {m} landed in the store");
+    }
+}
+
+/// A single malformed entry is skipped without stranding the rest of the
+/// batch — best-effort, matching the per-DID path. The good entry applies and
+/// the ack reports one failure.
+#[tokio::test]
+async fn tsp_sync_batch_skips_bad_entry_applies_rest() {
+    let (state, _dir) = make_state().await;
+    let (alice_id, alice_log) = valid_did_log("alice").await;
+    let msg = sync_batch_msg(vec![
+        sync_update_entry("alice", &alice_id, &alice_log),
+        // Missing `mnemonic` — `apply_sync_update_body` rejects it.
+        json!({ "did_id": "did:webvh:x:server.example.com:ghost", "log_content": "{}", "version_count": 1 }),
+    ]);
+
+    let (_resp_type, resp_body) = dispatch_tsp_message(&state, CONTROL_DID, &msg)
+        .await
+        .expect("sync-batch produces a response");
+
+    assert_eq!(resp_body["applied"], 1);
+    assert_eq!(resp_body["failed"], 1);
+
+    let stored: Option<DidRecord> = state.dids_ks.get(did_key("alice")).await.unwrap();
+    assert!(
+        stored.is_some(),
+        "the valid entry applied despite a bad sibling"
+    );
+}
+
+/// A batch from a sender that is NOT the configured control plane is rejected
+/// and applies nothing — the same authorisation the single-update path enforces.
+#[tokio::test]
+async fn tsp_sync_batch_from_unauthorised_sender_is_rejected() {
+    let (state, _dir) = make_state().await;
+    let (mallory_id, mallory_log) = valid_did_log("mallory").await;
+    let msg = sync_batch_msg(vec![sync_update_entry(
+        "mallory",
+        &mallory_id,
+        &mallory_log,
+    )]);
+
+    let (_resp_type, resp_body) = dispatch_tsp_message(&state, "did:web:attacker.example", &msg)
+        .await
+        .expect("a response (problem report) is produced");
+
+    assert_ne!(
+        resp_body["applied"], 1,
+        "an unauthorised batch must not report applied"
+    );
+    let stored: Option<DidRecord> = state.dids_ks.get(did_key("mallory")).await.unwrap();
+    assert!(stored.is_none(), "unauthorised batch applied nothing");
 }
 
 /// A sync-update from a sender that is NOT the configured control plane is

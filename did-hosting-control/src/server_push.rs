@@ -41,10 +41,23 @@ pub fn sync_all_dids_to_server(
     reported: std::collections::HashMap<String, u64>,
 ) {
     let dids_ks = state.dids_ks.clone();
+    let registry_ks = state.registry_ks.clone();
     let store = state.store.clone();
     let notify = state.outbox_notify.clone();
 
     tokio::spawn(async move {
+        // Batch this server's sync only if it advertised the capability at
+        // registration (mirrors `sync_batch_capable`). A resync fires one
+        // transport-level TSP reply per inbound frame; batching many DIDs into
+        // one frame keeps that reply from bursting past the mediator's rate
+        // limit. Servers that didn't advertise it get one message per DID.
+        let instance_id = server_did.replace(':', "_");
+        let batch = crate::registry::get_instance(&registry_ks, &instance_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|inst| inst.sync_batch_capable);
+
         // Iterate all published DIDs
         let raw = match dids_ks.prefix_iter_raw("did:").await {
             Ok(raw) => raw,
@@ -54,7 +67,11 @@ pub fn sync_all_dids_to_server(
             }
         };
 
-        let mut count = 0u64;
+        let mut count = 0u64; // DIDs queued
+        let mut frames = 0u64; // outbox rows (transport frames) enqueued
+        let mut pending: Vec<serde_json::Value> = Vec::new();
+        let mut pending_bytes = 0usize;
+
         for (_key, value) in raw {
             let record: DidRecord = match serde_json::from_slice(&value) {
                 Ok(r) => r,
@@ -101,16 +118,49 @@ pub fn sync_all_dids_to_server(
                 "version_count": record.version_count,
             });
 
-            if let Err(e) = crate::outbox::enqueue(&store, &server_did, MSG_SYNC_UPDATE, body).await
+            if !batch {
+                if let Err(e) =
+                    crate::outbox::enqueue(&store, &server_did, MSG_SYNC_UPDATE, body).await
+                {
+                    warn!(server_did = %server_did, mnemonic = %record.mnemonic, error = %e, "sync_all_dids: outbox enqueue failed");
+                } else {
+                    count += 1;
+                    frames += 1;
+                }
+                continue;
+            }
+
+            // Batched: flush before this entry would breach the count or byte
+            // cap, so a single DID never lands split across two frames.
+            let sz = body.to_string().len();
+            if !pending.is_empty()
+                && (pending.len() >= SYNC_BATCH_MAX_COUNT
+                    || pending_bytes + sz > SYNC_BATCH_MAX_BYTES)
             {
-                warn!(
-                    server_did = %server_did,
-                    mnemonic = %record.mnemonic,
-                    error = %e,
-                    "sync_all_dids: outbox enqueue failed"
-                );
+                let payload = json!({ "updates": std::mem::take(&mut pending) });
+                pending_bytes = 0;
+                if let Err(e) =
+                    crate::outbox::enqueue(&store, &server_did, MSG_SYNC_BATCH, payload).await
+                {
+                    warn!(server_did = %server_did, error = %e, "sync_all_dids: outbox batch enqueue failed");
+                } else {
+                    frames += 1;
+                }
+            }
+            pending_bytes += sz;
+            pending.push(body);
+            count += 1;
+        }
+
+        // Flush the trailing batch.
+        if !pending.is_empty() {
+            let payload = json!({ "updates": pending });
+            if let Err(e) =
+                crate::outbox::enqueue(&store, &server_did, MSG_SYNC_BATCH, payload).await
+            {
+                warn!(server_did = %server_did, error = %e, "sync_all_dids: outbox batch enqueue failed");
             } else {
-                count += 1;
+                frames += 1;
             }
         }
 
@@ -119,11 +169,18 @@ pub fn sync_all_dids_to_server(
             info!(
                 server_did = %server_did,
                 count,
+                frames,
+                batched = batch,
                 "initial DID sync queued for newly registered server"
             );
         }
     });
 }
+
+/// Max DIDs per `MSG_SYNC_BATCH`, and max serialized bytes. Bounds message size
+/// (each DID carries a full `did.jsonl`) while collapsing the resync burst.
+const SYNC_BATCH_MAX_COUNT: usize = 50;
+const SYNC_BATCH_MAX_BYTES: usize = 512 * 1024;
 
 /// Enqueue a DID update to every active server instance.
 ///

@@ -270,6 +270,7 @@ async fn services_overview_exposes_instance_advertised_services() {
         advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
         services_checked_at: Some(now_epoch()),
         trust_task_capable: false,
+        sync_batch_capable: false,
         last_inbound_transport: None,
         last_inbound_at: None,
         last_outbound_transport: None,
