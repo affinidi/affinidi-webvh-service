@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.8.0 (2026-07-15)
+
+The theme of this release is **transport as a first-class, negotiable property
+of every node**. DIDComm, TSP, and HTTPS all carry the same Trust-Task
+documents, each node's **DID document is the authoritative source of how to
+reach it**, and the transport a message actually travelled on is recorded
+rather than assumed.
+
+### Added — Transport-agnostic Trust Tasks (TSP + DIDComm + HTTPS)
+
+- TSP transport alongside DIDComm — everything is a Trust Task (#58), with TSP
+  decoupled from DIDComm: TSP-only transport, a three-way transport selection,
+  and TSP→DIDComm send fallback (#64).
+- Outbound control→server sync push over TSP (#62); server registration and
+  health routed as transport-agnostic Trust Tasks (#70).
+- HTTPS Trust-Task DID-management parity (#60, #31).
+- TSP-only VTA DID template selected for TSP-only nodes (#65).
+- The observed control-plane link transport is recorded and surfaced, distinct
+  from what a document advertises (#71).
+
+### Added — The DID document is authoritative for transport
+
+- Send-transport selection follows an explicit **document → config → fail**
+  precedence; the former blind-DIDComm default is gone (#86).
+- The standalone server advertises its own messaging transports on its DID
+  (#87), and mediator-configured node DIDs **omit the `WebVHHosting` service**
+  entirely — advertising only `TSPTransport` / `DIDCommMessaging` (#88).
+- DID-document services surface as badges across the controller UI (#67), with
+  resolver-implicit `#whois` / `#files` excluded (#68) and the badge cache
+  backfilled on standalone control boot (#69).
+
+### Added — Typed did-hosting DID-management protocol
+
+- Typed `did-hosting/1.0` DID-management Trust-Task protocol — eight operations
+  (#61) — accepting canonical spec URIs for did-management, webvh, and
+  info/list/change-owner/me-domains (#25, #26, #27), converging on canonical
+  URIs only with the alias bridge dropped (#28).
+- Trust-Tasks 0.2 specs with 0.1 back-compat; in-band recipient required on
+  every envelope (#40, #41).
+
+### Added — Service-identity key rotation
+
+- `identity-rotate-keys` rotates the service's own key-agreement key onto a
+  fresh fragment with a working grace period and old-mediator drain (#82, #84).
+
+### Added — Runtime DID management, delegated updates, secret backends
+
+- DID changes are picked up at runtime instead of requiring a restart (#78);
+  a DID document can be edited through the user's agent (#77), and the
+  delegated DID-update path is wired end-to-end (#79).
+- HashiCorp Vault and native Kubernetes Secret store backends (#53).
+- Discover-first daemon online setup with a webvh publication choice (#33); a
+  VTA-provisioned daemon trusts its provisioning VTA to publish (#55); DID-path
+  folding unified through one shared provision-ask builder (#34).
+
+### Fixed
+
+- Identity rotation: importing keys no longer destroys a live rotation's grace
+  period (#83), and a kid-reusing rotation is no longer misreported as
+  "unchanged" (#81).
+- A root DID must not carry `.well-known` in its identifier (#80); the root DID
+  registers correctly at the `.well-known` slot (#72).
+- Proxy-login / SIOP: camelCase `secretKind` on `vault/list` (#85), runtime RP
+  DID resolution (#51), session-key proofs without an in-band issuer (#44),
+  canonical camelCase log/owner wire fields (#39), and assorted demo fixes
+  (#17, #18, #19, #20, #23).
+- `host:port` domains resolve consistently end-to-end (#24); did:webvh host
+  authority is percent-decoded before domain validation (#56); `check-name`
+  probe/reserve/auto-assign contract implemented (#38).
+- CI and advisory maintenance (#43, #48, #49, #54, #73).
+
+### Dependencies
+
+- Aligned to `vti-common` 0.11.5 / `vta-sdk` 0.19 (#74) and refreshed the
+  lockfile to the latest compatible releases — `affinidi-messaging-*`,
+  `google-cloud-*`, `http-body(-util)`, `rustls`, `redis`, `jsonpath-rust`.
+
+### Versions
+
+- Workspace crates `0.7.0` → `0.8.0`; `did-hosting-client` `0.1.0` → `0.1.1`;
+  `did-hosting-ui` `1.0.0` → `1.1.0`.
+
 ## 0.7.0 (2026-05-24)
 
 ### Added — Trust Tasks framework adoption
