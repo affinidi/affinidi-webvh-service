@@ -445,10 +445,12 @@ async fn keyspaces_are_isolated() {
     // Removing from one keyspace does not affect the other.
     dids.remove("k1").await.expect("remove dids");
     assert!(!dids.contains_key("k1").await.expect("contains dids"));
-    assert!(sessions
-        .contains_key("k1")
-        .await
-        .expect("contains sessions"));
+    assert!(
+        sessions
+            .contains_key("k1")
+            .await
+            .expect("contains sessions")
+    );
 
     delete_test_table(&client, &table).await;
 }
@@ -589,10 +591,7 @@ async fn large_value_round_trip() {
         .await
         .expect("insert big");
 
-    let got = ks
-        .get_raw("content:bigdid:log")
-        .await
-        .expect("get big");
+    let got = ks.get_raw("content:bigdid:log").await.expect("get big");
     assert_eq!(got, Some(big_value));
 
     delete_test_table(&client, &table).await;
