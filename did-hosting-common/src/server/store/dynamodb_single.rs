@@ -42,9 +42,7 @@ use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{
-    AttributeValue, Delete, Put, ReturnValue, TransactWriteItem,
-};
+use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, ReturnValue, TransactWriteItem};
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -254,10 +252,7 @@ impl KeyspaceOps for SingleTableKeyspace {
                     .client
                     .query()
                     .table_name(&self.table_name)
-                    .expression_attribute_values(
-                        ":ks",
-                        AttributeValue::S(self.keyspace.clone()),
-                    );
+                    .expression_attribute_values(":ks", AttributeValue::S(self.keyspace.clone()));
 
                 if let Some(ref p) = prefix_str {
                     req = req
@@ -465,10 +460,7 @@ mod tests {
         // Missing sk (invalid — shouldn't happen with our schema, but
         // extract_pairs must not panic).
         let missing_sk = HashMap::from([
-            (
-                PK_ATTR.to_string(),
-                AttributeValue::S("dids".to_string()),
-            ),
+            (PK_ATTR.to_string(), AttributeValue::S("dids".to_string())),
             (
                 VAL_ATTR.to_string(),
                 AttributeValue::B(Blob::new(b"v".to_vec())),
