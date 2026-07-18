@@ -330,14 +330,35 @@ export default function DidDetail() {
   // The re-submit is idempotent: it re-sends the *pinned* `proposed` document, so
   // its digest matches the outstanding approval, and before the grant exists the
   // VTA simply returns `consentRequired` again (reusing the pending — the approver
-  // is not re-notified). So we can safely re-attempt on a timer until the grant is
-  // minted by the approver's signed decision — same browser or another device —
-  // and then it publishes on its own. The manual button stays as an override.
+  // is not re-notified). So re-attempting whenever the grant *might* be ready is
+  // safe, and on the grant it publishes on its own. The manual button is an
+  // override.
+  //
+  // Primary path is event-driven: the wallet emits `vtawallet:consentgranted`
+  // (with the payloadDigest) the instant the VTA reports the grant, so we
+  // re-attempt immediately with no polling latency. The timer below is only a
+  // slow fallback for a missed event or an older wallet/VTA that doesn't emit it.
   const [autoApplying, setAutoApplying] = useState(false);
   const attemptRef = useRef(handlePublishViaVta);
   attemptRef.current = handlePublishViaVta;
   const proposedRef = useRef(proposed);
   proposedRef.current = proposed;
+
+  // Event-driven: re-attempt the instant the wallet reports our approval landed.
+  useEffect(() => {
+    const digest = consent?.payloadDigest;
+    if (!digest || typeof window === "undefined" || !window.addEventListener) return;
+    const onGranted = (ev: Event) => {
+      const detail = (ev as CustomEvent).detail as { payloadDigest?: string } | undefined;
+      // Only the approval we're waiting on — ignore events for other tasks.
+      if (detail?.payloadDigest !== digest) return;
+      const pinned = proposedRef.current;
+      if (pinned) void attemptRef.current(pinned, { silent: true });
+    };
+    window.addEventListener("vtawallet:consentgranted", onGranted);
+    return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consent?.payloadDigest]);
 
   useEffect(() => {
     if (!consent || !proposed) {
@@ -347,8 +368,8 @@ export default function DidDetail() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
-    const INTERVAL_MS = 3000;
-    const MAX_ATTEMPTS = 100; // ~5 min ceiling; the pending's own TTL is the real bound.
+    const INTERVAL_MS = 15000; // slow fallback — the event drives the fast path.
+    const MAX_ATTEMPTS = 20; // ~5 min ceiling; the pending's own TTL is the real bound.
 
     const tick = async () => {
       if (cancelled) return;
