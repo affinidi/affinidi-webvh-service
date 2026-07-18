@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -260,11 +260,22 @@ export default function DidDetail() {
    * and which we could not have told the user about if we tried — and then
    * decides, per the user's policy, whether a human has to approve it.
    */
-  const handlePublishViaVta = async (retryOf?: Record<string, unknown>) => {
+  // Result of one publish attempt, so the auto-apply poll can decide whether to
+  // keep waiting (`consent`), stop on success (`accepted`), or back off (`error`).
+  type PublishResult = "accepted" | "consent" | "error";
+
+  // `opts.silent` is the background poll: it suppresses the toast and the
+  // `publishing` spinner (so the button doesn't flicker "Checking…" on every
+  // tick) but still resolves the approval — a granted update is always announced.
+  const handlePublishViaVta = async (
+    retryOf?: Record<string, unknown>,
+    opts?: { silent?: boolean },
+  ): Promise<PublishResult> => {
+    const silent = opts?.silent ?? false;
     const didId = didDetail?.didId;
     if (!didId) {
-      showAlert("Error", "This DID has no published identifier yet.");
-      return;
+      if (!silent) showAlert("Error", "This DID has no published identifier yet.");
+      return "error";
     }
 
     let document: Record<string, unknown>;
@@ -274,8 +285,8 @@ export default function DidDetail() {
       try {
         document = JSON.parse(docEditValue) as Record<string, unknown>;
       } catch {
-        showAlert("Error", "The document is not valid JSON.");
-        return;
+        if (!silent) showAlert("Error", "The document is not valid JSON.");
+        return "error";
       }
     }
 
@@ -286,7 +297,7 @@ export default function DidDetail() {
     const latest = logEntries[logEntries.length - 1];
     const expectedVersionId = latest?.versionId ?? undefined;
 
-    setPublishing(true);
+    if (!silent) setPublishing(true);
     try {
       const outcome = await requestDidUpdate({
         did: didId,
@@ -297,7 +308,7 @@ export default function DidDetail() {
       if (outcome.kind === "consentRequired") {
         setProposed(document);
         setConsent(outcome);
-        return;
+        return "consent";
       }
 
       setConsent(null);
@@ -305,12 +316,66 @@ export default function DidDetail() {
       setEditingDoc(false);
       showAlert("Published", "Your agent signed and published the update.");
       loadData();
+      return "accepted";
     } catch (e: unknown) {
-      showAlert("Error", e instanceof Error ? e.message : "The update failed.");
+      if (!silent) showAlert("Error", e instanceof Error ? e.message : "The update failed.");
+      return "error";
     } finally {
-      setPublishing(false);
+      if (!silent) setPublishing(false);
     }
   };
+
+  // ── Auto-apply: publish the moment the approval lands ──────────────────────
+  //
+  // The re-submit is idempotent: it re-sends the *pinned* `proposed` document, so
+  // its digest matches the outstanding approval, and before the grant exists the
+  // VTA simply returns `consentRequired` again (reusing the pending — the approver
+  // is not re-notified). So we can safely re-attempt on a timer until the grant is
+  // minted by the approver's signed decision — same browser or another device —
+  // and then it publishes on its own. The manual button stays as an override.
+  const [autoApplying, setAutoApplying] = useState(false);
+  const attemptRef = useRef(handlePublishViaVta);
+  attemptRef.current = handlePublishViaVta;
+  const proposedRef = useRef(proposed);
+  proposedRef.current = proposed;
+
+  useEffect(() => {
+    if (!consent || !proposed) {
+      setAutoApplying(false);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const INTERVAL_MS = 3000;
+    const MAX_ATTEMPTS = 100; // ~5 min ceiling; the pending's own TTL is the real bound.
+
+    const tick = async () => {
+      if (cancelled) return;
+      attempts += 1;
+      const pinned = proposedRef.current;
+      const result = pinned ? await attemptRef.current(pinned, { silent: true }) : "error";
+      if (cancelled) return;
+      // `accepted` clears `consent`, which re-runs this effect and tears the loop
+      // down. `error` is transient (backoff) — keep trying within the ceiling.
+      if (result === "accepted" || attempts >= MAX_ATTEMPTS) {
+        if (attempts >= MAX_ATTEMPTS) setAutoApplying(false);
+        return;
+      }
+      timer = setTimeout(() => void tick(), INTERVAL_MS);
+    };
+
+    setAutoApplying(true);
+    timer = setTimeout(() => void tick(), INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      setAutoApplying(false);
+    };
+    // Keyed on the digest (stable while the same approval is outstanding) so a
+    // silent re-`setConsent` of the same request never restarts the loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consent?.payloadDigest]);
 
   const handleToggleDocEdit = () => {
     if (!editingDoc && logEntries[selectedVersion]?.state) {
@@ -714,13 +779,23 @@ export default function DidDetail() {
                       If the codes differ, deny it. A code that does not match means the
                       change your device is showing you is not the change that would be made.
                     </Text>
+                    {autoApplying && (
+                      <Text style={[styles.hint, { textAlign: "center" }]}>
+                        Waiting for your approval — this will publish automatically the
+                        moment you approve.
+                      </Text>
+                    )}
                     <Pressable
                       style={[styles.outlineButton, publishing && styles.disabled]}
                       onPress={() => void handlePublishViaVta(proposed ?? undefined)}
                       disabled={publishing}
                     >
                       <Text style={styles.outlineButtonText}>
-                        {publishing ? "Checking..." : "I have approved it — publish"}
+                        {publishing
+                          ? "Checking..."
+                          : autoApplying
+                            ? "Publish now"
+                            : "I have approved it — publish"}
                       </Text>
                     </Pressable>
                   </View>
