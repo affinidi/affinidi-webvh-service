@@ -327,18 +327,20 @@ export default function DidDetail() {
 
   // ── Auto-apply: publish the moment the approval lands ──────────────────────
   //
-  // The re-submit is idempotent: it re-sends the *pinned* `proposed` document, so
-  // its digest matches the outstanding approval, and before the grant exists the
-  // VTA simply returns `consentRequired` again (reusing the pending — the approver
-  // is not re-notified). So re-attempting whenever the grant *might* be ready is
-  // safe, and on the grant it publishes on its own. The manual button is an
-  // override.
+  // Event-driven only. The wallet emits `vtawallet:consentgranted` (with the
+  // payloadDigest) the instant the VTA reports the grant, and we re-submit the
+  // *pinned* `proposed` document exactly once — its digest matches the
+  // outstanding approval, so the VTA applies it. The manual button is the
+  // fallback for a missed event.
   //
-  // Primary path is event-driven: the wallet emits `vtawallet:consentgranted`
-  // (with the payloadDigest) the instant the VTA reports the grant, so we
-  // re-attempt immediately with no polling latency. The timer below is only a
-  // slow fallback for a missed event or an older wallet/VTA that doesn't emit it.
-  const [autoApplying, setAutoApplying] = useState(false);
+  // There is deliberately NO timer poll. Every re-submit goes through the
+  // wallet's `requestTask`, which shows an un-skippable worker-mode confirm
+  // ("send this request to your VTA"). A blind re-submit loop therefore
+  // re-opens that popup on every tick — the poll that used to live here did
+  // exactly that, popping a fresh confirmation every 15s the whole time we were
+  // waiting for the approver. A single re-submit on the grant event is the only
+  // safe re-attempt; anything periodic must not go through `requestTask`.
+  const autoApplying = Boolean(consent && proposed);
   const attemptRef = useRef(handlePublishViaVta);
   attemptRef.current = handlePublishViaVta;
   const proposedRef = useRef(proposed);
@@ -357,44 +359,6 @@ export default function DidDetail() {
     };
     window.addEventListener("vtawallet:consentgranted", onGranted);
     return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [consent?.payloadDigest]);
-
-  useEffect(() => {
-    if (!consent || !proposed) {
-      setAutoApplying(false);
-      return;
-    }
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let attempts = 0;
-    const INTERVAL_MS = 15000; // slow fallback — the event drives the fast path.
-    const MAX_ATTEMPTS = 20; // ~5 min ceiling; the pending's own TTL is the real bound.
-
-    const tick = async () => {
-      if (cancelled) return;
-      attempts += 1;
-      const pinned = proposedRef.current;
-      const result = pinned ? await attemptRef.current(pinned, { silent: true }) : "error";
-      if (cancelled) return;
-      // `accepted` clears `consent`, which re-runs this effect and tears the loop
-      // down. `error` is transient (backoff) — keep trying within the ceiling.
-      if (result === "accepted" || attempts >= MAX_ATTEMPTS) {
-        if (attempts >= MAX_ATTEMPTS) setAutoApplying(false);
-        return;
-      }
-      timer = setTimeout(() => void tick(), INTERVAL_MS);
-    };
-
-    setAutoApplying(true);
-    timer = setTimeout(() => void tick(), INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-      setAutoApplying(false);
-    };
-    // Keyed on the digest (stable while the same approval is outstanding) so a
-    // silent re-`setConsent` of the same request never restarts the loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consent?.payloadDigest]);
 
