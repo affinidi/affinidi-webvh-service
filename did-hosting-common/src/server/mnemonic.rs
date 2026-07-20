@@ -99,3 +99,50 @@ pub fn validate_mnemonic(mnemonic: &str) -> Result<(), AppError> {
     }
     validate_custom_path(mnemonic)
 }
+
+/// Agent names nobody may claim.
+///
+/// Distinct from [`RESERVED_NAMES`], which protects *route* prefixes. These
+/// protect **trust**: `@support`, `@security` and `@admin` are what a victim
+/// would expect to belong to the operator, so letting a tenant register them
+/// hands over a ready-made phishing primitive. `@well-known` is reserved
+/// because it looks like infrastructure.
+const RESERVED_AGENT_NAMES: &[&str] = &[
+    "abuse",
+    "admin",
+    "administrator",
+    "api",
+    "help",
+    "hostmaster",
+    "info",
+    "postmaster",
+    "root",
+    "security",
+    "support",
+    "sysadmin",
+    "webmaster",
+    "well-known",
+];
+
+/// Validate an agent name's local part — the `alice` in `/@alice`.
+///
+/// Deliberately the same grammar as a path segment (2–63 chars, `[a-z0-9-]`,
+/// alphanumeric at both ends) so a name can never be ambiguous with, or
+/// confusable against, a hosted DID's mnemonic.
+///
+/// Note the charset makes collision with a mnemonic route structurally
+/// impossible in the other direction too: `@` is not a legal mnemonic
+/// character, so `/@alice` can never shadow a hosted DID path.
+pub fn validate_agent_name(name: &str) -> Result<(), AppError> {
+    let name = name.strip_prefix('@').unwrap_or(name);
+
+    validate_segment(name)?;
+
+    if RESERVED_AGENT_NAMES.contains(&name) {
+        return Err(path_err(format!(
+            "'{name}' is a reserved agent name and cannot be registered"
+        )));
+    }
+
+    Ok(())
+}

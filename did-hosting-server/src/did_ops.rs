@@ -271,6 +271,7 @@ pub async fn create_did(
 
         // Empty slot — no log yet, so no document to read services from.
         services: None,
+        agent_names: Vec::new(),
     };
 
     let mut batch = state.store.batch();

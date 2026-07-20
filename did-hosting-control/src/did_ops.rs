@@ -280,6 +280,7 @@ pub async fn create_did(
         // An empty slot — no log, so no document to read services from.
         // `publish_did` fills this on first upload.
         services: None,
+        agent_names: Vec::new(),
     };
 
     let mut batch = state.store.batch();
@@ -459,6 +460,22 @@ pub async fn register_did_atomic(
         domain: String::new(),
 
         services: extract_service_types(did_log),
+
+        // Carried over, not defaulted. This path also re-registers an
+        // EXISTING slot, where `Vec::new()` would silently drop every name
+        // bound to it.
+        //
+        // Control keeps the authoritative registry rather than deriving from
+        // the log, because a *disabled* name is deliberately absent from
+        // `alsoKnownAs` — it is parked, not claimed — so the log cannot
+        // express the reservation. The edge derives instead (see
+        // `control_register::apply_single_update`), which is what makes an
+        // edge structurally unable to serve a name the document does not
+        // claim.
+        agent_names: existing
+            .as_ref()
+            .map(|r| r.agent_names.clone())
+            .unwrap_or_default(),
     };
 
     // 4. Single-batch atomic write: record, log content, owner index;

@@ -15,14 +15,15 @@ use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use did_hosting_common::DidSyncUpdate;
 use did_hosting_common::did_ops::{
-    DidRecord, content_log_key, content_witness_key, did_key, extract_service_types, owner_key,
-    validate_did_jsonl,
+    AgentNameEntry, DidRecord, agent_name_key, content_log_key, content_witness_key, did_key,
+    extract_agent_names, extract_service_types, owner_key, validate_did_jsonl,
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
 use did_hosting_common::server::didcomm_profile::{
     PeerTransport, TransportFallback, resolve_transport,
 };
+use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use did_hosting_common::server::trust_tasks::send::{
     Retry, build_request, send_trust_task_with_retry,
@@ -307,6 +308,15 @@ pub async fn apply_single_update(
     validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
 
     let now = now_epoch();
+
+    // Agent names are scoped to the hosting domain, and the DID identifier is
+    // where that domain is authoritative — `extract_did_host` percent-decodes
+    // the authority (`localhost%3A8534` -> `localhost:8534`) so it matches the
+    // form a name carries. An unparseable identifier yields no names rather
+    // than failing the sync: a DID we cannot parse is one we should not be
+    // serving names for anyway.
+    let did_host = extract_did_host(&update.did_id).unwrap_or_default();
+
     let record = DidRecord {
         owner: "system".to_string(),
         mnemonic: update.mnemonic.clone(),
@@ -326,10 +336,50 @@ pub async fn apply_single_update(
         // plane to send a services list — the log is the authority, and
         // this keeps the edge node's badges consistent with what it serves.
         services: extract_service_types(&update.log_content),
+
+        // Same argument, and here it carries security weight: agent names
+        // come from the signed document's `alsoKnownAs`, never from the
+        // push. An edge therefore *cannot* serve a name the DID does not
+        // claim, so the agent-name specification's Layer-1 rule holds by
+        // construction rather than by remembering to check it — even if the
+        // control plane is compromised or buggy.
+        //
+        // A name absent from the new log is absent here, which is what makes
+        // the stale-index cleanup below correct.
+        agent_names: extract_agent_names(&update.log_content, &did_host)
+            .into_iter()
+            .map(|name| AgentNameEntry {
+                name,
+                enabled: true,
+                created_at: now,
+            })
+            .collect(),
     };
+
+    // Read the record we are replacing so stale name-index entries can be
+    // retired in the same batch. Without this, a name removed from
+    // `alsoKnownAs` would keep resolving from a leftover index entry — the
+    // document would stop claiming it while the edge kept serving it, which is
+    // precisely the state Layer-1 exists to prevent.
+    let previous: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await.ok().flatten();
 
     let mut batch = store.batch();
     batch.insert(dids_ks, did_key(&update.mnemonic), &record)?;
+
+    if let Some(prev) = previous.as_ref() {
+        for old in &prev.agent_names {
+            if !record.agent_names.iter().any(|n| n.name == old.name) {
+                batch.remove(dids_ks, agent_name_key(&did_host, &old.name));
+            }
+        }
+    }
+    for entry in &record.agent_names {
+        batch.insert_raw(
+            dids_ks,
+            agent_name_key(&did_host, &entry.name),
+            update.mnemonic.as_bytes().to_vec(),
+        );
+    }
     batch.insert_raw(
         dids_ks,
         content_log_key(&update.mnemonic),

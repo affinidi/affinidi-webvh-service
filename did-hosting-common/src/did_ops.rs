@@ -88,6 +88,42 @@ pub struct DidRecord {
     /// deferred still converges.
     #[serde(default)]
     pub services: Option<Vec<String>>,
+
+    /// Agent names (`/@alice`) that resolve to this DID.
+    ///
+    /// A DID may carry several — the agent name specification does not limit a
+    /// subject to one, and a deployment may want a personal name plus
+    /// role-scoped ones.
+    ///
+    /// `#[serde(default)]` so records written before this field existed
+    /// deserialise unchanged; an empty vec and a missing field are the same
+    /// thing, so no migration is needed.
+    ///
+    /// The authoritative name→DID lookup is the `name:{domain}:{name}` index,
+    /// not this list. This is the forward view, kept in the same write batch as
+    /// the index so the two cannot drift.
+    #[serde(default)]
+    pub agent_names: Vec<AgentNameEntry>,
+}
+
+/// One agent name bound to a hosted DID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameEntry {
+    /// The name's local part, without the `@` — `alice` for `/@alice`.
+    ///
+    /// Stored bare rather than as a full URL because the domain is already on
+    /// the record, and a name is only meaningful within its domain.
+    pub name: String,
+
+    /// Whether the name currently resolves.
+    ///
+    /// Disabling stops the redirect but **keeps the name reserved**, so nobody
+    /// else can claim it while it is parked. Removing is what releases it.
+    pub enabled: bool,
+
+    /// When the name was first bound to this DID.
+    pub created_at: u64,
 }
 
 fn default_method() -> String {
@@ -142,6 +178,18 @@ pub fn content_witness_key(mnemonic: &str) -> String {
 
 pub fn owner_key(did: &str, mnemonic: &str) -> String {
     format!("owner:{did}:{mnemonic}")
+}
+
+/// Reverse index: an agent name resolves to the mnemonic that owns it.
+///
+/// Scoped by domain because this service is multi-domain — `@alice` on one
+/// hosted domain is a different name from `@alice` on another, and they must be
+/// claimable independently.
+///
+/// Mirrors the `owner:` reverse-index pattern; written in the same batch as the
+/// `DidRecord` so the index and `DidRecord::agent_names` cannot diverge.
+pub fn agent_name_key(domain: &str, name: &str) -> String {
+    format!("name:{domain}:{name}")
 }
 
 pub fn watcher_sync_key(mnemonic: &str) -> String {
@@ -340,6 +388,55 @@ pub fn extract_service_types(jsonl_content: &str) -> Option<Vec<String>> {
     Some(crate::did::service_types_from_doc(state))
 }
 
+/// Extract the agent names a DID document claims, for a given hosting domain.
+///
+/// Reads `alsoKnownAs` from the latest log entry's document state and keeps the
+/// entries that are agent names (`/@…`) on `domain`.
+///
+/// # Why derive rather than track separately
+///
+/// The log is signed; `alsoKnownAs` is inside the signed document. Deriving the
+/// resolvable set from it means a node **structurally cannot** serve a name the
+/// DID does not claim — the agent-name specification's Layer-1 anti-spoofing
+/// rule holds by construction rather than by remembering to check it. It is the
+/// same reasoning that makes [`extract_service_types`] read the log instead of
+/// trusting a pushed list.
+///
+/// Canonicalisation goes through the `agent-names` crate so the name derived
+/// here is byte-identical to the one a resolver will compare against
+/// `alsoKnownAs`. Re-implementing that normalisation is how the two sides drift
+/// and every name silently fails to verify.
+pub fn extract_agent_names(jsonl_content: &str, domain: &str) -> Vec<String> {
+    let Some(last_line) = jsonl_content.lines().rfind(|l| !l.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(last_line) else {
+        return Vec::new();
+    };
+    let Some(entries) = value
+        .get("state")
+        .and_then(|s| s.get("alsoKnownAs"))
+        .and_then(|a| a.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+    for entry in entries.iter().filter_map(|e| e.as_str()) {
+        let Ok(parsed) = agent_names::AgentName::parse(entry) else {
+            continue; // not an agent name — alsoKnownAs legitimately holds other URIs
+        };
+        if parsed.authority() != domain {
+            continue; // a name on somebody else's domain; not ours to serve
+        }
+        let local = parsed.local_name().to_string();
+        if !names.contains(&local) {
+            names.push(local);
+        }
+    }
+    names
+}
+
 /// Parse JSONL content and extract metadata from the log entries.
 pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
     let lines: Vec<&str> = jsonl_content.lines().collect();
@@ -519,6 +616,7 @@ mod tests {
             method: "web".into(),
             domain: "tenant-a.example.com".into(),
             services: None,
+            agent_names: Vec::new(),
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: DidRecord = serde_json::from_str(&json).unwrap();

@@ -144,6 +144,7 @@ pub async fn bootstrap_did(
         // DIDComm per `advertise_tsp` / `mediator_did` above) are exactly
         // what `build_did_document` just wrote into the doc.
         services: extract_service_types(&jsonl),
+        agent_names: Vec::new(),
     };
 
     let mut batch = store.batch();
@@ -249,6 +250,8 @@ pub async fn import_did_at_path(
         domain: String::new(),
 
         services: extract_service_types(jsonl),
+
+        agent_names: Vec::new(),
     };
 
     let mut batch = store.batch();

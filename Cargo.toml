@@ -112,6 +112,10 @@ reqwest = { version = "0.13", features = ["json"] }
 anyhow = "1"
 
 # DID WebVH
+# Agent names (DID shortcuts) — parsing, canonicalisation and the
+# alsoKnownAs verification rule. Shared with the resolver side so both
+# normalise identically.
+agent-names = "0.1.2"
 didwebvh-rs = "0.5"
 
 # VTA SDK — 0.19 on crates.io, bumped in lockstep with vti-common 0.11.4
