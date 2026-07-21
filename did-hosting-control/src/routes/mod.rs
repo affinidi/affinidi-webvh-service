@@ -113,6 +113,30 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(did_manage::register_did),
             (*TASK_DID_REGISTER_1_0).clone(),
         )
+        // Agent-name mutations carry the new signed did.jsonl in the body, so
+        // they share the register/publish body ceiling. set/enable require the
+        // owner (or admin); remove/disable additionally require aal2 step-up,
+        // enforced by the `StepUpAuth` extractor in the handlers.
+        .route_with_task_permissive(
+            "/agent-names/set",
+            post(did_manage::set_agent_name),
+            (*TASK_AGENT_NAME_SET_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/agent-names/enable",
+            post(did_manage::enable_agent_name),
+            (*TASK_AGENT_NAME_ENABLE_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/agent-names/remove",
+            post(did_manage::remove_agent_name),
+            (*TASK_AGENT_NAME_REMOVE_1_0).clone(),
+        )
+        .route_with_task_permissive(
+            "/agent-names/disable",
+            post(did_manage::disable_agent_name),
+            (*TASK_AGENT_NAME_DISABLE_1_0).clone(),
+        )
         .into_router()
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
 
@@ -261,6 +285,13 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/dids/check",
             post(did_manage::check_name),
             (*TASK_DID_CHECK_NAME_1_0).clone(),
+        )
+        // Agent-name availability probe (read-only; the mutating verbs carry
+        // a did.jsonl and live in `upload_routes` under the larger body limit).
+        .route_with_task_permissive(
+            "/agent-names/check",
+            post(did_manage::check_agent_name),
+            (*TASK_AGENT_NAME_CHECK_1_0).clone(),
         )
         .route_with_task_permissive(
             "/dids",

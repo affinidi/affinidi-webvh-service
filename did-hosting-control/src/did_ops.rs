@@ -1379,6 +1379,50 @@ pub async fn check_name(state: &AppState, path: &str) -> Result<CheckNameRespons
     })
 }
 
+/// Availability of an agent name on a hosting domain.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameAvailability {
+    pub name: String,
+    pub domain: String,
+    /// Free to claim: neither reserved nor already bound on this domain.
+    pub available: bool,
+    /// On the host's reserved list (`@admin`, `@support`, …) — unavailable but
+    /// a well-formed name, distinct from a grammar error (which is a 400).
+    pub reserved: bool,
+}
+
+/// Check whether an agent name can be claimed on `domain`.
+///
+/// A reserved name is reported as `available: false, reserved: true` rather
+/// than an error, so a UI can explain *why*; a grammatically invalid name is a
+/// client error (`AppError::Validation`). Availability is domain-scoped: the
+/// same name may be free on one domain and taken on another.
+pub async fn check_agent_name(
+    state: &AppState,
+    domain: &str,
+    name: &str,
+) -> Result<AgentNameAvailability, AppError> {
+    let bare = name.strip_prefix('@').unwrap_or(name).to_string();
+    let reserved = match validate_agent_name(&bare) {
+        Ok(()) => false,
+        Err(AppError::AgentName(AgentNameError::Reserved)) => true,
+        // A malformed name (bad grammar) is a client error, not "unavailable".
+        Err(e) => return Err(e),
+    };
+    let taken = state
+        .dids_ks
+        .get_raw(agent_name_key(domain, &bare))
+        .await?
+        .is_some();
+    Ok(AgentNameAvailability {
+        available: !reserved && !taken,
+        reserved,
+        name: bare,
+        domain: domain.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests for register_did_atomic, publish_did stats counters, etc.
 // ---------------------------------------------------------------------------
@@ -3051,5 +3095,45 @@ mod tests_atomic {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::AgentName(AgentNameError::NotFound)));
+    }
+
+    /// Availability check: reserved → unavailable+reserved; free → available;
+    /// bound → unavailable; malformed → error.
+    #[tokio::test]
+    async fn check_agent_name_reports_availability() {
+        let (state, _dir) = test_state().await;
+
+        // A reserved name is unavailable but flagged reserved (not an error).
+        let r = check_agent_name(&state, "control.test", "admin")
+            .await
+            .unwrap();
+        assert!(!r.available && r.reserved);
+
+        // A free, well-formed name is available.
+        let r = check_agent_name(&state, "control.test", "alice")
+            .await
+            .unwrap();
+        assert!(r.available && !r.reserved);
+
+        // Once bound, it is no longer available (and not reserved).
+        let owner = "did:example:owner";
+        register_owned(&state, owner, "slot-chk").await;
+        let log = build_test_did_log_with_names("control.test", "slot-chk", &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, "slot-chk", "alice", &log, None)
+            .await
+            .unwrap();
+        let r = check_agent_name(&state, "control.test", "alice")
+            .await
+            .unwrap();
+        assert!(!r.available && !r.reserved);
+
+        // A different domain is unaffected — availability is domain-scoped.
+        let r = check_agent_name(&state, "other.test", "alice")
+            .await
+            .unwrap();
+        assert!(r.available);
+
+        // A grammatically invalid name is a client error, not "unavailable".
+        assert!(check_agent_name(&state, "control.test", "a").await.is_err());
     }
 }

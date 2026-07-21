@@ -482,6 +482,26 @@ pub static TASK_DID_RAW_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/did/raw-log/1.0").expect("static")
 });
 
+// Agent names — bind/release/park/resume a human-memorable `/@name` on a
+// hosted DID. The DIDComm/TSP-paired framework payloads live in
+// `did-hosting-control::trust_tasks_did`; these are the REST-surface task
+// identifiers.
+pub static TASK_AGENT_NAME_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/check/1.0").expect("static")
+});
+pub static TASK_AGENT_NAME_SET_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/set/1.0").expect("static")
+});
+pub static TASK_AGENT_NAME_REMOVE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/remove/1.0").expect("static")
+});
+pub static TASK_AGENT_NAME_ENABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/enable/1.0").expect("static")
+});
+pub static TASK_AGENT_NAME_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/disable/1.0").expect("static")
+});
+
 // Observability / config.
 pub static TASK_STATS_SERVER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/stats/server/1.0").expect("static")
@@ -695,6 +715,11 @@ mod tests {
             &TASK_DID_ENABLE_1_0,
             &TASK_DID_ROLLBACK_1_0,
             &TASK_DID_RAW_LOG_1_0,
+            &TASK_AGENT_NAME_CHECK_1_0,
+            &TASK_AGENT_NAME_SET_1_0,
+            &TASK_AGENT_NAME_REMOVE_1_0,
+            &TASK_AGENT_NAME_ENABLE_1_0,
+            &TASK_AGENT_NAME_DISABLE_1_0,
             &TASK_STATS_SERVER_1_0,
             &TASK_STATS_DID_1_0,
             &TASK_TIMESERIES_SERVER_1_0,

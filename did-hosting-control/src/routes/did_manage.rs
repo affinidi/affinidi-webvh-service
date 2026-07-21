@@ -2,7 +2,7 @@
 //!
 //! These routes match what the UI expects (from `did-hosting-ui/lib/api.ts`).
 
-use crate::auth::{AdminAuth, AuthClaims};
+use crate::auth::{AdminAuth, AuthClaims, StepUpAuth};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -46,6 +46,171 @@ pub async fn check_name(
 ) -> Result<Json<CheckNameResponse>, AppError> {
     let result = did_ops::check_name(&state, &req.path).await?;
     info!(did = %auth.did, path = %req.path, available = result.available, "name availability checked");
+    Ok(Json(result))
+}
+
+// ---------- Agent names (/api/agent-names/*) ----------
+
+/// Body shared by the mutating agent-name verbs. `didLog` is the new signed
+/// `did.jsonl` whose `alsoKnownAs` the op verifies (the spec's `didData`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameRequest {
+    pub mnemonic: String,
+    pub name: String,
+    pub did_log: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Body for the availability probe.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameCheckRequest {
+    pub name: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// The `{record}` response shared by the mutating verbs — the DID record in
+/// its spec projection, identical to the Trust-Task surface's response.
+fn agent_name_record_response(
+    state: &AppState,
+    record: &did_hosting_common::did_ops::DidRecord,
+) -> serde_json::Value {
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let did_url = format!(
+        "{}/{}/did.jsonl",
+        base_url.trim_end_matches('/'),
+        record.mnemonic
+    );
+    serde_json::json!({ "record": crate::messaging::spec_did_record_json(record, &did_url) })
+}
+
+/// `POST /api/agent-names/set` — bind or refresh a name (owner or admin).
+pub async fn set_agent_name(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = did_ops::set_agent_name(
+        &auth,
+        &state,
+        &req.mnemonic,
+        &req.name,
+        &req.did_log,
+        req.domain.as_deref(),
+    )
+    .await?;
+    server_push::notify_servers_did(&state, req.mnemonic.clone());
+    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name set via REST");
+    Ok(Json(agent_name_record_response(&state, &record)))
+}
+
+/// `POST /api/agent-names/enable` — resume a parked name (owner or admin).
+pub async fn enable_agent_name(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = did_ops::enable_agent_name(
+        &auth,
+        &state,
+        &req.mnemonic,
+        &req.name,
+        &req.did_log,
+        req.domain.as_deref(),
+    )
+    .await?;
+    server_push::notify_servers_did(&state, req.mnemonic.clone());
+    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name enabled via REST");
+    Ok(Json(agent_name_record_response(&state, &record)))
+}
+
+/// `POST /api/agent-names/remove` — release a name (destructive).
+///
+/// Gated on `StepUpAuth` (aal2): releasing a name frees it for anyone to
+/// reclaim, so a consumer must have stepped up. This is where the spec's
+/// `step_up_required` requirement is enforced (the Trust-Task path carries no
+/// assurance level; REST does).
+pub async fn remove_agent_name(
+    auth: StepUpAuth,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = did_ops::remove_agent_name(
+        &auth.0,
+        &state,
+        &req.mnemonic,
+        &req.name,
+        &req.did_log,
+        req.domain.as_deref(),
+    )
+    .await?;
+    server_push::notify_servers_did(&state, req.mnemonic.clone());
+    info!(did = %auth.0.did, mnemonic = %req.mnemonic, name = %req.name, "agent name removed via REST");
+    Ok(Json(agent_name_record_response(&state, &record)))
+}
+
+/// `POST /api/agent-names/disable` — park a name (kept reserved). Gated on
+/// `StepUpAuth` (aal2): taking a name out of service can disrupt anyone
+/// relying on it.
+pub async fn disable_agent_name(
+    auth: StepUpAuth,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = did_ops::disable_agent_name(
+        &auth.0,
+        &state,
+        &req.mnemonic,
+        &req.name,
+        &req.did_log,
+        req.domain.as_deref(),
+    )
+    .await?;
+    server_push::notify_servers_did(&state, req.mnemonic.clone());
+    info!(did = %auth.0.did, mnemonic = %req.mnemonic, name = %req.name, "agent name disabled via REST");
+    Ok(Json(agent_name_record_response(&state, &record)))
+}
+
+/// `POST /api/agent-names/check` — is a name free to claim on a domain?
+pub async fn check_agent_name(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameCheckRequest>,
+) -> Result<Json<did_ops::AgentNameAvailability>, AppError> {
+    // Names are domain-scoped: resolve the domain the same way register does
+    // (explicit → caller's ACL default → system default).
+    let acl_scope =
+        match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
+            Some(e) => e.domains,
+            None => did_hosting_common::server::domain::DomainScope::All,
+        };
+    let system_default = did_hosting_common::server::domain::get_default_domain(&state.store)
+        .await
+        .ok()
+        .flatten();
+    let domain = did_hosting_common::server::domain::resolve_request_domain(
+        req.domain.as_deref(),
+        &acl_scope,
+        system_default.as_deref(),
+    )
+    .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    let result = did_ops::check_agent_name(&state, &domain, &req.name).await?;
+    info!(
+        did = %auth.did,
+        name = %req.name,
+        domain = %domain,
+        available = result.available,
+        "agent name availability checked"
+    );
     Ok(Json(result))
 }
 
