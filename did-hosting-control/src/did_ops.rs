@@ -447,7 +447,7 @@ pub async fn register_did_atomic(
         _ => (now, 1),
     };
 
-    let new_record = DidRecord {
+    let mut new_record = DidRecord {
         owner: auth.did.clone(),
         mnemonic: path.to_string(),
         created_at,
@@ -464,28 +464,29 @@ pub async fn register_did_atomic(
 
         services: extract_service_types(did_log),
 
-        // Carried over, not defaulted. This path also re-registers an
-        // EXISTING slot, where `Vec::new()` would silently drop every name
-        // bound to it.
-        //
-        // Control keeps the authoritative registry rather than deriving from
-        // the log, because a *disabled* name is deliberately absent from
-        // `alsoKnownAs` — it is parked, not claimed — so the log cannot
-        // express the reservation. The edge derives instead (see
-        // `control_register::apply_single_update`), which is what makes an
-        // edge structurally unable to serve a name the document does not
-        // claim.
+        // Start from the existing registry (this path also re-registers an
+        // EXISTING slot, where `Vec::new()` would silently drop every name),
+        // then reconcile against the new document below. The carry-over is what
+        // preserves a *parked* name — deliberately absent from `alsoKnownAs`,
+        // so the log alone can't express the reservation.
         agent_names: existing
             .as_ref()
             .map(|r| r.agent_names.clone())
             .unwrap_or_default(),
     };
 
-    // 4. Single-batch atomic write: record, log content, owner index;
-    //    plus old-owner cleanup on takeover. From a resolver's
-    //    perspective there is no point at which the slot is
-    //    half-updated — either old-content/old-record or
-    //    new-content/new-record.
+    // Reconcile the authoritative registry against what the document claims —
+    // the control plane is the source of record, so a name registered at
+    // create/publish time must land in the registry (and its index), not only
+    // via the explicit agent-name ops. Parked entries are preserved.
+    let reg_domain =
+        did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
+    let (claimed, released) = reconcile_agent_names(&mut new_record, did_log, &reg_domain, now);
+
+    // 4. Single-batch atomic write: record, log content, owner index, agent-name
+    //    index; plus old-owner cleanup on takeover. From a resolver's
+    //    perspective there is no point at which the slot is half-updated —
+    //    either old-content/old-record or new-content/new-record.
     let mut batch = state.store.batch();
     batch.insert_raw(
         &state.dids_ks,
@@ -506,6 +507,16 @@ pub async fn register_did_atomic(
         owner_key(&auth.did, path),
         path.as_bytes().to_vec(),
     );
+    for name in &claimed {
+        batch.insert_raw(
+            &state.dids_ks,
+            agent_name_key(&reg_domain, name),
+            path.as_bytes().to_vec(),
+        );
+    }
+    for name in &released {
+        batch.remove(&state.dids_ks, agent_name_key(&reg_domain, name));
+    }
     batch.commit().await?;
 
     // Same rationale as `publish_did`: the atomic register path commits
@@ -630,6 +641,66 @@ async fn prepare_republish(
 }
 
 /// Publish (upload) a did.jsonl log for an existing DID slot.
+/// Reconcile the authoritative agent-name registry against a just-published
+/// document, returning the index changes to fold into the commit batch:
+/// `(names to point at this DID, names to retire)`.
+///
+/// The control plane is the source of record for DID hosting — a name is
+/// *served* iff the signed document claims it via `alsoKnownAs`. So a plain
+/// publish (the VTA editing the document) keeps the registry in step:
+/// - each name the document claims → asserted **enabled** (created-at preserved
+///   if it already existed), and its index points here;
+/// - a previously-enabled name the document no longer claims → **released**
+///   (dropped from the registry, its index retired);
+/// - a **parked** (`enabled == false`) entry the document doesn't claim →
+///   **kept**, because parking deliberately drops the name from the document
+///   while holding the reservation. A parked name that reappears in the
+///   document is resumed (becomes enabled).
+///
+/// The explicit agent-name ops (`set`/`enable`/`disable`/`remove`) manage the
+/// registry directly and don't go through here; this is only the plain-publish
+/// path, which previously left the registry untouched — so a name bound by
+/// editing `alsoKnownAs` was never registered, and later parking it failed.
+fn reconcile_agent_names(
+    record: &mut DidRecord,
+    did_log: &str,
+    domain: &str,
+    now: u64,
+) -> (Vec<String>, Vec<String>) {
+    let claimed = extract_agent_names(did_log, domain);
+    let is_claimed = |n: &str| claimed.iter().any(|c| c == n);
+
+    let released: Vec<String> = record
+        .agent_names
+        .iter()
+        .filter(|e| e.enabled && !is_claimed(&e.name))
+        .map(|e| e.name.clone())
+        .collect();
+
+    let mut next: Vec<AgentNameEntry> = record
+        .agent_names
+        .iter()
+        .filter(|e| !e.enabled && !is_claimed(&e.name))
+        .cloned()
+        .collect();
+    for name in &claimed {
+        let created_at = record
+            .agent_names
+            .iter()
+            .find(|e| &e.name == name)
+            .map(|e| e.created_at)
+            .unwrap_or(now);
+        next.push(AgentNameEntry {
+            name: name.clone(),
+            enabled: true,
+            created_at,
+        });
+    }
+    record.agent_names = next;
+
+    (claimed, released)
+}
+
 pub async fn publish_did(
     auth: &AuthClaims,
     state: &AppState,
@@ -637,9 +708,13 @@ pub async fn publish_did(
     did_log: &str,
     request_domain: Option<&str>,
 ) -> Result<(), AppError> {
-    let (record, _domain) =
+    let (mut record, domain) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
     let new_size = record.content_size;
+    let now = record.updated_at;
+
+    // Keep the authoritative registry in step with what the document claims.
+    let (claimed, released) = reconcile_agent_names(&mut record, did_log, &domain, now);
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -648,6 +723,16 @@ pub async fn publish_did(
         did_log.as_bytes().to_vec(),
     );
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    for name in &claimed {
+        batch.insert_raw(
+            &state.dids_ks,
+            agent_name_key(&domain, name),
+            mnemonic.as_bytes().to_vec(),
+        );
+    }
+    for name in &released {
+        batch.remove(&state.dids_ks, agent_name_key(&domain, name));
+    }
     batch.commit().await?;
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
@@ -3135,5 +3220,117 @@ mod tests_atomic {
 
         // A grammatically invalid name is a client error, not "unavailable".
         assert!(check_agent_name(&state, "control.test", "a").await.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry reconciliation on plain publish (the control plane is the
+    // source of record for names, not just the explicit agent-name ops).
+    // -----------------------------------------------------------------------
+
+    /// A name bound by a *plain publish* (edit alsoKnownAs, no `set` call) is
+    /// registered — enabled entry + index — and can then be parked. This is the
+    /// integration fix: the UI binds via publish and parks via the registry op,
+    /// which previously failed with `NotFound`.
+    #[tokio::test]
+    async fn publish_registers_a_claimed_name_so_park_works() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-recon";
+        register_owned(&state, owner, path).await;
+
+        // Simulate the UI bind: publish a version that claims @alice.
+        let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        publish_did(&owner_auth(owner), &state, path, &bind, None)
+            .await
+            .expect("publish");
+        let rec = get_record(&state, path).await;
+        assert!(
+            rec.agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled),
+            "a name claimed by a plain publish must be registered enabled"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some(path),
+            "plain publish must write the name index"
+        );
+
+        // Parking it now succeeds (previously NotFound — the bug).
+        let park = build_test_did_log_with_names("control.test", path, &[]).await;
+        let rec = disable_agent_name(&owner_auth(owner), &state, path, "alice", &park, None)
+            .await
+            .expect("park a publish-bound name");
+        assert!(
+            rec.agent_names
+                .iter()
+                .any(|e| e.name == "alice" && !e.enabled)
+        );
+    }
+
+    /// A publish that drops a previously-served name releases it (entry + index
+    /// gone) — served state follows the signed document.
+    #[tokio::test]
+    async fn publish_releases_a_dropped_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-rel";
+        register_owned(&state, owner, path).await;
+
+        let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        publish_did(&owner_auth(owner), &state, path, &bind, None)
+            .await
+            .unwrap();
+        let drop = build_test_did_log_with_names("control.test", path, &[]).await;
+        publish_did(&owner_auth(owner), &state, path, &drop, None)
+            .await
+            .unwrap();
+
+        let rec = get_record(&state, path).await;
+        assert!(!rec.agent_names.iter().any(|e| e.name == "alice"));
+        assert_eq!(index_target(&state, "control.test", "alice").await, None);
+    }
+
+    /// A parked (disabled) name is NOT collateral damage of a later plain
+    /// publish that doesn't claim it — the reservation is held even though the
+    /// document omits the name.
+    #[tokio::test]
+    async fn publish_preserves_a_parked_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-park";
+        register_owned(&state, owner, path).await;
+
+        let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        publish_did(&owner_auth(owner), &state, path, &bind, None)
+            .await
+            .unwrap();
+        let park = build_test_did_log_with_names("control.test", path, &[]).await;
+        disable_agent_name(&owner_auth(owner), &state, path, "alice", &park, None)
+            .await
+            .unwrap();
+
+        // Some later, unrelated publish (still not claiming alice).
+        let other = build_test_did_log_with_names("control.test", path, &[]).await;
+        publish_did(&owner_auth(owner), &state, path, &other, None)
+            .await
+            .unwrap();
+
+        let rec = get_record(&state, path).await;
+        assert!(
+            rec.agent_names
+                .iter()
+                .any(|e| e.name == "alice" && !e.enabled),
+            "a parked name survives a plain publish that omits it"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some(path),
+            "a parked name keeps its index reservation"
+        );
     }
 }
