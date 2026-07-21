@@ -4,10 +4,11 @@
 //! Drives the full Axum router in-process via `tower::ServiceExt::oneshot`.
 //! The point of these tests is the wiring the `did_ops` unit tests can't
 //! reach: that the routes are actually registered, that the JWT-Bearer gate
-//! runs, and — the reason this surface exists — that the destructive verbs
-//! (`remove`/`disable`) are gated behind aal2 **step-up**. A session minted by
-//! the harness is aal1, so those verbs must be refused with 403
-//! `step_up_required` before any business logic runs. The signed-log happy
+//! runs, and that the destructive verbs (`remove`/`disable`) reach `did_ops`
+//! on a plain **aal1** session. That last one is a regression pin, not an
+//! oversight: these verbs were briefly aal2 step-up-gated, but the gate was
+//! uncallable — the VTA's did-hosting session is aal1 by construction — so
+//! #108 moved the elevation to the agent's consent layer. The signed-log happy
 //! paths stay covered by the `did_ops` unit tests.
 
 use std::path::PathBuf;
@@ -43,6 +44,10 @@ struct Harness {
 }
 
 async fn make_harness() -> Harness {
+    make_harness_with_agent_names(FeaturesConfig::default().agent_names).await
+}
+
+async fn make_harness_with_agent_names(agent_names: bool) -> Harness {
     let dir = tempfile::tempdir().expect("temp dir");
     let store_config = StoreConfig {
         data_dir: PathBuf::from(dir.path()),
@@ -56,7 +61,10 @@ async fn make_harness() -> Harness {
     let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
 
     let config = AppConfig {
-        features: FeaturesConfig::default(),
+        features: FeaturesConfig {
+            agent_names,
+            ..FeaturesConfig::default()
+        },
         server_did: Some("did:webvh:test:control.example.com".into()),
         mediator_did: None,
         public_url: Some("http://control.test".into()),
@@ -318,4 +326,53 @@ async fn check_reports_availability() {
     let body = read_json(resp.into_body()).await;
     assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
     assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
+}
+
+/// A client must be able to learn whether this deployment serves agent names
+/// *before* it has a session — it cannot probe for it, because with the feature
+/// off `GET /@name` 404s exactly as an unknown name does.
+#[tokio::test]
+async fn server_info_advertises_agent_names_unauthenticated() {
+    let h = make_harness_with_agent_names(true).await;
+    let resp = app(&h)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/server-info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "server-info must stay unauthenticated"
+    );
+    let body = read_json(resp.into_body()).await;
+    assert_eq!(
+        body.get("agent_names").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// …and the answer has to track the flag, not merely be present.
+#[tokio::test]
+async fn server_info_reports_agent_names_off() {
+    let h = make_harness_with_agent_names(false).await;
+    let resp = app(&h)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/server-info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    let body = read_json(resp.into_body()).await;
+    assert_eq!(
+        body.get("agent_names").and_then(|v| v.as_bool()),
+        Some(false)
+    );
 }

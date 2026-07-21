@@ -617,6 +617,12 @@ export interface ServerInfoResponse {
    *  countdown copy. `null` if config is missing/unparseable — UI
    *  falls back to a generic warning without a specific duration. */
   disable_purge_grace_seconds: number | null;
+  /** Whether this deployment serves agent names (`/@alice` -> 302). Read it
+   *  before offering the Agent Names UI: with the feature off the redirect
+   *  404s, deliberately indistinguishable from "no such name", so there is no
+   *  way to detect it by probing. Optional — a deployment older than this
+   *  field omits it, and `undefined` should be read as "unknown", not "off". */
+  agent_names?: boolean;
 }
 
 // Cache the server-info response for the lifetime of the tab. The server's

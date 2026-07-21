@@ -26,6 +26,10 @@ pub struct ServerConfigResponse {
 pub struct FeaturesResponse {
     pub didcomm: bool,
     pub rest_api: bool,
+    /// Whether this edge serves `/@name` redirects. This is the node that
+    /// actually answers them, so its own config is the authoritative answer
+    /// for this host.
+    pub agent_names: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +116,7 @@ pub async fn get_config(
         features: FeaturesResponse {
             didcomm: cfg.features.didcomm,
             rest_api: cfg.features.rest_api,
+            agent_names: cfg.features.agent_names,
         },
         server: ServerResponse {
             host: cfg.server.host.clone(),

@@ -32,6 +32,14 @@ pub struct ServerInfoResponse {
     /// unparseable — in that case the UI falls back to a generic
     /// message without a specific duration.
     pub disable_purge_grace_seconds: Option<u64>,
+    /// Whether this deployment serves agent names (`/@alice` -> 302).
+    ///
+    /// Advertised here, on the unauthenticated endpoint, because a client
+    /// needs it *before* it has a session in order to decide whether to offer
+    /// the feature at all — and because it cannot be detected behaviourally:
+    /// with the feature off `GET /@name` returns 404, deliberately
+    /// indistinguishable from "no such name".
+    pub agent_names: bool,
 }
 
 pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> {
@@ -40,5 +48,6 @@ pub async fn server_info(State(state): State<AppState>) -> Json<ServerInfoRespon
     Json(ServerInfoResponse {
         server_did: state.config.server_did.clone(),
         disable_purge_grace_seconds,
+        agent_names: state.config.features.agent_names,
     })
 }
