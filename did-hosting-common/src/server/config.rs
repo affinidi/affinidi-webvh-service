@@ -2,7 +2,7 @@ use super::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub didcomm: bool,
@@ -17,12 +17,19 @@ pub struct FeaturesConfig {
     pub rest_api: bool,
     /// Serve agent-name redirects (`GET /@alice` -> 302 to a DID).
     ///
-    /// Off by default. A name only resolves if the signed DID document already
-    /// claims it via `alsoKnownAs`, so enabling this cannot by itself expose a
-    /// name the controller has not authorised — but it does turn the `/@…`
-    /// namespace into a served route, which an operator should opt into
-    /// deliberately.
-    #[serde(default)]
+    /// **On by default.** A name only resolves if the signed DID document
+    /// already claims it via `alsoKnownAs`, so serving the `/@…` namespace
+    /// cannot by itself expose a name the controller has not authorised: with
+    /// no names bound, every `/@…` request 404s exactly as it did before.
+    /// Meanwhile the write path (bind/park/resume, over REST and Trust Tasks)
+    /// and the UI that drives it are *not* gated on this flag — leaving it off
+    /// let an owner bind a name that then silently failed to resolve, which is
+    /// the worse default.
+    ///
+    /// Set `agent_names = false` (or `…_FEATURES_AGENT_NAMES=0`) to keep the
+    /// `/@…` namespace unserved on a host that wants those paths free for
+    /// something else.
+    #[serde(default = "default_true")]
     pub agent_names: bool,
     /// Deployment mode: "standalone" for individual services, "daemon" for unified binary.
     /// Controls UI behavior (e.g., hiding service topology in daemon mode).
@@ -32,6 +39,27 @@ pub struct FeaturesConfig {
 
 fn default_deployment_mode() -> String {
     "standalone".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Hand-written so the in-code default matches what serde fills in for an
+/// absent field — a derived `Default` would give `agent_names: false` and an
+/// empty `deployment_mode`, so every `..Default::default()` call site (the
+/// setup wizards, the recipe writer, tests) would disagree with the same
+/// config round-tripped through TOML.
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            didcomm: false,
+            tsp: false,
+            rest_api: false,
+            agent_names: true,
+            deployment_mode: default_deployment_mode(),
+        }
+    }
 }
 
 /// Three-way messaging-transport selection used by setup wizards and
@@ -969,6 +997,36 @@ pub fn init_tracing(log: &LogConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_names_default_on_for_absent_and_empty_config() {
+        // An operator who never heard of the flag serves `/@name`.
+        assert!(FeaturesConfig::default().agent_names);
+        let cfg: FeaturesConfig = toml::from_str("").unwrap();
+        assert!(cfg.agent_names);
+        // Sibling flags stay opt-in — this changes one default, not all of them.
+        assert!(!cfg.didcomm);
+        assert!(!cfg.tsp);
+        assert!(!cfg.rest_api);
+    }
+
+    #[test]
+    fn agent_names_can_still_be_switched_off() {
+        let cfg: FeaturesConfig = toml::from_str("agent_names = false").unwrap();
+        assert!(!cfg.agent_names);
+    }
+
+    #[test]
+    fn features_default_matches_toml_round_trip() {
+        // The hand-written `Default` and the serde defaults must not drift:
+        // `..Default::default()` in the setup wizards has to produce the same
+        // config an operator gets from an empty `[features]` table.
+        let from_toml: FeaturesConfig = toml::from_str("").unwrap();
+        let from_default = FeaturesConfig::default();
+        assert_eq!(from_toml.agent_names, from_default.agent_names);
+        assert_eq!(from_toml.deployment_mode, from_default.deployment_mode);
+        assert_eq!(from_default.deployment_mode, "standalone");
+    }
 
     #[test]
     fn identity_mode_default_is_vta() {

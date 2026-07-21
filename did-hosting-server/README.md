@@ -122,6 +122,8 @@ public_url = "https://webvh.example.com"
 [features]
 didcomm = true
 rest_api = true
+# agent_names = true   # serve GET /@alice -> 302 to the DID. On by default;
+                       # set false to leave the /@… namespace unserved.
 
 [server]
 host = "0.0.0.0"    # Bind address
