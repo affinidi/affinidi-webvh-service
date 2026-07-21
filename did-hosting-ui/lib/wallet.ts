@@ -549,6 +549,13 @@ export function isWalletTaskRelayAvailable(): boolean {
 export const WEBVH_DIDS_UPDATE_1_0 =
   "https://trusttasks.org/spec/vta/webvh/dids/update/1.0";
 
+/** Park / resume an agent name. Same `vta/webvh/...` dispatch discipline as
+ *  {@link WEBVH_DIDS_UPDATE_1_0}. */
+export const WEBVH_AGENT_NAME_DISABLE_1_0 =
+  "https://trusttasks.org/spec/vta/webvh/agent-name/disable/1.0";
+export const WEBVH_AGENT_NAME_ENABLE_1_0 =
+  "https://trusttasks.org/spec/vta/webvh/agent-name/enable/1.0";
+
 /** The VTA needs a human to approve this before it will run it. */
 export interface TaskConsentRequired {
   kind: "consentRequired";
@@ -617,6 +624,32 @@ export async function requestDidUpdate(args: {
       document: args.document,
       ...(args.expectedVersionId ? { expectedVersionId: args.expectedVersionId } : {}),
     },
+  })) as Record<string, unknown>;
+
+  return readOutcome(reply);
+}
+
+/**
+ * Ask the user's VTA to park (`enable: false`) or resume (`enable: true`) an
+ * agent name on a hosted DID.
+ *
+ * Unlike {@link requestDidUpdate}, we don't send a document — the VTA reads the
+ * DID's current document itself, edits `alsoKnownAs`, signs the new version, and
+ * calls the host's agent-name endpoint. The task is classified `destructive`,
+ * so the same cross-device approval ceremony applies (see {@link readOutcome}).
+ */
+export async function requestAgentNameTask(args: {
+  did: string;
+  name: string;
+  enable: boolean;
+}): Promise<RequestTaskOutcome> {
+  const wallet = window.vtaWallet;
+  if (!wallet?.requestTask) {
+    throw new Error("This wallet does not support delegated task execution.");
+  }
+  const reply = (await wallet.requestTask({
+    type: args.enable ? WEBVH_AGENT_NAME_ENABLE_1_0 : WEBVH_AGENT_NAME_DISABLE_1_0,
+    payload: { did: args.did, name: args.name },
   })) as Record<string, unknown>;
 
   return readOutcome(reply);
