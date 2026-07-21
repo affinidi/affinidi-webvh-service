@@ -242,6 +242,89 @@ pub struct WitnessPublishResponse {
     pub witness_url: String,
 }
 
+// --- Agent names -----------------------------------------------------------
+//
+// Bind a human-memorable name (`example.com/@alice`) to a hosted DID. Each
+// verb carries the caller's new signed `did.jsonl` (`didLog` — the spec's
+// `didData`), which the op publishes as a new DID version *and* which the
+// `alsoKnownAs` gate checks: set/enable require the document to claim the
+// name; remove/disable require it not to. See the
+// `did-management/agent-name/*` specifications. All four share one payload
+// shape and one `{record}` response; they differ only by Type URI and the
+// `did_ops` function they call.
+
+/// `did-hosting/agent-name/set/1.0` — bind or refresh a name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAgentNameRequest {
+    pub mnemonic: String,
+    /// The name's local part, without the leading `@` (the `alice` in `/@alice`).
+    pub name: String,
+    /// The new signed `did.jsonl` whose `alsoKnownAs` claims the name (the
+    /// spec's `didData`).
+    pub did_log: String,
+    /// Optional explicit hosting domain; cross-checked against the DID's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+impl trust_tasks_rs::Payload for SetAgentNameRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/agent-name/set/1.0";
+}
+
+/// `did-hosting/agent-name/remove/1.0` — release a name (destructive). The
+/// submitted document must no longer claim the name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveAgentNameRequest {
+    pub mnemonic: String,
+    pub name: String,
+    pub did_log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+impl trust_tasks_rs::Payload for RemoveAgentNameRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/agent-name/remove/1.0";
+}
+
+/// `did-hosting/agent-name/enable/1.0` — resume serving a parked name. The
+/// submitted document must claim the name again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnableAgentNameRequest {
+    pub mnemonic: String,
+    pub name: String,
+    pub did_log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+impl trust_tasks_rs::Payload for EnableAgentNameRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/agent-name/enable/1.0";
+}
+
+/// `did-hosting/agent-name/disable/1.0` — park a name (kept reserved). The
+/// submitted document must no longer claim the name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisableAgentNameRequest {
+    pub mnemonic: String,
+    pub name: String,
+    pub did_log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+impl trust_tasks_rs::Payload for DisableAgentNameRequest {
+    const TYPE_URI: &'static str = "https://trusttasks.org/spec/did-hosting/agent-name/disable/1.0";
+}
+
+/// The shared `#response` for every agent-name verb: the updated DID record
+/// (spec `DidRecord` shape). The response Type URI is derived from the
+/// request's by the framework, so this struct needs no `Payload` impl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameResponse {
+    pub record: Value,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -258,6 +341,10 @@ enum DidHostingInbound {
     Register(TrustTask<RegisterRequest>),
     ChangeOwner(TrustTask<ChangeOwnerRequest>),
     WitnessPublish(TrustTask<WitnessPublishRequest>),
+    SetAgentName(TrustTask<SetAgentNameRequest>),
+    RemoveAgentName(TrustTask<RemoveAgentNameRequest>),
+    EnableAgentName(TrustTask<EnableAgentNameRequest>),
+    DisableAgentName(TrustTask<DisableAgentNameRequest>),
 }
 
 fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
@@ -270,6 +357,10 @@ fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
         .on::<RegisterRequest, _>(DidHostingInbound::Register)
         .on::<ChangeOwnerRequest, _>(DidHostingInbound::ChangeOwner)
         .on::<WitnessPublishRequest, _>(DidHostingInbound::WitnessPublish)
+        .on::<SetAgentNameRequest, _>(DidHostingInbound::SetAgentName)
+        .on::<RemoveAgentNameRequest, _>(DidHostingInbound::RemoveAgentName)
+        .on::<EnableAgentNameRequest, _>(DidHostingInbound::EnableAgentName)
+        .on::<DisableAgentNameRequest, _>(DidHostingInbound::DisableAgentName)
 }
 
 /// Does the typed `did-hosting/*/1.0` protocol own this Type URI? The
@@ -304,6 +395,18 @@ where
         }
         Ok(DidHostingInbound::WitnessPublish(d)) => {
             handle_witness_publish(state, transport, policy, d).await
+        }
+        Ok(DidHostingInbound::SetAgentName(d)) => {
+            handle_set_agent_name(state, transport, policy, d).await
+        }
+        Ok(DidHostingInbound::RemoveAgentName(d)) => {
+            handle_remove_agent_name(state, transport, policy, d).await
+        }
+        Ok(DidHostingInbound::EnableAgentName(d)) => {
+            handle_enable_agent_name(state, transport, policy, d).await
+        }
+        Ok(DidHostingInbound::DisableAgentName(d)) => {
+            handle_disable_agent_name(state, transport, policy, d).await
         }
         Err(err) => DispatchOutcome::Rejected(err),
     }
@@ -789,6 +892,96 @@ where
     .await
 }
 
+/// Build the shared `{record}` agent-name response from an updated record.
+fn agent_name_response(state: &AppState, record: &DidRecord) -> AgentNameResponse {
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let did_url = format!(
+        "{}/{}/did.jsonl",
+        base_url.trim_end_matches('/'),
+        record.mnemonic
+    );
+    AgentNameResponse {
+        record: spec_did_record_json(record, &did_url),
+    }
+}
+
+/// The four agent-name verbs share one handler shape — authorize, call the
+/// matching `did_ops` op with `{mnemonic, name, didLog, domain}`, fan the new
+/// version out to edges, and reply with the updated record. They differ only
+/// by payload type and `did_ops` function, so a macro keeps them provably in
+/// lockstep. (Step-up on remove/disable is a consumer-policy gate enforced on
+/// the REST surface via `StepUpAuth`; the Trust-Task path carries no assurance
+/// level, so — like `handle_delete` — it relies on the proof-authenticated
+/// owner check in `did_ops`.)
+macro_rules! agent_name_handler {
+    ($handler:ident, $req:ty, $op:path) => {
+        async fn $handler<V>(
+            state: &AppState,
+            transport: &(impl TransportHandler + Sync),
+            policy: ProofPolicy<'_, V>,
+            doc: TrustTask<$req>,
+        ) -> DispatchOutcome
+        where
+            V: ProofVerifier + ?Sized,
+        {
+            let (my_vid, state) = match resolve_state(state, &doc) {
+                Ok(v) => v,
+                Err(o) => return *o,
+            };
+            run_pipeline(
+                transport,
+                policy,
+                doc,
+                &my_vid,
+                move |doc, parties| async move {
+                    let auth = authorize(&state, &doc, &parties).await?;
+                    let mnemonic = doc.payload.mnemonic.clone();
+                    let record = $op(
+                        &auth,
+                        &state,
+                        &mnemonic,
+                        &doc.payload.name,
+                        &doc.payload.did_log,
+                        doc.payload.domain.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| reject_apperror(&doc, e))?;
+                    crate::server_push::notify_servers_did(&state, mnemonic.clone());
+                    let resp = agent_name_response(&state, &record);
+                    Ok(doc.respond_with(new_id(), resp))
+                },
+            )
+            .await
+        }
+    };
+}
+
+agent_name_handler!(
+    handle_set_agent_name,
+    SetAgentNameRequest,
+    did_ops::set_agent_name
+);
+agent_name_handler!(
+    handle_remove_agent_name,
+    RemoveAgentNameRequest,
+    did_ops::remove_agent_name
+);
+agent_name_handler!(
+    handle_enable_agent_name,
+    EnableAgentNameRequest,
+    did_ops::enable_agent_name
+);
+agent_name_handler!(
+    handle_disable_agent_name,
+    DisableAgentNameRequest,
+    did_ops::disable_agent_name
+);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -857,10 +1050,20 @@ fn reject_apperror<P>(doc: &TrustTask<P>, e: AppError) -> trust_tasks_rs::ErrorR
     // StandardCode has no NotFound/Conflict; map the closest framework code.
     let code = match &e {
         AppError::Validation(_) => StandardCode::MalformedRequest,
-        AppError::Forbidden(_) | AppError::Authentication(_) | AppError::Unauthorized(_) => {
-            StandardCode::PermissionDenied
-        }
+        AppError::Forbidden(_)
+        | AppError::Authentication(_)
+        | AppError::Unauthorized(_)
+        | AppError::StepUpRequired(_) => StandardCode::PermissionDenied,
         AppError::NotFound(_) | AppError::Conflict(_) => StandardCode::TaskFailed,
+        // Agent-name precondition failures are client errors, not maintainer
+        // faults — surface them (with their message) rather than masking as an
+        // internal error. `AlsoKnownAsMismatch` is a malformed submission (the
+        // document doesn't match the request); the rest are task-state
+        // failures (name taken, not found, wrong enabled-state, reserved).
+        AppError::AgentName(
+            did_hosting_common::server::error::AgentNameError::AlsoKnownAsMismatch,
+        ) => StandardCode::MalformedRequest,
+        AppError::AgentName(_) => StandardCode::TaskFailed,
         _ => StandardCode::InternalError,
     };
     // Internal failures keep their operator detail in the log, not the wire.
@@ -1224,6 +1427,10 @@ mod tests {
             RegisterRequest::TYPE_URI,
             ChangeOwnerRequest::TYPE_URI,
             WitnessPublishRequest::TYPE_URI,
+            SetAgentNameRequest::TYPE_URI,
+            RemoveAgentNameRequest::TYPE_URI,
+            EnableAgentNameRequest::TYPE_URI,
+            DisableAgentNameRequest::TYPE_URI,
         ] {
             assert!(owns(uri), "dispatcher should own {uri}");
         }
@@ -1298,6 +1505,91 @@ mod tests {
         assert_eq!(
             err.payload.code,
             trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
+        );
+    }
+
+    // --- Agent names -------------------------------------------------------
+
+    /// A reserved name (`@admin`) routes to `did_ops::set_agent_name`, is
+    /// refused there, and — crucially — surfaces as a routed `task_failed`,
+    /// **not** a masked `internal_error`. This exercises the `reject_apperror`
+    /// arm added for `AppError::AgentName`.
+    #[tokio::test]
+    async fn set_agent_name_reserved_maps_to_task_failed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "aliceslot").await;
+
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                SetAgentNameRequest::TYPE_URI,
+                json!({ "mnemonic": mnemonic, "name": "admin", "didLog": "irrelevant" }),
+            ),
+        )
+        .await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected (reserved name), got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::TaskFailed),
+            "a reserved agent name must map to task_failed, not internal_error"
+        );
+    }
+
+    /// Set routes through the pipeline to `did_ops::set_agent_name`; a
+    /// malformed `didLog` is rejected in the shared publish path (a valid
+    /// signed log + `alsoKnownAs` happy path is covered by the `did_ops`
+    /// tests). Proves delegation for the whole agent-name family.
+    #[tokio::test]
+    async fn set_agent_name_malformed_log_rejected_over_typed() {
+        let (state, _dir) = test_state().await;
+        seed_admin(&state).await;
+        let mnemonic = reserve_did(&state, "nameslot").await;
+
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                SetAgentNameRequest::TYPE_URI,
+                json!({ "mnemonic": mnemonic, "name": "alice", "didLog": "not-a-valid-jsonl-log" }),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Rejected(_)),
+            "a malformed didLog is rejected in did_ops"
+        );
+    }
+
+    /// A caller absent from the ACL cannot invoke a destructive agent-name
+    /// verb — the auth gate runs before any `did_ops` work.
+    #[tokio::test]
+    async fn remove_agent_name_unknown_caller_denied() {
+        let (state, _dir) = test_state().await;
+        // No admin seeded → the caller is not in the ACL.
+        let outcome = dispatch::<TransportBoundVerifier>(
+            &state,
+            &transport(),
+            ProofPolicy::AcceptUnverified,
+            op_doc(
+                RemoveAgentNameRequest::TYPE_URI,
+                json!({ "mnemonic": "whatever", "name": "alice", "didLog": "x" }),
+            ),
+        )
+        .await;
+        let err = match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected (unknown caller), got {other:?}"),
+        };
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
         );
     }
 }
