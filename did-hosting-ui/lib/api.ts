@@ -239,6 +239,17 @@ export interface CheckNameResponse {
   path: string;
 }
 
+/** Availability of an agent name (`/@alice`) on a hosting domain. */
+export interface AgentNameAvailability {
+  name: string;
+  domain: string;
+  /** Free to claim: neither reserved nor already bound on this domain. */
+  available: boolean;
+  /** On the host's reserved list (`@admin`, `@support`, …) — unavailable but
+   *  a well-formed name, distinct from a grammar error (a 400). */
+  reserved: boolean;
+}
+
 export interface AclEntry {
   did: string;
   role: "admin" | "owner" | "service";
@@ -695,6 +706,16 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, domain }),
+    }),
+
+  /** Is an agent name (`/@name`) free to claim on `domain`? Binding itself is
+   *  a signed did.jsonl publish through the user's agent (edit `alsoKnownAs`),
+   *  not a call here — this is only the availability probe. */
+  checkAgentName: (name: string, domain?: string) =>
+    request<AgentNameAvailability>("/api/agent-names/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, domain }),
     }),
 
   uploadDid: (mnemonic: string, body: string) =>
