@@ -114,9 +114,16 @@ pub fn router_without_fallback() -> Router<AppState> {
             (*TASK_DID_REGISTER_1_0).clone(),
         )
         // Agent-name mutations carry the new signed did.jsonl in the body, so
-        // they share the register/publish body ceiling. set/enable require the
-        // owner (or admin); remove/disable additionally require aal2 step-up,
-        // enforced by the `StepUpAuth` extractor in the handlers.
+        // they share the register/publish body ceiling. All four require the
+        // owner (or admin) — plain `AuthClaims`, no step-up.
+        //
+        // `remove`/`disable` briefly required aal2 here; #108 removed it,
+        // because the gate was uncallable: the VTA's did-hosting session is
+        // aal1 by construction, so no agent could ever satisfy it. Elevation
+        // for the destructive verbs lives at the agent's consent layer, which
+        // classifies those tasks `Destructive` and forces a cross-device
+        // type-to-confirm. `remove_reaches_did_ops_without_step_up` and
+        // `disable_reaches_did_ops_without_step_up` pin the current behaviour.
         .route_with_task_permissive(
             "/agent-names/set",
             post(did_manage::set_agent_name),

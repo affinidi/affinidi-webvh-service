@@ -367,6 +367,18 @@ pub(crate) fn spec_did_record_json(
     if let Some(did_id) = record.did_id.as_ref().filter(|_| record.version_count > 0) {
         rec.insert("didId".into(), json!(did_id));
     }
+    // The agent-name registry, so the four `agent-name/*` verbs are
+    // self-describing: without it a client has to follow every `set` or
+    // `disable` with an authenticated `GET /api/dids/{mnemonic}` just to learn
+    // what its own call did. A *parked* name is invisible in the DID document
+    // by design, so the response is the only place the caller can see it.
+    //
+    // Emitted only when non-empty, matching `domain`/`didId` above: a DID with
+    // no names produces a byte-identical response to before, which keeps this
+    // additive for the `did-management/did/*` family that shares this shape.
+    if !record.agent_names.is_empty() {
+        rec.insert("agentNames".into(), json!(record.agent_names));
+    }
     Value::Object(rec)
 }
 

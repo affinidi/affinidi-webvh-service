@@ -950,6 +950,10 @@ pub struct ConfigResponse {
     pub passkey_enrollment_ttl: u64,
     /// Deployment
     pub deployment_mode: String,
+    /// Whether `/@name` redirects are served. Also on the unauthenticated
+    /// `GET /api/server-info`, which is where a client without a session
+    /// should read it; repeated here so the config screen is complete.
+    pub agent_names_enabled: bool,
     /// Storage & Logging
     pub data_dir: String,
     pub log_level: String,
@@ -988,6 +992,7 @@ pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Jso
         advertised_services,
         rest_api_enabled: c.features.rest_api,
         deployment_mode: c.features.deployment_mode.clone(),
+        agent_names_enabled: c.features.agent_names,
         listen_address: format!("{}:{}", c.server.host, c.server.port),
         vta_url: c.vta.url.clone(),
         vta_did: c.vta.did.clone(),
