@@ -54,6 +54,42 @@ pub const TASK_DID_PUBLISH_1_0: &str = "https://trusttasks.org/did-hosting/did/p
 /// Delete a DID — `DELETE /api/dids/{*mnemonic}`.
 pub const TASK_DID_DELETE_1_0: &str = "https://trusttasks.org/did-hosting/did/delete/1.0";
 
+// ---------------------------------------------------------------------------
+// Agent names
+// ---------------------------------------------------------------------------
+//
+// A human-memorable `/@alice` on a hosted DID. The four mutating verbs each
+// carry a full new signed `did.jsonl` whose `alsoKnownAs` claims the name
+// (`set`/`enable`) or no longer claims it (`remove`/`disable`); the host
+// verifies that direction matches the verb before committing. That agreement
+// is the specification's Layer-1 anti-spoofing rule: a host structurally
+// cannot serve a name the DID does not claim.
+
+/// Name availability probe — `POST /api/agent-names/check`.
+/// Body [`crate::AgentNameCheckRequest`], response
+/// [`crate::AgentNameAvailability`].
+pub const TASK_AGENT_NAME_CHECK_1_0: &str =
+    "https://trusttasks.org/did-hosting/agent-name/check/1.0";
+
+/// Bind a name to a DID — `POST /api/agent-names/set`. Refused when the name
+/// is reserved (`@admin`, `@support`, …) or already bound to another DID on
+/// the domain.
+pub const TASK_AGENT_NAME_SET_1_0: &str = "https://trusttasks.org/did-hosting/agent-name/set/1.0";
+
+/// Release a name — `POST /api/agent-names/remove`. The name becomes
+/// claimable by anyone; the irreversible counterpart to `disable`.
+pub const TASK_AGENT_NAME_REMOVE_1_0: &str =
+    "https://trusttasks.org/did-hosting/agent-name/remove/1.0";
+
+/// Resume serving a parked name — `POST /api/agent-names/enable`.
+pub const TASK_AGENT_NAME_ENABLE_1_0: &str =
+    "https://trusttasks.org/did-hosting/agent-name/enable/1.0";
+
+/// Park a name — `POST /api/agent-names/disable`. It stops resolving but stays
+/// reserved to this DID, so nobody else can claim it while parked.
+pub const TASK_AGENT_NAME_DISABLE_1_0: &str =
+    "https://trusttasks.org/did-hosting/agent-name/disable/1.0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +106,11 @@ mod tests {
             TASK_DID_REGISTER_1_0,
             TASK_DID_PUBLISH_1_0,
             TASK_DID_DELETE_1_0,
+            TASK_AGENT_NAME_CHECK_1_0,
+            TASK_AGENT_NAME_SET_1_0,
+            TASK_AGENT_NAME_REMOVE_1_0,
+            TASK_AGENT_NAME_ENABLE_1_0,
+            TASK_AGENT_NAME_DISABLE_1_0,
         ];
         for url in all {
             // Either the did-hosting-specific namespace (lifecycle ops

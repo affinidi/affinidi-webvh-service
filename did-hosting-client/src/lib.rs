@@ -13,6 +13,9 @@
 //!   Bearer-token Authorization for subsequent REST calls.
 //! - **DID lifecycle**: reserve path / check path / atomic
 //!   register-and-publish / publish update / delete.
+//! - **Agent names**: the `/@alice` shortcut surface — bind, release,
+//!   park, resume, and probe availability. See [`agent_names`] for the
+//!   verb semantics and the `alsoKnownAs` rule they enforce.
 //! - **Trust-Tasks transport**: every REST call sets the canonical
 //!   `Trust-Task:` HTTP header (T8b) so the daemon can exact-match
 //!   the operation.
@@ -50,6 +53,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent_names;
 pub mod auth;
 pub mod authed;
 pub mod client;
@@ -59,6 +63,9 @@ pub mod token_store;
 pub mod transport;
 pub mod trust_tasks;
 
+pub use agent_names::{
+    AgentNameAvailability, AgentNameCheckRequest, AgentNameEntry, AgentNameRequest,
+};
 pub use authed::AuthedClient;
 pub use client::{ChallengeResponse, Client, RegisterDidRequest, RequestUriResponse};
 pub use error::ClientError;
