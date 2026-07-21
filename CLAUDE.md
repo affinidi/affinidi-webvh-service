@@ -102,6 +102,41 @@ something outside this process?* If yes, it's probably one of the
 intentional omissions above. If no, it's parity work and belongs in
 `run_daemon()` or `run_daemon_storage_task`.
 
+## Source of record: control plane authoritative, edges ephemeral
+
+There is one source of record for DID hosting: **the control plane.** It owns
+the authoritative state — the `DidRecord`, the signed `did.jsonl`, the
+**agent-name registry** (`record.agent_names` + the `name:{domain}:{name}`
+index), owner and domain assignments. Everything else is downstream of it.
+
+- **The agent (VTA) is an external publisher *into* the control plane.** It
+  holds the DID's update key and produces signed `did.jsonl` versions, but it
+  publishes them *to* the control plane (`publish_did`, `register_did_atomic`,
+  the agent-name ops). It is a source of *documents*, not of record — the
+  control plane decides what is stored and served.
+
+- **Hosting servers (edges) are lossy and ephemeral — treat them as caches.**
+  An edge *derives* its view (served names, the index) from the logs the
+  control plane syncs to it (`control_register::apply_single_update`); it can
+  be wiped and rebuilt from the control plane at any time. Never keep state on
+  an edge that isn't reconstructible from a control-plane sync, and never treat
+  an edge's derived view as authoritative.
+
+**The load-bearing consequence:** every control-plane write must keep the
+authoritative state correct *by itself* — you cannot lean on an edge to hold or
+repair it. Concretely, `publish_did`/`register_did_atomic` **reconcile the
+agent-name registry against the published document** (`reconcile_agent_names`):
+a name the signed document claims via `alsoKnownAs` is registered `enabled` with
+its index; a previously-served name the document drops is released; a **parked**
+(`enabled: false`) name is preserved even though it's absent from the document
+(parking deliberately drops the claim while holding the reservation, which the
+log alone can't express). This is why a name can be bound by a *plain* publish
+(the VTA editing `alsoKnownAs`) and then parked — the registry is authoritative
+and always in step, not dependent on the explicit `agent-name/*` ops having been
+the one to add it. Edge derivation mirrors the same rule so an edge structurally
+cannot serve a name the document doesn't claim (Layer-1), but the control plane's
+reconciled registry — not the edge — is the truth.
+
 ## Cross-service networking & integration discipline
 
 This service's primary client is the VTA's `webvh_client`
