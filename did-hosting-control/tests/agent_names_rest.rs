@@ -202,50 +202,48 @@ fn app(h: &Harness) -> axum::Router {
 // Cases
 // ---------------------------------------------------------------------------
 
-/// `remove` is destructive → gated on aal2. An aal1 session is refused with
-/// 403 `step_up_required` before any business logic runs (so no DID is even
-/// needed). This is the reason the REST surface exists over the Trust-Task
-/// path, which carries no assurance level.
+/// `remove` is owner-or-admin, NOT HTTP step-up-gated: its real caller is the
+/// aal1 VTA, and the destructive elevation lives at the VTA's consent layer.
+/// An aal1 owner reaches `did_ops` — a malformed `didLog` is rejected there
+/// with 400 (not a 403 `step_up_required`), proving the gate is gone and the
+/// handler delegates.
 #[tokio::test]
-async fn remove_requires_step_up() {
+async fn remove_reaches_did_ops_without_step_up() {
     let h = make_harness().await;
     let owner = "did:example:owner";
     add_acl(&h.state, owner, Role::Owner).await;
+    seed_did(&h.state, owner, "aliceslot").await;
     let token = mint_token(&h.state, owner, Role::Owner).await;
 
     let resp = app(&h)
         .oneshot(post(
             "/api/agent-names/remove",
             Some(&token),
-            json!({ "mnemonic": "slot", "name": "alice", "didLog": "x" }),
+            json!({ "mnemonic": "aliceslot", "name": "alice", "didLog": "not-a-valid-log" }),
         ))
         .await
         .expect("router responds");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = read_json(resp.into_body()).await;
-    assert_eq!(
-        body.get("error").and_then(|v| v.as_str()),
-        Some("step_up_required")
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `disable` is likewise step-up-gated.
+/// `disable` is likewise owner-or-admin, not step-up-gated.
 #[tokio::test]
-async fn disable_requires_step_up() {
+async fn disable_reaches_did_ops_without_step_up() {
     let h = make_harness().await;
     let owner = "did:example:owner";
     add_acl(&h.state, owner, Role::Owner).await;
+    seed_did(&h.state, owner, "aliceslot").await;
     let token = mint_token(&h.state, owner, Role::Owner).await;
 
     let resp = app(&h)
         .oneshot(post(
             "/api/agent-names/disable",
             Some(&token),
-            json!({ "mnemonic": "slot", "name": "alice", "didLog": "x" }),
+            json!({ "mnemonic": "aliceslot", "name": "alice", "didLog": "not-a-valid-log" }),
         ))
         .await
         .expect("router responds");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// No Authorization header → 401, pinning the auth gate on a destructive verb.

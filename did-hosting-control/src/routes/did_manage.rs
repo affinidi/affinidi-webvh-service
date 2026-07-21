@@ -2,7 +2,7 @@
 //!
 //! These routes match what the UI expects (from `did-hosting-ui/lib/api.ts`).
 
-use crate::auth::{AdminAuth, AuthClaims, StepUpAuth};
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -132,19 +132,23 @@ pub async fn enable_agent_name(
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 
-/// `POST /api/agent-names/remove` — release a name (destructive).
+/// `POST /api/agent-names/remove` — release a name (destructive), owner or
+/// admin.
 ///
-/// Gated on `StepUpAuth` (aal2): releasing a name frees it for anyone to
-/// reclaim, so a consumer must have stepped up. This is where the spec's
-/// `step_up_required` requirement is enforced (the Trust-Task path carries no
-/// assurance level; REST does).
+/// Not HTTP step-up-gated. These verbs are driven by the DID's **agent**
+/// (VTA), whose session here is aal1 by construction — it authenticates by
+/// DID, and aal2 only comes from a human passkey/approval ceremony the VTA
+/// can't perform. The destructive elevation lives at the agent's own consent
+/// layer instead (the VTA classifies the task `Destructive`, forcing a
+/// cross-device type-to-confirm), so an additional aal2 gate here is both
+/// redundant and uncallable by the real client.
 pub async fn remove_agent_name(
-    auth: StepUpAuth,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Json(req): Json<AgentNameRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let record = did_ops::remove_agent_name(
-        &auth.0,
+        &auth,
         &state,
         &req.mnemonic,
         &req.name,
@@ -153,20 +157,19 @@ pub async fn remove_agent_name(
     )
     .await?;
     server_push::notify_servers_did(&state, req.mnemonic.clone());
-    info!(did = %auth.0.did, mnemonic = %req.mnemonic, name = %req.name, "agent name removed via REST");
+    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name removed via REST");
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 
-/// `POST /api/agent-names/disable` — park a name (kept reserved). Gated on
-/// `StepUpAuth` (aal2): taking a name out of service can disrupt anyone
-/// relying on it.
+/// `POST /api/agent-names/disable` — park a name (kept reserved), owner or
+/// admin. Not HTTP step-up-gated, for the same reason as `remove` above.
 pub async fn disable_agent_name(
-    auth: StepUpAuth,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Json(req): Json<AgentNameRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let record = did_ops::disable_agent_name(
-        &auth.0,
+        &auth,
         &state,
         &req.mnemonic,
         &req.name,
@@ -175,7 +178,7 @@ pub async fn disable_agent_name(
     )
     .await?;
     server_push::notify_servers_did(&state, req.mnemonic.clone());
-    info!(did = %auth.0.did, mnemonic = %req.mnemonic, name = %req.name, "agent name disabled via REST");
+    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name disabled via REST");
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 
