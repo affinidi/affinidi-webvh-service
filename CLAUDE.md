@@ -137,6 +137,21 @@ the one to add it. Edge derivation mirrors the same rule so an edge structurally
 cannot serve a name the document doesn't claim (Layer-1), but the control plane's
 reconciled registry — not the edge — is the truth.
 
+**Reconciling is not trusting.** Deriving the registry from `alsoKnownAs` says
+what a document *claims*, never that the claim is allowed. So both reconcile
+sites apply the same preconditions the explicit `set` verb does — reserved names
+refused, a name held by another DID refused, all under `path_locks.guard` — and
+the invariant to preserve when touching any of this is:
+
+> **A name only ever changes owner through an explicit `remove` by its current
+> holder.**
+
+Layer-1 verification cannot enforce that for you, and it is worth understanding
+why: after a hijack the new holder's document genuinely claims the name and the
+index genuinely points at them, so a resolver's `alsoKnownAs` round-trip passes.
+Layer-1 proves a served name is claimed by the DID it resolves to; it says
+nothing about *who was entitled to claim it*. That check exists only here.
+
 ## Cross-service networking & integration discipline
 
 This service's primary client is the VTA's `webvh_client`

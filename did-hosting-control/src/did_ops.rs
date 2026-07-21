@@ -479,9 +479,16 @@ pub async fn register_did_atomic(
     // the control plane is the source of record, so a name registered at
     // create/publish time must land in the registry (and its index), not only
     // via the explicit agent-name ops. Parked entries are preserved.
+    //
+    // Reserved and already-held names are refused here exactly as on the
+    // publish path; the `_path_guard` above is the critical section the
+    // collision check needs. A fresh slot is the *easiest* place to attempt a
+    // name capture — nothing else about registering constrains what the
+    // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
-    let (claimed, released) = reconcile_agent_names(&mut new_record, did_log, &reg_domain, now);
+    let (claimed, released) =
+        reconcile_agent_names(state, &mut new_record, path, did_log, &reg_domain, now).await?;
 
     // 4. Single-batch atomic write: record, log content, owner index, agent-name
     //    index; plus old-owner cleanup on takeover. From a resolver's
@@ -661,21 +668,106 @@ async fn prepare_republish(
 /// registry directly and don't go through here; this is only the plain-publish
 /// path, which previously left the registry untouched — so a name bound by
 /// editing `alsoKnownAs` was never registered, and later parking it failed.
-fn reconcile_agent_names(
+///
+/// # The preconditions are not optional here
+///
+/// Reconciling is not the same as trusting. `extract_agent_names` proves only
+/// that an `alsoKnownAs` entry parses as an agent name on *this* domain — it
+/// does not check the name is claimable, and the `agent-names` grammar is far
+/// laxer than [`validate_agent_name`]'s. So this path applies the same two
+/// preconditions the explicit `set` verb does, and for the same reasons:
+///
+/// - **Reserved names are refused.** `@admin` / `@support` / `@security` are a
+///   ready-made phishing primitive; `set` rejects them, and a publish that
+///   claims one must not be the way around that.
+/// - **A name held by another DID is refused.** Otherwise a plain publish
+///   silently repoints the index at the publisher, and Layer-1 verification
+///   cannot detect it: after the hijack the document genuinely claims the name
+///   and the index genuinely points at the hijacker, so a resolver's
+///   `alsoKnownAs` round-trip passes. The victim's name just stops resolving.
+///
+/// The invariant both rules exist to hold: **a name only ever changes owner
+/// through an explicit `remove` by its current holder.**
+///
+/// A claimed name that is merely *malformed* under our grammar (uppercase, too
+/// short, dotted — all of which `AgentName::parse` accepts) is skipped rather
+/// than refused. It is unserveable anyway (the resolve route re-validates and
+/// 404s), so registering it would only add an unreachable index entry, and
+/// failing the publish over an `alsoKnownAs` entry that was never an agent name
+/// in our sense would break unrelated documents.
+///
+/// Callers must hold `state.path_locks.guard(mnemonic)`: the collision check
+/// below and the index write it authorises have to be one critical section, or
+/// two concurrent publishes each see a free name and both claim it.
+async fn reconcile_agent_names(
+    state: &AppState,
     record: &mut DidRecord,
+    mnemonic: &str,
     did_log: &str,
     domain: &str,
     now: u64,
-) -> (Vec<String>, Vec<String>) {
-    let claimed = extract_agent_names(did_log, domain);
+) -> Result<(Vec<String>, Vec<String>), AppError> {
+    let mut claimed = Vec::new();
+    for name in extract_agent_names(did_log, domain) {
+        match validate_agent_name(&name) {
+            Ok(()) => {}
+            // Reserved is a refusal, not a skip — see above.
+            Err(AppError::AgentName(AgentNameError::Reserved)) => {
+                warn!(
+                    mnemonic = %mnemonic,
+                    name = %name,
+                    "publish claims a reserved agent name; refusing"
+                );
+                return Err(AgentNameError::Reserved.into());
+            }
+            // Unserveable, so not worth failing an otherwise valid publish.
+            Err(_) => {
+                debug!(
+                    mnemonic = %mnemonic,
+                    name = %name,
+                    "alsoKnownAs entry is not a valid agent name; not registering"
+                );
+                continue;
+            }
+        }
+
+        // Held by another DID on this domain? Refuse the whole publish. The
+        // caller controls their own document, so the remedy is theirs: drop
+        // the claim and republish. Nobody else can put a document into this
+        // state, so this cannot be used to wedge someone's key rotation.
+        if let Some(bytes) = state.dids_ks.get_raw(agent_name_key(domain, &name)).await?
+            && bytes != mnemonic.as_bytes()
+        {
+            warn!(
+                mnemonic = %mnemonic,
+                name = %name,
+                "publish claims an agent name held by another DID; refusing"
+            );
+            return Err(AgentNameError::Taken.into());
+        }
+
+        claimed.push(name);
+    }
+
     let is_claimed = |n: &str| claimed.iter().any(|c| c == n);
 
-    let released: Vec<String> = record
-        .agent_names
-        .iter()
-        .filter(|e| e.enabled && !is_claimed(&e.name))
-        .map(|e| e.name.clone())
-        .collect();
+    // Names this DID served and no longer claims. Retiring the index entry is
+    // only correct while it still points here — a stale registry entry left by
+    // an earlier hijack must not delete the current holder's index.
+    let mut released = Vec::new();
+    for entry in record.agent_names.iter().filter(|e| e.enabled) {
+        if is_claimed(&entry.name) {
+            continue;
+        }
+        let ours = state
+            .dids_ks
+            .get_raw(agent_name_key(domain, &entry.name))
+            .await?
+            .is_some_and(|bytes| bytes == mnemonic.as_bytes());
+        if ours {
+            released.push(entry.name.clone());
+        }
+    }
 
     let mut next: Vec<AgentNameEntry> = record
         .agent_names
@@ -698,7 +790,7 @@ fn reconcile_agent_names(
     }
     record.agent_names = next;
 
-    (claimed, released)
+    Ok((claimed, released))
 }
 
 pub async fn publish_did(
@@ -708,13 +800,23 @@ pub async fn publish_did(
     did_log: &str,
     request_domain: Option<&str>,
 ) -> Result<(), AppError> {
+    // Serialise the read-modify-write on this slot. `reconcile_agent_names`
+    // checks the name index and then writes it, and the agent-name verbs take
+    // the same lock — without it a publish and a `set` on the same DID, or two
+    // publishes claiming the same free name, interleave between check and
+    // commit.
+    let _guard = state.path_locks.guard(mnemonic).await;
+
     let (mut record, domain) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
     let new_size = record.content_size;
     let now = record.updated_at;
 
-    // Keep the authoritative registry in step with what the document claims.
-    let (claimed, released) = reconcile_agent_names(&mut record, did_log, &domain, now);
+    // Keep the authoritative registry in step with what the document claims —
+    // applying the same preconditions `set` does, so this path cannot be used
+    // to capture a reserved name or take one from another DID.
+    let (claimed, released) =
+        reconcile_agent_names(state, &mut record, mnemonic, did_log, &domain, now).await?;
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -3331,6 +3433,270 @@ mod tests_atomic {
                 .as_deref(),
             Some(path),
             "a parked name keeps its index reservation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent names: the publish path applies the same preconditions as `set`
+    //
+    // Reconciling the registry from `alsoKnownAs` must not become a way around
+    // the checks the explicit verb makes. Each of these mirrors a `set_*` test
+    // above, driven through a plain publish instead.
+    // -----------------------------------------------------------------------
+
+    /// `set` refuses a reserved name; a publish claiming one must too, or
+    /// `@admin` is a one-`PUT` phishing primitive.
+    #[tokio::test]
+    async fn publish_cannot_capture_a_reserved_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-pub-reserved";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        let log = build_test_did_log_with_names("control.test", path, &["admin"]).await;
+        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Reserved)),
+            "expected Reserved, got {err:?}"
+        );
+
+        assert_eq!(
+            index_target(&state, "control.test", "admin").await,
+            None,
+            "a refused publish must not write the index"
+        );
+        assert_eq!(
+            get_record(&state, path).await.version_count,
+            before,
+            "a refused publish must not advance the version"
+        );
+    }
+
+    /// The hijack. Layer-1 cannot catch this one: after the overwrite the
+    /// hijacker's document genuinely claims the name and the index genuinely
+    /// points at them, so a resolver's `alsoKnownAs` round-trip passes and the
+    /// victim's name simply stops resolving. It has to be refused here.
+    #[tokio::test]
+    async fn publish_cannot_hijack_a_name_held_by_another_did() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let log_a = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &log_a, None)
+            .await
+            .expect("owner A binds alice");
+
+        // B publishes a document claiming A's name.
+        let log_b = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
+        let err = publish_did(&owner_auth(owner_b), &state, "slot-b", &log_b, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Taken)),
+            "expected Taken, got {err:?}"
+        );
+
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a"),
+            "the name must still resolve to its holder"
+        );
+        assert!(
+            get_record(&state, "slot-a")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled),
+            "the holder's registry entry must be untouched"
+        );
+        assert!(
+            !get_record(&state, "slot-b")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice"),
+            "the hijacker must not end up registered"
+        );
+
+        // The control: the holder re-publishing its own name is not a
+        // collision, it is a refresh.
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &log_a, None)
+            .await
+            .expect("re-publishing one's own name must still work");
+    }
+
+    /// Parking deliberately keeps the reservation, so a parked name is exactly
+    /// what an opportunist would try to take — `disable` holds the index for
+    /// this reason, and the publish path must honour it.
+    #[tokio::test]
+    async fn publish_cannot_hijack_a_parked_name() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+            .await
+            .unwrap();
+        let park = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
+        disable_agent_name(&owner_auth(owner_a), &state, "slot-a", "alice", &park, None)
+            .await
+            .expect("park");
+
+        let log_b = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
+        let err = publish_did(&owner_auth(owner_b), &state, "slot-b", &log_b, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Taken)),
+            "expected Taken, got {err:?}"
+        );
+        assert!(
+            get_record(&state, "slot-a")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && !e.enabled),
+            "the parked reservation must survive the attempt"
+        );
+    }
+
+    /// A fresh slot is the easiest place to try a capture — nothing else about
+    /// registering constrains what the submitted document may claim.
+    #[tokio::test]
+    async fn register_cannot_capture_a_held_or_reserved_name() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+            .await
+            .unwrap();
+
+        // Register a brand-new slot whose first document claims A's name.
+        let log_b = build_test_did_log_with_names("control.test", "slot-new", &["alice"]).await;
+        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-new", &log_b, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Taken)),
+            "expected Taken, got {err:?}"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a"),
+        );
+
+        // …and the same for a reserved name on a fresh slot.
+        let log_r = build_test_did_log_with_names("control.test", "slot-res", &["support"]).await;
+        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-res", &log_r, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Reserved)),
+            "expected Reserved, got {err:?}"
+        );
+    }
+
+    /// `AgentName::parse` is far laxer than our grammar — it accepts uppercase,
+    /// single characters, dots. Such an entry is unserveable (the resolve route
+    /// re-validates and 404s), so it is skipped, not refused: failing the
+    /// publish would break documents whose `alsoKnownAs` was never meant as an
+    /// agent name in our sense.
+    #[tokio::test]
+    async fn publish_skips_an_unserveable_name_instead_of_failing() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-lax";
+        register_owned(&state, owner, path).await;
+
+        // "Bob" is a well-formed agent-name URI but not a valid name here.
+        let log = build_test_did_log_with_names("control.test", path, &["Bob", "alice"]).await;
+        publish_did(&owner_auth(owner), &state, path, &log, None)
+            .await
+            .expect("an unserveable entry must not fail the publish");
+
+        let rec = get_record(&state, path).await;
+        assert!(
+            rec.agent_names.iter().any(|e| e.name == "alice"),
+            "the valid name still registers"
+        );
+        assert!(
+            !rec.agent_names.iter().any(|e| e.name == "Bob"),
+            "the invalid one must not enter the registry"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "Bob").await,
+            None,
+            "nor the index"
+        );
+    }
+
+    /// Releasing retires the index only while it still points here. A registry
+    /// entry left over from before the guards existed must not become a way to
+    /// delete the current holder's index.
+    #[tokio::test]
+    async fn publish_release_does_not_retire_another_dids_index() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        // A holds alice legitimately.
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+            .await
+            .unwrap();
+
+        // B's record carries a stale enabled entry for alice (the state an
+        // earlier hijack would have left behind), while the index points at A.
+        let mut rec_b = get_record(&state, "slot-b").await;
+        rec_b.agent_names.push(AgentNameEntry {
+            name: "alice".to_string(),
+            enabled: true,
+            created_at: 0,
+        });
+        state
+            .dids_ks
+            .insert(did_key("slot-b"), &rec_b)
+            .await
+            .unwrap();
+
+        // B publishes without claiming alice: its own stale entry goes, but the
+        // index belongs to A and must survive.
+        let drop = build_test_did_log_with_names("control.test", "slot-b", &[]).await;
+        publish_did(&owner_auth(owner_b), &state, "slot-b", &drop, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !get_record(&state, "slot-b")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice"),
+            "B drops its stale entry"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a"),
+            "A's index entry must survive B's release"
         );
     }
 }
