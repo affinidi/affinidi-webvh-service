@@ -22,7 +22,46 @@ import {
   digestPrefix,
   type TaskConsentRequired,
 } from "../../lib/wallet";
-import type { DidStats, DidDetailResponse, LogEntryInfo, WatcherSyncStatus } from "../../lib/api";
+import type {
+  DidStats,
+  DidDetailResponse,
+  LogEntryInfo,
+  WatcherSyncStatus,
+} from "../../lib/api";
+
+// ---------------------------------------------------------------------------
+// Agent-name helpers
+// ---------------------------------------------------------------------------
+
+/** The hosting domain a name is scoped to — the DID's own host. Prefer the
+ *  record's tagged `domain`; fall back to the host segment of the `did:webvh`
+ *  identifier (percent-decoded, e.g. `localhost%3A8534` → `localhost:8534`). */
+function agentDomainOf(detail: DidDetailResponse | null): string | null {
+  if (detail?.domain) return detail.domain;
+  const didId = detail?.didId;
+  if (!didId) return null;
+  // did:webvh:<scid>:<host>:<path...> → host at index 3.
+  const parts = didId.split(":");
+  if (parts.length < 5 || parts[0] !== "did") return null;
+  try {
+    return decodeURIComponent(parts[3]);
+  } catch {
+    return parts[3];
+  }
+}
+
+/** If `aka` is an agent name (`…/@local`) on `domain`, return its local part.
+ *  Host match is case-insensitive; the local part is returned verbatim (the
+ *  spec compares it case-sensitively). */
+function agentNameLocalPart(aka: string, domain: string): string | null {
+  const noScheme = aka.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const marker = noScheme.indexOf("/@");
+  if (marker < 0) return null;
+  const host = noScheme.slice(0, marker);
+  const local = noScheme.slice(marker + 2).split("/")[0];
+  if (!local || host.toLowerCase() !== domain.toLowerCase()) return null;
+  return local;
+}
 
 // ---------------------------------------------------------------------------
 // Main component
@@ -71,6 +110,12 @@ export default function DidDetail() {
   const [paramPortable, setParamPortable] = useState(false);
   const [paramTtl, setParamTtl] = useState<string>("");
   const [knownWatcherUrls, setKnownWatcherUrls] = useState<string[]>([]);
+  // Agent names (`/@alice`)
+  const [nameInput, setNameInput] = useState("");
+  const [nameStatus, setNameStatus] = useState<
+    "checking" | "available" | "taken" | "reserved" | "error" | null
+  >(null);
+  const nameDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
@@ -129,6 +174,41 @@ export default function DidDetail() {
       setParamAlsoKnownAs(aka);
     }
   }, [logEntries]);
+
+  // The hosting domain this DID's names are scoped to.
+  const agentDomain = agentDomainOf(didDetail);
+
+  // The names currently claimed by the live document, parsed from its
+  // `alsoKnownAs`. Source of truth is the signed log — the edge serves exactly
+  // what the document claims — so this list mirrors what actually resolves.
+  const currentState = logEntries[logEntries.length - 1]?.state ?? null;
+  const boundNames: string[] = agentDomain
+    ? (Array.isArray(currentState?.alsoKnownAs) ? currentState!.alsoKnownAs : [])
+        .map((a: unknown) => (typeof a === "string" ? agentNameLocalPart(a, agentDomain) : null))
+        .filter((n): n is string => !!n)
+    : [];
+
+  // Debounced availability probe as the user types a new name.
+  useEffect(() => {
+    if (nameDebounce.current) clearTimeout(nameDebounce.current);
+    const trimmed = nameInput.trim().replace(/^@/, "");
+    if (trimmed.length < 2 || !agentDomain) {
+      setNameStatus(null);
+      return;
+    }
+    setNameStatus("checking");
+    nameDebounce.current = setTimeout(() => {
+      api
+        .checkAgentName(trimmed, agentDomain)
+        .then((r) =>
+          setNameStatus(r.reserved ? "reserved" : r.available ? "available" : "taken"),
+        )
+        .catch(() => setNameStatus("error"));
+    }, 400);
+    return () => {
+      if (nameDebounce.current) clearTimeout(nameDebounce.current);
+    };
+  }, [nameInput, agentDomain, api]);
 
   const handleCopyDidId = async () => {
     if (!didDetail?.didId) return;
@@ -361,6 +441,112 @@ export default function DidDetail() {
     return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consent?.payloadDigest]);
+
+  // Bind a name: publish a new version whose `alsoKnownAs` claims
+  // `https://<domain>/@<name>`. The edge derives the served name from that
+  // signed claim, so the redirect starts resolving once the agent publishes —
+  // no separate provisioning call needed.
+  const handleBindName = async () => {
+    const name = nameInput.trim().replace(/^@/, "");
+    if (!name || !agentDomain || !currentState) return;
+    if (boundNames.includes(name)) {
+      showAlert("Already bound", `@${name} is already on this DID.`);
+      return;
+    }
+    const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
+      ? currentState.alsoKnownAs.filter((a: unknown) => typeof a === "string")
+      : [];
+    const nextDoc = {
+      ...currentState,
+      alsoKnownAs: [...currentAka, `https://${agentDomain}/@${name}`],
+    };
+    setNameInput("");
+    setNameStatus(null);
+    await handlePublishViaVta(nextDoc);
+  };
+
+  // Remove a name: publish a version that no longer claims it. The redirect
+  // stops resolving and the name is freed for anyone to reclaim. (Parking a
+  // name — keeping it reserved but out of service — needs the step-up-gated
+  // provisioning endpoint and is not part of this surface yet.)
+  const handleUnbindName = (name: string) => {
+    if (!agentDomain || !currentState) return;
+    showConfirm(
+      "Remove name",
+      `Stop serving @${name}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
+      async () => {
+        const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
+          ? currentState.alsoKnownAs.filter((a: unknown) => typeof a === "string")
+          : [];
+        const nextAka = currentAka.filter(
+          (a) => agentNameLocalPart(a, agentDomain) !== name,
+        );
+        await handlePublishViaVta({ ...currentState, alsoKnownAs: nextAka });
+      },
+    );
+  };
+
+  // The cross-device approval code, shown wherever a publish is awaiting the
+  // user's approval — a plain document edit OR an agent-name change, since both
+  // go through the same delegated-publish flow. Returns null when idle.
+  const consentMatchPanel = () =>
+    consent ? (
+      <View
+        style={{
+          marginTop: spacing.md,
+          padding: spacing.md,
+          borderWidth: 1,
+          borderColor: colors.warning ?? colors.border,
+          borderRadius: radii.sm,
+          gap: spacing.sm,
+        }}
+      >
+        <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>
+          Approve this on your device
+        </Text>
+        <Text style={styles.hint}>
+          {consent.sideEffects === "destructive"
+            ? "This cannot be undone. Your agent has sent the change to your approving device, which will ask you to TYPE the code below. Do not type it from memory of this screen — read it from here, and only approve if the device shows the same code."
+            : "Your agent has sent this change to your approving device, with a description of what it will do. Check that the code shown there matches the one below, then approve it."}
+        </Text>
+        <Text
+          style={{
+            fontFamily: fonts.mono,
+            fontSize: 28,
+            letterSpacing: 6,
+            color: colors.textPrimary,
+            textAlign: "center",
+            paddingVertical: spacing.sm,
+          }}
+          selectable
+        >
+          {digestPrefix(consent.payloadDigest)}
+        </Text>
+        <Text style={styles.hint}>
+          If the codes differ, deny it. A code that does not match means the
+          change your device is showing you is not the change that would be made.
+        </Text>
+        {autoApplying && (
+          <Text style={[styles.hint, { textAlign: "center" }]}>
+            Waiting for your approval — this will publish automatically the
+            moment you approve.
+          </Text>
+        )}
+        <Pressable
+          style={[styles.outlineButton, publishing && styles.disabled]}
+          onPress={() => void handlePublishViaVta(proposed ?? undefined)}
+          disabled={publishing}
+        >
+          <Text style={styles.outlineButtonText}>
+            {publishing
+              ? "Checking..."
+              : autoApplying
+                ? "Publish now"
+                : "I have approved it — publish"}
+          </Text>
+        </Pressable>
+      </View>
+    ) : null;
 
   const handleToggleDocEdit = () => {
     if (!editingDoc && logEntries[selectedVersion]?.state) {
@@ -718,7 +904,9 @@ export default function DidDetail() {
                 )}
 
                 {/*
-                  The cross-device match.
+                  The cross-device match. Extracted to `consentMatchPanel` so
+                  the same approval code renders for an agent-name change too;
+                  see the note there.
 
                   Every other check in this design assumes an honest device. Only
                   this one survives a compromised one, because only this one moves
@@ -728,63 +916,7 @@ export default function DidDetail() {
                   a spinner is something you wait out; a code is something you
                   check.
                 */}
-                {consent && (
-                  <View
-                    style={{
-                      marginTop: spacing.md,
-                      padding: spacing.md,
-                      borderWidth: 1,
-                      borderColor: colors.warning ?? colors.border,
-                      borderRadius: radii.sm,
-                      gap: spacing.sm,
-                    }}
-                  >
-                    <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>
-                      Approve this on your device
-                    </Text>
-                    <Text style={styles.hint}>
-                      {consent.sideEffects === "destructive"
-                        ? "This cannot be undone. Your agent has sent the change to your approving device, which will ask you to TYPE the code below. Do not type it from memory of this screen — read it from here, and only approve if the device shows the same code."
-                        : "Your agent has sent this change to your approving device, with a description of what it will do. Check that the code shown there matches the one below, then approve it."}
-                    </Text>
-                    <Text
-                      style={{
-                        fontFamily: fonts.mono,
-                        fontSize: 28,
-                        letterSpacing: 6,
-                        color: colors.textPrimary,
-                        textAlign: "center",
-                        paddingVertical: spacing.sm,
-                      }}
-                      selectable
-                    >
-                      {digestPrefix(consent.payloadDigest)}
-                    </Text>
-                    <Text style={styles.hint}>
-                      If the codes differ, deny it. A code that does not match means the
-                      change your device is showing you is not the change that would be made.
-                    </Text>
-                    {autoApplying && (
-                      <Text style={[styles.hint, { textAlign: "center" }]}>
-                        Waiting for your approval — this will publish automatically the
-                        moment you approve.
-                      </Text>
-                    )}
-                    <Pressable
-                      style={[styles.outlineButton, publishing && styles.disabled]}
-                      onPress={() => void handlePublishViaVta(proposed ?? undefined)}
-                      disabled={publishing}
-                    >
-                      <Text style={styles.outlineButtonText}>
-                        {publishing
-                          ? "Checking..."
-                          : autoApplying
-                            ? "Publish now"
-                            : "I have approved it — publish"}
-                      </Text>
-                    </Pressable>
-                  </View>
-                )}
+                {consentMatchPanel()}
               </>
             ) : (
               logEntries[selectedVersion]?.state && (
@@ -808,6 +940,128 @@ export default function DidDetail() {
                   </pre>
                 </div>
               )
+            )}
+          </View>
+        )}
+
+        {/* Agent names */}
+        {logEntries.length > 0 && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Agent Names</Text>
+            <Text style={styles.hint}>
+              A human-memorable shortcut —{" "}
+              {agentDomain ? `${agentDomain}/@name` : "yourdomain/@name"} — that
+              redirects to this DID. A name is served because the signed document
+              claims it via alsoKnownAs, so binding one publishes a new version
+              through your agent.
+            </Text>
+
+            {boundNames.length > 0 ? (
+              <View style={{ gap: spacing.sm, marginTop: spacing.md }}>
+                {boundNames.map((name) => (
+                  <View
+                    key={name}
+                    style={{
+                      flexDirection: "row",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: spacing.md,
+                    }}
+                  >
+                    <Text style={{ fontFamily: fonts.mono, color: colors.textPrimary }}>
+                      @{name}
+                    </Text>
+                    <Pressable
+                      style={[styles.smallButton, publishing && styles.disabled]}
+                      onPress={() => handleUnbindName(name)}
+                      disabled={publishing}
+                    >
+                      <Text style={styles.smallButtonText}>Remove</Text>
+                    </Pressable>
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text style={[styles.hint, { marginTop: spacing.sm }]}>
+                No names bound yet.
+              </Text>
+            )}
+
+            {!agentDomain ? (
+              <Text style={[styles.hint, { marginTop: spacing.md }]}>
+                This DID has no published document yet — publish one before
+                binding a name.
+              </Text>
+            ) : isWalletTaskRelayAvailable() ? (
+              <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
+                <View
+                  style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}
+                >
+                  <Text style={{ color: colors.textSecondary, fontFamily: fonts.mono }}>
+                    @
+                  </Text>
+                  <input
+                    type="text"
+                    value={nameInput}
+                    onChange={(e) => setNameInput(e.target.value)}
+                    placeholder="alice"
+                    disabled={publishing}
+                    style={{
+                      flex: 1,
+                      backgroundColor: colors.bgPrimary,
+                      color: colors.textPrimary,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: radii.sm,
+                      padding: "6px 10px",
+                      fontFamily: fonts.mono,
+                      fontSize: 14,
+                    }}
+                  />
+                  <Pressable
+                    style={[
+                      styles.button,
+                      { marginTop: 0 },
+                      (publishing || nameStatus !== "available") && styles.disabled,
+                    ]}
+                    onPress={() => void handleBindName()}
+                    disabled={publishing || nameStatus !== "available"}
+                  >
+                    <Text style={styles.buttonText}>
+                      {publishing ? "Asking your agent..." : "Bind name"}
+                    </Text>
+                  </Pressable>
+                </View>
+                {nameStatus && (
+                  <Text
+                    style={{
+                      fontSize: 13,
+                      color:
+                        nameStatus === "available"
+                          ? colors.success
+                          : nameStatus === "checking"
+                            ? colors.textSecondary
+                            : colors.error,
+                    }}
+                  >
+                    {nameStatus === "checking"
+                      ? "Checking…"
+                      : nameStatus === "available"
+                        ? "Available"
+                        : nameStatus === "taken"
+                          ? "Already taken on this domain"
+                          : nameStatus === "reserved"
+                            ? "Reserved by the host"
+                            : "Could not check availability"}
+                  </Text>
+                )}
+                {/* The approval code lands here when a name change is pending
+                    (the doc editor shows it in its own section when open). */}
+                {!editingDoc && consentMatchPanel()}
+              </View>
+            ) : (
+              <Text style={[styles.hint, { marginTop: spacing.md }]}>
+                Binding a name needs a connected agent wallet to sign the update.
+              </Text>
             )}
           </View>
         )}
