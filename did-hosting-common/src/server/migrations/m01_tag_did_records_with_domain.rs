@@ -205,6 +205,7 @@ mod tests {
             method: "webvh".into(),
             domain: String::new(), // legacy state
             services: None,
+            agent_names: Vec::new(),
         }
     }
 
@@ -222,6 +223,7 @@ mod tests {
             method: "webvh".into(),
             domain: domain.into(),
             services: None,
+            agent_names: Vec::new(),
         }
     }
 

@@ -1860,6 +1860,7 @@ mod tests {
             // T12: legacy construction site; T13 migration fills `domain`.
             method: "webvh".to_string(),
             domain: String::new(),
+            agent_names: Vec::new(),
         };
         state
             .dids_ks

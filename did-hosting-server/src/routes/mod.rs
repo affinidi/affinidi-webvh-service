@@ -4,6 +4,7 @@ mod config;
 pub(crate) mod did_manage;
 pub mod did_public;
 pub(crate) mod health;
+pub mod resolve_agent_name;
 mod resolve_shared;
 #[cfg(feature = "method-web")]
 pub mod resolve_web;
@@ -16,6 +17,20 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 
 use crate::server::AppState;
+
+/// Agent-name redirect routes (`/@{name}` and `/@{name}/{*context}`).
+///
+/// Registered on both the full and public-only routers because a redirect is a
+/// public read, like `.well-known`. The routes are always present; the handler
+/// gates on `features.agent_names` at request time and 404s when the feature is
+/// off, so a disabled deployment is indistinguishable from one with no names.
+/// This keeps the runtime flag out of router *construction*, which is otherwise
+/// compile-time.
+fn agent_name_routes() -> Router<AppState> {
+    Router::new()
+        .route("/@{name}", get(resolve_agent_name::serve))
+        .route("/@{name}/{*context}", get(resolve_agent_name::serve))
+}
 
 /// Build the server router without the DID-serving fallback.
 ///
@@ -94,7 +109,7 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         );
     }
 
-    router
+    router.merge(agent_name_routes())
 }
 
 /// Build a minimal router with only public DID-serving routes (daemon mode).
@@ -123,7 +138,7 @@ pub fn router_public_only() -> Router<AppState> {
             get(resolve_web::serve_root_did_web),
         );
     }
-    router
+    router.merge(agent_name_routes())
 }
 
 /// Build the full server router with DID-serving fallback (standalone mode).

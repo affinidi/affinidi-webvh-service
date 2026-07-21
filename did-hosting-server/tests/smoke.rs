@@ -293,6 +293,7 @@ async fn resolve_side_safety_blocks_cross_domain_and_disabled_domain() {
         method: "webvh".into(),
         domain: "domain-a.example".into(),
         services: None,
+        agent_names: Vec::new(),
     };
     state
         .dids_ks
@@ -532,6 +533,7 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
         method: "webvh".into(),
         domain: String::new(), // legacy state
         services: None,        // legacy state
+        agent_names: Vec::new(),
     };
     state
         .dids_ks

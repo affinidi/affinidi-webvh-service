@@ -279,6 +279,7 @@ impl DaemonConfig {
             didcomm: self.features.didcomm,
             tsp: self.features.tsp,
             rest_api: self.features.rest_api,
+            agent_names: self.features.agent_names,
             deployment_mode: "daemon".to_string(),
         }
     }

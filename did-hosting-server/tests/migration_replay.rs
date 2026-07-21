@@ -92,6 +92,7 @@ fn pre_t12_record(mnemonic: &str, did_id: Option<&str>) -> DidRecord {
         domain: String::new(),
         // Absent services — what M-02 fills in.
         services: None,
+        agent_names: Vec::new(),
     }
 }
 

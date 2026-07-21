@@ -46,6 +46,7 @@ fn legacy_record(mnemonic: &str) -> DidRecord {
         method: "webvh".into(),
         domain: String::new(),
         services: None,
+        agent_names: Vec::new(),
     }
 }
 

@@ -193,6 +193,7 @@ mod tests {
             method: "webvh".into(),
             domain: "host.example".into(),
             services,
+            agent_names: Vec::new(),
         }
     }
 

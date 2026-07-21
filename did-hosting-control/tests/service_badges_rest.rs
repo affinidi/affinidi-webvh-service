@@ -166,6 +166,7 @@ async fn seed_did(
         method: "webvh".to_string(),
         domain: "control.test".to_string(),
         services,
+        agent_names: Vec::new(),
     };
     let mut batch = state.store.batch();
     batch

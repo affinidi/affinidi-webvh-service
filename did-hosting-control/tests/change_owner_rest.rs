@@ -177,6 +177,7 @@ async fn seed_did(state: &AppState, owner_did: &str, mnemonic: &str) {
         method: "webvh".to_string(),
         domain: String::new(),
         services: None,
+        agent_names: Vec::new(),
     };
     let mut batch = state.store.batch();
     batch

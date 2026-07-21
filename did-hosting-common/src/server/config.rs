@@ -15,6 +15,15 @@ pub struct FeaturesConfig {
     pub tsp: bool,
     #[serde(default)]
     pub rest_api: bool,
+    /// Serve agent-name redirects (`GET /@alice` -> 302 to a DID).
+    ///
+    /// Off by default. A name only resolves if the signed DID document already
+    /// claims it via `alsoKnownAs`, so enabling this cannot by itself expose a
+    /// name the controller has not authorised — but it does turn the `/@…`
+    /// namespace into a served route, which an operator should opt into
+    /// deliberately.
+    #[serde(default)]
+    pub agent_names: bool,
     /// Deployment mode: "standalone" for individual services, "daemon" for unified binary.
     /// Controls UI behavior (e.g., hiding service topology in daemon mode).
     #[serde(default = "default_deployment_mode")]
@@ -749,6 +758,10 @@ pub fn apply_env_overrides(
     env_bool!(&format!("{prefix}_FEATURES_DIDCOMM"), features.didcomm);
     env_bool!(&format!("{prefix}_FEATURES_TSP"), features.tsp);
     env_bool!(&format!("{prefix}_FEATURES_REST_API"), features.rest_api);
+    env_bool!(
+        &format!("{prefix}_FEATURES_AGENT_NAMES"),
+        features.agent_names
+    );
 
     // Server
     env_str!(&format!("{prefix}_SERVER_HOST"), server.host);
