@@ -19,8 +19,10 @@ import { showAlert, showConfirm } from "../../lib/alert";
 import {
   isWalletTaskRelayAvailable,
   requestDidUpdate,
+  requestAgentNameTask,
   digestPrefix,
   type TaskConsentRequired,
+  type RequestTaskOutcome,
 } from "../../lib/wallet";
 import type {
   DidStats,
@@ -94,15 +96,20 @@ export default function DidDetail() {
   // Delegated publish: the VTA holds the update key, so we propose and it decides.
   const [publishing, setPublishing] = useState(false);
   const [consent, setConsent] = useState<TaskConsentRequired | null>(null);
-  // The exact document the outstanding approval is bound to.
+  // The exact re-submit the outstanding approval is bound to — a document
+  // publish OR an agent-name park/resume.
   //
-  // The approval is bound to a digest of the payload, so a retry MUST send the
-  // identical document. If the user edits the textarea while their phone is
-  // buzzing and we then submitted the new text, the digest would not match, the
-  // grant would not be found, and the VTA would raise a fresh approval — which
-  // is the *safe* failure, but a baffling one. Pinning what was proposed keeps
-  // "I approved it" meaning what the user thinks it means.
-  const [proposed, setProposed] = useState<Record<string, unknown> | null>(null);
+  // The approval is bound to a digest of the *payload*, so a retry MUST send
+  // the identical request. If the user edited the textarea (or typed a
+  // different name) while their phone was buzzing and we then submitted the new
+  // input, the digest would not match, the grant would not be found, and the
+  // VTA would raise a fresh approval — the *safe* failure, but a baffling one.
+  // Pinning the exact re-submit closure keeps "I approved it" meaning what the
+  // user thinks it means. A ref, not state: it is read only from the
+  // grant-event handler and the manual button, never rendered.
+  const resubmitRef = useRef<
+    ((opts?: { silent?: boolean }) => Promise<"accepted" | "consent" | "error">) | null
+  >(null);
   const [editingParams, setEditingParams] = useState(false);
   const [paramWatchers, setParamWatchers] = useState<string[]>([]);
   const [paramWitnesses, setParamWitnesses] = useState<string[]>([]);
@@ -116,6 +123,9 @@ export default function DidDetail() {
     "checking" | "available" | "taken" | "reserved" | "error" | null
   >(null);
   const nameDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Resume a parked name — typed, because a parked name is absent from the
+  // document's `alsoKnownAs`, so the served-names list can't surface it.
+  const [resumeInput, setResumeInput] = useState("");
 
   const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
@@ -347,17 +357,48 @@ export default function DidDetail() {
   // `opts.silent` is the background poll: it suppresses the toast and the
   // `publishing` spinner (so the button doesn't flicker "Checking…" on every
   // tick) but still resolves the approval — a granted update is always announced.
+  // Run one delegated task through the wallet: submit, and on a
+  // `consentRequired` refusal pin the exact re-submit so the grant event (and
+  // the manual button) can replay it byte-identically. `submit` and `resubmit`
+  // MUST produce the same payload, or the approved digest won't match.
+  const runDelegatedTask = async (
+    submit: () => Promise<RequestTaskOutcome>,
+    resubmit: (opts?: { silent?: boolean }) => Promise<PublishResult>,
+    successMsg: string,
+    opts?: { silent?: boolean },
+  ): Promise<PublishResult> => {
+    const silent = opts?.silent ?? false;
+    if (!silent) setPublishing(true);
+    try {
+      const outcome = await submit();
+      if (outcome.kind === "consentRequired") {
+        resubmitRef.current = resubmit;
+        setConsent(outcome);
+        return "consent";
+      }
+      resubmitRef.current = null;
+      setConsent(null);
+      setEditingDoc(false);
+      showAlert("Done", successMsg);
+      loadData();
+      return "accepted";
+    } catch (e: unknown) {
+      if (!silent) showAlert("Error", e instanceof Error ? e.message : "The request failed.");
+      return "error";
+    } finally {
+      if (!silent) setPublishing(false);
+    }
+  };
+
   const handlePublishViaVta = async (
     retryOf?: Record<string, unknown>,
     opts?: { silent?: boolean },
   ): Promise<PublishResult> => {
-    const silent = opts?.silent ?? false;
     const didId = didDetail?.didId;
     if (!didId) {
-      if (!silent) showAlert("Error", "This DID has no published identifier yet.");
+      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
       return "error";
     }
-
     let document: Record<string, unknown>;
     if (retryOf) {
       document = retryOf;
@@ -365,66 +406,62 @@ export default function DidDetail() {
       try {
         document = JSON.parse(docEditValue) as Record<string, unknown>;
       } catch {
-        if (!silent) showAlert("Error", "The document is not valid JSON.");
+        if (!opts?.silent) showAlert("Error", "The document is not valid JSON.");
         return "error";
       }
     }
-
     // The version we based this edit on. A human in the approval loop makes the
     // window minutes wide, so the log really can move underneath us; without this
     // the VTA would apply our edit on top of someone else's and every signature in
     // the resulting chain would still verify.
-    const latest = logEntries[logEntries.length - 1];
-    const expectedVersionId = latest?.versionId ?? undefined;
-
-    if (!silent) setPublishing(true);
-    try {
-      const outcome = await requestDidUpdate({
-        did: didId,
-        document,
-        ...(expectedVersionId ? { expectedVersionId } : {}),
-      });
-
-      if (outcome.kind === "consentRequired") {
-        setProposed(document);
-        setConsent(outcome);
-        return "consent";
-      }
-
-      setConsent(null);
-      setProposed(null);
-      setEditingDoc(false);
-      showAlert("Published", "Your agent signed and published the update.");
-      loadData();
-      return "accepted";
-    } catch (e: unknown) {
-      if (!silent) showAlert("Error", e instanceof Error ? e.message : "The update failed.");
-      return "error";
-    } finally {
-      if (!silent) setPublishing(false);
-    }
+    const expectedVersionId = logEntries[logEntries.length - 1]?.versionId ?? undefined;
+    return runDelegatedTask(
+      () =>
+        requestDidUpdate({
+          did: didId,
+          document,
+          ...(expectedVersionId ? { expectedVersionId } : {}),
+        }),
+      (o) => handlePublishViaVta(document, o),
+      "Your agent signed and published the update.",
+      opts,
+    );
   };
 
-  // ── Auto-apply: publish the moment the approval lands ──────────────────────
+  // Park (`enable === false`) or resume (`enable === true`) an agent name
+  // through the agent. The VTA reads the current document, edits `alsoKnownAs`,
+  // signs, and calls the host — so unlike a bind/remove we send only the name.
+  const runParkResume = (
+    name: string,
+    enable: boolean,
+    opts?: { silent?: boolean },
+  ): Promise<PublishResult> => {
+    const didId = didDetail?.didId;
+    if (!didId) {
+      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
+      return Promise.resolve("error");
+    }
+    return runDelegatedTask(
+      () => requestAgentNameTask({ did: didId, name, enable }),
+      (o) => runParkResume(name, enable, o),
+      enable ? `@${name} is being served again.` : `@${name} has been parked.`,
+      opts,
+    );
+  };
+
+  // ── Auto-apply: run the moment the approval lands ──────────────────────────
   //
   // Event-driven only. The wallet emits `vtawallet:consentgranted` (with the
-  // payloadDigest) the instant the VTA reports the grant, and we re-submit the
-  // *pinned* `proposed` document exactly once — its digest matches the
+  // payloadDigest) the instant the VTA reports the grant, and we replay the
+  // *pinned* re-submit exactly once — its payload digest matches the
   // outstanding approval, so the VTA applies it. The manual button is the
   // fallback for a missed event.
   //
   // There is deliberately NO timer poll. Every re-submit goes through the
-  // wallet's `requestTask`, which shows an un-skippable worker-mode confirm
-  // ("send this request to your VTA"). A blind re-submit loop therefore
-  // re-opens that popup on every tick — the poll that used to live here did
-  // exactly that, popping a fresh confirmation every 15s the whole time we were
-  // waiting for the approver. A single re-submit on the grant event is the only
-  // safe re-attempt; anything periodic must not go through `requestTask`.
-  const autoApplying = Boolean(consent && proposed);
-  const attemptRef = useRef(handlePublishViaVta);
-  attemptRef.current = handlePublishViaVta;
-  const proposedRef = useRef(proposed);
-  proposedRef.current = proposed;
+  // wallet's `requestTask`, which shows an un-skippable worker-mode confirm.
+  // A blind re-submit loop would re-open that popup on every tick; a single
+  // re-submit on the grant event is the only safe re-attempt.
+  const autoApplying = consent != null;
 
   // Event-driven: re-attempt the instant the wallet reports our approval landed.
   useEffect(() => {
@@ -434,8 +471,7 @@ export default function DidDetail() {
       const detail = (ev as CustomEvent).detail as { payloadDigest?: string } | undefined;
       // Only the approval we're waiting on — ignore events for other tasks.
       if (detail?.payloadDigest !== digest) return;
-      const pinned = proposedRef.current;
-      if (pinned) void attemptRef.current(pinned, { silent: true });
+      void resubmitRef.current?.({ silent: true });
     };
     window.addEventListener("vtawallet:consentgranted", onGranted);
     return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
@@ -466,9 +502,8 @@ export default function DidDetail() {
   };
 
   // Remove a name: publish a version that no longer claims it. The redirect
-  // stops resolving and the name is freed for anyone to reclaim. (Parking a
-  // name — keeping it reserved but out of service — needs the step-up-gated
-  // provisioning endpoint and is not part of this surface yet.)
+  // stops resolving and the name is freed for anyone to reclaim. Distinct from
+  // parking (below), which keeps the name reserved to this DID.
   const handleUnbindName = (name: string) => {
     if (!agentDomain || !currentState) return;
     showConfirm(
@@ -484,6 +519,26 @@ export default function DidDetail() {
         await handlePublishViaVta({ ...currentState, alsoKnownAs: nextAka });
       },
     );
+  };
+
+  // Park a name: stop serving it but keep it reserved to this DID. Unlike
+  // remove, the agent runs a dedicated task that both drops the claim and tells
+  // the host to hold the reservation — so nobody else can take it while parked.
+  const handleParkName = (name: string) => {
+    showConfirm(
+      "Park name",
+      `Park @${name}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
+      () => void runParkResume(name, false),
+    );
+  };
+
+  // Resume a parked name (typed by the user — a parked name isn't in the
+  // document, so it can't be listed).
+  const handleResumeName = () => {
+    const name = resumeInput.trim().replace(/^@/, "");
+    if (!name) return;
+    setResumeInput("");
+    void runParkResume(name, true);
   };
 
   // The cross-device approval code, shown wherever a publish is awaiting the
@@ -534,7 +589,7 @@ export default function DidDetail() {
         )}
         <Pressable
           style={[styles.outlineButton, publishing && styles.disabled]}
-          onPress={() => void handlePublishViaVta(proposed ?? undefined)}
+          onPress={() => void resubmitRef.current?.()}
           disabled={publishing}
         >
           <Text style={styles.outlineButtonText}>
@@ -971,13 +1026,22 @@ export default function DidDetail() {
                     <Text style={{ fontFamily: fonts.mono, color: colors.textPrimary }}>
                       @{name}
                     </Text>
-                    <Pressable
-                      style={[styles.smallButton, publishing && styles.disabled]}
-                      onPress={() => handleUnbindName(name)}
-                      disabled={publishing}
-                    >
-                      <Text style={styles.smallButtonText}>Remove</Text>
-                    </Pressable>
+                    <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                      <Pressable
+                        style={[styles.smallButton, publishing && styles.disabled]}
+                        onPress={() => handleParkName(name)}
+                        disabled={publishing}
+                      >
+                        <Text style={styles.smallButtonText}>Park</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.smallButton, publishing && styles.disabled]}
+                        onPress={() => handleUnbindName(name)}
+                        disabled={publishing}
+                      >
+                        <Text style={styles.smallButtonText}>Remove</Text>
+                      </Pressable>
+                    </View>
                   </View>
                 ))}
               </View>
@@ -1054,6 +1118,48 @@ export default function DidDetail() {
                             : "Could not check availability"}
                   </Text>
                 )}
+                {/* Resume a parked name. Parked names aren't in the document,
+                    so they can't be listed — the owner types the one they
+                    parked. */}
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: spacing.sm,
+                    marginTop: spacing.sm,
+                  }}
+                >
+                  <Text style={{ color: colors.textSecondary, fontFamily: fonts.mono }}>
+                    @
+                  </Text>
+                  <input
+                    type="text"
+                    value={resumeInput}
+                    onChange={(e) => setResumeInput(e.target.value)}
+                    placeholder="resume a parked name"
+                    disabled={publishing}
+                    style={{
+                      flex: 1,
+                      backgroundColor: colors.bgPrimary,
+                      color: colors.textPrimary,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: radii.sm,
+                      padding: "6px 10px",
+                      fontFamily: fonts.mono,
+                      fontSize: 14,
+                    }}
+                  />
+                  <Pressable
+                    style={[
+                      styles.smallButton,
+                      (publishing || resumeInput.trim().length < 2) && styles.disabled,
+                    ]}
+                    onPress={handleResumeName}
+                    disabled={publishing || resumeInput.trim().length < 2}
+                  >
+                    <Text style={styles.smallButtonText}>Resume</Text>
+                  </Pressable>
+                </View>
                 {/* The approval code lands here when a name change is pending
                     (the doc editor shows it in its own section when open). */}
                 {!editingDoc && consentMatchPanel()}
