@@ -123,9 +123,6 @@ export default function DidDetail() {
     "checking" | "available" | "taken" | "reserved" | "error" | null
   >(null);
   const nameDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Resume a parked name — typed, because a parked name is absent from the
-  // document's `alsoKnownAs`, so the served-names list can't surface it.
-  const [resumeInput, setResumeInput] = useState("");
 
   const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
@@ -197,6 +194,13 @@ export default function DidDetail() {
         .map((a: unknown) => (typeof a === "string" ? agentNameLocalPart(a, agentDomain) : null))
         .filter((n): n is string => !!n)
     : [];
+
+  // Parked names come from the host's authoritative registry — they are
+  // deliberately absent from the document, so they cannot be derived like the
+  // served ones above.
+  const parkedNames: string[] = (didDetail?.agentNames ?? [])
+    .filter((e) => !e.enabled)
+    .map((e) => e.name);
 
   // Debounced availability probe as the user types a new name.
   useEffect(() => {
@@ -532,13 +536,13 @@ export default function DidDetail() {
     );
   };
 
-  // Resume a parked name (typed by the user — a parked name isn't in the
-  // document, so it can't be listed).
-  const handleResumeName = () => {
-    const name = resumeInput.trim().replace(/^@/, "");
-    if (!name) return;
-    setResumeInput("");
-    void runParkResume(name, true);
+  // Resume a parked name — picked from the registry list, so no typing.
+  const handleResumeName = (name: string) => {
+    showConfirm(
+      "Resume name",
+      `Serve @${name} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
+      () => void runParkResume(name, true),
+    );
   };
 
   // The cross-device approval code, shown wherever a publish is awaiting the
@@ -1118,48 +1122,43 @@ export default function DidDetail() {
                             : "Could not check availability"}
                   </Text>
                 )}
-                {/* Resume a parked name. Parked names aren't in the document,
-                    so they can't be listed — the owner types the one they
-                    parked. */}
-                <View
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: spacing.sm,
-                    marginTop: spacing.sm,
-                  }}
-                >
-                  <Text style={{ color: colors.textSecondary, fontFamily: fonts.mono }}>
-                    @
-                  </Text>
-                  <input
-                    type="text"
-                    value={resumeInput}
-                    onChange={(e) => setResumeInput(e.target.value)}
-                    placeholder="resume a parked name"
-                    disabled={publishing}
-                    style={{
-                      flex: 1,
-                      backgroundColor: colors.bgPrimary,
-                      color: colors.textPrimary,
-                      border: `1px solid ${colors.border}`,
-                      borderRadius: radii.sm,
-                      padding: "6px 10px",
-                      fontFamily: fonts.mono,
-                      fontSize: 14,
-                    }}
-                  />
-                  <Pressable
-                    style={[
-                      styles.smallButton,
-                      (publishing || resumeInput.trim().length < 2) && styles.disabled,
-                    ]}
-                    onPress={handleResumeName}
-                    disabled={publishing || resumeInput.trim().length < 2}
-                  >
-                    <Text style={styles.smallButtonText}>Resume</Text>
-                  </Pressable>
-                </View>
+                {/* Parked names, from the host's authoritative registry —
+                    they're deliberately absent from the document, so this is
+                    the only place they can come from. */}
+                {parkedNames.length > 0 && (
+                  <View style={{ gap: spacing.sm, marginTop: spacing.md }}>
+                    <Text style={styles.hint}>
+                      Parked — reserved to this DID, not currently served.
+                    </Text>
+                    {parkedNames.map((name) => (
+                      <View
+                        key={name}
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: spacing.md,
+                        }}
+                      >
+                        <Text
+                          style={{
+                            fontFamily: fonts.mono,
+                            color: colors.textSecondary,
+                          }}
+                        >
+                          @{name}
+                        </Text>
+                        <Pressable
+                          style={[styles.smallButton, publishing && styles.disabled]}
+                          onPress={() => handleResumeName(name)}
+                          disabled={publishing}
+                        >
+                          <Text style={styles.smallButtonText}>Resume</Text>
+                        </Pressable>
+                      </View>
+                    ))}
+                  </View>
+                )}
                 {/* The approval code lands here when a name change is pending
                     (the doc editor shows it in its own section when open). */}
                 {!editingDoc && consentMatchPanel()}

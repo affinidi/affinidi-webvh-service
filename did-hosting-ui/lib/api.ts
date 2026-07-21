@@ -214,6 +214,10 @@ export interface DidDetailResponse {
   method?: string;
   /** v0.7: hosting domain. Omitted on legacy records pre-M-01. */
   domain?: string;
+  /** The DID's agent names from the authoritative registry, each with its
+   *  `enabled` flag. Absent/empty when the DID has none. Parked names appear
+   *  here only — they are deliberately not in the document. */
+  agentNames?: AgentNameEntry[];
 }
 
 export interface LogEntryInfo {
@@ -237,6 +241,15 @@ export interface ChangeOwnerResponse {
 export interface CheckNameResponse {
   available: boolean;
   path: string;
+}
+
+/** One agent name in a DID's authoritative registry. A parked name
+ *  (`enabled: false`) is absent from the document's `alsoKnownAs`, so this is
+ *  the only way to surface it. */
+export interface AgentNameEntry {
+  name: string;
+  enabled: boolean;
+  createdAt: number;
 }
 
 /** Availability of an agent name (`/@alice`) on a hosting domain. */

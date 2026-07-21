@@ -378,6 +378,12 @@ pub struct DidDetailResponse {
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// The DID's agent names from the authoritative registry, each with its
+    /// `enabled` flag. A parked name (`enabled: false`) is absent from the
+    /// document's `alsoKnownAs`, so this is the only way a client can surface it
+    /// (e.g. to offer Resume).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_names: Vec<did_hosting_common::did_ops::AgentNameEntry>,
 }
 
 pub async fn get_did(
@@ -399,6 +405,7 @@ pub async fn get_did(
         log: log_metadata,
         method: (!record.method.is_empty()).then(|| record.method.clone()),
         domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+        agent_names: record.agent_names,
     }))
 }
 
@@ -572,6 +579,7 @@ pub async fn rollback_did(
         log: log_metadata,
         method: (!record.method.is_empty()).then(|| record.method.clone()),
         domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+        agent_names: record.agent_names,
     }))
 }
 
