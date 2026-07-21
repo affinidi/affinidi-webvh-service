@@ -91,6 +91,61 @@ pub enum AppError {
         domain: String,
         message: Option<String>,
     },
+
+    /// An agent-name operation (`did_ops::set_agent_name` and friends) failed
+    /// a name-specific precondition. Carries a typed [`AgentNameError`] so the
+    /// Trust-Task and REST surfaces can map it to a spec error code without
+    /// sniffing message prose — the same discipline `ValidationKind` follows.
+    #[error("agent name error: {0}")]
+    AgentName(#[from] AgentNameError),
+}
+
+/// Failure modes specific to the agent-name operations. Kept as a typed enum,
+/// rather than folded into `Validation`/`Conflict`/`NotFound`, so each maps
+/// one-to-one onto its `did-management/agent-name/*` spec error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AgentNameError {
+    /// The requested name is on the host's reserved list (`@admin`,
+    /// `@support`, …) → `name_reserved`.
+    #[error("agent name is reserved")]
+    Reserved,
+
+    /// The name is already bound to a different DID on this domain →
+    /// `name_taken`.
+    #[error("agent name is already taken")]
+    Taken,
+
+    /// No such name is bound to this DID → `not_found`.
+    #[error("agent name not found")]
+    NotFound,
+
+    /// An `enable` target is not in the disabled state → `not_disabled`.
+    #[error("agent name is not disabled")]
+    NotDisabled,
+
+    /// A `disable` target is already disabled → `already_disabled`.
+    #[error("agent name is already disabled")]
+    AlreadyDisabled,
+
+    /// The submitted document's `alsoKnownAs` does not match the operation's
+    /// requirement — it must claim the name for `set`/`enable`, and must not
+    /// for `remove`/`disable` → `also_known_as_mismatch`.
+    #[error("submitted document's alsoKnownAs does not match the requested name")]
+    AlsoKnownAsMismatch,
+}
+
+impl AgentNameError {
+    /// The HTTP status this failure renders to.
+    fn http_status(self) -> StatusCode {
+        match self {
+            AgentNameError::NotFound => StatusCode::NOT_FOUND,
+            AgentNameError::Reserved
+            | AgentNameError::Taken
+            | AgentNameError::NotDisabled
+            | AgentNameError::AlreadyDisabled => StatusCode::CONFLICT,
+            AgentNameError::AlsoKnownAsMismatch => StatusCode::BAD_REQUEST,
+        }
+    }
 }
 
 /// Semantic tags for finer-grained error classification without string matching.
@@ -234,6 +289,18 @@ impl AppError {
                 ValidationKind::InvalidWitness => "e.p.did.witness-invalid",
                 ValidationKind::Other => "e.p.did.validation-error",
             },
+            // Legacy did-management DIDComm codes for agent-name failures. The
+            // dedicated agent-name Trust Tasks (PR 4) carry their own spec
+            // error codes in the response; these keep a stray agent-name error
+            // on the old dispatch path from collapsing to `internal-error`.
+            AppError::AgentName(e) => match e {
+                AgentNameError::NotFound => "e.p.did.mnemonic-not-found",
+                AgentNameError::Reserved => "e.p.did.path-invalid",
+                AgentNameError::Taken => "e.p.did.path-unavailable",
+                AgentNameError::NotDisabled
+                | AgentNameError::AlreadyDisabled
+                | AgentNameError::AlsoKnownAsMismatch => "e.p.did.validation-error",
+            },
             _ => "e.p.did.internal-error",
         }
     }
@@ -260,6 +327,8 @@ impl AppError {
             AppError::Validation(msg) => sanitize_user_message(msg),
             AppError::Conflict(msg) => sanitize_user_message(msg),
             AppError::QuotaExceeded(msg) => sanitize_user_message(msg),
+            // Fixed, name-free strings — safe to surface verbatim.
+            AppError::AgentName(e) => e.to_string(),
             // 5xx variants — covered by the server-error branch in
             // into_response — but return a stable string here too in
             // case anyone calls `user_message()` directly.
@@ -289,6 +358,7 @@ impl IntoResponse for AppError {
             AppError::TrustTaskMalformed(_) => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMismatch { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::DomainDisabled { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::AgentName(e) => e.http_status(),
         };
 
         // DomainDisabled is a 5xx but the body is part of the public

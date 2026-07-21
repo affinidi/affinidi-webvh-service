@@ -6,10 +6,13 @@
 
 use bip39::Language;
 use did_hosting_common::did_ops::{
-    self, DidRecord, LogEntryInfo, LogMetadata, content_log_key, content_witness_key, did_key,
-    owner_key,
+    self, AgentNameEntry, DidRecord, LogEntryInfo, LogMetadata, agent_name_key, content_log_key,
+    content_witness_key, did_key, extract_agent_names, owner_key,
 };
-use did_hosting_common::server::mnemonic::{validate_custom_path, validate_mnemonic};
+use did_hosting_common::server::error::AgentNameError;
+use did_hosting_common::server::mnemonic::{
+    validate_agent_name, validate_custom_path, validate_mnemonic,
+};
 use did_hosting_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
 use rand::random_range;
 use tracing::{debug, info, warn};
@@ -526,14 +529,24 @@ pub async fn register_did_atomic(
     })
 }
 
-/// Publish (upload) a did.jsonl log for an existing DID slot.
-pub async fn publish_did(
+/// Shared front-half of a new-version publish: authorize the caller, verify
+/// the submitted log's cryptographic proofs, run the host/domain safety
+/// checks, and advance the loaded record's version/size/did_id/services/domain
+/// fields — the work `publish_did` and every agent-name operation do
+/// identically before they commit.
+///
+/// Returns the prepared, **uncommitted** record and the DID's resolved hosting
+/// domain (the authority an agent name is scoped to). The caller commits it,
+/// optionally alongside extra batch operations, so a single implementation of
+/// the authorize/verify/safety pipeline backs both the plain publish and the
+/// name-binding ops.
+async fn prepare_republish(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
     did_log: &str,
     request_domain: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<(DidRecord, String), AppError> {
     use crate::auth::session::now_epoch;
 
     validate_mnemonic(mnemonic)?;
@@ -550,11 +563,10 @@ pub async fn publish_did(
 
     // T20b: same safety check as register_did_atomic — the embedded
     // DID's host must be a configured active domain on this server
-    // and allowed by the caller's ACL. `publish_did` updates an
-    // existing slot, but a malicious or buggy client could push a
-    // log entry pointing at a different host than the one originally
-    // registered — this catches that without trusting the stored
-    // record's old `did_id`.
+    // and allowed by the caller's ACL. This updates an existing slot,
+    // but a malicious or buggy client could push a log entry pointing
+    // at a different host than the one originally registered — this
+    // catches that without trusting the stored record's old `did_id`.
     if let Some(did_id) = did_id_val.as_deref() {
         check_did_host_safety(state, auth, did_id).await?;
     }
@@ -603,6 +615,32 @@ pub async fn publish_did(
         record.domain = host;
     }
 
+    // The hosting domain an agent name is scoped to: the record's tagged
+    // domain, or the DID's own host if a legacy record still carries none.
+    let domain = if !record.domain.is_empty() {
+        record.domain.clone()
+    } else {
+        did_id_val
+            .as_deref()
+            .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+            .unwrap_or_default()
+    };
+
+    Ok((record, domain))
+}
+
+/// Publish (upload) a did.jsonl log for an existing DID slot.
+pub async fn publish_did(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+) -> Result<(), AppError> {
+    let (record, _domain) =
+        prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
+    let new_size = record.content_size;
+
     let mut batch = state.store.batch();
     batch.insert_raw(
         &state.dids_ks,
@@ -638,6 +676,295 @@ pub async fn publish_did(
     crate::identity_rotation::on_did_published(state, mnemonic).await;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Agent names
+// ---------------------------------------------------------------------------
+
+/// Which agent-name verb a request carries. Selects the `alsoKnownAs`
+/// direction the submitted document must satisfy and the registry mutation
+/// applied on commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentNameOp {
+    /// Bind (or refresh) a name; the document MUST claim it.
+    Set,
+    /// Release a name for anyone to reclaim; the document MUST no longer claim
+    /// it. Destructive.
+    Remove,
+    /// Resume serving a parked name; the document MUST claim it again.
+    Enable,
+    /// Park a name — kept reserved, but stops resolving; the document MUST no
+    /// longer claim it.
+    Disable,
+}
+
+impl AgentNameOp {
+    /// Whether the submitted document must claim the name for this verb.
+    ///
+    /// `set`/`enable` make a name resolvable, so the signed document has to
+    /// claim it; `remove`/`disable` take it out of service, so the document
+    /// must *not* — this is what keeps the served state and the signed
+    /// document from ever diverging (the spec's Layer-1 invariant).
+    fn requires_claim(self) -> bool {
+        matches!(self, AgentNameOp::Set | AgentNameOp::Enable)
+    }
+}
+
+/// Bind a human-memorable agent name to a hosted DID (`example.com/@alice`),
+/// or refresh an existing binding.
+///
+/// The caller submits the new signed DID document (`did_log`) whose
+/// `alsoKnownAs` claims the name; the host verifies the claim and commits the
+/// name binding and the new document version in one batch, so there is never a
+/// moment where the name resolves but the document does not claim it. See the
+/// `did-management/agent-name/set` Trust Task specification.
+pub async fn set_agent_name(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    name: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+) -> Result<DidRecord, AppError> {
+    apply_agent_name_op(
+        auth,
+        state,
+        mnemonic,
+        name,
+        did_log,
+        request_domain,
+        AgentNameOp::Set,
+    )
+    .await
+}
+
+/// Release an agent name so anyone may reclaim it. The submitted document must
+/// no longer claim the name via `alsoKnownAs`. Destructive — consumers gate
+/// this behind operator step-up (enforced at the Trust-Task surface, not here).
+/// See `did-management/agent-name/remove`.
+pub async fn remove_agent_name(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    name: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+) -> Result<DidRecord, AppError> {
+    apply_agent_name_op(
+        auth,
+        state,
+        mnemonic,
+        name,
+        did_log,
+        request_domain,
+        AgentNameOp::Remove,
+    )
+    .await
+}
+
+/// Resume serving a previously parked (disabled) agent name. The submitted
+/// document must claim the name again. See `did-management/agent-name/enable`.
+pub async fn enable_agent_name(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    name: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+) -> Result<DidRecord, AppError> {
+    apply_agent_name_op(
+        auth,
+        state,
+        mnemonic,
+        name,
+        did_log,
+        request_domain,
+        AgentNameOp::Enable,
+    )
+    .await
+}
+
+/// Park an agent name: it stops resolving but stays reserved to this DID (so
+/// nobody else can claim it). The submitted document must no longer claim the
+/// name. Consumers gate this behind operator step-up (enforced at the
+/// Trust-Task surface, not here). See `did-management/agent-name/disable`.
+pub async fn disable_agent_name(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    name: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+) -> Result<DidRecord, AppError> {
+    apply_agent_name_op(
+        auth,
+        state,
+        mnemonic,
+        name,
+        did_log,
+        request_domain,
+        AgentNameOp::Disable,
+    )
+    .await
+}
+
+/// The name-index side-effect an agent-name op folds into its commit batch.
+enum IndexWrite {
+    /// Point `name:{domain}:{name}` at this mnemonic.
+    Insert,
+    /// Retire the index entry — the name is released.
+    Remove,
+    /// Leave the index untouched — a parked name stays reserved.
+    Keep,
+}
+
+/// The shared engine behind the four agent-name verbs.
+///
+/// Authorizes the caller and publishes the submitted document as a new DID
+/// version (via [`prepare_republish`]), enforces the verb's `alsoKnownAs`
+/// gate, applies the verb's registry precondition + mutation, and commits the
+/// new log, the updated record, and the name-index change in **one batch** —
+/// so a name and the document that claims it can never disagree, even across a
+/// crash.
+#[allow(clippy::too_many_arguments)]
+async fn apply_agent_name_op(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    name: &str,
+    did_log: &str,
+    request_domain: Option<&str>,
+    op: AgentNameOp,
+) -> Result<DidRecord, AppError> {
+    use crate::auth::session::now_epoch;
+
+    // Canonical local part. `validate_agent_name` enforces the grammar and
+    // rejects reserved names (`@admin`, `@support`, …) before any lookup.
+    validate_agent_name(name)?;
+    let name = name.strip_prefix('@').unwrap_or(name).to_string();
+
+    // Serialise the read-modify-write on this slot: the collision check, the
+    // registry mutation, and the index write must not interleave with another
+    // op on the same DID.
+    let _guard = state.path_locks.guard(mnemonic).await;
+
+    // Authorize + verify the submitted document + advance the record. This
+    // yields not_owner / invalid_did_data / unknown_domain exactly as a plain
+    // publish would.
+    let (mut record, domain) =
+        prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
+
+    // The gate: does the submitted document claim the name on this domain?
+    // `extract_agent_names` canonicalises through the `agent-names` crate, so
+    // the comparison is byte-identical to what a resolver will later do.
+    let claimed = extract_agent_names(did_log, &domain)
+        .iter()
+        .any(|n| n == &name);
+    if claimed != op.requires_claim() {
+        return Err(AgentNameError::AlsoKnownAsMismatch.into());
+    }
+
+    let index_key = agent_name_key(&domain, &name);
+
+    // Verb-specific precondition + registry mutation, yielding the index
+    // side-effect to fold into the commit batch below.
+    let index_write = match op {
+        AgentNameOp::Set => {
+            // A name already bound to a *different* DID on this domain is
+            // taken; the same DID re-setting is an idempotent refresh.
+            if let Some(bytes) = state.dids_ks.get_raw(index_key.clone()).await?
+                && bytes != mnemonic.as_bytes()
+            {
+                return Err(AgentNameError::Taken.into());
+            }
+            upsert_agent_name(&mut record.agent_names, &name, now_epoch());
+            IndexWrite::Insert
+        }
+        AgentNameOp::Enable => {
+            let entry = record
+                .agent_names
+                .iter_mut()
+                .find(|e| e.name == name)
+                .ok_or(AgentNameError::NotFound)?;
+            if entry.enabled {
+                return Err(AgentNameError::NotDisabled.into());
+            }
+            entry.enabled = true;
+            IndexWrite::Insert
+        }
+        AgentNameOp::Disable => {
+            let entry = record
+                .agent_names
+                .iter_mut()
+                .find(|e| e.name == name)
+                .ok_or(AgentNameError::NotFound)?;
+            if !entry.enabled {
+                return Err(AgentNameError::AlreadyDisabled.into());
+            }
+            entry.enabled = false;
+            // Keep the index: a parked name stays reserved, so a later `set`
+            // by another DID still sees it as taken. The name's own `enabled`
+            // flag is what stops it resolving.
+            IndexWrite::Keep
+        }
+        AgentNameOp::Remove => {
+            let before = record.agent_names.len();
+            record.agent_names.retain(|e| e.name != name);
+            if record.agent_names.len() == before {
+                return Err(AgentNameError::NotFound.into());
+            }
+            IndexWrite::Remove
+        }
+    };
+
+    // Commit the new document version, the updated record, and the name-index
+    // change in one atomic batch — the guarantee the specification requires.
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_log_key(mnemonic),
+        did_log.as_bytes().to_vec(),
+    );
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    match index_write {
+        IndexWrite::Insert => {
+            batch.insert_raw(&state.dids_ks, index_key, mnemonic.as_bytes().to_vec())
+        }
+        IndexWrite::Remove => batch.remove(&state.dids_ks, index_key),
+        IndexWrite::Keep => {}
+    }
+    batch.commit().await?;
+
+    state.stats_collector.record_update(mnemonic);
+
+    info!(
+        did = %auth.did,
+        mnemonic = %mnemonic,
+        name = %name,
+        ?op,
+        version = record.version_count,
+        "agent name updated on control plane"
+    );
+
+    // Same rationale as `publish_did`: a new document version was committed,
+    // so if it was the service's own DID, re-resolve and rotate if needed.
+    crate::identity_rotation::on_did_published(state, mnemonic).await;
+
+    Ok(record)
+}
+
+/// Add a name to the registry, or refresh an existing entry to enabled.
+fn upsert_agent_name(names: &mut Vec<AgentNameEntry>, name: &str, now: u64) {
+    if let Some(entry) = names.iter_mut().find(|e| e.name == name) {
+        entry.enabled = true;
+    } else {
+        names.push(AgentNameEntry {
+            name: name.to_string(),
+            enabled: true,
+            created_at: now,
+        });
+    }
 }
 
 /// Upload witness content for a DID.
@@ -2277,5 +2604,452 @@ mod tests_atomic {
                 "DIDCommMessaging".to_string()
             ])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent names
+    // -----------------------------------------------------------------------
+
+    /// A signed did:webvh log whose document claims the given agent names via
+    /// `alsoKnownAs`. Each name is written as `<host>/@<name>`, the form
+    /// `agent-names` parses and `extract_agent_names` matches on. `host` is the
+    /// decoded authority (no port-encoding) so it equals the DID's host.
+    async fn build_test_did_log_with_names(host: &str, path: &str, names: &[&str]) -> String {
+        let signing = Secret::generate_ed25519(None, None);
+        let signing_pub_mb = signing
+            .get_public_keymultibase()
+            .expect("signing public key multibase");
+        let mut doc =
+            build_did_document(host, path, &signing_pub_mb, &DidDocumentOptions::default());
+        if !names.is_empty() {
+            let aka: Vec<String> = names.iter().map(|n| format!("{host}/@{n}")).collect();
+            doc["alsoKnownAs"] = serde_json::json!(aka);
+        }
+        let (_scid, jsonl) = create_log_entry(&doc, &signing)
+            .await
+            .expect("create_log_entry");
+        jsonl
+    }
+
+    async fn get_record(state: &AppState, path: &str) -> DidRecord {
+        state
+            .dids_ks
+            .get(did_key(path))
+            .await
+            .unwrap()
+            .expect("record")
+    }
+
+    async fn index_target(state: &AppState, domain: &str, name: &str) -> Option<String> {
+        state
+            .dids_ks
+            .get_raw(agent_name_key(domain, name))
+            .await
+            .unwrap()
+            .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    /// Register a fresh DID at `path` on host `control.test`, owned by `owner`.
+    async fn register_owned(state: &AppState, owner: &str, path: &str) {
+        let log = build_test_did_log("scid", "control.test", path).await;
+        register_did_atomic(&owner_auth(owner), state, path, &log, false)
+            .await
+            .expect("register");
+    }
+
+    /// Happy path: the document claims the name, so it binds — the entry is
+    /// enabled, the index points at the slot, and the version advances.
+    #[tokio::test]
+    async fn set_agent_name_binds_when_document_claims_it() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-set";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        let log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        let record = set_agent_name(&owner_auth(owner), &state, path, "alice", &log, None)
+            .await
+            .expect("set should bind a claimed name");
+
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled),
+            "alice must be present and enabled"
+        );
+        assert_eq!(
+            record.version_count,
+            before + 1,
+            "publish must bump version"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some(path),
+            "index must point at the slot"
+        );
+        // A leading '@' on the argument is tolerated and canonicalised away.
+        let record = get_record(&state, path).await;
+        assert!(record.agent_names.iter().any(|e| e.name == "alice"));
+    }
+
+    /// The security test: a document that does not claim the name is rejected,
+    /// and — because the write is one batch — nothing is committed. No orphaned
+    /// index entry, no registry entry, no version bump.
+    #[tokio::test]
+    async fn set_agent_name_rejects_and_commits_nothing_on_mismatch() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-mismatch";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        // Document claims a *different* name than the one requested.
+        let log = build_test_did_log_with_names("control.test", path, &["bob"]).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "alice", &log, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::AgentName(AgentNameError::AlsoKnownAsMismatch)
+        ));
+
+        let record = get_record(&state, path).await;
+        assert!(
+            record.agent_names.is_empty(),
+            "no registry entry may be written on a rejected set"
+        );
+        assert_eq!(
+            record.version_count, before,
+            "a rejected set must not advance the version"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice").await,
+            None,
+            "no index entry may leak on a rejected set (atomicity)"
+        );
+    }
+
+    /// A reserved name is refused up front with the typed error, before any
+    /// document work.
+    #[tokio::test]
+    async fn set_agent_name_rejects_reserved() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-reserved";
+        register_owned(&state, owner, path).await;
+
+        let log = build_test_did_log_with_names("control.test", path, &["admin"]).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "admin", &log, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::AgentName(AgentNameError::Reserved)));
+    }
+
+    /// A name bound to one DID cannot be taken by another on the same domain;
+    /// the same DID re-setting it is an idempotent refresh.
+    #[tokio::test]
+    async fn set_agent_name_collision_is_taken_but_same_owner_refreshes() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let log_a = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        set_agent_name(
+            &owner_auth(owner_a),
+            &state,
+            "slot-a",
+            "alice",
+            &log_a,
+            None,
+        )
+        .await
+        .expect("first bind");
+
+        // A different DID claiming the same name on the same domain is taken.
+        let log_b = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
+        let err = set_agent_name(
+            &owner_auth(owner_b),
+            &state,
+            "slot-b",
+            "alice",
+            &log_b,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::AgentName(AgentNameError::Taken)));
+
+        // The original owner re-setting is fine (idempotent refresh).
+        let log_a2 = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        set_agent_name(
+            &owner_auth(owner_a),
+            &state,
+            "slot-a",
+            "alice",
+            &log_a2,
+            None,
+        )
+        .await
+        .expect("idempotent re-set by the same owner");
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a")
+        );
+    }
+
+    /// Seed a `DidRecord` directly on an arbitrary host. `register_did_atomic`
+    /// pins the DID host to the server's configured host, so multi-domain
+    /// tests seed the record rather than register it. The name ops themselves
+    /// carry no such host-pin — they scope by the record's domain.
+    async fn seed_record_on_host(state: &AppState, owner: &str, path: &str, host: &str) {
+        let record = DidRecord {
+            owner: owner.to_string(),
+            mnemonic: path.to_string(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 1,
+            did_id: Some(format!("did:webvh:seed:{host}:{path}")),
+            content_size: 0,
+            disabled: false,
+            deleted_at: None,
+            method: "webvh".to_string(),
+            domain: host.to_string(),
+            services: None,
+            agent_names: Vec::new(),
+        };
+        state
+            .dids_ks
+            .insert(did_key(path), &record)
+            .await
+            .expect("seed record");
+    }
+
+    /// The same name on two different domains does not collide — names are
+    /// domain-scoped by the `name:{domain}:{name}` index key.
+    #[tokio::test]
+    async fn set_agent_name_is_domain_scoped() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+
+        for (host, path) in [("one.example", "slot-one"), ("two.example", "slot-two")] {
+            seed_record_on_host(&state, owner, path, host).await;
+            let named = build_test_did_log_with_names(host, path, &["alice"]).await;
+            set_agent_name(&owner_auth(owner), &state, path, "alice", &named, None)
+                .await
+                .expect("bind alice on this domain");
+        }
+
+        assert_eq!(
+            index_target(&state, "one.example", "alice")
+                .await
+                .as_deref(),
+            Some("slot-one")
+        );
+        assert_eq!(
+            index_target(&state, "two.example", "alice")
+                .await
+                .as_deref(),
+            Some("slot-two")
+        );
+    }
+
+    /// A non-owner (non-admin) cannot bind a name.
+    #[tokio::test]
+    async fn set_agent_name_requires_owner() {
+        let (state, _dir) = test_state().await;
+        register_owned(&state, "did:example:owner", "slot-auth").await;
+
+        let log = build_test_did_log_with_names("control.test", "slot-auth", &["alice"]).await;
+        let err = set_agent_name(
+            &owner_auth("did:example:intruder"),
+            &state,
+            "slot-auth",
+            "alice",
+            &log,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// Disable parks a name: the entry stays (disabled) and the index is kept
+    /// so the name remains reserved. The submitting document must drop the
+    /// name.
+    #[tokio::test]
+    async fn disable_agent_name_parks_but_keeps_reservation() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-disable";
+        register_owned(&state, owner, path).await;
+
+        let set_log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, path, "alice", &set_log, None)
+            .await
+            .expect("set");
+
+        // Disabling with a document that STILL claims the name is a mismatch.
+        let still_claims = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        let err = disable_agent_name(
+            &owner_auth(owner),
+            &state,
+            path,
+            "alice",
+            &still_claims,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::AgentName(AgentNameError::AlsoKnownAsMismatch)
+        ));
+
+        // Disabling with a document that drops the name parks it.
+        let dropped = build_test_did_log_with_names("control.test", path, &[]).await;
+        let record = disable_agent_name(&owner_auth(owner), &state, path, "alice", &dropped, None)
+            .await
+            .expect("disable");
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && !e.enabled),
+            "alice must remain present but disabled"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some(path),
+            "a parked name keeps its index entry (stays reserved)"
+        );
+
+        // Disabling again is a no-op error.
+        let dropped2 = build_test_did_log_with_names("control.test", path, &[]).await;
+        let err = disable_agent_name(&owner_auth(owner), &state, path, "alice", &dropped2, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::AgentName(AgentNameError::AlreadyDisabled)
+        ));
+    }
+
+    /// Enable resumes a parked name; the document must claim it again.
+    #[tokio::test]
+    async fn enable_agent_name_resumes_a_parked_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-enable";
+        register_owned(&state, owner, path).await;
+
+        let set_log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, path, "alice", &set_log, None)
+            .await
+            .expect("set");
+
+        // Enabling an already-enabled name is refused.
+        let claims = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        let err = enable_agent_name(&owner_auth(owner), &state, path, "alice", &claims, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::AgentName(AgentNameError::NotDisabled)
+        ));
+
+        // Park it, then re-enable with a document that claims it again.
+        let dropped = build_test_did_log_with_names("control.test", path, &[]).await;
+        disable_agent_name(&owner_auth(owner), &state, path, "alice", &dropped, None)
+            .await
+            .expect("disable");
+        let reclaim = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        let record = enable_agent_name(&owner_auth(owner), &state, path, "alice", &reclaim, None)
+            .await
+            .expect("enable");
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled)
+        );
+    }
+
+    /// Enabling a name that was never bound is a not-found.
+    #[tokio::test]
+    async fn enable_agent_name_unknown_is_not_found() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-enable-unknown";
+        register_owned(&state, owner, path).await;
+
+        let claims = build_test_did_log_with_names("control.test", path, &["ghost"]).await;
+        let err = enable_agent_name(&owner_auth(owner), &state, path, "ghost", &claims, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::AgentName(AgentNameError::NotFound)));
+    }
+
+    /// Remove releases a name: the entry and the index entry both go, freeing
+    /// the name for anyone to reclaim. The document must drop the name.
+    #[tokio::test]
+    async fn remove_agent_name_releases_the_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-remove";
+        register_owned(&state, owner, path).await;
+
+        let set_log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, path, "alice", &set_log, None)
+            .await
+            .expect("set");
+
+        // Removing with a document that still claims the name is a mismatch.
+        let still_claims = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        let err = remove_agent_name(
+            &owner_auth(owner),
+            &state,
+            path,
+            "alice",
+            &still_claims,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::AgentName(AgentNameError::AlsoKnownAsMismatch)
+        ));
+
+        // Removing with a document that drops it releases the name.
+        let dropped = build_test_did_log_with_names("control.test", path, &[]).await;
+        let record = remove_agent_name(&owner_auth(owner), &state, path, "alice", &dropped, None)
+            .await
+            .expect("remove");
+        assert!(
+            !record.agent_names.iter().any(|e| e.name == "alice"),
+            "alice must be gone from the registry"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice").await,
+            None,
+            "the index entry must be retired so the name is free"
+        );
+
+        // Removing again is not-found.
+        let dropped2 = build_test_did_log_with_names("control.test", path, &[]).await;
+        let err = remove_agent_name(&owner_auth(owner), &state, path, "alice", &dropped2, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::AgentName(AgentNameError::NotFound)));
     }
 }

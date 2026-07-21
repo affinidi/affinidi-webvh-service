@@ -1,4 +1,4 @@
-use super::error::{AppError, ValidationKind};
+use super::error::{AgentNameError, AppError, ValidationKind};
 
 /// Names that conflict with server routes and must not be used as the
 /// **first segment** of a custom path.
@@ -139,9 +139,9 @@ pub fn validate_agent_name(name: &str) -> Result<(), AppError> {
     validate_segment(name)?;
 
     if RESERVED_AGENT_NAMES.contains(&name) {
-        return Err(path_err(format!(
-            "'{name}' is a reserved agent name and cannot be registered"
-        )));
+        // A typed error, not `path_err`: the provisioning surfaces map this to
+        // the `name_reserved` spec code, distinct from a malformed name.
+        return Err(AppError::AgentName(AgentNameError::Reserved));
     }
 
     Ok(())
