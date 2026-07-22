@@ -3094,6 +3094,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "did-hosting-common",
+ "did-hosting-control",
  "ed25519-dalek",
  "firestore",
  "fjall",

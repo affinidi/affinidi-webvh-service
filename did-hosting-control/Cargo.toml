@@ -36,6 +36,11 @@ vault-secrets = ["did-hosting-common/vault-secrets"]
 k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
 store-redis = ["dep:redis", "did-hosting-common/store-redis"]
+# In-process test harness (`TestServer`) for this crate's own integration tests
+# and for downstream consumers that want to cover a control-plane path without
+# hand-assembling `AppState`. Enable via a `[dev-dependencies]` `features =
+# ["test-support"]` entry. Off by default — never compiled into a release.
+test-support = ["dep:tempfile"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
@@ -120,9 +125,12 @@ azure_data_cosmos = { version = "0.36", features = [
 azure_core = { version = "1.0", optional = true }
 azure_security_keyvault_secrets = { version = "1.0", optional = true }
 azure_identity = { version = "1.0", optional = true }
+# Enabled by the `test-support` feature so the in-process `TestServer` fixture
+# can open a temporary fjall store. Optional + non-default: a production build
+# never pulls it in.
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 anyhow.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -130,3 +138,7 @@ base64 = { workspace = true }
 # Embedded mediator fixture for in-process DIDComm flow tests.
 # Defaults to MemoryStore (no Redis required); spawns on 127.0.0.1:0.
 affinidi-messaging-test-mediator = "0.2"
+# Self-dependency with `test-support` on, so this crate's own integration
+# tests compile the `test_support` module (and get `tempfile`) exactly as a
+# downstream consumer would via `features = ["test-support"]`.
+did-hosting-control = { path = ".", features = ["test-support"] }
