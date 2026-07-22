@@ -123,6 +123,8 @@ export default function DidDetail() {
     "checking" | "available" | "taken" | "reserved" | "error" | null
   >(null);
   const nameDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Guards the one-time path prefill below so it never clobbers later edits.
+  const namePrefilled = useRef(false);
 
   const loadData = useCallback(() => {
     if (!mnemonic || !isAuthenticated) return;
@@ -223,6 +225,27 @@ export default function DidDetail() {
       if (nameDebounce.current) clearTimeout(nameDebounce.current);
     };
   }, [nameInput, agentDomain, api]);
+
+  // Suggest the DID's own path as the agent name. An agent name's grammar is
+  // deliberately identical to a path segment's, so the path is a valid name by
+  // construction and is almost always the one the owner wants. Fires once, and
+  // only when nothing is bound yet (the first-bind case), so it never overrides
+  // a later edit or suggests a name this DID already holds. The availability
+  // probe above then runs on the suggestion automatically.
+  useEffect(() => {
+    if (namePrefilled.current || !didDetail || nameInput !== "") return;
+    // `didDetail.agentNames` is the authoritative registry (served + parked);
+    // if it has anything, the owner is adding a further name — leave it blank.
+    if ((didDetail.agentNames ?? []).length > 0) return;
+    // The root DID has no path segment to borrow.
+    if (mnemonic === ".well-known") return;
+    const segment = mnemonic.split("/").filter(Boolean).pop() ?? "";
+    // Skip a segment that isn't a valid name (uppercase, odd chars) rather than
+    // prefill something the availability check would immediately reject.
+    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(segment)) return;
+    namePrefilled.current = true;
+    setNameInput(segment);
+  }, [didDetail, mnemonic, nameInput]);
 
   const handleCopyDidId = async () => {
     if (!didDetail?.didId) return;
