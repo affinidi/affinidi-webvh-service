@@ -555,12 +555,8 @@ mod tests {
     fn extract_pairs_all_missing_returns_empty() {
         // All items missing required attributes.
         let items = vec![
-            HashMap::from([
-                (PK_ATTR.to_string(), AttributeValue::S("ks".to_string())),
-            ]),
-            HashMap::from([
-                (SK_ATTR.to_string(), AttributeValue::S("k".to_string())),
-            ]),
+            HashMap::from([(PK_ATTR.to_string(), AttributeValue::S("ks".to_string()))]),
+            HashMap::from([(SK_ATTR.to_string(), AttributeValue::S("k".to_string()))]),
         ];
         let mut out = Vec::new();
         extract_pairs(items, &mut out);
@@ -581,10 +577,7 @@ mod tests {
     #[test]
     fn extract_val_bytes_missing_val_attr() {
         // Item without VAL_ATTR returns None.
-        let item = HashMap::from([(
-            PK_ATTR.to_string(),
-            AttributeValue::S("test".to_string()),
-        )]);
+        let item = HashMap::from([(PK_ATTR.to_string(), AttributeValue::S("test".to_string()))]);
         assert_eq!(extract_val_bytes(item), None);
     }
 
