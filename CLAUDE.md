@@ -152,6 +152,50 @@ index genuinely points at them, so a resolver's `alsoKnownAs` round-trip passes.
 Layer-1 proves a served name is claimed by the DID it resolves to; it says
 nothing about *who was entitled to claim it*. That check exists only here.
 
+### Three roles — and why the control plane is never advertised
+
+Keep these distinct; conflating them is what makes "where do I manage this DID?"
+sound like a protocol gap when it isn't:
+
+- **Owner** — a VTA *or some other external system*, **never** the hosting
+  platform. It authenticates to the control plane and the record stores `owner =
+  auth.did` (that authenticated DID; see `register_did_atomic`). The owner holds
+  the update key and knows its control plane out-of-band, because it registered
+  the server.
+- **Control plane** — the authoritative registry **and** the publishing
+  endpoint. Custodian of the DID; pushes to edges. **Not** the owner — just the
+  infrastructure the owner publishes through.
+- **Edges** — lossy caches the control plane publishes into.
+
+**Decision (settled): a managed DID does *not* advertise its control plane, and
+the control plane is not otherwise discoverable from the DID.** This was
+considered — a signed `WebVHControlPlane` service entry in each managed
+document, or a `.well-known` / `server-info` pointer — and rejected:
+
+- **It leaks the wrong thing.** Per-DID advertisement publishes an enumerable
+  map ("these N DIDs → control plane X") of the single highest-value,
+  authoritative endpoint in the system, for a benefit that evaporates on
+  inspection. The *association* is the sensitive part; do not stamp it into
+  permanent public documents.
+- **The only real driver was operator recovery** (a VTA that lost its local
+  server-map), and that is **operator state, not identity data** — it belongs in
+  the operator's backups / config / runbook alongside the seed, not in a public
+  DID document. A holder's DID document stays about the holder (their keys, the
+  services *they* offer), never about the infrastructure hosting it.
+- **Cross-owner hand-off** (a different VTA taking over) is the one case that
+  might seem to need discovery, but it hits the ownership model first
+  (`owner = the old VTA`; transfer needs `change_did_owner`, authorized by the
+  current owner or an admin). That is a recovery/authorization problem, not a
+  discovery one — discovery was never the bottleneck.
+
+If a genuine cross-agent need ever appears, the *only* acceptable shape is a
+**domain-level, auth-gated** lookup at the **edge** (the domain is already in
+the DID string): the caller proves it controls a DID on that domain, and only
+then does the edge reveal its control plane — one relationship, not per-DID, and
+nothing visible to anyone who could not already act on it. Until then, note that
+the unauthenticated `/api/server-info` lives on the **control plane** (not the
+edge), so nothing about the topology leaks today. Keep it that way.
+
 ## Cross-service networking & integration discipline
 
 This service's primary client is the VTA's `webvh_client`
