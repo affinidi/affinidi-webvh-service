@@ -830,3 +830,793 @@ async fn unicode_keys_round_trip() {
 
     delete_test_table(&client, &table).await;
 }
+
+// ===========================================================================
+// All-keyspace isolation test — proves every keyspace the service uses
+// (dids, sessions, acl, stats, ts, witnesses, domains, registry, etc.)
+// coexists safely in ONE table without data leaking between them.
+// ===========================================================================
+
+#[tokio::test]
+async fn all_service_keyspaces_coexist_in_single_table() {
+    use did_hosting_common::server::store::{
+        KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_OUTBOUND_QUEUE,
+        KS_PENDING_PURGES, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    };
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let keyspaces = vec![
+        KS_DIDS,
+        KS_SESSIONS,
+        KS_ACL,
+        KS_STATS,
+        KS_TIMESERIES,
+        KS_WITNESSES,
+        KS_DOMAINS,
+        KS_REGISTRY,
+        KS_OUTBOUND_QUEUE,
+        KS_PENDING_PURGES,
+        KS_META,
+        KS_ASSIGNMENTS,
+    ];
+
+    // Write the same key "test:key" into every keyspace with a different value.
+    for ks_name in &keyspaces {
+        let ks = store.keyspace(ks_name).expect("open keyspace");
+        ks.insert_raw("test:key", ks_name.as_bytes().to_vec())
+            .await
+            .expect("insert");
+    }
+
+    // Read back: each keyspace must return its own value, not another's.
+    for ks_name in &keyspaces {
+        let ks = store.keyspace(ks_name).expect("open keyspace");
+        let val = ks.get_raw("test:key").await.expect("get");
+        assert_eq!(
+            val,
+            Some(ks_name.as_bytes().to_vec()),
+            "keyspace {ks_name} returned wrong value — isolation broken"
+        );
+    }
+
+    // Remove from one keyspace, verify others still have their data.
+    let dids = store.keyspace(KS_DIDS).expect("dids");
+    dids.remove("test:key").await.expect("remove");
+    assert!(!dids.contains_key("test:key").await.expect("contains"));
+
+    for ks_name in keyspaces.iter().skip(1) {
+        let ks = store.keyspace(ks_name).expect("open keyspace");
+        assert!(
+            ks.contains_key("test:key").await.expect("contains"),
+            "removing from dids affected {ks_name}"
+        );
+    }
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// Witness keyspace operations — exercises the exact access patterns
+// webvh-witness uses against DynamoDB single-table.
+// ===========================================================================
+
+#[tokio::test]
+async fn witness_keyspace_operations() {
+    use did_hosting_common::server::store::KS_WITNESSES;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_WITNESSES).expect("witnesses keyspace");
+
+    // Witness stores proofs keyed by mnemonic.
+    let proof_a = serde_json::json!({
+        "mnemonic": "alice",
+        "witness_did": "did:web:witness.example.com",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "proof": "base64-encoded-signature"
+    });
+    let proof_b = serde_json::json!({
+        "mnemonic": "bob",
+        "witness_did": "did:web:witness.example.com",
+        "timestamp": "2024-01-02T00:00:00Z",
+        "proof": "another-signature"
+    });
+
+    // Write witness proofs.
+    ks.insert("witness:alice", &proof_a).await.expect("insert");
+    ks.insert("witness:bob", &proof_b).await.expect("insert");
+
+    // Read back.
+    let got: Option<serde_json::Value> = ks.get("witness:alice").await.expect("get");
+    assert_eq!(got, Some(proof_a));
+
+    // Prefix query (witness lists all proofs).
+    let all = ks.prefix_iter_raw(b"witness:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    // Remove a proof.
+    ks.remove("witness:alice").await.expect("remove");
+    let all = ks.prefix_iter_raw(b"witness:").await.expect("prefix");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, b"witness:bob");
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// Watcher sync-status operations — exercises the exact access patterns
+// webvh-watcher uses against DynamoDB single-table.
+// ===========================================================================
+
+#[tokio::test]
+async fn watcher_sync_status_operations() {
+    use did_hosting_common::server::store::KS_DIDS;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_DIDS).expect("dids keyspace");
+
+    // Watcher stores sync status under "watcher_sync:" prefix in the dids keyspace.
+    let sync_a = serde_json::json!({
+        "mnemonic": "alice",
+        "last_version": 3,
+        "last_checked": "2024-01-01T12:00:00Z"
+    });
+    let sync_b = serde_json::json!({
+        "mnemonic": "bob",
+        "last_version": 1,
+        "last_checked": "2024-01-01T10:00:00Z"
+    });
+
+    // Write sync statuses.
+    ks.insert("watcher_sync:alice", &sync_a).await.expect("insert");
+    ks.insert("watcher_sync:bob", &sync_b).await.expect("insert");
+
+    // Read back.
+    let got: Option<serde_json::Value> = ks.get("watcher_sync:alice").await.expect("get");
+    assert_eq!(got, Some(sync_a.clone()));
+
+    // Prefix query (watcher lists all watched DIDs).
+    let all = ks.prefix_iter_raw(b"watcher_sync:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    // Update sync status (simulates watcher polling and finding new version).
+    let sync_a_updated = serde_json::json!({
+        "mnemonic": "alice",
+        "last_version": 4,
+        "last_checked": "2024-01-01T14:00:00Z"
+    });
+    ks.insert("watcher_sync:alice", &sync_a_updated)
+        .await
+        .expect("update");
+
+    let got: Option<serde_json::Value> = ks.get("watcher_sync:alice").await.expect("get");
+    assert_eq!(got, Some(sync_a_updated));
+
+    // Watcher sync keys coexist with DID records in the same keyspace.
+    ks.insert_raw("did:alice", b"did-record".to_vec())
+        .await
+        .expect("insert did");
+
+    // Prefix scan for "watcher_sync:" must NOT return DID records.
+    let syncs = ks.prefix_iter_raw(b"watcher_sync:").await.expect("prefix");
+    assert_eq!(syncs.len(), 2);
+
+    // Prefix scan for "did:" must NOT return watcher sync records.
+    let dids = ks.prefix_iter_raw(b"did:").await.expect("prefix");
+    assert_eq!(dids.len(), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// Batch across all keyspaces — simulates daemon bootstrap writing DIDs,
+// ACL, and domains in a single transaction.
+// ===========================================================================
+
+#[tokio::test]
+async fn batch_across_all_keyspaces_simulates_bootstrap() {
+    use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_DOMAINS};
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let dids = store.keyspace(KS_DIDS).expect("dids");
+    let acl = store.keyspace(KS_ACL).expect("acl");
+    let domains = store.keyspace(KS_DOMAINS).expect("domains");
+
+    // Simulate daemon bootstrap: write DID record + content + owner + ACL + domain
+    // in one batch (exactly what happens at first boot).
+    let mut batch = store.batch();
+
+    // DID record.
+    batch.insert(
+        &dids,
+        "did:.well-known",
+        &serde_json::json!({"did_id": "did:webvh:QmABC:host:.well-known", "owner": "system"}),
+    ).expect("batch did");
+
+    // DID log content (raw bytes).
+    batch.insert_raw(&dids, "content:.well-known:log", b"jsonl-entry-here".to_vec());
+
+    // Owner reverse index.
+    batch.insert_raw(&dids, "owner:system:.well-known", b".well-known".to_vec());
+
+    // ACL entry.
+    batch.insert(
+        &acl,
+        "acl:did:key:z6MkAdmin",
+        &serde_json::json!({"role": "admin", "max_dids": 100}),
+    ).expect("batch acl");
+
+    // Domain seed.
+    batch.insert(
+        &domains,
+        "domain:example.com",
+        &serde_json::json!({"domain": "example.com", "owner": "system"}),
+    ).expect("batch domain");
+
+    batch.commit().await.expect("bootstrap batch commit");
+
+    // Verify everything landed in the correct keyspace.
+    let did_record: Option<serde_json::Value> = dids.get("did:.well-known").await.expect("get");
+    assert_eq!(did_record.unwrap()["did_id"], "did:webvh:QmABC:host:.well-known");
+
+    let content = dids.get_raw("content:.well-known:log").await.expect("get");
+    assert_eq!(content, Some(b"jsonl-entry-here".to_vec()));
+
+    let owner = dids.get_raw("owner:system:.well-known").await.expect("get");
+    assert_eq!(owner, Some(b".well-known".to_vec()));
+
+    let acl_entry: Option<serde_json::Value> = acl.get("acl:did:key:z6MkAdmin").await.expect("get");
+    assert_eq!(acl_entry.unwrap()["role"], "admin");
+
+    let domain: Option<serde_json::Value> = domains.get("domain:example.com").await.expect("get");
+    assert_eq!(domain.unwrap()["domain"], "example.com");
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// did-hosting-server access patterns
+// ===========================================================================
+
+/// Server: DID record + content log + content witness + owner index
+/// are always written/deleted as a batch. This is the core multi-key
+/// operation the server uses for every DID create/update/delete.
+#[tokio::test]
+async fn server_did_batch_write_and_read() {
+    use did_hosting_common::server::store::KS_DIDS;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_DIDS).expect("dids");
+
+    // Batch: create DID record + content log + witness content + owner index
+    let mut batch = store.batch();
+    batch.insert(
+        &ks, "did:alice",
+        &serde_json::json!({"did_id": "did:webvh:Qm:host:alice", "owner": "did:key:zAdmin", "state": "active"}),
+    ).expect("batch did");
+    batch.insert_raw(&ks, "content:alice:log", b"jsonl-signed-entry\n".to_vec());
+    batch.insert_raw(&ks, "content:alice:witness", b"witness-proof-json".to_vec());
+    batch.insert_raw(&ks, "owner:did:key:zAdmin:alice", b"alice".to_vec());
+    batch.commit().await.expect("batch commit");
+
+    // Read each key back.
+    let did_rec: serde_json::Value = ks.get("did:alice").await.expect("get").expect("exists");
+    assert_eq!(did_rec["state"], "active");
+
+    let log = ks.get_raw("content:alice:log").await.expect("get").expect("exists");
+    assert_eq!(log, b"jsonl-signed-entry\n");
+
+    let witness = ks.get_raw("content:alice:witness").await.expect("get").expect("exists");
+    assert_eq!(witness, b"witness-proof-json");
+
+    let owner = ks.get_raw("owner:did:key:zAdmin:alice").await.expect("get").expect("exists");
+    assert_eq!(owner, b"alice");
+
+    // Prefix scan for owner's DIDs.
+    let owner_dids = ks.prefix_iter_raw(b"owner:did:key:zAdmin:").await.expect("prefix");
+    assert_eq!(owner_dids.len(), 1);
+
+    // Batch delete (simulates DID removal).
+    let mut batch = store.batch();
+    batch.remove(&ks, "did:alice");
+    batch.remove(&ks, "content:alice:log");
+    batch.remove(&ks, "content:alice:witness");
+    batch.remove(&ks, "owner:did:key:zAdmin:alice");
+    batch.commit().await.expect("batch delete");
+
+    // All gone.
+    assert!(!ks.contains_key("did:alice").await.expect("contains"));
+    assert!(!ks.contains_key("content:alice:log").await.expect("contains"));
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Server: watcher_sync prefix lives inside KS_DIDS alongside did: records.
+/// Prefix scan must scope correctly.
+#[tokio::test]
+async fn server_watcher_sync_coexists_with_did_records() {
+    use did_hosting_common::server::store::KS_DIDS;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_DIDS).expect("dids");
+
+    // Mix DID records and watcher_sync records in the same keyspace.
+    ks.insert("did:alice", &serde_json::json!({"state": "active"})).await.expect("ins");
+    ks.insert("did:bob", &serde_json::json!({"state": "active"})).await.expect("ins");
+    ks.insert("watcher_sync:alice", &serde_json::json!({"version": 3})).await.expect("ins");
+    ks.insert("watcher_sync:bob", &serde_json::json!({"version": 1})).await.expect("ins");
+    ks.insert_raw("content:alice:log", b"log".to_vec()).await.expect("ins");
+    ks.insert_raw("owner:system:alice", b"alice".to_vec()).await.expect("ins");
+
+    // Each prefix scan returns only its own prefix.
+    let dids = ks.prefix_iter_raw(b"did:").await.expect("prefix");
+    assert_eq!(dids.len(), 2);
+
+    let syncs = ks.prefix_iter_raw(b"watcher_sync:").await.expect("prefix");
+    assert_eq!(syncs.len(), 2);
+
+    let contents = ks.prefix_iter_raw(b"content:").await.expect("prefix");
+    assert_eq!(contents.len(), 1);
+
+    let owners = ks.prefix_iter_raw(b"owner:").await.expect("prefix");
+    assert_eq!(owners.len(), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Server: stats and timeseries keyspaces.
+#[tokio::test]
+async fn server_stats_and_timeseries() {
+    use did_hosting_common::server::store::{KS_STATS, KS_TIMESERIES};
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let stats = store.keyspace(KS_STATS).expect("stats");
+    let ts = store.keyspace(KS_TIMESERIES).expect("timeseries");
+
+    // Stats: per-mnemonic counters.
+    stats.insert("stats:alice", &serde_json::json!({"resolves": 42, "updates": 5})).await.expect("ins");
+    stats.insert("stats:bob", &serde_json::json!({"resolves": 10, "updates": 1})).await.expect("ins");
+
+    // prefix_iter_raw to list all stats (used by stats seeding at startup).
+    let all_stats = stats.prefix_iter_raw(b"stats:").await.expect("prefix");
+    assert_eq!(all_stats.len(), 2);
+
+    // Timeseries: buckets keyed as ts:<mnemonic>:<epoch>.
+    ts.insert("ts:alice:1704067200", &serde_json::json!({"resolves": 10})).await.expect("ins");
+    ts.insert("ts:alice:1704153600", &serde_json::json!({"resolves": 15})).await.expect("ins");
+    ts.insert("ts:bob:1704067200", &serde_json::json!({"resolves": 5})).await.expect("ins");
+
+    // Scan for one mnemonic's time-series.
+    let alice_ts = ts.prefix_iter_raw(b"ts:alice:").await.expect("prefix");
+    assert_eq!(alice_ts.len(), 2);
+
+    // Scan across all mnemonics.
+    let all_ts = ts.prefix_iter_raw(b"ts:").await.expect("prefix");
+    assert_eq!(all_ts.len(), 3);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Server: session + refresh token lifecycle with take_raw_atomic.
+#[tokio::test]
+async fn server_session_and_refresh_token_lifecycle() {
+    use did_hosting_common::server::store::KS_SESSIONS;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_SESSIONS).expect("sessions");
+
+    // Create session + refresh token index.
+    let session = serde_json::json!({
+        "user_did": "did:key:zAlice",
+        "expires_at": 1704153600
+    });
+    ks.insert("session:s1", &session).await.expect("ins");
+    ks.insert_raw("refresh:tok-abc", b"s1".to_vec()).await.expect("ins");
+
+    // Normal session lookup.
+    let s: serde_json::Value = ks.get("session:s1").await.expect("get").expect("exists");
+    assert_eq!(s["user_did"], "did:key:zAlice");
+
+    // Refresh token rotation: atomic take (exactly one caller gets the value).
+    let taken = ks.take_raw("refresh:tok-abc").await.expect("take");
+    assert_eq!(taken, Some(b"s1".to_vec()));
+
+    // Second take returns None (token consumed).
+    let taken_again = ks.take_raw("refresh:tok-abc").await.expect("take");
+    assert_eq!(taken_again, None);
+
+    // Session cleanup: prefix scan for expired sessions.
+    let all_sessions = ks.prefix_iter_raw(b"session:").await.expect("prefix");
+    assert_eq!(all_sessions.len(), 1);
+
+    // Remove session.
+    ks.remove("session:s1").await.expect("remove");
+    let all_sessions = ks.prefix_iter_raw(b"session:").await.expect("prefix");
+    assert_eq!(all_sessions.len(), 0);
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// did-hosting-control access patterns
+// ===========================================================================
+
+/// Control: ACL CRUD — insert, get, prefix scan, remove.
+#[tokio::test]
+async fn control_acl_crud() {
+    use did_hosting_common::server::store::KS_ACL;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_ACL).expect("acl");
+
+    // Insert ACL entries.
+    ks.insert("acl:did:key:zAdmin", &serde_json::json!({"role": "admin", "max_dids": 100})).await.expect("ins");
+    ks.insert("acl:did:key:zOwner", &serde_json::json!({"role": "owner", "max_dids": 10})).await.expect("ins");
+    ks.insert("acl:did:key:zService", &serde_json::json!({"role": "service"})).await.expect("ins");
+
+    // Get specific ACL.
+    let admin: serde_json::Value = ks.get("acl:did:key:zAdmin").await.expect("get").expect("exists");
+    assert_eq!(admin["role"], "admin");
+
+    // List all ACLs (prefix scan).
+    let all = ks.prefix_iter_raw(b"acl:").await.expect("prefix");
+    assert_eq!(all.len(), 3);
+
+    // Revoke (remove).
+    ks.remove("acl:did:key:zService").await.expect("remove");
+    let all = ks.prefix_iter_raw(b"acl:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Control: registry — service instance management.
+#[tokio::test]
+async fn control_registry_instance_ops() {
+    use did_hosting_common::server::store::KS_REGISTRY;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_REGISTRY).expect("registry");
+
+    // Register service instances.
+    ks.insert("instance:srv-1", &serde_json::json!({"url": "https://srv1.example.com", "last_seen": 1704067200})).await.expect("ins");
+    ks.insert("instance:srv-2", &serde_json::json!({"url": "https://srv2.example.com", "last_seen": 1704067200})).await.expect("ins");
+
+    // List instances.
+    let all = ks.prefix_iter_raw(b"instance:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    // Deregister.
+    ks.remove("instance:srv-1").await.expect("remove");
+    let all = ks.prefix_iter_raw(b"instance:").await.expect("prefix");
+    assert_eq!(all.len(), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Control: outbound queue — FIFO ordering via lex-sorted keys.
+#[tokio::test]
+async fn control_outbound_queue_fifo_order() {
+    use did_hosting_common::server::store::KS_OUTBOUND_QUEUE;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_OUTBOUND_QUEUE).expect("outbound");
+
+    // Outbox keys: outbox:<target_did>:<micros>:<uuid> — lex order gives FIFO.
+    let target = "did:key:zTarget";
+    ks.insert_raw(
+        format!("outbox:{}:00000000000001:uuid-a", target),
+        b"msg-1".to_vec(),
+    ).await.expect("ins");
+    ks.insert_raw(
+        format!("outbox:{}:00000000000002:uuid-b", target),
+        b"msg-2".to_vec(),
+    ).await.expect("ins");
+    ks.insert_raw(
+        format!("outbox:{}:00000000000003:uuid-c", target),
+        b"msg-3".to_vec(),
+    ).await.expect("ins");
+
+    // Prefix scan for target — results come in lex order (FIFO).
+    let prefix = format!("outbox:{}:", target);
+    let msgs = ks.prefix_iter_raw(prefix.as_bytes()).await.expect("prefix");
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[0].1, b"msg-1");
+    assert_eq!(msgs[1].1, b"msg-2");
+    assert_eq!(msgs[2].1, b"msg-3");
+
+    // Consume first message (remove after delivery).
+    let first_key = String::from_utf8(msgs[0].0.clone()).unwrap();
+    ks.remove(first_key).await.expect("remove");
+    let remaining = ks.prefix_iter_raw(prefix.as_bytes()).await.expect("prefix");
+    assert_eq!(remaining.len(), 2);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Control: domain and assignment keyspaces.
+#[tokio::test]
+async fn control_domain_and_assignment_ops() {
+    use did_hosting_common::server::store::{KS_DOMAINS, KS_ASSIGNMENTS};
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let domains = store.keyspace(KS_DOMAINS).expect("domains");
+    let assignments = store.keyspace(KS_ASSIGNMENTS).expect("assignments");
+
+    // Seed domains.
+    domains.insert("example.com", &serde_json::json!({"domain": "example.com"})).await.expect("ins");
+    domains.insert("test.org", &serde_json::json!({"domain": "test.org"})).await.expect("ins");
+
+    // Seed assignments.
+    assignments.insert("example.com", &serde_json::json!({"zone": "us-east-1"})).await.expect("ins");
+    assignments.insert("test.org", &serde_json::json!({"zone": "eu-west-1"})).await.expect("ins");
+
+    // List all domains.
+    let all_domains = domains.prefix_iter_raw(b"").await.expect("prefix");
+    assert_eq!(all_domains.len(), 2);
+
+    // List all assignments.
+    let all_assign = assignments.prefix_iter_raw(b"").await.expect("prefix");
+    assert_eq!(all_assign.len(), 2);
+
+    // Domains and assignments are separate keyspaces — no cross-contamination.
+    assert!(!domains.contains_key("zone:us-east-1").await.expect("contains"));
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Control: pending purges keyspace (soft-delete grace period).
+#[tokio::test]
+async fn control_pending_purges() {
+    use did_hosting_common::server::store::KS_PENDING_PURGES;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_PENDING_PURGES).expect("pending_purges");
+
+    // Queue DIDs for purge after grace period.
+    ks.insert("purge:alice:1704153600", &serde_json::json!({"mnemonic": "alice", "purge_after": 1704153600})).await.expect("ins");
+    ks.insert("purge:bob:1704240000", &serde_json::json!({"mnemonic": "bob", "purge_after": 1704240000})).await.expect("ins");
+
+    // List all pending purges.
+    let all = ks.prefix_iter_raw(b"purge:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    // Process one purge.
+    ks.remove("purge:alice:1704153600").await.expect("remove");
+    let remaining = ks.prefix_iter_raw(b"purge:").await.expect("prefix");
+    assert_eq!(remaining.len(), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+/// Control: meta keyspace (migration markers).
+#[tokio::test]
+async fn control_meta_migration_markers() {
+    use did_hosting_common::server::store::KS_META;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_META).expect("meta");
+
+    // Write migration markers (idempotent, checked at startup).
+    ks.insert("migration:M-01", &serde_json::json!({"applied_at": 1704067200})).await.expect("ins");
+    ks.insert("migration:M-02", &serde_json::json!({"applied_at": 1704153600})).await.expect("ins");
+
+    // Check if a migration has been applied.
+    assert!(ks.contains_key("migration:M-01").await.expect("contains"));
+    assert!(!ks.contains_key("migration:M-99").await.expect("contains"));
+
+    // List all applied migrations.
+    let all = ks.prefix_iter_raw(b"migration:").await.expect("prefix");
+    assert_eq!(all.len(), 2);
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// webvh-witness access patterns
+// (witness_keyspace_operations above covers the main pattern;
+//  this adds ACL + session patterns used by the witness crate)
+// ===========================================================================
+
+/// Witness: ACL and session access (witness has its own ACL + sessions).
+#[tokio::test]
+async fn witness_acl_and_session_access() {
+    use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS};
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let acl = store.keyspace(KS_ACL).expect("acl");
+    let sessions = store.keyspace(KS_SESSIONS).expect("sessions");
+
+    // Witness ACL entry (controls who can request witness proofs).
+    acl.insert("acl:did:key:zWitnessUser", &serde_json::json!({"role": "owner"})).await.expect("ins");
+
+    // Witness session (auth token for witness API).
+    sessions.insert("session:ws1", &serde_json::json!({"user": "did:key:zWitnessUser"})).await.expect("ins");
+    sessions.insert_raw("refresh:witness-tok", b"ws1".to_vec()).await.expect("ins");
+
+    // Verify reads.
+    let acl_entry: serde_json::Value = acl.get("acl:did:key:zWitnessUser").await.expect("get").expect("exists");
+    assert_eq!(acl_entry["role"], "owner");
+
+    let sess: serde_json::Value = sessions.get("session:ws1").await.expect("get").expect("exists");
+    assert_eq!(sess["user"], "did:key:zWitnessUser");
+
+    // Refresh token take (atomic).
+    let tok = sessions.take_raw("refresh:witness-tok").await.expect("take");
+    assert_eq!(tok, Some(b"ws1".to_vec()));
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// webvh-watcher access patterns
+// (watcher_sync_status_operations above covers sync status;
+//  this adds the DID mirroring pattern: did: + content: in watcher's store)
+// ===========================================================================
+
+/// Watcher: mirrors DID records + content from remote server into its local store.
+#[tokio::test]
+async fn watcher_did_mirror_operations() {
+    use did_hosting_common::server::store::KS_DIDS;
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace(KS_DIDS).expect("dids");
+
+    // Watcher receives DID records from remote and inserts them locally.
+    ks.insert("did:remote-alice", &serde_json::json!({"did_id": "did:webvh:Qm:remote:alice", "state": "active"})).await.expect("ins");
+    ks.insert_raw("content:remote-alice:log", b"remote-log-data\n".to_vec()).await.expect("ins");
+    ks.insert_raw("content:remote-alice:witness", b"remote-witness".to_vec()).await.expect("ins");
+
+    // Watcher reads mirrored data for serving.
+    let did: serde_json::Value = ks.get("did:remote-alice").await.expect("get").expect("exists");
+    assert_eq!(did["state"], "active");
+
+    let log = ks.get_raw("content:remote-alice:log").await.expect("get").expect("exists");
+    assert_eq!(log, b"remote-log-data\n");
+
+    let witness = ks.get_raw("content:remote-alice:witness").await.expect("get").expect("exists");
+    assert_eq!(witness, b"remote-witness");
+
+    // Watcher updates mirrored data when remote version changes.
+    ks.insert_raw("content:remote-alice:log", b"updated-log\n".to_vec()).await.expect("update");
+    let updated = ks.get_raw("content:remote-alice:log").await.expect("get").expect("exists");
+    assert_eq!(updated, b"updated-log\n");
+
+    // Watcher removes mirrored data if DID is deactivated upstream.
+    ks.remove("did:remote-alice").await.expect("remove");
+    ks.remove("content:remote-alice:log").await.expect("remove");
+    ks.remove("content:remote-alice:witness").await.expect("remove");
+
+    assert!(!ks.contains_key("did:remote-alice").await.expect("contains"));
+
+    delete_test_table(&client, &table).await;
+}
+
+// ===========================================================================
+// did-hosting-daemon access patterns
+// (daemon combines all modules; this tests the cross-module scenario)
+// ===========================================================================
+
+/// Daemon: full lifecycle — bootstrap + runtime + cleanup in one table.
+#[tokio::test]
+async fn daemon_full_lifecycle_single_table() {
+    use did_hosting_common::server::store::{
+        KS_ACL, KS_DIDS, KS_DOMAINS, KS_META, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    };
+
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    let dids = store.keyspace(KS_DIDS).expect("dids");
+    let acl = store.keyspace(KS_ACL).expect("acl");
+    let domains = store.keyspace(KS_DOMAINS).expect("domains");
+    let meta = store.keyspace(KS_META).expect("meta");
+    let sessions = store.keyspace(KS_SESSIONS).expect("sessions");
+    let stats = store.keyspace(KS_STATS).expect("stats");
+    let ts = store.keyspace(KS_TIMESERIES).expect("ts");
+    let witnesses = store.keyspace(KS_WITNESSES).expect("witnesses");
+
+    // === Phase 1: Bootstrap (server + control) ===
+    let mut batch = store.batch();
+    // Server: root DID.
+    batch.insert(&dids, "did:.well-known", &serde_json::json!({"did_id": "did:webvh:Qm:host:.well-known", "owner": "system"})).expect("b");
+    batch.insert_raw(&dids, "content:.well-known:log", b"bootstrap-log\n".to_vec());
+    batch.insert_raw(&dids, "owner:system:.well-known", b".well-known".to_vec());
+    // Control: admin ACL.
+    batch.insert(&acl, "acl:did:key:zAdmin", &serde_json::json!({"role": "admin"})).expect("b");
+    // Control: domain seed.
+    batch.insert(&domains, "example.com", &serde_json::json!({"domain": "example.com"})).expect("b");
+    // Daemon: migration marker.
+    batch.insert(&meta, "migration:M-01", &serde_json::json!({"done": true})).expect("b");
+    batch.commit().await.expect("bootstrap batch");
+
+    // === Phase 2: Runtime — user resolves DID (server reads) ===
+    let did_rec: serde_json::Value = dids.get("did:.well-known").await.expect("get").expect("exists");
+    assert_eq!(did_rec["owner"], "system");
+    let log = dids.get_raw("content:.well-known:log").await.expect("get").expect("exists");
+    assert_eq!(log, b"bootstrap-log\n");
+
+    // === Phase 3: Runtime — stats flush (daemon background task) ===
+    stats.insert("stats:.well-known", &serde_json::json!({"resolves": 42})).await.expect("ins");
+    ts.insert("ts:.well-known:1704067200", &serde_json::json!({"resolves": 42})).await.expect("ins");
+
+    // === Phase 4: Runtime — witness attestation ===
+    witnesses.insert("witness:.well-known:v1", &serde_json::json!({"proof": "sig"})).await.expect("ins");
+    let proof: serde_json::Value = witnesses.get("witness:.well-known:v1").await.expect("get").expect("exists");
+    assert_eq!(proof["proof"], "sig");
+
+    // === Phase 5: Runtime — user creates session (server/control auth) ===
+    sessions.insert("session:s1", &serde_json::json!({"user": "did:key:zAdmin"})).await.expect("ins");
+    sessions.insert_raw("refresh:tok1", b"s1".to_vec()).await.expect("ins");
+
+    // === Phase 6: Cleanup (daemon background task) ===
+    // Session cleanup.
+    sessions.remove("session:s1").await.expect("rm");
+    // Stats already written, just verify.
+    let s: serde_json::Value = stats.get("stats:.well-known").await.expect("get").expect("exists");
+    assert_eq!(s["resolves"], 42);
+
+    // === Verify: all keyspaces independently intact ===
+    assert!(dids.contains_key("did:.well-known").await.expect("c"));
+    assert!(acl.contains_key("acl:did:key:zAdmin").await.expect("c"));
+    assert!(domains.contains_key("example.com").await.expect("c"));
+    assert!(meta.contains_key("migration:M-01").await.expect("c"));
+    assert!(witnesses.contains_key("witness:.well-known:v1").await.expect("c"));
+    assert!(!sessions.contains_key("session:s1").await.expect("c")); // cleaned up
+
+    delete_test_table(&client, &table).await;
+}

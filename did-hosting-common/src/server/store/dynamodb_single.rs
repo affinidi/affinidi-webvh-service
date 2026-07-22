@@ -522,4 +522,82 @@ mod tests {
             other => panic!("expected AppError::Store, got {other:?}"),
         }
     }
+
+    #[test]
+    fn extract_pairs_preserves_order() {
+        // Verify that order is preserved when extracting multiple items.
+        let items = vec![
+            item("ks", "z_item", b"z"),
+            item("ks", "a_item", b"a"),
+            item("ks", "m_item", b"m"),
+        ];
+        let mut out = Vec::new();
+        extract_pairs(items, &mut out);
+        assert_eq!(out.len(), 3);
+        // Order comes from the input vector.
+        assert_eq!(out[0].0, b"z_item");
+        assert_eq!(out[1].0, b"a_item");
+        assert_eq!(out[2].0, b"m_item");
+    }
+
+    #[test]
+    fn extract_pairs_handles_empty_values() {
+        // Values can be empty bytes.
+        let items = vec![item("ks", "empty", b"")];
+        let mut out = Vec::new();
+        extract_pairs(items, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"empty");
+        assert_eq!(out[0].1, b"");
+    }
+
+    #[test]
+    fn extract_pairs_all_missing_returns_empty() {
+        // All items missing required attributes.
+        let items = vec![
+            HashMap::from([
+                (PK_ATTR.to_string(), AttributeValue::S("ks".to_string())),
+            ]),
+            HashMap::from([
+                (SK_ATTR.to_string(), AttributeValue::S("k".to_string())),
+            ]),
+        ];
+        let mut out = Vec::new();
+        extract_pairs(items, &mut out);
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn extract_val_bytes_with_empty_blob() {
+        // Empty blob should still return Some.
+        let mut item = HashMap::new();
+        item.insert(
+            VAL_ATTR.to_string(),
+            AttributeValue::B(Blob::new(Vec::new())),
+        );
+        assert_eq!(extract_val_bytes(item), Some(Vec::new()));
+    }
+
+    #[test]
+    fn extract_val_bytes_missing_val_attr() {
+        // Item without VAL_ATTR returns None.
+        let item = HashMap::from([(
+            PK_ATTR.to_string(),
+            AttributeValue::S("test".to_string()),
+        )]);
+        assert_eq!(extract_val_bytes(item), None);
+    }
+
+    #[test]
+    fn key_as_string_with_special_chars() {
+        // UTF-8 strings with special characters should work.
+        assert_eq!(
+            key_as_string("special:chars:!@#$%".as_bytes()).unwrap(),
+            "special:chars:!@#$%"
+        );
+        assert_eq!(
+            key_as_string("path/to/resource".as_bytes()).unwrap(),
+            "path/to/resource"
+        );
+    }
 }
