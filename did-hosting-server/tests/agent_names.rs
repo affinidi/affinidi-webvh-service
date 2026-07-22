@@ -132,24 +132,36 @@ fn app(state: AppState) -> axum::Router {
 }
 
 async fn get(state: AppState, path: &str) -> (StatusCode, Option<String>) {
+    get_with_accept(state, path, None).await.0
+}
+
+/// Like [`get`] but lets a test set `Accept` (to exercise content negotiation)
+/// and also returns the `Vary` header.
+async fn get_with_accept(
+    state: AppState,
+    path: &str,
+    accept: Option<&str>,
+) -> ((StatusCode, Option<String>), Option<String>) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", DOMAIN);
+    if let Some(a) = accept {
+        builder = builder.header("accept", a);
+    }
     let response = app(state)
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(path)
-                .header("host", DOMAIN)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
-    let location = response
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    (status, location)
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    ((status, header("location")), header("vary"))
 }
 
 #[tokio::test]
@@ -171,6 +183,41 @@ async fn resolves_a_context_qualified_name() {
     let (status, location) = get(state, "/@alice/h2hsummit").await;
     assert_eq!(status, StatusCode::FOUND);
     assert_eq!(location.as_deref(), Some(DID));
+}
+
+/// A browser (`Accept: text/html`) can't follow a `did:` Location, so it is
+/// redirected to the DID's same-origin, loadable `did.jsonl` instead — and the
+/// response advertises `Vary: accept` so a shared cache keeps the two audiences
+/// apart.
+#[tokio::test]
+async fn a_browser_is_redirected_to_the_loadable_did_jsonl() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let ((status, location), vary) = get_with_accept(
+        state,
+        "/@alice",
+        Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    // Relative, so the browser resolves it against this origin; `alice-did` is
+    // the seeded mnemonic.
+    assert_eq!(location.as_deref(), Some("/alice-did/did.jsonl"));
+    assert_eq!(vary.as_deref(), Some("accept"));
+}
+
+/// A non-browser caller that happens to accept anything (`*/*`, curl's default)
+/// still gets the DID — the machine contract is unchanged.
+#[tokio::test]
+async fn a_wildcard_accept_still_gets_the_did() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let ((status, location), vary) = get_with_accept(state, "/@alice", Some("*/*")).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+    assert_eq!(vary.as_deref(), Some("accept"));
 }
 
 /// Feature off -> the namespace is not served, even for a name that exists.
