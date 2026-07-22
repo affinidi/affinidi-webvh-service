@@ -133,11 +133,44 @@ async fn resolve(state: &AppState, raw_name: &str, parts: &Parts) -> Result<Resp
     };
 
     debug!(%name, %did, "agent name resolved");
-    let location = HeaderValue::from_str(&did)
+
+    // Content-negotiate the redirect target on `Accept`.
+    //
+    // The default — for resolvers, the `agent-names` `HttpRedirectResolver`,
+    // and `curl` — is the DID itself. That is the contract: the caller resolves
+    // the DID and checks its document claims the name back (Layer-1). A browser,
+    // though, can't follow a `did:` scheme, so an `Accept: text/html` caller
+    // gets a same-origin redirect to the DID's resolvable `did.jsonl` instead —
+    // it lands on real, loadable content rather than an unnavigable scheme. The
+    // machine contract is unchanged; only the human's browser is redirected
+    // somewhere it can render.
+    //
+    // A *relative* target (`/{mnemonic}/did.jsonl`) so the browser resolves it
+    // against this exact origin — no scheme/host reconstruction, correct behind
+    // a TLS-terminating proxy. `mnemonic` is `.well-known` for a root DID, which
+    // is exactly the log's path there too, so one form covers every case.
+    let wants_html = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    let target = if wants_html {
+        format!("/{mnemonic}/did.jsonl")
+    } else {
+        did
+    };
+
+    let location = HeaderValue::from_str(&target)
         .map_err(|_| AppError::NotFound(format!("no such agent name: @{name}")))?;
     Ok((
         StatusCode::FOUND,
-        [(header::LOCATION, location)],
+        [
+            (header::LOCATION, location),
+            // The response body depends on `Accept`, so a shared cache must key
+            // on it — otherwise it could hand a browser's `did.jsonl` redirect
+            // to a resolver, or vice versa.
+            (header::VARY, HeaderValue::from_static("accept")),
+        ],
         // A short public cache: a name mapping changes rarely, but it CAN
         // change (rename, disable), so it is not immutable.
         [(
