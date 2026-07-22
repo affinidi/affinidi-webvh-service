@@ -201,6 +201,71 @@ impl WebVHClient {
         self.handle_response(resp).await
     }
 
+    /// Fetch a single DID's detail record — including its `agentNames`
+    /// registry (with `enabled` flags), which the list endpoint omits.
+    /// Returned as a raw JSON value so a caller can read fields without this
+    /// crate having to mirror the control plane's response type.
+    pub async fn get_did_detail(&self, mnemonic: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .auth_get(&format!("/api/dids/{mnemonic}"))?
+            .send()
+            .await?;
+        self.handle_response(resp).await
+    }
+
+    /// Probe whether an agent name is free on `domain`
+    /// (`POST /api/agent-names/check`). Response carries `available` and
+    /// `reserved` — the latter distinct so a caller can say *why* a name is
+    /// unavailable.
+    pub async fn check_agent_name(
+        &self,
+        name: &str,
+        domain: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::Map::new();
+        body.insert("name".into(), serde_json::Value::String(name.to_string()));
+        if let Some(d) = domain {
+            body.insert("domain".into(), serde_json::Value::String(d.to_string()));
+        }
+        let resp = self
+            .auth_post("/api/agent-names/check")?
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await?;
+        self.handle_response(resp).await
+    }
+
+    /// Drive an agent-name mutation — `op` is one of
+    /// `set` / `remove` / `enable` / `disable` — by submitting the freshly
+    /// signed `did.jsonl` whose `alsoKnownAs` claims (`set`/`enable`) or no
+    /// longer claims (`remove`/`disable`) the name. The control plane verifies
+    /// that direction matches the verb, republishes the log, and applies the
+    /// registry change in one commit. Returns the `{record}` response.
+    pub async fn agent_name_op(
+        &self,
+        op: &str,
+        mnemonic: &str,
+        name: &str,
+        did_log: &str,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "mnemonic".into(),
+            serde_json::Value::String(mnemonic.to_string()),
+        );
+        body.insert("name".into(), serde_json::Value::String(name.to_string()));
+        body.insert(
+            "didLog".into(),
+            serde_json::Value::String(did_log.to_string()),
+        );
+        let resp = self
+            .auth_post(&format!("/api/agent-names/{op}"))?
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await?;
+        self.handle_response(resp).await
+    }
+
     /// Returns the server URL this client is configured with.
     pub fn server_url(&self) -> &str {
         &self.server_url
