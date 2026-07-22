@@ -1602,10 +1602,15 @@ async fn daemon_full_lifecycle_single_table() {
     // === Phase 5: Runtime — user creates session (server/control auth) ===
     sessions.insert("session:s1", &serde_json::json!({"user": "did:key:zAdmin"})).await.expect("ins");
     sessions.insert_raw("refresh:tok1", b"s1".to_vec()).await.expect("ins");
+    // Verify session was stored.
+    assert!(sessions.contains_key("session:s1").await.expect("c"));
 
     // === Phase 6: Cleanup (daemon background task) ===
     // Session cleanup.
     sessions.remove("session:s1").await.expect("rm");
+    // Verify session is gone immediately after remove.
+    assert!(!sessions.contains_key("session:s1").await.expect("c"));
+
     // Stats already written, just verify.
     let s: serde_json::Value = stats.get("stats:.well-known").await.expect("get").expect("exists");
     assert_eq!(s["resolves"], 42);
@@ -1616,7 +1621,6 @@ async fn daemon_full_lifecycle_single_table() {
     assert!(domains.contains_key("example.com").await.expect("c"));
     assert!(meta.contains_key("migration:M-01").await.expect("c"));
     assert!(witnesses.contains_key("witness:.well-known:v1").await.expect("c"));
-    assert!(!sessions.contains_key("session:s1").await.expect("c")); // cleaned up
 
     delete_test_table(&client, &table).await;
 }
