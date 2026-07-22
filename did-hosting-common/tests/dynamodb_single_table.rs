@@ -840,8 +840,8 @@ async fn unicode_keys_round_trip() {
 #[tokio::test]
 async fn all_service_keyspaces_coexist_in_single_table() {
     use did_hosting_common::server::store::{
-        KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_OUTBOUND_QUEUE,
-        KS_PENDING_PURGES, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+        KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_OUTBOUND_QUEUE, KS_PENDING_PURGES,
+        KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
     };
 
     let endpoint = require_endpoint!();
@@ -977,8 +977,12 @@ async fn watcher_sync_status_operations() {
     });
 
     // Write sync statuses.
-    ks.insert("watcher_sync:alice", &sync_a).await.expect("insert");
-    ks.insert("watcher_sync:bob", &sync_b).await.expect("insert");
+    ks.insert("watcher_sync:alice", &sync_a)
+        .await
+        .expect("insert");
+    ks.insert("watcher_sync:bob", &sync_b)
+        .await
+        .expect("insert");
 
     // Read back.
     let got: Option<serde_json::Value> = ks.get("watcher_sync:alice").await.expect("get");
@@ -1040,37 +1044,50 @@ async fn batch_across_all_keyspaces_simulates_bootstrap() {
     let mut batch = store.batch();
 
     // DID record.
-    batch.insert(
-        &dids,
-        "did:.well-known",
-        &serde_json::json!({"did_id": "did:webvh:QmABC:host:.well-known", "owner": "system"}),
-    ).expect("batch did");
+    batch
+        .insert(
+            &dids,
+            "did:.well-known",
+            &serde_json::json!({"did_id": "did:webvh:QmABC:host:.well-known", "owner": "system"}),
+        )
+        .expect("batch did");
 
     // DID log content (raw bytes).
-    batch.insert_raw(&dids, "content:.well-known:log", b"jsonl-entry-here".to_vec());
+    batch.insert_raw(
+        &dids,
+        "content:.well-known:log",
+        b"jsonl-entry-here".to_vec(),
+    );
 
     // Owner reverse index.
     batch.insert_raw(&dids, "owner:system:.well-known", b".well-known".to_vec());
 
     // ACL entry.
-    batch.insert(
-        &acl,
-        "acl:did:key:z6MkAdmin",
-        &serde_json::json!({"role": "admin", "max_dids": 100}),
-    ).expect("batch acl");
+    batch
+        .insert(
+            &acl,
+            "acl:did:key:z6MkAdmin",
+            &serde_json::json!({"role": "admin", "max_dids": 100}),
+        )
+        .expect("batch acl");
 
     // Domain seed.
-    batch.insert(
-        &domains,
-        "domain:example.com",
-        &serde_json::json!({"domain": "example.com", "owner": "system"}),
-    ).expect("batch domain");
+    batch
+        .insert(
+            &domains,
+            "domain:example.com",
+            &serde_json::json!({"domain": "example.com", "owner": "system"}),
+        )
+        .expect("batch domain");
 
     batch.commit().await.expect("bootstrap batch commit");
 
     // Verify everything landed in the correct keyspace.
     let did_record: Option<serde_json::Value> = dids.get("did:.well-known").await.expect("get");
-    assert_eq!(did_record.unwrap()["did_id"], "did:webvh:QmABC:host:.well-known");
+    assert_eq!(
+        did_record.unwrap()["did_id"],
+        "did:webvh:QmABC:host:.well-known"
+    );
 
     let content = dids.get_raw("content:.well-known:log").await.expect("get");
     assert_eq!(content, Some(b"jsonl-entry-here".to_vec()));
@@ -1119,17 +1136,32 @@ async fn server_did_batch_write_and_read() {
     let did_rec: serde_json::Value = ks.get("did:alice").await.expect("get").expect("exists");
     assert_eq!(did_rec["state"], "active");
 
-    let log = ks.get_raw("content:alice:log").await.expect("get").expect("exists");
+    let log = ks
+        .get_raw("content:alice:log")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(log, b"jsonl-signed-entry\n");
 
-    let witness = ks.get_raw("content:alice:witness").await.expect("get").expect("exists");
+    let witness = ks
+        .get_raw("content:alice:witness")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(witness, b"witness-proof-json");
 
-    let owner = ks.get_raw("owner:did:key:zAdmin:alice").await.expect("get").expect("exists");
+    let owner = ks
+        .get_raw("owner:did:key:zAdmin:alice")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(owner, b"alice");
 
     // Prefix scan for owner's DIDs.
-    let owner_dids = ks.prefix_iter_raw(b"owner:did:key:zAdmin:").await.expect("prefix");
+    let owner_dids = ks
+        .prefix_iter_raw(b"owner:did:key:zAdmin:")
+        .await
+        .expect("prefix");
     assert_eq!(owner_dids.len(), 1);
 
     // Batch delete (simulates DID removal).
@@ -1142,7 +1174,11 @@ async fn server_did_batch_write_and_read() {
 
     // All gone.
     assert!(!ks.contains_key("did:alice").await.expect("contains"));
-    assert!(!ks.contains_key("content:alice:log").await.expect("contains"));
+    assert!(
+        !ks.contains_key("content:alice:log")
+            .await
+            .expect("contains")
+    );
 
     delete_test_table(&client, &table).await;
 }
@@ -1160,12 +1196,24 @@ async fn server_watcher_sync_coexists_with_did_records() {
     let ks = store.keyspace(KS_DIDS).expect("dids");
 
     // Mix DID records and watcher_sync records in the same keyspace.
-    ks.insert("did:alice", &serde_json::json!({"state": "active"})).await.expect("ins");
-    ks.insert("did:bob", &serde_json::json!({"state": "active"})).await.expect("ins");
-    ks.insert("watcher_sync:alice", &serde_json::json!({"version": 3})).await.expect("ins");
-    ks.insert("watcher_sync:bob", &serde_json::json!({"version": 1})).await.expect("ins");
-    ks.insert_raw("content:alice:log", b"log".to_vec()).await.expect("ins");
-    ks.insert_raw("owner:system:alice", b"alice".to_vec()).await.expect("ins");
+    ks.insert("did:alice", &serde_json::json!({"state": "active"}))
+        .await
+        .expect("ins");
+    ks.insert("did:bob", &serde_json::json!({"state": "active"}))
+        .await
+        .expect("ins");
+    ks.insert("watcher_sync:alice", &serde_json::json!({"version": 3}))
+        .await
+        .expect("ins");
+    ks.insert("watcher_sync:bob", &serde_json::json!({"version": 1}))
+        .await
+        .expect("ins");
+    ks.insert_raw("content:alice:log", b"log".to_vec())
+        .await
+        .expect("ins");
+    ks.insert_raw("owner:system:alice", b"alice".to_vec())
+        .await
+        .expect("ins");
 
     // Each prefix scan returns only its own prefix.
     let dids = ks.prefix_iter_raw(b"did:").await.expect("prefix");
@@ -1197,17 +1245,35 @@ async fn server_stats_and_timeseries() {
     let ts = store.keyspace(KS_TIMESERIES).expect("timeseries");
 
     // Stats: per-mnemonic counters.
-    stats.insert("stats:alice", &serde_json::json!({"resolves": 42, "updates": 5})).await.expect("ins");
-    stats.insert("stats:bob", &serde_json::json!({"resolves": 10, "updates": 1})).await.expect("ins");
+    stats
+        .insert(
+            "stats:alice",
+            &serde_json::json!({"resolves": 42, "updates": 5}),
+        )
+        .await
+        .expect("ins");
+    stats
+        .insert(
+            "stats:bob",
+            &serde_json::json!({"resolves": 10, "updates": 1}),
+        )
+        .await
+        .expect("ins");
 
     // prefix_iter_raw to list all stats (used by stats seeding at startup).
     let all_stats = stats.prefix_iter_raw(b"stats:").await.expect("prefix");
     assert_eq!(all_stats.len(), 2);
 
     // Timeseries: buckets keyed as ts:<mnemonic>:<epoch>.
-    ts.insert("ts:alice:1704067200", &serde_json::json!({"resolves": 10})).await.expect("ins");
-    ts.insert("ts:alice:1704153600", &serde_json::json!({"resolves": 15})).await.expect("ins");
-    ts.insert("ts:bob:1704067200", &serde_json::json!({"resolves": 5})).await.expect("ins");
+    ts.insert("ts:alice:1704067200", &serde_json::json!({"resolves": 10}))
+        .await
+        .expect("ins");
+    ts.insert("ts:alice:1704153600", &serde_json::json!({"resolves": 15}))
+        .await
+        .expect("ins");
+    ts.insert("ts:bob:1704067200", &serde_json::json!({"resolves": 5}))
+        .await
+        .expect("ins");
 
     // Scan for one mnemonic's time-series.
     let alice_ts = ts.prefix_iter_raw(b"ts:alice:").await.expect("prefix");
@@ -1237,7 +1303,9 @@ async fn server_session_and_refresh_token_lifecycle() {
         "expires_at": 1704153600
     });
     ks.insert("session:s1", &session).await.expect("ins");
-    ks.insert_raw("refresh:tok-abc", b"s1".to_vec()).await.expect("ins");
+    ks.insert_raw("refresh:tok-abc", b"s1".to_vec())
+        .await
+        .expect("ins");
 
     // Normal session lookup.
     let s: serde_json::Value = ks.get("session:s1").await.expect("get").expect("exists");
@@ -1279,12 +1347,31 @@ async fn control_acl_crud() {
     let ks = store.keyspace(KS_ACL).expect("acl");
 
     // Insert ACL entries.
-    ks.insert("acl:did:key:zAdmin", &serde_json::json!({"role": "admin", "max_dids": 100})).await.expect("ins");
-    ks.insert("acl:did:key:zOwner", &serde_json::json!({"role": "owner", "max_dids": 10})).await.expect("ins");
-    ks.insert("acl:did:key:zService", &serde_json::json!({"role": "service"})).await.expect("ins");
+    ks.insert(
+        "acl:did:key:zAdmin",
+        &serde_json::json!({"role": "admin", "max_dids": 100}),
+    )
+    .await
+    .expect("ins");
+    ks.insert(
+        "acl:did:key:zOwner",
+        &serde_json::json!({"role": "owner", "max_dids": 10}),
+    )
+    .await
+    .expect("ins");
+    ks.insert(
+        "acl:did:key:zService",
+        &serde_json::json!({"role": "service"}),
+    )
+    .await
+    .expect("ins");
 
     // Get specific ACL.
-    let admin: serde_json::Value = ks.get("acl:did:key:zAdmin").await.expect("get").expect("exists");
+    let admin: serde_json::Value = ks
+        .get("acl:did:key:zAdmin")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(admin["role"], "admin");
 
     // List all ACLs (prefix scan).
@@ -1311,8 +1398,18 @@ async fn control_registry_instance_ops() {
     let ks = store.keyspace(KS_REGISTRY).expect("registry");
 
     // Register service instances.
-    ks.insert("instance:srv-1", &serde_json::json!({"url": "https://srv1.example.com", "last_seen": 1704067200})).await.expect("ins");
-    ks.insert("instance:srv-2", &serde_json::json!({"url": "https://srv2.example.com", "last_seen": 1704067200})).await.expect("ins");
+    ks.insert(
+        "instance:srv-1",
+        &serde_json::json!({"url": "https://srv1.example.com", "last_seen": 1704067200}),
+    )
+    .await
+    .expect("ins");
+    ks.insert(
+        "instance:srv-2",
+        &serde_json::json!({"url": "https://srv2.example.com", "last_seen": 1704067200}),
+    )
+    .await
+    .expect("ins");
 
     // List instances.
     let all = ks.prefix_iter_raw(b"instance:").await.expect("prefix");
@@ -1342,15 +1439,21 @@ async fn control_outbound_queue_fifo_order() {
     ks.insert_raw(
         format!("outbox:{}:00000000000001:uuid-a", target),
         b"msg-1".to_vec(),
-    ).await.expect("ins");
+    )
+    .await
+    .expect("ins");
     ks.insert_raw(
         format!("outbox:{}:00000000000002:uuid-b", target),
         b"msg-2".to_vec(),
-    ).await.expect("ins");
+    )
+    .await
+    .expect("ins");
     ks.insert_raw(
         format!("outbox:{}:00000000000003:uuid-c", target),
         b"msg-3".to_vec(),
-    ).await.expect("ins");
+    )
+    .await
+    .expect("ins");
 
     // Prefix scan for target — results come in lex order (FIFO).
     let prefix = format!("outbox:{}:", target);
@@ -1372,7 +1475,7 @@ async fn control_outbound_queue_fifo_order() {
 /// Control: domain and assignment keyspaces.
 #[tokio::test]
 async fn control_domain_and_assignment_ops() {
-    use did_hosting_common::server::store::{KS_DOMAINS, KS_ASSIGNMENTS};
+    use did_hosting_common::server::store::{KS_ASSIGNMENTS, KS_DOMAINS};
 
     let endpoint = require_endpoint!();
     let client = local_client(&endpoint).await;
@@ -1383,12 +1486,24 @@ async fn control_domain_and_assignment_ops() {
     let assignments = store.keyspace(KS_ASSIGNMENTS).expect("assignments");
 
     // Seed domains.
-    domains.insert("example.com", &serde_json::json!({"domain": "example.com"})).await.expect("ins");
-    domains.insert("test.org", &serde_json::json!({"domain": "test.org"})).await.expect("ins");
+    domains
+        .insert("example.com", &serde_json::json!({"domain": "example.com"}))
+        .await
+        .expect("ins");
+    domains
+        .insert("test.org", &serde_json::json!({"domain": "test.org"}))
+        .await
+        .expect("ins");
 
     // Seed assignments.
-    assignments.insert("example.com", &serde_json::json!({"zone": "us-east-1"})).await.expect("ins");
-    assignments.insert("test.org", &serde_json::json!({"zone": "eu-west-1"})).await.expect("ins");
+    assignments
+        .insert("example.com", &serde_json::json!({"zone": "us-east-1"}))
+        .await
+        .expect("ins");
+    assignments
+        .insert("test.org", &serde_json::json!({"zone": "eu-west-1"}))
+        .await
+        .expect("ins");
 
     // List all domains.
     let all_domains = domains.prefix_iter_raw(b"").await.expect("prefix");
@@ -1399,7 +1514,12 @@ async fn control_domain_and_assignment_ops() {
     assert_eq!(all_assign.len(), 2);
 
     // Domains and assignments are separate keyspaces — no cross-contamination.
-    assert!(!domains.contains_key("zone:us-east-1").await.expect("contains"));
+    assert!(
+        !domains
+            .contains_key("zone:us-east-1")
+            .await
+            .expect("contains")
+    );
 
     delete_test_table(&client, &table).await;
 }
@@ -1416,8 +1536,18 @@ async fn control_pending_purges() {
     let ks = store.keyspace(KS_PENDING_PURGES).expect("pending_purges");
 
     // Queue DIDs for purge after grace period.
-    ks.insert("purge:alice:1704153600", &serde_json::json!({"mnemonic": "alice", "purge_after": 1704153600})).await.expect("ins");
-    ks.insert("purge:bob:1704240000", &serde_json::json!({"mnemonic": "bob", "purge_after": 1704240000})).await.expect("ins");
+    ks.insert(
+        "purge:alice:1704153600",
+        &serde_json::json!({"mnemonic": "alice", "purge_after": 1704153600}),
+    )
+    .await
+    .expect("ins");
+    ks.insert(
+        "purge:bob:1704240000",
+        &serde_json::json!({"mnemonic": "bob", "purge_after": 1704240000}),
+    )
+    .await
+    .expect("ins");
 
     // List all pending purges.
     let all = ks.prefix_iter_raw(b"purge:").await.expect("prefix");
@@ -1443,8 +1573,18 @@ async fn control_meta_migration_markers() {
     let ks = store.keyspace(KS_META).expect("meta");
 
     // Write migration markers (idempotent, checked at startup).
-    ks.insert("migration:M-01", &serde_json::json!({"applied_at": 1704067200})).await.expect("ins");
-    ks.insert("migration:M-02", &serde_json::json!({"applied_at": 1704153600})).await.expect("ins");
+    ks.insert(
+        "migration:M-01",
+        &serde_json::json!({"applied_at": 1704067200}),
+    )
+    .await
+    .expect("ins");
+    ks.insert(
+        "migration:M-02",
+        &serde_json::json!({"applied_at": 1704153600}),
+    )
+    .await
+    .expect("ins");
 
     // Check if a migration has been applied.
     assert!(ks.contains_key("migration:M-01").await.expect("contains"));
@@ -1477,21 +1617,46 @@ async fn witness_acl_and_session_access() {
     let sessions = store.keyspace(KS_SESSIONS).expect("sessions");
 
     // Witness ACL entry (controls who can request witness proofs).
-    acl.insert("acl:did:key:zWitnessUser", &serde_json::json!({"role": "owner"})).await.expect("ins");
+    acl.insert(
+        "acl:did:key:zWitnessUser",
+        &serde_json::json!({"role": "owner"}),
+    )
+    .await
+    .expect("ins");
 
     // Witness session (auth token for witness API).
-    sessions.insert("session:ws1", &serde_json::json!({"user": "did:key:zWitnessUser"})).await.expect("ins");
-    sessions.insert_raw("refresh:witness-tok", b"ws1".to_vec()).await.expect("ins");
+    sessions
+        .insert(
+            "session:ws1",
+            &serde_json::json!({"user": "did:key:zWitnessUser"}),
+        )
+        .await
+        .expect("ins");
+    sessions
+        .insert_raw("refresh:witness-tok", b"ws1".to_vec())
+        .await
+        .expect("ins");
 
     // Verify reads.
-    let acl_entry: serde_json::Value = acl.get("acl:did:key:zWitnessUser").await.expect("get").expect("exists");
+    let acl_entry: serde_json::Value = acl
+        .get("acl:did:key:zWitnessUser")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(acl_entry["role"], "owner");
 
-    let sess: serde_json::Value = sessions.get("session:ws1").await.expect("get").expect("exists");
+    let sess: serde_json::Value = sessions
+        .get("session:ws1")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(sess["user"], "did:key:zWitnessUser");
 
     // Refresh token take (atomic).
-    let tok = sessions.take_raw("refresh:witness-tok").await.expect("take");
+    let tok = sessions
+        .take_raw("refresh:witness-tok")
+        .await
+        .expect("take");
     assert_eq!(tok, Some(b"ws1".to_vec()));
 
     delete_test_table(&client, &table).await;
@@ -1515,29 +1680,58 @@ async fn watcher_did_mirror_operations() {
     let ks = store.keyspace(KS_DIDS).expect("dids");
 
     // Watcher receives DID records from remote and inserts them locally.
-    ks.insert("did:remote-alice", &serde_json::json!({"did_id": "did:webvh:Qm:remote:alice", "state": "active"})).await.expect("ins");
-    ks.insert_raw("content:remote-alice:log", b"remote-log-data\n".to_vec()).await.expect("ins");
-    ks.insert_raw("content:remote-alice:witness", b"remote-witness".to_vec()).await.expect("ins");
+    ks.insert(
+        "did:remote-alice",
+        &serde_json::json!({"did_id": "did:webvh:Qm:remote:alice", "state": "active"}),
+    )
+    .await
+    .expect("ins");
+    ks.insert_raw("content:remote-alice:log", b"remote-log-data\n".to_vec())
+        .await
+        .expect("ins");
+    ks.insert_raw("content:remote-alice:witness", b"remote-witness".to_vec())
+        .await
+        .expect("ins");
 
     // Watcher reads mirrored data for serving.
-    let did: serde_json::Value = ks.get("did:remote-alice").await.expect("get").expect("exists");
+    let did: serde_json::Value = ks
+        .get("did:remote-alice")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(did["state"], "active");
 
-    let log = ks.get_raw("content:remote-alice:log").await.expect("get").expect("exists");
+    let log = ks
+        .get_raw("content:remote-alice:log")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(log, b"remote-log-data\n");
 
-    let witness = ks.get_raw("content:remote-alice:witness").await.expect("get").expect("exists");
+    let witness = ks
+        .get_raw("content:remote-alice:witness")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(witness, b"remote-witness");
 
     // Watcher updates mirrored data when remote version changes.
-    ks.insert_raw("content:remote-alice:log", b"updated-log\n".to_vec()).await.expect("update");
-    let updated = ks.get_raw("content:remote-alice:log").await.expect("get").expect("exists");
+    ks.insert_raw("content:remote-alice:log", b"updated-log\n".to_vec())
+        .await
+        .expect("update");
+    let updated = ks
+        .get_raw("content:remote-alice:log")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(updated, b"updated-log\n");
 
     // Watcher removes mirrored data if DID is deactivated upstream.
     ks.remove("did:remote-alice").await.expect("remove");
     ks.remove("content:remote-alice:log").await.expect("remove");
-    ks.remove("content:remote-alice:witness").await.expect("remove");
+    ks.remove("content:remote-alice:witness")
+        .await
+        .expect("remove");
 
     assert!(!ks.contains_key("did:remote-alice").await.expect("contains"));
 
@@ -1573,35 +1767,91 @@ async fn daemon_full_lifecycle_single_table() {
     // === Phase 1: Bootstrap (server + control) ===
     let mut batch = store.batch();
     // Server: root DID.
-    batch.insert(&dids, "did:.well-known", &serde_json::json!({"did_id": "did:webvh:Qm:host:.well-known", "owner": "system"})).expect("b");
-    batch.insert_raw(&dids, "content:.well-known:log", b"bootstrap-log\n".to_vec());
+    batch
+        .insert(
+            &dids,
+            "did:.well-known",
+            &serde_json::json!({"did_id": "did:webvh:Qm:host:.well-known", "owner": "system"}),
+        )
+        .expect("b");
+    batch.insert_raw(
+        &dids,
+        "content:.well-known:log",
+        b"bootstrap-log\n".to_vec(),
+    );
     batch.insert_raw(&dids, "owner:system:.well-known", b".well-known".to_vec());
     // Control: admin ACL.
-    batch.insert(&acl, "acl:did:key:zAdmin", &serde_json::json!({"role": "admin"})).expect("b");
+    batch
+        .insert(
+            &acl,
+            "acl:did:key:zAdmin",
+            &serde_json::json!({"role": "admin"}),
+        )
+        .expect("b");
     // Control: domain seed.
-    batch.insert(&domains, "example.com", &serde_json::json!({"domain": "example.com"})).expect("b");
+    batch
+        .insert(
+            &domains,
+            "example.com",
+            &serde_json::json!({"domain": "example.com"}),
+        )
+        .expect("b");
     // Daemon: migration marker.
-    batch.insert(&meta, "migration:M-01", &serde_json::json!({"done": true})).expect("b");
+    batch
+        .insert(&meta, "migration:M-01", &serde_json::json!({"done": true}))
+        .expect("b");
     batch.commit().await.expect("bootstrap batch");
 
     // === Phase 2: Runtime — user resolves DID (server reads) ===
-    let did_rec: serde_json::Value = dids.get("did:.well-known").await.expect("get").expect("exists");
+    let did_rec: serde_json::Value = dids
+        .get("did:.well-known")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(did_rec["owner"], "system");
-    let log = dids.get_raw("content:.well-known:log").await.expect("get").expect("exists");
+    let log = dids
+        .get_raw("content:.well-known:log")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(log, b"bootstrap-log\n");
 
     // === Phase 3: Runtime — stats flush (daemon background task) ===
-    stats.insert("stats:.well-known", &serde_json::json!({"resolves": 42})).await.expect("ins");
-    ts.insert("ts:.well-known:1704067200", &serde_json::json!({"resolves": 42})).await.expect("ins");
+    stats
+        .insert("stats:.well-known", &serde_json::json!({"resolves": 42}))
+        .await
+        .expect("ins");
+    ts.insert(
+        "ts:.well-known:1704067200",
+        &serde_json::json!({"resolves": 42}),
+    )
+    .await
+    .expect("ins");
 
     // === Phase 4: Runtime — witness attestation ===
-    witnesses.insert("witness:.well-known:v1", &serde_json::json!({"proof": "sig"})).await.expect("ins");
-    let proof: serde_json::Value = witnesses.get("witness:.well-known:v1").await.expect("get").expect("exists");
+    witnesses
+        .insert(
+            "witness:.well-known:v1",
+            &serde_json::json!({"proof": "sig"}),
+        )
+        .await
+        .expect("ins");
+    let proof: serde_json::Value = witnesses
+        .get("witness:.well-known:v1")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(proof["proof"], "sig");
 
     // === Phase 5: Runtime — user creates session (server/control auth) ===
-    sessions.insert("session:s1", &serde_json::json!({"user": "did:key:zAdmin"})).await.expect("ins");
-    sessions.insert_raw("refresh:tok1", b"s1".to_vec()).await.expect("ins");
+    sessions
+        .insert("session:s1", &serde_json::json!({"user": "did:key:zAdmin"}))
+        .await
+        .expect("ins");
+    sessions
+        .insert_raw("refresh:tok1", b"s1".to_vec())
+        .await
+        .expect("ins");
     // Verify session was stored.
     assert!(sessions.contains_key("session:s1").await.expect("c"));
 
@@ -1612,7 +1862,11 @@ async fn daemon_full_lifecycle_single_table() {
     assert!(!sessions.contains_key("session:s1").await.expect("c"));
 
     // Stats already written, just verify.
-    let s: serde_json::Value = stats.get("stats:.well-known").await.expect("get").expect("exists");
+    let s: serde_json::Value = stats
+        .get("stats:.well-known")
+        .await
+        .expect("get")
+        .expect("exists");
     assert_eq!(s["resolves"], 42);
 
     // === Verify: all keyspaces independently intact ===
@@ -1620,7 +1874,12 @@ async fn daemon_full_lifecycle_single_table() {
     assert!(acl.contains_key("acl:did:key:zAdmin").await.expect("c"));
     assert!(domains.contains_key("example.com").await.expect("c"));
     assert!(meta.contains_key("migration:M-01").await.expect("c"));
-    assert!(witnesses.contains_key("witness:.well-known:v1").await.expect("c"));
+    assert!(
+        witnesses
+            .contains_key("witness:.well-known:v1")
+            .await
+            .expect("c")
+    );
 
     delete_test_table(&client, &table).await;
 }
