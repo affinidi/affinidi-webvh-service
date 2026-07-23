@@ -152,20 +152,19 @@ jobs:
       - name: Install libdbus-1-dev
         if: contains(matrix.features, 'keyring')
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - name: Check did-hosting-common with ${{ matrix.store }}
-        # Build-only backends need to prove they compile, nothing more — no
-        # binary is produced or run, so `check` is the whole job.
+      - name: Build did-hosting-common with ${{ matrix.store }}
+        # `build`, not `check` — see the note on the `methods` job below.
         #
-        # Skipped where the suite runs: the `cargo test` step below compiles
-        # the same crate with the same features, so checking first is work
-        # done twice.
+        # Still skipped where the suite runs: the `cargo test` step compiles
+        # the same crate with the same features, so building first is work
+        # done twice. That part measured as a real (if small) win and stays.
         if: ${{ !matrix.run_tests }}
         run: >
-          cargo check -p did-hosting-common --no-default-features
+          cargo build -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
       - name: Test did-hosting-common with ${{ matrix.store }}
         # Only embedded fjall runs the unit suite (isolated per-test store);
-        # other backends are check-only above.
+        # other backends are build-only above.
         if: matrix.run_tests
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
@@ -302,14 +301,25 @@ jobs:
       # No libdbus here: these cases build `--no-default-features` with a
       # single `method-*` flag, so `keyring` — the only thing that links
       # against the Secret Service — is never in the graph.
-      - name: Check did-hosting-common (${{ matrix.case }})
-        # `check`, not `build`. The assertion is either "this compiles" or
-        # "this fails with a specific `compile_error!`", and a `compile_error!`
-        # fires during type-checking — so the failure cases still produce the
-        # message this greps for.
+      - name: Build did-hosting-common (${{ matrix.case }})
+        # `build`, not `check`, on measurement rather than principle.
+        #
+        # `check` skips codegen and linking, so in isolation it is ~2x faster
+        # on a cold target dir. #124 applied that reasoning here and every one
+        # of these cases got ~2x SLOWER instead (39-55s -> 99-133s), on a run
+        # whose cache already held check artifacts.
+        #
+        # The likely cause is `Swatinem/rust-cache`: the cache these jobs
+        # restore was accumulated over many `build` runs, and check units
+        # cannot be satisfied from build artifacts — so each job paid a larger
+        # restore AND a fresh compile. Whatever the mechanism, the measurement
+        # is what governs.
+        #
+        # Before changing this again, compare a full CI run, not two local
+        # `cargo` invocations.
         run: |
           set +e
-          out=$(cargo check -p did-hosting-common \
+          out=$(cargo build -p did-hosting-common \
             --no-default-features --features "${{ matrix.features }}" 2>&1)
           status=$?
           set -e
@@ -345,10 +355,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # No libdbus: `server-core,<cloud backend>` does not pull `keyring`.
-      # `check` is enough — the question is whether the backend's SDK compiles
-      # against this workspace, not whether it links.
+      # That trimming stays; the `check` conversion does not — see the note on
+      # the `methods` job above.
       - run: >
-          cargo check -p did-hosting-common --no-default-features
+          cargo build -p did-hosting-common --no-default-features
           --features "server-core,${{ matrix.backend }}"
 
   deny:
