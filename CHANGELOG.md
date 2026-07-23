@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Agent names are visible where you actually look for them.** Binding and
+  parking already lived in the Agent Names card on the DID detail page, but
+  that card sits below the document viewer — too far to reach for the everyday
+  act of copying a handle to give someone, and the DIDs list showed no names at
+  all. Served names now render as copyable `domain/@name` chips directly
+  beneath the DID on both the list and the detail header. Under the DID, not
+  above it: a name is an alias, and promoting it over the identifier leaves a
+  reader unsure which line is authoritative — doubly so in the list, whose card
+  heading is already a friendly label. `GET /api/dids` gained `agentNames`,
+  carrying the same registry entries `GET /api/dids/{mnemonic}` serves so the
+  list needs no per-DID fetch; parked entries ride along and the views filter
+  them out, since a parked name would advertise a redirect that 404s.
+
 - **Batched DID sync to cut the resync mediator-throttle flood.** A control
   plane pushed one `MSG_SYNC_UPDATE` per DID, and each inbound frame draws one
   transport-level TSP reply — so a bulk resync (a server (re)registering with

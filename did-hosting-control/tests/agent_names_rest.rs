@@ -13,6 +13,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use did_hosting_common::did_ops::AgentNameEntry;
 use did_hosting_common::server::acl::Role;
 use did_hosting_control::test_support::{TestServer, TestServerOptions};
 use http_body_util::BodyExt;
@@ -226,5 +227,71 @@ async fn server_info_reports_agent_names_off() {
     assert_eq!(
         body.get("agent_names").and_then(|v| v.as_bool()),
         Some(false)
+    );
+}
+
+/// The registry reaches `GET /api/dids` as `agentNames`, so the DID list can
+/// render a handle without fetching every DID.
+///
+/// Parked entries ride along — the list view filters them client-side, but the
+/// payload is the registry, not a pre-filtered view of it, so a caller
+/// auditing reservations isn't silently short-changed. Slots with no names
+/// omit the key entirely, which is what puts the UI's optional field on
+/// `undefined` rather than `[]`.
+#[tokio::test]
+async fn dids_list_exposes_the_agent_name_registry() {
+    let h = make_harness().await;
+    let owner = "did:example:owner";
+    h.add_acl(owner, Role::Owner).await;
+    let token = h.mint_token(owner, Role::Owner).await;
+
+    let mut named = h.seed_did(owner, "named").await;
+    named.domain = "control.test".into();
+    named.agent_names = vec![
+        AgentNameEntry {
+            name: "alice".into(),
+            enabled: true,
+            created_at: 7,
+        },
+        AgentNameEntry {
+            name: "parked".into(),
+            enabled: false,
+            created_at: 9,
+        },
+    ];
+    h.put_did(&named).await;
+    h.seed_did(owner, "unnamed").await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/dids")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(&h).oneshot(req).await.expect("router response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_json(resp.into_body()).await;
+
+    let entries = body.as_array().expect("array of DIDs");
+    let named = entries
+        .iter()
+        .find(|e| e["mnemonic"] == "named")
+        .expect("named DID present");
+    assert_eq!(
+        named["agentNames"],
+        json!([
+            { "name": "alice", "enabled": true, "createdAt": 7 },
+            { "name": "parked", "enabled": false, "createdAt": 9 },
+        ]),
+        "camelCase registry entries, parked included"
+    );
+
+    let unnamed = entries
+        .iter()
+        .find(|e| e["mnemonic"] == "unnamed")
+        .expect("unnamed DID present");
+    assert!(
+        unnamed.get("agentNames").is_none(),
+        "a DID with no names must omit the key, not send []; got {unnamed}"
     );
 }

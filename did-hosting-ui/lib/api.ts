@@ -33,6 +33,12 @@ export interface DidRecord {
    *  M-02 hasn't swept — render no badges in both cases. An empty array
    *  is meaningful: the document was read and advertises nothing. */
   services?: string[];
+  /** The slot's agent names from the authoritative registry — the same shape
+   *  `DidDetailResponse.agentNames` carries, so the list can render a handle
+   *  without fetching each DID. Includes parked entries; filter with
+   *  `servedNames` before showing them as resolvable. Absent when the DID has
+   *  none. */
+  agentNames?: AgentNameEntry[];
 }
 
 // ---------------------------------------------------------------------------

@@ -533,6 +533,7 @@ pub async fn list_dids(
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
             let did_stats = did_hosting_common::DidStats::default();
+            let agent_names = record.agent_names.clone();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -544,6 +545,7 @@ pub async fn list_dids(
                 disabled: record.disabled,
                 method: (!record.method.is_empty()).then(|| record.method.clone()),
                 domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+                agent_names,
                 services: record.services,
             });
         }
@@ -571,6 +573,7 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             Err(_) => continue,
         };
         let did_stats = did_hosting_common::DidStats::default();
+        let agent_names = record.agent_names.clone();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -582,6 +585,7 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             disabled: record.disabled,
             method: (!record.method.is_empty()).then(|| record.method.clone()),
             domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+            agent_names,
             services: record.services,
         });
     }

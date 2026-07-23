@@ -594,6 +594,20 @@ pub struct DidListEntry {
     /// badge row in both cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
+    /// The slot's agent names, straight off `DidRecord::agent_names` — the
+    /// same registry shape `DidDetailResponse` serves, so a name renders
+    /// identically in a list row and on the detail page without the list
+    /// having to fetch each DID.
+    ///
+    /// Carries parked entries too (`enabled: false`) rather than pre-filtering
+    /// here: the caller decides. The list view shows only served names, but a
+    /// caller auditing reservations needs the parked ones, and a list that
+    /// silently dropped them would be the wrong primitive to build that on.
+    ///
+    /// Empty (and omitted from the wire) for every slot with no names, which
+    /// is every slot on a deployment that has never used the feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_names: Vec<crate::did_ops::AgentNameEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -740,6 +754,7 @@ mod tests {
             method: None,
             domain: None,
             services: None,
+            agent_names: Vec::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
@@ -768,6 +783,7 @@ mod tests {
             method: None,
             domain: None,
             services: None,
+            agent_names: Vec::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -791,6 +807,11 @@ mod tests {
                 "TSPTransport".to_string(),
                 "DIDCommMessaging".to_string(),
             ]),
+            agent_names: vec![crate::did_ops::AgentNameEntry {
+                name: "alice".to_string(),
+                enabled: true,
+                created_at: 5,
+            }],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: DidListEntry = serde_json::from_str(&json).unwrap();
@@ -806,6 +827,9 @@ mod tests {
                 "DIDCommMessaging".to_string(),
             ])
         );
+        assert!(json.contains(r#""agentNames":[{"name":"alice","enabled":true,"createdAt":5}]"#));
+        assert_eq!(back.agent_names.len(), 1);
+        assert_eq!(back.agent_names[0].name, "alice");
     }
 
     /// A record written before the `services` field existed must still
@@ -819,6 +843,9 @@ mod tests {
         }"#;
         let back: DidListEntry = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.services, None);
+        // Same contract for names: absent is empty, and the field being new
+        // must not make a pre-agent-name payload fail to parse.
+        assert!(back.agent_names.is_empty());
     }
 
     #[test]
