@@ -144,13 +144,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Only the matrix entries that enable `keyring` link against the Secret
-      # Service; the rest build `--no-default-features` without it and were
-      # paying for an `apt-get update` they never used. Keyed off the feature
-      # string so adding `keyring` to an entry turns the install back on by
-      # itself.
+      # Unconditional. The feature string is not what decides this: every
+      # matrix entry builds `did-hosting-common`, which depends on
+      # `affinidi-tdk-common` non-optionally, and that crate pulls
+      # `dbus-secret-service-keyring-store` as a plain target-specific
+      # dependency on Linux — no `optional = true`, no feature gate. See the
+      # note on `cloud-secrets-build`.
       - name: Install libdbus-1-dev
-        if: contains(matrix.features, 'keyring')
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build did-hosting-common with ${{ matrix.store }}
         # `build`, not `check` — see the note on the `methods` job below.
@@ -298,9 +298,12 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # No libdbus here: these cases build `--no-default-features` with a
-      # single `method-*` flag, so `keyring` — the only thing that links
-      # against the Secret Service — is never in the graph.
+      # libdbus IS in the graph, whatever the feature string says: these cases
+      # build `did-hosting-common`, which depends on `affinidi-tdk-common`
+      # non-optionally, and that crate pulls `dbus-secret-service-keyring-store`
+      # unconditionally on Linux. See the note on `cloud-secrets-build`.
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build did-hosting-common (${{ matrix.case }})
         # `build`, not `check`, on measurement rather than principle.
         #
@@ -354,9 +357,24 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # No libdbus: `server-core,<cloud backend>` does not pull `keyring`.
-      # That trimming stays; the `check` conversion does not — see the note on
-      # the `methods` job above.
+      # libdbus IS required here, despite the feature string naming no keyring
+      # backend. `did-hosting-common` depends on `affinidi-tdk-common`
+      # non-optionally, and that crate pulls `dbus-secret-service-keyring-store`
+      # as a plain target-specific dependency on Linux:
+      #
+      #   [target.'cfg(any(target_os = "linux", ...))'.dependencies
+      #     .dbus-secret-service-keyring-store]
+      #
+      # No `optional = true`, no feature gate — so no feature selection on our
+      # side can remove it, and every Linux build of this crate needs
+      # `libdbus-1-dev`.
+      #
+      # This job only ever passed because the cache usually carried a prebuilt
+      # `libdbus-sys`, so its build script never re-ran. A cache-cold run — a
+      # fresh branch, or a lockfile change that shifts the cache key — fails
+      # with "Package dbus-1 was not found in the pkg-config search path".
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: >
           cargo build -p did-hosting-common --no-default-features
           --features "server-core,${{ matrix.backend }}"
