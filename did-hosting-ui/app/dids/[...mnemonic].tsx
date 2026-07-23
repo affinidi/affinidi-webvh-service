@@ -532,9 +532,15 @@ export default function DidDetail() {
   // `https://<domain>/@<name>`. The edge derives the served name from that
   // signed claim, so the redirect starts resolving once the agent publishes —
   // no separate provisioning call needed.
-  const handleBindName = async () => {
-    const name = nameInput.trim().replace(/^@/, "");
-    if (!name || !agentDomain || !currentState) return;
+  /// Publish a version that additionally claims `name`.
+  ///
+  /// Takes the local part, so the community name is `""` — the one caller that
+  /// cannot come from the text field. Shared so the typed path and the
+  /// community-name button build the identical `alsoKnownAs` entry; the URL
+  /// shape is what a resolver compares against, and two copies of it would be
+  /// two chances to drift.
+  const bindName = async (name: string) => {
+    if (!agentDomain || !currentState) return;
     if (boundNames.includes(name)) {
       showAlert(
         "Already bound",
@@ -552,6 +558,38 @@ export default function DidDetail() {
     setNameInput("");
     setNameStatus(null);
     await handlePublishViaVta(nextDoc);
+  };
+
+  const handleBindName = async () => {
+    const name = nameInput.trim().replace(/^@/, "");
+    // The text field never binds the community name: an empty input is "the
+    // user has not typed yet", not a request. The button below is the
+    // deliberate affordance for it.
+    if (!name) return;
+    await bindName(name);
+  };
+
+  /// Only the root DID may hold `{domain}/@` — the control plane enforces that
+  /// structurally (`validate_agent_name_binding`), so offering the control on a
+  /// tenant slot would advertise something the server refuses.
+  const canBindCommunityName =
+    mnemonic === ".well-known" &&
+    !!agentDomain &&
+    !!currentState &&
+    !boundNames.includes("") &&
+    !parkedNames.includes("");
+
+  const handleBindCommunityName = () => {
+    if (!agentDomain) return;
+    showConfirm(
+      "Bind the community name",
+      `Claim ${agentDomain}/@ for this DID?\n\n` +
+        `This is the name of the trust community that owns ${agentDomain}, and it ` +
+        `resolves to this root DID. Your agent will publish a new version claiming it.`,
+      () => {
+        void bindName("");
+      },
+    );
   };
 
   // Remove a name: publish a version that no longer claims it. The redirect
@@ -1225,6 +1263,35 @@ export default function DidDetail() {
                             : "Could not check availability"}
                   </Text>
                 )}
+                {/* The community name gets its own control rather than a
+                    spelling in the text field above. It is a single specific
+                    name, not something to type, and an empty input already
+                    means "nothing entered yet" — overloading it would make an
+                    accidental Enter publish a document version. Root DID only:
+                    the control plane binds `{domain}/@` to `.well-known`
+                    structurally, so offering it elsewhere would advertise
+                    something the server refuses. */}
+                {canBindCommunityName && (
+                  <View style={{ marginTop: spacing.lg, gap: spacing.sm }}>
+                    <Text style={styles.hint}>
+                      This is the domain&apos;s root DID, so it can also hold the
+                      community name — {agentDomain}/@ — which identifies the
+                      trust community that owns {agentDomain}.
+                    </Text>
+                    <Pressable
+                      style={[styles.smallButton, publishing && styles.disabled]}
+                      onPress={handleBindCommunityName}
+                      disabled={publishing}
+                    >
+                      <Text style={styles.smallButtonText}>
+                        {publishing
+                          ? "Asking your agent..."
+                          : `Bind ${agentDomain}/@`}
+                      </Text>
+                    </Pressable>
+                  </View>
+                )}
+
                 {/* Parked names, from the host's authoritative registry —
                     they're deliberately absent from the document, so this is
                     the only place they can come from. */}
