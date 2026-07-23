@@ -1363,6 +1363,39 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
     Ok(entries)
 }
 
+/// Cross-check a caller's explicit domain against the slot's own domain.
+///
+/// A DID's host IS its domain, so a caller naming a different one is either
+/// misconfigured or reaching for another tenant's slot — reject before acting
+/// rather than silently ignoring the parameter. Prefers the persisted
+/// `record.domain`; falls back to the DID's embedded host for legacy slots
+/// that never had a domain resolved, and passes when neither is known (an
+/// un-domained install has nothing to compare against).
+fn ensure_slot_domain_matches(
+    record: &DidRecord,
+    request_domain: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(requested) = request_domain.filter(|d| !d.is_empty()) else {
+        return Ok(());
+    };
+    let slot_domain = if !record.domain.is_empty() {
+        record.domain.clone()
+    } else {
+        record
+            .did_id
+            .as_deref()
+            .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+            .unwrap_or_default()
+    };
+    if !slot_domain.is_empty() && !requested.eq_ignore_ascii_case(&slot_domain) {
+        return Err(AppError::Validation(format!(
+            "did-management:unknown_domain — requested domain `{requested}` does \
+             not match the slot's domain `{slot_domain}`",
+        )));
+    }
+    Ok(())
+}
+
 /// Delete a DID and all its associated data.
 pub async fn delete_did(
     auth: &AuthClaims,
@@ -1375,27 +1408,7 @@ pub async fn delete_did(
 
     let did_id = record.did_id.clone();
 
-    // Cross-check the caller's explicit `?domain=` against the slot's domain
-    // before deleting — same `did-management:unknown_domain` guard as publish,
-    // so a misconfigured caller can't delete the wrong tenant's slot. Prefer
-    // the persisted `record.domain`; fall back to the DID's embedded host for
-    // legacy slots that never had a domain resolved.
-    if let Some(requested) = request_domain.filter(|d| !d.is_empty()) {
-        let slot_domain = if !record.domain.is_empty() {
-            record.domain.clone()
-        } else {
-            did_id
-                .as_deref()
-                .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
-                .unwrap_or_default()
-        };
-        if !slot_domain.is_empty() && !requested.eq_ignore_ascii_case(&slot_domain) {
-            return Err(AppError::Validation(format!(
-                "did-management:unknown_domain — requested domain `{requested}` does \
-                 not match the slot's domain `{slot_domain}`",
-            )));
-        }
-    }
+    ensure_slot_domain_matches(&record, request_domain)?;
 
     let mut batch = state.store.batch();
     batch.remove(&state.dids_ks, did_key(mnemonic));
@@ -1612,6 +1625,45 @@ pub async fn check_agent_name(
         name: bare,
         domain: domain.to_string(),
     })
+}
+
+/// Read a hosted DID's agent-name registry — the authoritative forward view,
+/// including *parked* entries.
+///
+/// The registry is the only place a parked name is visible: disabling drops it
+/// from the document's `alsoKnownAs` by design, so a client reading the DID
+/// document alone cannot tell a parked name from one that was never bound, and
+/// so cannot offer to resume it.
+///
+/// Returns the slot's domain alongside the entries because a bare local part
+/// (`alice`) only means something within a domain (`example.com/@alice`); the
+/// domain is empty for un-domained legacy slots.
+pub async fn list_agent_names(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    request_domain: Option<&str>,
+) -> Result<(String, Vec<AgentNameEntry>), AppError> {
+    validate_mnemonic(mnemonic)?;
+    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    ensure_slot_domain_matches(&record, request_domain)?;
+
+    let domain = if !record.domain.is_empty() {
+        record.domain.clone()
+    } else {
+        record
+            .did_id
+            .as_deref()
+            .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+            .unwrap_or_default()
+    };
+    debug!(
+        did = %auth.did,
+        mnemonic = %mnemonic,
+        count = record.agent_names.len(),
+        "agent names listed"
+    );
+    Ok((domain, record.agent_names))
 }
 
 // ---------------------------------------------------------------------------

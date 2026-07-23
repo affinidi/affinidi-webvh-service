@@ -74,7 +74,10 @@ pub struct AgentNameCheckRequest {
 
 /// The `{record}` response shared by the mutating verbs — the DID record in
 /// its spec projection, identical to the Trust-Task surface's response.
-fn agent_name_record_response(
+///
+/// `pub(crate)` so the DIDComm dispatch table emits the same bytes; the two
+/// transports have no reason to project the record differently.
+pub(crate) fn agent_name_record_response(
     state: &AppState,
     record: &did_hosting_common::did_ops::DidRecord,
 ) -> serde_json::Value {
@@ -182,14 +185,21 @@ pub async fn disable_agent_name(
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 
-/// `POST /api/agent-names/check` — is a name free to claim on a domain?
-pub async fn check_agent_name(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Json(req): Json<AgentNameCheckRequest>,
-) -> Result<Json<did_ops::AgentNameAvailability>, AppError> {
-    // Names are domain-scoped: resolve the domain the same way register does
-    // (explicit → caller's ACL default → system default).
+/// Resolve the domain an agent-name probe is scoped to.
+///
+/// Names are domain-scoped, so a bare `@alice` is meaningless until a domain
+/// is pinned down: the same name may be free on one domain and taken on
+/// another. Resolution is the same chain register uses — explicit → caller's
+/// ACL default → system default — and, unlike the reservation path, a failure
+/// here is fatal: answering "available" against a guessed domain would be a
+/// wrong answer, not a lenient one.
+///
+/// `pub(crate)` so the DIDComm `agent-name/check` arm scopes identically.
+pub(crate) async fn resolve_agent_name_domain(
+    auth: &AuthClaims,
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<String, AppError> {
     let acl_scope =
         match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
             Some(e) => e.domains,
@@ -199,12 +209,21 @@ pub async fn check_agent_name(
         .await
         .ok()
         .flatten();
-    let domain = did_hosting_common::server::domain::resolve_request_domain(
-        req.domain.as_deref(),
+    did_hosting_common::server::domain::resolve_request_domain(
+        requested,
         &acl_scope,
         system_default.as_deref(),
     )
-    .map_err(|e| AppError::Validation(e.to_string()))?;
+    .map_err(|e| AppError::Validation(e.to_string()))
+}
+
+/// `POST /api/agent-names/check` — is a name free to claim on a domain?
+pub async fn check_agent_name(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameCheckRequest>,
+) -> Result<Json<did_ops::AgentNameAvailability>, AppError> {
+    let domain = resolve_agent_name_domain(&auth, &state, req.domain.as_deref()).await?;
 
     let result = did_ops::check_agent_name(&state, &domain, &req.name).await?;
     info!(

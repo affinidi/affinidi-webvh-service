@@ -59,6 +59,16 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // `fetch_me_domains_for_caller` so both transports return
         // byte-identical payloads.
         .route(MSG_ME_DOMAINS, handler_fn(handle_webvh_message))?
+        // agent-name/* — net-new DIDComm routes for the six verbs that
+        // shipped REST-only, so a VTA on this transport can name the DIDs
+        // it provisions instead of falling back to HTTPS for that one step.
+        // Each arm calls the same `did_ops` function as its REST twin.
+        .route(MSG_AGENT_NAME_SET, handler_fn(handle_webvh_message))?
+        .route(MSG_AGENT_NAME_REMOVE, handler_fn(handle_webvh_message))?
+        .route(MSG_AGENT_NAME_ENABLE, handler_fn(handle_webvh_message))?
+        .route(MSG_AGENT_NAME_DISABLE, handler_fn(handle_webvh_message))?
+        .route(MSG_AGENT_NAME_LIST, handler_fn(handle_webvh_message))?
+        .route(MSG_AGENT_NAME_CHECK, handler_fn(handle_webvh_message))?
         // Wallet confirmation response (RP→wallet confirm protocol).
         // The matching outbound `confirm/1.0` is sent by the REST
         // endpoint `POST /api/confirm/request`.
@@ -733,6 +743,141 @@ pub async fn dispatch_did_op(
                     .as_str()
                     .to_string(),
                 serde_json::to_value(resp)?,
+            ))
+        }
+        MSG_AGENT_NAME_SET
+        | MSG_AGENT_NAME_REMOVE
+        | MSG_AGENT_NAME_ENABLE
+        | MSG_AGENT_NAME_DISABLE => {
+            // The four mutating verbs share one body (`AgentNameRequest`, the
+            // REST type verbatim) and one `{record}` response; they differ
+            // only in which `did_ops` function commits the change and which
+            // `alsoKnownAs` direction that function then demands of `didLog`.
+            let req: crate::routes::did_manage::AgentNameRequest =
+                serde_json::from_value(msg.body.clone()).map_err(|e| {
+                    AppError::Validation(format!("invalid agent-name request body: {e}"))
+                })?;
+
+            // `set` is the fallback arm rather than an explicit one: the outer
+            // pattern already guarantees the type is one of the four, so this
+            // stays exhaustive without an unreachable panic on the wire path.
+            let (response_type, record) = match msg.typ.as_str() {
+                MSG_AGENT_NAME_REMOVE => (
+                    MSG_AGENT_NAME_REMOVE_RESPONSE,
+                    did_ops::remove_agent_name(
+                        auth,
+                        state,
+                        &req.mnemonic,
+                        &req.name,
+                        &req.did_log,
+                        req.domain.as_deref(),
+                    )
+                    .await?,
+                ),
+                MSG_AGENT_NAME_ENABLE => (
+                    MSG_AGENT_NAME_ENABLE_RESPONSE,
+                    did_ops::enable_agent_name(
+                        auth,
+                        state,
+                        &req.mnemonic,
+                        &req.name,
+                        &req.did_log,
+                        req.domain.as_deref(),
+                    )
+                    .await?,
+                ),
+                MSG_AGENT_NAME_DISABLE => (
+                    MSG_AGENT_NAME_DISABLE_RESPONSE,
+                    did_ops::disable_agent_name(
+                        auth,
+                        state,
+                        &req.mnemonic,
+                        &req.name,
+                        &req.did_log,
+                        req.domain.as_deref(),
+                    )
+                    .await?,
+                ),
+                _ => (
+                    MSG_AGENT_NAME_SET_RESPONSE,
+                    did_ops::set_agent_name(
+                        auth,
+                        state,
+                        &req.mnemonic,
+                        &req.name,
+                        &req.did_log,
+                        req.domain.as_deref(),
+                    )
+                    .await?,
+                ),
+            };
+
+            // Every verb publishes a new DID version, so hosting servers need
+            // the fan-out the REST handlers send — without it a name bound
+            // over DIDComm would not resolve until the next full resync.
+            server_push::notify_servers_did(state, req.mnemonic.clone());
+            // Same fields the REST handlers log, so an audit of "who changed
+            // this name" doesn't have to know which transport carried it.
+            info!(
+                did = %auth.did,
+                mnemonic = %req.mnemonic,
+                name = %req.name,
+                msg_type = %msg.typ,
+                "agent name changed via DIDComm"
+            );
+            Ok((
+                response_type.to_string(),
+                crate::routes::did_manage::agent_name_record_response(state, &record),
+            ))
+        }
+        MSG_AGENT_NAME_LIST => {
+            // Read-only. The registry — not the DID document — is the only
+            // place a *parked* name is visible, so this is what a client needs
+            // to offer "resume" for a name it disabled earlier.
+            let mnemonic = msg
+                .body
+                .get("mnemonic")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
+            let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
+            let (domain, names) =
+                did_ops::list_agent_names(auth, state, mnemonic, request_domain).await?;
+
+            let mut body = serde_json::Map::new();
+            body.insert("mnemonic".into(), json!(mnemonic));
+            // Omitted rather than empty-stringed for an un-domained legacy
+            // slot, matching how `spec_did_record_json` treats `domain`.
+            if !domain.is_empty() {
+                body.insert("domain".into(), json!(domain));
+            }
+            // Always present, unlike the record projection's conditional
+            // `agentNames`: this verb's whole answer is the list, and a client
+            // shouldn't have to distinguish "no names" from "field missing".
+            body.insert("agentNames".into(), json!(names));
+            Ok((
+                MSG_AGENT_NAME_LIST_RESPONSE.to_string(),
+                Value::Object(body),
+            ))
+        }
+        MSG_AGENT_NAME_CHECK => {
+            // Read-only probe. Domain scoping is resolved by the same helper
+            // the REST handler uses (explicit → caller's ACL default → system
+            // default), because "is @alice free?" has no answer until the
+            // domain is pinned down.
+            let req: crate::routes::did_manage::AgentNameCheckRequest =
+                serde_json::from_value(msg.body.clone()).map_err(|e| {
+                    AppError::Validation(format!("invalid agent-name check body: {e}"))
+                })?;
+            let domain = crate::routes::did_manage::resolve_agent_name_domain(
+                auth,
+                state,
+                req.domain.as_deref(),
+            )
+            .await?;
+            let result = did_ops::check_agent_name(state, &domain, &req.name).await?;
+            Ok((
+                MSG_AGENT_NAME_CHECK_RESPONSE.to_string(),
+                serde_json::to_value(result)?,
             ))
         }
         other => Err(AppError::Validation(format!(
@@ -2796,6 +2941,320 @@ mod tests {
 
         let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("not in the ACL")));
+    }
+
+    // -----------------------------------------------------------------------
+    // agent-name/* dispatch
+    // -----------------------------------------------------------------------
+    //
+    // The signed-log happy paths are covered by the `did_ops` unit tests; what
+    // these pin is the wiring the REST tests can't see — that each verb is
+    // reachable on the DIDComm dispatch table, parses the same body the REST
+    // handler does, and lands in the same `did_ops` function with the caller's
+    // authorization intact.
+
+    /// Seed a DID whose registry already holds names, so the read verbs have
+    /// something to project. `domain` is set explicitly rather than derived
+    /// from `did_id` so the expected response is unambiguous.
+    async fn seed_did_with_names(
+        state: &AppState,
+        owner_did: &str,
+        mnemonic: &str,
+        domain: &str,
+        names: &[(&str, bool)],
+    ) {
+        seed_did(state, owner_did, mnemonic).await;
+        let mut record: DidRecord = state
+            .dids_ks
+            .get(did_key(mnemonic))
+            .await
+            .unwrap()
+            .expect("seeded record");
+        record.domain = domain.to_string();
+        record.agent_names = names
+            .iter()
+            .map(
+                |(name, enabled)| did_hosting_common::did_ops::AgentNameEntry {
+                    name: (*name).to_string(),
+                    enabled: *enabled,
+                    created_at: 7,
+                },
+            )
+            .collect();
+        state
+            .dids_ks
+            .insert(did_key(mnemonic), &record)
+            .await
+            .expect("update seeded record");
+    }
+
+    /// A body missing a required field is a client error, not a 500 — the
+    /// mutating verbs deserialise the REST `AgentNameRequest` verbatim.
+    #[tokio::test]
+    async fn dispatch_agent_name_set_missing_name_is_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_AGENT_NAME_SET,
+            json!({ "mnemonic": "alpha-beta", "didLog": "{}" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("agent-name")));
+    }
+
+    /// `set` reaches `did_ops::set_agent_name` for the slot's owner: a
+    /// malformed `didLog` is rejected there as an invalid log, proving
+    /// delegation rather than a dispatch-table dead end.
+    #[tokio::test]
+    async fn dispatch_agent_name_set_reaches_did_ops() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        let msg = build_msg(
+            MSG_AGENT_NAME_SET,
+            json!({ "mnemonic": "alpha-beta", "name": "alice", "didLog": "not-a-valid-log" }),
+        );
+        let auth = owner_auth(owner);
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert_eq!(map_app_error_code(&err), "e.p.did.invalid-log");
+    }
+
+    /// A reserved name is refused before any storage read, and surfaces as the
+    /// dedicated `name_reserved` code rather than a generic validation error.
+    #[tokio::test]
+    async fn dispatch_agent_name_set_reserved_name_rejected() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        let msg = build_msg(
+            MSG_AGENT_NAME_SET,
+            json!({ "mnemonic": "alpha-beta", "name": "admin", "didLog": "irrelevant" }),
+        );
+        let auth = owner_auth(owner);
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::AgentName(did_hosting_common::server::error::AgentNameError::Reserved)
+            ),
+            "expected a reserved-name error, got {err:?}"
+        );
+    }
+
+    /// The owner check in `did_ops` is not weakened by the DIDComm path — a
+    /// non-owner calling the destructive verb is forbidden.
+    #[tokio::test]
+    async fn dispatch_agent_name_remove_cross_owner_forbidden() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
+
+        let msg = build_msg(
+            MSG_AGENT_NAME_REMOVE,
+            json!({ "mnemonic": "alpha-beta", "name": "alice", "didLog": "x" }),
+        );
+        let attacker = owner_auth("did:example:attacker");
+
+        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
+    }
+
+    /// `list` projects the registry, parked entries included — the whole point
+    /// of the verb, since a parked name is absent from the DID document.
+    #[tokio::test]
+    async fn dispatch_agent_name_list_returns_registry() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did_with_names(
+            &state,
+            owner,
+            "alpha-beta",
+            "example.com",
+            &[("alice", true), ("parked", false)],
+        )
+        .await;
+
+        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_AGENT_NAME_LIST_RESPONSE);
+        assert_eq!(
+            body.get("domain").and_then(|v| v.as_str()),
+            Some("example.com")
+        );
+        let names = body
+            .get("agentNames")
+            .and_then(|v| v.as_array())
+            .expect("agentNames array");
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            names[0].get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(names[0].get("createdAt").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(
+            names[1].get("enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "a parked name must still be listed"
+        );
+    }
+
+    /// A DID with no names answers with an empty array, not a missing field —
+    /// the caller asked for a list and should not have to tell "none" from
+    /// "the host forgot to say".
+    #[tokio::test]
+    async fn dispatch_agent_name_list_empty_registry_is_empty_array() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did_with_names(&state, owner, "alpha-beta", "example.com", &[]).await;
+
+        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
+        let (_, body) = dispatch_did_op(&owner_auth(owner), &state, &msg)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.get("agentNames").and_then(|v| v.as_array()),
+            Some(&vec![])
+        );
+    }
+
+    /// `list` without a `mnemonic` is a validation error, matching the other
+    /// mnemonic-scoped arms.
+    #[tokio::test]
+    async fn dispatch_agent_name_list_missing_mnemonic_is_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({}));
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
+    }
+
+    /// An explicit `domain` that doesn't match the slot's is the same
+    /// cross-tenant rejection publish and delete give.
+    #[tokio::test]
+    async fn dispatch_agent_name_list_domain_mismatch_rejected() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did_with_names(
+            &state,
+            owner,
+            "alpha-beta",
+            "example.com",
+            &[("alice", true)],
+        )
+        .await;
+
+        let msg = build_msg(
+            MSG_AGENT_NAME_LIST,
+            json!({ "mnemonic": "alpha-beta", "domain": "other.example" }),
+        );
+        let err = dispatch_did_op(&owner_auth(owner), &state, &msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("unknown_domain")));
+    }
+
+    /// `list` is owner-scoped: another caller cannot enumerate a DID's names.
+    #[tokio::test]
+    async fn dispatch_agent_name_list_cross_owner_forbidden() {
+        let (state, _dir) = test_state().await;
+        seed_did_with_names(
+            &state,
+            "did:example:owner-a",
+            "alpha-beta",
+            "example.com",
+            &[("alice", true)],
+        )
+        .await;
+
+        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
+        let err = dispatch_did_op(&owner_auth("did:example:attacker"), &state, &msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// `check` answers on the explicitly-named domain and reports a free name.
+    #[tokio::test]
+    async fn dispatch_agent_name_check_available() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_AGENT_NAME_CHECK,
+            json!({ "name": "alice", "domain": "example.com" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_AGENT_NAME_CHECK_RESPONSE);
+        assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            body.get("domain").and_then(|v| v.as_str()),
+            Some("example.com")
+        );
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// A reserved name reports `available: false, reserved: true` rather than
+    /// erroring — the UI needs to explain *why* it can't be claimed.
+    #[tokio::test]
+    async fn dispatch_agent_name_check_reserved() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_AGENT_NAME_CHECK,
+            json!({ "name": "admin", "domain": "example.com" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let (_, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /// A name already bound on the domain is unavailable — the arm reads the
+    /// same `name:{domain}:{name}` index the resolver does.
+    #[tokio::test]
+    async fn dispatch_agent_name_check_taken() {
+        let (state, _dir) = test_state().await;
+        state
+            .dids_ks
+            .insert_raw(
+                did_hosting_common::did_ops::agent_name_key("example.com", "alice"),
+                b"alpha-beta".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let msg = build_msg(
+            MSG_AGENT_NAME_CHECK,
+            json!({ "name": "alice", "domain": "example.com" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let (_, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// With no domain on the wire and no system default configured, `check`
+    /// refuses rather than guessing: "is @alice free?" answered against the
+    /// wrong domain is a wrong answer, not a lenient one.
+    #[tokio::test]
+    async fn dispatch_agent_name_check_unresolvable_domain_is_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(MSG_AGENT_NAME_CHECK, json!({ "name": "alice" }));
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
     /// Force-replace via `MSG_DID_REQUEST` with `force: true` succeeds when

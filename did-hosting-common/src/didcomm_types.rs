@@ -77,6 +77,46 @@ pub const MSG_PROBLEM_REPORT: &str =
 pub const MSG_ME_DOMAINS: &str = "https://trusttasks.org/spec/did-management/me/domains/0.1";
 
 // ---------------------------------------------------------------------------
+// Agent names (`domain/@name` bound to a hosted DID)
+// ---------------------------------------------------------------------------
+//
+// Net-new in DIDComm form: the six verbs shipped REST-only, so a VTA that
+// speaks DIDComm/TSP could provision a DID but could not name it. Each verb
+// dispatches to the same `did_ops::*_agent_name` function the REST handler
+// calls, so the two transports cannot drift.
+//
+// These live here rather than in `did_hosting_tasks` because that module is
+// the *REST* task registry (`did-hosting/agent-name/{verb}/1.0`, matched on
+// the `Trust-Task:` header) and carries a cross-crate byte-parity obligation
+// with `did-hosting-client`. The dispatcher matches on `MSG_*`, and every
+// other DIDComm verb declares its request/response pair here.
+
+pub const MSG_AGENT_NAME_SET: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/set/0.1";
+pub const MSG_AGENT_NAME_SET_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/set/0.1#response";
+pub const MSG_AGENT_NAME_REMOVE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/remove/0.1";
+pub const MSG_AGENT_NAME_REMOVE_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/remove/0.1#response";
+pub const MSG_AGENT_NAME_ENABLE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/enable/0.1";
+pub const MSG_AGENT_NAME_ENABLE_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/enable/0.1#response";
+pub const MSG_AGENT_NAME_DISABLE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/disable/0.1";
+pub const MSG_AGENT_NAME_DISABLE_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/disable/0.1#response";
+pub const MSG_AGENT_NAME_LIST: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/list/0.1";
+pub const MSG_AGENT_NAME_LIST_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/list/0.1#response";
+pub const MSG_AGENT_NAME_CHECK: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/check/0.1";
+pub const MSG_AGENT_NAME_CHECK_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/check/0.1#response";
+
+// ---------------------------------------------------------------------------
 // Server registration (server → control plane)
 // ---------------------------------------------------------------------------
 

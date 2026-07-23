@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Agent names work over DIDComm/TSP, not just REST.** The six agent-name
+  verbs shipped REST-only, so a VTA on the DIDComm transport could provision a
+  DID and then had to fall back to HTTPS for the one step that gives it a
+  human-memorable handle — the exact seam a DIDComm-native agent exists to
+  avoid. `agent-name/{set,remove,enable,disable,list,check}/0.1` are now on the
+  control plane's DIDComm dispatch table, so they are reachable over the
+  mediator-routed transport, the HTTP-signed `POST /api/didcomm` route, and the
+  Trust-Task envelope alike. Every arm calls the same `did_ops` function its
+  REST twin does and reuses the REST request types and `{record}` projection
+  verbatim, so the two transports cannot answer differently; the owner/admin
+  checks, the domain-scoping chain (explicit → caller's ACL default → system
+  default) and the server fan-out after a mutation are unchanged. `list` is
+  net-new to both surfaces: it returns the registry — parked entries included —
+  which is the only place a parked name is visible, since parking removes it
+  from the document's `alsoKnownAs` by design.
+
 - **Agent names are visible where you actually look for them.** Binding and
   parking already lived in the Agent Names card on the DID detail page, but
   that card sits below the document viewer — too far to reach for the everyday
