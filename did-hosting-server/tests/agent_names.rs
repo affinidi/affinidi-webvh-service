@@ -288,3 +288,71 @@ async fn a_name_does_not_resolve_on_the_wrong_host() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// The community name — `GET /@`
+//
+// A name with an empty local part belongs to the verifiable trust community
+// that owns the domain, and resolves through the same index as every other
+// name. Nothing here special-cases the root slot: the control plane's
+// `validate_agent_name_binding` is what makes `.well-known` the only mnemonic
+// the empty name can be bound to, so by the time the edge sees an index entry
+// the question is already settled.
+// ---------------------------------------------------------------------------
+
+/// `/@` needs its own route: a path parameter does not match an empty segment,
+/// so without one this falls through to the DID-serving fallback and is read
+/// as a mnemonic.
+#[tokio::test]
+async fn resolves_the_community_name_to_its_did() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", true, false).await;
+
+    let (status, location) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+}
+
+/// A domain that has not bound its community name serves nothing for `/@` —
+/// and says so the same way it would for any unbound name.
+#[tokio::test]
+async fn community_name_404s_when_unbound() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Parking the community name stops it resolving, like any other name.
+#[tokio::test]
+async fn a_parked_community_name_does_not_resolve() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", false, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The community name takes no path, so `/@/anything` is not a context-
+/// qualified community name and must not redirect. `agent-names` rejects the
+/// spelling at parse time; the edge simply never routes it.
+#[tokio::test]
+async fn community_name_with_a_path_does_not_resolve() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", true, false).await;
+
+    let (status, location) = get(state, "/@/context").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(location, None);
+}
+
+/// With the feature off the community name is as invisible as any other.
+#[tokio::test]
+async fn community_name_404s_when_the_feature_is_off() {
+    let (state, _dir) = make_state(false).await;
+    seed(&state, "", true, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

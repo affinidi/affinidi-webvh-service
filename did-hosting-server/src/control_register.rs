@@ -25,6 +25,7 @@ use did_hosting_common::server::didcomm_profile::{
 };
 use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
+use did_hosting_common::server::mnemonic::validate_agent_name_binding;
 use did_hosting_common::server::trust_tasks::send::{
     Retry, build_request, send_trust_task_with_retry,
 };
@@ -346,8 +347,18 @@ pub async fn apply_single_update(
         //
         // A name absent from the new log is absent here, which is what makes
         // the stale-index cleanup below correct.
+        //
+        // The claim check is Layer-1 and holds by construction. Entitlement —
+        // *may this DID claim this name* — is the control plane's job, and a
+        // name that reaches here has already passed it. The one case worth
+        // re-checking is the community name (`{domain}/@`), which is the
+        // domain's own identity: cheap to verify against the mnemonic, and the
+        // single most valuable name to get wrong, so it does not rely on the
+        // push being honest. `validate_agent_name_binding` also drops reserved
+        // names for the same reason.
         agent_names: extract_agent_names(&update.log_content, &did_host)
             .into_iter()
+            .filter(|name| validate_agent_name_binding(name, &update.mnemonic).is_ok())
             .map(|name| AgentNameEntry {
                 name,
                 enabled: true,

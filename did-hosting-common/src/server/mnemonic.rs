@@ -124,6 +124,11 @@ const RESERVED_AGENT_NAMES: &[&str] = &[
     "well-known",
 ];
 
+/// The mnemonic of the root DID — the slot whose document resolves at
+/// `https://{domain}/.well-known/did.jsonl`, and which *is* the domain's own
+/// identity. Registering it is admin-only (see `register_did_atomic`).
+pub const ROOT_DID_MNEMONIC: &str = ".well-known";
+
 /// Validate an agent name's local part — the `alice` in `/@alice`.
 ///
 /// Deliberately the same grammar as a path segment (2–63 chars, `[a-z0-9-]`,
@@ -133,14 +138,66 @@ const RESERVED_AGENT_NAMES: &[&str] = &[
 /// Note the charset makes collision with a mnemonic route structurally
 /// impossible in the other direction too: `@` is not a legal mnemonic
 /// character, so `/@alice` can never shadow a hosted DID path.
+///
+/// # The community name
+///
+/// An **empty** local part is the community name — `webvh.storm.ws/@`, which
+/// the agent name FAQ defines as the name of the verifiable trust community
+/// owning the domain. It is well-formed, so this returns `Ok` for it, but
+/// being well-formed is not permission to *bind* it: that is
+/// [`validate_agent_name_binding`]'s job, and every binding site must go
+/// through it. This function answers "may this be served / looked up", which
+/// is why the edge's resolve route and the availability probe use it directly.
 pub fn validate_agent_name(name: &str) -> Result<(), AppError> {
     let name = name.strip_prefix('@').unwrap_or(name);
+
+    // The community name has no local part to check against the grammar, and
+    // an empty string is not a reserved *word* — the protection it needs is
+    // the binding rule, not this list.
+    if name.is_empty() {
+        return Ok(());
+    }
 
     validate_segment(name)?;
 
     if RESERVED_AGENT_NAMES.contains(&name) {
         // A typed error, not `path_err`: the provisioning surfaces map this to
         // the `name_reserved` spec code, distinct from a malformed name.
+        return Err(AppError::AgentName(AgentNameError::Reserved));
+    }
+
+    Ok(())
+}
+
+/// May `mnemonic` bind `name` on this host?
+///
+/// The grammar check of [`validate_agent_name`], plus the one rule that a
+/// grammar cannot express: **the community name (`/@`) belongs to the root DID
+/// and to nothing else.**
+///
+/// That rule is structural rather than role-based, and deliberately so. The
+/// community name is the domain's own identity — the strongest phishing
+/// primitive the host has, one step beyond the `@support` / `@security` names
+/// [`RESERVED_AGENT_NAMES`] already withholds. An admin-only gate would still
+/// let an operator bind it to a tenant's DID by mistake; tying it to the
+/// `.well-known` slot means the only DID that can ever answer for
+/// `{domain}/@` is the one already serving as `{domain}`'s root, which is
+/// exactly what a resolver following the name expects to find.
+///
+/// Call this from **every** site that writes the name index — the explicit
+/// `agent-name/*` verbs *and* the publish-path reconciliation, which derives
+/// claims from a document's `alsoKnownAs` and so is equally a binding site.
+/// Reconciling is not trusting: a tenant that puts `{domain}/@` in its own
+/// `alsoKnownAs` is refused here rather than silently registered.
+pub fn validate_agent_name_binding(name: &str, mnemonic: &str) -> Result<(), AppError> {
+    validate_agent_name(name)?;
+
+    let bare = name.strip_prefix('@').unwrap_or(name);
+    if bare.is_empty() && mnemonic != ROOT_DID_MNEMONIC {
+        // `Reserved` rather than a new variant: to every caller this is the
+        // same answer the reserved list gives — a well-formed name the host
+        // keeps for itself — and it already carries the `name_reserved` spec
+        // code and a 409.
         return Err(AppError::AgentName(AgentNameError::Reserved));
     }
 

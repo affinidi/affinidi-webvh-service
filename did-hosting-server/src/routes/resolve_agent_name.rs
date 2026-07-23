@@ -49,7 +49,37 @@ pub async fn serve(
     Path(params): Path<AgentNamePath>,
     parts: Parts,
 ) -> Response {
+    // An empty `name` means the request was `/@/…`. The router will not bind an
+    // empty parameter in a final segment (which is why `/@` needs its own
+    // route) but *will* bind one when a wildcard follows, so `/@/context`
+    // arrives here as `name = "", context = Some("context")`.
+    //
+    // That is not a context-qualified community name — the community name takes
+    // no path — and letting it through would redirect `/@/anything` to the root
+    // DID, handing out an unbounded family of spellings for the domain's own
+    // identity. Only `serve_community` resolves the empty name.
+    if params.name.is_empty() {
+        return AppError::NotFound("no such agent name".to_string()).into_response();
+    }
     match resolve(&state, &params.name, &parts).await {
+        Ok(response) => response,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /@` — the community name.
+///
+/// The FAQ gives a name with an empty local part to the verifiable trust
+/// community that owns the domain, and in this service the domain's own
+/// identity is its root DID. So this resolves through exactly the same index
+/// as every other name: nothing special-cases the root slot here, because
+/// `validate_agent_name_binding` has already made `.well-known` the only
+/// mnemonic the empty name can be bound to.
+///
+/// Needs a separate handler only because a path parameter cannot capture an
+/// empty segment — `/@` never matches `/@{name}`.
+pub async fn serve_community(State(state): State<AppState>, parts: Parts) -> Response {
+    match resolve(&state, "", &parts).await {
         Ok(response) => response,
         Err(e) => e.into_response(),
     }

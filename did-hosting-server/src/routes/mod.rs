@@ -18,7 +18,7 @@ use axum::routing::{get, post, put};
 
 use crate::server::AppState;
 
-/// Agent-name redirect routes (`/@{name}` and `/@{name}/{*context}`).
+/// Agent-name redirect routes (`/@`, `/@{name}` and `/@{name}/{*context}`).
 ///
 /// Registered on both the full and public-only routers because a redirect is a
 /// public read, like `.well-known`. The routes are always present; the handler
@@ -26,8 +26,20 @@ use crate::server::AppState;
 /// off, so a disabled deployment is indistinguishable from one with no names.
 /// This keeps the runtime flag out of router *construction*, which is otherwise
 /// compile-time.
+///
+/// `/@` — the community name — needs its own route: the router will not bind
+/// an empty path parameter in the final segment, so `/@{name}` does not cover
+/// it and the request would otherwise fall through to the DID-serving fallback
+/// and be read as a mnemonic.
+///
+/// It is deliberately *not* paired with a `/@/{*context}` route — the
+/// community name takes no path. Note that omitting the route is not by itself
+/// enough: the router *will* bind an empty parameter when a wildcard follows
+/// it, so `/@/context` still reaches `serve` with `name = ""`. `serve` rejects
+/// an empty name for exactly that reason; see the note there.
 fn agent_name_routes() -> Router<AppState> {
     Router::new()
+        .route("/@", get(resolve_agent_name::serve_community))
         .route("/@{name}", get(resolve_agent_name::serve))
         .route("/@{name}/{*context}", get(resolve_agent_name::serve))
 }

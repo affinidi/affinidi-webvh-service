@@ -11,7 +11,7 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::server::error::AgentNameError;
 use did_hosting_common::server::mnemonic::{
-    validate_agent_name, validate_custom_path, validate_mnemonic,
+    validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
 };
 use did_hosting_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
 use rand::random_range;
@@ -674,12 +674,16 @@ async fn prepare_republish(
 /// Reconciling is not the same as trusting. `extract_agent_names` proves only
 /// that an `alsoKnownAs` entry parses as an agent name on *this* domain — it
 /// does not check the name is claimable, and the `agent-names` grammar is far
-/// laxer than [`validate_agent_name`]'s. So this path applies the same two
+/// laxer than [`validate_agent_name`]'s. So this path applies the same
 /// preconditions the explicit `set` verb does, and for the same reasons:
 ///
 /// - **Reserved names are refused.** `@admin` / `@support` / `@security` are a
 ///   ready-made phishing primitive; `set` rejects them, and a publish that
 ///   claims one must not be the way around that.
+/// - **The community name is refused for every slot but the root DID.**
+///   `{domain}/@` is the domain's own identity, so a tenant putting it in its
+///   `alsoKnownAs` is the sharpest form of the same attack. See
+///   [`validate_agent_name_binding`].
 /// - **A name held by another DID is refused.** Otherwise a plain publish
 ///   silently repoints the index at the publisher, and Layer-1 verification
 ///   cannot detect it: after the hijack the document genuinely claims the name
@@ -709,9 +713,11 @@ async fn reconcile_agent_names(
 ) -> Result<(Vec<String>, Vec<String>), AppError> {
     let mut claimed = Vec::new();
     for name in extract_agent_names(did_log, domain) {
-        match validate_agent_name(&name) {
+        match validate_agent_name_binding(&name, mnemonic) {
             Ok(()) => {}
-            // Reserved is a refusal, not a skip — see above.
+            // Reserved is a refusal, not a skip — see above. This also covers a
+            // non-root slot claiming the community name `{domain}/@`, which
+            // `validate_agent_name_binding` reports as `Reserved`.
             Err(AppError::AgentName(AgentNameError::Reserved)) => {
                 warn!(
                     mnemonic = %mnemonic,
@@ -1026,9 +1032,11 @@ async fn apply_agent_name_op(
 ) -> Result<DidRecord, AppError> {
     use crate::auth::session::now_epoch;
 
-    // Canonical local part. `validate_agent_name` enforces the grammar and
-    // rejects reserved names (`@admin`, `@support`, …) before any lookup.
-    validate_agent_name(name)?;
+    // Canonical local part. `validate_agent_name_binding` enforces the grammar,
+    // rejects reserved names (`@admin`, `@support`, …), and refuses the
+    // community name (`/@`) for any slot but the root DID — all before any
+    // lookup.
+    validate_agent_name_binding(name, mnemonic)?;
     let name = name.strip_prefix('@').unwrap_or(name).to_string();
 
     // Serialise the read-modify-write on this slot: the collision check, the
@@ -1589,17 +1597,28 @@ pub struct AgentNameAvailability {
 /// than an error, so a UI can explain *why*; a grammatically invalid name is a
 /// client error (`AppError::Validation`). Availability is domain-scoped: the
 /// same name may be free on one domain and taken on another.
+///
+/// The community name (`{domain}/@`) reports as reserved. This probe carries no
+/// mnemonic, so it cannot know whether the asker is the root DID — and the
+/// honest answer to "can I claim this" is no for every caller but one, whose
+/// binding happens at provisioning rather than through this surface. Answering
+/// `available` here would invite a claim that
+/// [`validate_agent_name_binding`] then refuses.
 pub async fn check_agent_name(
     state: &AppState,
     domain: &str,
     name: &str,
 ) -> Result<AgentNameAvailability, AppError> {
     let bare = name.strip_prefix('@').unwrap_or(name).to_string();
-    let reserved = match validate_agent_name(&bare) {
-        Ok(()) => false,
-        Err(AppError::AgentName(AgentNameError::Reserved)) => true,
-        // A malformed name (bad grammar) is a client error, not "unavailable".
-        Err(e) => return Err(e),
+    let reserved = if bare.is_empty() {
+        true
+    } else {
+        match validate_agent_name(&bare) {
+            Ok(()) => false,
+            Err(AppError::AgentName(AgentNameError::Reserved)) => true,
+            // A malformed name (bad grammar) is a client error, not "unavailable".
+            Err(e) => return Err(e),
+        }
     };
     let taken = state
         .dids_ks
@@ -3476,6 +3495,123 @@ mod tests_atomic {
             get_record(&state, path).await.version_count,
             before,
             "a refused publish must not advance the version"
+        );
+    }
+
+    /// How an operator actually binds the community name: the ordinary `set`
+    /// verb against the root slot, with a document claiming `control.test/@`.
+    /// No provisioning-template change is needed for this — the VTA re-signs
+    /// the document with the `alsoKnownAs` entry exactly as it does for any
+    /// other name.
+    #[tokio::test]
+    async fn set_binds_the_community_name_on_the_root_slot() {
+        let (state, _dir) = test_state().await;
+        let admin = "did:example:admin";
+        let log = build_test_did_log("scid", "control.test", ".well-known").await;
+        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false)
+            .await
+            .expect("admin registers the root DID");
+
+        let log = build_test_did_log_with_names("control.test", ".well-known", &[""]).await;
+        let record = set_agent_name(&admin_auth(admin), &state, ".well-known", "", &log, None)
+            .await
+            .expect("set should bind the community name on the root slot");
+
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name.is_empty() && e.enabled),
+            "the community name must be present and enabled"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "").await.as_deref(),
+            Some(".well-known"),
+            "index must point at the root slot"
+        );
+    }
+
+    /// The same call against a tenant slot is refused — the binding rule is
+    /// structural, so admin authority does not buy a way around it.
+    #[tokio::test]
+    async fn set_refuses_the_community_name_on_a_tenant_slot() {
+        let (state, _dir) = test_state().await;
+        let admin = "did:example:admin";
+        let path = "slot-set-community";
+        register_owned(&state, "did:example:owner", path).await;
+
+        let log = build_test_did_log_with_names("control.test", path, &[""]).await;
+        let err = set_agent_name(&admin_auth(admin), &state, path, "", &log, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Reserved)),
+            "expected Reserved, got {err:?}"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "").await,
+            None,
+            "a refused set must not write the community index entry"
+        );
+    }
+
+    /// The community name is the domain's own identity, so a tenant claiming
+    /// `control.test/@` in its `alsoKnownAs` is the sharpest form of the
+    /// reserved-name attack above: it would make an ordinary hosted DID answer
+    /// for the whole community.
+    #[tokio::test]
+    async fn publish_cannot_capture_the_community_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "slot-pub-community";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        let log = build_test_did_log_with_names("control.test", path, &[""]).await;
+        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Reserved)),
+            "expected Reserved, got {err:?}"
+        );
+
+        assert_eq!(
+            index_target(&state, "control.test", "").await,
+            None,
+            "a refused publish must not write the community index entry"
+        );
+        assert_eq!(
+            get_record(&state, path).await.version_count,
+            before,
+            "a refused publish must not advance the version"
+        );
+    }
+
+    /// …and the root DID may. This is the whole point of the binding rule
+    /// being structural: `.well-known` is the one slot for which the community
+    /// name is not a capture.
+    #[tokio::test]
+    async fn root_did_may_publish_the_community_name() {
+        let (state, _dir) = test_state().await;
+        // The root slot is admin-only to register, so the whole flow runs as
+        // admin — which is also the realistic path: `.well-known` is
+        // provisioned by the operator, not by a tenant.
+        let admin = "did:example:admin";
+        let log = build_test_did_log("scid", "control.test", ".well-known").await;
+        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false)
+            .await
+            .expect("admin registers the root DID");
+
+        let log = build_test_did_log_with_names("control.test", ".well-known", &[""]).await;
+        publish_did(&admin_auth(admin), &state, ".well-known", &log, None)
+            .await
+            .expect("the root DID may claim its domain's community name");
+
+        assert_eq!(
+            index_target(&state, "control.test", "").await.as_deref(),
+            Some(".well-known"),
+            "the community name should index to the root slot"
         );
     }
 
