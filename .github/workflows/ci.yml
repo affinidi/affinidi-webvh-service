@@ -73,7 +73,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: MSRV — build workspace (default features)
         run: cargo +${{ env.MSRV }} build --workspace --locked
-      - name: MSRV — check did-hosting-common with every feature combination
+      - name: MSRV — build did-hosting-common with every feature combination
         # Cloud-secret backends and non-default storage backends are gated
         # behind feature flags. They must also build at MSRV; otherwise a
         # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
@@ -83,20 +83,27 @@ jobs:
         # `method-webvh` and `method-web` (multi-method rollout, T11/T24)
         # are also feature-gated; same MSRV-pass rationale.
         #
-        # `check`, not `build`: an MSRV regression is a too-new API showing up
-        # as a name-resolution or trait error, which type-checking catches.
-        # Only codegen and linking are skipped, and those do not have an MSRV
-        # dimension. The workspace step above is still a real `build`, so the
-        # link step is exercised once per run rather than fifteen times —
-        # which is what makes this loop roughly half its former cost.
+        # `build`, not `check`, and deliberately so — this loop was briefly
+        # switched to `check` in #124 and got 3.4x SLOWER (108s -> 364s).
+        #
+        # Cargo fingerprints check and build as separate units, so a `check`
+        # here cannot reuse what the `cargo build --workspace` step above just
+        # compiled: it recompiles the whole dependency tree a second time in
+        # check mode. Reusing that step's artifacts is exactly why each feature
+        # combination costs ~8s rather than a full compile.
+        #
+        # `check` only pays off in a job that does no `build` at all. Do not
+        # "optimise" this one without measuring build-then-X in a *single*
+        # target directory — benchmarking the two commands in isolation says
+        # nothing about this job's shape, which is how the regression got in.
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
                      store-firestore store-cosmosdb passkey \
                      setup-wizard metrics \
                      method-webvh method-web; do
-            echo "::group::MSRV check did-hosting-common --features server-core,$feat"
-            cargo +${{ env.MSRV }} check -p did-hosting-common --locked \
+            echo "::group::MSRV build did-hosting-common --features server-core,$feat"
+            cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
               --no-default-features --features "server-core,$feat"
             echo "::endgroup::"
           done
