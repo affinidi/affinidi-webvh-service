@@ -269,13 +269,14 @@ selected at compile time via feature flags. The default backend
 is **fjall**, an embedded key-value store that requires no
 external services.
 
-| Backend                   | Feature flag      | Config fields                                                                                                |
-| ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
-| Fjall (default, embedded) | `store-fjall`     | `store.data_dir`                                                                                             |
-| Redis                     | `store-redis`     | `store.redis_url`                                                                                            |
-| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table`, `store.dynamodb_region`                                                              |
-| Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
-| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
+| Backend                   | Feature flag             | Config fields                                                                                                |
+| ------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Fjall (default, embedded) | `store-fjall`            | `store.data_dir`                                                                                             |
+| Redis                     | `store-redis`            | `store.redis_url`                                                                                            |
+| AWS DynamoDB (auto)       | `store-dynamodb`         | `store.dynamodb_table_prefix`, `store.dynamodb_region`                                                       |
+| AWS DynamoDB (single-table, externally provisioned) | `store-dynamodb-single` | `store.dynamodb_table_name` (required), `store.dynamodb_region`. Table must exist with `pk` (S, HASH) + `sk` (S, RANGE). |
+| Google Firestore          | `store-firestore`        | `store.firestore_project`, `store.firestore_database`                                                        |
+| Azure Cosmos DB           | `store-cosmosdb`         | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
 
 To build with a non-default storage backend:
 

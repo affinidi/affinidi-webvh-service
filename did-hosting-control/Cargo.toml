@@ -42,6 +42,7 @@ store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 # ["test-support"]` entry. Off by default — never compiled into a release.
 test-support = ["dep:tempfile"]
 store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
+store-dynamodb-single = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb-single"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # NOTE: passkey/WebAuthn is always compiled into the control plane — it is
