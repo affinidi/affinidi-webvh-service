@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main, "release/**"]
 
+# Supersede a PR's in-flight run when new commits land on the same ref — a
+# review push otherwise leaves ~31 minutes of runner time chasing a diff nobody
+# will read.
+#
+# Deliberately NOT cancelled for `push`: a run on main / release/** is the
+# build-of-record for that commit, and cancelling it leaves a commit with no
+# green tick even though it was never actually tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -62,7 +73,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: MSRV — build workspace (default features)
         run: cargo +${{ env.MSRV }} build --workspace --locked
-      - name: MSRV — build did-hosting-common with every feature combination
+      - name: MSRV — check did-hosting-common with every feature combination
         # Cloud-secret backends and non-default storage backends are gated
         # behind feature flags. They must also build at MSRV; otherwise a
         # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
@@ -71,14 +82,21 @@ jobs:
         #
         # `method-webvh` and `method-web` (multi-method rollout, T11/T24)
         # are also feature-gated; same MSRV-pass rationale.
+        #
+        # `check`, not `build`: an MSRV regression is a too-new API showing up
+        # as a name-resolution or trait error, which type-checking catches.
+        # Only codegen and linking are skipped, and those do not have an MSRV
+        # dimension. The workspace step above is still a real `build`, so the
+        # link step is exercised once per run rather than fifteen times —
+        # which is what makes this loop roughly half its former cost.
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
                      store-firestore store-cosmosdb passkey \
                      setup-wizard metrics \
                      method-webvh method-web; do
-            echo "::group::MSRV build did-hosting-common --features server-core,$feat"
-            cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
+            echo "::group::MSRV check did-hosting-common --features server-core,$feat"
+            cargo +${{ env.MSRV }} check -p did-hosting-common --locked \
               --no-default-features --features "server-core,$feat"
             echo "::endgroup::"
           done
@@ -119,15 +137,28 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Only the matrix entries that enable `keyring` link against the Secret
+      # Service; the rest build `--no-default-features` without it and were
+      # paying for an `apt-get update` they never used. Keyed off the feature
+      # string so adding `keyring` to an entry turns the install back on by
+      # itself.
       - name: Install libdbus-1-dev
+        if: contains(matrix.features, 'keyring')
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - name: Build did-hosting-common with ${{ matrix.store }}
+      - name: Check did-hosting-common with ${{ matrix.store }}
+        # Build-only backends need to prove they compile, nothing more — no
+        # binary is produced or run, so `check` is the whole job.
+        #
+        # Skipped where the suite runs: the `cargo test` step below compiles
+        # the same crate with the same features, so checking first is work
+        # done twice.
+        if: ${{ !matrix.run_tests }}
         run: >
-          cargo build -p did-hosting-common --no-default-features
+          cargo check -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
       - name: Test did-hosting-common with ${{ matrix.store }}
         # Only embedded fjall runs the unit suite (isolated per-test store);
-        # other backends are build-only above.
+        # other backends are check-only above.
         if: matrix.run_tests
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
@@ -261,12 +292,17 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install libdbus-1-dev
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - name: Build did-hosting-common (${{ matrix.case }})
+      # No libdbus here: these cases build `--no-default-features` with a
+      # single `method-*` flag, so `keyring` — the only thing that links
+      # against the Secret Service — is never in the graph.
+      - name: Check did-hosting-common (${{ matrix.case }})
+        # `check`, not `build`. The assertion is either "this compiles" or
+        # "this fails with a specific `compile_error!`", and a `compile_error!`
+        # fires during type-checking — so the failure cases still produce the
+        # message this greps for.
         run: |
           set +e
-          out=$(cargo build -p did-hosting-common \
+          out=$(cargo check -p did-hosting-common \
             --no-default-features --features "${{ matrix.features }}" 2>&1)
           status=$?
           set -e
@@ -301,10 +337,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install libdbus-1-dev
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # No libdbus: `server-core,<cloud backend>` does not pull `keyring`.
+      # `check` is enough — the question is whether the backend's SDK compiles
+      # against this workspace, not whether it links.
       - run: >
-          cargo build -p did-hosting-common --no-default-features
+          cargo check -p did-hosting-common --no-default-features
           --features "server-core,${{ matrix.backend }}"
 
   deny:
