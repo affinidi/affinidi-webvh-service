@@ -437,6 +437,51 @@ pub fn extract_agent_names(jsonl_content: &str, domain: &str) -> Vec<String> {
     names
 }
 
+/// Fold the names a document claims into the registry a record already carries.
+///
+/// The control plane keeps the authoritative registry; the document decides
+/// which of its entries currently *resolve*. This reconciles the two:
+///
+/// - a derived name already in the registry keeps its `created_at` (the binding
+///   is the same binding — a republish is not a re-claim) and is enabled;
+/// - a derived name that is new is appended, enabled, stamped `now`;
+/// - a registry entry the document no longer claims is **disabled, not
+///   dropped**. Disabling stops the redirect but keeps the name reserved to
+///   this slot, which is exactly the state the data model calls "parked". A
+///   name only leaves the registry when it is explicitly released.
+///
+/// That last rule is what makes the registry a superset of the document rather
+/// than a mirror of it, and it is why the control plane can hold a reservation
+/// the signed log has no way to express.
+///
+/// The edge does not use this — [`extract_agent_names`] alone is its rule, so
+/// an edge is structurally unable to serve a name the document does not claim.
+pub fn reconcile_agent_names(
+    previous: &[AgentNameEntry],
+    derived: &[String],
+    now: u64,
+) -> Vec<AgentNameEntry> {
+    let mut out: Vec<AgentNameEntry> = previous
+        .iter()
+        .map(|entry| AgentNameEntry {
+            enabled: derived.contains(&entry.name),
+            ..entry.clone()
+        })
+        .collect();
+
+    for name in derived {
+        if !out.iter().any(|entry| &entry.name == name) {
+            out.push(AgentNameEntry {
+                name: name.clone(),
+                enabled: true,
+                created_at: now,
+            });
+        }
+    }
+
+    out
+}
+
 /// Parse JSONL content and extract metadata from the log entries.
 pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
     let lines: Vec<&str> = jsonl_content.lines().collect();
@@ -765,5 +810,39 @@ mod agent_name_tests {
     fn no_also_known_as_is_empty() {
         let log = "{\"versionId\":\"1\",\"state\":{\"id\":\"did:webvh:x:host.example\"}}";
         assert!(extract_agent_names(log, "host.example").is_empty());
+    }
+
+    fn entry(name: &str, enabled: bool, created_at: u64) -> AgentNameEntry {
+        AgentNameEntry {
+            name: name.into(),
+            enabled,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn reconcile_adds_newly_claimed_names() {
+        let out = reconcile_agent_names(&[], &["alice".into()], 100);
+        assert_eq!(out, vec![entry("alice", true, 100)]);
+    }
+
+    #[test]
+    fn reconcile_keeps_the_original_claim_time() {
+        // A republish is not a re-claim; `created_at` is the binding's age.
+        let out = reconcile_agent_names(&[entry("alice", true, 100)], &["alice".into()], 500);
+        assert_eq!(out, vec![entry("alice", true, 100)]);
+    }
+
+    #[test]
+    fn reconcile_parks_a_name_the_document_dropped() {
+        // Retained, so the reservation holds; disabled, so it stops resolving.
+        let out = reconcile_agent_names(&[entry("alice", true, 100)], &[], 500);
+        assert_eq!(out, vec![entry("alice", false, 100)]);
+    }
+
+    #[test]
+    fn reconcile_reenables_a_reclaimed_name() {
+        let out = reconcile_agent_names(&[entry("alice", false, 100)], &["alice".into()], 500);
+        assert_eq!(out, vec![entry("alice", true, 100)]);
     }
 }

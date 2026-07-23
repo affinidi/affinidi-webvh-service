@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Agent names are visible in the UI, and resolve on the daemon.** The
+  control plane now derives a slot's agent names from the signed document's
+  `alsoKnownAs` on publish / atomic-register / rollback — the same rule the
+  edge applies to a pushed log — and writes the `name:{domain}:{name}` index in
+  the same batch. Without this the recommended single-binary deployment would
+  accept a document claiming `/@alice` and then 404 the redirect, because the
+  daemon's control plane *is* the store the `/@name` handler reads and nothing
+  was writing to it. A name the document stops claiming is **disabled, not
+  dropped**: the redirect stops, the reservation holds. Deleting a slot releases
+  its names.
+
+  `GET /api/dids` and `GET /api/dids/{mnemonic}` gained `agentNames` — enabled
+  names, local part only, omitted when there are none. The DIDs list and the DID
+  detail page render them as copyable `domain/@name` chips directly beneath the
+  DID, in that order deliberately: an agent name is an alias for the identifier
+  above it, and promoting it over the DID leaves a reader unsure which line is
+  authoritative.
+
 - **Batched DID sync to cut the resync mediator-throttle flood.** A control
   plane pushed one `MSG_SYNC_UPDATE` per DID, and each inbound frame draws one
   transport-level TSP reply — so a bulk resync (a server (re)registering with

@@ -28,6 +28,19 @@ pub use did_hosting_common::did_ops::{
     owner_key, parse_log_entries, watcher_sync_key,
 };
 
+/// The agent names that currently resolve to a record, for the list wire type.
+///
+/// Enabled entries only — a name the edge is holding but not serving would
+/// otherwise show in a management UI as a live redirect that 404s.
+fn enabled_agent_names(record: &DidRecord) -> Vec<String> {
+    record
+        .agent_names
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Quota index — O(1) per-owner count and size tracking
 // ---------------------------------------------------------------------------
@@ -533,6 +546,7 @@ pub async fn list_dids(
             .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
         if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
             let did_stats = did_hosting_common::DidStats::default();
+            let agent_names = enabled_agent_names(&record);
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -544,6 +558,7 @@ pub async fn list_dids(
                 disabled: record.disabled,
                 method: (!record.method.is_empty()).then(|| record.method.clone()),
                 domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+                agent_names,
                 services: record.services,
             });
         }
@@ -571,6 +586,7 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             Err(_) => continue,
         };
         let did_stats = did_hosting_common::DidStats::default();
+        let agent_names = enabled_agent_names(&record);
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -582,6 +598,7 @@ async fn list_all_dids(auth: &AuthClaims, state: &AppState) -> Result<Vec<DidLis
             disabled: record.disabled,
             method: (!record.method.is_empty()).then(|| record.method.clone()),
             domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+            agent_names,
             services: record.services,
         });
     }

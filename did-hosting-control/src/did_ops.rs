@@ -72,6 +72,107 @@ pub use did_hosting_common::did_ops::{
 };
 
 // ---------------------------------------------------------------------------
+// Agent names
+// ---------------------------------------------------------------------------
+
+/// Reconcile a slot's agent names against the log about to be committed, and
+/// stage the `name:{domain}:{name}` index writes into the caller's batch.
+///
+/// Returns the entries to store on the record. The caller must commit the batch
+/// — index and record land together or not at all, which is the whole point:
+/// a name that resolves to a mnemonic whose record disagrees is exactly the
+/// drift the index exists to avoid.
+///
+/// # Why the control plane derives at all
+///
+/// The edge derives its names from pushed logs in
+/// `control_register::apply_single_update`, so a standalone server is covered.
+/// The daemon has no such push — its control plane *is* the store the `/@name`
+/// handler reads — so without this the recommended single-binary deployment
+/// would accept a document claiming `/@alice` and then 404 on it.
+///
+/// Index rows are written for parked entries too. A parked name is still
+/// reserved to this slot, and the resolve handler re-checks `enabled` before
+/// redirecting, so the row is a reservation record rather than a live mapping.
+fn stage_agent_names(
+    batch: &mut crate::store::WriteBatch,
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    did_host: &str,
+    previous: &[did_hosting_common::did_ops::AgentNameEntry],
+    log_content: &str,
+    now: u64,
+) -> Vec<did_hosting_common::did_ops::AgentNameEntry> {
+    use did_hosting_common::did_ops::{agent_name_key, extract_agent_names, reconcile_agent_names};
+
+    // No host means no domain to scope names to. Carry the previous entries
+    // through untouched rather than silently retiring every name because a DID
+    // identifier failed to parse.
+    if did_host.is_empty() {
+        return previous.to_vec();
+    }
+
+    let derived = extract_agent_names(log_content, did_host);
+    let entries = reconcile_agent_names(previous, &derived, now);
+
+    for entry in &entries {
+        batch.insert_raw(
+            dids_ks,
+            agent_name_key(did_host, &entry.name),
+            mnemonic.as_bytes().to_vec(),
+        );
+    }
+
+    entries
+}
+
+/// Stage removal of every index row a record's names hold.
+///
+/// Used on delete, where the slot itself goes away: the reservation cannot
+/// outlive the slot it reserves, and a dangling row would otherwise sit in the
+/// index pointing at a mnemonic with no record.
+fn stage_agent_name_removal(
+    batch: &mut crate::store::WriteBatch,
+    dids_ks: &KeyspaceHandle,
+    record: &DidRecord,
+) {
+    use did_hosting_common::did_ops::agent_name_key;
+
+    let host = did_host_of(record);
+    if host.is_empty() {
+        return;
+    }
+    for entry in &record.agent_names {
+        batch.remove(dids_ks, agent_name_key(&host, &entry.name));
+    }
+}
+
+/// The hosting domain a record's names are scoped to.
+///
+/// Prefers the persisted `domain`; falls back to the DID identifier's embedded
+/// host for legacy slots M-01 has not swept. Empty when neither is known.
+fn did_host_of(record: &DidRecord) -> String {
+    if !record.domain.is_empty() {
+        return record.domain.clone();
+    }
+    record
+        .did_id
+        .as_deref()
+        .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+        .unwrap_or_default()
+}
+
+/// The enabled subset of a record's names, for the list / detail wire types.
+pub fn resolvable_agent_names(record: &DidRecord) -> Vec<String> {
+    record
+        .agent_names
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
@@ -444,6 +545,37 @@ pub async fn register_did_atomic(
         _ => (now, 1),
     };
 
+    // 4. Single-batch atomic write: record, log content, owner index;
+    //    plus old-owner cleanup on takeover. From a resolver's
+    //    perspective there is no point at which the slot is
+    //    half-updated — either old-content/old-record or
+    //    new-content/new-record.
+    let mut batch = state.store.batch();
+
+    // Agent names are folded in before the record is built so the name index
+    // rows join the same batch. `existing` is carried in rather than defaulted:
+    // this path also re-registers an EXISTING slot, where an empty previous
+    // list would silently drop every name bound to it — including the parked
+    // ones, which the incoming document cannot re-assert by construction.
+    //
+    // The host comes from the DID identifier, not `record.domain`: this
+    // construction site still writes an empty domain (T12 legacy; M-01
+    // backfills), and the identifier's authority is the value a name is scoped
+    // by anyway.
+    let did_host = did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
+    let agent_names = stage_agent_names(
+        &mut batch,
+        &state.dids_ks,
+        path,
+        &did_host,
+        &existing
+            .as_ref()
+            .map(|r| r.agent_names.clone())
+            .unwrap_or_default(),
+        did_log,
+        now,
+    );
+
     let new_record = DidRecord {
         owner: auth.did.clone(),
         mnemonic: path.to_string(),
@@ -461,29 +593,9 @@ pub async fn register_did_atomic(
 
         services: extract_service_types(did_log),
 
-        // Carried over, not defaulted. This path also re-registers an
-        // EXISTING slot, where `Vec::new()` would silently drop every name
-        // bound to it.
-        //
-        // Control keeps the authoritative registry rather than deriving from
-        // the log, because a *disabled* name is deliberately absent from
-        // `alsoKnownAs` — it is parked, not claimed — so the log cannot
-        // express the reservation. The edge derives instead (see
-        // `control_register::apply_single_update`), which is what makes an
-        // edge structurally unable to serve a name the document does not
-        // claim.
-        agent_names: existing
-            .as_ref()
-            .map(|r| r.agent_names.clone())
-            .unwrap_or_default(),
+        agent_names,
     };
 
-    // 4. Single-batch atomic write: record, log content, owner index;
-    //    plus old-owner cleanup on takeover. From a resolver's
-    //    perspective there is no point at which the slot is
-    //    half-updated — either old-content/old-record or
-    //    new-content/new-record.
-    let mut batch = state.store.batch();
     batch.insert_raw(
         &state.dids_ks,
         content_log_key(path),
@@ -604,6 +716,20 @@ pub async fn publish_did(
     }
 
     let mut batch = state.store.batch();
+
+    // Same rationale as the badge cache above: a publish can add a name to
+    // `alsoKnownAs` or drop one, and the redirect must follow the document.
+    // Dropped names are parked rather than deleted — see `reconcile_agent_names`.
+    record.agent_names = stage_agent_names(
+        &mut batch,
+        &state.dids_ks,
+        mnemonic,
+        &did_host_of(&record),
+        &record.agent_names.clone(),
+        did_log,
+        record.updated_at,
+    );
+
     batch.insert_raw(
         &state.dids_ks,
         content_log_key(mnemonic),
@@ -782,6 +908,7 @@ pub async fn list_dids(
             let stats_key = format!("stats:{mnemonic}");
             let did_stats: did_hosting_common::DidStats =
                 state.stats_ks.get(stats_key).await?.unwrap_or_default();
+            let agent_names = resolvable_agent_names(&record);
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
                 owner: record.owner,
@@ -793,6 +920,7 @@ pub async fn list_dids(
                 disabled: record.disabled,
                 method: (!record.method.is_empty()).then(|| record.method.clone()),
                 domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+                agent_names,
                 services: record.services,
             });
         }
@@ -822,6 +950,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
         let stats_key = format!("stats:{}", record.mnemonic);
         let did_stats: did_hosting_common::DidStats =
             state.stats_ks.get(stats_key).await?.unwrap_or_default();
+        let agent_names = resolvable_agent_names(&record);
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
             owner: record.owner,
@@ -833,6 +962,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             disabled: record.disabled,
             method: (!record.method.is_empty()).then(|| record.method.clone()),
             domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+            agent_names,
             services: record.services,
         });
     }
@@ -884,6 +1014,10 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, content_log_key(mnemonic));
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
+    // The slot is going away, so its name reservations go with it — otherwise
+    // the index keeps rows pointing at a mnemonic that no longer has a record,
+    // and the name stays unclaimable by anyone else.
+    stage_agent_name_removal(&mut batch, &state.dids_ks, &record);
     batch.commit().await?;
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
@@ -1021,6 +1155,20 @@ pub async fn rollback_did(
     record.services = extract_service_types(&truncated);
 
     let mut batch = state.store.batch();
+
+    // And it can retract a name the same way. Parked, not deleted: the rolled
+    // back entry may well be re-published, and the reservation should survive
+    // an operator undoing a bad version.
+    record.agent_names = stage_agent_names(
+        &mut batch,
+        &state.dids_ks,
+        mnemonic,
+        &did_host_of(&record),
+        &record.agent_names.clone(),
+        &truncated,
+        record.updated_at,
+    );
+
     batch.insert_raw(
         &state.dids_ks,
         content_log_key(mnemonic),

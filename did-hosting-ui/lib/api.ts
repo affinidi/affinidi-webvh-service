@@ -33,6 +33,12 @@ export interface DidRecord {
    *  M-02 hasn't swept — render no badges in both cases. An empty array
    *  is meaningful: the document was read and advertises nothing. */
   services?: string[];
+  /** Agent names that resolve to this DID, local part only (`alice`). The
+   *  hosting domain is `domain`, or the DID's host for legacy records — see
+   *  `agentNameHost`. Enabled names only; the field is omitted entirely when
+   *  there are none, which is every record on a deployment that has never
+   *  turned the feature on. */
+  agentNames?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +220,9 @@ export interface DidDetailResponse {
   method?: string;
   /** v0.7: hosting domain. Omitted on legacy records pre-M-01. */
   domain?: string;
+  /** Agent names resolving to this DID. Same contract as
+   *  `DidRecord.agentNames`. */
+  agentNames?: string[];
 }
 
 export interface LogEntryInfo {

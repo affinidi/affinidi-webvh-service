@@ -594,6 +594,16 @@ pub struct DidListEntry {
     /// badge row in both cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
+    /// Agent names that currently **resolve** to this DID, local part only
+    /// (`alice`, not `example.com/@alice`) — the domain is already on the
+    /// entry, and a name is only meaningful within its domain.
+    ///
+    /// Enabled entries only: a parked name is reserved but not resolvable, and
+    /// showing it in a list would advertise a redirect that 404s. Empty (and
+    /// omitted from the wire) for records with no names, which is every record
+    /// on a deployment that has never used the feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -740,6 +750,7 @@ mod tests {
             method: None,
             domain: None,
             services: None,
+            agent_names: Vec::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"createdAt\""));
@@ -768,6 +779,7 @@ mod tests {
             method: None,
             domain: None,
             services: None,
+            agent_names: Vec::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"didId\":null"));
@@ -791,9 +803,12 @@ mod tests {
                 "TSPTransport".to_string(),
                 "DIDCommMessaging".to_string(),
             ]),
+            agent_names: vec!["alice".to_string()],
         };
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"agentNames\":[\"alice\"]"));
         let back: DidListEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_names, vec!["alice".to_string()]);
         assert_eq!(back.mnemonic, "test");
         assert_eq!(back.version_count, 3);
         assert_eq!(back.did_id, Some("did:webvh:abc:host:path".to_string()));

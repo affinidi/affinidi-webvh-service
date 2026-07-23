@@ -210,6 +210,11 @@ pub struct DidDetailResponse {
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// Agent names that currently resolve to this DID, local part only.
+    /// Same contract as `DidListEntry::agent_names` — enabled entries only,
+    /// omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_names: Vec<String>,
 }
 
 pub async fn get_did(
@@ -219,6 +224,7 @@ pub async fn get_did(
 ) -> Result<Json<DidDetailResponse>, AppError> {
     let mnemonic = clean_mnemonic(&mnemonic);
     let (record, log_metadata) = did_ops::get_did_info(&auth, &state, mnemonic).await?;
+    let agent_names = did_ops::resolvable_agent_names(&record);
 
     Ok(Json(DidDetailResponse {
         mnemonic: record.mnemonic,
@@ -231,6 +237,7 @@ pub async fn get_did(
         log: log_metadata,
         method: (!record.method.is_empty()).then(|| record.method.clone()),
         domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+        agent_names,
     }))
 }
 
@@ -390,6 +397,7 @@ pub async fn rollback_did(
 ) -> Result<Json<DidDetailResponse>, AppError> {
     let mnemonic = clean_mnemonic(&mnemonic);
     let (record, log_metadata) = did_ops::rollback_did(&auth, &state, mnemonic).await?;
+    let agent_names = did_ops::resolvable_agent_names(&record);
 
     server_push::notify_servers_did(&state, mnemonic.to_string());
 
@@ -404,6 +412,7 @@ pub async fn rollback_did(
         log: log_metadata,
         method: (!record.method.is_empty()).then(|| record.method.clone()),
         domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
+        agent_names,
     }))
 }
 

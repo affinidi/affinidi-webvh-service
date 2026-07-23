@@ -12,6 +12,7 @@ import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { AgentNameChips } from "../../components/AgentNameChips";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -403,6 +404,7 @@ export default function DidDetail() {
     ts ? new Date(ts * 1000).toLocaleString() : "Never";
 
   const logEntryCount = didDetail?.log?.logEntryCount ?? 0;
+  const hasAgentNames = (didDetail?.agentNames?.length ?? 0) > 0;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
@@ -414,7 +416,9 @@ export default function DidDetail() {
         {/* DID ID directly under title */}
         {didDetail && (
           didDetail.didId ? (
-            <View style={styles.didIdRow}>
+            <View
+              style={[styles.didIdRow, hasAgentNames && styles.didIdRowTight]}
+            >
               <Text style={styles.didIdText} numberOfLines={1}>
                 {didDetail.didId}
               </Text>
@@ -427,6 +431,26 @@ export default function DidDetail() {
           ) : (
             <Text style={styles.pendingText}>Pending upload</Text>
           )
+        )}
+        {/* Agent names, directly under the DID they redirect to.
+
+            Here rather than in the DID Details panel below: that panel is
+            log metadata (version, method, entry count) — facts you look up.
+            An agent name is an address you hand to someone, so it belongs
+            beside the other address on the page. A DID can carry several,
+            which the panel's right-aligned label/value rows handle badly and
+            a wrapping chip row handles for free.
+
+            The DID row tightens its bottom margin only when names follow, so
+            a DID with no names keeps exactly the spacing it has today. */}
+        {hasAgentNames && (
+          <View style={styles.agentNamesRow}>
+            <AgentNameChips
+              names={didDetail!.agentNames}
+              domain={didDetail!.domain}
+              didId={didDetail!.didId}
+            />
+          </View>
         )}
         {/* Owner */}
         {didDetail && (
@@ -1224,6 +1248,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     alignSelf: "flex-start",
     gap: spacing.sm,
+    marginBottom: spacing.xl,
+  },
+  didIdRowTight: {
+    marginBottom: spacing.sm,
+  },
+  agentNamesRow: {
+    alignSelf: "flex-start",
     marginBottom: spacing.xl,
   },
   didIdText: {
