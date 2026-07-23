@@ -11,8 +11,10 @@ import { Link } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { ServiceBadges } from "../../components/ServiceBadges";
+import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showConfirm } from "../../lib/alert";
+import { useAgentNames } from "../../lib/use-agent-names";
 import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
 
 function formatDuration(seconds: number): string {
@@ -36,6 +38,39 @@ function Row({ label, value }: { label: string; value: string }) {
     <View style={styles.row}>
       <Text style={styles.label}>{label}</Text>
       <Text style={styles.value}>{value}</Text>
+    </View>
+  );
+}
+
+/**
+ * A [`Row`] whose value is a DID, with any agent names it serves as chips
+ * beneath it.
+ *
+ * Under the DID, never above, per `AgentNameChips`: a name is an alias, and
+ * the DID stays the authoritative line. With no names this renders exactly as
+ * a plain `Row` did, which is the common case.
+ */
+function DidRow({
+  label,
+  did,
+  names,
+}: {
+  label: string;
+  did: string | null | undefined;
+  names: string[];
+}) {
+  if (!did) return <Row label={label} value="Not configured" />;
+  return (
+    <View style={styles.row}>
+      <Text style={styles.label}>{label}</Text>
+      <View style={styles.didValue}>
+        <Text style={styles.value}>{did}</Text>
+        {names.length > 0 && (
+          <View style={styles.didValueNames}>
+            <AgentNameChips names={names} didId={did} size="sm" />
+          </View>
+        )}
+      </View>
     </View>
   );
 }
@@ -66,6 +101,15 @@ export default function SettingsPage() {
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Called unconditionally, above the early returns, and tolerant of the
+  // nulls it sees while `config` is still loading — it re-requests when the
+  // set of DIDs actually changes, not on every render.
+  const agentNames = useAgentNames([
+    config?.controlDid,
+    config?.mediatorDid,
+    config?.vtaDid,
+  ]);
 
   const [generations, setGenerations] = useState<IdentityGeneration[]>([]);
   const [identityError, setIdentityError] = useState<string | null>(null);
@@ -186,13 +230,15 @@ export default function SettingsPage() {
       {/* Identity */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Identity</Text>
-        <Row
+        <DidRow
           label="Control Plane DID"
-          value={config.controlDid ?? "Not configured"}
+          did={config.controlDid}
+          names={agentNames[config.controlDid ?? ""] ?? []}
         />
-        <Row
+        <DidRow
           label="Mediator DID"
-          value={config.mediatorDid ?? "Not configured"}
+          did={config.mediatorDid}
+          names={agentNames[config.mediatorDid ?? ""] ?? []}
         />
         <Row
           label="Control Plane URL"
@@ -282,7 +328,13 @@ export default function SettingsPage() {
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>VTA Integration</Text>
           {config.vtaUrl && <Row label="VTA URL" value={config.vtaUrl} />}
-          {config.vtaDid && <Row label="VTA DID" value={config.vtaDid} />}
+          {config.vtaDid && (
+            <DidRow
+              label="VTA DID"
+              did={config.vtaDid}
+              names={agentNames[config.vtaDid] ?? []}
+            />
+          )}
         </View>
       )}
 
@@ -389,6 +441,15 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     textAlign: "right",
     flex: 1,
+  },
+  // The DID keeps `value`'s right alignment; the chips sit under it, right-
+  // aligned to match, so the column edge stays straight down the card.
+  didValue: {
+    flex: 1,
+    alignItems: "flex-end",
+  },
+  didValueNames: {
+    marginTop: spacing.xs,
   },
   badge: {
     borderRadius: 4,

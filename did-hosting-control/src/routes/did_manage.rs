@@ -72,6 +72,24 @@ pub struct AgentNameCheckRequest {
     pub domain: Option<String>,
 }
 
+/// Body for the reverse lookup: which names do these DIDs serve?
+///
+/// `deny_unknown_fields` because this is a new contract with no clients to
+/// break, and silently dropping a field a caller thought it sent is how a
+/// filter or scope argument goes missing unnoticed (R3.2).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentNameResolveRequest {
+    pub dids: Vec<String>,
+}
+
+/// `{ "names": { "<did>": ["alice"] } }` — DIDs with no served names are
+/// absent, not present-and-empty.
+#[derive(Debug, Serialize)]
+pub struct AgentNameResolveResponse {
+    pub names: std::collections::HashMap<String, Vec<String>>,
+}
+
 /// The `{record}` response shared by the mutating verbs — the DID record in
 /// its spec projection, identical to the Trust-Task surface's response.
 ///
@@ -183,6 +201,28 @@ pub async fn disable_agent_name(
     server_push::notify_servers_did(&state, req.mnemonic.clone());
     info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name disabled via REST");
     Ok(Json(agent_name_record_response(&state, &record)))
+}
+
+/// `POST /api/agent-names/resolve` — which agent names do these DIDs serve?
+///
+/// The reverse of the `/@name` redirect, for display surfaces that hold a DID
+/// and want to show its handle: the dashboard, the servers list, the settings
+/// page, a DID's owner row. Batched because those surfaces hold several DIDs
+/// at once, and a per-DID round-trip would make showing a name cost more than
+/// the identifier it replaces.
+///
+/// Authenticated, though every name it returns is already public — an
+/// unauthenticated batch lookup is an enumeration surface even when each
+/// individual answer is not a secret. Any role: a name is not privileged
+/// information, and the surfaces that need it are visible to every logged-in
+/// operator.
+pub async fn resolve_agent_names(
+    _auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<AgentNameResolveRequest>,
+) -> Result<Json<AgentNameResolveResponse>, AppError> {
+    let names = did_ops::resolve_agent_names(&state, &req.dids).await?;
+    Ok(Json(AgentNameResolveResponse { names }))
 }
 
 /// Resolve the domain an agent-name probe is scoped to.

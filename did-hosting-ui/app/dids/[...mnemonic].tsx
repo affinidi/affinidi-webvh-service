@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { AgentNameChips } from "../../components/AgentNameChips";
+import { useAgentNames } from "../../lib/use-agent-names";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -80,6 +81,10 @@ export default function DidDetail() {
   const [stats, setStats] = useState<DidStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
   const [didDetail, setDidDetail] = useState<DidDetailResponse | null>(null);
+  // The owner's own handle, if this service hosts the owner's DID too — the
+  // common case, since a VTA usually registers itself here before its DIDs.
+  const ownerNameMap = useAgentNames([didDetail?.owner]);
+  const ownerNames = ownerNameMap[didDetail?.owner ?? ""] ?? [];
   const [copied, setCopied] = useState(false);
   const [didContent, setDidContent] = useState("");
   const [witnessContent, setWitnessContent] = useState("");
@@ -729,9 +734,21 @@ export default function DidDetail() {
             />
           </View>
         )}
-        {/* Owner */}
+        {/* Owner. The owner is a DID like any other — usually the VTA that
+            registered this slot — so if it is hosted here and serves a name,
+            show the handle under it. Foreign owners resolve to nothing and
+            render exactly as before. */}
         {didDetail && (
-          <Text style={styles.ownerText}>Owner: {didDetail.owner}</Text>
+          <View style={styles.ownerRow}>
+            <Text style={styles.ownerText}>Owner: {didDetail.owner}</Text>
+            {ownerNames.length > 0 && (
+              <AgentNameChips
+                names={ownerNames}
+                didId={didDetail.owner}
+                size="sm"
+              />
+            )}
+          </View>
         )}
 
         {/* Stats */}
@@ -1671,11 +1688,17 @@ const styles = StyleSheet.create({
     color: colors.warning,
     marginBottom: spacing.xl,
   },
+  ownerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    marginBottom: spacing.lg,
+  },
   ownerText: {
     fontSize: 13,
     fontFamily: fonts.mono,
     color: colors.textSecondary,
-    marginBottom: spacing.lg,
   },
   ownerInput: {
     backgroundColor: colors.bgPrimary,

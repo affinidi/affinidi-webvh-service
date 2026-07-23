@@ -14,8 +14,10 @@ import {
   SERVICE_TYPE_TSP,
 } from "./ServiceBadges";
 import { ControlLink } from "./ControlLink";
+import { AgentNameChips } from "./AgentNameChips";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { ServiceOverview, ServiceInfo } from "../lib/api";
+import { useAgentNames } from "../lib/use-agent-names";
 
 const STATUS_COLORS: Record<string, string> = {
   active: colors.teal,
@@ -143,7 +145,13 @@ function StatValue({ label, value }: { label: string; value: string | number }) 
   );
 }
 
-function ServiceCard({ service }: { service: ServiceInfo }) {
+function ServiceCard({
+  service,
+  agentNames,
+}: {
+  service: ServiceInfo;
+  agentNames: string[];
+}) {
   const did = service.did;
   const shortDid = did
     ? did.length > 40
@@ -165,8 +173,15 @@ function ServiceCard({ service }: { service: ServiceInfo }) {
 
       <Text style={styles.serviceUrl} numberOfLines={1}>{service.url}</Text>
 
+      {/* The DID is truncated for width, so the full value goes to the chips
+          via `didId` — they need the authority, not the ellipsis. */}
       {shortDid && (
         <Text style={styles.serviceDid} numberOfLines={1}>{shortDid}</Text>
+      )}
+      {agentNames.length > 0 && (
+        <View style={styles.serviceNamesRow}>
+          <AgentNameChips names={agentNames} didId={did} size="sm" />
+        </View>
       )}
 
       {/* What this instance's DID document advertises. Cached on the
@@ -274,6 +289,10 @@ export function ServiceOverviewPanel({
     const interval = setInterval(refresh, 5000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  // Above the early returns, so the hook order stays fixed. The panel polls
+  // every 5s; the lookup only re-fires when the set of DIDs actually changes.
+  const agentNames = useAgentNames((data?.services ?? []).map((s) => s.did));
 
   if (loading && !data) {
     return (
@@ -447,13 +466,25 @@ export function ServiceOverviewPanel({
       ) : (
         <>
           {servers.length > 0 && (
-            <ServiceGroup label="Servers" services={servers} />
+            <ServiceGroup
+              label="Servers"
+              services={servers}
+              agentNames={agentNames}
+            />
           )}
           {witnesses.length > 0 && (
-            <ServiceGroup label="Witnesses" services={witnesses} />
+            <ServiceGroup
+              label="Witnesses"
+              services={witnesses}
+              agentNames={agentNames}
+            />
           )}
           {watchers.length > 0 && (
-            <ServiceGroup label="Watchers" services={watchers} />
+            <ServiceGroup
+              label="Watchers"
+              services={watchers}
+              agentNames={agentNames}
+            />
           )}
         </>
       )}
@@ -464,9 +495,11 @@ export function ServiceOverviewPanel({
 function ServiceGroup({
   label,
   services,
+  agentNames,
 }: {
   label: string;
   services: ServiceInfo[];
+  agentNames: Record<string, string[]>;
 }) {
   return (
     <View style={styles.group}>
@@ -475,7 +508,11 @@ function ServiceGroup({
         <Text style={styles.groupCount}>({services.length})</Text>
       </Text>
       {services.map((s) => (
-        <ServiceCard key={s.instanceId} service={s} />
+        <ServiceCard
+          key={s.instanceId}
+          service={s}
+          agentNames={agentNames[s.did ?? ""] ?? []}
+        />
       ))}
     </View>
   );
@@ -759,6 +796,9 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     color: colors.textSecondary,
     marginBottom: 4,
+  },
+  serviceNamesRow: {
+    marginBottom: spacing.sm,
   },
   serviceDid: {
     fontSize: 11,

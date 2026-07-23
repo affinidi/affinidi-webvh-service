@@ -10,6 +10,7 @@ use did_hosting_common::did_ops::{
     content_witness_key, did_key, extract_agent_names, owner_key,
 };
 use did_hosting_common::server::error::AgentNameError;
+use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
     validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
 };
@@ -1683,6 +1684,103 @@ pub async fn list_agent_names(
         "agent names listed"
     );
     Ok((domain, record.agent_names))
+}
+
+/// The most DIDs one resolve call will answer for.
+///
+/// Sized for the display surfaces that drive it — a settings page holds three
+/// DIDs, a servers list a handful — not for bulk export. Each entry is a store
+/// read, so an uncapped list would turn one request into unbounded I/O.
+pub const MAX_RESOLVE_DIDS: usize = 64;
+
+/// DID → its served agent names, for a batch of DIDs. The reverse of the
+/// `/@name` redirect.
+///
+/// # Why this is not an index lookup
+///
+/// The registry indexes `name → mnemonic`; nothing maps a DID identifier back
+/// to its record. It does not need to: for `did:webvh` the mnemonic *is*
+/// derivable from the identifier ([`mnemonic_from_did`]), so this is a direct
+/// read per DID rather than a scan. That is also why the result is not
+/// authoritative for foreign DIDs — a DID hosted elsewhere simply has no local
+/// record, and is reported as having no names rather than resolved over the
+/// network. Callers rendering a foreign DID get the DID, which is correct: this
+/// service can only vouch for names it serves.
+///
+/// # What is returned
+///
+/// Only **served** (`enabled`) names, and only from a record whose `did_id` is
+/// the DID asked about. Parked names are registry-private — they resolve to
+/// nothing, so publishing them here would advertise a handle that 404s and
+/// would leak a reservation its holder deliberately took out of service.
+///
+/// DIDs with no names are omitted from the map entirely; a caller reads a
+/// missing key and an empty list the same way, and the common case is that most
+/// DIDs have none.
+///
+/// # Disclosure
+///
+/// Every name returned is already in that DID's `alsoKnownAs` and already
+/// served as a public redirect by the edge, so this reveals nothing new about a
+/// DID the caller already holds. It is authenticated regardless — it answers
+/// questions about arbitrary DIDs, and an unauthenticated batch endpoint is an
+/// enumeration surface even when each individual answer is public.
+pub async fn resolve_agent_names(
+    state: &AppState,
+    dids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
+    use std::collections::HashMap;
+
+    if !state.config.features.agent_names {
+        return Ok(HashMap::new());
+    }
+    if dids.len() > MAX_RESOLVE_DIDS {
+        return Err(AppError::Validation(format!(
+            "at most {MAX_RESOLVE_DIDS} DIDs per resolve request, got {}",
+            dids.len()
+        )));
+    }
+
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for did in dids {
+        // Already answered — a caller may repeat a DID (the same instance
+        // appearing twice in a list), and one read is enough.
+        if out.contains_key(did) {
+            continue;
+        }
+        let Some(mnemonic) = mnemonic_from_did(did) else {
+            continue;
+        };
+        let Some(record) = state
+            .dids_ks
+            .get::<DidRecord>(did_key(&mnemonic))
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        // The slot must hold *this* DID. `mnemonic_from_did` yields the slot a
+        // DID *would* occupy, and for a pathless DID that is the single global
+        // `.well-known` — so without this, asking about any foreign root DID
+        // would return the local root DID's names.
+        if record.did_id.as_deref() != Some(did.as_str())
+            || record.disabled
+            || record.deleted_at.is_some()
+        {
+            continue;
+        }
+        let names: Vec<String> = record
+            .agent_names
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.name.clone())
+            .collect();
+        if !names.is_empty() {
+            out.insert(did.clone(), names);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

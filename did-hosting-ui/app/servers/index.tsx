@@ -35,8 +35,24 @@ import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { ControlLink } from "../../components/ControlLink";
+import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
+import { useAgentNames } from "../../lib/use-agent-names";
+
+/**
+ * The DID an instance actually recorded, or `null`.
+ *
+ * Deliberately not the `instanceId`-derived fallback the card displays: that
+ * is a reconstruction for the eye, not an identifier the control plane could
+ * resolve, so sending it to the name lookup would be asking about a DID that
+ * does not exist.
+ */
+function instanceDid(instance: ServiceInstance): string | null {
+  return typeof instance.metadata?.did === "string"
+    ? instance.metadata.did
+    : null;
+}
 import type { ServiceInstance } from "../../lib/api";
 
 export default function ServersScreen() {
@@ -49,6 +65,10 @@ export default function ServersScreen() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [pickerFor, setPickerFor] = useState<ServiceInstance | null>(null);
+
+  // One lookup for every instance on the page, refreshed when the set of
+  // recorded DIDs changes rather than on every render.
+  const agentNames = useAgentNames(instances.map(instanceDid));
 
   const refresh = useCallback(async () => {
     if (!isAuthenticated) {
@@ -208,6 +228,7 @@ export default function ServersScreen() {
           renderItem={({ item }) => (
             <ServerCard
               instance={item}
+              agentNames={agentNames[instanceDid(item) ?? ""] ?? []}
               busyKey={busy}
               onAssign={() => setPickerFor(item)}
               onUnassign={(d) => handleUnassign(item, d)}
@@ -233,6 +254,7 @@ export default function ServersScreen() {
 }
 
 function ServerCard({
+  agentNames,
   instance,
   busyKey,
   onAssign,
@@ -240,18 +262,16 @@ function ServerCard({
   onPurge,
 }: {
   instance: ServiceInstance;
+  agentNames: string[];
   busyKey: string | null;
   onAssign: () => void;
   onUnassign: (domain: string) => void;
   onPurge: (domain: string) => void;
 }) {
-  const did = useMemo(() => {
-    const metaDid =
-      typeof instance.metadata?.did === "string"
-        ? instance.metadata.did
-        : null;
-    return metaDid ?? instance.instanceId.replace(/_/g, ":");
-  }, [instance]);
+  const did = useMemo(
+    () => instanceDid(instance) ?? instance.instanceId.replace(/_/g, ":"),
+    [instance],
+  );
 
   const healthColor =
     instance.status === "active"
@@ -288,6 +308,11 @@ function ServerCard({
           <Text style={styles.cardSubline} numberOfLines={1}>
             {did}
           </Text>
+          {agentNames.length > 0 && (
+            <View style={styles.cardNamesRow}>
+              <AgentNameChips names={agentNames} didId={did} size="sm" />
+            </View>
+          )}
           <Text style={styles.cardUrl} numberOfLines={1}>
             {instance.url}
           </Text>
@@ -522,6 +547,9 @@ const styles = StyleSheet.create({
     fontFamily: fonts.semibold,
     fontSize: 16,
     color: colors.textPrimary,
+  },
+  cardNamesRow: {
+    marginTop: spacing.xs,
   },
   cardSubline: {
     marginTop: 4,

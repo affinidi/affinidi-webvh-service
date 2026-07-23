@@ -501,6 +501,12 @@ pub static TASK_AGENT_NAME_ENABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 pub static TASK_AGENT_NAME_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/agent-name/disable/1.0").expect("static")
 });
+/// DID → names, the reverse of the `/@name` redirect. Batched, because its
+/// callers are display surfaces holding several DIDs at once and a per-DID
+/// round-trip would make a name cost more than the identifier it replaces.
+pub static TASK_AGENT_NAME_RESOLVE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/resolve/1.0").expect("static")
+});
 
 // Observability / config.
 pub static TASK_STATS_SERVER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
@@ -720,6 +726,7 @@ mod tests {
             &TASK_AGENT_NAME_REMOVE_1_0,
             &TASK_AGENT_NAME_ENABLE_1_0,
             &TASK_AGENT_NAME_DISABLE_1_0,
+            &TASK_AGENT_NAME_RESOLVE_1_0,
             &TASK_STATS_SERVER_1_0,
             &TASK_STATS_DID_1_0,
             &TASK_TIMESERIES_SERVER_1_0,

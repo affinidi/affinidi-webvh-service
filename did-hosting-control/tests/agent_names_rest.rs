@@ -411,3 +411,209 @@ async fn server_info_reports_no_names_when_the_feature_is_off() {
 
     assert!(server_names_of(&h).await.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// `POST /api/agent-names/resolve` — DID -> names, the reverse of `/@name`
+//
+// Display surfaces hold a DID and want to show its handle. There is no
+// did_id -> record index and none is needed: for `did:webvh` the mnemonic is
+// derivable from the identifier, so each entry is a direct read.
+// ---------------------------------------------------------------------------
+
+/// Seed a hosted DID at `mnemonic` whose identifier is `did_id`.
+async fn seed_named_did(h: &TestServer, mnemonic: &str, did_id: &str, names: &[(&str, bool)]) {
+    let record = did_hosting_common::did_ops::DidRecord {
+        owner: "did:example:operator".into(),
+        mnemonic: mnemonic.into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(did_id.into()),
+        content_size: 0,
+        disabled: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: "control.example.com".into(),
+        services: None,
+        agent_names: names
+            .iter()
+            .map(|(n, enabled)| AgentNameEntry {
+                name: (*n).into(),
+                enabled: *enabled,
+                created_at: 0,
+            })
+            .collect(),
+    };
+    h.put_did(&record).await;
+}
+
+async fn resolve_names(h: &TestServer, token: &str, dids: &[&str]) -> (StatusCode, Value) {
+    let resp = app(h)
+        .oneshot(post(
+            "/api/agent-names/resolve",
+            Some(token),
+            json!({ "dids": dids }),
+        ))
+        .await
+        .expect("router responds");
+    let status = resp.status();
+    (status, read_json(resp.into_body()).await)
+}
+
+#[tokio::test]
+async fn resolve_maps_dids_to_their_served_names() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    seed_named_did(
+        &h,
+        "alice",
+        "did:webvh:abc:control.example.com:alice",
+        &[("alice", true)],
+    )
+    .await;
+
+    let (status, body) =
+        resolve_names(&h, &token, &["did:webvh:abc:control.example.com:alice"]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["names"]["did:webvh:abc:control.example.com:alice"],
+        json!(["alice"])
+    );
+}
+
+/// The root DID's community name comes back as an empty local part, which is
+/// what a client joins with the authority to render `{domain}/@`.
+#[tokio::test]
+async fn resolve_returns_the_community_name_for_a_root_did() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    seed_named_did(
+        &h,
+        ".well-known",
+        "did:webvh:abc:control.example.com",
+        &[("", true)],
+    )
+    .await;
+
+    let (_, body) = resolve_names(&h, &token, &["did:webvh:abc:control.example.com"]).await;
+    assert_eq!(
+        body["names"]["did:webvh:abc:control.example.com"],
+        json!([""])
+    );
+}
+
+/// The guard that matters. Every pathless DID maps to the *same* `.well-known`
+/// slot, so without checking `did_id` a question about a foreign root DID would
+/// be answered with the local root DID's names.
+#[tokio::test]
+async fn resolve_does_not_answer_for_a_foreign_root_did() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    seed_named_did(
+        &h,
+        ".well-known",
+        "did:webvh:abc:control.example.com",
+        &[("", true)],
+    )
+    .await;
+
+    let (_, body) = resolve_names(&h, &token, &["did:webvh:zzz:someone-else.example"]).await;
+    assert_eq!(
+        body["names"],
+        json!({}),
+        "a foreign root DID must not inherit the local root DID's names"
+    );
+}
+
+/// Parked names are registry-private: they resolve to nothing, so returning
+/// one would advertise a handle that 404s.
+#[tokio::test]
+async fn resolve_omits_parked_names() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    seed_named_did(
+        &h,
+        "bob",
+        "did:webvh:abc:control.example.com:bob",
+        &[("parked", false), ("live", true)],
+    )
+    .await;
+
+    let (_, body) = resolve_names(&h, &token, &["did:webvh:abc:control.example.com:bob"]).await;
+    assert_eq!(
+        body["names"]["did:webvh:abc:control.example.com:bob"],
+        json!(["live"])
+    );
+}
+
+/// A DID this service does not host is reported as having no names rather than
+/// resolved over the network — the service can only vouch for names it serves.
+#[tokio::test]
+async fn resolve_omits_unknown_and_unnamed_dids() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    seed_named_did(&h, "quiet", "did:webvh:abc:control.example.com:quiet", &[]).await;
+
+    let (_, body) = resolve_names(
+        &h,
+        &token,
+        &[
+            "did:webvh:abc:control.example.com:quiet",
+            "did:web:elsewhere.example",
+            "not-even-a-did",
+        ],
+    )
+    .await;
+    assert_eq!(body["names"], json!({}));
+}
+
+/// Unauthenticated batch lookup would be an enumeration surface even though
+/// each individual answer is public.
+#[tokio::test]
+async fn resolve_requires_authentication() {
+    let h = make_harness().await;
+    let resp = app(&h)
+        .oneshot(post(
+            "/api/agent-names/resolve",
+            None,
+            json!({ "dids": ["did:webvh:abc:control.example.com:alice"] }),
+        ))
+        .await
+        .expect("router responds");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Each entry is a store read, so the batch is capped rather than unbounded.
+#[tokio::test]
+async fn resolve_rejects_an_oversized_batch() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    let many: Vec<String> = (0..(did_hosting_control::did_ops::MAX_RESOLVE_DIDS + 1))
+        .map(|i| format!("did:webvh:abc:control.example.com:slot{i}"))
+        .collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+
+    let (status, _) = resolve_names(&h, &token, &refs).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An unknown field is refused rather than dropped — a scope or filter a
+/// caller thought it sent must not go missing silently (R3.2).
+#[tokio::test]
+async fn resolve_rejects_unknown_fields() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:owner", Role::Owner).await;
+    let resp = app(&h)
+        .oneshot(post(
+            "/api/agent-names/resolve",
+            Some(&token),
+            json!({ "dids": [], "includeParked": true }),
+        ))
+        .await
+        .expect("router responds");
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "an unknown field must not be silently ignored"
+    );
+}

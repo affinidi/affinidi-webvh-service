@@ -258,6 +258,12 @@ export interface AgentNameEntry {
   createdAt: number;
 }
 
+/** DID -> served agent names (bare local parts). DIDs with none are omitted,
+ *  so a missing key and an empty array mean the same thing. */
+export interface AgentNameResolveResponse {
+  names: Record<string, string[]>;
+}
+
 /** Availability of an agent name (`/@alice`) on a hosting domain. */
 export interface AgentNameAvailability {
   name: string;
@@ -746,6 +752,21 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, domain }),
+    }),
+
+  /** DID -> its served agent names, the reverse of the `/@name` redirect.
+   *
+   *  Batched: display surfaces hold several DIDs at once, and a per-DID
+   *  round-trip would make showing a handle cost more than the identifier it
+   *  replaces. DIDs with no served names are absent from the map, so read a
+   *  miss and an empty list the same way. Only names this service actually
+   *  serves come back — a DID hosted elsewhere resolves to nothing here rather
+   *  than being chased over the network. */
+  resolveAgentNames: (dids: string[]) =>
+    request<AgentNameResolveResponse>("/api/agent-names/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dids }),
     }),
 
   uploadDid: (mnemonic: string, body: string) =>

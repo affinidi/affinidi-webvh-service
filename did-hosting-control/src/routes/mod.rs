@@ -302,6 +302,14 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(did_manage::check_agent_name),
             (*TASK_AGENT_NAME_CHECK_1_0).clone(),
         )
+        // DID -> names, the reverse of the `/@name` redirect. Read-only and
+        // batched; sits here rather than in `upload_routes` because it carries
+        // no did.jsonl.
+        .route_with_task_permissive(
+            "/agent-names/resolve",
+            post(did_manage::resolve_agent_names),
+            (*TASK_AGENT_NAME_RESOLVE_1_0).clone(),
+        )
         .route_with_task_permissive(
             "/dids",
             post(did_manage::request_uri).get(did_manage::list_dids),
