@@ -14,6 +14,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { useAgentNames } from "../../lib/use-agent-names";
+import { extractDidHost } from "../../lib/domain";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -38,32 +39,43 @@ import type {
 // ---------------------------------------------------------------------------
 
 /** The hosting domain a name is scoped to — the DID's own host. Prefer the
- *  record's tagged `domain`; fall back to the host segment of the `did:webvh`
- *  identifier (percent-decoded, e.g. `localhost%3A8534` → `localhost:8534`). */
+ *  record's tagged `domain`; fall back to the host segment of the identifier.
+ *
+ *  Delegates to the shared [`extractDidHost`] rather than re-parsing here. The
+ *  local copy this replaces required at least five colon-separated segments,
+ *  which silently excluded **root DIDs**: `did:webvh:<scid>:<host>` has exactly
+ *  four, because the root DID's path is implicit (`/.well-known/did.jsonl`) and
+ *  absent from the identifier. A root record whose `domain` had not been tagged
+ *  therefore resolved to no domain at all, disabling the whole Agent Names card
+ *  — on precisely the DID that owns the domain's community name. */
 function agentDomainOf(detail: DidDetailResponse | null): string | null {
-  if (detail?.domain) return detail.domain;
-  const didId = detail?.didId;
-  if (!didId) return null;
-  // did:webvh:<scid>:<host>:<path...> → host at index 3.
-  const parts = didId.split(":");
-  if (parts.length < 5 || parts[0] !== "did") return null;
-  try {
-    return decodeURIComponent(parts[3]);
-  } catch {
-    return parts[3];
-  }
+  return detail?.domain || extractDidHost(detail?.didId);
+}
+
+/** How a bound name is written back to the operator.
+ *
+ *  `@alice` for an ordinary name, and `domain/@` for the community name —
+ *  whose local part is empty, so the usual `@` + local part renders as a lone
+ *  `@` and reads as a typo or a stray character in a confirm dialog. */
+function agentNameLabel(name: string, domain: string | null): string {
+  return name === "" ? `${domain ?? ""}/@` : `@${name}`;
 }
 
 /** If `aka` is an agent name (`…/@local`) on `domain`, return its local part.
  *  Host match is case-insensitive; the local part is returned verbatim (the
- *  spec compares it case-sensitively). */
+ *  spec compares it case-sensitively).
+ *
+ *  Returns `""` — not `null` — for the **community name** (`domain/@`), whose
+ *  local part is genuinely empty. `null` means "not an agent name on this
+ *  domain" and is the only value callers should discard; a caller that filters
+ *  on truthiness instead drops the community name along with the non-matches. */
 function agentNameLocalPart(aka: string, domain: string): string | null {
   const noScheme = aka.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   const marker = noScheme.indexOf("/@");
   if (marker < 0) return null;
   const host = noScheme.slice(0, marker);
   const local = noScheme.slice(marker + 2).split("/")[0];
-  if (!local || host.toLowerCase() !== domain.toLowerCase()) return null;
+  if (host.toLowerCase() !== domain.toLowerCase()) return null;
   return local;
 }
 
@@ -200,7 +212,10 @@ export default function DidDetail() {
   const boundNames: string[] = agentDomain
     ? (Array.isArray(currentState?.alsoKnownAs) ? currentState!.alsoKnownAs : [])
         .map((a: unknown) => (typeof a === "string" ? agentNameLocalPart(a, agentDomain) : null))
-        .filter((n): n is string => !!n)
+        // `!== null`, not truthiness: the community name's local part is the
+        // empty string, and a truthy filter would silently drop it — leaving a
+        // root DID that serves `domain/@` reading as "No names bound yet".
+        .filter((n): n is string => n !== null)
     : [];
 
   // Parked names come from the host's authoritative registry — they are
@@ -477,7 +492,9 @@ export default function DidDetail() {
     return runDelegatedTask(
       () => requestAgentNameTask({ did: didId, name, enable }),
       (o) => runParkResume(name, enable, o),
-      enable ? `@${name} is being served again.` : `@${name} has been parked.`,
+      enable
+        ? `${agentNameLabel(name, agentDomain)} is being served again.`
+        : `${agentNameLabel(name, agentDomain)} has been parked.`,
       opts,
     );
   };
@@ -519,7 +536,10 @@ export default function DidDetail() {
     const name = nameInput.trim().replace(/^@/, "");
     if (!name || !agentDomain || !currentState) return;
     if (boundNames.includes(name)) {
-      showAlert("Already bound", `@${name} is already on this DID.`);
+      showAlert(
+        "Already bound",
+        `${agentNameLabel(name, agentDomain)} is already on this DID.`,
+      );
       return;
     }
     const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
@@ -541,7 +561,7 @@ export default function DidDetail() {
     if (!agentDomain || !currentState) return;
     showConfirm(
       "Remove name",
-      `Stop serving @${name}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
+      `Stop serving ${agentNameLabel(name, agentDomain)}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
       async () => {
         const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
           ? currentState.alsoKnownAs.filter((a: unknown) => typeof a === "string")
@@ -560,7 +580,7 @@ export default function DidDetail() {
   const handleParkName = (name: string) => {
     showConfirm(
       "Park name",
-      `Park @${name}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
+      `Park ${agentNameLabel(name, agentDomain)}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
       () => void runParkResume(name, false),
     );
   };
@@ -569,7 +589,7 @@ export default function DidDetail() {
   const handleResumeName = (name: string) => {
     showConfirm(
       "Resume name",
-      `Serve @${name} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
+      `Serve ${agentNameLabel(name, agentDomain)} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
       () => void runParkResume(name, true),
     );
   };
@@ -1100,8 +1120,11 @@ export default function DidDetail() {
                       gap: spacing.md,
                     }}
                   >
+                    {/* The community name has no local part, so `@` alone
+                        would read as a stray character next to Park/Remove.
+                        Spell it as the FAQ writes it — `domain/@`. */}
                     <Text style={{ fontFamily: fonts.mono, color: colors.textPrimary }}>
-                      @{name}
+                      {agentNameLabel(name, agentDomain)}
                     </Text>
                     <View style={{ flexDirection: "row", gap: spacing.sm }}>
                       <Pressable
@@ -1128,10 +1151,17 @@ export default function DidDetail() {
               </Text>
             )}
 
+            {/* No domain means we cannot scope a name — names are
+                domain-scoped, so `@alice` is meaningless without one. Say what
+                is actually missing: the previous copy claimed the DID had no
+                published document, which was a guess at the cause rather than
+                an observation, and read as a flat contradiction on a slot whose
+                document is rendered a few hundred pixels above. */}
             {!agentDomain ? (
               <Text style={[styles.hint, { marginTop: spacing.md }]}>
-                This DID has no published document yet — publish one before
-                binding a name.
+                {didDetail?.didId
+                  ? "This DID's hosting domain could not be determined, so a name cannot be scoped to it."
+                  : "This DID has no published document yet — publish one before binding a name."}
               </Text>
             ) : isWalletTaskRelayAvailable() ? (
               <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
@@ -1219,7 +1249,7 @@ export default function DidDetail() {
                             color: colors.textSecondary,
                           }}
                         >
-                          @{name}
+                          {agentNameLabel(name, agentDomain)}
                         </Text>
                         <Pressable
                           style={[styles.smallButton, publishing && styles.disabled]}
