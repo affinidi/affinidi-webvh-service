@@ -24,7 +24,7 @@ serde_json = "1"
 
 # The structure-aware targets need `Arbitrary` for the log-entry graph, which
 # lives behind didwebvh-rs's off-by-default `arbitrary` feature (v0.5.5+).
-didwebvh-rs = { version = "0.5.5", features = ["arbitrary"] }
+didwebvh-rs = { version = "0.6", features = ["arbitrary"] }
 
 # The crate under test. Default features (method-webvh + method-web) are enough
 # for `did_ops`; server-core and the store/secret backends are not pulled in.
