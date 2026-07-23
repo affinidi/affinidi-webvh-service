@@ -13,6 +13,10 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import {
+  AgentNameChips,
+  servedNames,
+} from "../../components/AgentNameChips";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
@@ -408,6 +412,30 @@ export default function DidList() {
                       )}
                     </View>
                   )}
+                  {/* Agent names, under the DID rather than above it.
+
+                      The card's heading is already a friendly label (the
+                      mnemonic, which is also the link target and the DID's own
+                      path segment). Leading with the agent name would stack
+                      two friendly labels above the identifier they both point
+                      at, and the eye stops trusting which line is the DID.
+                      Under it, the name reads as what it is: an alias for the
+                      string above. Same placement as the detail page, so a
+                      handle looks the same wherever you meet it.
+
+                      Served names only — the list has no document to read, so
+                      it filters the registry itself. Cached on the record, so
+                      this costs no extra request. */}
+                  {servedNames(item.agentNames).length > 0 && (
+                    <View style={styles.agentNamesRow}>
+                      <AgentNameChips
+                        names={servedNames(item.agentNames)}
+                        domain={item.domain}
+                        didId={item.didId}
+                        size="sm"
+                      />
+                    </View>
+                  )}
                   {/* Services the DID document advertises. Cached on the
                       record, so this costs no extra request. Renders
                       nothing for slots with no document yet. */}
@@ -569,6 +597,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  agentNamesRow: {
     marginBottom: spacing.sm,
   },
   statusActive: {

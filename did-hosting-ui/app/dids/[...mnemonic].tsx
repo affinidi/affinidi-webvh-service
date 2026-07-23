@@ -12,6 +12,7 @@ import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { AgentNameChips } from "../../components/AgentNameChips";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -682,7 +683,12 @@ export default function DidDetail() {
         {/* DID ID directly under title */}
         {didDetail && (
           didDetail.didId ? (
-            <View style={styles.didIdRow}>
+            <View
+              style={[
+                styles.didIdRow,
+                boundNames.length > 0 && styles.didIdRowTight,
+              ]}
+            >
               <Text style={styles.didIdText} numberOfLines={1}>
                 {didDetail.didId}
               </Text>
@@ -695,6 +701,33 @@ export default function DidDetail() {
           ) : (
             <Text style={styles.pendingText}>Pending upload</Text>
           )
+        )}
+        {/* Agent names, directly under the DID they redirect to.
+
+            Copy-only here; binding and parking stay in the Agent Names card
+            below. The card is where you *manage* names, but it sits under the
+            document viewer — too far to reach for the everyday act of copying
+            a handle to give someone, which is what this line is for.
+
+            Not in the DID Details panel either: that panel is log metadata
+            (version, method, entry count) — facts you look up. An agent name
+            is an address you hand out, so it belongs beside the other address
+            on the page. Several names wrap for free here; the panel's
+            right-aligned label/value rows would not take a list.
+
+            `boundNames` (not the registry) so this never contradicts the card
+            below — both show what the live document claims.
+
+            The DID row tightens its bottom margin only when names follow, so a
+            DID with no names keeps exactly the spacing it has today. */}
+        {boundNames.length > 0 && (
+          <View style={styles.agentNamesRow}>
+            <AgentNameChips
+              names={boundNames}
+              domain={agentDomain}
+              didId={didDetail?.didId}
+            />
+          </View>
         )}
         {/* Owner */}
         {didDetail && (
@@ -1606,6 +1639,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     alignSelf: "flex-start",
     gap: spacing.sm,
+    marginBottom: spacing.xl,
+  },
+  didIdRowTight: {
+    marginBottom: spacing.sm,
+  },
+  agentNamesRow: {
+    alignSelf: "flex-start",
     marginBottom: spacing.xl,
   },
   didIdText: {
