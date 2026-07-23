@@ -20,6 +20,7 @@ ignore = [
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
   { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained — transitive only (folded into rustls upstream); no direct dependency." },
   { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained — build-time-only, transitive (no direct dependency); successor of the already-ignored proc-macro-error (RUSTSEC-2024-0370)." },
+  { id = "RUSTSEC-2026-0215", reason = "`smallstr` unmaintained — transitive only, via json-syntax <- json-ld <- ssi-json-ld; no direct dependency and no upstream migration yet." },
 ]
 
 [bans]
