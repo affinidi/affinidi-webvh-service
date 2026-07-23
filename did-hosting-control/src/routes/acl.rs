@@ -24,10 +24,11 @@ use tracing::{info, warn};
 use crate::acl::{self, AclEntry};
 use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
+use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
 use did_hosting_common::server::acl::{
-    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest, validate_did_format,
+    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest,
 };
 use did_hosting_common::server::domain::{DomainScope, get_default_domain};
 
@@ -94,7 +95,8 @@ pub async fn create_acl(
     // (e.g. trailing whitespace, control chars, missing `did:` prefix)
     // never lands as a key — silent mismatches with `check_acl` would
     // otherwise lock the operator out of the system they just configured.
-    let did = validate_did_format(&req.did)?;
+    // An agent name is resolved to its DID here; see `resolve_did_or_agent_name`.
+    let did = did_ops::resolve_did_or_agent_name(&state, &req.did).await?;
 
     // Check if entry already exists
     if acl::get_acl_entry(&state.acl_ks, &did).await?.is_some() {
@@ -162,7 +164,7 @@ pub async fn update_acl(
     Json(updates): Json<UpdateAclRequest>,
 ) -> Result<Response, AppError> {
     warn_deprecated("PUT /api/acl/{did}", &auth.0.did);
-    let did = validate_did_format(&did)?;
+    let did = did_ops::resolve_did_or_agent_name(&state, &did).await?;
     let mut entry = acl::get_acl_entry(&state.acl_ks, &did)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
@@ -196,7 +198,7 @@ pub async fn delete_acl(
     Path(did): Path<String>,
 ) -> Result<Response, AppError> {
     warn_deprecated("DELETE /api/acl/{did}", &auth.0.did);
-    let did = validate_did_format(&did)?;
+    let did = did_ops::resolve_did_or_agent_name(&state, &did).await?;
 
     // Prevent self-deletion
     if auth.0.did == did {

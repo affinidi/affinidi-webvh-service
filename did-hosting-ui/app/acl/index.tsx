@@ -1051,13 +1051,22 @@ export default function AclManagement() {
         <Text style={styles.sectionTitle}>Add Entry</Text>
         <TextInput
           style={styles.input}
-          placeholder="did:web:example.com"
+          placeholder="did:web:example.com  or  example.com/@alice"
           placeholderTextColor={colors.textTertiary}
           value={newDid}
           onChangeText={setNewDid}
           autoCapitalize="none"
           autoCorrect={false}
         />
+        {/* Names are resolved once, when the entry is created; the entry is
+            stored against the DID. Said plainly here because otherwise an
+            operator could reasonably assume access follows the name, and be
+            surprised either way — that it does not move when the name does,
+            or that it might. */}
+        <Text style={styles.hintSmall}>
+          A DID, or an agent name hosted here — the name is resolved now and the
+          entry is stored against the DID it points at today.
+        </Text>
         <View style={styles.roleRow}>
           {(["owner", "admin", "service"] as const).map((r) => (
             <Pressable
@@ -1267,6 +1276,13 @@ const styles = StyleSheet.create({
     color: colors.textOnAccent,
     fontSize: 14,
     fontFamily: fonts.semibold,
+  },
+  hintSmall: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+    marginTop: spacing.xs,
+    lineHeight: 16,
   },
   hint: {
     fontSize: 14,

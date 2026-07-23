@@ -3076,6 +3076,7 @@ dependencies = [
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
+ "agent-names",
  "anyhow",
  "async-trait",
  "aws-config",

@@ -9,6 +9,7 @@ use did_hosting_common::did_ops::{
     self, AgentNameEntry, DidRecord, LogEntryInfo, LogMetadata, agent_name_key, content_log_key,
     content_witness_key, did_key, extract_agent_names, owner_key,
 };
+use did_hosting_common::server::acl::validate_did_format;
 use did_hosting_common::server::error::AgentNameError;
 use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
@@ -1442,7 +1443,7 @@ pub async fn change_did_owner(
     mnemonic: &str,
     new_owner: &str,
 ) -> Result<DidRecord, AppError> {
-    use did_hosting_common::server::acl::{get_acl_entry, validate_did_format};
+    use did_hosting_common::server::acl::get_acl_entry;
 
     use crate::auth::session::now_epoch;
 
@@ -1462,8 +1463,15 @@ pub async fn change_did_owner(
 
     // Canonicalise (trim + format check) before any storage I/O so a
     // typo in the new-owner DID can't silently mismatch later
-    // `check_acl` lookups. Same validator the ACL routes use.
-    let new_owner = validate_did_format(new_owner)?;
+    // `check_acl` lookups.
+    //
+    // An agent name is accepted and resolved to its DID, for the same reason
+    // the ACL routes accept one: `record.owner` is compared against an
+    // authenticated DID, so the stored value must be a DID, and a name typed
+    // here is input convenience that is resolved exactly once. Ownership then
+    // stays with the DID the name pointed at — releasing and re-claiming the
+    // name later transfers nothing.
+    let new_owner = resolve_did_or_agent_name(state, new_owner).await?;
 
     if record.owner == new_owner {
         return Ok(record);
@@ -1692,6 +1700,108 @@ pub async fn list_agent_names(
 /// DIDs, a servers list a handful — not for bulk export. Each entry is a store
 /// read, so an uncapped list would turn one request into unbounded I/O.
 pub const MAX_RESOLVE_DIDS: usize = 64;
+
+/// Turn what an operator typed into the DID an authorization record is keyed on.
+///
+/// Shared by the ACL routes and `change_did_owner`.
+///
+/// Accepts either a DID, or an **agent name** (`webvh.storm.ws/@alice`) which
+/// is resolved to the DID that currently holds it. Names are far easier to type
+/// correctly than a `did:webvh:Qm…` string, and a mistyped ACL subject is a
+/// silent failure — the entry simply never matches anyone.
+///
+/// # Resolution happens here, and *only* here
+///
+/// The value stored is always the DID. Nothing downstream ever resolves a name
+/// again, and that is a security property rather than an optimisation:
+///
+/// - A name can be released by its holder and claimed by someone else. If
+///   authorization resolved names at **check** time, the new holder would
+///   inherit the old holder's role the moment they claimed it — no write to the
+///   ACL, no audit trail, nothing to notice.
+/// - `check_acl` is an exact lookup on the authenticated DID, and the principal
+///   arriving at every authorization decision is a DID. A name stored as a key
+///   could never match one, so late resolution is not merely unsafe, it does
+///   not work.
+///
+/// So an agent name here is *input convenience*. The binding it creates is to
+/// the DID the name pointed at when the operator pressed the button, and it
+/// stays pointed there. The UI shows the DID's current name by looking it up
+/// (`/api/agent-names/resolve`), so the display stays live without the stored
+/// authorization data depending on a mutable label.
+///
+/// Only names this deployment actually serves resolve — the same gates the
+/// public `/@name` redirect applies. A name that resolves to nothing is a
+/// validation error naming the name, never a silently-created entry keyed on
+/// something that cannot authenticate.
+pub async fn resolve_did_or_agent_name(state: &AppState, input: &str) -> Result<String, AppError> {
+    let trimmed = input.trim();
+    if !agent_names::AgentName::looks_like_agent_name(trimmed) {
+        return validate_did_format(trimmed);
+    }
+    // Canonicalise through the shared parser so the authority and local part are
+    // split exactly as the resolver and the registry would split them.
+    let name = agent_names::AgentName::parse(trimmed)
+        .map_err(|e| AppError::Validation(format!("'{trimmed}' is not a valid agent name: {e}")))?;
+    match resolve_agent_name_to_did(state, name.authority(), name.local_name()).await? {
+        Some(did) => Ok(did),
+        None => Err(AppError::Validation(format!(
+            "agent name '{}' does not resolve to a DID hosted here — bind it first, \
+             or use the DID directly",
+            name.without_scheme()
+        ))),
+    }
+}
+
+/// The DID an agent name currently resolves to, or `None` if it resolves to
+/// nothing here.
+///
+/// The `/@name` redirect the edge serves, done in-process against the
+/// authoritative registry. Applies the same gates the edge does — the name must
+/// be `enabled`, and the slot must be neither disabled nor deleted — so this
+/// can never hand back a DID that the public redirect would refuse to serve.
+///
+/// # This is a *write-time* helper, and that is the whole point
+///
+/// Resolving a name to a DID is only safe at the moment an operator types it.
+/// A name is not a stable identifier: its holder may release it (`remove`) and
+/// somebody else may then claim it. Anything that resolves a name **at decision
+/// time** therefore hands the new holder whatever the old holder had — silently,
+/// with no write to the thing being protected and nothing in an audit log to
+/// show for it. Resolve once, store the DID, and a later re-claim changes
+/// nothing.
+pub async fn resolve_agent_name_to_did(
+    state: &AppState,
+    domain: &str,
+    name: &str,
+) -> Result<Option<String>, AppError> {
+    if !state.config.features.agent_names {
+        return Ok(None);
+    }
+    let bare = name.strip_prefix('@').unwrap_or(name);
+    let Some(mnemonic) = state
+        .dids_ks
+        .get_raw(agent_name_key(domain, bare))
+        .await?
+        .and_then(|b| String::from_utf8(b).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? else {
+        return Ok(None);
+    };
+    if record.disabled || record.deleted_at.is_some() {
+        return Ok(None);
+    }
+    if !record
+        .agent_names
+        .iter()
+        .any(|e| e.name == bare && e.enabled)
+    {
+        return Ok(None);
+    }
+    Ok(record.did_id)
+}
 
 /// DID → its served agent names, for a batch of DIDs. The reverse of the
 /// `/@name` redirect.
