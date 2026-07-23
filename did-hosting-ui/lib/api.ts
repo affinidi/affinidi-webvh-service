@@ -629,6 +629,11 @@ export interface ServerInfoResponse {
    *  way to detect it by probing. Optional — a deployment older than this
    *  field omits it, and `undefined` should be read as "unknown", not "off". */
   agent_names?: boolean;
+  /** Agent names the server's own DID serves, as bare local parts — the input
+   *  `AgentNameChips` takes. A community name (`{domain}/@`) arrives as an
+   *  empty string, which is its real local part and renders correctly without
+   *  special-casing. Optional: a deployment older than this field omits it. */
+  server_names?: string[];
 }
 
 // Cache the server-info response for the lifetime of the tab. The server's

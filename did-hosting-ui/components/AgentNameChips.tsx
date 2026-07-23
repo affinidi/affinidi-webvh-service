@@ -28,6 +28,14 @@
  * Exactly what is shown — `webvh.storm.ws/@alice`, the form the agent-name FAQ
  * writes names in and the one a resolver accepts. A copy button that yields a
  * different string than the one on screen makes people paste twice to check.
+ *
+ * ## The community name
+ *
+ * An **empty** local part is the community name — `webvh.storm.ws/@`, the name
+ * of the trust community that owns the domain. It needs no special handling
+ * here: the chip is built by joining the host and the local part, so an empty
+ * one renders and copies as `webvh.storm.ws/@` on its own. Do not filter empty
+ * strings out of `names` on the assumption they are placeholders.
  */
 import { useState } from "react";
 import { View, Text, StyleSheet, Pressable } from "react-native";

@@ -295,3 +295,119 @@ async fn dids_list_exposes_the_agent_name_registry() {
         "a DID with no names must omit the key, not send []; got {unnamed}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `server_names` — the server's own agent names on `GET /api/server-info`
+//
+// The login page shows the server's DID so an operator can grant it wallet
+// access. A DID is unreadable, so the friendly handle rides along on the same
+// unauthenticated request. It is resolved from the store rather than config, so
+// it cannot claim a name the edge would not actually serve.
+// ---------------------------------------------------------------------------
+
+/// The default test node's `server_did` is pathless, so its slot is the root
+/// one — and the name it carries is the community name, an empty local part.
+async fn seed_server_own_names(h: &TestServer, did_id: &str, names: &[(&str, bool)]) {
+    let record = did_hosting_common::did_ops::DidRecord {
+        owner: "did:example:operator".into(),
+        mnemonic: ".well-known".into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(did_id.into()),
+        content_size: 0,
+        disabled: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: "control.example.com".into(),
+        services: None,
+        agent_names: names
+            .iter()
+            .map(|(n, enabled)| AgentNameEntry {
+                name: (*n).into(),
+                enabled: *enabled,
+                created_at: 0,
+            })
+            .collect(),
+    };
+    h.put_did(&record).await;
+}
+
+async fn server_names_of(h: &TestServer) -> Vec<String> {
+    let resp = app(h)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/server-info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_json(resp.into_body()).await;
+    body.get("server_names")
+        .and_then(|v| v.as_array())
+        .expect("server_names must always be present")
+        .iter()
+        .map(|v| v.as_str().expect("name is a string").to_string())
+        .collect()
+}
+
+/// The community name reaches the client as an empty local part — which is
+/// what it is. The client joins it with the authority to render
+/// `control.example.com/@`.
+#[tokio::test]
+async fn server_info_reports_the_servers_own_community_name() {
+    let h = make_harness().await;
+    seed_server_own_names(&h, "did:webvh:test:control.example.com", &[("", true)]).await;
+
+    assert_eq!(server_names_of(&h).await, vec![""]);
+}
+
+/// A server with no names of its own reports an empty list, not an absent
+/// field — so a client never has to distinguish "none" from "too old to say".
+#[tokio::test]
+async fn server_info_reports_no_names_when_the_server_has_none() {
+    let h = make_harness().await;
+    assert!(server_names_of(&h).await.is_empty());
+}
+
+/// The load-bearing guard. `mnemonic_from_did` maps any pathless DID to the
+/// single global `.well-known` slot, so without checking that the slot holds
+/// *this* DID, a node whose `server_did` was minted elsewhere would advertise
+/// whichever root DID happens to be hosted here.
+#[tokio::test]
+async fn server_info_ignores_a_root_slot_holding_a_different_did() {
+    let h = make_harness().await;
+    seed_server_own_names(&h, "did:webvh:other:someone-else.example", &[("", true)]).await;
+
+    assert!(
+        server_names_of(&h).await.is_empty(),
+        "a root slot holding someone else's DID must not be reported as ours"
+    );
+}
+
+/// A parked name does not resolve, so advertising it would hand out a handle
+/// that 404s.
+#[tokio::test]
+async fn server_info_omits_a_parked_name() {
+    let h = make_harness().await;
+    seed_server_own_names(
+        &h,
+        "did:webvh:test:control.example.com",
+        &[("", false), ("live", true)],
+    )
+    .await;
+
+    assert_eq!(server_names_of(&h).await, vec!["live"]);
+}
+
+/// With agent names off nothing is served, so nothing is advertised.
+#[tokio::test]
+async fn server_info_reports_no_names_when_the_feature_is_off() {
+    let h = make_harness_with_agent_names(false).await;
+    seed_server_own_names(&h, "did:webvh:test:control.example.com", &[("", true)]).await;
+
+    assert!(server_names_of(&h).await.is_empty());
+}

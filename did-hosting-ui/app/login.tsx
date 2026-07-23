@@ -9,6 +9,7 @@ import * as Clipboard from "expo-clipboard";
 import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
+import { AgentNameChips } from "../components/AgentNameChips";
 import {
   api,
   clearSessionPrincipalDid,
@@ -75,13 +76,20 @@ export default function Login() {
   // than showing "(unset)" — operators who haven't configured it
   // don't need a Copy button.
   const [serverDid, setServerDid] = useState<string | null>(null);
+  // The server's own agent names, if it serves any. Same request as the DID —
+  // no extra round-trip — and rendered beneath it, because a name is an alias
+  // and the DID stays the thing you paste into a wallet.
+  const [serverNames, setServerNames] = useState<string[]>([]);
   const [copiedServerDid, setCopiedServerDid] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const info = await api.serverInfo();
-        if (!cancelled) setServerDid(info.server_did);
+        if (!cancelled) {
+          setServerDid(info.server_did);
+          setServerNames(info.server_names ?? []);
+        }
       } catch {
         // Best-effort. The login page works without the DID row.
       }
@@ -236,6 +244,15 @@ export default function Login() {
               <Text style={styles.serverDidValue} numberOfLines={1}>
                 {serverDid}
               </Text>
+              {serverNames.length > 0 && (
+                <View style={styles.serverNamesRow}>
+                  <AgentNameChips
+                    names={serverNames}
+                    didId={serverDid}
+                    size="sm"
+                  />
+                </View>
+              )}
               <Text style={styles.serverDidHint}>
                 Grant access to this DID in your wallet to enable proxied SIOP login.
               </Text>
@@ -520,6 +537,9 @@ const styles = StyleSheet.create({
     // ellipsis isn't applied (e.g. when zoomed in).
     wordBreak: "break-all",
   } as any,
+  serverNamesRow: {
+    marginTop: spacing.sm,
+  },
   serverDidHint: {
     marginTop: 4,
     fontSize: 11,
