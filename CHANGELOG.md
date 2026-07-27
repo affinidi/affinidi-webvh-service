@@ -60,8 +60,11 @@
   presented it as a dead end. `created` is now stamped 5 seconds in the past.
   Nothing enforces a *maximum* age on `created`, so the backdate costs nothing
   and also protects against verifiers we don't ship. The matching server-side
-  fix — a 60s clock-skew allowance, matching our bearer-JWT leeway — is in
-  `affinidi-data-integrity` 0.7.8 and lands here when that release is picked up.
+  fix — a 60s clock-skew allowance, matching our bearer-JWT leeway — arrives
+  with `affinidi-data-integrity` 0.7.8 (below), and is what covers signers we
+  *don't* ship the UI for: the VTA's `webvh_client` races the control plane's
+  clock exactly the same way and gets no benefit from the browser-side
+  backdate.
 
 - **Enforce the `?domain=` cross-tenant safety check on publish/delete.** The
   VTA sends `?domain=` on `PUT`/`DELETE /api/dids/{mnemonic}` (and documents a
@@ -123,6 +126,14 @@
 - **Quieter sync logging.** The per-DID `inbound TSP: server sync/domain
   message` receipt and the duplicate `applied DID sync update … via mediator`
   line drop to `debug`; each applied update logs once at `info`.
+
+### Dependencies
+
+- affinidi-data-integrity 0.7.7 → 0.7.8 — verification now allows a 60s
+  clock-skew window on a proof's `created` instead of comparing it strictly
+  against the verifier's clock (affinidi/affinidi-tdk-rs#666). This is the
+  server-side half of the clock-skew fix above; the lockfile move is the whole
+  change, since the `"0.7"` requirement already admitted it.
 
 ## 0.8.0 (2026-07-15)
 
