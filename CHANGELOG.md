@@ -48,6 +48,21 @@
 
 ### Fixed
 
+- **Signed UI requests no longer fail on browser-vs-server clock skew.** The Web
+  UI stamps a proof's `created` from the *browser's* clock
+  (`session-key.ts::signEnvelope`), and the verifier compared it strictly
+  against the *server's*, rejecting anything in its future. A browser even
+  milliseconds ahead therefore made every signed action — adding an ACL entry,
+  say — a race between clock skew and network latency: the request passed when
+  it arrived slowly enough for the server's clock to catch up, and failed with
+  `proofInvalid` / "Created date is in the future" when it didn't. Same click,
+  different outcome, and the rejection carried `retryable: false`, so the UI
+  presented it as a dead end. `created` is now stamped 5 seconds in the past.
+  Nothing enforces a *maximum* age on `created`, so the backdate costs nothing
+  and also protects against verifiers we don't ship. The matching server-side
+  fix — a 60s clock-skew allowance, matching our bearer-JWT leeway — is in
+  `affinidi-data-integrity` 0.7.8 and lands here when that release is picked up.
+
 - **Enforce the `?domain=` cross-tenant safety check on publish/delete.** The
   VTA sends `?domain=` on `PUT`/`DELETE /api/dids/{mnemonic}` (and documents a
   `did-management:unknown_domain` rejection), but the control-plane handlers had

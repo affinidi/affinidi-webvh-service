@@ -168,6 +168,17 @@ export function clearSessionKeypair(): void {
 // eddsa-jcs-2022 envelope signing
 // ---------------------------------------------------------------------------
 
+/**
+ * How far into the past to stamp a proof's `created`, in milliseconds.
+ *
+ * Small enough to stay inside any plausible freshness window a verifier
+ * might apply, large enough to absorb ordinary browser-vs-server clock
+ * skew on a machine whose clock is otherwise sane. A machine further
+ * ahead than this already fails bearer-JWT validation (60s leeway), so
+ * widening it buys nothing.
+ */
+const CREATED_BACKDATE_MS = 5_000;
+
 /** Subset of the trust-task envelope shape relevant to signing. */
 export type SignableEnvelope = {
   [key: string]: unknown;
@@ -203,11 +214,19 @@ export async function signEnvelope<T extends SignableEnvelope>(
   // the session-bound did:key fragment; server-side
   // `dispatch_trust_task` verifies this matches the JWT-bound session
   // pubkey before the framework's AffinidiVerifier resolves it.
+  //
+  // `created` is backdated by CREATED_BACKDATE_MS: it is stamped from
+  // *this browser's* clock but checked against the *server's*, and a
+  // W3C Data Integrity verifier rejects any `created` in its future.
+  // Without the backdate, a browser clock even milliseconds ahead makes
+  // acceptance a race between clock skew and network latency — the same
+  // click fails or succeeds depending on how fast the request lands.
+  // Nothing enforces a max age on `created`, so backdating is free.
   const proofConfig: Record<string, unknown> = {
     type: "DataIntegrityProof",
     cryptosuite: "eddsa-jcs-2022",
     verificationMethod: `${sessionDidKey}#${sessionDidKey.slice("did:key:".length)}`,
-    created: new Date().toISOString(),
+    created: new Date(Date.now() - CREATED_BACKDATE_MS).toISOString(),
     proofPurpose: "assertionMethod",
   };
 
