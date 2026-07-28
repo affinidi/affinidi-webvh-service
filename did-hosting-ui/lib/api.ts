@@ -1251,6 +1251,108 @@ interface TrustTaskErrorPayload {
   details?: any;
 }
 
+/**
+ * An `ApiError` that keeps the `trust-task-error/0.1` payload, so the
+ * retry policy in `trustTask()` can read `code` / `retryable` /
+ * `retryAfter` instead of matching on a message string. Callers that only
+ * want the message keep working — this is an `ApiError` with the same
+ * `status` and `message` as before.
+ */
+export class TrustTaskRejection extends ApiError {
+  constructor(
+    message: string,
+    public payload: TrustTaskErrorPayload,
+  ) {
+    // 422: application-layer rejection; the HTTP status carried the same
+    // signal.
+    super(422, message);
+    this.name = "TrustTaskRejection";
+  }
+}
+
+/**
+ * The code that is safe to auto-retry on *any* task.
+ *
+ * `unavailable` is the spec's unambiguous "temporarily unable to process"
+ * (SPEC §8.3) — the task did **not** run, so re-issuing cannot double-apply
+ * a mutation.
+ */
+const ALWAYS_RETRY_CODES = new Set<string>(["unavailable"]);
+
+/**
+ * Task types with no side effects, where a re-issue is safe even for an
+ * error code that is ambiguous about whether the first attempt took
+ * effect (`internalError`). Enumerated rather than derived as "not a
+ * mutation", so a future proofless *write* doesn't silently inherit
+ * auto-retry.
+ *
+ * This is the distinction that makes honoring the flag useful against
+ * this control plane at all: it emits `internalError` (retryable by
+ * default in `trust_tasks_rs`) but never `unavailable`, so a code-only
+ * policy would be inert. Safety here comes from the *operation* being
+ * non-mutating, not from the code.
+ *
+ * A mutation (`acl/grant`, `acl/revoke`, `acl/change-role`) that fails
+ * with `internalError` stays a hard error: the write may already have
+ * landed, and silently re-issuing it could apply it twice. That is the
+ * user's call, not ours.
+ */
+const READ_ONLY_TASK_TYPES = new Set<string>([
+  "https://trusttasks.org/spec/acl/list/0.1",
+  "https://trusttasks.org/spec/acl/show/0.1",
+]);
+
+/** Codes that are retryable per the framework but only safe on a
+ *  side-effect-free task. */
+const READ_ONLY_RETRY_CODES = new Set<string>(["internalError"]);
+
+/** Extra attempts after the first. One is enough to ride out a restart or
+ *  a brief mediator hiccup; more would just delay showing the user a real
+ *  failure. */
+const TRUST_TASK_MAX_RETRIES = 1;
+
+/** Cap on an honored `retryAfter`, so a server can't park the UI on a
+ *  spinner. Past this we surface the error and let the user retry. */
+const TRUST_TASK_MAX_RETRY_DELAY_MS = 5_000;
+
+/** Fallback pause when the server marks an error retryable but gives no
+ *  `retryAfter`. */
+const TRUST_TASK_DEFAULT_RETRY_DELAY_MS = 500;
+
+/**
+ * Apply SPEC §8.4 retry semantics to a rejection, returning how long to
+ * wait before re-issuing, or `null` to give up and surface the error.
+ *
+ * Mirrors `trust_tasks_rs::ErrorPayload::should_retry_at`: retry only when
+ * `retryable` is set and any `retryAfter` has elapsed. We additionally
+ * *wait out* a near-future `retryAfter` rather than failing on it, which
+ * is what makes the hint useful in an interactive UI.
+ */
+function retryDelayMs(
+  typeUri: string,
+  payload: TrustTaskErrorPayload,
+  now: number,
+): number | null {
+  // The server's flag is necessary but not sufficient: it says "retrying
+  // is allowed", not "re-issuing this particular task is safe".
+  if (!payload.retryable) return null;
+  const safe =
+    ALWAYS_RETRY_CODES.has(payload.code) ||
+    (READ_ONLY_RETRY_CODES.has(payload.code) &&
+      READ_ONLY_TASK_TYPES.has(typeUri));
+  if (!safe) return null;
+
+  if (payload.retryAfter === undefined) {
+    return TRUST_TASK_DEFAULT_RETRY_DELAY_MS;
+  }
+  const at = Date.parse(payload.retryAfter);
+  // An unparseable hint is not a reason to hammer the server.
+  if (Number.isNaN(at)) return null;
+  const wait = at - now;
+  if (wait <= 0) return 0;
+  return wait <= TRUST_TASK_MAX_RETRY_DELAY_MS ? wait : null;
+}
+
 /** Per-spec request-payload shapes used by the ACL surface. */
 interface AclGrantPayload {
   entry: SpecAclEntry;
@@ -1365,7 +1467,7 @@ const REQUIRED_PROOF_TYPES = new Set<string>([
  * against another verifier. The proof's `verificationMethod` ties the
  * signature to the session keypair, not the JWT subject's published DID.
  */
-async function trustTask<Req, Resp>(
+async function sendTrustTaskOnce<Req, Resp>(
   typeUri: string,
   payload: Req,
 ): Promise<Resp> {
@@ -1488,9 +1590,9 @@ async function trustTask<Req, Resp>(
   // right shape to the caller.
   if (respDoc.type === TT_ERROR_TYPE) {
     const err = respDoc.payload as TrustTaskErrorPayload;
-    throw new ApiError(
-      422, // surface as application-layer; the HTTP status carried the same signal
+    throw new TrustTaskRejection(
       err.message ?? err.code ?? "trust task rejected",
+      err,
     );
   }
   if (!respDoc.type.endsWith(TT_RESPONSE_FRAGMENT)) {
@@ -1500,6 +1602,49 @@ async function trustTask<Req, Resp>(
     );
   }
   return respDoc.payload as Resp;
+}
+
+/**
+ * Send a trust task, honoring the server's `retryable` / `retryAfter`
+ * hints (SPEC §8.4) instead of discarding them.
+ *
+ * Every attempt goes through `sendTrustTaskOnce`, which builds a **fresh**
+ * envelope: new `id`, new `issuedAt`, and — for signed specs — a new proof
+ * with a new `created`. That is deliberate. §8.4's "retry" is the strict
+ * bit-for-bit resend, which is useless for a signed envelope: the same
+ * `created` that was just rejected would be rejected again. Re-issuing
+ * under a fresh `id` is always permitted by the spec and is the only form
+ * of retry that can actually succeed here.
+ *
+ * Which is exactly why the policy is narrow. A re-issued document is a
+ * *new* task, so if the first one had already taken effect the server
+ * would apply it twice. Auto-retry is therefore limited to the code that
+ * guarantees the task did not run (`unavailable`), plus `internalError`
+ * on tasks that have no side effects to duplicate. See
+ * `READ_ONLY_TASK_TYPES` before widening either.
+ */
+async function trustTask<Req, Resp>(
+  typeUri: string,
+  payload: Req,
+): Promise<Resp> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await sendTrustTaskOnce<Req, Resp>(typeUri, payload);
+    } catch (e) {
+      if (!(e instanceof TrustTaskRejection) || attempt >= TRUST_TASK_MAX_RETRIES) {
+        throw e;
+      }
+      const delay = retryDelayMs(typeUri, e.payload, Date.now());
+      if (delay === null) throw e;
+      // eslint-disable-next-line no-console
+      console.debug(
+        `trust task ${typeUri} rejected as ${e.payload.code} (retryable); re-issuing in ${delay}ms`,
+      );
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
 }
 
 /** Browser-safe UUIDv4. Falls back to a polyfill where crypto.randomUUID
