@@ -21,6 +21,7 @@ import { ApiError, api, retryDelayMs } from "../api";
 
 const GRANT = "https://trusttasks.org/spec/acl/grant/0.1";
 const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.1";
+const CHANGE_ROLE = "https://trusttasks.org/spec/acl/change-role/0.1";
 const LIST = "https://trusttasks.org/spec/acl/list/0.1";
 const SHOW = "https://trusttasks.org/spec/acl/show/0.1";
 const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.1";
@@ -48,26 +49,31 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
       .toBeNull();
   });
 
-  it("retries `unavailable` on mutations — the task provably did not run", () => {
-    for (const type of [GRANT, REVOKE]) {
+  it("retries `unavailable` on any mutation — the task provably did not run", () => {
+    for (const type of [GRANT, REVOKE, CHANGE_ROLE]) {
       expect(retryDelayMs(type, { code: "unavailable", retryable: true }, NOW))
         .toBe(500);
     }
   });
 
-  it("refuses `internalError` on mutations — the write may already have landed", () => {
-    // This is the double-apply guard. If it ever starts returning a
-    // number, a transient failure mid-grant can apply the grant twice.
-    for (const type of [GRANT, REVOKE]) {
+  it("retries `internalError` where re-applying is a no-op", () => {
+    // Reads have nothing to duplicate; `acl/grant` is idempotent by
+    // SPEC §3 ("re-emitting an identical grant produces no state
+    // change"), so a re-issue after a silent success changes nothing.
+    for (const type of [LIST, SHOW, GRANT]) {
       expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
-        .toBeNull();
+        .toBe(500);
     }
   });
 
-  it("retries `internalError` on side-effect-free tasks", () => {
-    for (const type of [LIST, SHOW]) {
+  it("refuses `internalError` where a re-issue would report a misleading error", () => {
+    // Neither corrupts state — both fail cleanly — but a re-issue after
+    // a first attempt that silently succeeded reports failure for an
+    // operation that worked: `subject_not_present` for revoke,
+    // `state_mismatch` for the state-checked change-role.
+    for (const type of [REVOKE, CHANGE_ROLE]) {
       expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
-        .toBe(500);
+        .toBeNull();
     }
   });
 
