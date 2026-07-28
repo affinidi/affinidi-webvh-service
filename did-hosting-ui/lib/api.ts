@@ -1327,8 +1327,11 @@ const TRUST_TASK_DEFAULT_RETRY_DELAY_MS = 500;
  * `retryable` is set and any `retryAfter` has elapsed. We additionally
  * *wait out* a near-future `retryAfter` rather than failing on it, which
  * is what makes the hint useful in an interactive UI.
+ *
+ * Exported for `lib/__tests__/trust-task-retry.test.ts`; not part of the
+ * client surface.
  */
-function retryDelayMs(
+export function retryDelayMs(
   typeUri: string,
   payload: TrustTaskErrorPayload,
   now: number,
