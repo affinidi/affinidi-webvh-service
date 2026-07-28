@@ -48,6 +48,21 @@
 
 ### Fixed
 
+- **The Web UI honors the server's `retryable` hint instead of discarding it.**
+  `dispatchTrustTask` parsed the `trust-task-error/0.1` payload and threw away
+  `retryable` and `retryAfter`, so an error the server had explicitly marked
+  transient reached the user as a hard failure with a manual retry as the only
+  recourse. The UI now applies the SPEC §8.4 rule (mirroring
+  `trust_tasks_rs::ErrorPayload::should_retry_at`): one extra attempt, after
+  waiting out a `retryAfter` up to 5s. Because a signed envelope cannot be
+  resent bit-for-bit — the rejected `created` would simply be rejected again —
+  a retry re-issues under a fresh `id`, which the spec permits and which is the
+  only form that can succeed. That makes each retry a *new* task, so the policy
+  is deliberately narrow: `unavailable` (the spec's unambiguous "did not run")
+  on any task, and `internalError` only on side-effect-free ones (`acl/list`,
+  `acl/show`). A mutation that fails with `internalError` stays a hard error —
+  the write may already have landed, and re-issuing could apply it twice.
+
 - **Signed UI requests no longer fail on browser-vs-server clock skew.** The Web
   UI stamps a proof's `created` from the *browser's* clock
   (`session-key.ts::signEnvelope`), and the verifier compared it strictly
