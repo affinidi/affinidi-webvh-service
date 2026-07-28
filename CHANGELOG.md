@@ -74,10 +74,13 @@
   resent bit-for-bit — the rejected `created` would simply be rejected again —
   a retry re-issues under a fresh `id`, which the spec permits and which is the
   only form that can succeed. That makes each retry a *new* task, so the policy
-  is deliberately narrow: `unavailable` (the spec's unambiguous "did not run")
-  on any task, and `internalError` only on side-effect-free ones (`acl/list`,
-  `acl/show`). A mutation that fails with `internalError` stays a hard error —
-  the write may already have landed, and re-issuing could apply it twice.
+  turns on whether applying a task twice is a no-op: `unavailable` (the spec's
+  unambiguous "did not run") is retried on anything, while the ambiguous
+  `internalError` is retried only on `acl/list` and `acl/show` (reads) and
+  `acl/grant` (idempotent by spec §3 — "re-emitting an identical grant produces
+  no state change"). `acl/revoke` and `acl/change-role` are excluded: neither
+  corrupts state on a re-issue, but both would report failure for an operation
+  that had actually succeeded (`subject_not_present`, `state_mismatch`).
 
 - **Signed UI requests no longer fail on browser-vs-server clock skew.** The Web
   UI stamps a proof's `created` from the *browser's* clock

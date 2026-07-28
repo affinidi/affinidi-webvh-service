@@ -1280,31 +1280,50 @@ export class TrustTaskRejection extends ApiError {
 const ALWAYS_RETRY_CODES = new Set<string>(["unavailable"]);
 
 /**
- * Task types with no side effects, where a re-issue is safe even for an
- * error code that is ambiguous about whether the first attempt took
- * effect (`internalError`). Enumerated rather than derived as "not a
- * mutation", so a future proofless *write* doesn't silently inherit
- * auto-retry.
+ * Task types where re-issuing is safe even when the error is *ambiguous*
+ * about whether the first attempt took effect (`internalError`) — either
+ * because the task has no side effects, or because applying it twice is
+ * a no-op.
  *
  * This is the distinction that makes honoring the flag useful against
  * this control plane at all: it emits `internalError` (retryable by
  * default in `trust_tasks_rs`) but never `unavailable`, so a code-only
- * policy would be inert. Safety here comes from the *operation* being
- * non-mutating, not from the code.
+ * policy would be inert. Safety comes from what the *task* does, not from
+ * the code.
  *
- * A mutation (`acl/grant`, `acl/revoke`, `acl/change-role`) that fails
- * with `internalError` stays a hard error: the write may already have
- * landed, and silently re-issuing it could apply it twice. That is the
- * user's call, not ours.
+ * Membership is a claim about the maintainer's semantics, so each entry
+ * cites the rule that makes it true:
+ *
+ * * `acl/list`, `acl/show` — reads. Nothing to duplicate.
+ * * `acl/grant` — idempotent by SPEC §3, "re-emitting an identical grant
+ *   produces no state change". The handler's equal-role arm merges the
+ *   producer's metadata and persists only when a field actually changed
+ *   (`handlers/grant.rs`), so a re-issue after a first attempt that
+ *   silently succeeded is a no-op.
+ *
+ * Deliberately excluded — and *not* because they would corrupt state;
+ * both fail cleanly on re-issue — but because the failure would be
+ * misleading, reporting an error for an operation that succeeded:
+ *
+ * * `acl/revoke` — a re-issue after a successful full removal is
+ *   rejected `acl/revoke:subject_not_present`.
+ * * `acl/change-role` — state-checked against `fromRole`, so a re-issue
+ *   after success is rejected `acl/change-role:state_mismatch`.
+ *
+ * Enumerated rather than derived as "not a mutation", so a future
+ * proofless *write* cannot silently inherit auto-retry. Adding an entry
+ * means answering: if the first attempt already took effect, is a second
+ * one a no-op?
  */
-const READ_ONLY_TASK_TYPES = new Set<string>([
+const REISSUE_SAFE_TASK_TYPES = new Set<string>([
   "https://trusttasks.org/spec/acl/list/0.1",
   "https://trusttasks.org/spec/acl/show/0.1",
+  "https://trusttasks.org/spec/acl/grant/0.1",
 ]);
 
-/** Codes that are retryable per the framework but only safe on a
- *  side-effect-free task. */
-const READ_ONLY_RETRY_CODES = new Set<string>(["internalError"]);
+/** Codes that are retryable per the framework but ambiguous about whether
+ *  the task ran — honored only on a `REISSUE_SAFE_TASK_TYPES` task. */
+const AMBIGUOUS_RETRY_CODES = new Set<string>(["internalError"]);
 
 /** Extra attempts after the first. One is enough to ride out a restart or
  *  a brief mediator hiccup; more would just delay showing the user a real
@@ -1341,8 +1360,8 @@ export function retryDelayMs(
   if (!payload.retryable) return null;
   const safe =
     ALWAYS_RETRY_CODES.has(payload.code) ||
-    (READ_ONLY_RETRY_CODES.has(payload.code) &&
-      READ_ONLY_TASK_TYPES.has(typeUri));
+    (AMBIGUOUS_RETRY_CODES.has(payload.code) &&
+      REISSUE_SAFE_TASK_TYPES.has(typeUri));
   if (!safe) return null;
 
   if (payload.retryAfter === undefined) {
@@ -1621,10 +1640,10 @@ async function sendTrustTaskOnce<Req, Resp>(
  *
  * Which is exactly why the policy is narrow. A re-issued document is a
  * *new* task, so if the first one had already taken effect the server
- * would apply it twice. Auto-retry is therefore limited to the code that
+ * would apply it again. Auto-retry is therefore limited to the code that
  * guarantees the task did not run (`unavailable`), plus `internalError`
- * on tasks that have no side effects to duplicate. See
- * `READ_ONLY_TASK_TYPES` before widening either.
+ * on tasks where a second application is a no-op. See
+ * `REISSUE_SAFE_TASK_TYPES` before widening either.
  */
 async function trustTask<Req, Resp>(
   typeUri: string,
