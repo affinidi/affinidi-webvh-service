@@ -388,6 +388,33 @@ jobs:
         with:
           command: check
 
+  # The admin UI had no CI at all until now: `did-hosting-ui` is TypeScript
+  # that never reached a compiler or a test runner on any push, so a type
+  # error or a broken client-side policy could only be caught by someone
+  # running Expo locally. It ships the trust-task client — envelope shapes,
+  # proof signing, the SPEC §8.4 retry policy — which is wire behaviour the
+  # Rust suite cannot see.
+  ui:
+    name: ui (typecheck + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: did-hosting-ui
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          # Matches the `engines.node` floor in did-hosting-ui/package.json.
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: did-hosting-ui/package-lock.json
+      # `npm ci`, not `npm install` — fails loudly if package-lock.json has
+      # drifted from package.json rather than silently resolving something
+      # else, the same reason the Rust jobs pass `--locked`.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   # NB: there is intentionally no `cargo publish --dry-run` job. The
   # did-hosting-* crates are a deployable service, not libraries — none are
   # published to crates.io, and did-hosting-common dev-depends on the

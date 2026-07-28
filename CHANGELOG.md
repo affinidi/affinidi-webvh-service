@@ -46,6 +46,22 @@
   that don't advertise the capability still get one message per DID, so an older
   control plane and an older server interoperate unchanged.
 
+### Added
+
+- **The admin UI has CI.** `did-hosting-ui` is TypeScript that never reached a
+  compiler or a test runner on any push — `ci.yml` had no Node job at all, and
+  the package had no test script — so a type error or a broken client-side
+  policy could only be caught by someone running Expo locally. That matters
+  more than it sounds: the UI holds the trust-task client (envelope shapes,
+  proof signing, the §8.4 retry policy), which is wire behaviour the Rust suite
+  cannot see. A `ui` job now runs `npm ci` (lockfile-pinned, matching the Rust
+  jobs' `--locked`), `npm run typecheck`, and `npm test`. Vitest is the runner;
+  it needs no Expo/React-Native scaffolding for `lib/`, which has no
+  module-scope browser dependencies. First suite covers the retry policy: the
+  §8.4 decision table exhaustively, plus `api.listAcl` end-to-end through
+  `trustTask` with `fetch` stubbed, so the re-issue path, the attempt bound and
+  the give-up path are all exercised against real client code.
+
 ### Fixed
 
 - **The Web UI honors the server's `retryable` hint instead of discarding it.**
