@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Added
+
+- **Signed end-to-end coverage for the approval round trip and
+  REQUIRED-proof dispatch** (#147, #149, #150). Closes the test
+  deferral left in `did-hosting-control/src/messaging.rs` when
+  REQUIRED-proof specs had no signing path: now that both legs sign,
+  the tests mint a `task-consent/request/0.1` through the exact
+  production builder (control `did:key`), verify it the way a
+  conforming approver must (proof + issuer ↔ `verificationMethod`
+  binding via `TransportBoundVerifier`), sign the wallet's
+  `task-consent/decision/0.1` echoing the verified document's
+  `challenge`/`payloadDigest`, and drive it through the inbound
+  decision path — asserting the parked request resolves on
+  approve/deny and that unsigned, tampered, wrong-holder,
+  wrong-key, wrong-digest, wrong-recipient, and stale-challenge
+  variants are each refused without consuming the pending entry.
+  A signed `acl/grant/0.1` (proof REQUIRED) envelope dispatch is
+  covered the same way: a real Data Integrity proof verifies
+  end-to-end under `enforce_proofs = true` and lands the entry;
+  tampered → `proofInvalid`, proofless → `proofRequired`, nothing
+  stored. Test-enabling refactor only: the decision handler's body
+  moved into `run_consent_decision` (the established `run_*`
+  extraction pattern) so it is drivable without an ATM-backed
+  `HandlerContext`; wire behavior is unchanged.
+
 ### Fixed
 
 - **Both approval-request legs the control plane sends are now signed

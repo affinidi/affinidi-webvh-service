@@ -101,7 +101,11 @@ pub struct ConsentResult {
 /// boundary can't be shifted; salted so an unsalted digest over a
 /// low-entropy payload isn't a confirmation oracle for anyone who
 /// observes it in transit.
-fn wire_digest(task_type: &str, payload: &Value, challenge: &str) -> Result<String, AppError> {
+pub(crate) fn wire_digest(
+    task_type: &str,
+    payload: &Value,
+    challenge: &str,
+) -> Result<String, AppError> {
     let canonical = serde_json_canonicalizer::to_string(payload)
         .map_err(|e| AppError::Internal(format!("payload JCS canonicalization failed: {e}")))?;
     let mut h = Sha256::new();
@@ -124,8 +128,12 @@ fn wire_digest(task_type: &str, payload: &Value, challenge: &str) -> Result<Stri
 /// `proofPurpose: assertionMethod`, signed by `signing_secret` (the
 /// control DID's assertion key, so `issuer` equals the DID of
 /// `proof.verificationMethod`).
+///
+/// `pub(crate)` (with [`wire_digest`]) so the round-trip tests in
+/// `crate::messaging` mint the request leg through the exact production
+/// builder rather than a lookalike.
 #[allow(clippy::too_many_arguments)]
-async fn build_signed_request_document(
+pub(crate) async fn build_signed_request_document(
     control_did: &str,
     signing_secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
     holder_did: &str,

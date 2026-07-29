@@ -254,12 +254,31 @@ async fn handle_consent_decision(
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let sender = require_sender(&ctx)?;
+    match run_consent_decision(&state, sender, &message).await? {
+        Some((response_type, response_body)) => Ok(Some(
+            DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Compute the wire-level `(response_type, response_body)` for an inbound
+/// `task-consent/decision/0.1`, or `None` when the decision must be
+/// ignored (every refusal deliberately resolves nothing — see the stage
+/// comments below). Extracted from [`handle_consent_decision`] so the
+/// full signed round trip is testable without an `ATM`-backed
+/// [`HandlerContext`] — the same pattern as `run_authenticate` /
+/// `run_trust_tasks_envelope`.
+async fn run_consent_decision(
+    state: &AppState,
+    sender: &str,
+    message: &Message,
+) -> Result<Option<(String, Value)>, DIDCommServiceError> {
     use did_hosting_common::did_hosting_tasks::{
         TASK_CONSENT_DECISION_0_1, TASK_CONSENT_DECISION_RESPONSE_0_1,
     };
     use trust_tasks_rs::ProofVerifier;
-
-    let sender = require_sender(&ctx)?;
 
     // ── 1. The body must be a Trust Task document of the decision type.
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
@@ -406,10 +425,10 @@ async fn handle_consent_decision(
         "payloadDigest": digest,
         "approvals": if approved { 1 } else { 0 },
     });
-    Ok(Some(
-        DIDCommResponse::new(TASK_CONSENT_DECISION_RESPONSE_0_1.as_str().to_string(), ack)
-            .thid(message.id.clone()),
-    ))
+    Ok(Some((
+        TASK_CONSENT_DECISION_RESPONSE_0_1.as_str().to_string(),
+        ack,
+    )))
 }
 
 async fn handle_webvh_message(
@@ -3479,10 +3498,12 @@ mod tests {
     /// Happy-path envelope dispatch. Exercises the `acl/list/0.1`
     /// flow (a RECOMMENDED spec — proofless requests are valid under
     /// the framework's IS_PROOF_REQUIRED enforcement). REQUIRED specs
-    /// (`acl/grant`, `acl/revoke`, `acl/change-role`) require a
-    /// real Data Integrity proof under upstream 0.1.1; the
-    /// end-to-end integration test for those lives in the browser-
-    /// signing path test once that lands.
+    /// (`acl/grant`, `acl/revoke`, `acl/change-role`) require a real
+    /// Data Integrity proof; the signed end-to-end coverage for that
+    /// enforcement lives in `trust_tasks_envelope_signed_acl_grant_*`
+    /// below, and the signed request→decision round trip of the
+    /// consent family in the `task_consent_signed_round_trip` /
+    /// `task_consent_decision_*` tests.
     #[tokio::test]
     async fn trust_tasks_envelope_happy_path_list_returns_handled_response() {
         let (state, _dir) = test_state().await;
@@ -3632,5 +3653,670 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Signed end-to-end coverage: real Data Integrity proofs over
+    // did:key material, verified by the production
+    // `TransportBoundVerifier` — the task-consent request→decision
+    // round trip and REQUIRED-spec (`acl/grant`) envelope dispatch.
+    // -----------------------------------------------------------------
+
+    use affinidi_data_integrity::DidKeyResolver;
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use did_hosting_common::did_hosting_tasks::{
+        TASK_ADMIN_ACTION_1_0, TASK_CONSENT_DECISION_0_1, TASK_CONSENT_DECISION_RESPONSE_0_1,
+    };
+    use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+
+    use crate::routes::task_consent::{build_signed_request_document, wire_digest};
+    use crate::server::PendingConfirm;
+    use crate::signing::test_util::did_key_signer;
+
+    /// The action text used across the round-trip tests.
+    const CONSENT_ACTION: &str = "Rotate the registry signing key";
+
+    /// `test_state` with `server_did` pinned to `control_did` and the
+    /// production DI verifier over `did:key` wired in — the decision
+    /// handler refuses everything without a verifier, and its audience
+    /// check compares the decision's `recipient` against `server_did`.
+    async fn consent_state(control_did: &str) -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = test_state().await;
+        let mut config = (*state.config).clone();
+        config.server_did = Some(control_did.to_string());
+        state.config = Arc::new(config);
+        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
+            Arc::new(DidKeyResolver),
+        )));
+        (state, dir)
+    }
+
+    /// Mint the signed request leg exactly as `POST /api/task-consent/request`
+    /// does — same digest, same builder, same signer shape — and return
+    /// `(request_document, challenge, digest)`.
+    async fn minted_request(
+        control_did: &str,
+        control_signer: &Secret,
+        holder_did: &str,
+    ) -> (Value, String, String) {
+        let task_type = TASK_ADMIN_ACTION_1_0.as_str();
+        let challenge = "00112233445566778899aabbccddeeff".to_string();
+        let digest = wire_digest(task_type, &json!({ "action": CONSENT_ACTION }), &challenge)
+            .expect("wire digest");
+        let document = build_signed_request_document(
+            control_did,
+            control_signer,
+            holder_did,
+            "did:example:admin",
+            CONSENT_ACTION,
+            task_type,
+            &challenge,
+            &digest,
+            "2026-07-29T00:00:00Z",
+            "2026-07-29T00:01:00Z",
+        )
+        .await
+        .expect("build + sign request");
+        (document, challenge, digest)
+    }
+
+    /// Wallet-side decision: an unsigned `task-consent/decision/0.1`
+    /// document echoing `challenge` + `digest`.
+    fn unsigned_decision(
+        issuer_did: Option<&str>,
+        recipient: &str,
+        challenge: &str,
+        digest: &str,
+        decision: &str,
+    ) -> Value {
+        let mut doc = json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": TASK_CONSENT_DECISION_0_1.as_str(),
+            "recipient": recipient,
+            "issuedAt": "2026-07-29T00:00:30Z",
+            "payload": {
+                "challenge": challenge,
+                "payloadDigest": digest,
+                "decision": decision,
+            },
+        });
+        if let Some(issuer) = issuer_did {
+            doc["issuer"] = json!(issuer);
+        }
+        doc
+    }
+
+    /// [`unsigned_decision`], signed with the holder's key via the same
+    /// signing entry point the production code uses.
+    async fn signed_decision(
+        signer: &Secret,
+        issuer_did: &str,
+        recipient: &str,
+        challenge: &str,
+        digest: &str,
+        decision: &str,
+    ) -> Value {
+        crate::signing::sign_trust_task_document(
+            unsigned_decision(Some(issuer_did), recipient, challenge, digest, decision),
+            signer,
+        )
+        .await
+        .expect("sign decision")
+    }
+
+    /// Park a pending consent exactly as the REST route does; the
+    /// returned receiver resolves with the wallet's decision.
+    async fn park_pending(
+        state: &AppState,
+        challenge: &str,
+        holder_did: &str,
+        digest: &str,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.pending_confirms.lock().await.insert(
+            challenge.to_string(),
+            PendingConfirm {
+                holder_did: holder_did.to_string(),
+                expected_digest: digest.to_string(),
+                tx,
+            },
+        );
+        rx
+    }
+
+    /// Drive a decision document through the handler and assert it is
+    /// refused *silently and completely*: no acknowledgement, the parked
+    /// entry survives for the legitimate wallet, and the channel never
+    /// fires.
+    async fn assert_decision_refused(
+        state: &AppState,
+        sender: &str,
+        decision: Value,
+        rx: &mut tokio::sync::oneshot::Receiver<bool>,
+        challenge: &str,
+        why: &str,
+    ) {
+        let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), decision);
+        let resp = super::run_consent_decision(state, sender, &msg)
+            .await
+            .expect("refusals are silent, not transport errors");
+        assert!(resp.is_none(), "{why}: must not be acknowledged");
+        assert!(
+            state.pending_confirms.lock().await.contains_key(challenge),
+            "{why}: the pending entry must survive"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "{why}: the parked request must not resolve"
+        );
+    }
+
+    /// The full signed round trip the retired deferral asked for: the
+    /// control plane mints + signs the request leg (through the exact
+    /// production builder the REST route uses), a conforming wallet
+    /// verifies it before rendering — proof verifies AND `issuer` is the
+    /// DID of `proof.verificationMethod` — then signs a decision echoing
+    /// the *verified document's* challenge + payloadDigest, and the
+    /// inbound handler verifies the decision and resolves the parked
+    /// request.
+    #[tokio::test]
+    async fn task_consent_signed_round_trip_approve() {
+        use trust_tasks_rs::ProofVerifier;
+
+        let (control_did, control_signer) = did_key_signer(&[21u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[22u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+
+        // ── Request leg, signed by the control DID.
+        let (request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+
+        // ── Wallet side: verify before rendering `note`, with the same
+        // verifier construction a conforming approver uses.
+        let parsed: trust_tasks_rs::TrustTask<Value> =
+            serde_json::from_value(request).expect("request parses as a TrustTask");
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify(&parsed)
+            .await
+            .expect("wallet verifies the request proof");
+        assert_eq!(parsed.issuer.as_deref(), Some(control_did.as_str()));
+        // The wallet echoes what the *verified document* carries — not
+        // anything from the transport envelope.
+        let echo_challenge = parsed.payload["challenge"].as_str().unwrap().to_string();
+        let echo_digest = parsed.payload["payloadDigest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(echo_challenge, challenge);
+        assert_eq!(echo_digest, digest);
+
+        // ── The REST route parks the pending entry keyed by challenge.
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        // ── Decision leg: holder signs an approve; the handler verifies
+        // and resolves the parked request.
+        let decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &control_did,
+            &echo_challenge,
+            &echo_digest,
+            "approve",
+        )
+        .await;
+        let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), decision);
+        let (resp_type, ack) = super::run_consent_decision(&state, &holder_did, &msg)
+            .await
+            .expect("handler ok")
+            .expect("an acknowledgement is returned");
+
+        assert_eq!(resp_type, TASK_CONSENT_DECISION_RESPONSE_0_1.as_str());
+        assert_eq!(ack["status"], "granted");
+        assert_eq!(ack["approvals"], 1);
+        assert_eq!(ack["payloadDigest"], digest.as_str());
+        assert!(rx.try_recv().expect("decision delivered"), "approved");
+        assert!(
+            state.pending_confirms.lock().await.is_empty(),
+            "pending entry consumed"
+        );
+    }
+
+    /// Same round trip, denying: the parked request resolves `false` and
+    /// the spec `#response` says `denied` with zero approvals.
+    #[tokio::test]
+    async fn task_consent_signed_round_trip_deny() {
+        let (control_did, control_signer) = did_key_signer(&[23u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[24u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        let decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &control_did,
+            &challenge,
+            &digest,
+            "deny",
+        )
+        .await;
+        let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), decision);
+        let (_, ack) = super::run_consent_decision(&state, &holder_did, &msg)
+            .await
+            .expect("handler ok")
+            .expect("an acknowledgement is returned");
+
+        assert_eq!(ack["status"], "denied");
+        assert_eq!(ack["approvals"], 0);
+        assert!(!rx.try_recv().expect("decision delivered"), "denied");
+    }
+
+    /// An unsigned decision is refused outright — the proof, not the
+    /// authcrypt session, is the authorization.
+    #[tokio::test]
+    async fn task_consent_decision_without_proof_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[25u8; 32]);
+        let (holder_did, _holder_signer) = did_key_signer(&[26u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        let decision = unsigned_decision(
+            Some(&holder_did),
+            &control_did,
+            &challenge,
+            &digest,
+            "approve",
+        );
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "unsigned decision",
+        )
+        .await;
+    }
+
+    /// Flipping the decision *after* signing must fail proof
+    /// verification — the signature covers the payload, so a deny cannot
+    /// be laundered into an approve in transit.
+    #[tokio::test]
+    async fn task_consent_decision_tampered_after_signing_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[27u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[28u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        let mut decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &control_did,
+            &challenge,
+            &digest,
+            "deny",
+        )
+        .await;
+        decision["payload"]["decision"] = json!("approve");
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "tampered decision",
+        )
+        .await;
+    }
+
+    /// A decision signed consistently by a DID that is not the holder the
+    /// request was addressed to is refused at the pending-entry binding
+    /// — a valid signature from the wrong party authorizes nothing.
+    #[tokio::test]
+    async fn task_consent_decision_from_wrong_holder_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[29u8; 32]);
+        let (holder_did, _holder_signer) = did_key_signer(&[30u8; 32]);
+        let (attacker_did, attacker_signer) = did_key_signer(&[66u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        // Well-formed and properly signed — just by the wrong DID.
+        let decision = signed_decision(
+            &attacker_signer,
+            &attacker_did,
+            &control_did,
+            &challenge,
+            &digest,
+            "approve",
+        )
+        .await;
+        assert_decision_refused(
+            &state,
+            &attacker_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "wrong holder",
+        )
+        .await;
+    }
+
+    /// The proof's `verificationMethod` DID must equal the authcrypt
+    /// sender — a decision whose proof is someone else's key, delivered
+    /// over a session authenticated as the holder, is refused at the
+    /// proof↔sender binding before verification is even attempted.
+    #[tokio::test]
+    async fn task_consent_decision_proof_key_mismatching_sender_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[31u8; 32]);
+        let (holder_did, _holder_signer) = did_key_signer(&[32u8; 32]);
+        let (attacker_did, attacker_signer) = did_key_signer(&[67u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        // Signed by the attacker's key, but arriving on a transport
+        // session the service attributes to the holder.
+        let decision = signed_decision(
+            &attacker_signer,
+            &attacker_did,
+            &control_did,
+            &challenge,
+            &digest,
+            "approve",
+        )
+        .await;
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "proof key != sender",
+        )
+        .await;
+    }
+
+    /// A decision echoing a digest other than the one the request carried
+    /// answers a different question — refused, and the legitimate pending
+    /// entry survives.
+    #[tokio::test]
+    async fn task_consent_decision_digest_mismatch_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[33u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[34u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        // A digest over a *different* action than the one we asked about.
+        let other_digest = wire_digest(
+            TASK_ADMIN_ACTION_1_0.as_str(),
+            &json!({ "action": "Delete every hosted DID" }),
+            &challenge,
+        )
+        .expect("wire digest");
+        let decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &control_did,
+            &challenge,
+            &other_digest,
+            "approve",
+        )
+        .await;
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "digest mismatch",
+        )
+        .await;
+    }
+
+    /// Audience binding: a decision addressed to another executor must
+    /// not resolve a pending consent here, even when everything else
+    /// checks out.
+    #[tokio::test]
+    async fn task_consent_decision_for_other_executor_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[35u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[36u8; 32]);
+        let (other_executor, _) = did_key_signer(&[68u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        let decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &other_executor,
+            &challenge,
+            &digest,
+            "approve",
+        )
+        .await;
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            decision,
+            &mut rx,
+            &challenge,
+            "wrong recipient",
+        )
+        .await;
+    }
+
+    /// A decision for a challenge nothing is parked on (stale, lapsed,
+    /// or already resolved) is silently ignored.
+    #[tokio::test]
+    async fn task_consent_decision_unknown_challenge_is_refused() {
+        let (control_did, _control_signer) = did_key_signer(&[37u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[38u8; 32]);
+        let (state, _dir) = consent_state(&control_did).await;
+
+        let decision = signed_decision(
+            &holder_signer,
+            &holder_did,
+            &control_did,
+            "ffffffffffffffffffffffffffffffff",
+            "not-a-real-digest",
+            "approve",
+        )
+        .await;
+        let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), decision);
+        let resp = super::run_consent_decision(&state, &holder_did, &msg)
+            .await
+            .expect("silent refusal");
+        assert!(resp.is_none(), "unknown challenge must not be acknowledged");
+    }
+
+    // ── Signed REQUIRED-spec envelope dispatch (`acl/grant/0.1`) ──────
+
+    /// Build an (unsigned) typed `acl/grant/0.1` document granting
+    /// `subject` the `owner` role, issued by `admin_did` to this test
+    /// control plane.
+    fn unsigned_grant_doc(admin_did: &str, subject: &str) -> Value {
+        use trust_tasks_rs::specs::acl::grant::v0_1 as grant;
+        let entry = grant::AclEntry {
+            subject: subject.into(),
+            role: "owner".into(),
+            scopes: vec![],
+            allowed_keys: None,
+            approve: None,
+            label: Some("signed e2e grant".into()),
+            created_at: None,
+            created_by: None,
+            updated_at: None,
+            updated_by: None,
+            expires_at: None,
+            step_up: None,
+            ext: serde_json::from_value(json!({
+                "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
+            }))
+            .expect("webvh ext parses"),
+        };
+        let payload = grant::Payload {
+            entry,
+            ext: None,
+            reason: Some("signed end-to-end grant".into()),
+        };
+        let mut doc = trust_tasks_rs::TrustTask::for_payload(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            payload,
+        );
+        doc.issuer = Some(admin_did.into());
+        doc.recipient = Some("did:webvh:test:control.example.com".into());
+        doc.issued_at = Some(chrono::Utc::now());
+        serde_json::to_value(&doc).expect("grant document serialises")
+    }
+
+    /// `test_state` + the production `did:key` verifier + `admin_did`
+    /// seeded as Admin, for the REQUIRED-spec envelope tests.
+    async fn grant_state(admin_did: &str) -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = test_state().await;
+        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
+            Arc::new(DidKeyResolver),
+        )));
+        assert!(
+            state.config.trust_tasks.enforce_proofs,
+            "strict proofs are the default"
+        );
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: admin_did.into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .expect("seed admin");
+        (state, dir)
+    }
+
+    /// The signed REQUIRED-spec dispatch the retired deferral named:
+    /// `acl/grant/0.1` (proof REQUIRED) carrying a *real* Data Integrity
+    /// proof, dispatched through the DIDComm envelope path under
+    /// `enforce_proofs = true` and the production verifier, landing the
+    /// granted entry in the ACL store.
+    #[tokio::test]
+    async fn trust_tasks_envelope_signed_acl_grant_verifies_end_to_end() {
+        let (admin_did, admin_signer) = did_key_signer(&[41u8; 32]);
+        let (state, _dir) = grant_state(&admin_did).await;
+
+        let subject = "did:example:grantee";
+        let signed = crate::signing::sign_trust_task_document(
+            unsigned_grant_doc(&admin_did, subject),
+            &admin_signer,
+        )
+        .await
+        .expect("sign grant");
+        let msg = build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, signed);
+
+        let (resp_type, resp_body) = super::run_trust_tasks_envelope(&state, &admin_did, &msg)
+            .await
+            .expect("dispatch ok")
+            .expect("a response is emitted");
+
+        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        let inner = resp_body["type"].as_str().unwrap();
+        assert!(
+            inner.ends_with("/acl/grant/0.1#response"),
+            "expected grant response, got {inner}"
+        );
+        let stored = did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, subject)
+            .await
+            .expect("acl read")
+            .expect("granted entry stored");
+        assert!(
+            matches!(stored.role, Role::Owner),
+            "granted role is owner, got {:?}",
+            stored.role
+        );
+    }
+
+    /// Tampering with a signed grant after signing is refused with
+    /// `proofInvalid` — and nothing lands in the ACL store.
+    #[tokio::test]
+    async fn trust_tasks_envelope_signed_acl_grant_tampered_is_rejected() {
+        let (admin_did, admin_signer) = did_key_signer(&[42u8; 32]);
+        let (state, _dir) = grant_state(&admin_did).await;
+
+        let mut signed = crate::signing::sign_trust_task_document(
+            unsigned_grant_doc(&admin_did, "did:example:grantee"),
+            &admin_signer,
+        )
+        .await
+        .expect("sign grant");
+        signed["payload"]["entry"]["subject"] = json!("did:example:mallory");
+        let msg = build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, signed);
+
+        let (_, resp_body) = super::run_trust_tasks_envelope(&state, &admin_did, &msg)
+            .await
+            .expect("dispatch ok")
+            .expect("an error document is emitted");
+
+        assert_eq!(
+            resp_body["type"],
+            "https://trusttasks.org/spec/trust-task-error/0.2"
+        );
+        assert_eq!(resp_body["payload"]["code"], "proofInvalid");
+        for did in ["did:example:mallory", "did:example:grantee"] {
+            assert!(
+                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, did)
+                    .await
+                    .expect("acl read")
+                    .is_none(),
+                "{did} must not be granted"
+            );
+        }
+    }
+
+    /// A proofless grant is refused (`proofRequired`) even from a
+    /// seeded Admin sender — for REQUIRED specs the proof, not the
+    /// transport session, authorizes.
+    #[tokio::test]
+    async fn trust_tasks_envelope_unsigned_acl_grant_is_rejected() {
+        let (admin_did, _admin_signer) = did_key_signer(&[43u8; 32]);
+        let (state, _dir) = grant_state(&admin_did).await;
+
+        let msg = build_msg(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            unsigned_grant_doc(&admin_did, "did:example:grantee"),
+        );
+        let (_, resp_body) = super::run_trust_tasks_envelope(&state, &admin_did, &msg)
+            .await
+            .expect("dispatch ok")
+            .expect("an error document is emitted");
+
+        assert_eq!(
+            resp_body["type"],
+            "https://trusttasks.org/spec/trust-task-error/0.2"
+        );
+        assert_eq!(resp_body["payload"]["code"], "proofRequired");
+        assert!(
+            did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, "did:example:grantee")
+                .await
+                .expect("acl read")
+                .is_none(),
+            "nothing must be granted"
+        );
     }
 }
