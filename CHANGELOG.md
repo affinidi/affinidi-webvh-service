@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.8.6 (2026-07-29)
+
+### Changed
+
+- **`vta-sdk` 0.19 → 0.20 and `vti-common` 0.11.5 → 0.11.30, moved
+  together.** The two crates share the canonical SIOPv2 / RFC-6749 auth wire
+  types (`vta_sdk::protocols::auth::{Session, TokenBundle,
+  AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`), so a
+  mismatched pair resolves to two `vta-sdk` copies and fails to compile with
+  `E0308` on `AuthenticateResponse`. `vti-common` 0.11.30 re-pins onto
+  `vta-sdk ^0.20`; both keep `affinidi-tdk ^0.8`. All five declarations —
+  the workspace `vta-sdk` pin plus the four `vti-common` entries in
+  `did-hosting-{common,control,server}` and `webvh-witness` — moved in one
+  step, and `cargo tree -d -e normal,build,dev` lists none of `vta-sdk`,
+  `vti-common` or `affinidi-tdk`.
+
+  The lock's `affinidi-messaging-mediator` moved 0.17.9 → 0.17.13 as part of
+  this, via the `affinidi-messaging-test-mediator` dev-dependency. Below
+  0.17.13 the mediator pins `vta-sdk ^0.19` and so reintroduced a second
+  `vta-sdk` copy in the *dev* graph — invisible to a passing build, because
+  the two copies never meet in one type-checking context. It is also
+  independently required: a mediator below 0.17.13 answers
+  `messaging/account/update` with `501 unsupported Trust Task type` and
+  cannot serve a VTA on messaging SDK 0.18.65, which this workspace moved to
+  in 0.8.5. The integration tests were otherwise running against a mediator
+  that no longer represents production.
+
+  **No source changes were needed to compile.** The auth surface this
+  service actually consumes did not move: `vti_common::auth::handlers`,
+  `auth::backend`, `auth::jwt`, `auth::siop`, `auth::step_up` and
+  `vti_common::error` are byte-identical between 0.11.5 and 0.11.30, and
+  in `vta_sdk::protocols::auth` only the unused `RevokeSessionResponse`
+  changed. `sealed_transfer`, `keys`, `did_secrets`, `credentials`,
+  `auth_light` and `didcomm_light` are unchanged, so the sealed-transfer
+  bundle bytes and the DID-signed assertion domain tag are wire-identical
+  to 0.19 — an offline bundle produced by either version verifies on the
+  other.
+
+  Behavioural deltas this service inherits, none of them source-visible:
+
+  - **`VtaClient`'s webvh operations now dispatch Trust Tasks over the
+    DIDComm leg** (`rpc_tt` in place of `rpc`, e.g.
+    `spec/vta/webvh/servers/list/1.0` instead of the
+    `did_management::LIST_WEBVH_SERVERS` protocol message). The REST leg is
+    unchanged. This reaches the daemon's setup wizard, which calls
+    `list_webvh_servers` / `list_webvh_server_domains` after
+    `connect_didcomm`, so the hosting-server picker over DIDComm now
+    requires a VTA new enough to route those task URIs. Failure is
+    non-fatal — the wizard degrades to serverless with a printed note.
+  - **Transport discovery is TSP-aware.** `ResolvedVta` gained
+    `tsp_mediator_did`, `VtaEndpoint` gained a `Tsp` variant (and
+    `#[non_exhaustive]`), and 0.20 no longer synthesises a REST URL from the
+    VTA DID's own domain when it finds no `#vta-rest`. A TSP-only VTA that
+    used to arrive looking like a REST one (and fail at the network call)
+    is now reported honestly; `connect_setup_client` says so explicitly
+    rather than falling through the "neither REST nor DIDComm" arm. A TSP
+    leg for the catalogue reads is deliberately not added here.
+  - Two extraction rules inside `resolve_vta_endpoint` changed with the
+    move to the shared `ServiceCapabilities`: REST discovery now matches on
+    the service `type` (`VTARest` / `TRQPRest`) rather than the
+    `#vta-rest` id fragment, and the DIDComm mediator is taken from the
+    first `DIDCommMessaging` service's first endpoint rather than the first
+    `did:`-prefixed URI found across all of them. Both are no-ops for a
+    VTA-minted DID document; a hand-written one could resolve differently.
+  - `TransportChoice::Auto` now prefers TSP > DIDComm > REST, and
+    `challenge_response` no longer leaks an ATM task per login.
+
+- Corrected the stale note on
+  `did_hosting_control::routes::auth::canonical_to_local_auth_response`. It
+  claimed the helper existed because two `vta-sdk` copies made one type look
+  like two, and predicted it would disappear once `vta-sdk` consolidated
+  onto a single published version. That consolidation is this release, and
+  the helper is still required: `did_hosting_common::AuthenticateResponse`
+  is a genuinely separate local type in `types.rs`, kept so the client
+  crates have a wire type that does not drag the SDK in.
+
 ## 0.8.4 (2026-07-29)
 
 ### Changed

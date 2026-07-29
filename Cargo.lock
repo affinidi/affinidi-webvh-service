@@ -349,9 +349,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator"
-version = "0.17.9"
+version = "0.17.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d5c18bf36ed44c4f4b17a37ddd9a7ab7407acd93f87d0b3be67620aebefe6c8"
+checksum = "3c3a4dbf5d8151ba18bd96ff4b684252ac57dc4569c0b7725d97b51297a6ffa5"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-common",
@@ -413,9 +413,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-common"
-version = "0.15.30"
+version = "0.15.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80f271a25216dfff7ec10e30c9d73b78f705f6319d1bd1544dc221a9dee331cc"
+checksum = "e8740756329af4040d2c488f2d2e5c27a62b91c4cdde04e9f8d3876cb583ce9a"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -501,9 +501,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-test-mediator"
-version = "0.2.42"
+version = "0.2.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c899d79d1f2bf6109b94da694de647a557bc2f8ada18c8e995b198e245e82b7e"
+checksum = "d86ac1886e4569e190523d5b549fd0f89733ca3fa9729933c750ad74b55ff0f6"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -3166,7 +3166,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-daemon"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-messaging-didcomm-service",
  "affinidi-tdk",
@@ -3195,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-server"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -9403,6 +9403,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-tasks-capability-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cdd2a1c83c4b1b74d2bd335ff2e45cdcb1bf4e17eddbf24761dd4a471a79cf8"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "trust-tasks-rs",
+ "uuid",
+]
+
+[[package]]
 name = "trust-tasks-didcomm"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9798,9 +9812,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.19.22"
+version = "0.20.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90eab9c3036db79750b8113d7439f0d92ddb90f140b3ab5cc07403c0d1d08681"
+checksum = "53959519b5acfa1080e91c650dfa2455783578d8bdfc9b3651648b603eaee81e"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -9840,11 +9854,13 @@ dependencies = [
 
 [[package]]
 name = "vti-common"
-version = "0.11.5"
+version = "0.11.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1ef23b04aae83d859f35906de325233b166dc74a160f298fd455aba9fd9419"
+checksum = "f394694a4ae018e7be287ec3d7edc20cc26c5fa1aad1f3516e634807fe592506"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-delivery",
  "affinidi-tdk",
  "async-trait",
  "axum",
@@ -9867,6 +9883,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "trust-tasks-capability-client",
+ "trust-tasks-rs",
  "uuid",
  "vta-sdk",
 ]
@@ -10091,7 +10109,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-watcher"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "axum",
  "axum-extra",
@@ -10110,7 +10128,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-witness"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
