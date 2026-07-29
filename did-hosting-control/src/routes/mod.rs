@@ -1,6 +1,5 @@
 mod acl;
 mod auth;
-pub mod confirm;
 // `pub(crate)` so the DIDComm dispatch table reuses the REST request types
 // and helpers verbatim — the two transports must not grow separate shapes.
 pub(crate) mod did_manage;
@@ -13,6 +12,7 @@ mod proxy;
 mod registry;
 pub mod server_info;
 pub(crate) mod stats_sync;
+pub mod task_consent;
 mod trust_tasks;
 
 use axum::Router;
@@ -160,13 +160,14 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(auth::refresh),
             (*TASK_AUTH_REFRESH_0_1).clone(),
         )
-        // RP-initiated wallet confirmation (admin-only). Sends a
-        // `confirm/1.0` DIDComm message to a holder DID and waits for the
-        // wallet's authcrypted approve/deny.
+        // RP-initiated wallet consent (admin-only). Sends a
+        // `task-consent/request/0.1` document to a holder DID over DIDComm
+        // and waits for the wallet's signed `task-consent/decision/0.1`.
+        // (Replaces the retired `confirm/{request,response}/0.1` flow.)
         .route_with_task_permissive(
-            "/confirm/request",
-            post(confirm::request),
-            (*TASK_CONFIRM_REQUEST_0_1).clone(),
+            "/task-consent/request",
+            post(task_consent::request),
+            (*TASK_CONSENT_REQUEST_0_1).clone(),
         )
         // Passkey (WebAuthn)
         .route_with_task_permissive(

@@ -70,12 +70,12 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .route(MSG_AGENT_NAME_REMOVE, handler_fn(handle_webvh_message))?
         .route(MSG_AGENT_NAME_LIST, handler_fn(handle_webvh_message))?
         .route(MSG_AGENT_NAME_CHECK, handler_fn(handle_webvh_message))?
-        // Wallet confirmation response (RP→wallet confirm protocol).
-        // The matching outbound `confirm/1.0` is sent by the REST
-        // endpoint `POST /api/confirm/request`.
+        // Wallet consent decision (RP→wallet task-consent protocol).
+        // The matching outbound `task-consent/request/0.1` is sent by
+        // the REST endpoint `POST /api/task-consent/request`.
         .route(
-            crate::routes::confirm::MSG_WALLET_CONFIRM_RESPONSE,
-            handler_fn(handle_confirm_response),
+            did_hosting_common::did_hosting_tasks::TASK_CONSENT_DECISION_0_1.as_str(),
+            handler_fn(handle_consent_decision),
         )?
         // Server registration
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
@@ -215,69 +215,201 @@ async fn run_authenticate(
     Ok(pair)
 }
 
-/// Inbound `confirm-response/1.0` from a wallet.
+/// Extract `(challenge, payloadDigest, approved)` from a
+/// `task-consent/decision/0.1` payload, or `None` when a required member
+/// is absent or `decision` is not one of the spec's two values.
 ///
-/// The authcrypt envelope *is* the authentication: the DIDComm service
-/// layer has already authenticated the sender, so `ctx.sender_did` is the
-/// holder DID. We correlate by `challenge`, verify the sender matches the
-/// holder DID the request was addressed to, and resolve the parked REST
-/// request with the user's decision. No DIDComm reply is needed.
-async fn handle_confirm_response(
+/// A device **MUST NOT** synthesise an approval, and neither may we:
+/// anything that is not literally `approve` is *not* an approval, and
+/// anything that is not literally `deny` is not a signed refusal either
+/// — an unknown third value is a decision this executor cannot read, so
+/// it resolves nothing and the parked request times out.
+fn parse_decision_payload(payload: &Value) -> Option<(&str, &str, bool)> {
+    let challenge = payload.get("challenge").and_then(Value::as_str)?;
+    let digest = payload.get("payloadDigest").and_then(Value::as_str)?;
+    let approved = match payload.get("decision").and_then(Value::as_str)? {
+        "approve" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    Some((challenge, digest, approved))
+}
+
+/// Inbound `task-consent/decision/0.1` from a wallet.
+///
+/// The decision's Data Integrity proof — not the transport session — is
+/// the authorization (per the task-consent spec), so it is **required**
+/// and verified before anything else. The authcrypt envelope binds the
+/// sender on top of that: the DIDComm service layer has already
+/// authenticated `ctx.sender_did` as the holder DID, and the decision is
+/// only honoured when the proof's `verificationMethod` DID, the in-band
+/// `issuer` (when present) and the authcrypt sender all name the holder
+/// the request was addressed to. We correlate by `challenge`, require
+/// the echoed `payloadDigest` to match the one we sent (the binding
+/// between what the human approved and what the parked admin call
+/// proceeds with), and resolve the parked REST request with the user's
+/// decision. A `#response` acknowledgement is returned per the spec.
+async fn handle_consent_decision(
     ctx: HandlerContext,
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    use did_hosting_common::did_hosting_tasks::{
+        TASK_CONSENT_DECISION_0_1, TASK_CONSENT_DECISION_RESPONSE_0_1,
+    };
+    use trust_tasks_rs::ProofVerifier;
+
     let sender = require_sender(&ctx)?;
 
-    let approved = message.body.get("approved").and_then(|v| v.as_bool());
-    let challenge = message.body.get("challenge").and_then(|v| v.as_str());
-
-    let (approved, challenge) = match (approved, challenge) {
-        (Some(a), Some(c)) => (a, c),
-        _ => {
+    // ── 1. The body must be a Trust Task document of the decision type.
+    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
+        Ok(d) => d,
+        Err(e) => {
             warn!(
                 sender = sender,
-                "confirm-response missing 'approved' or 'challenge' — ignoring"
+                error = %e,
+                "task-consent decision is not a Trust Task document — ignoring"
             );
             return Ok(None);
         }
     };
-
-    // Look up and remove the pending entry under the same lock so two
-    // responses for the same challenge can't both fire the sender.
-    let pending = {
-        let mut map = state.pending_confirms.lock().await;
-        map.remove(challenge)
-    };
-
-    let pending = match pending {
-        Some(p) => p,
-        None => {
-            // Stale, duplicate, or already-resolved challenge.
-            warn!(
-                sender = sender,
-                "confirm-response for unknown challenge — ignoring"
-            );
-            return Ok(None);
-        }
-    };
-
-    // The authcrypt sender must equal the holder DID the request was
-    // sent to — reject a response from any other DID.
-    if pending.holder_did != sender {
+    if doc.type_uri.to_string() != TASK_CONSENT_DECISION_0_1.as_str() {
         warn!(
             sender = sender,
-            expected = %pending.holder_did,
-            "confirm-response sender does not match addressed holder DID — rejecting"
+            doc_type = %doc.type_uri,
+            "task-consent decision body type does not match the message type — ignoring"
         );
-        // Entry already removed; the parked REST request will time out.
         return Ok(None);
     }
 
-    info!(sender = sender, approved, "confirm-response received");
+    // ── 2. The proof is mandatory: it — not the authcrypt session that
+    //       carried the message — is the authorization.
+    let Some(proof) = doc.proof.as_ref() else {
+        warn!(
+            sender = sender,
+            "task-consent decision carries no proof — ignoring"
+        );
+        return Ok(None);
+    };
+    // The proven signer must be the authcrypt sender (and so, below, the
+    // addressed holder). `TransportBoundVerifier` additionally enforces
+    // `verificationMethod` DID == `issuer` whenever `issuer` is present.
+    let proof_did = proof
+        .verification_method
+        .split_once('#')
+        .map(|(d, _)| d)
+        .unwrap_or(proof.verification_method.as_str());
+    if proof_did != sender {
+        warn!(
+            sender = sender,
+            proof_did = %proof_did,
+            "task-consent decision proof verificationMethod DID does not match the sender — ignoring"
+        );
+        return Ok(None);
+    }
+    if let Some(issuer) = doc.issuer.as_deref()
+        && issuer != sender
+    {
+        warn!(
+            sender = sender,
+            issuer = %issuer,
+            "task-consent decision issuer does not match the sender — ignoring"
+        );
+        return Ok(None);
+    }
+    // Audience binding: a decision signed for another executor must not
+    // resolve a pending consent here.
+    if let (Some(recipient), Some(control_did)) =
+        (doc.recipient.as_deref(), state.config.server_did.as_deref())
+        && recipient != control_did
+    {
+        warn!(
+            sender = sender,
+            recipient = %recipient,
+            "task-consent decision recipient is not this control plane — ignoring"
+        );
+        return Ok(None);
+    }
+    let Some(verifier) = state.trust_tasks_verifier.as_deref() else {
+        warn!("trust-tasks proof verifier not configured — cannot accept consent decisions");
+        return Ok(None);
+    };
+    if let Err(e) = verifier.verify(&doc).await {
+        warn!(
+            sender = sender,
+            error = %e,
+            "task-consent decision proof failed verification — ignoring"
+        );
+        return Ok(None);
+    }
+
+    // ── 3. Typed payload fields, validated BEFORE the pending entry is
+    //       consumed so a malformed decision cannot destroy it.
+    let Some((challenge, digest, approved)) = parse_decision_payload(&doc.payload) else {
+        warn!(
+            sender = sender,
+            "task-consent decision missing challenge/payloadDigest or \
+             carrying an unknown decision — ignoring"
+        );
+        return Ok(None);
+    };
+
+    // ── 4. Match the pending entry and remove it under ONE lock, so two
+    //       decisions for the same challenge can't both fire the sender —
+    //       and so a decision that fails the holder/digest checks leaves
+    //       the legitimate pending entry in place rather than consuming
+    //       it. The proven sender must equal the holder DID the request
+    //       was addressed to, and the echoed digest must be the one we
+    //       sent (the binding between what the human approved and what
+    //       the parked admin call proceeds with).
+    let pending = {
+        let mut map = state.pending_confirms.lock().await;
+        match map.get(challenge) {
+            None => {
+                // Stale, duplicate, lapsed, or already-resolved challenge.
+                warn!(
+                    sender = sender,
+                    "task-consent decision for unknown challenge — ignoring"
+                );
+                return Ok(None);
+            }
+            Some(p) if p.holder_did != sender => {
+                warn!(
+                    sender = sender,
+                    expected = %p.holder_did,
+                    "task-consent decision sender does not match addressed holder DID — rejecting"
+                );
+                return Ok(None);
+            }
+            Some(p) if p.expected_digest != digest => {
+                warn!(
+                    sender = sender,
+                    "task-consent decision payloadDigest does not match the pending request \
+                     — rejecting"
+                );
+                return Ok(None);
+            }
+            Some(_) => map
+                .remove(challenge)
+                .expect("checked present under the same lock"),
+        }
+    };
+
+    info!(sender = sender, approved, "task-consent decision received");
     // Receiver may have already timed out and dropped — ignore the error.
     let _ = pending.tx.send(approved);
-    Ok(None)
+
+    // Spec `#response` acknowledgement: minApprovals is 1, so an approve
+    // is immediately `granted` and a deny is `denied`.
+    let ack = json!({
+        "status": if approved { "granted" } else { "denied" },
+        "payloadDigest": digest,
+        "approvals": if approved { 1 } else { 0 },
+    });
+    Ok(Some(
+        DIDCommResponse::new(TASK_CONSENT_DECISION_RESPONSE_0_1.as_str().to_string(), ack)
+            .thid(message.id.clone()),
+    ))
 }
 
 async fn handle_webvh_message(
@@ -1862,6 +1994,51 @@ mod tests {
     use crate::server::AppState;
 
     use super::*;
+
+    #[test]
+    fn decision_payload_parses_both_spec_decisions() {
+        let approve = json!({
+            "challenge": "9c1f4b7a2e6d80f35a4c9b1e7d2f6083",
+            "payloadDigest": "3b0c7f1d",
+            "decision": "approve",
+        });
+        assert_eq!(
+            parse_decision_payload(&approve),
+            Some(("9c1f4b7a2e6d80f35a4c9b1e7d2f6083", "3b0c7f1d", true))
+        );
+
+        let deny = json!({
+            "challenge": "c",
+            "payloadDigest": "d",
+            "decision": "deny",
+            "reason": "I did not initiate this",
+        });
+        assert_eq!(parse_decision_payload(&deny), Some(("c", "d", false)));
+    }
+
+    /// Anything that is not literally `approve` or `deny` resolves nothing.
+    /// A device must not synthesise an approval, and neither may we — the
+    /// old `confirm-response` shape (`{"approved": bool}`) lands here too,
+    /// so a stale wallet cannot approve anything post-cutover.
+    #[test]
+    fn decision_payload_rejects_anything_but_the_two_spec_values() {
+        for payload in [
+            json!({ "challenge": "c", "payloadDigest": "d", "decision": "approved" }),
+            json!({ "challenge": "c", "payloadDigest": "d", "decision": "" }),
+            json!({ "challenge": "c", "payloadDigest": "d", "decision": true }),
+            json!({ "challenge": "c", "payloadDigest": "d" }),
+            json!({ "challenge": "c", "decision": "approve" }),
+            json!({ "payloadDigest": "d", "decision": "approve" }),
+            // The retired confirm/response/0.1 shape.
+            json!({ "challenge": "c", "approved": true }),
+        ] {
+            assert_eq!(
+                parse_decision_payload(&payload),
+                None,
+                "must not resolve: {payload}"
+            );
+        }
+    }
 
     /// Build a minimal `AppState` backed by a tempdir-rooted fjall store. The
     /// returned `_dir` guard must outlive `state` — when it drops, fjall

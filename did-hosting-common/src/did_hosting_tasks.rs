@@ -146,12 +146,41 @@ pub static TASK_AUTH_STEP_UP_VTA_FINISH_0_2: LazyLock<TrustTask> = LazyLock::new
     TrustTask::new("https://trusttasks.org/spec/auth/step-up/approve-response/0.2").expect("static")
 });
 
-/// `spec/confirm/request/0.1` — canonical RP→wallet/VTA consent
-/// loop. did-hosting uses it for the "park a REST call, await a
-/// holder's DIDComm approve" pattern that backs admin-initiated
-/// sensitive operations.
-pub static TASK_CONFIRM_REQUEST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/spec/confirm/request/0.1").expect("static")
+/// `spec/task-consent/request/0.1` — canonical RP→wallet/VTA consent
+/// loop (the retired `confirm/request/0.1` is superseded by this).
+/// did-hosting uses it for the "park a REST call, await a holder's
+/// DIDComm decision" pattern that backs admin-initiated sensitive
+/// operations: `effects: []` (no dry-run exists for a prose-described
+/// admin action), `minApprovals: 1`, and the admin's action text
+/// carried verbatim in the explicitly-untrusted `note` field.
+pub static TASK_CONSENT_REQUEST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/task-consent/request/0.1").expect("static")
+});
+
+/// `spec/task-consent/decision/0.1` — the wallet's signed answer to a
+/// task-consent request. The Data Integrity proof on the decision — not
+/// the transport session that carried it — is the authorization.
+pub static TASK_CONSENT_DECISION_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/task-consent/decision/0.1").expect("static")
+});
+
+/// `spec/task-consent/decision/0.1#response` — the executor's
+/// acknowledgement of a recorded decision (`granted` / `pending` /
+/// `denied`), per the framework `<type>#response` convention.
+pub static TASK_CONSENT_DECISION_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/task-consent/decision/0.1#response")
+        .expect("static")
+});
+
+/// `did-hosting/admin-action/1.0` — service-local identifier for the
+/// *pending task* a task-consent request concerns when the gated
+/// operation is a prose-described, admin-initiated action with no
+/// registered task of its own. Never routed; referenced only as the
+/// `taskType` bound into a task-consent `payloadDigest`, so a decision
+/// minted for an admin-action prompt can never authorize a registered
+/// task whose payload happens to canonicalize identically.
+pub static TASK_ADMIN_ACTION_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/did-hosting/admin-action/1.0").expect("static")
 });
 
 // -- DID provisioning lifecycle --------------------------------------------
@@ -530,7 +559,10 @@ mod tests {
             &TASK_AUTH_STEP_UP_VTA_START_0_2,
             &TASK_AUTH_STEP_UP_VTA_FINISH_0_1,
             &TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
-            &TASK_CONFIRM_REQUEST_0_1,
+            &TASK_CONSENT_REQUEST_0_1,
+            &TASK_CONSENT_DECISION_0_1,
+            &TASK_CONSENT_DECISION_RESPONSE_0_1,
+            &TASK_ADMIN_ACTION_1_0,
             &TASK_DID_CHECK_NAME_0_1,
             &TASK_DID_CHECK_NAME_RESPONSE_0_1,
             &TASK_DID_REGISTER_0_1,
