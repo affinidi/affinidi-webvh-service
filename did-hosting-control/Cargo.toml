@@ -79,6 +79,10 @@ trust-tasks-https = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 trust-tasks-proof = { workspace = true }
 chrono = { workspace = true }
+# Direct dep for signing the request leg of outbound approval Trust Tasks
+# (task-consent/request, auth/step-up/approve-request) with the control DID's
+# assertion key — see src/signing.rs and issue #147.
+affinidi-data-integrity = { workspace = true }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }

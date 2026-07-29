@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Both approval-request legs the control plane sends are now signed
+  Trust Task documents** (#147). The specs for both families mark the
+  request's Data Integrity proof REQUIRED — the approver renders the
+  request's prose as the basis of a human decision, so the request must
+  be attributable to the relying party by signature, not just by
+  transport attribution — but `did-hosting-control` sent both unsigned:
+
+  - `task-consent/request/0.1` now carries an `eddsa-jcs-2022` proof
+    (`proofPurpose: assertionMethod`) signed with the control DID's
+    assertion key, with `issuer` == the DID of
+    `proof.verificationMethod` == the control DID — the same binding
+    this service's own `TransportBoundVerifier` enforces on the wallet's
+    inbound decision, so the wallet verifies our request exactly the way
+    we verify its answer. The module's documented
+    "authcrypt-attribution-only request leg" deviation is retired.
+  - `POST /api/auth/step-up/vta/start` — previously a bare
+    `{subject, sessionId, challenge, reason}` JSON, not a Trust Task at
+    all — now mints a full signed `auth/step-up/approve-request/0.2`
+    document (issuer = control DID, recipient = the subject DID on the
+    self-approve path, payload per the closed spec schema). For the
+    coordinated rollout the REST response is a superset: the legacy
+    top-level fields are unchanged (deprecated; existing consumers keep
+    parsing them) and the signed document rides alongside in a new
+    `document` field.
+
+  The signing key comes from the service identity's current generation
+  (`signing_kid` + its loaded secret), not the boot-time
+  `signing_key_bytes` seed, so the proof's `verificationMethod` tracks
+  identity rotation and always names a key the published DID document
+  advertises. Signing is hand-rolled on `affinidi-data-integrity` in the
+  new `did_hosting_control::signing` module for now; it moves to the
+  shared `trust_tasks_proof::affinidi::sign_trust_task` helper once that
+  releases. The daemon inherits both changes — it mounts the control
+  plane's router and DIDComm listener unchanged.
+
 ## 0.8.6 (2026-07-29)
 
 ### Changed

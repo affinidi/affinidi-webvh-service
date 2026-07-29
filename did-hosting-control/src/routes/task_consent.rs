@@ -36,13 +36,13 @@
 //! The authcrypt envelope additionally binds the sender: a decision is
 //! only honoured if its authcrypt sender equals the holder DID the
 //! request was sent to AND the proof verifies against that same DID.
-//! The *request* leg deliberately rides on authcrypt attribution alone
-//! (no Data Integrity proof), mirroring this service's step-up
-//! `approve-request` precedent: the authcrypted envelope from the
-//! control DID is what makes the rendered `note`/`effects` attributable
-//! to this RP. This is a documented deviation from the spec's
-//! REQUIRED request proof, acceptable pre-production because the
-//! transport authenticates the same party the proof would.
+//! The *request* leg carries the spec's REQUIRED Data Integrity proof,
+//! signed by the control plane's own DID key (`eddsa-jcs-2022`,
+//! `proofPurpose: assertionMethod`, `issuer` == the DID of
+//! `proof.verificationMethod` == the control DID) — see
+//! [`crate::signing`]. The wallet verifies that proof before rendering
+//! `note`/`effects`; the authcrypt envelope additionally binds the
+//! transport sender to the same DID.
 
 use std::time::Duration;
 
@@ -114,9 +114,67 @@ fn wire_digest(task_type: &str, payload: &Value, challenge: &str) -> Result<Stri
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Build the signed `task-consent/request/0.1` document.
+///
+/// A full Trust Task document, matching the shape the spec's consumers
+/// render. `effects` is empty (no dry-run exists for a prose-described
+/// action) and `consequences` says so; the admin's `action` rides
+/// verbatim in the explicitly-untrusted `note`. The document carries the
+/// spec's REQUIRED Data Integrity proof: `eddsa-jcs-2022`,
+/// `proofPurpose: assertionMethod`, signed by `signing_secret` (the
+/// control DID's assertion key, so `issuer` equals the DID of
+/// `proof.verificationMethod`).
+#[allow(clippy::too_many_arguments)]
+async fn build_signed_request_document(
+    control_did: &str,
+    signing_secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
+    holder_did: &str,
+    requester_did: &str,
+    action: &str,
+    task_type: &str,
+    challenge: &str,
+    digest: &str,
+    issued_at: &str,
+    expires_at: &str,
+) -> Result<Value, AppError> {
+    let request_type = did_hosting_common::did_hosting_tasks::TASK_CONSENT_REQUEST_0_1.as_str();
+    let unsigned = json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": request_type,
+        "issuer": control_did,
+        "recipient": holder_did,
+        "issuedAt": issued_at,
+        "payload": {
+            "challenge": challenge,
+            "taskType": task_type,
+            "payloadDigest": digest,
+            // The gated actions are state-changing admin operations; the
+            // service has no compiled handler to derive a finer class from.
+            "sideEffects": "mutating",
+            "exposure": { "discloses": "none", "actsAsSubject": false },
+            // No dry-run exists for a prose-described admin action, so
+            // effects MUST stay empty and the static fallback text below
+            // carries what is knowable per-task rather than per-request.
+            "effects": [],
+            "consequences": [
+                "Approving authorizes the control-plane administrator to proceed \
+                 with the one admin action described in the requester's note. The \
+                 service cannot compute the action's concrete effects.",
+            ],
+            "requester": requester_did,
+            "note": action,
+            "approverSet": "holder",
+            "minApprovals": 1,
+            "excludeRequester": false,
+            "expiresAt": expires_at,
+        },
+    });
+    crate::signing::sign_trust_task_document(unsigned, signing_secret).await
+}
+
 /// POST /api/task-consent/request — admin-only.
 ///
-/// Generates a random hex `challenge`, sends a
+/// Generates a random hex `challenge`, sends a signed
 /// `task-consent/request/0.1` document to `holder_did`, then waits (up
 /// to 60s) for the wallet's signed `task-consent/decision/0.1`. Returns
 /// `{ "approved": bool }`.
@@ -158,6 +216,10 @@ pub async fn request(
         .get()
         .ok_or_else(|| AppError::Internal("DIDComm service not started".into()))?;
 
+    // The control DID's assertion key — resolved before anything is
+    // registered, so a missing key fails the request cleanly.
+    let signing_secret = crate::signing::control_assertion_secret(&state, &control_did)?;
+
     // Fresh 16-byte (128-bit) challenge, hex-encoded — the spec's
     // entropy floor, and the digest salt.
     let challenge = rand::random::<[u8; 16]>()
@@ -174,6 +236,27 @@ pub async fn request(
     let pending_payload = json!({ "action": req.action });
     let digest = wire_digest(task_type, &pending_payload, &challenge)?;
 
+    let now = chrono::Utc::now();
+    let expires_at = (now + chrono::Duration::from_std(CONSENT_TIMEOUT).expect("static"))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let request_type = did_hosting_common::did_hosting_tasks::TASK_CONSENT_REQUEST_0_1.as_str();
+
+    // Build + sign the document before registering the pending entry, so
+    // a signing failure leaves nothing behind to clean up.
+    let document = build_signed_request_document(
+        &control_did,
+        &signing_secret,
+        &req.holder_did,
+        &auth.0.did,
+        &req.action,
+        task_type,
+        &challenge,
+        &digest,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        &expires_at,
+    )
+    .await?;
+
     // Register the pending entry *before* sending so a fast wallet
     // decision can never arrive before the correlation slot exists.
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
@@ -188,47 +271,6 @@ pub async fn request(
             },
         );
     }
-
-    let now = chrono::Utc::now();
-    let expires_at = (now + chrono::Duration::from_std(CONSENT_TIMEOUT).expect("static"))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let request_type = did_hosting_common::did_hosting_tasks::TASK_CONSENT_REQUEST_0_1.as_str();
-
-    // A full Trust Task document, matching the shape the spec's
-    // consumers render. `effects` is empty (no dry-run exists for a
-    // prose-described action) and `consequences` says so; the admin's
-    // `action` rides verbatim in the explicitly-untrusted `note`.
-    let document = json!({
-        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": request_type,
-        "issuer": control_did,
-        "recipient": req.holder_did,
-        "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "payload": {
-            "challenge": challenge,
-            "taskType": task_type,
-            "payloadDigest": digest,
-            // The gated actions are state-changing admin operations; the
-            // service has no compiled handler to derive a finer class from.
-            "sideEffects": "mutating",
-            "exposure": { "discloses": "none", "actsAsSubject": false },
-            // No dry-run exists for a prose-described admin action, so
-            // effects MUST stay empty and the static fallback text below
-            // carries what is knowable per-task rather than per-request.
-            "effects": [],
-            "consequences": [
-                "Approving authorizes the control-plane administrator to proceed \
-                 with the one admin action described in the requester's note. The \
-                 service cannot compute the action's concrete effects.",
-            ],
-            "requester": auth.0.did,
-            "note": req.action,
-            "approverSet": "holder",
-            "minApprovals": 1,
-            "excludeRequester": false,
-            "expiresAt": expires_at,
-        },
-    });
 
     let message = Message::build(
         uuid::Uuid::new_v4().to_string(),
@@ -314,6 +356,68 @@ mod tests {
             base,
             wire_digest("https://a.example/t/1.0", &payload, "c1").unwrap()
         );
+    }
+
+    /// The outbound request document's proof verifies with the same
+    /// machinery the repo uses for inbound decisions
+    /// (`TransportBoundVerifier`), and the issuer binding holds:
+    /// `issuer` == control DID == the DID of `proof.verificationMethod`.
+    #[tokio::test]
+    async fn signed_request_document_verifies_and_binds_issuer() {
+        use std::sync::Arc;
+
+        use affinidi_data_integrity::DidKeyResolver;
+        use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+        use trust_tasks_rs::{ProofVerifier, TrustTask};
+
+        let (control_did, signer) = crate::signing::test_util::did_key_signer(&[11u8; 32]);
+
+        let task_type = did_hosting_common::did_hosting_tasks::TASK_ADMIN_ACTION_1_0.as_str();
+        let action = "Rotate the registry signing key";
+        let challenge = "00112233445566778899aabbccddeeff";
+        let digest = wire_digest(task_type, &json!({ "action": action }), challenge).unwrap();
+
+        let document = build_signed_request_document(
+            &control_did,
+            &signer,
+            "did:web:holder.example",
+            "did:web:admin.example",
+            action,
+            task_type,
+            challenge,
+            &digest,
+            "2026-07-29T00:00:00Z",
+            "2026-07-29T00:01:00Z",
+        )
+        .await
+        .expect("build + sign");
+
+        // The proof names the assertion key of the issuer DID.
+        assert_eq!(document["issuer"], control_did);
+        let vm = document["proof"]["verificationMethod"]
+            .as_str()
+            .expect("proof carries a verificationMethod");
+        assert_eq!(vm.split('#').next().unwrap(), control_did);
+        assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
+        assert_eq!(document["proof"]["proofPurpose"], "assertionMethod");
+
+        // The proof verifies under the shared verifier (which also
+        // enforces the issuer ↔ verificationMethod binding).
+        let doc: TrustTask<Value> =
+            serde_json::from_value(document.clone()).expect("signed doc parses as a TrustTask");
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify(&doc)
+            .await
+            .expect("request proof verifies");
+
+        // And the signature actually covers the payload: tampering with
+        // the rendered note breaks it.
+        let mut tampered = doc;
+        tampered.payload["note"] = json!("Approve something else entirely");
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify(&tampered)
+            .await
+            .expect_err("tampered note must fail verification");
     }
 
     #[test]

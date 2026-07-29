@@ -439,17 +439,89 @@ fn trust_task_malformed(reason: &str) -> Response {
         .into_response()
 }
 
+/// Build the signed `auth/step-up/approve-request/0.2` document.
+///
+/// A full Trust Task document per the spec: `issuer` = the control DID
+/// (the relying party), `recipient` = the subject DID (self-approve
+/// path — the wallet holding the subject key is the approver), and the
+/// spec's REQUIRED Data Integrity proof (`eddsa-jcs-2022`,
+/// `proofPurpose: assertionMethod`) signed with the control DID's
+/// assertion key, so the wallet can verify the `reason` it renders is
+/// this RP's before surfacing it. The payload carries exactly the
+/// schema's REQUIRED members (`subject`, `sessionId`, `challenge`,
+/// `reason`); the schema is closed (`additionalProperties: false`) and
+/// has no `expiresAt` — expiry is the RP's server-side nonce policy.
+async fn build_signed_step_up_approve_request(
+    control_did: &str,
+    signing_secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
+    subject: &str,
+    session_id: &str,
+    challenge: &str,
+    reason: &str,
+) -> Result<Value, AppError> {
+    use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
+
+    let unsigned = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": TASK_AUTH_STEP_UP_VTA_START_0_2.as_str(),
+        "issuer": control_did,
+        "recipient": subject,
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": {
+            "subject": subject,
+            "sessionId": session_id,
+            "challenge": challenge,
+            "reason": reason,
+        },
+    });
+    crate::signing::sign_trust_task_document(unsigned, signing_secret).await
+}
+
 /// POST /api/auth/step-up/vta/start — issue a step-up nonce bound to the
-/// caller's session. The wallet relays it to the VTA, which signs an
-/// approval committing to it.
+/// caller's session, minted as a signed
+/// `auth/step-up/approve-request/0.2` Trust Task document. The wallet
+/// verifies the document's proof, shows the `reason`, and signs an
+/// approve-response committing to the `challenge`.
+///
+/// Response shape (coordinated-rollout superset):
+/// - `document` — the signed `auth/step-up/approve-request/0.2` Trust
+///   Task document. New consumers MUST use this.
+/// - `subject`, `sessionId`, `challenge`, `reason` — **deprecated**
+///   legacy top-level copies of the document's payload fields, kept
+///   verbatim for existing consumers that parse the bare shape. They
+///   will be removed once the wallet side reads `document`.
 pub async fn step_up_vta_start(
     auth: AuthClaims,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // The control DID signs the request; both are required to finish the
+    // flow anyway (`step_up_vta_finish` needs `server_did` + verifier).
+    let control_did = state.config.server_did.as_deref().ok_or_else(|| {
+        AppError::Config("server_did not configured; cannot sign the step-up request".into())
+    })?;
+    let signing_secret = crate::signing::control_assertion_secret(&state, control_did)?;
+
     let challenge = rand::random::<[u8; 32]>()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    // Spec `auth/step-up/approve-request/0.2` payload fields. The subject is
+    // the session's authenticated DID; the wallet signs an approve-response
+    // that echoes `subject`/`sessionId`/`challenge` and proves control of the
+    // subject key (holder-self-signs — the VTA is no longer in the loop).
+    let reason = "Elevate this session to aal2";
+    let document = build_signed_step_up_approve_request(
+        control_did,
+        &signing_secret,
+        &auth.did,
+        &auth.session_id,
+        &challenge,
+        reason,
+    )
+    .await?;
+
+    // Persist the nonce only after the document signed, so a signing
+    // failure leaves no orphaned challenge bound to the session.
     state
         .sessions_ks
         .insert_raw(
@@ -457,15 +529,15 @@ pub async fn step_up_vta_start(
             challenge.as_bytes().to_vec(),
         )
         .await?;
-    // Spec `auth/step-up/approve-request/0.2` payload fields. The subject is
-    // the session's authenticated DID; the wallet signs an approve-response
-    // that echoes `subject`/`sessionId`/`challenge` and proves control of the
-    // subject key (holder-self-signs — the VTA is no longer in the loop).
+
     Ok(Json(serde_json::json!({
+        // Deprecated legacy fields — kept for wire compatibility during
+        // the coordinated rollout; consumers should move to `document`.
         "subject": auth.did,
         "sessionId": auth.session_id,
         "challenge": challenge,
-        "reason": "Elevate this session to aal2",
+        "reason": reason,
+        "document": document,
     })))
 }
 
@@ -702,4 +774,72 @@ pub async fn refresh(
     )
     .await?;
     Ok(Json(canonical_to_local_auth_response(resp)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use affinidi_data_integrity::DidKeyResolver;
+    use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+    use serde_json::json;
+
+    /// The step-up approve-request document's proof verifies with the
+    /// same machinery the finish leg uses (`TransportBoundVerifier`),
+    /// and the issuer binding holds: `issuer` == control DID == the DID
+    /// of `proof.verificationMethod`.
+    #[tokio::test]
+    async fn signed_step_up_request_verifies_and_binds_issuer() {
+        use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
+
+        let (control_did, signer) = crate::signing::test_util::did_key_signer(&[13u8; 32]);
+
+        let subject = "did:web:alice.example";
+        let session_id = "sess-1234";
+        let challenge = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let document = build_signed_step_up_approve_request(
+            &control_did,
+            &signer,
+            subject,
+            session_id,
+            challenge,
+            "Elevate this session to aal2",
+        )
+        .await
+        .expect("build + sign");
+
+        // Envelope shape per the spec: RP as issuer, approver (the
+        // subject wallet, self-approve path) as recipient.
+        assert_eq!(document["type"], TASK_AUTH_STEP_UP_VTA_START_0_2.as_str());
+        assert_eq!(document["issuer"], control_did);
+        assert_eq!(document["recipient"], subject);
+        assert_eq!(document["payload"]["subject"], subject);
+        assert_eq!(document["payload"]["sessionId"], session_id);
+        assert_eq!(document["payload"]["challenge"], challenge);
+
+        // Proof binding: assertion key of the issuer DID, eddsa-jcs-2022.
+        let vm = document["proof"]["verificationMethod"]
+            .as_str()
+            .expect("proof carries a verificationMethod");
+        assert_eq!(vm.split('#').next().unwrap(), control_did);
+        assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
+        assert_eq!(document["proof"]["proofPurpose"], "assertionMethod");
+
+        // Verifies under the shared verifier (issuer ↔ vm binding included).
+        let doc: TrustTask<Value> =
+            serde_json::from_value(document.clone()).expect("signed doc parses as a TrustTask");
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify(&doc)
+            .await
+            .expect("approve-request proof verifies");
+
+        // The signature covers the rendered reason: tampering breaks it.
+        let mut tampered = doc;
+        tampered.payload["reason"] = json!("Hand over the keys");
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify(&tampered)
+            .await
+            .expect_err("tampered reason must fail verification");
+    }
 }
