@@ -180,7 +180,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 trust-tasks-rs = { version = "0.2", default-features = false }
 trust-tasks-https = { version = "0.2", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.2", default-features = false }
-trust-tasks-proof = { version = "0.2", default-features = false, features = ["affinidi"] }
+trust-tasks-proof = { version = "0.2.2", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for

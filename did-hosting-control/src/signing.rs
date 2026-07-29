@@ -14,12 +14,15 @@
 //! [`did_hosting_common::server::trust_tasks::TransportBoundVerifier`]
 //! enforces on inbound decisions, so a wallet can verify our requests the
 //! same way we verify its answers.
-//
-// TODO: switch to trust_tasks_proof::affinidi::sign_trust_task once released.
+//!
+//! Signing itself is delegated to `trust_tasks_proof::affinidi::sign_trust_task`
+//! (0.2.2+), which additionally pre-flights the in-band `issuer` against the
+//! signing key's DID — so a document whose `issuer` doesn't match the key is
+//! refused at sign time rather than shipped and refused by the wallet.
 
-use affinidi_data_integrity::{DataIntegrityProof, SignOptions, crypto_suites::CryptoSuite};
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde_json::Value;
+use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
 
 use crate::error::AppError;
 use crate::server::AppState;
@@ -79,7 +82,7 @@ pub async fn sign_trust_task_document(
         unsigned.get("proof").is_none(),
         "document to sign must not already carry a proof"
     );
-    let proof = DataIntegrityProof::sign(
+    sign_trust_task(
         &unsigned,
         signing_secret,
         SignOptions::new()
@@ -87,12 +90,7 @@ pub async fn sign_trust_task_document(
             .with_cryptosuite(CryptoSuite::EddsaJcs2022),
     )
     .await
-    .map_err(|e| AppError::Internal(format!("sign trust task document: {e}")))?;
-
-    let mut doc = unsigned;
-    doc["proof"] = serde_json::to_value(&proof)
-        .map_err(|e| AppError::Internal(format!("serialize proof: {e}")))?;
-    Ok(doc)
+    .map_err(|e| AppError::Internal(format!("sign trust task document: {e}")))
 }
 
 #[cfg(test)]
