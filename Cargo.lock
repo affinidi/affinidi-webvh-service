@@ -3099,6 +3099,7 @@ dependencies = [
 name = "did-hosting-control"
 version = "0.8.6"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",

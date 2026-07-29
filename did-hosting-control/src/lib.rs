@@ -32,6 +32,7 @@ pub mod server;
 pub mod server_push;
 pub mod setup;
 pub mod setup_recipe;
+pub mod signing;
 pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
