@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -3142,6 +3142,8 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

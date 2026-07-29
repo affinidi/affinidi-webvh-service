@@ -56,6 +56,10 @@ tokio = { version = "1", features = [
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RFC 8785 JCS canonicalization. Used by the task-consent `payloadDigest`,
+# which the spec defines over the canonical payload so the digest is stable
+# across serializers on both sides of the approval.
+serde_json_canonicalizer = "0.3"
 
 # Error handling
 thiserror = "2"
@@ -75,6 +79,7 @@ rand = "0.10"
 # Cryptography
 ed25519-dalek = "2"
 multibase = "0.9"
+sha2 = "0.10"
 
 # JWT
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }

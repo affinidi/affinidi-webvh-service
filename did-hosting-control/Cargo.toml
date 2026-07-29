@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-control"
 description = "DID Hosting Control Plane — Unified management UI and service registry"
-version = "0.8.3"
+version = "0.8.4"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -101,6 +101,8 @@ webauthn-rs = { workspace = true }
 mime_guess = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = "1.0"

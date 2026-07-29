@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.8.4 (2026-07-29)
+
+### Changed
+
+- **Clean cutover from the retired `confirm/*` pair to the `task-consent`
+  family.** The registry retired `confirm/{request,response}/0.1`
+  (supersededBy `task-consent/{request,decision}`, trust-tasks-tf #156):
+  a confirm *is* a task-consent with empty `effects`, `minApprovals: 1`,
+  and the requester's display text carried in the new explicitly-untrusted
+  `note` field. The control plane's live RP→wallet confirmation flow moved
+  onto the new family wholesale — the confirm URIs are gone, not aliased.
+  - `POST /api/confirm/request` → **`POST /api/task-consent/request`**,
+    identified by `spec/task-consent/request/0.1`. Same admin-only auth,
+    same request body (`holder_did`, `action`), same `{ "approved": bool }`
+    result, same 60-second park-and-wait. The request it now sends is a
+    full Trust Task document rather than a bare body: `effects: []` (this
+    service has no dry-run for a prose-described admin action, and the
+    spec requires an executor without one to leave effects empty),
+    `consequences` carrying that fact in the words the wallet renders when
+    effects are empty, `minApprovals: 1`, `excludeRequester: false`,
+    `expiresAt` matching the park window, and the caller's `action` text
+    verbatim in `note`.
+  - The inbound `confirm-response/1.0` DIDComm handler is replaced by a
+    `spec/task-consent/decision/0.1` handler. **The decision's Data
+    Integrity proof is now mandatory and verified** — under the old pair
+    the authcrypt envelope alone was the authentication, and the wallet's
+    answer carried no signature at all. Per the task-consent spec the
+    proof, not the transport session, is the authorization: the handler
+    requires it, checks the proof's `verificationMethod` DID, the in-band
+    `issuer`, and the authcrypt sender all name the addressed holder,
+    binds `recipient` to this control plane, and then verifies the
+    signature through the existing `TransportBoundVerifier`. It answers
+    with the spec's `#response`
+    (`{status: granted|denied, payloadDigest, approvals}`).
+  - The decision is bound to the request by **`payloadDigest`**, which the
+    old `confirm/response` had no equivalent of: a domain-separated
+    SHA-256 over the RFC 8785 (JCS) canonical pending-task payload, the
+    task type, and the 128-bit `challenge` as salt. The wallet echoes it
+    verbatim and a mismatch is rejected, so an approval can no longer be
+    replayed against a different action under the same challenge. The
+    gated "task" is identified by the service-local
+    `did-hosting/admin-action/1.0` URI (never routed — it exists only to
+    be bound into the digest, so a decision minted for an admin-action
+    prompt cannot authorize a registered task whose payload canonicalizes
+    identically).
+  - A failed holder/digest check no longer consumes the pending entry: the
+    lookup, the checks and the removal now happen under one lock, so a
+    malformed or mis-addressed decision leaves a legitimate in-flight
+    consent intact.
+  - `action` is validated against the schema's 500-character `note` limit
+    and rejected rather than silently truncated.
+
+  **Removed wire identifiers** (no dual-accept — pre-production policy):
+  `https://trusttasks.org/spec/confirm/request/0.1`,
+  `https://trusttasks.org/wallet/confirm/1.0`,
+  `https://trusttasks.org/wallet/confirm-response/1.0`, and the REST route
+  `POST /api/confirm/request`. Wallets must move to the task-consent
+  family; a stale `{"approved": bool}` answer is now unparseable and
+  resolves nothing.
+
+  **Known deviation:** the *request* leg carries no Data Integrity proof,
+  though `task-consent/request/0.1` marks one REQUIRED. It rides on
+  authcrypt attribution from the control DID instead, mirroring this
+  service's existing step-up `approve-request` precedent — the transport
+  authenticates the same party the proof would. Signing the request needs
+  the control plane's issuer key wired into the route; tracked separately.
+
+
 ## 0.8.3 (2026-07-29)
 
 ### Changed
