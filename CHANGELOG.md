@@ -13,8 +13,19 @@
   `vta-sdk ^0.20`; both keep `affinidi-tdk ^0.8`. All five declarations —
   the workspace `vta-sdk` pin plus the four `vti-common` entries in
   `did-hosting-{common,control,server}` and `webvh-witness` — moved in one
-  step, and `cargo tree -d -e normal` lists none of `vta-sdk`,
+  step, and `cargo tree -d -e normal,build,dev` lists none of `vta-sdk`,
   `vti-common` or `affinidi-tdk`.
+
+  The lock's `affinidi-messaging-mediator` moved 0.17.9 → 0.17.13 as part of
+  this, via the `affinidi-messaging-test-mediator` dev-dependency. Below
+  0.17.13 the mediator pins `vta-sdk ^0.19` and so reintroduced a second
+  `vta-sdk` copy in the *dev* graph — invisible to a passing build, because
+  the two copies never meet in one type-checking context. It is also
+  independently required: a mediator below 0.17.13 answers
+  `messaging/account/update` with `501 unsupported Trust Task type` and
+  cannot serve a VTA on messaging SDK 0.18.65, which this workspace moved to
+  in 0.8.5. The integration tests were otherwise running against a mediator
+  that no longer represents production.
 
   **No source changes were needed to compile.** The auth surface this
   service actually consumes did not move: `vti_common::auth::handlers`,

@@ -132,15 +132,16 @@ didwebvh-rs = "0.6"
 # to two vta-sdk copies and fails to compile (E0308 on AuthenticateResponse).
 # The four `vti-common = "0.11.30"` declarations in did-hosting-{common,
 # control,server} and webvh-witness are the other half of that pin; move
-# all five together. Verify afterwards with `cargo tree -d -e normal`,
-# which must list neither `vta-sdk` nor `vti-common` nor `affinidi-tdk`.
+# all five together. Verify afterwards with
+# `cargo tree -d -e normal,build,dev`, which must list none of `vta-sdk`,
+# `vti-common` or `affinidi-tdk` — the dev graph counts here too.
 #
-# Known, accepted duplicate in the *dev* graph only: the
-# `affinidi-messaging-test-mediator` dev-dependency of did-hosting-control
-# pulls `affinidi-messaging-mediator`, which still depends on vta-sdk ^0.19,
-# so `cargo tree -d -e normal,build,dev` shows vta-sdk 0.19.x alongside
-# 0.20.x. Harmless — no type crosses between the test mediator and our code
-# — and it disappears when affinidi-messaging-mediator moves to 0.20.
+# The dev graph is the easy one to miss: `did-hosting-control` dev-depends on
+# `affinidi-messaging-test-mediator`, which pulls `affinidi-messaging-mediator`,
+# which pins vta-sdk itself. A test mediator below 0.17.13 pins vta-sdk ^0.19
+# and reintroduces the second copy behind a build that still passes, because
+# the two copies never meet in one type-checking context. Keep the lock's
+# `affinidi-messaging-mediator` at >= 0.17.13.
 #
 # `tsp` feature: enables the Trust Spanning Protocol client surface
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
