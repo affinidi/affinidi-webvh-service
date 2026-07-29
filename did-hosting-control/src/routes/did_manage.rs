@@ -51,14 +51,32 @@ pub async fn check_name(
 
 // ---------- Agent names (/api/agent-names/*) ----------
 
-/// Body shared by the mutating agent-name verbs. `didLog` is the new signed
-/// `did.jsonl` whose `alsoKnownAs` the op verifies (the spec's `didData`).
+/// Body of `did-management/agent-name/remove/0.1`. The spec names the new
+/// signed `did.jsonl` field `didData`; the pre-cutover `didLog` spelling is
+/// accepted as an alias so in-flight clients keep working.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentNameRequest {
     pub mnemonic: String,
     pub name: String,
+    #[serde(alias = "didData")]
     pub did_log: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Body of `did-management/agent-name/update/0.1` — the declarative
+/// binding-state update that replaced the set / enable / disable verb trio.
+/// `state: active` requires `didData` to claim the name via `alsoKnownAs`;
+/// `state: parked` requires it not to.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNameUpdateRequest {
+    pub mnemonic: String,
+    pub name: String,
+    pub state: did_ops::AgentNameState,
+    #[serde(alias = "didLog")]
+    pub did_data: String,
     #[serde(default)]
     pub domain: Option<String>,
 }
@@ -113,43 +131,28 @@ pub(crate) fn agent_name_record_response(
     serde_json::json!({ "record": crate::messaging::spec_did_record_json(record, &did_url) })
 }
 
-/// `POST /api/agent-names/set` — bind or refresh a name (owner or admin).
-pub async fn set_agent_name(
+/// `POST /api/agent-names/update` — set a name's binding state
+/// (`did-management/agent-name/update/0.1`): `active` binds, refreshes, or
+/// resumes it; `parked` stops it resolving while keeping the reservation.
+/// Owner or admin. Replaces the retired `/agent-names/{set,enable,disable}`
+/// endpoints in the #143 clean cutover.
+pub async fn update_agent_name(
     auth: AuthClaims,
     State(state): State<AppState>,
-    Json(req): Json<AgentNameRequest>,
+    Json(req): Json<AgentNameUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let record = did_ops::set_agent_name(
+    let record = did_ops::update_agent_name(
         &auth,
         &state,
         &req.mnemonic,
         &req.name,
-        &req.did_log,
+        &req.did_data,
         req.domain.as_deref(),
+        req.state,
     )
     .await?;
     server_push::notify_servers_did(&state, req.mnemonic.clone());
-    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name set via REST");
-    Ok(Json(agent_name_record_response(&state, &record)))
-}
-
-/// `POST /api/agent-names/enable` — resume a parked name (owner or admin).
-pub async fn enable_agent_name(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Json(req): Json<AgentNameRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let record = did_ops::enable_agent_name(
-        &auth,
-        &state,
-        &req.mnemonic,
-        &req.name,
-        &req.did_log,
-        req.domain.as_deref(),
-    )
-    .await?;
-    server_push::notify_servers_did(&state, req.mnemonic.clone());
-    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name enabled via REST");
+    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, state = ?req.state, "agent name updated via REST");
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 
@@ -179,27 +182,6 @@ pub async fn remove_agent_name(
     .await?;
     server_push::notify_servers_did(&state, req.mnemonic.clone());
     info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name removed via REST");
-    Ok(Json(agent_name_record_response(&state, &record)))
-}
-
-/// `POST /api/agent-names/disable` — park a name (kept reserved), owner or
-/// admin. Not HTTP step-up-gated, for the same reason as `remove` above.
-pub async fn disable_agent_name(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-    Json(req): Json<AgentNameRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let record = did_ops::disable_agent_name(
-        &auth,
-        &state,
-        &req.mnemonic,
-        &req.name,
-        &req.did_log,
-        req.domain.as_deref(),
-    )
-    .await?;
-    server_push::notify_servers_did(&state, req.mnemonic.clone());
-    info!(did = %auth.did, mnemonic = %req.mnemonic, name = %req.name, "agent name disabled via REST");
     Ok(Json(agent_name_record_response(&state, &record)))
 }
 

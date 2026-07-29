@@ -54,31 +54,41 @@ fn parity_pairs() -> Vec<(&'static str, String, &'static str)> {
             daemon_tasks::TASK_AUTH_REFRESH_0_1.as_str().to_string(),
             client_tasks::TASK_AUTH_REFRESH_0_1,
         ),
-        // DID lifecycle (v0.1 client surface)
+        // DID lifecycle — canonical spec URIs (post-#143 clean cutover)
         (
-            "TASK_DID_CHECK_NAME_1_0",
-            daemon_tasks::TASK_DID_CHECK_NAME_1_0.as_str().to_string(),
-            client_tasks::TASK_DID_CHECK_NAME_1_0,
+            "TASK_DID_CHECK_NAME_0_1",
+            daemon_tasks::TASK_DID_CHECK_NAME_0_1.as_str().to_string(),
+            client_tasks::TASK_DID_CHECK_NAME_0_1,
         ),
         (
-            "TASK_DID_REQUEST_1_0",
-            daemon_tasks::TASK_DID_REQUEST_1_0.as_str().to_string(),
-            client_tasks::TASK_DID_REQUEST_1_0,
+            "TASK_DID_REGISTER_0_1",
+            daemon_tasks::TASK_DID_REGISTER_0_1.as_str().to_string(),
+            client_tasks::TASK_DID_REGISTER_0_1,
         ),
         (
-            "TASK_DID_REGISTER_1_0",
-            daemon_tasks::TASK_DID_REGISTER_1_0.as_str().to_string(),
-            client_tasks::TASK_DID_REGISTER_1_0,
+            "TASK_DID_DELETE_0_1",
+            daemon_tasks::TASK_DID_DELETE_0_1.as_str().to_string(),
+            client_tasks::TASK_DID_DELETE_0_1,
+        ),
+        // Agent names — canonical spec URIs
+        (
+            "TASK_AGENT_NAME_CHECK_0_1",
+            daemon_tasks::TASK_AGENT_NAME_CHECK_0_1.as_str().to_string(),
+            client_tasks::TASK_AGENT_NAME_CHECK_0_1,
         ),
         (
-            "TASK_DID_PUBLISH_1_0",
-            daemon_tasks::TASK_DID_PUBLISH_1_0.as_str().to_string(),
-            client_tasks::TASK_DID_PUBLISH_1_0,
+            "TASK_AGENT_NAME_UPDATE_0_1",
+            daemon_tasks::TASK_AGENT_NAME_UPDATE_0_1
+                .as_str()
+                .to_string(),
+            client_tasks::TASK_AGENT_NAME_UPDATE_0_1,
         ),
         (
-            "TASK_DID_DELETE_1_0",
-            daemon_tasks::TASK_DID_DELETE_1_0.as_str().to_string(),
-            client_tasks::TASK_DID_DELETE_1_0,
+            "TASK_AGENT_NAME_REMOVE_0_1",
+            daemon_tasks::TASK_AGENT_NAME_REMOVE_0_1
+                .as_str()
+                .to_string(),
+            client_tasks::TASK_AGENT_NAME_REMOVE_0_1,
         ),
     ]
 }

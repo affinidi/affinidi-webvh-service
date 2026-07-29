@@ -45,8 +45,10 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // VTA provisioning protocol
         .route(MSG_AUTHENTICATE, handler_fn(handle_authenticate))?
         .route(MSG_DID_REQUEST, handler_fn(handle_webvh_message))?
+        // `did/publish` is retired (spec supersededBy: `did/register`) —
+        // the register arm's owner-update rule carries the reserved-slot
+        // completion the two-step flow used to finish with a publish.
         .route(MSG_DID_REGISTER, handler_fn(handle_webvh_message))?
-        .route(MSG_DID_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_WITNESS_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
@@ -59,14 +61,13 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // `fetch_me_domains_for_caller` so both transports return
         // byte-identical payloads.
         .route(MSG_ME_DOMAINS, handler_fn(handle_webvh_message))?
-        // agent-name/* — net-new DIDComm routes for the six verbs that
-        // shipped REST-only, so a VTA on this transport can name the DIDs
-        // it provisions instead of falling back to HTTPS for that one step.
-        // Each arm calls the same `did_ops` function as its REST twin.
-        .route(MSG_AGENT_NAME_SET, handler_fn(handle_webvh_message))?
+        // agent-name/* — DIDComm routes so a VTA on this transport can name
+        // the DIDs it provisions instead of falling back to HTTPS for that
+        // one step. `update` carries the declarative `state: active|parked`
+        // that replaced the retired set / enable / disable verb trio; each
+        // arm calls the same `did_ops` function as its REST twin.
+        .route(MSG_AGENT_NAME_UPDATE, handler_fn(handle_webvh_message))?
         .route(MSG_AGENT_NAME_REMOVE, handler_fn(handle_webvh_message))?
-        .route(MSG_AGENT_NAME_ENABLE, handler_fn(handle_webvh_message))?
-        .route(MSG_AGENT_NAME_DISABLE, handler_fn(handle_webvh_message))?
         .route(MSG_AGENT_NAME_LIST, handler_fn(handle_webvh_message))?
         .route(MSG_AGENT_NAME_CHECK, handler_fn(handle_webvh_message))?
         // Wallet confirmation response (RP→wallet confirm protocol).
@@ -545,52 +546,6 @@ pub async fn dispatch_did_op(
                 }),
             ))
         }
-        MSG_DID_PUBLISH => {
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            // The v0.1 spec names the log field `didData` (camelCase, like
-            // every other did-management wire field — see register/0.1 +
-            // publish/0.1). `did_log` is the pre-v0.7 legacy alias. Accept
-            // both, preferring the canonical name, so the VTA's spec-correct
-            // `didData` body publishes and old `did_log` clients still work.
-            let did_log = msg
-                .body
-                .get("didData")
-                .or_else(|| msg.body.get("did_log"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'didData' in body".into()))?;
-
-            did_ops::publish_did(auth, state, mnemonic, did_log, None).await?;
-
-            // Read back the record for protocol response fields
-            let record: did_hosting_common::did_ops::DidRecord = state
-                .dids_ks
-                .get(did_key(mnemonic))
-                .await?
-                .ok_or_else(|| AppError::Internal("record missing after publish".into()))?;
-
-            let base_url = state
-                .config
-                .did_hosting_url
-                .as_deref()
-                .or(state.config.public_url.as_deref())
-                .unwrap_or("http://localhost");
-            let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
-
-            server_push::notify_servers_did(state, mnemonic.to_string());
-            Ok((
-                MSG_DID_CONFIRM.to_string(),
-                json!({
-                    "did_id": record.did_id,
-                    "did_url": did_url,
-                    "version_id": record.did_id,
-                    "version_count": record.version_count,
-                }),
-            ))
-        }
         MSG_WITNESS_PUBLISH => {
             let mnemonic = msg
                 .body
@@ -745,86 +700,67 @@ pub async fn dispatch_did_op(
                 serde_json::to_value(resp)?,
             ))
         }
-        MSG_AGENT_NAME_SET
-        | MSG_AGENT_NAME_REMOVE
-        | MSG_AGENT_NAME_ENABLE
-        | MSG_AGENT_NAME_DISABLE => {
-            // The four mutating verbs share one body (`AgentNameRequest`, the
-            // REST type verbatim) and one `{record}` response; they differ
-            // only in which `did_ops` function commits the change and which
-            // `alsoKnownAs` direction that function then demands of `didLog`.
-            let req: crate::routes::did_manage::AgentNameRequest =
-                serde_json::from_value(msg.body.clone()).map_err(|e| {
-                    AppError::Validation(format!("invalid agent-name request body: {e}"))
-                })?;
-
-            // `set` is the fallback arm rather than an explicit one: the outer
-            // pattern already guarantees the type is one of the four, so this
-            // stays exhaustive without an unreachable panic on the wire path.
-            let (response_type, record) = match msg.typ.as_str() {
-                MSG_AGENT_NAME_REMOVE => (
-                    MSG_AGENT_NAME_REMOVE_RESPONSE,
-                    did_ops::remove_agent_name(
-                        auth,
-                        state,
-                        &req.mnemonic,
-                        &req.name,
-                        &req.did_log,
-                        req.domain.as_deref(),
-                    )
-                    .await?,
-                ),
-                MSG_AGENT_NAME_ENABLE => (
-                    MSG_AGENT_NAME_ENABLE_RESPONSE,
-                    did_ops::enable_agent_name(
-                        auth,
-                        state,
-                        &req.mnemonic,
-                        &req.name,
-                        &req.did_log,
-                        req.domain.as_deref(),
-                    )
-                    .await?,
-                ),
-                MSG_AGENT_NAME_DISABLE => (
-                    MSG_AGENT_NAME_DISABLE_RESPONSE,
-                    did_ops::disable_agent_name(
-                        auth,
-                        state,
-                        &req.mnemonic,
-                        &req.name,
-                        &req.did_log,
-                        req.domain.as_deref(),
-                    )
-                    .await?,
-                ),
-                _ => (
-                    MSG_AGENT_NAME_SET_RESPONSE,
-                    did_ops::set_agent_name(
-                        auth,
-                        state,
-                        &req.mnemonic,
-                        &req.name,
-                        &req.did_log,
-                        req.domain.as_deref(),
-                    )
-                    .await?,
-                ),
+        MSG_AGENT_NAME_UPDATE | MSG_AGENT_NAME_REMOVE => {
+            // The two mutating verbs share one `{record}` response. `update`
+            // carries the declarative `state: active | parked` field
+            // (did-management/agent-name/update/0.1); `remove` stays a
+            // separate destructive task (agent-name/remove/0.1). Both carry
+            // the caller's new signed `did.jsonl` (`didData`), whose
+            // `alsoKnownAs` direction the `did_ops` engine verifies against
+            // the requested state.
+            let (response_type, record) = if msg.typ.as_str() == MSG_AGENT_NAME_REMOVE {
+                let req: crate::routes::did_manage::AgentNameRequest =
+                    serde_json::from_value(msg.body.clone()).map_err(|e| {
+                        AppError::Validation(format!("invalid agent-name request body: {e}"))
+                    })?;
+                let record = did_ops::remove_agent_name(
+                    auth,
+                    state,
+                    &req.mnemonic,
+                    &req.name,
+                    &req.did_log,
+                    req.domain.as_deref(),
+                )
+                .await?;
+                server_push::notify_servers_did(state, req.mnemonic.clone());
+                info!(
+                    did = %auth.did,
+                    mnemonic = %req.mnemonic,
+                    name = %req.name,
+                    msg_type = %msg.typ,
+                    "agent name removed via DIDComm"
+                );
+                (MSG_AGENT_NAME_REMOVE_RESPONSE, record)
+            } else {
+                let req: crate::routes::did_manage::AgentNameUpdateRequest =
+                    serde_json::from_value(msg.body.clone()).map_err(|e| {
+                        AppError::Validation(format!("invalid agent-name update body: {e}"))
+                    })?;
+                let record = did_ops::update_agent_name(
+                    auth,
+                    state,
+                    &req.mnemonic,
+                    &req.name,
+                    &req.did_data,
+                    req.domain.as_deref(),
+                    req.state,
+                )
+                .await?;
+                // Every update publishes a new DID version, so hosting
+                // servers need the fan-out the REST handler sends — without
+                // it a name bound over DIDComm would not resolve until the
+                // next full resync.
+                server_push::notify_servers_did(state, req.mnemonic.clone());
+                info!(
+                    did = %auth.did,
+                    mnemonic = %req.mnemonic,
+                    name = %req.name,
+                    state = ?req.state,
+                    "agent name updated via DIDComm"
+                );
+                (MSG_AGENT_NAME_UPDATE_RESPONSE, record)
             };
 
-            // Every verb publishes a new DID version, so hosting servers need
-            // the fan-out the REST handlers send — without it a name bound
-            // over DIDComm would not resolve until the next full resync.
-            server_push::notify_servers_did(state, req.mnemonic.clone());
-            // Same fields the REST handlers log, so an audit of "who changed
-            // this name" doesn't have to know which transport carried it.
-            info!(
-                did = %auth.did,
-                mnemonic = %req.mnemonic,
-                name = %req.name,
-                msg_type = %msg.typ,
-                "agent name changed via DIDComm"
-            );
             Ok((
                 response_type.to_string(),
                 crate::routes::did_manage::agent_name_record_response(state, &record),
@@ -853,7 +789,27 @@ pub async fn dispatch_did_op(
             // Always present, unlike the record projection's conditional
             // `agentNames`: this verb's whole answer is the list, and a client
             // shouldn't have to distinguish "no names" from "field missing".
-            body.insert("agentNames".into(), json!(names));
+            //
+            // Projected per did-management/agent-name/list/0.1: `createdAt`
+            // is an RFC3339 timestamp on the wire (the store keeps epoch
+            // seconds), matching how `spec_did_record_json` projects the
+            // record's own audit fields.
+            let rfc3339 = |secs: u64| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+                    .unwrap_or_default()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            };
+            let entries: Vec<Value> = names
+                .iter()
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "enabled": e.enabled,
+                        "createdAt": rfc3339(e.created_at),
+                    })
+                })
+                .collect();
+            body.insert("agentNames".into(), json!(entries));
             Ok((
                 MSG_AGENT_NAME_LIST_RESPONSE.to_string(),
                 Value::Object(body),
@@ -2049,66 +2005,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_did_op_publish_missing_mnemonic_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DID_PUBLISH, json!({ "did_log": "irrelevant" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_publish_missing_log_field_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DID_PUBLISH, json!({ "mnemonic": "alpha-beta" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        // The canonical (camelCase, spec) field name is surfaced.
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("didData")));
-    }
-
-    /// Contract: the publish handler reads the log from the canonical
-    /// `didData` field (camelCase, matching did-management/did/publish/0.1
-    /// and what the VTA sends). Proven by getting *past* field extraction —
-    /// the request fails later on the unknown mnemonic, not on a missing
-    /// field. Pins the VTA<->host field name so they can't drift again.
-    #[tokio::test]
-    async fn dispatch_did_op_publish_reads_did_data_field() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_DID_PUBLISH,
-            json!({ "mnemonic": "alpha-beta", "method": "webvh", "didData": "log-content" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(
-            matches!(err, AppError::NotFound(_)),
-            "didData must be read (then fail on unknown mnemonic), got: {err:?}"
-        );
-    }
-
-    /// Contract: the legacy snake_case `did_log` alias still publishes, so
-    /// pre-v0.7 clients keep working.
-    #[tokio::test]
-    async fn dispatch_did_op_publish_accepts_legacy_did_log_alias() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_DID_PUBLISH,
-            json!({ "mnemonic": "alpha-beta", "did_log": "log-content" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(
-            matches!(err, AppError::NotFound(_)),
-            "legacy did_log must still be read, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn dispatch_did_op_witness_missing_mnemonic_validation() {
         let (state, _dir) = test_state().await;
         let msg = build_msg(MSG_WITNESS_PUBLISH, json!({ "witness": {} }));
@@ -2989,13 +2885,13 @@ mod tests {
     }
 
     /// A body missing a required field is a client error, not a 500 — the
-    /// mutating verbs deserialise the REST `AgentNameRequest` verbatim.
+    /// update verb deserialises the REST `AgentNameUpdateRequest` verbatim.
     #[tokio::test]
-    async fn dispatch_agent_name_set_missing_name_is_validation() {
+    async fn dispatch_agent_name_update_missing_name_is_validation() {
         let (state, _dir) = test_state().await;
         let msg = build_msg(
-            MSG_AGENT_NAME_SET,
-            json!({ "mnemonic": "alpha-beta", "didLog": "{}" }),
+            MSG_AGENT_NAME_UPDATE,
+            json!({ "mnemonic": "alpha-beta", "state": "active", "didData": "{}" }),
         );
         let auth = owner_auth("did:example:caller");
 
@@ -3003,36 +2899,54 @@ mod tests {
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("agent-name")));
     }
 
-    /// `set` reaches `did_ops::set_agent_name` for the slot's owner: a
-    /// malformed `didLog` is rejected there as an invalid log, proving
-    /// delegation rather than a dispatch-table dead end.
+    /// A `state` outside the spec enum is a client error — the declarative
+    /// field only accepts `active` / `parked` (release is `remove`'s job).
     #[tokio::test]
-    async fn dispatch_agent_name_set_reaches_did_ops() {
+    async fn dispatch_agent_name_update_invalid_state_is_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_AGENT_NAME_UPDATE,
+            json!({ "mnemonic": "alpha-beta", "name": "alice", "state": "released", "didData": "{}" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("agent-name")));
+    }
+
+    /// `update {state: active}` reaches `did_ops::update_agent_name` for the
+    /// slot's owner: a malformed `didData` is rejected there as an invalid
+    /// log, proving delegation rather than a dispatch-table dead end. The
+    /// pre-cutover `didLog` spelling is accepted as an alias.
+    #[tokio::test]
+    async fn dispatch_agent_name_update_reaches_did_ops() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner-a";
         seed_did(&state, owner, "alpha-beta").await;
 
-        let msg = build_msg(
-            MSG_AGENT_NAME_SET,
-            json!({ "mnemonic": "alpha-beta", "name": "alice", "didLog": "not-a-valid-log" }),
-        );
-        let auth = owner_auth(owner);
+        for field in ["didData", "didLog"] {
+            let msg = build_msg(
+                MSG_AGENT_NAME_UPDATE,
+                json!({ "mnemonic": "alpha-beta", "name": "alice", "state": "active", field: "not-a-valid-log" }),
+            );
+            let auth = owner_auth(owner);
 
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert_eq!(map_app_error_code(&err), "e.p.did.invalid-log");
+            let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+            assert_eq!(map_app_error_code(&err), "e.p.did.invalid-log");
+        }
     }
 
     /// A reserved name is refused before any storage read, and surfaces as the
-    /// dedicated `name_reserved` code rather than a generic validation error.
+    /// dedicated reserved-name code rather than a generic validation error.
     #[tokio::test]
-    async fn dispatch_agent_name_set_reserved_name_rejected() {
+    async fn dispatch_agent_name_update_reserved_name_rejected() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner-a";
         seed_did(&state, owner, "alpha-beta").await;
 
         let msg = build_msg(
-            MSG_AGENT_NAME_SET,
-            json!({ "mnemonic": "alpha-beta", "name": "admin", "didLog": "irrelevant" }),
+            MSG_AGENT_NAME_UPDATE,
+            json!({ "mnemonic": "alpha-beta", "name": "admin", "state": "active", "didData": "irrelevant" }),
         );
         let auth = owner_auth(owner);
 
@@ -3098,7 +3012,11 @@ mod tests {
             names[0].get("enabled").and_then(|v| v.as_bool()),
             Some(true)
         );
-        assert_eq!(names[0].get("createdAt").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(
+            names[0].get("createdAt").and_then(|v| v.as_str()),
+            Some("1970-01-01T00:00:07Z"),
+            "createdAt is projected to RFC3339 per agent-name/list/0.1"
+        );
         assert_eq!(
             names[1].get("enabled").and_then(|v| v.as_bool()),
             Some(false),

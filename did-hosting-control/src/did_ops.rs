@@ -877,61 +877,71 @@ pub async fn publish_did(
 // Agent names
 // ---------------------------------------------------------------------------
 
-/// Which agent-name verb a request carries. Selects the `alsoKnownAs`
+/// Which agent-name operation a request carries. Selects the `alsoKnownAs`
 /// direction the submitted document must satisfy and the registry mutation
 /// applied on commit.
+///
+/// `Activate` / `Park` are the two values of the declarative
+/// `did-management/agent-name/update/0.1` `state` field (`active` /
+/// `parked`); `Remove` is the separate destructive
+/// `did-management/agent-name/remove/0.1` task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentNameOp {
-    /// Bind (or refresh) a name; the document MUST claim it.
-    Set,
+    /// `state: active` — bind a free name, refresh an existing binding, or
+    /// resume a parked one; the document MUST claim the name.
+    Activate,
     /// Release a name for anyone to reclaim; the document MUST no longer claim
     /// it. Destructive.
     Remove,
-    /// Resume serving a parked name; the document MUST claim it again.
-    Enable,
-    /// Park a name — kept reserved, but stops resolving; the document MUST no
-    /// longer claim it.
-    Disable,
+    /// `state: parked` — kept reserved, but stops resolving; the document MUST
+    /// no longer claim it.
+    Park,
+}
+
+/// Desired binding state carried by `did-management/agent-name/update/0.1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentNameState {
+    Active,
+    Parked,
 }
 
 impl AgentNameOp {
-    /// Whether the submitted document must claim the name for this verb.
+    /// Whether the submitted document must claim the name for this operation.
     ///
-    /// `set`/`enable` make a name resolvable, so the signed document has to
-    /// claim it; `remove`/`disable` take it out of service, so the document
+    /// `active` makes a name resolvable, so the signed document has to
+    /// claim it; `remove`/`parked` take it out of service, so the document
     /// must *not* — this is what keeps the served state and the signed
     /// document from ever diverging (the spec's Layer-1 invariant).
     fn requires_claim(self) -> bool {
-        matches!(self, AgentNameOp::Set | AgentNameOp::Enable)
+        matches!(self, AgentNameOp::Activate)
     }
 }
 
-/// Bind a human-memorable agent name to a hosted DID (`example.com/@alice`),
-/// or refresh an existing binding.
+/// Set the binding state of an agent name per
+/// `did-management/agent-name/update/0.1` — the declarative replacement for
+/// the retired set / enable / disable verb trio.
 ///
-/// The caller submits the new signed DID document (`did_log`) whose
-/// `alsoKnownAs` claims the name; the host verifies the claim and commits the
-/// name binding and the new document version in one batch, so there is never a
-/// moment where the name resolves but the document does not claim it. See the
-/// `did-management/agent-name/set` Trust Task specification.
-pub async fn set_agent_name(
+/// `Active` binds a free name (`example.com/@alice`), refreshes an existing
+/// binding, or resumes a parked one; the submitted signed document
+/// (`did_log`, the spec's `didData`) must claim the name via `alsoKnownAs`.
+/// `Parked` stops the name resolving while keeping its reservation; the
+/// document must no longer claim it. Requesting the state the binding is
+/// already in is an idempotent refresh, per the spec.
+pub async fn update_agent_name(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
     name: &str,
     did_log: &str,
     request_domain: Option<&str>,
+    desired: AgentNameState,
 ) -> Result<DidRecord, AppError> {
-    apply_agent_name_op(
-        auth,
-        state,
-        mnemonic,
-        name,
-        did_log,
-        request_domain,
-        AgentNameOp::Set,
-    )
-    .await
+    let op = match desired {
+        AgentNameState::Active => AgentNameOp::Activate,
+        AgentNameState::Parked => AgentNameOp::Park,
+    };
+    apply_agent_name_op(auth, state, mnemonic, name, did_log, request_domain, op).await
 }
 
 /// Release an agent name so anyone may reclaim it. The submitted document must
@@ -954,52 +964,6 @@ pub async fn remove_agent_name(
         did_log,
         request_domain,
         AgentNameOp::Remove,
-    )
-    .await
-}
-
-/// Resume serving a previously parked (disabled) agent name. The submitted
-/// document must claim the name again. See `did-management/agent-name/enable`.
-pub async fn enable_agent_name(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    name: &str,
-    did_log: &str,
-    request_domain: Option<&str>,
-) -> Result<DidRecord, AppError> {
-    apply_agent_name_op(
-        auth,
-        state,
-        mnemonic,
-        name,
-        did_log,
-        request_domain,
-        AgentNameOp::Enable,
-    )
-    .await
-}
-
-/// Park an agent name: it stops resolving but stays reserved to this DID (so
-/// nobody else can claim it). The submitted document must no longer claim the
-/// name. Consumers gate this behind operator step-up (enforced at the
-/// Trust-Task surface, not here). See `did-management/agent-name/disable`.
-pub async fn disable_agent_name(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-    name: &str,
-    did_log: &str,
-    request_domain: Option<&str>,
-) -> Result<DidRecord, AppError> {
-    apply_agent_name_op(
-        auth,
-        state,
-        mnemonic,
-        name,
-        did_log,
-        request_domain,
-        AgentNameOp::Disable,
     )
     .await
 }
@@ -1067,9 +1031,10 @@ async fn apply_agent_name_op(
     // Verb-specific precondition + registry mutation, yielding the index
     // side-effect to fold into the commit batch below.
     let index_write = match op {
-        AgentNameOp::Set => {
+        AgentNameOp::Activate => {
             // A name already bound to a *different* DID on this domain is
-            // taken; the same DID re-setting is an idempotent refresh.
+            // taken; the same DID re-activating is an idempotent refresh, and
+            // a parked entry is resumed (upsert flips `enabled` back on).
             if let Some(bytes) = state.dids_ks.get_raw(index_key.clone()).await?
                 && bytes != mnemonic.as_bytes()
             {
@@ -1078,31 +1043,19 @@ async fn apply_agent_name_op(
             upsert_agent_name(&mut record.agent_names, &name, now_epoch());
             IndexWrite::Insert
         }
-        AgentNameOp::Enable => {
+        AgentNameOp::Park => {
             let entry = record
                 .agent_names
                 .iter_mut()
                 .find(|e| e.name == name)
                 .ok_or(AgentNameError::NotFound)?;
-            if entry.enabled {
-                return Err(AgentNameError::NotDisabled.into());
-            }
-            entry.enabled = true;
-            IndexWrite::Insert
-        }
-        AgentNameOp::Disable => {
-            let entry = record
-                .agent_names
-                .iter_mut()
-                .find(|e| e.name == name)
-                .ok_or(AgentNameError::NotFound)?;
-            if !entry.enabled {
-                return Err(AgentNameError::AlreadyDisabled.into());
-            }
+            // Declarative: parking an already-parked name is an idempotent
+            // refresh (the submitted document still republishes), not a
+            // conflict — the spec has no already_disabled error class.
             entry.enabled = false;
-            // Keep the index: a parked name stays reserved, so a later `set`
-            // by another DID still sees it as taken. The name's own `enabled`
-            // flag is what stops it resolving.
+            // Keep the index: a parked name stays reserved, so a later
+            // `active` claim by another DID still sees it as taken. The
+            // name's own `enabled` flag is what stops it resolving.
             IndexWrite::Keep
         }
         AgentNameOp::Remove => {
@@ -3171,6 +3124,61 @@ mod tests_atomic {
             .expect("register");
     }
 
+    /// Test shims over `update_agent_name` keeping the historical verb
+    /// names readable in the assertions below: `set` / `enable` are both
+    /// `state: active` (the declarative spec folds bind / refresh / resume
+    /// into one value), `disable` is `state: parked`.
+    async fn set_agent_name(
+        auth: &AuthClaims,
+        state: &AppState,
+        mnemonic: &str,
+        name: &str,
+        did_log: &str,
+        domain: Option<&str>,
+    ) -> Result<DidRecord, AppError> {
+        update_agent_name(
+            auth,
+            state,
+            mnemonic,
+            name,
+            did_log,
+            domain,
+            AgentNameState::Active,
+        )
+        .await
+    }
+
+    async fn enable_agent_name(
+        auth: &AuthClaims,
+        state: &AppState,
+        mnemonic: &str,
+        name: &str,
+        did_log: &str,
+        domain: Option<&str>,
+    ) -> Result<DidRecord, AppError> {
+        set_agent_name(auth, state, mnemonic, name, did_log, domain).await
+    }
+
+    async fn disable_agent_name(
+        auth: &AuthClaims,
+        state: &AppState,
+        mnemonic: &str,
+        name: &str,
+        did_log: &str,
+        domain: Option<&str>,
+    ) -> Result<DidRecord, AppError> {
+        update_agent_name(
+            auth,
+            state,
+            mnemonic,
+            name,
+            did_log,
+            domain,
+            AgentNameState::Parked,
+        )
+        .await
+    }
+
     /// Happy path: the document claims the name, so it binds — the entry is
     /// enabled, the index points at the slot, and the version advances.
     #[tokio::test]
@@ -3447,15 +3455,18 @@ mod tests_atomic {
             "a parked name keeps its index entry (stays reserved)"
         );
 
-        // Disabling again is a no-op error.
+        // Parking again is an idempotent refresh (declarative state), not a
+        // conflict — the entry stays parked and the reservation stays.
         let dropped2 = build_test_did_log_with_names("control.test", path, &[]).await;
-        let err = disable_agent_name(&owner_auth(owner), &state, path, "alice", &dropped2, None)
+        let record = disable_agent_name(&owner_auth(owner), &state, path, "alice", &dropped2, None)
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::AgentName(AgentNameError::AlreadyDisabled)
-        ));
+            .expect("idempotent park");
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && !e.enabled)
+        );
     }
 
     /// Enable resumes a parked name; the document must claim it again.
@@ -3471,15 +3482,18 @@ mod tests_atomic {
             .await
             .expect("set");
 
-        // Enabling an already-enabled name is refused.
+        // Activating an already-active name is an idempotent refresh
+        // (declarative state), not a conflict.
         let claims = build_test_did_log_with_names("control.test", path, &["alice"]).await;
-        let err = enable_agent_name(&owner_auth(owner), &state, path, "alice", &claims, None)
+        let record = enable_agent_name(&owner_auth(owner), &state, path, "alice", &claims, None)
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::AgentName(AgentNameError::NotDisabled)
-        ));
+            .expect("idempotent activate");
+        assert!(
+            record
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled)
+        );
 
         // Park it, then re-enable with a document that claims it again.
         let dropped = build_test_did_log_with_names("control.test", path, &[]).await;
@@ -3498,16 +3512,18 @@ mod tests_atomic {
         );
     }
 
-    /// Enabling a name that was never bound is a not-found.
+    /// Parking a name that was never bound is a not-found — there is no
+    /// reservation to keep. (Activating an unbound name is a bind, per the
+    /// declarative spec, so the not-found class only exists for `parked`.)
     #[tokio::test]
-    async fn enable_agent_name_unknown_is_not_found() {
+    async fn park_agent_name_unknown_is_not_found() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
-        let path = "slot-enable-unknown";
+        let path = "slot-park-unknown";
         register_owned(&state, owner, path).await;
 
-        let claims = build_test_did_log_with_names("control.test", path, &["ghost"]).await;
-        let err = enable_agent_name(&owner_auth(owner), &state, path, "ghost", &claims, None)
+        let dropped = build_test_did_log_with_names("control.test", path, &[]).await;
+        let err = disable_agent_name(&owner_auth(owner), &state, path, "ghost", &dropped, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::AgentName(AgentNameError::NotFound)));

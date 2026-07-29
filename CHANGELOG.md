@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.8.3 (2026-07-29)
+
+### Changed
+
+- **Clean cutover to the consolidated `did-management` state-enum tasks
+  (#143).** The registry collapsed the state-toggle verb sets into
+  declarative state-enum tasks, and this service now speaks only the
+  canonical URIs:
+  - `did-management/agent-name/update/0.1` (`state: active | parked`)
+    replaces `agent-name/{set,enable,disable}/0.1` on the DIDComm dispatch
+    table, the Trust-Task envelope, and REST (`POST /api/agent-names/update`
+    replaces `/set`, `/enable`, `/disable`). `agent-name/remove` stays its
+    own destructive task, now on its canonical
+    `did-management/agent-name/remove/0.1` URI. The update/remove payloads
+    accept the pre-cutover `didLog` spelling as an alias for the spec's
+    `didData`. Parking or re-activating a name that is already in the
+    requested state is now an idempotent refresh, not a conflict
+    (declarative-state semantics per the spec).
+  - `did-management/did/publish/0.1` is retired (spec supersededBy:
+    `did/register`): the DIDComm publish route, the typed-envelope publish
+    op, and the `did-hosting/did/publish/1.0` REST header are gone.
+    `PUT /api/dids/{*mnemonic}` (unchanged handler) is now identified by
+    `did-management/did/register/0.1` — a register from the slot's owner is
+    an update, which is exactly the operation publish carried.
+  - The REST `Trust-Task` surface dropped the legacy `did-hosting/*/1.0`
+    identifiers for every operation that has a registry spec, replacing
+    them with the canonical `spec/did-management/*` (and
+    `spec/webvh/witness/publish/0.1`) URIs; `did/{enable,disable}` and
+    `domain/{enable,disable}` endpoints are identified by the new
+    `did/set-state/0.1` / `domain/set-state/0.1` tasks.
+  - `agent-name/{check,list}/0.1` now have registry specs; `list` responses
+    project `createdAt` as RFC3339 per the spec (the store keeps epoch
+    seconds).
+  - Removed identifiers are listed in the PR body so downstream clients
+    (VTA, CLI) can be swept; ops with no registry spec (stats, timeseries,
+    config, acl `1.0`, registry list/get/health, did log/raw-log,
+    agent-name/resolve, domain/list, step-up-check) keep their
+    `did-hosting/*/1.0` identifiers unchanged.
+
+
 ## 0.8.2 (2026-07-15)
 
 ### Added
