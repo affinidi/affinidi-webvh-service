@@ -317,6 +317,8 @@ mod tests {
             subject: subject.into(),
             role: role.into(),
             scopes: vec![],
+            allowed_keys: None,
+            approve: None,
             label: Some("test entry".into()),
             created_at: None,
             created_by: None,

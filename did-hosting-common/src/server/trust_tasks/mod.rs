@@ -64,7 +64,10 @@ use crate::server::store::KeyspaceHandle;
 /// the variant.
 #[derive(Debug)]
 pub enum TypedInbound {
-    Grant(TrustTask<grant::v0_1::Payload>),
+    // Boxed: `AclEntry` carries the widest payload in this enum (scopes,
+    // step-up, approve authority, key filter), so an unboxed variant sets the
+    // size of every inbound message. See clippy::large_enum_variant.
+    Grant(Box<TrustTask<grant::v0_1::Payload>>),
     Revoke(TrustTask<revoke::v0_1::Payload>),
     ChangeRole(TrustTask<change_role::v0_1::Payload>),
     Show(TrustTask<show::v0_1::Payload>),
@@ -81,7 +84,7 @@ pub enum TypedInbound {
 /// handler.
 pub fn build_dispatcher() -> Dispatcher<TypedInbound> {
     Dispatcher::new()
-        .on::<grant::v0_1::Payload, _>(TypedInbound::Grant)
+        .on::<grant::v0_1::Payload, _>(|d| TypedInbound::Grant(Box::new(d)))
         .on::<revoke::v0_1::Payload, _>(TypedInbound::Revoke)
         .on::<change_role::v0_1::Payload, _>(TypedInbound::ChangeRole)
         .on::<show::v0_1::Payload, _>(TypedInbound::Show)
@@ -266,7 +269,7 @@ where
         Err(err) => return DispatchOutcome::Rejected(err),
     };
     match typed {
-        TypedInbound::Grant(d) => handlers::grant::handle(ctx, transport, policy, d).await,
+        TypedInbound::Grant(d) => handlers::grant::handle(ctx, transport, policy, *d).await,
         TypedInbound::Revoke(d) => handlers::revoke::handle(ctx, transport, policy, d).await,
         TypedInbound::ChangeRole(d) => {
             handlers::change_role::handle(ctx, transport, policy, d).await
