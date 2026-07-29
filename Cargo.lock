@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "affinidi-tdk",
  "async-trait",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",

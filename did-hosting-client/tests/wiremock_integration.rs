@@ -25,7 +25,7 @@ use std::sync::Arc;
 use did_hosting_client::auth::HostingSigningIdentityOwned;
 use did_hosting_client::trust_tasks::{
     TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_CHALLENGE_0_1, TASK_AUTH_REFRESH_0_1,
-    TASK_DID_PUBLISH_1_0,
+    TASK_DID_REGISTER_0_1,
 };
 use did_hosting_client::{
     AuthedClient, Client, ClientError, InMemoryTokenStore, ServerLocks, SharedTokenStore, TokenData,
@@ -155,7 +155,7 @@ async fn publish_401_maps_to_auth_error() {
     let server = mock_server().await;
     Mock::given(method("PUT"))
         .and(path("/api/dids/alice"))
-        .and(header("trust-task", TASK_DID_PUBLISH_1_0))
+        .and(header("trust-task", TASK_DID_REGISTER_0_1))
         .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
         .mount(&server)
         .await;

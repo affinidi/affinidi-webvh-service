@@ -76,23 +76,23 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/registry/{instance_id}/domains/{domain}/assign",
             post(registry::assign_domain_to_server),
-            (*TASK_DOMAIN_ASSIGN_1_0).clone(),
+            (*TASK_DOMAIN_ASSIGN_0_1).clone(),
         )
         .route_with_task_permissive(
             "/registry/{instance_id}/domains/{domain}/unassign",
             post(registry::unassign_domain_from_server),
-            (*TASK_DOMAIN_UNASSIGN_1_0).clone(),
+            (*TASK_DOMAIN_UNASSIGN_0_1).clone(),
         )
         // T30: admin "Purge now". Bypasses the grace period.
         .route_with_task_permissive(
             "/registry/{instance_id}/domains/{domain}/purge",
             post(registry::purge_domain_on_server),
-            (*TASK_DOMAIN_PURGE_1_0).clone(),
+            (*TASK_DOMAIN_PURGE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/register-service",
             post(registry::register_service),
-            (*TASK_SERVER_REGISTER_1_0).clone(),
+            (*TASK_SERVER_REGISTER_0_1).clone(),
         )
         .into_router();
 
@@ -100,20 +100,24 @@ pub fn router_without_fallback() -> Router<AppState> {
     // `/dids/register` carries the full did.jsonl in the body too — same
     // ceiling, same router so the limit applies uniformly.
     let upload_routes: Router<AppState> = TrustTaskRouter::new()
+        // `did/publish` is retired (spec supersededBy: `did/register`): the
+        // canonical task for "upload a new signed log for a slot I own" —
+        // including completing a reserved slot — is a register, whose
+        // owner-update rule makes this the same operation.
         .route_with_task_permissive(
             "/dids/{*mnemonic}",
             put(did_manage::upload_did),
-            (*TASK_DID_PUBLISH_1_0).clone(),
+            (*TASK_DID_REGISTER_0_1).clone(),
         )
         .route_with_task_permissive(
             "/witness/{*mnemonic}",
             put(did_manage::upload_witness),
-            (*TASK_WEBVH_WITNESS_PUBLISH_1_0).clone(),
+            (*TASK_WEBVH_WITNESS_PUBLISH_0_1).clone(),
         )
         .route_with_task_permissive(
             "/dids/register",
             post(did_manage::register_did),
-            (*TASK_DID_REGISTER_1_0).clone(),
+            (*TASK_DID_REGISTER_0_1).clone(),
         )
         // Agent-name mutations carry the new signed did.jsonl in the body, so
         // they share the register/publish body ceiling. All four require the
@@ -127,24 +131,14 @@ pub fn router_without_fallback() -> Router<AppState> {
         // type-to-confirm. `remove_reaches_did_ops_without_step_up` and
         // `disable_reaches_did_ops_without_step_up` pin the current behaviour.
         .route_with_task_permissive(
-            "/agent-names/set",
-            post(did_manage::set_agent_name),
-            (*TASK_AGENT_NAME_SET_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/agent-names/enable",
-            post(did_manage::enable_agent_name),
-            (*TASK_AGENT_NAME_ENABLE_1_0).clone(),
+            "/agent-names/update",
+            post(did_manage::update_agent_name),
+            (*TASK_AGENT_NAME_UPDATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/agent-names/remove",
             post(did_manage::remove_agent_name),
-            (*TASK_AGENT_NAME_REMOVE_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/agent-names/disable",
-            post(did_manage::disable_agent_name),
-            (*TASK_AGENT_NAME_DISABLE_1_0).clone(),
+            (*TASK_AGENT_NAME_REMOVE_0_1).clone(),
         )
         .into_router()
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
@@ -267,40 +261,40 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/domains/{name}",
             put(domain::update_domain_route).delete(domain::delete_domain_route),
-            (*TASK_DOMAIN_UPDATE_1_0).clone(),
+            (*TASK_DOMAIN_UPDATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/domains/{name}/disable",
             post(domain::disable_domain_route),
-            (*TASK_DOMAIN_DISABLE_1_0).clone(),
+            (*TASK_DOMAIN_SET_STATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/domains/{name}/enable",
             post(domain::enable_domain_route),
-            (*TASK_DOMAIN_DISABLE_1_0).clone(),
+            (*TASK_DOMAIN_SET_STATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/domains/{name}/set-default",
             post(domain::set_default_domain_route),
-            (*TASK_DOMAIN_SET_DEFAULT_1_0).clone(),
+            (*TASK_DOMAIN_SET_DEFAULT_0_1).clone(),
         )
         .route_with_task_permissive(
             "/me/domains",
             get(domain::list_my_domains),
-            (*TASK_ME_DOMAINS_1_0).clone(),
+            (*TASK_ME_DOMAINS_0_1).clone(),
         )
         // DID management (authenticated)
         .route_with_task_permissive(
             "/dids/check",
             post(did_manage::check_name),
-            (*TASK_DID_CHECK_NAME_1_0).clone(),
+            (*TASK_DID_CHECK_NAME_0_1).clone(),
         )
         // Agent-name availability probe (read-only; the mutating verbs carry
         // a did.jsonl and live in `upload_routes` under the larger body limit).
         .route_with_task_permissive(
             "/agent-names/check",
             post(did_manage::check_agent_name),
-            (*TASK_AGENT_NAME_CHECK_1_0).clone(),
+            (*TASK_AGENT_NAME_CHECK_0_1).clone(),
         )
         // DID -> names, the reverse of the `/@name` redirect. Read-only and
         // batched; sits here rather than in `upload_routes` because it carries
@@ -313,12 +307,12 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/dids",
             post(did_manage::request_uri).get(did_manage::list_dids),
-            (*TASK_DID_REQUEST_1_0).clone(),
+            (*TASK_DID_CHECK_NAME_0_1).clone(),
         )
         .route_with_task_permissive(
             "/dids/{*mnemonic}",
             get(did_manage::get_did).delete(did_manage::delete_did),
-            (*TASK_DID_INFO_1_0).clone(),
+            (*TASK_DID_INFO_0_1).clone(),
         )
         .route_with_task_permissive(
             "/log/{*mnemonic}",
@@ -328,22 +322,22 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route_with_task_permissive(
             "/owner/{*mnemonic}",
             put(did_manage::change_owner),
-            (*TASK_DID_CHANGE_OWNER_1_0).clone(),
+            (*TASK_DID_CHANGE_OWNER_0_1).clone(),
         )
         .route_with_task_permissive(
             "/disable/{*mnemonic}",
             put(did_manage::disable_did),
-            (*TASK_DID_DISABLE_1_0).clone(),
+            (*TASK_DID_SET_STATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/enable/{*mnemonic}",
             put(did_manage::enable_did),
-            (*TASK_DID_ENABLE_1_0).clone(),
+            (*TASK_DID_SET_STATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/rollback/{*mnemonic}",
             post(did_manage::rollback_did),
-            (*TASK_DID_ROLLBACK_1_0).clone(),
+            (*TASK_DID_ROLLBACK_0_1).clone(),
         )
         .route_with_task_permissive(
             "/raw/{*mnemonic}",

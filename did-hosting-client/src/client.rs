@@ -310,7 +310,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_CHECK_NAME_1_0)?)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_CHECK_NAME_0_1)?)
             .bearer_auth(access_token)
             .json(&Body { path, domain })
             .send()
@@ -339,7 +339,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REQUEST_1_0)?)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_CHECK_NAME_0_1)?)
             .bearer_auth(access_token)
             .json(&Body { path, force })
             .send()
@@ -369,7 +369,7 @@ impl Client {
         let resp = self
             .http
             .post(url)
-            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REGISTER_1_0)?)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REGISTER_0_1)?)
             .bearer_auth(access_token)
             .json(req)
             .send()
@@ -398,7 +398,7 @@ impl Client {
         let resp = self
             .http
             .put(url)
-            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_PUBLISH_1_0)?)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_REGISTER_0_1)?)
             .bearer_auth(access_token)
             .header("content-type", content_type)
             .body(body)
@@ -415,7 +415,7 @@ impl Client {
         let resp = self
             .http
             .delete(url)
-            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_DELETE_1_0)?)
+            .headers(self.trust_task_headers(crate::trust_tasks::TASK_DID_DELETE_0_1)?)
             .bearer_auth(access_token)
             .send()
             .await

@@ -1,10 +1,10 @@
 //! HTTP-shape coverage for the agent-name REST surface
-//! (`POST /api/agent-names/{set,remove,enable,disable,check}`).
+//! (`POST /api/agent-names/{update,remove,check,resolve}`).
 //!
 //! Drives the full Axum router in-process via `tower::ServiceExt::oneshot`.
 //! The point of these tests is the wiring the `did_ops` unit tests can't
 //! reach: that the routes are actually registered, that the JWT-Bearer gate
-//! runs, and that the destructive verbs (`remove`/`disable`) reach `did_ops`
+//! runs, and that the destructive verbs (`remove`/parking) reach `did_ops`
 //! on a plain **aal1** session. That last one is a regression pin, not an
 //! oversight: these verbs were briefly aal2 step-up-gated, but the gate was
 //! uncallable — the VTA's did-hosting session is aal1 by construction — so
@@ -87,7 +87,8 @@ async fn remove_reaches_did_ops_without_step_up() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `disable` is likewise owner-or-admin, not step-up-gated.
+/// Parking (`update {state: parked}`) is likewise owner-or-admin, not
+/// step-up-gated.
 #[tokio::test]
 async fn disable_reaches_did_ops_without_step_up() {
     let h = make_harness().await;
@@ -98,9 +99,9 @@ async fn disable_reaches_did_ops_without_step_up() {
 
     let resp = app(&h)
         .oneshot(post(
-            "/api/agent-names/disable",
+            "/api/agent-names/update",
             Some(&token),
-            json!({ "mnemonic": "aliceslot", "name": "alice", "didLog": "not-a-valid-log" }),
+            json!({ "mnemonic": "aliceslot", "name": "alice", "state": "parked", "didData": "not-a-valid-log" }),
         ))
         .await
         .expect("router responds");
@@ -122,9 +123,11 @@ async fn remove_without_auth_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// `set` is NOT step-up-gated (an aal1 owner may bind). The route is wired and
-/// delegates to `did_ops`: a malformed `didLog` is rejected there with 400
-/// (not 404), proving both registration and delegation.
+/// `update {state: active}` is NOT step-up-gated (an aal1 owner may bind).
+/// The route is wired and delegates to `did_ops`: a malformed `didData` is
+/// rejected there with 400 (not 404), proving both registration and
+/// delegation. Exercised for both the spec's `didData` field and the
+/// pre-cutover `didLog` alias.
 #[tokio::test]
 async fn set_route_is_wired_and_delegates() {
     let h = make_harness().await;
@@ -133,16 +136,18 @@ async fn set_route_is_wired_and_delegates() {
     h.seed_did(owner, "aliceslot").await;
     let token = h.mint_token(owner, Role::Owner).await;
 
-    let resp = app(&h)
-        .oneshot(post(
-            "/api/agent-names/set",
-            Some(&token),
-            json!({ "mnemonic": "aliceslot", "name": "alice", "didLog": "not-a-valid-log" }),
-        ))
-        .await
-        .expect("router responds");
-    // Reached the handler + did_ops (400), not an unrouted 404.
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    for field in ["didData", "didLog"] {
+        let resp = app(&h)
+            .oneshot(post(
+                "/api/agent-names/update",
+                Some(&token),
+                json!({ "mnemonic": "aliceslot", "name": "alice", "state": "active", field: "not-a-valid-log" }),
+            ))
+            .await
+            .expect("router responds");
+        // Reached the handler + did_ops (400), not an unrouted 404.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 /// `check` reports availability for a free name (aal1 is fine — it's a read).

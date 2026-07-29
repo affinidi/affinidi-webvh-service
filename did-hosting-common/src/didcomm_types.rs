@@ -39,16 +39,14 @@ pub const MSG_AUTH_RESPONSE: &str = "https://trusttasks.org/spec/auth/authentica
 pub const MSG_DID_REQUEST: &str = "https://trusttasks.org/spec/did-management/did/check-name/0.1";
 pub const MSG_DID_OFFER: &str =
     "https://trusttasks.org/spec/did-management/did/check-name/0.1#response";
-pub const MSG_DID_PUBLISH: &str = "https://trusttasks.org/spec/did-management/did/publish/0.1";
-pub const MSG_DID_CONFIRM: &str =
-    "https://trusttasks.org/spec/did-management/did/publish/0.1#response";
-/// Atomic claim-and-publish in a single call. Use when the caller already has
-/// a complete `did.jsonl` for a known path and needs slot allocation +
-/// content upload to land in one transaction (e.g. registering an existing
-/// serverless DID with this server). The two-step
-/// `MSG_DID_REQUEST` + `MSG_DID_PUBLISH` flow has a window where the slot
-/// is allocated but empty; this flow has no such gap, so existing
-/// resolvers never see a 404 between the two calls.
+/// Atomic claim-and-publish in a single call — and, since the retirement
+/// of `did-management/did/publish/0.1` (spec supersededBy: `did/register`),
+/// the ONLY publish surface: a register against a slot the caller already
+/// owns (including a reserved-but-empty one from `MSG_DID_REQUEST` with
+/// `reserve: true`) is accepted as an owner update, which is exactly the
+/// operation the retired publish task carried. One-shot register also
+/// avoids the window where a reserved slot is allocated but empty, so
+/// existing resolvers never see a 404 between the two calls.
 pub const MSG_DID_REGISTER: &str = "https://trusttasks.org/spec/did-management/did/register/0.1";
 pub const MSG_DID_REGISTER_CONFIRM: &str =
     "https://trusttasks.org/spec/did-management/did/register/0.1#response";
@@ -80,7 +78,7 @@ pub const MSG_ME_DOMAINS: &str = "https://trusttasks.org/spec/did-management/me/
 // Agent names (`domain/@name` bound to a hosted DID)
 // ---------------------------------------------------------------------------
 //
-// Net-new in DIDComm form: the six verbs shipped REST-only, so a VTA that
+// Net-new in DIDComm form: the verbs shipped REST-only, so a VTA that
 // speaks DIDComm/TSP could provision a DID but could not name it. Each verb
 // dispatches to the same `did_ops::*_agent_name` function the REST handler
 // calls, so the two transports cannot drift.
@@ -91,22 +89,19 @@ pub const MSG_ME_DOMAINS: &str = "https://trusttasks.org/spec/did-management/me/
 // with `did-hosting-client`. The dispatcher matches on `MSG_*`, and every
 // other DIDComm verb declares its request/response pair here.
 
-pub const MSG_AGENT_NAME_SET: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/set/0.1";
-pub const MSG_AGENT_NAME_SET_RESPONSE: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/set/0.1#response";
+/// Declarative binding-state update (`state: "active" | "parked"`), the
+/// canonical replacement for the retired set / enable / disable verb trio
+/// (spec supersededBy: `did-management/agent-name/update`). `active` binds
+/// a free name, refreshes an existing binding, or resumes a parked one;
+/// `parked` stops the name resolving while keeping its reservation.
+pub const MSG_AGENT_NAME_UPDATE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/update/0.1";
+pub const MSG_AGENT_NAME_UPDATE_RESPONSE: &str =
+    "https://trusttasks.org/spec/did-management/agent-name/update/0.1#response";
 pub const MSG_AGENT_NAME_REMOVE: &str =
     "https://trusttasks.org/spec/did-management/agent-name/remove/0.1";
 pub const MSG_AGENT_NAME_REMOVE_RESPONSE: &str =
     "https://trusttasks.org/spec/did-management/agent-name/remove/0.1#response";
-pub const MSG_AGENT_NAME_ENABLE: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/enable/0.1";
-pub const MSG_AGENT_NAME_ENABLE_RESPONSE: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/enable/0.1#response";
-pub const MSG_AGENT_NAME_DISABLE: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/disable/0.1";
-pub const MSG_AGENT_NAME_DISABLE_RESPONSE: &str =
-    "https://trusttasks.org/spec/did-management/agent-name/disable/0.1#response";
 pub const MSG_AGENT_NAME_LIST: &str =
     "https://trusttasks.org/spec/did-management/agent-name/list/0.1";
 pub const MSG_AGENT_NAME_LIST_RESPONSE: &str =

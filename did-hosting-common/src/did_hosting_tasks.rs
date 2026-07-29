@@ -156,83 +156,13 @@ pub static TASK_CONFIRM_REQUEST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
 
 // -- DID provisioning lifecycle --------------------------------------------
 //
-// Two URI generations co-exist for the DID-lifecycle operations:
-//
-// 1. The historical `did-hosting/did/*/1.0` namespace used by handlers,
-//    REST headers, and the alias table's canonical column today. These
-//    constants are suffixed `_1_0`.
-// 2. The canonical Trust-Task spec URIs under
-//    `spec/did-management/did/*/0.1` — the source of truth per
-//    `dtgwg-trust-tasks-tf`. New code SHOULD emit these; the alias
-//    table also accepts them as inbound forms so VTA and other clients
-//    that already speak spec URIs round-trip cleanly. These constants
-//    are suffixed `_0_1` and pair with a `_RESPONSE_0_1` for the
-//    framework `#response` fragment convention (SPEC §4.4.1).
-//
-// Phase 3 of the cross-repo did-management migration retires the `_1_0`
-// constants once all in-flight clients move; until then both forms are
-// supported and the alias table keeps inbound dispatch agnostic.
-
-pub static TASK_DID_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/request/1.0").expect("static")
-});
-
-pub static TASK_DID_OFFER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/offer/1.0").expect("static")
-});
-
-pub static TASK_DID_PUBLISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/publish/1.0").expect("static")
-});
-
-pub static TASK_DID_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/confirm/1.0").expect("static")
-});
-
-pub static TASK_DID_REGISTER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/register/1.0").expect("static")
-});
-
-pub static TASK_DID_REGISTER_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/register-confirm/1.0").expect("static")
-});
-
-pub static TASK_DID_INFO_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/info-request/1.0").expect("static")
-});
-
-pub static TASK_DID_INFO_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/info/1.0").expect("static")
-});
-
-pub static TASK_DID_LIST_REQUEST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/list-request/1.0").expect("static")
-});
-
-pub static TASK_DID_LIST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/list/1.0").expect("static")
-});
-
-pub static TASK_DID_DELETE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/delete/1.0").expect("static")
-});
-
-pub static TASK_DID_DELETE_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/delete-confirm/1.0").expect("static")
-});
-
-pub static TASK_DID_CHANGE_OWNER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/change-owner/1.0").expect("static")
-});
-
-pub static TASK_DID_CHANGE_OWNER_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/change-owner-confirm/1.0")
-        .expect("static")
-});
-
-pub static TASK_DID_PROBLEM_REPORT_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/problem-report/1.0").expect("static")
-});
+// Canonical Trust-Task spec URIs only (Phase 3 of the cross-repo
+// did-management migration, affinidi/affinidi-webvh-service#143): the
+// historical `did-hosting/did/*/1.0` constants and their paired
+// `*-confirm` / `*-offer` / `*-ack` response forms were removed in the
+// clean cutover — the framework `<type>#response` convention (SPEC
+// §4.4.1) replaces the pair-URL scheme, and every operation routes on
+// its `spec/did-management/...` URI.
 
 // -- DID-management Trust-Task spec URIs (canonical per dtgwg-trust-tasks-tf) -
 //
@@ -260,15 +190,6 @@ pub static TASK_DID_REGISTER_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
 
 pub static TASK_DID_REGISTER_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/spec/did-management/did/register/0.1#response")
-        .expect("static")
-});
-
-pub static TASK_DID_PUBLISH_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/spec/did-management/did/publish/0.1").expect("static")
-});
-
-pub static TASK_DID_PUBLISH_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/spec/did-management/did/publish/0.1#response")
         .expect("static")
 });
 
@@ -323,31 +244,77 @@ pub static TASK_ME_DOMAINS_RESPONSE_0_1: LazyLock<TrustTask> = LazyLock::new(|| 
         .expect("static")
 });
 
+/// `spec/did-management/did/set-state/0.1` — declarative hosting state
+/// (`active` | `suspended`), the canonical replacement for the retired
+/// `did/enable` + `did/disable` pair.
+pub static TASK_DID_SET_STATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/set-state/0.1").expect("static")
+});
+
+/// `spec/did-management/did/rollback/0.1` — canonical rollback task.
+pub static TASK_DID_ROLLBACK_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/did/rollback/0.1").expect("static")
+});
+
+// Agent names — bind/release/park/resume a human-memorable `/@name` on a
+// hosted DID, on their canonical spec URIs. `update` carries the
+// declarative `state: active | parked` that replaced the retired
+// set / enable / disable verb trio; `remove` stays its own task (the
+// destructive release is separately auditable by design).
+pub static TASK_AGENT_NAME_UPDATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/agent-name/update/0.1")
+        .expect("static")
+});
+pub static TASK_AGENT_NAME_REMOVE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/agent-name/remove/0.1")
+        .expect("static")
+});
+pub static TASK_AGENT_NAME_CHECK_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/agent-name/check/0.1")
+        .expect("static")
+});
+pub static TASK_AGENT_NAME_LIST_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/agent-name/list/0.1")
+        .expect("static")
+});
+
+// Domain management on canonical spec URIs. `set-state` carries the
+// declarative `state: active | disabled` that replaced the retired
+// `domain/enable` + `domain/disable` pair. `domain/list` has no registry
+// spec yet and stays on its legacy identifier below.
+pub static TASK_DOMAIN_CREATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/create/0.1").expect("static")
+});
+pub static TASK_DOMAIN_UPDATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/update/0.1").expect("static")
+});
+pub static TASK_DOMAIN_SET_STATE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/set-state/0.1")
+        .expect("static")
+});
+pub static TASK_DOMAIN_SET_DEFAULT_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/set-default/0.1")
+        .expect("static")
+});
+pub static TASK_DOMAIN_PURGE_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/purge/0.1").expect("static")
+});
+pub static TASK_DOMAIN_ASSIGN_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/assign/0.1").expect("static")
+});
+pub static TASK_DOMAIN_UNASSIGN_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/domain/unassign/0.1")
+        .expect("static")
+});
+
+/// `spec/did-management/server/register/0.1` — canonical server
+/// self-registration with the control plane.
+pub static TASK_SERVER_REGISTER_0_1: LazyLock<TrustTask> = LazyLock::new(|| {
+    TrustTask::new("https://trusttasks.org/spec/did-management/server/register/0.1")
+        .expect("static")
+});
+
 // -- Hosting infrastructure (server registration, health, stats) ------------
-
-pub static TASK_SERVER_REGISTER_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/register/1.0").expect("static")
-});
-
-pub static TASK_SERVER_REGISTER_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/register-ack/1.0").expect("static")
-});
-
-pub static TASK_SERVER_HEALTH_PING_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/health-ping/1.0").expect("static")
-});
-
-pub static TASK_SERVER_HEALTH_PONG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/health-pong/1.0").expect("static")
-});
-
-pub static TASK_SERVER_STATS_SYNC_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/stats-sync/1.0").expect("static")
-});
-
-pub static TASK_SERVER_STATS_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/server/stats-ack/1.0").expect("static")
-});
 
 // -- Domain management (new in multi-domain release) -----------------------
 //
@@ -356,38 +323,6 @@ pub static TASK_SERVER_STATS_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 
 pub static TASK_DOMAIN_LIST_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/domain/list/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_CREATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/create/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_UPDATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/update/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/disable/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_SET_DEFAULT_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/set-default/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_PURGE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/purge/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_ASSIGN_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/assign/1.0").expect("static")
-});
-
-pub static TASK_DOMAIN_UNASSIGN_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/domain/unassign/1.0").expect("static")
-});
-
-pub static TASK_ME_DOMAINS_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/me/domains/1.0").expect("static")
 });
 
 // -- T8b: REST-only operations that don't have a DIDComm equivalent ---------
@@ -463,20 +398,8 @@ pub static TASK_ACL_DELETE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 
 // DID management — REST-specific helpers (the DIDComm-paired ones are
 // above).
-pub static TASK_DID_CHECK_NAME_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/check-name/1.0").expect("static")
-});
 pub static TASK_DID_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/did/log/1.0").expect("static")
-});
-pub static TASK_DID_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/disable/1.0").expect("static")
-});
-pub static TASK_DID_ENABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/enable/1.0").expect("static")
-});
-pub static TASK_DID_ROLLBACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/did/rollback/1.0").expect("static")
 });
 pub static TASK_DID_RAW_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
     TrustTask::new("https://trusttasks.org/did-hosting/did/raw-log/1.0").expect("static")
@@ -486,21 +409,6 @@ pub static TASK_DID_RAW_LOG_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 // hosted DID. The DIDComm/TSP-paired framework payloads live in
 // `did-hosting-control::trust_tasks_did`; these are the REST-surface task
 // identifiers.
-pub static TASK_AGENT_NAME_CHECK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/check/1.0").expect("static")
-});
-pub static TASK_AGENT_NAME_SET_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/set/1.0").expect("static")
-});
-pub static TASK_AGENT_NAME_REMOVE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/remove/1.0").expect("static")
-});
-pub static TASK_AGENT_NAME_ENABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/enable/1.0").expect("static")
-});
-pub static TASK_AGENT_NAME_DISABLE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/did-hosting/agent-name/disable/1.0").expect("static")
-});
 /// DID → names, the reverse of the `/@name` redirect. Batched, because its
 /// callers are display surfaces holding several DIDs at once and a per-DID
 /// round-trip would make a name cost more than the identifier it replaces.
@@ -555,30 +463,6 @@ pub static TASK_REGISTRY_HEALTH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
 // Witness + sync are protocol features of did:webvh's append-only log.
 // did:web has no analog (single did.json, no log, no witness signature).
 // Future per-method protocol ops live under `webs/...` / `webplus/...`.
-
-pub static TASK_WEBVH_WITNESS_PUBLISH_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/witness-publish/1.0").expect("static")
-});
-
-pub static TASK_WEBVH_WITNESS_CONFIRM_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/witness-confirm/1.0").expect("static")
-});
-
-pub static TASK_WEBVH_SYNC_UPDATE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/sync-update/1.0").expect("static")
-});
-
-pub static TASK_WEBVH_SYNC_UPDATE_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/sync-update-ack/1.0").expect("static")
-});
-
-pub static TASK_WEBVH_SYNC_DELETE_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/sync-delete/1.0").expect("static")
-});
-
-pub static TASK_WEBVH_SYNC_DELETE_ACK_1_0: LazyLock<TrustTask> = LazyLock::new(|| {
-    TrustTask::new("https://trusttasks.org/webvh/did/sync-delete-ack/1.0").expect("static")
-});
 
 // -- webvh Trust-Task spec URIs (canonical per dtgwg-trust-tasks-tf) ---------
 //
@@ -637,28 +521,20 @@ mod tests {
         let all: &[&LazyLock<TrustTask>] = &[
             &TASK_AUTH_AUTHENTICATE_0_1,
             &TASK_AUTH_AUTHENTICATE_RESPONSE_0_1,
+            &TASK_AUTH_STEP_UP_PASSKEY_START_0_1,
+            &TASK_AUTH_STEP_UP_PASSKEY_START_0_2,
+            &TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1,
+            &TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2,
+            &TASK_AUTH_STEP_UP_CHECK_1_0,
+            &TASK_AUTH_STEP_UP_VTA_START_0_1,
+            &TASK_AUTH_STEP_UP_VTA_START_0_2,
+            &TASK_AUTH_STEP_UP_VTA_FINISH_0_1,
+            &TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
             &TASK_CONFIRM_REQUEST_0_1,
-            &TASK_DID_REQUEST_1_0,
-            &TASK_DID_OFFER_1_0,
-            &TASK_DID_PUBLISH_1_0,
-            &TASK_DID_CONFIRM_1_0,
-            &TASK_DID_REGISTER_1_0,
-            &TASK_DID_REGISTER_CONFIRM_1_0,
-            &TASK_DID_INFO_REQUEST_1_0,
-            &TASK_DID_INFO_1_0,
-            &TASK_DID_LIST_REQUEST_1_0,
-            &TASK_DID_LIST_1_0,
-            &TASK_DID_DELETE_1_0,
-            &TASK_DID_DELETE_CONFIRM_1_0,
-            &TASK_DID_CHANGE_OWNER_1_0,
-            &TASK_DID_CHANGE_OWNER_CONFIRM_1_0,
-            &TASK_DID_PROBLEM_REPORT_1_0,
             &TASK_DID_CHECK_NAME_0_1,
             &TASK_DID_CHECK_NAME_RESPONSE_0_1,
             &TASK_DID_REGISTER_0_1,
             &TASK_DID_REGISTER_RESPONSE_0_1,
-            &TASK_DID_PUBLISH_0_1,
-            &TASK_DID_PUBLISH_RESPONSE_0_1,
             &TASK_DID_DELETE_0_1,
             &TASK_DID_DELETE_RESPONSE_0_1,
             &TASK_DID_PROBLEM_REPORT_0_1,
@@ -670,62 +546,36 @@ mod tests {
             &TASK_DID_CHANGE_OWNER_RESPONSE_0_1,
             &TASK_ME_DOMAINS_0_1,
             &TASK_ME_DOMAINS_RESPONSE_0_1,
-            &TASK_SERVER_REGISTER_1_0,
-            &TASK_SERVER_REGISTER_ACK_1_0,
-            &TASK_SERVER_HEALTH_PING_1_0,
-            &TASK_SERVER_HEALTH_PONG_1_0,
-            &TASK_SERVER_STATS_SYNC_1_0,
-            &TASK_SERVER_STATS_ACK_1_0,
+            &TASK_DID_SET_STATE_0_1,
+            &TASK_DID_ROLLBACK_0_1,
+            &TASK_AGENT_NAME_UPDATE_0_1,
+            &TASK_AGENT_NAME_REMOVE_0_1,
+            &TASK_AGENT_NAME_CHECK_0_1,
+            &TASK_AGENT_NAME_LIST_0_1,
+            &TASK_DOMAIN_CREATE_0_1,
+            &TASK_DOMAIN_UPDATE_0_1,
+            &TASK_DOMAIN_SET_STATE_0_1,
+            &TASK_DOMAIN_SET_DEFAULT_0_1,
+            &TASK_DOMAIN_PURGE_0_1,
+            &TASK_DOMAIN_ASSIGN_0_1,
+            &TASK_DOMAIN_UNASSIGN_0_1,
+            &TASK_SERVER_REGISTER_0_1,
             &TASK_DOMAIN_LIST_1_0,
-            &TASK_DOMAIN_CREATE_1_0,
-            &TASK_DOMAIN_UPDATE_1_0,
-            &TASK_DOMAIN_DISABLE_1_0,
-            &TASK_DOMAIN_SET_DEFAULT_1_0,
-            &TASK_DOMAIN_PURGE_1_0,
-            &TASK_DOMAIN_ASSIGN_1_0,
-            &TASK_DOMAIN_UNASSIGN_1_0,
-            &TASK_ME_DOMAINS_1_0,
-            &TASK_WEBVH_WITNESS_PUBLISH_1_0,
-            &TASK_WEBVH_WITNESS_CONFIRM_1_0,
-            &TASK_WEBVH_SYNC_UPDATE_1_0,
-            &TASK_WEBVH_SYNC_UPDATE_ACK_1_0,
-            &TASK_WEBVH_SYNC_DELETE_1_0,
-            &TASK_WEBVH_SYNC_DELETE_ACK_1_0,
-            &TASK_WEBVH_WITNESS_PUBLISH_0_1,
-            &TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1,
-            &TASK_WEBVH_SYNC_UPDATE_0_1,
-            &TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1,
-            &TASK_WEBVH_SYNC_DELETE_0_1,
-            &TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1,
-            // T8b: REST-specific.
             &TASK_AUTH_CHALLENGE_0_1,
             &TASK_AUTH_REFRESH_0_1,
             &TASK_AUTH_PASSKEY_ENROLL_START_0_1,
             &TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1,
             &TASK_AUTH_PASSKEY_LOGIN_START_0_1,
-            &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1,
             &TASK_AUTH_PASSKEY_LOGIN_START_0_2,
+            &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1,
             &TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2,
-            &TASK_AUTH_STEP_UP_PASSKEY_START_0_2,
-            &TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2,
-            &TASK_AUTH_STEP_UP_VTA_START_0_2,
-            &TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
             &TASK_AUTH_PASSKEY_INVITE_0_1,
             &TASK_ACL_LIST_1_0,
             &TASK_ACL_CREATE_1_0,
             &TASK_ACL_UPDATE_1_0,
             &TASK_ACL_DELETE_1_0,
-            &TASK_DID_CHECK_NAME_1_0,
             &TASK_DID_LOG_1_0,
-            &TASK_DID_DISABLE_1_0,
-            &TASK_DID_ENABLE_1_0,
-            &TASK_DID_ROLLBACK_1_0,
             &TASK_DID_RAW_LOG_1_0,
-            &TASK_AGENT_NAME_CHECK_1_0,
-            &TASK_AGENT_NAME_SET_1_0,
-            &TASK_AGENT_NAME_REMOVE_1_0,
-            &TASK_AGENT_NAME_ENABLE_1_0,
-            &TASK_AGENT_NAME_DISABLE_1_0,
             &TASK_AGENT_NAME_RESOLVE_1_0,
             &TASK_STATS_SERVER_1_0,
             &TASK_STATS_DID_1_0,
@@ -738,6 +588,12 @@ mod tests {
             &TASK_REGISTRY_GET_1_0,
             &TASK_REGISTRY_DEREGISTER_1_0,
             &TASK_REGISTRY_HEALTH_1_0,
+            &TASK_WEBVH_WITNESS_PUBLISH_0_1,
+            &TASK_WEBVH_WITNESS_PUBLISH_RESPONSE_0_1,
+            &TASK_WEBVH_SYNC_UPDATE_0_1,
+            &TASK_WEBVH_SYNC_UPDATE_RESPONSE_0_1,
+            &TASK_WEBVH_SYNC_DELETE_0_1,
+            &TASK_WEBVH_SYNC_DELETE_RESPONSE_0_1,
         ];
         for lock in all {
             let _t = lock.as_str(); // force deref; expect() inside LazyLock
@@ -752,9 +608,9 @@ mod tests {
     #[test]
     fn method_agnostic_urls_under_did_hosting() {
         for url in [
-            TASK_DID_REQUEST_1_0.as_str(),
             TASK_DOMAIN_LIST_1_0.as_str(),
-            TASK_SERVER_REGISTER_1_0.as_str(),
+            TASK_DID_LOG_1_0.as_str(),
+            TASK_REGISTRY_LIST_1_0.as_str(),
         ] {
             assert!(
                 url.starts_with("https://trusttasks.org/did-hosting/"),
@@ -764,14 +620,14 @@ mod tests {
     }
 
     #[test]
-    fn webvh_specific_urls_under_webvh() {
+    fn webvh_specific_urls_under_spec_webvh() {
         for url in [
-            TASK_WEBVH_WITNESS_PUBLISH_1_0.as_str(),
-            TASK_WEBVH_SYNC_UPDATE_1_0.as_str(),
+            TASK_WEBVH_WITNESS_PUBLISH_0_1.as_str(),
+            TASK_WEBVH_SYNC_UPDATE_0_1.as_str(),
         ] {
             assert!(
-                url.starts_with("https://trusttasks.org/webvh/"),
-                "expected /webvh/ namespace: {url}"
+                url.starts_with("https://trusttasks.org/spec/webvh/"),
+                "expected /spec/webvh/ namespace: {url}"
             );
         }
     }
@@ -780,9 +636,9 @@ mod tests {
     fn every_url_ends_in_a_maj_min_version() {
         let all: &[&LazyLock<TrustTask>] = &[
             &TASK_AUTH_AUTHENTICATE_0_1,
-            &TASK_DID_REQUEST_1_0,
+            &TASK_DID_CHECK_NAME_0_1,
             &TASK_DOMAIN_LIST_1_0,
-            &TASK_WEBVH_SYNC_UPDATE_1_0,
+            &TASK_WEBVH_SYNC_UPDATE_0_1,
         ];
         for lock in all {
             let url = lock.as_str();
