@@ -655,6 +655,16 @@ async fn select_webvh_target(
 /// reads the catalogue without spinning up a mediator session. Falls back
 /// to a DIDComm session against a DIDComm-only VTA so the picker still
 /// works there.
+///
+/// A **TSP-only** VTA is not supported here and returns an error, which the
+/// caller degrades to serverless. Before vta-sdk 0.20 this case could not be
+/// distinguished: `resolve_vta` synthesised a REST URL from the VTA DID's own
+/// domain when it found no `#vta-rest`, so a TSP-only VTA arrived looking like
+/// a REST one and the REST leg below failed at the network call instead. 0.20
+/// reports `ResolvedVta.tsp_mediator_did` and stops inventing the URL, so the
+/// failure is now honest and immediate. Adding a TSP leg means routing the
+/// catalogue reads over `vta_sdk`'s TSP transport — deliberately out of scope
+/// for the dependency bump that surfaced this.
 async fn connect_setup_client(
     resolved: &ResolvedVta,
     setup_key: &EphemeralSetupKey,
@@ -685,6 +695,14 @@ async fn connect_setup_client(
         )
         .await
         .map_err(|e| format!("VTA DIDComm connection failed: {e}").into());
+    }
+
+    if resolved.tsp_mediator_did.is_some() {
+        return Err(
+            "VTA advertises only a TSP transport, which the hosting-server \
+                    picker does not speak; register the server manually"
+                .into(),
+        );
     }
 
     Err("VTA advertises neither a REST nor a DIDComm transport".into())

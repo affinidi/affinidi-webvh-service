@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-common"
 description = "DID Hosting Common, Common methods and structs related to WebVH Content"
-version = "0.8.5"
+version = "0.8.6"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -103,14 +103,16 @@ vta-sdk = { workspace = true }
 # The git-pinned rev that lived here through the pre-publish
 # window is gone.
 #
-# 0.11.4 re-pins onto vta-sdk ^0.19 + affinidi-tdk ^0.8. Keep in lockstep
+# 0.11.30 re-pins onto vta-sdk ^0.20 + affinidi-tdk ^0.8. Keep in lockstep
 # with the workspace `vta-sdk` pin: a mismatched pair resolves to two
 # vta-sdk copies and fails to compile (E0308 on the shared auth types).
-# The floor is 0.11.4, not 0.11: 0.11.3 added the `Session.last_seen` /
-# `acr_expires_at` fields we now construct, and 0.11.4 added the `jti`
-# parameter to `AuthBackend::mint_access_token` — an unlocked build
-# against an earlier 0.11.x will not compile.
-vti-common = { version = "0.11.4", default-features = false }
+# The floor is a pinned patch, not bare 0.11, because each of these added
+# something we construct or call: 0.11.3 the `Session.last_seen` /
+# `acr_expires_at` fields, 0.11.4 the `jti` parameter to
+# `AuthBackend::mint_access_token`, and 0.11.30 the move to vta-sdk 0.20
+# (below 0.11.30 the pair straddles the 0.19/0.20 boundary). An unlocked
+# build against an earlier 0.11.x will not compile.
+vti-common = { version = "0.11.30", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)

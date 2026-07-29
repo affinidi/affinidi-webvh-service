@@ -360,18 +360,22 @@ async fn authenticate_didcomm_jws(
     }
 }
 
-/// Translate the canonical
-/// `vti_common::auth::handlers::handle_*` response (shape from
-/// vti-common's internal vta-sdk pin) into did-hosting's
-/// workspace-vta-sdk-pinned wire type. Both shapes are
-/// byte-identical on the wire (same JSON via serde) so the
-/// translation is pure field-copy — but Rust treats the two
-/// versions of vta-sdk as distinct types, so we copy fields
-/// explicitly.
+/// Translate the canonical `vta_sdk::protocols::auth::AuthenticateResponse`
+/// returned by `vti_common::auth::handlers::handle_*` into did-hosting's own
+/// [`did_hosting_common::AuthenticateResponse`].
 ///
-/// When vta-sdk consolidates onto a single published version
-/// (next vti-common publish to crates.io) this helper goes away
-/// in favour of a direct `From` impl.
+/// These are two genuinely different types, not two copies of one type: the
+/// SDK owns the canonical SIOPv2 / RFC-6749 shape, while `did-hosting-common`
+/// declares its own in `types.rs` so the client crates have a wire type that
+/// does not drag the SDK in. Both serialise identically, so the translation is
+/// a pure field-copy — but it is a permanent boundary, not a workaround for a
+/// duplicated dependency. (An earlier version of this comment claimed the
+/// latter and predicted the helper would disappear once vta-sdk consolidated
+/// onto one published version; that consolidation happened at vta-sdk 0.20 /
+/// vti-common 0.11.30 and the helper is still required.)
+///
+/// A `From` impl would be the natural home for this, but neither type is local
+/// to this crate, so the orphan rule rules it out here.
 fn canonical_to_local_auth_response(
     a: vta_sdk::protocols::auth::AuthenticateResponse,
 ) -> did_hosting_common::AuthenticateResponse {

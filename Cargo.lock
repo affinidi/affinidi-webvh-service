@@ -408,7 +408,7 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.19.28",
 ]
 
 [[package]]
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3088,7 +3088,7 @@ dependencies = [
  "url",
  "uuid",
  "vaultrs",
- "vta-sdk",
+ "vta-sdk 0.20.24",
  "vti-common",
  "webauthn-rs",
  "webauthn-rs-proto",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -3159,14 +3159,14 @@ dependencies = [
  "trust-tasks-rs",
  "url",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.20.24",
  "vti-common",
  "webauthn-rs",
 ]
 
 [[package]]
 name = "did-hosting-daemon"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-messaging-didcomm-service",
  "affinidi-tdk",
@@ -3188,14 +3188,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "vta-sdk",
+ "vta-sdk 0.20.24",
  "webvh-watcher",
  "webvh-witness",
 ]
 
 [[package]]
 name = "did-hosting-server"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -3254,7 +3254,7 @@ dependencies = [
  "trust-tasks-rs",
  "utoipa",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.20.24",
  "vti-common",
 ]
 
@@ -9403,6 +9403,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-tasks-capability-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cdd2a1c83c4b1b74d2bd335ff2e45cdcb1bf4e17eddbf24761dd4a471a79cf8"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "trust-tasks-rs",
+ "uuid",
+]
+
+[[package]]
 name = "trust-tasks-didcomm"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9798,9 +9812,42 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.19.22"
+version = "0.19.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90eab9c3036db79750b8113d7439f0d92ddb90f140b3ab5cc07403c0d1d08681"
+checksum = "7e5c6b5be45c551ee4f7bfcd1165125c04fc7cbd7485b266e197eb6467bcaa17"
+dependencies = [
+ "affinidi-crypto",
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-core",
+ "affinidi-messaging-delivery",
+ "affinidi-messaging-didcomm",
+ "affinidi-openid4vci",
+ "affinidi-openid4vp",
+ "affinidi-tdk",
+ "base64 0.22.1",
+ "chrono",
+ "curve25519-dalek",
+ "didwebvh-rs",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.3",
+ "multibase",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "vta-sdk"
+version = "0.20.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53959519b5acfa1080e91c650dfa2455783578d8bdfc9b3651648b603eaee81e"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -9840,11 +9887,13 @@ dependencies = [
 
 [[package]]
 name = "vti-common"
-version = "0.11.5"
+version = "0.11.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1ef23b04aae83d859f35906de325233b166dc74a160f298fd455aba9fd9419"
+checksum = "f394694a4ae018e7be287ec3d7edc20cc26c5fa1aad1f3516e634807fe592506"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-delivery",
  "affinidi-tdk",
  "async-trait",
  "axum",
@@ -9867,8 +9916,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "trust-tasks-capability-client",
+ "trust-tasks-rs",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.20.24",
 ]
 
 [[package]]
@@ -10091,7 +10142,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-watcher"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "axum",
  "axum-extra",
@@ -10110,7 +10161,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-witness"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -10142,7 +10193,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk",
+ "vta-sdk 0.20.24",
  "vti-common",
 ]
 
