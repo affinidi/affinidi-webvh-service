@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",

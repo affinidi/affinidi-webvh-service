@@ -1611,6 +1611,25 @@ async fn handle_server_register(
         DIDCommResponse::new(typ, body).thid(message.id.clone()),
     ))
 }
+/// Answer a message this router has no arm for with a problem-report, so the
+/// caller fails immediately and *knows which task we refused*.
+///
+/// Dropping an unrouted type silently — which this did — turns every retirement
+/// into a mystery timeout on the client. When #144 retired `did/publish/0.1` and
+/// the `agent-name` set/enable/disable trio, a VTA still sending them got no
+/// reply at all: it burned its full 30s `send_and_wait` and surfaced
+/// "bad gateway: request timed out" with no mention of the task, on four
+/// separate operations. The retirements were correct; the silence is what made
+/// them expensive to diagnose. Naming the type turns a 30s dead end into an
+/// immediate, greppable error, and does so for the *next* retirement too.
+///
+/// Threading to `message.id` is load-bearing: callers demux replies by thread
+/// id, so an unthreaded problem-report is discarded and the caller waits out its
+/// timeout anyway — the bug would look unfixed.
+///
+/// Loop-safe: an inbound problem-report returns above, before we would reply,
+/// and `is_problem_report` matches the type we emit — so a peer that cannot
+/// route our reply logs and drops it rather than answering back.
 async fn handle_fallback(
     ctx: HandlerContext,
     message: Message,
@@ -1622,9 +1641,34 @@ async fn handle_fallback(
     warn!(
         sender = sender.unwrap_or("unknown"),
         msg_type = %message.typ,
-        "inbound DIDComm: unhandled message type — ignoring"
+        "inbound DIDComm: unhandled message type — replying with a problem-report"
     );
-    Ok(None)
+    let (typ, body) = run_unsupported_task(&message.typ);
+    Ok(Some(
+        DIDCommResponse::new(typ, body).thid(message.id.clone()),
+    ))
+}
+
+/// The problem-report [`handle_fallback`] answers an unrouted type with.
+///
+/// Returns `(typ, body)` rather than a `DIDCommResponse` for the same reason
+/// the `run_*` helpers in this module do: the response type exposes no getters,
+/// so a test can only assert what the builder was handed. The threading stays at
+/// the call site, where `message.id` lives.
+fn run_unsupported_task(msg_type: &str) -> (String, Value) {
+    (
+        MSG_PROBLEM_REPORT.to_string(),
+        json!({
+            "code": "e.p.msg.unsupported-task",
+            // The type is the whole diagnostic: a retired task, a typo, and a
+            // peer predating the task are indistinguishable without it, and the
+            // caller cannot log what it was never told.
+            "comment": format!(
+                "this control plane has no handler for `{msg_type}` — it may have been retired, \
+                 or this peer may be a version that predates it"
+            ),
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,6 +2781,66 @@ mod tests {
             body.get("code").and_then(|v| v.as_str()),
             Some("e.p.did.unauthorized")
         );
+    }
+
+    /// An unrouted type is answered, not dropped. Dropping it is what made the
+    /// #144 retirements expensive: the caller learned nothing for 30s and then
+    /// reported a bare gateway timeout. The reply must name the type, or the
+    /// caller still cannot say which task was refused.
+    #[test]
+    fn unsupported_task_reply_names_the_type() {
+        let (typ, body) = run_unsupported_task("https://example.org/spec/made-up/0.1");
+        assert_eq!(typ, MSG_PROBLEM_REPORT);
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("e.p.msg.unsupported-task")
+        );
+        let comment = body.get("comment").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            comment.contains("https://example.org/spec/made-up/0.1"),
+            "the refused type is the whole diagnostic; got {comment}"
+        );
+    }
+
+    /// The reply is itself a problem-report by `is_problem_report`'s reckoning,
+    /// which is what makes this loop-safe: a peer that cannot route our reply
+    /// logs and drops it in its own fallback instead of answering back. If the
+    /// emitted type ever stopped matching, two fallbacks would ping-pong.
+    #[test]
+    fn unsupported_task_reply_cannot_start_a_problem_report_loop() {
+        let (typ, _) = run_unsupported_task("https://example.org/spec/made-up/0.1");
+        assert!(
+            did_hosting_common::server::problem_report::is_problem_report(&typ),
+            "{typ} must be recognised as a problem-report so peers drop rather than reply"
+        );
+    }
+
+    /// The four URIs #144 retired each produce a reply naming them rather than
+    /// silence — these are the exact tasks a VTA predating the cutover sends,
+    /// and each one cost a 30s timeout.
+    ///
+    /// This asserts the *reply*, not that the URIs are unrouted: `Router`
+    /// exposes no route introspection, so "is it still routed" isn't checkable
+    /// from here. Re-adding a route would make these URIs bypass the fallback
+    /// entirely and this test would keep passing while testing nothing about
+    /// them — it guards the reply shape, which is what the client depends on.
+    #[test]
+    fn retired_tasks_are_refused_by_name() {
+        for retired in [
+            "https://trusttasks.org/spec/did-management/did/publish/0.1",
+            "https://trusttasks.org/spec/did-management/agent-name/set/0.1",
+            "https://trusttasks.org/spec/did-management/agent-name/enable/0.1",
+            "https://trusttasks.org/spec/did-management/agent-name/disable/0.1",
+        ] {
+            let (typ, body) = run_unsupported_task(retired);
+            assert_eq!(typ, MSG_PROBLEM_REPORT, "{retired}");
+            assert!(
+                body.get("comment")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.contains(retired)),
+                "{retired} must be named in the reply"
+            );
+        }
     }
 
     /// `run_webvh_dispatch` mirrors the `handle_webvh_message` wrapper:

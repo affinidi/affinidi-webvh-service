@@ -29,8 +29,31 @@
 
 ### Fixed
 
-- **Both approval-request legs the control plane sends are now signed
-  Trust Task documents** (#147). The specs for both families mark the
+- **An unrouted DIDComm message now gets a problem-report instead of
+  silence** (did-hosting-control 0.8.7). The control plane's fallback
+  handler logged an unhandled type and returned nothing, so a caller
+  sending a task this router has no arm for learned nothing at all —
+  it waited out its full request timeout and then reported a bare
+  gateway error naming no task.
+
+  That is what made #144's retirements expensive downstream. A VTA
+  still sending the retired `did/publish/0.1` and the
+  `agent-name/{set,enable,disable}/0.1` trio burned 30 seconds per
+  call and surfaced "bad gateway: request timed out" with nothing to
+  grep for; on DIDComm — the transport a client prefers whenever a
+  host advertises both — every server-managed publish failed this
+  way, while the REST equivalents failed visibly with a 404. The
+  retirements themselves were correct; only the silence was the
+  problem, and it would have cost the same on the next one.
+
+  The fallback now replies `e.p.msg.unsupported-task` naming the
+  refused type, threaded to the request id so the caller's dispatcher
+  actually demuxes it — an unthreaded reply would be discarded and
+  the caller would wait out the timeout regardless. Loop-safe: an
+  inbound problem-report still returns early, before the reply path,
+  and the emitted type is itself matched by `is_problem_report`, so a
+  peer that cannot route it logs and drops rather than answering
+  back. Both properties are pinned by tests.
   request's Data Integrity proof REQUIRED — the approver renders the
   request's prose as the basis of a human decision, so the request must
   be attributable to the relying party by signature, not just by
