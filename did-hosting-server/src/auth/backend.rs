@@ -66,6 +66,7 @@ impl AuthBackend for DidHostingServerAuthBackend {
         acr: &str,
         _tee_attested: bool,
         ttl_secs: u64,
+        jti: &str,
     ) -> Result<String, Self::Error> {
         let mut claims = JwtKeys::new_claims(
             subject.to_string(),
@@ -73,6 +74,7 @@ impl AuthBackend for DidHostingServerAuthBackend {
             role.to_string(),
             ttl_secs,
         );
+        claims.jti = jti.to_string();
         claims.amr = amr.to_vec();
         claims.acr = acr.to_string();
         self.jwt_keys

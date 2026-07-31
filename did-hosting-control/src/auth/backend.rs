@@ -71,6 +71,7 @@ impl AuthBackend for DidHostingControlAuthBackend {
         acr: &str,
         _tee_attested: bool,
         ttl_secs: u64,
+        jti: &str,
     ) -> Result<String, Self::Error> {
         // did-hosting's Claims has no `contexts` or `tee_attested`
         // fields — both args are accepted by the canonical
@@ -82,6 +83,7 @@ impl AuthBackend for DidHostingControlAuthBackend {
             role.to_string(),
             ttl_secs,
         );
+        claims.jti = jti.to_string();
         claims.amr = amr.to_vec();
         claims.acr = acr.to_string();
         self.jwt_keys

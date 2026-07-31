@@ -2598,6 +2598,7 @@ mod tests {
         let payload = list::Payload {
             ext: None,
             cursor: None,
+            direction: None,
             page_size: None,
             role: None,
             scope: None,

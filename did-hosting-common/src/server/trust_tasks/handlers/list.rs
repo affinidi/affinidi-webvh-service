@@ -346,6 +346,7 @@ mod tests {
     ) -> TrustTask<list::Payload> {
         let payload = list::Payload {
             cursor: cursor.map(|s| s.to_string()),
+            direction: None,
             ext: None,
             page_size: page_size.and_then(NonZeroU64::new),
             role: role.map(|s| s.to_string().try_into().expect("role parses")),

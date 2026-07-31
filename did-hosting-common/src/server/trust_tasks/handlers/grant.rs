@@ -327,6 +327,11 @@ mod tests {
             // is an optional per-entry AAL hint we don't model — leave it
             // unset so the entry translates as a plain webvh grant.
             step_up: None,
+            // `allowed_keys` / `approve` (added later in the 0.2 acl/grant
+            // schema) are optional; we don't model per-key restrictions or
+            // approve-authority, so leave both unset.
+            allowed_keys: None,
+            approve: None,
             // Owner needs domains; we always supply it via the webvh ext
             // so the entry handler accepts it on translate.
             ext: serde_json::from_value(serde_json::json!({
