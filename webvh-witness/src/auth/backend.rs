@@ -64,6 +64,7 @@ impl AuthBackend for WebvhWitnessAuthBackend {
             role.to_string(),
             ttl_secs,
         );
+        claims.jti = jti.to_string();
         claims.amr = amr.to_vec();
         claims.acr = acr.to_string();
         // Override `new_claims`' own random `jti`: the caller pins this nonce
