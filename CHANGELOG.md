@@ -29,6 +29,39 @@
 
 ### Fixed
 
+- **An approved DID update applied off-tab no longer strands the DID
+  detail screen** (did-hosting-ui). Binding an agent name published a
+  new version, but the screen kept showing the old one and every route
+  forward failed with `concurrent update: … expected 1-…, current is
+  2-…`.
+
+  The screen refreshed on mount and after a *successful* publish, and
+  nowhere else. A delegated publish that needs approval does not
+  succeed inline — it returns `consentRequired` and pins the exact
+  re-submit — and the only thing that ever resumed it was the wallet's
+  `vtawallet:consentgranted` event. That event fires solely in the tab
+  whose wallet relayed the decision, so approving on a paired mobile
+  approver let the VTA apply the update server-side with nothing to
+  dispatch back to the browser. The tab kept its stale `logEntries`,
+  and both exits were dead: "Publish now" replays a payload pinned to
+  `expectedVersionId` v1, and a fresh bind composes `alsoKnownAs` from
+  the same stale `currentState` — the VTA's dry-run rejects each as a
+  concurrent update. A manual browser reload was the only escape, and
+  nothing on screen suggested one.
+
+  While an approval is outstanding the screen now re-reads the log
+  every five seconds and, once it has moved past the pinned version,
+  retires the dead re-submit and reloads. This does not reopen the
+  question the "no timer poll" note settled: that rule is about
+  *re-submitting*, which reopens the wallet's un-skippable worker-mode
+  confirm on each tick, whereas this is an authenticated GET that
+  touches no wallet. The notice deliberately does not claim the user's
+  change was the one applied — an advancing log proves only that the
+  document moved, not who moved it. The decision rule is extracted to
+  `lib/pinned-edit.ts` and unit-tested, including that an empty or
+  partial read counts as "nothing observed" rather than movement, so a
+  failed poll can never discard a live approval.
+
 - **An unrouted DIDComm message now gets a problem-report instead of
   silence** (did-hosting-control 0.8.7). The control plane's fallback
   handler logged an unhandled type and returned nothing, so a caller
