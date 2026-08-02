@@ -1,7 +1,6 @@
 [advisories]
 version = 2
 ignore = [
-  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained but build-time-only — pulled in transitively via linked-data-derive (ssi-json-ld). No runtime exposure; no safe upgrade available upstream." },
   { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on the `rsa` crate. Pulled in transitively by jsonwebtoken, but webvh JWTs use Ed25519 (EdDSA), so the RSA timing sidechannel is not on any code path we exercise." },
   # The three advisories below all live in `rustls-webpki 0.101.7`, an OLD copy
   # pulled only via `aws-smithy-http-client -> hyper-rustls 0.24.2` deep in the
@@ -19,9 +18,11 @@ ignore = [
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
   { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained — transitive only (folded into rustls upstream); no direct dependency." },
-  { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained — build-time-only, transitive (no direct dependency); successor of the already-ignored proc-macro-error (RUSTSEC-2024-0370)." },
-  { id = "RUSTSEC-2026-0215", reason = "`smallstr` unmaintained — transitive only, via json-syntax <- json-ld <- ssi-json-ld; no direct dependency and no upstream migration yet." },
 ]
+# Removed with the vta-sdk 0.21 / vti-common 0.11.33 bump, which dropped the
+# whole `ssi-*` / `json-ld` subtree and the old `proc-macro-error` generation:
+#   RUSTSEC-2024-0370 (proc-macro-error), RUSTSEC-2026-0173 (proc-macro-error2),
+#   RUSTSEC-2026-0215 (smallstr) — none of those crates are in the lock any more.
 
 [bans]
 multiple-versions = "allow"
@@ -66,9 +67,8 @@ allow = [
 ]
 
 exceptions = [
-  { allow = ["MPL-2.0"], crate = "bitmaps" },
-  { allow = ["MPL-2.0"], crate = "im" },
-  { allow = ["CC-BY-SA-3.0", "MPL-2.0"], crate = "sized-chunks" },
+  # `bitmaps` / `im` / `sized-chunks` (MPL-2.0, CC-BY-SA-3.0) dropped out of the
+  # graph with the `ssi-*` subtree — see the advisories note above.
   { allow = ["MPL-2.0"], crate = "webauthn-rs" },
   { allow = ["MPL-2.0"], crate = "webauthn-rs-core" },
   { allow = ["MPL-2.0"], crate = "webauthn-rs-proto" },

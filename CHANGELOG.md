@@ -87,6 +87,49 @@
   releases. The daemon inherits both changes — it mounts the control
   plane's router and DIDComm listener unchanged.
 
+### Dependencies
+
+- **`vta-sdk` 0.20 → 0.21 and `vti-common` 0.11.30 → 0.11.33, moved
+  together.** `vti-common` 0.11.33 re-pins onto `vta-sdk` ^0.21, so
+  refreshing the lockfile alone would have resolved *two* `vta-sdk`
+  copies — the exact failure the lockstep note in the workspace
+  manifest warns about. Bumped as one change across the workspace
+  `vta-sdk` requirement and all four `vti-common` declarations
+  (`did-hosting-{common,control,server}`, `webvh-witness`); verified
+  with `cargo tree -d -e normal,build,dev`, which reports no duplicate
+  `vta-sdk`, `vti-common`, `affinidi-tdk` or `trust-tasks-*`. The dev
+  graph moved with it: `affinidi-messaging-mediator` 0.17.13 → 0.18.4
+  (via `affinidi-messaging-test-mediator` 0.2.45), which is the
+  mediator floor that keeps the dev half on `vta-sdk` ^0.21.
+
+- **`firestore` 0.49 → 0.50** — required, not cosmetic. `firestore`
+  0.49 no longer compiles against the current `gcloud-sdk` (a new
+  `concurrency_mode` field on `transaction_options::ReadWrite`), so
+  the `store-firestore` backend was broken by the lockfile refresh
+  until the major bump. **`azure_data_cosmos` 0.36 → 0.37** alongside
+  it (`store-cosmosdb`).
+
+- Lockfile refreshed to the latest compatible releases across the rest
+  of the graph — `affinidi-*`, `trust-tasks-*`, `aws-*`,
+  `google-cloud-*`, `tokio`, `kube`, `redis`, `toml`, `uuid`,
+  `thiserror`. The `vta-sdk` 0.21 move dropped the whole `ssi-*` /
+  `json-ld` subtree and the old `proc-macro-error` generation, so
+  three now-unmatched advisory ignores (RUSTSEC-2024-0370,
+  RUSTSEC-2026-0173, RUSTSEC-2026-0215) and three dead licence
+  exceptions (`bitmaps`, `im`, `sized-chunks`) came out of
+  `deny.toml`. No first-party code changed; the full suite,
+  `cargo clippy --workspace --all-targets` and `cargo deny check` are
+  clean, and each storage backend still builds on its own.
+
+- **Admin UI: Expo SDK 56 → 57** (`expo` 57.0.9, `expo-router` 57.0.9,
+  `react-native` 0.85.3 → 0.86.2, `react`/`react-dom` 19.2.8,
+  `react-native-screens` 4.26, `react-native-safe-area-context` 5.8),
+  plus **TypeScript 6 → 7** and `recharts` 3.10. SDK 57 requires
+  `expo-status-bar` to be listed as a config plugin, which is the one
+  `app.json` change. `npm run typecheck`, `npm test` and
+  `npm run build:web` all pass, and `npm audit` reports no
+  vulnerabilities — no application code needed changing.
+
 ## 0.8.6 (2026-07-29)
 
 ### Changed
