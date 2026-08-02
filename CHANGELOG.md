@@ -29,6 +29,39 @@
 
 ### Fixed
 
+- **An approved DID update applied off-tab no longer strands the DID
+  detail screen** (did-hosting-ui). Binding an agent name published a
+  new version, but the screen kept showing the old one and every route
+  forward failed with `concurrent update: … expected 1-…, current is
+  2-…`.
+
+  The screen refreshed on mount and after a *successful* publish, and
+  nowhere else. A delegated publish that needs approval does not
+  succeed inline — it returns `consentRequired` and pins the exact
+  re-submit — and the only thing that ever resumed it was the wallet's
+  `vtawallet:consentgranted` event. That event fires solely in the tab
+  whose wallet relayed the decision, so approving on a paired mobile
+  approver let the VTA apply the update server-side with nothing to
+  dispatch back to the browser. The tab kept its stale `logEntries`,
+  and both exits were dead: "Publish now" replays a payload pinned to
+  `expectedVersionId` v1, and a fresh bind composes `alsoKnownAs` from
+  the same stale `currentState` — the VTA's dry-run rejects each as a
+  concurrent update. A manual browser reload was the only escape, and
+  nothing on screen suggested one.
+
+  While an approval is outstanding the screen now re-reads the log
+  every five seconds and, once it has moved past the pinned version,
+  retires the dead re-submit and reloads. This does not reopen the
+  question the "no timer poll" note settled: that rule is about
+  *re-submitting*, which reopens the wallet's un-skippable worker-mode
+  confirm on each tick, whereas this is an authenticated GET that
+  touches no wallet. The notice deliberately does not claim the user's
+  change was the one applied — an advancing log proves only that the
+  document moved, not who moved it. The decision rule is extracted to
+  `lib/pinned-edit.ts` and unit-tested, including that an empty or
+  partial read counts as "nothing observed" rather than movement, so a
+  failed poll can never discard a live approval.
+
 - **An unrouted DIDComm message now gets a problem-report instead of
   silence** (did-hosting-control 0.8.7). The control plane's fallback
   handler logged an unhandled type and returned nothing, so a caller
@@ -86,6 +119,49 @@
   shared `trust_tasks_proof::affinidi::sign_trust_task` helper once that
   releases. The daemon inherits both changes — it mounts the control
   plane's router and DIDComm listener unchanged.
+
+### Dependencies
+
+- **`vta-sdk` 0.20 → 0.21 and `vti-common` 0.11.30 → 0.11.33, moved
+  together.** `vti-common` 0.11.33 re-pins onto `vta-sdk` ^0.21, so
+  refreshing the lockfile alone would have resolved *two* `vta-sdk`
+  copies — the exact failure the lockstep note in the workspace
+  manifest warns about. Bumped as one change across the workspace
+  `vta-sdk` requirement and all four `vti-common` declarations
+  (`did-hosting-{common,control,server}`, `webvh-witness`); verified
+  with `cargo tree -d -e normal,build,dev`, which reports no duplicate
+  `vta-sdk`, `vti-common`, `affinidi-tdk` or `trust-tasks-*`. The dev
+  graph moved with it: `affinidi-messaging-mediator` 0.17.13 → 0.18.4
+  (via `affinidi-messaging-test-mediator` 0.2.45), which is the
+  mediator floor that keeps the dev half on `vta-sdk` ^0.21.
+
+- **`firestore` 0.49 → 0.50** — required, not cosmetic. `firestore`
+  0.49 no longer compiles against the current `gcloud-sdk` (a new
+  `concurrency_mode` field on `transaction_options::ReadWrite`), so
+  the `store-firestore` backend was broken by the lockfile refresh
+  until the major bump. **`azure_data_cosmos` 0.36 → 0.37** alongside
+  it (`store-cosmosdb`).
+
+- Lockfile refreshed to the latest compatible releases across the rest
+  of the graph — `affinidi-*`, `trust-tasks-*`, `aws-*`,
+  `google-cloud-*`, `tokio`, `kube`, `redis`, `toml`, `uuid`,
+  `thiserror`. The `vta-sdk` 0.21 move dropped the whole `ssi-*` /
+  `json-ld` subtree and the old `proc-macro-error` generation, so
+  three now-unmatched advisory ignores (RUSTSEC-2024-0370,
+  RUSTSEC-2026-0173, RUSTSEC-2026-0215) and three dead licence
+  exceptions (`bitmaps`, `im`, `sized-chunks`) came out of
+  `deny.toml`. No first-party code changed; the full suite,
+  `cargo clippy --workspace --all-targets` and `cargo deny check` are
+  clean, and each storage backend still builds on its own.
+
+- **Admin UI: Expo SDK 56 → 57** (`expo` 57.0.9, `expo-router` 57.0.9,
+  `react-native` 0.85.3 → 0.86.2, `react`/`react-dom` 19.2.8,
+  `react-native-screens` 4.26, `react-native-safe-area-context` 5.8),
+  plus **TypeScript 6 → 7** and `recharts` 3.10. SDK 57 requires
+  `expo-status-bar` to be listed as a config plugin, which is the one
+  `app.json` change. `npm run typecheck`, `npm test` and
+  `npm run build:web` all pass, and `npm audit` reports no
+  vulnerabilities — no application code needed changing.
 
 ## 0.8.6 (2026-07-29)
 

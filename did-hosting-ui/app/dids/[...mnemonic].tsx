@@ -14,6 +14,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { useAgentNames } from "../../lib/use-agent-names";
+import { hasLogMovedPast } from "../../lib/pinned-edit";
 import { extractDidHost } from "../../lib/domain";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
@@ -128,6 +129,11 @@ export default function DidDetail() {
   const resubmitRef = useRef<
     ((opts?: { silent?: boolean }) => Promise<"accepted" | "consent" | "error">) | null
   >(null);
+  // The log version the pinned re-submit above was built against, captured when
+  // the VTA asked for consent. The refresh below compares it against the live
+  // log to notice that the pinned payload has been overtaken — see the comment
+  // there. A ref for the same reason as `resubmitRef`: never rendered.
+  const pinnedVersionRef = useRef<string | null>(null);
   const [editingParams, setEditingParams] = useState(false);
   const [paramWatchers, setParamWatchers] = useState<string[]>([]);
   const [paramWitnesses, setParamWitnesses] = useState<string[]>([]);
@@ -421,10 +427,12 @@ export default function DidDetail() {
       const outcome = await submit();
       if (outcome.kind === "consentRequired") {
         resubmitRef.current = resubmit;
+        pinnedVersionRef.current = logEntries[logEntries.length - 1]?.versionId ?? null;
         setConsent(outcome);
         return "consent";
       }
       resubmitRef.current = null;
+      pinnedVersionRef.current = null;
       setConsent(null);
       setEditingDoc(false);
       showAlert("Done", successMsg);
@@ -527,6 +535,61 @@ export default function DidDetail() {
     return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consent?.payloadDigest]);
+
+  // ── While an approval is outstanding, re-read the log ──────────────────────
+  //
+  // Read-only, and that is the whole distinction from the rule above: "no timer
+  // poll" is about *re-submitting*, which reopens the wallet's un-skippable
+  // worker-mode confirm on every tick. Re-reading the log is an authenticated
+  // GET that touches no wallet, so it carries none of that cost — and without
+  // it this screen cannot notice that the approval has already been applied.
+  //
+  // It routinely won't notice otherwise. The grant event only fires in the tab
+  // whose wallet relayed the decision; approve on a paired mobile approver and
+  // the VTA applies the update server-side with nothing to dispatch here. The
+  // tab then sits on the banner showing a stale document, and every way out
+  // fails the same way: the "Publish now" button replays a payload pinned to a
+  // version the log has already left, and a fresh edit is composed from that
+  // same stale `currentState` — both rejected by the VTA's dry-run as
+  // `concurrent update`, with a manual browser reload the only escape.
+  useEffect(() => {
+    if (!consent || !mnemonic || !isAuthenticated) return;
+    let cancelled = false;
+    const check = async () => {
+      let entries: LogEntryInfo[];
+      try {
+        entries = await api.getDidLog(mnemonic);
+      } catch {
+        // Transient — the next tick retries. Never surfaced: a failed poll is
+        // indistinguishable to the user from still waiting.
+        return;
+      }
+      if (cancelled) return;
+      // Unchanged — still genuinely waiting on the approver.
+      if (!hasLogMovedPast(pinnedVersionRef.current, entries)) return;
+      // The log moved. Whatever the pinned payload was, it can no longer apply,
+      // so retire it rather than leave a button that can only fail.
+      resubmitRef.current = null;
+      pinnedVersionRef.current = null;
+      setConsent(null);
+      loadData();
+      // Deliberately not "your change was applied": the log advancing proves
+      // only that it moved, not who moved it. Another admin, or the owner's own
+      // agent, could have published in the same window, and claiming credit for
+      // someone else's version is exactly the sort of thing that makes an
+      // operator trust the wrong document.
+      showAlert(
+        "This DID has moved on",
+        `It is now at version ${entries.length}. If that was your approved change, it has been applied and the current document is shown below — otherwise re-apply your edit on top of it.`,
+      );
+    };
+    void check();
+    const id = setInterval(() => void check(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [consent, mnemonic, isAuthenticated, api, loadData]);
 
   // Bind a name: publish a new version whose `alsoKnownAs` claims
   // `https://<domain>/@<name>`. The edge derives the served name from that
