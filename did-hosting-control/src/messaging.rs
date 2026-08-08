@@ -1773,6 +1773,48 @@ pub(crate) async fn run_trust_tasks_envelope(
         .server_did
         .as_deref()
         .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
+
+    // Replay gate — the same one `run_webvh_dispatch` applies to bare `MSG_*`
+    // messages, on the same `(sender, msg.id)` key.
+    //
+    // It has to be here too, not only there. Freshness (`created_time` ± the
+    // 5-minute window, checked during unpack) does not stop replay: a captured
+    // envelope re-submitted inside that window still verifies. `replay.rs` names
+    // the operations that matters for — delete, change-owner, publish — and
+    // every one of them is reachable through *both* DIDComm framings, since
+    // `bridge_did_management` hands the envelope's document to the same
+    // `dispatch_did_op` table the bare types use. A VTA moving its
+    // DID-management traffic onto the envelope binding would otherwise leave
+    // this protection behind, and leave it behind silently — the kind of
+    // regression that looks like nothing at all until someone replays a delete.
+    //
+    // Ordering differs from `run_webvh_dispatch` deliberately. That one gates
+    // after its ACL check, so a sender the ACL would reject cannot consume cache
+    // slots. Here authorization belongs to the dispatcher and varies by op
+    // (framework §7.2 ops authorize themselves; discovery is intentionally
+    // open), so there is no single ACL verdict to sequence behind. The gate runs
+    // after the body parses as a Trust Task — malformed bodies never reach the
+    // cache — and the router's `require_encrypted(true).require_sender_did(true)`
+    // means every key inserted still belongs to a cryptographically proven
+    // sender, never an anonymous one.
+    //
+    // The rejection is the *same* problem report the bare path emits, wrapped as
+    // a Trust Task document the way `bridge_did_management` wraps every other
+    // `AppError`. Parity is the whole point of this gate, so the error a client
+    // sees must not depend on which framing it used to get here.
+    if let Err(e) = state.replay_cache.check_and_insert(sender, &message.id) {
+        let code = map_app_error_code(&e);
+        warn!(
+            code,
+            did = sender,
+            msg_id = %message.id,
+            type_uri = %doc.type_uri,
+            "trust-tasks envelope: replay rejected"
+        );
+        let body = tt_reply(&doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e))?;
+        return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
+    }
+
     let transport =
         trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
 
@@ -3720,6 +3762,88 @@ mod tests {
         assert_eq!(resp_body["payload"]["available"], true);
         assert_eq!(resp_body["issuer"], "did:webvh:test:control.example.com");
         assert_eq!(resp_body["recipient"], sender);
+    }
+
+    /// A replayed envelope is refused, with the *same* `e.p.did.replay-detected`
+    /// problem report the bare `MSG_*` path emits.
+    ///
+    /// This is the gate that made it safe to move DID-management traffic onto
+    /// the envelope binding. `bridge_did_management` hands an envelope's
+    /// document to the same `dispatch_did_op` table the bare types use, so
+    /// without this the two DIDComm framings reached identical state-changing
+    /// operations with non-identical replay protection — and a client switching
+    /// framing would have silently lost it. Uses a destructive op (`did/delete`)
+    /// because that is precisely what `replay.rs` exists to stop being replayed.
+    #[tokio::test]
+    async fn trust_tasks_envelope_replay_is_refused_like_the_bare_path() {
+        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+
+        let (state, _dir) = test_state().await;
+        let sender = "did:example:admin";
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: sender.into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        seed_did(&state, sender, "replayed").await;
+
+        // `build_msg` pins a constant `msg.id`, so sending the same envelope
+        // twice IS the replay — exactly the captured-and-resubmitted shape the
+        // freshness window cannot catch on its own.
+        let envelope = || {
+            build_msg(
+                trust_tasks_didcomm::ENVELOPE_TYPE,
+                json!({
+                    "id": "urn:uuid:44444444-4444-4444-4444-444444444444",
+                    "type": "https://trusttasks.org/spec/did-management/did/delete/0.1",
+                    "recipient": "did:webvh:test:control.example.com",
+                    "issuedAt": "2026-07-06T00:00:00Z",
+                    "payload": { "mnemonic": "replayed" }
+                }),
+            )
+        };
+
+        let (_, first) = super::run_trust_tasks_envelope(&state, sender, &envelope())
+            .await
+            .expect("dispatch ok")
+            .expect("a response is emitted");
+        assert_ne!(
+            first["type"], MSG_PROBLEM_REPORT,
+            "the first delivery must be handled, not rejected: {first}"
+        );
+
+        let (resp_type, replayed) = super::run_trust_tasks_envelope(&state, sender, &envelope())
+            .await
+            .expect("dispatch ok")
+            .expect("the replay is answered, not dropped");
+
+        // Still a well-formed envelope carrying a Trust Task document — a
+        // rejection the sender can read, not a silent drop.
+        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        assert_eq!(replayed["type"], MSG_PROBLEM_REPORT);
+
+        // Byte-for-byte the code `run_webvh_dispatch_replay_rejected` pins on
+        // the bare path. Untagged `AppError::Validation` maps to the generic
+        // code, so the `replay-detected` marker rides the comment — that is the
+        // observed behaviour on both paths, and identical behaviour is the
+        // property under test. (`replay.rs`'s doc comment still advertises a
+        // dedicated `e.p.did.replay-detected` code; nothing emits it, on either
+        // path, and correcting that claim is out of scope here.)
+        assert_eq!(replayed["payload"]["code"], "e.p.did.validation-error");
+        let comment = replayed["payload"]["comment"].as_str().unwrap_or("");
+        assert!(
+            comment.contains("replay-detected"),
+            "replay rejection should mention 'replay-detected', got: {comment}"
+        );
     }
 
     #[tokio::test]

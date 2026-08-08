@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Security
+
+- **The DIDComm trust-task envelope now carries the same anti-replay gate
+  as the bare `MSG_*` path** (did-hosting-control 0.8.8). The control
+  plane accepts DID-management ops in *two* DIDComm framings: a bare task
+  type (`MSG_DID_REGISTER`, `MSG_DELETE`, …) routed to `run_webvh_dispatch`,
+  and the `trust_tasks_didcomm::ENVELOPE_TYPE` envelope routed to
+  `run_trust_tasks_envelope`. Both reach the same `dispatch_did_op` table —
+  the envelope path via `bridge_did_management` — so both reach the same
+  state-changing operations. Only the first consulted the replay cache.
+
+  Freshness does not cover this. `created_time` ± the 5-minute window is
+  checked during unpack, but a captured envelope re-submitted inside that
+  window still verifies; the `(sender, msg.id)` cache is what stops it, and
+  `replay.rs` names the operations it exists for — delete, change-owner,
+  publish. A client moving its DID-management traffic from bare types onto
+  the envelope binding (which is the direction the VTA is going) would have
+  silently lost that protection, with no error and no log to show for it.
+
+  `run_trust_tasks_envelope` now gates on the same cache and the same key,
+  and rejects with the *same* problem report the bare path emits, so the
+  error a client sees does not depend on which framing it used. Ordering
+  differs deliberately: the bare path gates after its ACL check, while here
+  authorization belongs to the dispatcher and varies by op (framework §7.2
+  ops authorize themselves; discovery is intentionally open), so the gate
+  runs after the body parses as a Trust Task — malformed bodies never reach
+  the cache, and the router's `require_encrypted(true).require_sender_did(true)`
+  means every key inserted still belongs to a proven sender.
+
+  No wire change, no new URI, and no behavioural change for first delivery
+  of any message.
+
 ### Added
 
 - **Signed end-to-end coverage for the approval round trip and
