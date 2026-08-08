@@ -61,6 +61,32 @@
 
 ### Fixed
 
+- **`cargo publish` no longer fails on the control plane's UI build**
+  (did-hosting-control 0.8.8, did-hosting-ui). Both the build script and
+  the rust-embed derive reached `../did-hosting-ui`, a workspace sibling
+  that `cargo package` never collects — so verification of the packaged
+  crate died in `build.rs` with a misleading `failed to run npm install
+  --prefer-offline: No such file or directory`. npm was never looked up:
+  `Command::current_dir` was pointed at a path that does not exist inside
+  the tarball. `--no-verify` would only have moved the breakage to
+  consumers, since `cargo install did-hosting-control` and docs.rs build
+  the same tarball.
+
+  `npm run build:web` now exports into `did-hosting-control/ui-dist/`, the
+  crate embeds *that*, and the directory is carried into the tarball by an
+  explicit `include` list. When the `did-hosting-ui` sibling is absent —
+  the published crate, or a lone checkout of this one — `build_ui` returns
+  early against the pre-bundled assets, so **building the published crate
+  requires neither Node nor npm**; `check_node_version` is now reached only
+  when a bundler run is genuinely due. A build with no bundle at all still
+  compiles (empty folder, UI routes 404) behind a `cargo:warning` rather
+  than failing the derive.
+
+  Publishing this crate now needs `cargo publish --allow-dirty`: cargo
+  counts the gitignored bundle as an uncommitted change. Check `git status`
+  is otherwise clean first — that flag suppresses the dirty check wholesale,
+  not just for `ui-dist`.
+
 - **An approved DID update applied off-tab no longer strands the DID
   detail screen** (did-hosting-ui). Binding an agent name published a
   new version, but the screen kept showing the old one and every route

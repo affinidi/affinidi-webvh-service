@@ -2,8 +2,14 @@ use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
+/// The bundle lives *inside this crate* rather than at `../did-hosting-ui/dist`
+/// so it travels in the published `.crate` tarball — `cargo package` only
+/// collects files under the package root, and a folder the derive cannot see is
+/// a compile error. `build.rs` populates it from the `did-hosting-ui` workspace
+/// when that sibling is present, and leaves the pre-bundled copy alone
+/// otherwise (published crate, no Node required). See `build.rs::build_ui`.
 #[derive(Embed)]
-#[folder = "../did-hosting-ui/dist"]
+#[folder = "ui-dist"]
 struct Assets;
 
 pub async fn static_handler(uri: Uri) -> Response {

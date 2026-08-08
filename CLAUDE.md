@@ -288,3 +288,15 @@ to each other must keep the document as the source of truth.
   pins (`did-hosting-* = { version = "0.x", path = … }`) — but not external
   crates that happen to share that number (`tower-http`, `tokio-util`) — update
   `did-hosting-ui/package.json`, and add a grouped `CHANGELOG.md` entry.
+
+- **Publishing needs `cargo publish --allow-dirty`.** The control plane embeds
+  the management UI from `did-hosting-control/ui-dist/` — a gitignored build
+  artifact (`npm run build:web` exports there) that an explicit `include` list
+  in that crate's `Cargo.toml` carries into the tarball, because the
+  `did-hosting-ui` sibling is outside the package and never gets collected.
+  Cargo counts the untracked bundle as an uncommitted change, so the flag is
+  required; **confirm `git status` is otherwise clean first**, since it
+  suppresses the dirty check for everything, not just `ui-dist`. Build the UI
+  before publishing — the packaged crate embeds whatever is in `ui-dist` at
+  package time and deliberately cannot rebuild it (no Node in a consumer's
+  build).
