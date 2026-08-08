@@ -6,6 +6,10 @@
 **/*.list
 
 # UI build artifacts
+# `npm run build:web` writes the bundle the control plane embeds here; it is
+# packaged for crates.io via did-hosting-control's `include` list, which is why
+# `cargo publish` for that crate needs `--allow-dirty`.
+did-hosting-control/ui-dist/
 webvh-ui/dist/
 webvh-ui/node_modules/
 webvh-ui/.expo/

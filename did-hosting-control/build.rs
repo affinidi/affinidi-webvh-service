@@ -50,10 +50,30 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
 
 #[cfg(feature = "ui")]
 fn build_ui() {
-    check_node_version();
-
     let ui_dir = Path::new("../did-hosting-ui");
-    let dist_dir = ui_dir.join("dist");
+    // The embedded bundle lives inside this crate (`ui-dist/`) so it is carried
+    // by the published tarball; `npm run build:web` writes straight into it.
+    // See the `include` list in Cargo.toml and `frontend.rs`.
+    let dist_dir = Path::new("ui-dist");
+
+    // No UI workspace — we are building from the published `.crate` (or any
+    // checkout of this crate alone), where `ui-dist` is pre-bundled. Nothing to
+    // build, and crucially neither Node nor npm is required.
+    if !ui_dir.is_dir() {
+        if !dist_dir.join("index.html").exists() {
+            // rust-embed's derive fails outright on a missing folder, so leave
+            // an empty one behind: the binary builds and `static_handler`
+            // already answers 404 when `index.html` is absent.
+            std::fs::create_dir_all(dist_dir)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist_dir.display()));
+            println!(
+                "cargo:warning=No management UI bundle found in did-hosting-control/ui-dist and \
+                 the ../did-hosting-ui workspace is absent — UI routes will return 404. Build \
+                 from the workspace checkout, or disable the `ui` feature."
+            );
+        }
+        return;
+    }
 
     // Track UI source files for rebuild detection
     for dir in &["app", "components", "lib"] {
@@ -90,6 +110,10 @@ fn build_ui() {
         return;
     }
 
+    // Only now that a bundler run is actually due does Node become a hard
+    // requirement — a fresh `ui-dist` builds fine without it.
+    check_node_version();
+
     // Install deps when `node_modules` is missing OR out of sync with the
     // lockfile. npm writes `node_modules/.package-lock.json` on a successful
     // install; if the committed `package-lock.json` is newer (e.g. a
@@ -112,7 +136,10 @@ fn build_ui() {
         run_npm(ui_dir, &["install", "--prefer-offline"]);
     }
 
-    // Build
+    // Build. `expo export` refuses to write into a non-empty output directory,
+    // so clear the previous bundle first — a failed build fails the crate build
+    // too, so there is nothing to preserve.
+    let _ = std::fs::remove_dir_all(dist_dir);
     run_npm(ui_dir, &["run", "build:web"]);
 }
 

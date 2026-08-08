@@ -12,6 +12,19 @@ repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 build = "build.rs"
+# `ui-dist/` is a build artifact (gitignored, produced by `npm run build:web`
+# via build.rs) but it MUST ship in the published tarball: the crate embeds it
+# with rust-embed, and `../did-hosting-ui` is a workspace sibling that
+# `cargo package` never collects. An explicit `include` is what overrides the
+# gitignore — which is also why publishing this crate needs
+# `cargo publish --allow-dirty` (cargo counts the untracked bundle as dirty).
+include = [
+  "src/**/*",
+  "tests/**/*",
+  "ui-dist/**/*",
+  "build.rs",
+  "README.md",
+]
 
 [features]
 default = ["keyring", "store-fjall", "ui"]
