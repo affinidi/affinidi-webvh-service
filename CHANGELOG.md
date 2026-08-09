@@ -41,17 +41,42 @@
   since base58 is not byte-aligned and a leading-zero digest encodes
   shorter.
 
-  **Known, deliberately not fixed here:** the 6-character code the
-  operator compares between the two screens is the digest's first six
-  characters, and under this encoding the first three are always `zQm` —
-  the algorithm prefix, not entropy. The code now carries ~17.6 bits
-  where it carried ~35. The principled fix (derive from the decoded
-  bytes, skipping the 2-byte multihash prefix) has to land in the same
-  release on both screens — ours is `digestPrefix` in
-  `did-hosting-ui/lib/wallet.ts`, the approver's is `vta-mobile-core`'s
-  `MATCH_CODE_LEN` — so changing it here alone would break matching
-  outright rather than merely weakening it. Documented at both call
-  sites; #911 reached the same conclusion from the other side.
+- **The operator's match code now derives from the digest bytes, not the
+  encoding** (`digestPrefix`, moved to `did-hosting-ui/lib/digest-code.ts`).
+
+  This is the other half of the change above, and skipping it would have
+  broken the check outright. The code is the six characters the operator
+  compares between this screen and the approver's device, under a hint
+  that reads *"if the codes differ, deny it"*. It used to be the digest's
+  first six characters, which was `hex(digest)[..6]` while the wire
+  carried hex. Left alone, the encoding change would have made this
+  screen show `zQmcdL` while the approver showed `d449ac` — every code
+  mismatching, every legitimate change looking like an attack.
+
+  `digestPrefix` now decodes the multibase, strips the `0x12 0x20`
+  multihash prefix, and hex-encodes the leading digest bytes — mirroring
+  `vta-mobile-core`'s `match_code_from_digest` exactly. Because the
+  digest is still SHA-256, this reproduces the *same* code the screen
+  showed before the migration, so the encoding change is invisible here.
+
+  It also keeps the entropy: `payloadDigest` opens `zQm` for every value
+  ever produced (base58btc marker plus the sha2-256 multihash prefix), so
+  slicing the encoded string would have spent half the code on a constant
+  — ~17.6 bits where the operator believes they are comparing ~35, and
+  still *looking* like six random characters, which is what would make it
+  dangerous rather than merely wasteful.
+
+  Fails closed: anything that is not a base58btc sha2-256 multihash —
+  including a stale bare-hex digest — yields `""`, so the operator sees
+  no code and denies rather than being shown a plausible prefix of an
+  unparseable value.
+
+  Pinned by `lib/__tests__/digest-prefix.test.ts` against the VTA's own
+  test vector (`zQmSK9…GYZ` → `3b0c7f`), so a divergence in either
+  repo's derivation fails a test instead of silently reaching an
+  operator. The function moved to its own import-free module because
+  `wallet.ts` imports `react-native`, which the test runner cannot parse;
+  `wallet.ts` re-exports it, so callers are unchanged.
 
 ### Security
 

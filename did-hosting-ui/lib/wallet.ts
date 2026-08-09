@@ -589,36 +589,10 @@ export interface TaskAccepted {
 
 export type RequestTaskOutcome = TaskAccepted | TaskConsentRequired;
 
-/**
- * How much of the digest a human is asked to compare.
- *
- * Must stay equal to `vta-mobile-core`'s `MATCH_CODE_LEN`, and derived
- * the same way: this is the *requesting* screen, the approver's device
- * is the other one, and the operator compares the two by eye. Changing
- * the derivation on one side alone breaks matching outright.
- */
-export const DIGEST_PREFIX_LEN = 6;
-
-/**
- * NOTE — weaker than it looks, and deliberately left that way for now.
- *
- * Since `payloadDigest` became a multibase multihash (base58btc over the
- * sha2-256 multihash), **the first three characters are always `zQm`** —
- * that is the algorithm prefix, not entropy. So a 6-character code
- * carries ~17.6 bits where it used to carry ~35 under hex: a ~300,000x
- * smaller space for an offline search to find a payload that displays
- * the same code to the operator. It still *looks* like six random
- * characters, which is what makes it worth stating here.
- *
- * The principled fix is to derive from the decoded digest bytes,
- * skipping the 2-byte multihash prefix. It needs the approver's screen
- * to change in the same release — see the matching note in
- * OpenVTC/verifiable-trust-infrastructure#911, which reached the same
- * conclusion from the other side.
- */
-export function digestPrefix(payloadDigest: string): string {
-  return payloadDigest.slice(0, DIGEST_PREFIX_LEN);
-}
+// The operator's comparison code lives in its own import-free module so
+// the test runner can reach it; this file imports `react-native`, which
+// vitest cannot parse. Re-exported here so callers keep one import site.
+export { DIGEST_PREFIX_LEN, digestPrefix } from "./digest-code";
 
 /**
  * Ask the user's VTA to update a DID document.
