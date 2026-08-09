@@ -97,10 +97,17 @@ pub struct ConsentResult {
 ///
 /// Per `task-consent/request/0.1`: a digest over the canonical
 /// (RFC 8785 JCS) pending-task payload, the task type, and the
-/// `challenge` as salt. Type and payload are length-prefixed so the
-/// boundary can't be shifted; salted so an unsalted digest over a
+/// `challenge` as salt, encoded as a multibase multihash
+/// ([`encode_digest_multibase`]). Type and payload are length-prefixed
+/// so the boundary can't be shifted; salted so an unsalted digest over a
 /// low-entropy payload isn't a confirmation oracle for anyone who
 /// observes it in transit.
+///
+/// The construction deliberately matches `vta_policy::consent::wire_digest`
+/// field for field *except* the domain tag, which is per-service so a
+/// digest minted here can never be replayed as one the VTA minted. The
+/// approver never recomputes this value — it echoes what we sent — so
+/// only the encoding has to agree between us, not the pre-image.
 pub(crate) fn wire_digest(
     task_type: &str,
     payload: &Value,
@@ -115,7 +122,39 @@ pub(crate) fn wire_digest(
     h.update((canonical.len() as u64).to_be_bytes());
     h.update(canonical.as_bytes());
     h.update(challenge.as_bytes());
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(encode_digest_multibase(&h.finalize()))
+}
+
+/// Multihash prefix for SHA-256 with a 32-byte digest: code `0x12`,
+/// length `0x20`. Carried in-band so the value is self-describing and
+/// the wire format survives an algorithm change without a schema
+/// revision.
+const MULTIHASH_SHA2_256_32: [u8; 2] = [0x12, 0x20];
+
+/// Encode a SHA-256 digest as a multibase-encoded multihash — the
+/// `digestMultibase` form W3C VCDM 2.0 defines and `did:webvh` already
+/// uses for its SCIDs.
+///
+/// This replaced bare hex when the Trust Tasks registry moved
+/// `payloadDigest` onto the shared `DigestMultibase` type (pattern
+/// `^[zumbfF][A-Za-z0-9+/=_-]+$`), which rules out "a bare hex string or
+/// a `sha-256:`-style prefix" as non-conforming. **It is a wire change,
+/// not a rendering change**: the digest is what the approver signs and
+/// what we match its decision against, so every party that computes one
+/// independently has to move together. The VTA's half is
+/// OpenVTC/verifiable-trust-infrastructure#911, which converted
+/// `vta_policy::consent` to the identical encoding and made
+/// `vta-mobile-core` *parse* the value rather than pass a string
+/// through — so a hex digest from us now fails at the approver's device
+/// rather than producing an approval that silently never takes effect.
+///
+/// base58btc (`z`) to match `did:key` / `did:webvh` and the VTA's
+/// `vta_sdk::did_key::ed25519_multibase_pubkey`.
+fn encode_digest_multibase(digest: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(MULTIHASH_SHA2_256_32.len() + digest.len());
+    buf.extend_from_slice(&MULTIHASH_SHA2_256_32);
+    buf.extend_from_slice(digest);
+    multibase::encode(multibase::Base::Base58Btc, &buf)
 }
 
 /// Build the signed `task-consent/request/0.1` document.
@@ -363,6 +402,47 @@ mod tests {
         assert_eq!(
             base,
             wire_digest("https://a.example/t/1.0", &payload, "c1").unwrap()
+        );
+    }
+
+    /// The encoding is a wire contract, not a rendering choice: the
+    /// approver's device *parses* this value as `DigestMultibase`
+    /// (`^[zumbfF][A-Za-z0-9+/=_-]+$`, ≥16 chars), so a bare hex digest
+    /// fails there rather than here. Asserted by shape rather than
+    /// length — base58 is not byte-aligned, so a leading-zero digest
+    /// encodes shorter.
+    #[test]
+    fn digest_is_multibase_multihash_not_hex() {
+        let digest = wire_digest(
+            "https://a.example/t/1.0",
+            &json!({ "action": "Rotate the registry signing key" }),
+            "c1",
+        )
+        .unwrap();
+
+        assert!(
+            digest.starts_with('z'),
+            "must be multibase base58btc, got {digest}"
+        );
+        let (base, bytes) = multibase::decode(&digest).expect("valid multibase");
+        assert_eq!(base, multibase::Base::Base58Btc);
+        assert_eq!(
+            &bytes[..2],
+            &MULTIHASH_SHA2_256_32,
+            "must carry the sha2-256 multihash prefix in-band"
+        );
+        assert_eq!(bytes.len(), 34, "2-byte multihash prefix + 32-byte digest");
+
+        // The published `task-consent/request/0.1` pattern, which bare
+        // hex satisfies only by accident (and only when the digest
+        // happens to start with one of b/f/F/u/m/z).
+        assert!(
+            digest.len() >= 16
+                && digest
+                    .chars()
+                    .skip(1)
+                    .all(|c| c.is_ascii_alphanumeric() || "+/=_-".contains(c)),
+            "must match the DigestMultibase pattern, got {digest}"
         );
     }
 

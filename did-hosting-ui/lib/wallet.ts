@@ -589,12 +589,10 @@ export interface TaskAccepted {
 
 export type RequestTaskOutcome = TaskAccepted | TaskConsentRequired;
 
-/** How much of the digest a human is asked to compare. */
-export const DIGEST_PREFIX_LEN = 6;
-
-export function digestPrefix(payloadDigest: string): string {
-  return payloadDigest.slice(0, DIGEST_PREFIX_LEN);
-}
+// The operator's comparison code lives in its own import-free module so
+// the test runner can reach it; this file imports `react-native`, which
+// vitest cannot parse. Re-exported here so callers keep one import site.
+export { DIGEST_PREFIX_LEN, digestPrefix } from "./digest-code";
 
 /**
  * Ask the user's VTA to update a DID document.

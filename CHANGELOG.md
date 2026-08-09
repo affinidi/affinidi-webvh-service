@@ -2,6 +2,82 @@
 
 ## Unreleased
 
+### Changed — wire
+
+- **The task-consent `payloadDigest` is now a `digestMultibase`, not bare
+  hex.** `routes::task_consent::wire_digest` emits
+  `multibase(base58btc, 0x12 0x20 || sha256(…))` — the encoding W3C VCDM
+  2.0 defines, `did:webvh` already uses for its SCIDs, and the Trust
+  Tasks registry moved `payloadDigest` onto in `trust-tasks-rs` 0.4. The
+  pre-image is unchanged: same domain tag, same length-prefixed task type
+  and JCS-canonical payload, same challenge salt. Only the encoding moved.
+
+  **This is a coordinated cross-repo change and had to happen.** The
+  published `task-consent/request/0.1` schema types the member as
+  `DigestMultibase` (`^[zumbfF][A-Za-z0-9+/=_-]+$`, ≥16 chars), which a
+  hex digest satisfies only by accident — and only when it happens to
+  start with one of `b`/`f`/`F`/`u`/`m`/`z`. The VTA's half is
+  OpenVTC/verifiable-trust-infrastructure#911, which converted
+  `vta_policy::consent` to the identical encoding *and* made
+  `vta-mobile-core` **parse** the incoming digest as `DigestMultibase`
+  rather than pass a string through. Against that approver our hex value
+  now fails at the device — which is the good failure. The bad one, had
+  the parse not been added, is an approval the operator gives and accepts
+  and which then silently never takes effect, because the executor can
+  never match it.
+
+  The digest is only ever *echoed* by the approver, never recomputed, so
+  the two services keep their own domain tags
+  (`did-hosting/task-consent/v1\0` here, `vta/task-consent/v1\0` there) —
+  a digest minted by one can't be replayed as the other's. Only the
+  encoding has to agree.
+
+  Nothing to migrate: in-flight pendings live in an in-memory map behind
+  `CONSENT_TIMEOUT` and do not survive the restart that deploys this.
+
+  Covered by a new `digest_is_multibase_multihash_not_hex` test asserting
+  the *structure* — base58btc, the `0x12 0x20` multihash prefix in-band,
+  34 bytes, and the published pattern — rather than a character count,
+  since base58 is not byte-aligned and a leading-zero digest encodes
+  shorter.
+
+- **The operator's match code now derives from the digest bytes, not the
+  encoding** (`digestPrefix`, moved to `did-hosting-ui/lib/digest-code.ts`).
+
+  This is the other half of the change above, and skipping it would have
+  broken the check outright. The code is the six characters the operator
+  compares between this screen and the approver's device, under a hint
+  that reads *"if the codes differ, deny it"*. It used to be the digest's
+  first six characters, which was `hex(digest)[..6]` while the wire
+  carried hex. Left alone, the encoding change would have made this
+  screen show `zQmcdL` while the approver showed `d449ac` — every code
+  mismatching, every legitimate change looking like an attack.
+
+  `digestPrefix` now decodes the multibase, strips the `0x12 0x20`
+  multihash prefix, and hex-encodes the leading digest bytes — mirroring
+  `vta-mobile-core`'s `match_code_from_digest` exactly. Because the
+  digest is still SHA-256, this reproduces the *same* code the screen
+  showed before the migration, so the encoding change is invisible here.
+
+  It also keeps the entropy: `payloadDigest` opens `zQm` for every value
+  ever produced (base58btc marker plus the sha2-256 multihash prefix), so
+  slicing the encoded string would have spent half the code on a constant
+  — ~17.6 bits where the operator believes they are comparing ~35, and
+  still *looking* like six random characters, which is what would make it
+  dangerous rather than merely wasteful.
+
+  Fails closed: anything that is not a base58btc sha2-256 multihash —
+  including a stale bare-hex digest — yields `""`, so the operator sees
+  no code and denies rather than being shown a plausible prefix of an
+  unparseable value.
+
+  Pinned by `lib/__tests__/digest-prefix.test.ts` against the VTA's own
+  test vector (`zQmSK9…GYZ` → `3b0c7f`), so a divergence in either
+  repo's derivation fails a test instead of silently reaching an
+  operator. The function moved to its own import-free module because
+  `wallet.ts` imports `react-native`, which the test runner cannot parse;
+  `wallet.ts` re-exports it, so callers are unchanged.
+
 ### Security
 
 - **The DIDComm trust-task envelope now carries the same anti-replay gate
@@ -201,16 +277,11 @@
   with an unchanged payload shape.
 
   **0.4** retyped digest-carrying payload members from `String` to the
-  validating `DigestMultibase` newtype. It did not reach our code — our
-  `task-consent/*` legs are built and read as untyped `serde_json::Value`
-  against the descriptors in `did_hosting_tasks.rs`, not the codegen
-  payload types — but it does mean the raw-hex `payloadDigest` in
-  `routes::task_consent::wire_digest` no longer conforms to the published
-  schema for the spec version we declare. Nothing rejects it today: the
-  VTA holds `payload_digest` as a `String` and echoes it verbatim, and
-  neither side parses through the 0.4 newtype. Re-encoding it as a
-  multibase-multihash is a coordinated cross-repo change, deliberately
-  not folded into a dependency bump.
+  validating `DigestMultibase` newtype. It did not reach our *compile* —
+  our `task-consent/*` legs are built and read as untyped
+  `serde_json::Value` against the descriptors in `did_hosting_tasks.rs`,
+  not the codegen payload types — but see the wire change below, which
+  it forces.
 
   The lock now carries **two `trust-tasks-rs` copies** — 0.2.60 for
   `vta-sdk` 0.21.9 / `vti-common` 0.11.35 / `trust-tasks-capability-client`,
