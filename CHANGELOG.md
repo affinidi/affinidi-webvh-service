@@ -180,6 +180,111 @@
 
 ### Dependencies
 
+- **The `trust-tasks-*` family 0.2 → 0.4, moved as one workspace event**
+  (`trust-tasks-rs` 0.2.55 → 0.4.1, `-https` / `-didcomm` / `-proof` /
+  `-tsp` 0.2.x → 0.4.0). The core types cross the public API of the four
+  binding crates, so a graph mixing majors does not type-check — all five
+  requirements move together or none do.
+
+  Two framework changes reached our code. **0.3** added `parentThreadId`
+  to the document envelope and `inResponseTo` to the error payload, which
+  breaks struct-literal construction of `TrustTask` / `ErrorResponse`: the
+  three unrouted body-parse error builders (`messaging::body_parse_error`,
+  `routes::auth::trust_task_malformed`, `routes::trust_tasks::body_parse_error`)
+  pass `None` — nothing parsed, so there is no request to read an enclosing
+  exchange from — and `messaging::tt_reply` carries the request's value
+  through, since per SPEC §4.9.2 the whole exchange shares one parent.
+  0.3 also moved the emitted framework error Type URI to
+  `trust-task-error/0.3`, which two envelope-dispatch tests asserted on.
+  No wire change we produce: `parentThreadId` is omitted when unset, and
+  the error documents we hand-build still declare `trust-task-error/0.1`
+  with an unchanged payload shape.
+
+  **0.4** retyped digest-carrying payload members from `String` to the
+  validating `DigestMultibase` newtype. It did not reach our code — our
+  `task-consent/*` legs are built and read as untyped `serde_json::Value`
+  against the descriptors in `did_hosting_tasks.rs`, not the codegen
+  payload types — but it does mean the raw-hex `payloadDigest` in
+  `routes::task_consent::wire_digest` no longer conforms to the published
+  schema for the spec version we declare. Nothing rejects it today: the
+  VTA holds `payload_digest` as a `String` and echoes it verbatim, and
+  neither side parses through the 0.4 newtype. Re-encoding it as a
+  multibase-multihash is a coordinated cross-repo change, deliberately
+  not folded into a dependency bump.
+
+  The lock now carries **two `trust-tasks-rs` copies** — 0.2.60 for
+  `vta-sdk` 0.21.9 / `vti-common` 0.11.35 / `trust-tasks-capability-client`,
+  0.4.1 for us and the messaging stack. It compiles because neither
+  `vta-sdk` nor `vti-common` exposes a trust-task type across its API to
+  us, so the copies never meet in one type-checking context. Collapse it
+  when the VTI side republishes on 0.4; dropping back to 0.2 would instead
+  split the messaging stack, which is already on ^0.4.
+
+  **0.4.1 is deliberate, not stale.** `trust-tasks-rs` 0.5.0 published
+  the same day, adding an optional `ceremony` envelope member (SPEC §4.11)
+  — wire-compatible, breaking only struct-literal construction. Nothing
+  in the Affinidi ecosystem has picked it up: the whole messaging stack
+  still pins ^0.4.0, so taking 0.5 would mean a *third* copy in the lock
+  and putting us on a different major from `affinidi-messaging-didcomm-service`,
+  the crate we register handlers with. Revisit when the messaging stack moves.
+
+- **The Affinidi messaging stack moved with it** —
+  `affinidi-messaging-sdk` 0.18.65 → 0.19.3,
+  `affinidi-messaging-didcomm-service` 0.3.21 → 0.3.24,
+  `affinidi-messaging-mediator` 0.18.4 → 0.18.11 (via
+  `affinidi-messaging-test-mediator` 0.2.45 → 0.2.49),
+  `affinidi-tdk` 0.8.4 → 0.8.5, `affinidi-tsp` and `affinidi-messaging-didcomm`
+  to their latest patches. Those three messaging crates are what pin
+  `trust-tasks-rs` ^0.4 on the ecosystem side, so this half is not
+  separable from the one above.
+
+- **`vti-common` 0.11.33 → 0.11.35 and `vta-sdk` 0.21.4 → 0.21.9**, moved
+  together as the lockstep note in the workspace manifest requires — the
+  workspace `vta-sdk` requirement plus all four `vti-common` declarations
+  (`did-hosting-{common,control,server}`, `webvh-witness`). Verified with
+  `cargo tree -d -e normal,build,dev`: no duplicate `vta-sdk`,
+  `vti-common` or `affinidi-tdk`; `trust-tasks-rs` is the one expected
+  duplicate, for the reason above.
+
+- **`ed25519-dalek` 2 → 3 and `sha2` 0.10 → 0.11**, taken to *join* the
+  copy the Affinidi stack already uses rather than because they are latest.
+  All of `affinidi-crypto`, `-data-integrity`, `-messaging-didcomm`,
+  `-tsp`, `vta-sdk` and `vti-common` were already on dalek 3, leaving our
+  five crates as the only first-party holdouts on 2.x; `didwebvh-rs`,
+  `vta-sdk` and `vti-common` are likewise on sha2 0.11. Both boundaries
+  are byte-level on our side (JWT keys go to `jsonwebtoken` as DER/raw
+  bytes via `JwtKeys::from_ed25519_bytes`; sha2 is used once, for the
+  task-consent wire digest), so no signing or verification code changed.
+  The only `ed25519-dalek` 2 left in the lock is `jsonwebtoken`'s own,
+  which never crosses our API.
+
+- **Deliberately *not* taken: `jsonwebtoken` 11 and `base64` 0.23.**
+  Both are the latest published, and both would have added a duplicate
+  rather than replaced one. `trust-tasks-https`'s `jwt` feature and
+  `vti-common` pin `jsonwebtoken` ^10, so 11 keeps 10 in the graph *and*
+  splits us from the JWT surface we hand tokens to — and 11 still depends
+  on `ed25519-dalek` ^2, so it buys nothing on that front either. Every
+  Affinidi crate is on `base64` 0.22, so 0.23 would be a third copy (the
+  AWS SDK already drags in 0.21) for a crate that is pure encoding and
+  crosses no API. The reasoning is recorded next to each requirement in
+  the workspace manifest so the next refresh doesn't relitigate it.
+
+- **Admin UI: in-range dependency refresh** — `expo` 57.0.9 → 57.0.11,
+  `expo-router` 57.0.9 → 57.0.11, `expo-constants` 57.0.8 → 57.0.9,
+  `expo-linking` 57.0.4 → 57.0.5, `react-native-safe-area-context` 5.8.0
+  → 5.8.1. Lockfile only; no `package.json` range changed.
+  `npm run typecheck` and `npm test` pass.
+
+  `npm audit` reports 14 high-severity advisories, all in the Metro /
+  Expo *build* toolchain (`image-size`, `nanoid`, `metro*`,
+  `@react-native/*`) and none in shipped runtime code. They are not a
+  regression from this change — they were published after the SDK 57
+  bump — and `npm audit fix --force` "resolves" them by downgrading
+  `expo` 57 → 53 and `react-native` 0.86 → 0.72, which is a far larger
+  regression than the advisories. Left for the upstream Expo release
+  that carries the fixed Metro. `react-native-screens` 4.27.0 is
+  available but out of the declared `~4.26` range; not taken here.
+
 - **`vta-sdk` 0.20 → 0.21 and `vti-common` 0.11.30 → 0.11.33, moved
   together.** `vti-common` 0.11.33 re-pins onto `vta-sdk` ^0.21, so
   refreshing the lockfile alone would have resolved *two* `vta-sdk`
