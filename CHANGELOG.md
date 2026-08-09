@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+### Changed — wire
+
+- **The task-consent `payloadDigest` is now a `digestMultibase`, not bare
+  hex.** `routes::task_consent::wire_digest` emits
+  `multibase(base58btc, 0x12 0x20 || sha256(…))` — the encoding W3C VCDM
+  2.0 defines, `did:webvh` already uses for its SCIDs, and the Trust
+  Tasks registry moved `payloadDigest` onto in `trust-tasks-rs` 0.4. The
+  pre-image is unchanged: same domain tag, same length-prefixed task type
+  and JCS-canonical payload, same challenge salt. Only the encoding moved.
+
+  **This is a coordinated cross-repo change and had to happen.** The
+  published `task-consent/request/0.1` schema types the member as
+  `DigestMultibase` (`^[zumbfF][A-Za-z0-9+/=_-]+$`, ≥16 chars), which a
+  hex digest satisfies only by accident — and only when it happens to
+  start with one of `b`/`f`/`F`/`u`/`m`/`z`. The VTA's half is
+  OpenVTC/verifiable-trust-infrastructure#911, which converted
+  `vta_policy::consent` to the identical encoding *and* made
+  `vta-mobile-core` **parse** the incoming digest as `DigestMultibase`
+  rather than pass a string through. Against that approver our hex value
+  now fails at the device — which is the good failure. The bad one, had
+  the parse not been added, is an approval the operator gives and accepts
+  and which then silently never takes effect, because the executor can
+  never match it.
+
+  The digest is only ever *echoed* by the approver, never recomputed, so
+  the two services keep their own domain tags
+  (`did-hosting/task-consent/v1\0` here, `vta/task-consent/v1\0` there) —
+  a digest minted by one can't be replayed as the other's. Only the
+  encoding has to agree.
+
+  Nothing to migrate: in-flight pendings live in an in-memory map behind
+  `CONSENT_TIMEOUT` and do not survive the restart that deploys this.
+
+  Covered by a new `digest_is_multibase_multihash_not_hex` test asserting
+  the *structure* — base58btc, the `0x12 0x20` multihash prefix in-band,
+  34 bytes, and the published pattern — rather than a character count,
+  since base58 is not byte-aligned and a leading-zero digest encodes
+  shorter.
+
+  **Known, deliberately not fixed here:** the 6-character code the
+  operator compares between the two screens is the digest's first six
+  characters, and under this encoding the first three are always `zQm` —
+  the algorithm prefix, not entropy. The code now carries ~17.6 bits
+  where it carried ~35. The principled fix (derive from the decoded
+  bytes, skipping the 2-byte multihash prefix) has to land in the same
+  release on both screens — ours is `digestPrefix` in
+  `did-hosting-ui/lib/wallet.ts`, the approver's is `vta-mobile-core`'s
+  `MATCH_CODE_LEN` — so changing it here alone would break matching
+  outright rather than merely weakening it. Documented at both call
+  sites; #911 reached the same conclusion from the other side.
+
 ### Security
 
 - **The DIDComm trust-task envelope now carries the same anti-replay gate
@@ -201,16 +252,11 @@
   with an unchanged payload shape.
 
   **0.4** retyped digest-carrying payload members from `String` to the
-  validating `DigestMultibase` newtype. It did not reach our code — our
-  `task-consent/*` legs are built and read as untyped `serde_json::Value`
-  against the descriptors in `did_hosting_tasks.rs`, not the codegen
-  payload types — but it does mean the raw-hex `payloadDigest` in
-  `routes::task_consent::wire_digest` no longer conforms to the published
-  schema for the spec version we declare. Nothing rejects it today: the
-  VTA holds `payload_digest` as a `String` and echoes it verbatim, and
-  neither side parses through the 0.4 newtype. Re-encoding it as a
-  multibase-multihash is a coordinated cross-repo change, deliberately
-  not folded into a dependency bump.
+  validating `DigestMultibase` newtype. It did not reach our *compile* —
+  our `task-consent/*` legs are built and read as untyped
+  `serde_json::Value` against the descriptors in `did_hosting_tasks.rs`,
+  not the codegen payload types — but see the wire change below, which
+  it forces.
 
   The lock now carries **two `trust-tasks-rs` copies** — 0.2.60 for
   `vta-sdk` 0.21.9 / `vti-common` 0.11.35 / `trust-tasks-capability-client`,
