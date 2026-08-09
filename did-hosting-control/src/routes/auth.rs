@@ -418,6 +418,9 @@ fn trust_task_malformed(reason: &str) -> Response {
     let err_doc = trust_tasks_rs::ErrorResponse {
         id: format!("urn:uuid:{}", Uuid::new_v4()),
         thread_id: None,
+        // Unrouted: the envelope never parsed, so there is no request to read
+        // an enclosing exchange from (SPEC §4.9.2).
+        parent_thread_id: None,
         type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
             .parse()
             .expect("framework error Type URI parses"),

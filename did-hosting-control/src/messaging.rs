@@ -1850,6 +1850,9 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
     TrustTask {
         id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         thread_id: None,
+        // The body never parsed, so there is no request to read an enclosing
+        // exchange from (SPEC §4.9.2).
+        parent_thread_id: None,
         type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
             .parse()
             .expect("framework error Type URI parses"),
@@ -2063,6 +2066,9 @@ fn tt_reply(
     let doc = trust_tasks_rs::TrustTask {
         id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         thread_id: Some(request.id.clone()),
+        // SPEC §4.9.2 — the whole exchange shares one parent, so a response
+        // stays inside whatever enclosing exchange the request named.
+        parent_thread_id: request.parent_thread_id.clone(),
         type_uri,
         issuer: Some(my_vid.to_string()),
         recipient: Some(sender.to_string()),
@@ -4503,7 +4509,7 @@ mod tests {
 
         assert_eq!(
             resp_body["type"],
-            "https://trusttasks.org/spec/trust-task-error/0.2"
+            "https://trusttasks.org/spec/trust-task-error/0.3"
         );
         assert_eq!(resp_body["payload"]["code"], "proofInvalid");
         for did in ["did:example:mallory", "did:example:grantee"] {
@@ -4536,7 +4542,7 @@ mod tests {
 
         assert_eq!(
             resp_body["type"],
-            "https://trusttasks.org/spec/trust-task-error/0.2"
+            "https://trusttasks.org/spec/trust-task-error/0.3"
         );
         assert_eq!(resp_body["payload"]["code"], "proofRequired");
         assert!(
