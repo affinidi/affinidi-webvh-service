@@ -102,7 +102,7 @@ pub async fn challenge(
 /// checking the signature, then bind the JWT to the resolved DID.
 ///
 /// Body is accepted as raw bytes (mirroring `routes/trust_tasks.rs`) so
-/// a malformed envelope surfaces a `trust-task-error/0.1` document with
+/// a malformed envelope surfaces a `trust-task-error` document with
 /// `code: malformed_request` rather than axum's text/plain default.
 pub async fn authenticate(
     State(state): State<AppState>,
@@ -399,7 +399,7 @@ fn canonical_to_local_auth_response(
     }
 }
 
-/// Build a `trust-task-error/0.1` HTTP response for a malformed
+/// Build a `trust-task-error` HTTP response for a malformed
 /// authenticate envelope. Mirrors `routes/trust_tasks.rs::body_parse_error`
 /// — unrouted (no source issuer/recipient to draw from), `code:
 /// malformed_request`, mapped to its spec status via `status_for_code`.
@@ -421,9 +421,7 @@ fn trust_task_malformed(reason: &str) -> Response {
         // Unrouted: the envelope never parsed, so there is no request to read
         // an enclosing exchange from (SPEC §4.9.2).
         parent_thread_id: None,
-        type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
-            .parse()
-            .expect("framework error Type URI parses"),
+        type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         issuer: None,
         recipient: None,
         issued_at: Some(chrono::Utc::now()),

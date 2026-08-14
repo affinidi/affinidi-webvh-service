@@ -137,6 +137,31 @@
 
 ### Fixed
 
+- **The service no longer emits two versions of the framework error
+  document.** Every *routed* rejection goes out through
+  `TrustTask::reject_with`, which stamps whatever `trust-tasks-rs` emits —
+  `trust-task-error/0.3` since the framework's own 0.3 release. But the four
+  **unrouted** paths (a body that never parsed into a Trust Task, so there is
+  no request to reject from) each wrote the Type URI out by hand, and each
+  wrote `0.1`: `routes::trust_tasks::error_type_uri`,
+  `routes::auth::trust_task_malformed`, `messaging::body_parse_error` and the
+  TSP transport's parse-failure reply.
+
+  So which version a caller saw depended on whether its request happened to
+  parse. That is a trap for exactly the consumer that pins a version, and the
+  trap sprang: a client enumerating `0.1`/`0.2` decoded every `0.3` rejection as
+  a **success**, because an unrecognised error document falls through to the
+  success branch (see the management-UI entry below, and
+  OpenVTC/vta-browser-plugin#115).
+
+  `trust-tasks-rs` keeps `trust_task_error_type_uri()` `pub(crate)`, so the
+  value cannot be read from the framework. It is now named once for the
+  workspace in `did_hosting_common::server::trust_tasks::framework_error_type_uri`,
+  and a test compares it against the Type URI a real `reject_with` produces —
+  so a framework bump fails a test instead of silently re-splitting the service
+  in two. Test assertions that hard-coded `0.1` now assert against that
+  function rather than a literal.
+
 - **The management UI now recognises a Trust-Task rejection again**
   (did-hosting-ui). Two independent faults, either of which alone hid the
   server's answer:

@@ -80,7 +80,7 @@ pub(crate) async fn run_tsp_trust_task(
             // Same `malformed_request` shape the DIDComm/HTTPS transports
             // emit, so a producer sees a consistent error across transports.
             let err_doc = body_parse_error(&e.to_string());
-            let body = serde_json::to_vec(&err_doc).expect("trust-task-error/0.1 serialises");
+            let body = serde_json::to_vec(&err_doc).expect("trust-task-error serialises");
             return Ok(Some(body));
         }
     };
@@ -186,7 +186,7 @@ mod tests {
     }
 
     /// A malformed TSP payload comes back as a serialised
-    /// `trust-task-error/0.1` document, not an `Err` — the sender gets a
+    /// `trust-task-error` document, not an `Err` — the sender gets a
     /// consistent error shape across every transport.
     #[tokio::test]
     async fn malformed_payload_yields_trust_task_error_doc() {
@@ -198,7 +198,7 @@ mod tests {
         let doc: Value = serde_json::from_slice(&bytes).expect("response is JSON");
         assert_eq!(
             doc["type"],
-            "https://trusttasks.org/spec/trust-task-error/0.1"
+            did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string()
         );
     }
 
