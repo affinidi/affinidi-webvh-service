@@ -137,6 +137,35 @@
 
 ### Fixed
 
+- **The management UI now recognises a Trust-Task rejection again**
+  (did-hosting-ui). Two independent faults, either of which alone hid the
+  server's answer:
+
+  1. The reply-document check was pinned to `trust-task-error/0.1`, and
+     `trust-tasks-rs` has emitted `/0.3` since its 0.3 release — it carries the
+     §8.2 `inResponseTo` member, which `0.2`'s `additionalProperties: false`
+     payload schema cannot admit. The workspace is on 0.4.1, so nothing had sent
+     a document that check matched for some time. It now matches the framework
+     slug at any `0.x` (SPEC.md §5.2 forward-minor), so the next minor cannot
+     break it again; `1.x` is excluded, as that is where the payload shape may
+     change.
+
+  2. A rejection arrives as a *document* at a non-2xx status —
+     `into_response` maps the code through `status_for_code`
+     (`permissionDenied` → 403, `taskFailed` → 422). `request()` threw on the
+     status before the body was examined, so the document was discarded no
+     matter what version it claimed. Every rejection surfaced as a bare
+     `ApiError` carrying serialised JSON as its message, which meant the §8.4
+     retry policy — written against `code` / `retryable` / `retryAfter` — could
+     never run: nothing was ever a `TrustTaskRejection`. The body is now parsed
+     before the failure is classified; anything that is not a framework error
+     document is re-thrown untouched. `TrustTaskRejection` also keeps the status
+     it arrived at instead of reporting a flat 422.
+
+  The tests missed both because they served error documents at HTTP 200 and
+  typed them `/0.1` — a shape no server produces. They now serve rejections at
+  their mapped status with the emitted version.
+
 - **`cargo publish` no longer fails on the control plane's UI build**
   (did-hosting-control 0.8.8, did-hosting-ui). Both the build script and
   the rust-embed derive reached `../did-hosting-ui`, a workspace sibling
