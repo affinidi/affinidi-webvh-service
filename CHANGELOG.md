@@ -135,6 +135,31 @@
   extraction pattern) so it is drivable without an ATM-backed
   `HandlerContext`; wire behavior is unchanged.
 
+### Added
+
+- **The DID detail page now says when a delegated edit is unlikely to work, and
+  what to do when it did not** (did-hosting-ui, `lib/delegation-guard.ts`). Two
+  separate confusions, neither of which the obvious ownership gate solves on its
+  own:
+
+  - A control-plane admin sees *every* DID on the server (`list_dids` returns
+    all of them when the caller is admin and names no owner), and
+    "Publish with my agent" was offered on all of them — including DIDs no agent
+    of theirs could ever sign for. The page now warns when the DID's owner is
+    not the identity the session authenticated as. It **warns rather than
+    gates**: the page cannot learn which agent the wallet holds
+    (`walletDefaults()` returns only the step-up VTA), so a hard gate would also
+    block the legitimate passkey-session-plus-owning-wallet case.
+
+  - An **orphan** — a DID this host still serves after the owning agent deleted
+    it — passes any ownership test, because the host record keeps its `owner`.
+    (`delete_did_webvh` calls the host first and, if that fails, logs
+    "continuing local cleanup but DID is now orphaned on the daemon" and removes
+    the local record anyway.) The agent's rejection for this reads
+    `did not found: SCID … not found`, which looks like data loss for a DID the
+    host is visibly serving. That specific rejection now carries the reason and
+    the command that resolves it, rather than the raw error alone.
+
 ### Fixed
 
 - **The service no longer emits two versions of the framework error

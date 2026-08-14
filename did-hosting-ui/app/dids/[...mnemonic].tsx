@@ -28,6 +28,7 @@ import {
   type TaskConsentRequired,
   type RequestTaskOutcome,
 } from "../../lib/wallet";
+import { orphanHint, ownerMismatchWarning } from "../../lib/delegation-guard";
 import type {
   DidStats,
   DidDetailResponse,
@@ -98,6 +99,10 @@ export default function DidDetail() {
   // common case, since a VTA usually registers itself here before its DIDs.
   const ownerNameMap = useAgentNames([didDetail?.owner]);
   const ownerNames = ownerNameMap[didDetail?.owner ?? ""] ?? [];
+  // Rendered beside the delegated-edit actions when this DID belongs to someone
+  // other than the identity we signed in as. `null` when they match or either
+  // is unknown — see `delegation-guard` for why this warns rather than gates.
+  const delegationWarning = ownerMismatchWarning(didDetail?.owner, callerDid);
   const [copied, setCopied] = useState(false);
   const [didContent, setDidContent] = useState("");
   const [witnessContent, setWitnessContent] = useState("");
@@ -439,7 +444,12 @@ export default function DidDetail() {
       loadData();
       return "accepted";
     } catch (e: unknown) {
-      if (!silent) showAlert("Error", e instanceof Error ? e.message : "The request failed.");
+      // The wallet flattens the agent's rejection to a message string on its
+      // way through the extension bridge, so there is no `code` here — the
+      // message is all we get, and `orphanHint` is written to work from it.
+      const message = e instanceof Error ? e.message : "The request failed.";
+      const hint = orphanHint(undefined, message);
+      if (!silent) showAlert("Error", hint ? `${message}\n\n${hint}` : message);
       return "error";
     } finally {
       if (!silent) setPublishing(false);
@@ -678,10 +688,18 @@ export default function DidDetail() {
   // Park a name: stop serving it but keep it reserved to this DID. Unlike
   // remove, the agent runs a dedicated task that both drops the claim and tells
   // the host to hold the reservation — so nobody else can take it while parked.
+  // Park and resume are delegated publishes like any other, so the same
+  // ownership caveat applies — and the confirm is the last thing read before
+  // the agent is asked, which makes it the right place to say so.
+  const withDelegationWarning = (body: string) =>
+    delegationWarning ? `${body}\n\n${delegationWarning}` : body;
+
   const handleParkName = (name: string) => {
     showConfirm(
       "Park name",
-      `Park ${agentNameLabel(name, agentDomain)}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
+      withDelegationWarning(
+        `Park ${agentNameLabel(name, agentDomain)}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
+      ),
       () => void runParkResume(name, false),
     );
   };
@@ -690,7 +708,9 @@ export default function DidDetail() {
   const handleResumeName = (name: string) => {
     showConfirm(
       "Resume name",
-      `Serve ${agentNameLabel(name, agentDomain)} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
+      withDelegationWarning(
+        `Serve ${agentNameLabel(name, agentDomain)} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
+      ),
       () => void runParkResume(name, true),
     );
   };
@@ -1153,6 +1173,19 @@ export default function DidDetail() {
                       change actually does before it signs anything — including effects that
                       are not visible in the document above.
                     </Text>
+                    {/*
+                      Shown, not enforced. An admin sees every DID on this server,
+                      so the button used to be offered on DIDs no agent of theirs
+                      could sign for — but the page cannot identify which agent the
+                      wallet holds, so a hard gate would also block the legitimate
+                      case (passkey session, wallet connected to the owning agent).
+                      Say what is odd and let the operator decide.
+                    */}
+                    {delegationWarning && (
+                      <Text style={[styles.hint, { color: colors.warning }]}>
+                        {delegationWarning}
+                      </Text>
+                    )}
                   </View>
                 )}
 
