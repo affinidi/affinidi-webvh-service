@@ -171,11 +171,13 @@ didwebvh-rs = "0.6"
 # republishes on vta-sdk ^0.23. Keep the lock's `affinidi-messaging-mediator`
 # at >= 0.18.4 regardless.
 #
-# `trust-tasks-rs` used to be duplicated in the *shipped* graph too, because
-# vta-sdk 0.21 / vti-common 0.11.35 pinned ^0.2 while we and the messaging
-# stack were on ^0.4. The 0.23 bump collapsed it — vta-sdk 0.23 is on ^0.4 —
-# so normal+build now carries one copy. Do not "fix" a future split by dropping
-# back to 0.2, which would instead split the messaging stack.
+# `trust-tasks-rs` has now been duplicated in the *shipped* graph twice, and
+# collapsed twice, by the same move: bring every crate that carries it onto one
+# major. First when vta-sdk 0.21 / vti-common 0.11.35 pinned ^0.2 against our
+# ^0.4 (the 0.23 bump closed it), then again on 0.4 → 0.6, where four
+# transitive carriers had to move together (see the Trust Tasks block below).
+# Do not "fix" a future split by dropping *back* a major — that splits the
+# messaging stack instead of joining it.
 #
 # `tsp` feature: enables the Trust Spanning Protocol client surface
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
@@ -193,11 +195,37 @@ vta-sdk = { version = "0.23", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). On crates.io at 0.4.x. The whole family
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.6.x. The whole family
 # moves as one workspace event — `trust-tasks-rs`'s core types cross the
 # public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
 # mixing majors does not type-check. Bump all five together, and in
 # lockstep with verifiable-trust-infrastructure.
+#
+# **"All five" undersells it.** `trust-tasks-rs` also arrives transitively
+# through four crates we pin by caret, and every one of them has to reach a
+# release on the same major or the shipped graph carries two copies:
+# `vti-common`, `affinidi-messaging-sdk`, `affinidi-messaging-didcomm-service`
+# and `trust-tasks-capability-client`. On the 0.4 → 0.6 move all four needed a
+# lockfile update and nothing else — the requirements were already wide enough —
+# but `cargo tree -d -e normal,build` is what tells you, and it listed
+# trust-tasks-rs twice until the last of them moved. Run it; do not assume the
+# five manifest lines were the whole job.
+#
+# What 0.4 → 0.6 changed for us:
+#   * 0.5.0 — `TrustTask<P>` gained an optional `ceremony` member (framework
+#     0.4, SPEC §4.11), so struct-literal construction of the envelope needs
+#     it. Four sites here, and they are not all the same: the three unrouted
+#     body-parse error builders pass `None` (nothing parsed, so there is no
+#     request to carry a ceremony from), while `messaging::tt_reply` builds a
+#     *response* and must carry `request.ceremony.clone()` — SPEC §7.1 keeps a
+#     reply inside the enactment its request belonged to, and `None` there
+#     would silently drop it out.
+#   * 0.6.0 — `DigestMultibase` narrowed to the two multibase headers CID §2.4
+#     requires (`z` base58btc, `u` base64url-no-pad) and now enforces each
+#     alphabet instead of assuming it. We mint base58btc, so nothing moved —
+#     but a peer that had chosen `b`/`f`/`m` (the old pattern admitted them)
+#     parses before this bump and fails after. `routes::task_consent` has a
+#     test asserting the base; keep it.
 #
 # What 0.2 → 0.4 changed for us:
 #   * 0.3.0 — `TrustTask` gained `parent_thread_id` and `ErrorPayload`
@@ -224,16 +252,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.4", default-features = false }
-trust-tasks-https = { version = "0.4", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.4", default-features = false }
-trust-tasks-proof = { version = "0.4", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.6", default-features = false }
+trust-tasks-https = { version = "0.6", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.6", default-features = false }
+trust-tasks-proof = { version = "0.6", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.4", default-features = false }
+trust-tasks-tsp = { version = "0.6", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the

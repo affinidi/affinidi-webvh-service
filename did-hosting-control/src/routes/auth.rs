@@ -419,8 +419,10 @@ fn trust_task_malformed(reason: &str) -> Response {
         id: format!("urn:uuid:{}", Uuid::new_v4()),
         thread_id: None,
         // Unrouted: the envelope never parsed, so there is no request to read
-        // an enclosing exchange from (SPEC §4.9.2).
+        // an enclosing exchange from (SPEC §4.9.2) — nor a ceremony to stay
+        // inside (§7.1).
         parent_thread_id: None,
+        ceremony: None,
         type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         issuer: None,
         recipient: None,

@@ -335,6 +335,37 @@
 
 ### Dependencies
 
+- **The `trust-tasks-*` family 0.4 → 0.6, with `vta-sdk` 0.23.2 and
+  `vti-common` 0.11.40.** The registry published
+  `vta/webvh/servers/reconcile/0.1` (trustoverip/dtgwg-trust-tasks-tf#210) in
+  `trust-tasks-rs` 0.6.1; this brings the workspace onto it, in lockstep with
+  OpenVTC/verifiable-trust-infrastructure#979.
+
+  **Six manifest lines were not the whole job.** Moving the five
+  `trust-tasks-*` pins and `vta-sdk` left `trust-tasks-rs` duplicated in the
+  *shipped* graph, which the rule in `Cargo.toml` forbids: four transitive
+  carriers were still on `^0.4` — `vti-common`, `affinidi-messaging-sdk`,
+  `affinidi-messaging-didcomm-service` and `trust-tasks-capability-client`.
+  All four moved by lockfile alone (their requirements were already wide
+  enough), and `cargo tree -d -e normal,build` is what surfaced it. `vti-common`
+  0.11.40 only existed because the VTI release landed first; the two repos
+  genuinely cannot be reconciled out of order.
+
+  Two source-level consequences of 0.5.0's new `ceremony` envelope member, at
+  the four places this workspace builds a `TrustTask` by struct literal. Three
+  are unrouted body-parse error builders and pass `None` — nothing parsed, so
+  there is no request to carry a ceremony from. The fourth,
+  `messaging::tt_reply`, builds a **response** and now carries
+  `request.ceremony.clone()`: SPEC §7.1 keeps a reply inside the enactment its
+  request belonged to, and `None` there would have silently dropped responses
+  out of their ceremony — a latent wire defect the compiler surfaced by
+  accident.
+
+  0.6.0's `DigestMultibase` narrowing (to `z`/`u`, with each alphabet enforced)
+  needed no change: `routes::task_consent` mints base58btc and has a test
+  asserting it. A peer that had chosen `b`/`f`/`m` would parse before this bump
+  and fail after.
+
 - **`vta-sdk` 0.21 → 0.23 and `vti-common` 0.11.35 → 0.11.39, moved
   together.** The two share the canonical auth wire types
   (`protocols::auth::{Session, TokenBundle, AuthenticateResponse, …}`), so

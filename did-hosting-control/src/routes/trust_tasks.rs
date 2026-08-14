@@ -223,8 +223,9 @@ fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
         id: format!("urn:uuid:{}", Uuid::new_v4()),
         thread_id: None,
         // Unrouted, as above: nothing parsed, so no enclosing exchange to name
-        // (SPEC §4.9.2).
+        // (SPEC §4.9.2) and no ceremony to stay inside (§7.1).
         parent_thread_id: None,
+        ceremony: None,
         type_uri: error_type_uri(),
         issuer: None,
         recipient: None,
