@@ -17,14 +17,18 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api, retryDelayMs } from "../api";
+import { ApiError, TrustTaskRejection, api, retryDelayMs } from "../api";
 
 const GRANT = "https://trusttasks.org/spec/acl/grant/0.1";
 const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.1";
 const CHANGE_ROLE = "https://trusttasks.org/spec/acl/change-role/0.1";
 const LIST = "https://trusttasks.org/spec/acl/list/0.1";
 const SHOW = "https://trusttasks.org/spec/acl/show/0.1";
-const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.1";
+// The version the control plane actually emits. `trust-tasks-rs` has emitted
+// `trust-task-error/0.3` since its 0.3 release and the workspace is on 0.4.1.
+// This file used to say `0.1`, which nothing has sent for some time — one half
+// of why the rejection path could be broken in production and green here.
+const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.3";
 
 const NOW = Date.parse("2026-07-28T12:00:00Z");
 const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
@@ -134,15 +138,67 @@ function listResponse(entries: unknown[]) {
   };
 }
 
+/** The part of `Response` that `request()` actually touches. Named so the
+ *  stand-ins below can be annotated — without a declared return type, `text`
+ *  referring to a value the same object literal computes is circular (TS7023). */
+interface StubResponse {
+  ok: boolean;
+  status: number;
+  statusText?: string;
+  headers: Headers;
+  json: () => Promise<unknown>;
+  text: () => Promise<string>;
+}
+
 /** Minimal `Response` stand-in. `request()` inspects `headers` to reject
  *  HTML fallbacks from the SPA catch-all, so the content type matters. */
-const jsonOk = (body: unknown) => ({
+const jsonOk = (body: unknown): StubResponse => ({
   ok: true,
   status: 200,
   headers: new Headers({ "content-type": "application/json" }),
   json: async () => body,
   text: async () => JSON.stringify(body),
 });
+
+/**
+ * A rejection as the control plane actually returns one: the error document at
+ * the status `status_for_code` maps its framework code to — never 200.
+ *
+ * Serving these at 200 (which this file did) is the other half of why the
+ * rejection path was green here and dead in production: `request()` throws on
+ * the status before the document is ever looked at, so the branch that builds a
+ * `TrustTaskRejection` — and therefore the whole §8.4 retry policy below — was
+ * unreachable against a real server while every test passed.
+ */
+const STATUS_FOR_CODE: Record<string, number> = {
+  permissionDenied: 403,
+  notFound: 404,
+  malformedRequest: 400,
+  taskFailed: 422,
+  unavailable: 503,
+  internalError: 500,
+};
+
+const jsonError = (body: { type: string; payload: { code: string } }): StubResponse => {
+  const serialised = JSON.stringify(body);
+  return {
+    ok: false,
+    status: STATUS_FOR_CODE[body.payload.code] ?? 500,
+    statusText: "Error",
+    headers: new Headers({ "content-type": "application/json" }),
+    json: async () => body,
+    text: async () => serialised,
+  };
+};
+
+/** Serve success documents at 200 and error documents at their mapped status,
+ *  the way the server does. */
+const asResponse = (doc: unknown): StubResponse => {
+  const type = (doc as { type?: unknown })?.type;
+  return typeof type === "string" && type.includes("/trust-task-error/")
+    ? jsonError(doc as { type: string; payload: { code: string } })
+    : jsonOk(doc);
+};
 
 describe("trustTask — re-issue behaviour", () => {
   let trustTaskCalls: number;
@@ -164,7 +220,7 @@ describe("trustTask — re-issue behaviour", () => {
           trustTaskCalls++;
           const next = queue.shift();
           if (next === undefined) throw new Error("unexpected extra POST");
-          return jsonOk(next);
+          return asResponse(next);
         }
         throw new Error(`unexpected fetch: ${path}`);
       }),
@@ -221,5 +277,72 @@ describe("trustTask — re-issue behaviour", () => {
     await settled;
 
     expect(trustTaskCalls).toBe(1);
+  });
+
+  it("a rejection at its real status is still a TrustTaskRejection with its payload", async () => {
+    // The regression. A rejection arrives as a document at a NON-2xx status, so
+    // `request()` throws on the status first. Without reading the body before
+    // deciding, the document was discarded: the caller got a bare `ApiError`
+    // whose message was the serialised JSON, and `retryDelayMs` — which reads
+    // `code` and `retryable` off the payload — never ran, because nothing was
+    // ever a `TrustTaskRejection`.
+    stubFetch([errorResponse("permissionDenied", false)]);
+
+    const promise = api.listAcl();
+    const settled = expect(promise).rejects.toSatisfy(
+      (e: unknown) =>
+        e instanceof TrustTaskRejection &&
+        e.payload.code === "permissionDenied" &&
+        e.payload.retryable === false &&
+        // …and it reports the status it actually arrived at, not a flat 422.
+        e.status === 403,
+    );
+    await vi.runAllTimersAsync();
+    await settled;
+  });
+
+  it("re-issues after a retryable rejection served at its real status", async () => {
+    // The consequence of the above, and the behaviour the §8.4 policy exists
+    // for: `unavailable` (503) provably did not run, so it is safe to re-issue.
+    // This could not have worked while every rejection was a plain `ApiError`.
+    stubFetch([errorResponse("unavailable", true), listResponse([])]);
+
+    const promise = api.listAcl();
+    await vi.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.entries).toEqual([]);
+    expect(trustTaskCalls).toBe(2);
+  });
+
+  it("a non-trust-task error body is left alone", async () => {
+    // A proxy error page, an auth failure, anything that is not a framework
+    // error document must surface as the `ApiError` it is — dressing it up as a
+    // rejection would hand the retry policy fields nobody promised.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string): Promise<StubResponse> => {
+        if (path === "/api/server-info") {
+          return jsonOk({ server_did: "did:webvh:example:test", version: "0" });
+        }
+        return {
+          ok: false,
+          status: 502,
+          statusText: "Bad Gateway",
+          headers: new Headers({ "content-type": "text/html" }),
+          text: async () => "<html>gateway</html>",
+          json: async () => {
+            throw new Error("not json");
+          },
+        };
+      }),
+    );
+
+    const promise = api.listAcl();
+    const settled = expect(promise).rejects.toSatisfy(
+      (e: unknown) => e instanceof ApiError && !(e instanceof TrustTaskRejection),
+    );
+    await vi.runAllTimersAsync();
+    await settled;
   });
 });

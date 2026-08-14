@@ -451,6 +451,17 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * The raw response body, when there was one.
+     *
+     * Kept because a Trust-Task rejection arrives *as a document* at a non-2xx
+     * status (`status_for_code` maps `permissionDenied` → 403, `taskFailed` →
+     * 422, …). Throwing on the status alone discards that document, and with it
+     * the `code` / `retryable` / `retryAfter` members the §8.4 retry policy is
+     * written against — leaving the caller to match on message text, which is
+     * the thing that policy exists to avoid.
+     */
+    public body?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -571,7 +582,7 @@ async function request<T>(
       window.dispatchEvent(new Event("webvh:unauthorized"));
     }
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    throw new ApiError(res.status, text, text);
   }
 
   if (res.status === 204) {
@@ -1230,7 +1241,24 @@ export const api = {
 
 /** Trust Tasks framework Type URI prefix. */
 const TT_RESPONSE_FRAGMENT = "#response";
-const TT_ERROR_TYPE = "https://trusttasks.org/spec/trust-task-error/0.1";
+
+/**
+ * Is this reply document a framework error document, at any `0.x` minor?
+ *
+ * Matched by slug rather than pinned to a version. This was `=== ".../0.1"`,
+ * and `trust-tasks-rs` has emitted `trust-task-error/0.3` since its 0.3 release
+ * (it carries the §8.2 `inResponseTo` member, which `0.2`'s
+ * `additionalProperties: false` payload schema cannot admit) — so the control
+ * plane this UI talks to, on 0.4.1, has not sent a document this recognised in
+ * some time. SPEC.md §5.2's forward-minor rule says a consumer SHOULD accept a
+ * later minor; matching the slug means the next one cannot break it again.
+ * `1.x` is excluded on purpose: a major bump is where the payload shape may
+ * change, and `TrustTaskErrorPayload` is read directly off it.
+ */
+function isTrustTaskErrorType(type: string | undefined): boolean {
+  if (typeof type !== "string") return false;
+  return /^https:\/\/trusttasks\.org\/spec\/trust-task-error\/0\.\d+$/.test(type);
+}
 
 /** Outer envelope shape produced by every `trustTask()` call. */
 interface TrustTaskEnvelope<P> {
@@ -1258,14 +1286,49 @@ interface TrustTaskErrorPayload {
  * want the message keep working — this is an `ApiError` with the same
  * `status` and `message` as before.
  */
+/**
+ * Recover a {@link TrustTaskRejection} from an {@link ApiError} whose body is a
+ * framework error document, or `null` when it is anything else.
+ *
+ * Deliberately strict about what counts: the type must be a framework error
+ * document and the payload must carry a `code`. A body that merely happens to
+ * be JSON — an HTML error page is not, but a reverse proxy's `{"error": …}` is
+ * — must not be dressed up as a Trust-Task rejection, or the retry policy would
+ * be reading fields off a shape nobody promised.
+ */
+function trustTaskRejectionFrom(err: ApiError): TrustTaskRejection | null {
+  if (!err.body) return null;
+  let doc: { type?: unknown; payload?: unknown };
+  try {
+    doc = JSON.parse(err.body);
+  } catch {
+    return null;
+  }
+  if (!isTrustTaskErrorType(typeof doc?.type === "string" ? doc.type : undefined)) {
+    return null;
+  }
+  const payload = doc.payload as TrustTaskErrorPayload | undefined;
+  if (!payload || typeof payload.code !== "string") return null;
+  return new TrustTaskRejection(
+    payload.message ?? payload.code ?? "trust task rejected",
+    payload,
+    err.status,
+  );
+}
+
 export class TrustTaskRejection extends ApiError {
   constructor(
     message: string,
     public payload: TrustTaskErrorPayload,
+    // The status the rejection actually arrived at. `status_for_code` maps the
+    // framework code onto it (permissionDenied → 403, notFound → 404,
+    // taskFailed → 422), so reporting a flat 422 for all of them told anything
+    // reading `.status` — an error banner, a redirect on 401/403 — the wrong
+    // thing. Defaults to 422 for the 2xx-bodied path, which carries no status
+    // of its own.
+    status = 422,
   ) {
-    // 422: application-layer rejection; the HTTP status carried the same
-    // signal.
-    super(422, message);
+    super(status, message);
     this.name = "TrustTaskRejection";
   }
 }
@@ -1597,20 +1660,40 @@ async function sendTrustTaskOnce<Req, Resp>(
     }
   }
 
-  const respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(
-    "/api/trust-tasks",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(envelope),
-    },
-  );
+  let respDoc: TrustTaskEnvelope<Resp | TrustTaskErrorPayload>;
+  try {
+    respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(
+      "/api/trust-tasks",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(envelope),
+      },
+    );
+  } catch (e) {
+    // A rejection is a *document*, and it arrives at a non-2xx status:
+    // `into_response` maps the framework code through `status_for_code`
+    // (permissionDenied → 403, taskFailed → 422, …). `request()` throws on the
+    // status, so without this the document never reached the branch below —
+    // every rejection surfaced as a bare `ApiError` carrying the serialised
+    // JSON as its message, and the §8.4 retry policy, which reads `code` and
+    // `retryable` off the payload, could never run at all.
+    //
+    // Read the body before deciding what the failure was (the same rule the
+    // sibling wallet learned as guide R3.7). Anything that is not a
+    // trust-task error document — a proxy error page, an auth failure, a
+    // network-level fault — is re-thrown untouched.
+    const rejection = e instanceof ApiError ? trustTaskRejectionFrom(e) : null;
+    if (rejection) throw rejection;
+    throw e;
+  }
 
-  // Successful response carries `type: <request-type>#response`. An
-  // error response carries `type: <trust-task-error/0.1>`. We
-  // discriminate on the response envelope's `type` to surface the
-  // right shape to the caller.
-  if (respDoc.type === TT_ERROR_TYPE) {
+  // Successful response carries `type: <request-type>#response`. An error
+  // response carries a framework `trust-task-error/0.x` type. We discriminate
+  // on the response envelope's `type` to surface the right shape to the caller.
+  // Reachable when a peer answers a rejection at a 2xx status; the non-2xx
+  // path is handled above.
+  if (isTrustTaskErrorType(respDoc.type)) {
     const err = respDoc.payload as TrustTaskErrorPayload;
     throw new TrustTaskRejection(
       err.message ?? err.code ?? "trust task rejected",
