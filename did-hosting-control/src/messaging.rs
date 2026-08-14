@@ -1853,6 +1853,10 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
         // The body never parsed, so there is no request to read an enclosing
         // exchange from (SPEC §4.9.2).
         parent_thread_id: None,
+        // No ceremony, for the same reason as `parent_thread_id` above: SPEC
+        // §7.1 carries the member forward from the request so a reply stays
+        // inside its enactment, and here there is no request to carry it from.
+        ceremony: None,
         type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         issuer: None,
         recipient: None,
@@ -2067,6 +2071,12 @@ fn tt_reply(
         // SPEC §4.9.2 — the whole exchange shares one parent, so a response
         // stays inside whatever enclosing exchange the request named.
         parent_thread_id: request.parent_thread_id.clone(),
+        // And the ceremony for the same reason (SPEC §7.1): a response stays
+        // inside the enactment its request belonged to. `respond_with` carries
+        // this for callers that use it — this builder does not, because it
+        // needs a caller-chosen `type_uri`, so it has to carry it by hand.
+        // `None` here would silently drop the response out of its ceremony.
+        ceremony: request.ceremony.clone(),
         type_uri,
         issuer: Some(my_vid.to_string()),
         recipient: Some(sender.to_string()),
