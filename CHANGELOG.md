@@ -285,6 +285,33 @@
 
 ### Dependencies
 
+- **`vta-sdk` 0.21 → 0.23 and `vti-common` 0.11.35 → 0.11.39, moved
+  together.** The two share the canonical auth wire types
+  (`protocols::auth::{Session, TokenBundle, AuthenticateResponse, …}`), so
+  their requirements are one pin in five places, and vti-common 0.11.38
+  re-pinned onto vta-sdk ^0.22, 0.11.39 onto ^0.23.
+
+  This had to move because the version requirement is a caret: `cargo update`
+  floated vti-common to 0.11.39 on its own, and cargo's answer to "this needs a
+  vta-sdk you did not ask for" is not a resolution error — it adds the second
+  copy. The result was three `E0308: mismatched types` in `routes/auth.rs`
+  naming two identical-looking `AuthenticateResponse` types, which reads as a
+  code bug and is not one. CI never saw it (every job passes `--locked`); the
+  `Upstream drift` canary, which resolves the way `cargo install` does, went red
+  on 2026-08-13, a day before an operator's unlocked build hit the same wall.
+
+  No source changes were needed to absorb it — the workspace compiles, tests and
+  clippies clean against 0.23. Two duplicates also collapsed in the shipped
+  (normal + build) graph: it now carries one `vta-sdk`, one `vti-common`, one
+  `affinidi-tdk` **and** one `trust-tasks-rs`, the last because vta-sdk 0.23
+  pins `trust-tasks-rs` ^0.4 where 0.21 pinned ^0.2.
+
+  The **dev** graph still carries vta-sdk 0.21.9 and trust-tasks-rs 0.2.60, via
+  `affinidi-messaging-test-mediator` → `affinidi-messaging-mediator` 0.18.11,
+  which pins vta-sdk ^0.21. Tolerated deliberately: the mediator is a spawned
+  test fixture and neither copy crosses into a type-checking context of ours.
+  It collapses when the messaging stack republishes on ^0.23.
+
 - **The `trust-tasks-*` family 0.2 → 0.4, moved as one workspace event**
   (`trust-tasks-rs` 0.2.55 → 0.4.1, `-https` / `-didcomm` / `-proof` /
   `-tsp` 0.2.x → 0.4.0). The core types cross the public API of the four
