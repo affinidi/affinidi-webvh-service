@@ -15,7 +15,7 @@
 //! `TrustTask<Value>` by hand. The reason: axum's typed `Json<...>`
 //! extractor rejects malformed bodies with a plain-text 400 *before*
 //! the handler runs, which would be a wire-shape regression — the
-//! framework spec asks for a `trust-task-error/0.1` document on
+//! framework spec asks for a `trust-task-error` document on
 //! malformed input. Handling the parse here lets us emit the routed
 //! error document with `code: malformed_request` for any body-shape
 //! failure.
@@ -54,7 +54,7 @@ use crate::server::AppState;
 /// each typed handler.
 ///
 /// Body is accepted as raw bytes so a parse failure surfaces as a
-/// `trust-task-error/0.1` document with `code: malformed_request`
+/// `trust-task-error` document with `code: malformed_request`
 /// rather than axum's text/plain default. The route mount caps body
 /// size separately (see [`crate::routes::TRUST_TASKS_BODY_LIMIT`]).
 pub async fn dispatch_trust_task(
@@ -73,7 +73,7 @@ pub async fn dispatch_trust_task(
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
 
     // ─── 2. Parse the body to `TrustTask<Value>`. A parse failure
-    //        emits a routed `trust-task-error/0.1` document with
+    //        emits a routed `trust-task-error` document with
     //        `code: malformed_request`.
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(d) => d,
@@ -209,7 +209,7 @@ pub async fn dispatch_trust_task(
     Ok(into_response(outcome))
 }
 
-/// Build a `trust-task-error/0.1` document for a body-parse failure.
+/// Build a `trust-task-error` document for a body-parse failure.
 /// We have no source `TrustTask` to draw `issuer`/`recipient` from,
 /// so the error response is unrouted — the framework permits this on
 /// malformed-body failures since the producer can correlate on the
@@ -237,10 +237,12 @@ fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
     }
 }
 
+/// One definition for the workspace — see
+/// [`did_hosting_common::server::trust_tasks::framework_error_type_uri`] for why
+/// the value is named rather than read from the framework, and why every
+/// unrouted path must agree with the routed ones.
 fn error_type_uri() -> trust_tasks_rs::TypeUri {
-    "https://trusttasks.org/spec/trust-task-error/0.1"
-        .parse()
-        .expect("framework error Type URI parses")
+    did_hosting_common::server::trust_tasks::framework_error_type_uri()
 }
 
 fn into_response(outcome: DispatchOutcome) -> Response {
@@ -261,8 +263,8 @@ fn into_response(outcome: DispatchOutcome) -> Response {
                 tracing::error!(status_u16, "unexpected status code from status_for_code");
                 StatusCode::INTERNAL_SERVER_ERROR
             });
-            let body = serde_json::to_vec(&err_doc)
-                .expect("error document serialises (trust-task-error/0.1)");
+            let body =
+                serde_json::to_vec(&err_doc).expect("error document serialises (trust-task-error)");
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -300,8 +302,8 @@ mod tests {
         assert!(err.id.starts_with("urn:uuid:"));
         assert!(err.thread_id.is_none());
         assert_eq!(
-            err.type_uri.to_string(),
-            "https://trusttasks.org/spec/trust-task-error/0.1"
+            err.type_uri,
+            did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         );
         assert!(err.issuer.is_none());
         assert!(err.recipient.is_none());

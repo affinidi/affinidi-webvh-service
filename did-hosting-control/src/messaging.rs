@@ -1763,7 +1763,7 @@ pub(crate) async fn run_trust_tasks_envelope(
             // sender sees a consistent error shape across transports.
             let err_doc = body_parse_error(&e.to_string());
             let body =
-                serde_json::to_value(&err_doc).expect("trust-task-error/0.1 document serialises");
+                serde_json::to_value(&err_doc).expect("trust-task-error document serialises");
             return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
         }
     };
@@ -1838,7 +1838,7 @@ pub(crate) async fn run_trust_tasks_envelope(
     }
 }
 
-/// Build the same body-parse `trust-task-error/0.1` document that the
+/// Build the same body-parse `trust-task-error` document that the
 /// HTTPS transport uses, kept here so the two transports emit
 /// byte-identical error shapes for parse failures.
 pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
@@ -1853,9 +1853,7 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
         // The body never parsed, so there is no request to read an enclosing
         // exchange from (SPEC §4.9.2).
         parent_thread_id: None,
-        type_uri: "https://trusttasks.org/spec/trust-task-error/0.1"
-            .parse()
-            .expect("framework error Type URI parses"),
+        type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         issuer: None,
         recipient: None,
         issued_at: Some(chrono::Utc::now()),
@@ -3711,7 +3709,7 @@ mod tests {
         assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
         assert_eq!(
             resp_body["type"].as_str().unwrap(),
-            "https://trusttasks.org/spec/trust-task-error/0.1"
+            did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string()
         );
         // trust-tasks-rs 0.2 serialises StandardCode in camelCase
         // (`malformedRequest`); it still reads the 0.1 snake_case form on

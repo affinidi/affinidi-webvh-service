@@ -204,7 +204,31 @@ where
     }
 }
 
-/// Build a `trust-task-error/0.1` document addressed to the request's
+/// The framework's error-document Type URI — the one `TrustTask::reject_with`
+/// stamps on every *routed* rejection this service emits.
+///
+/// Named here because `trust-tasks-rs` keeps `trust_task_error_type_uri()`
+/// `pub(crate)`, so the handful of **unrouted** paths — where the body never
+/// parsed into a Trust Task and there is no request document to reject from —
+/// have to write the value out. They wrote `0.1` while every routed reject went
+/// out as `0.3` (the framework has emitted `0.3` since its own 0.3 release, for
+/// the §8.2 `inResponseTo` member that `0.2`'s `additionalProperties: false`
+/// payload schema cannot admit). One service emitting two versions, split only
+/// by whether the request happened to parse, is a trap for exactly the consumer
+/// that pins one of them — and that consumer existed: a client enumerating
+/// `0.1`/`0.2` read every `0.3` rejection as a *success*.
+///
+/// One definition for the whole workspace, pinned by
+/// `unrouted_and_routed_errors_agree_on_the_type_uri` below, which compares it
+/// against a real `reject_with`. A framework bump fails that test rather than
+/// re-splitting the service in two.
+pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
+    "https://trusttasks.org/spec/trust-task-error/0.3"
+        .parse()
+        .expect("framework error Type URI parses")
+}
+
+/// Build a framework error document addressed to the request's
 /// `issuer`, carrying a custom `ErrorPayload` — used by handlers that
 /// need to emit spec-defined error shapes that don't fit the
 /// framework's [`trust_tasks_rs::RejectReason`] variants (e.g.
@@ -292,6 +316,38 @@ mod tests {
 
     const SERVICE_DID: &str = "did:web:maintainer.example";
     const ADMIN_DID: &str = "did:web:admin.example";
+
+    /// The unrouted body-parse errors must claim the same document type as a
+    /// routed rejection. They cannot ask the framework —
+    /// `trust_task_error_type_uri()` is `pub(crate)` there — so
+    /// [`framework_error_type_uri`] names the version, and this compares it
+    /// against what `reject_with` actually stamps.
+    ///
+    /// A framework bump fails here instead of splitting the service into two
+    /// dialects, which is how the unrouted paths came to say `0.1` while every
+    /// routed reject said `0.3`.
+    #[test]
+    fn unrouted_and_routed_errors_agree_on_the_type_uri() {
+        let request: TrustTask<serde_json::Value> = TrustTask::new(
+            "urn:uuid:probe",
+            list::v0_1::Payload::TYPE_URI
+                .parse()
+                .expect("acl/list Type URI parses"),
+            serde_json::json!({}),
+        );
+        let routed = request.reject_with(
+            "urn:uuid:routed",
+            trust_tasks_rs::RejectReason::InternalError {
+                reason: "probe".into(),
+            },
+        );
+        assert_eq!(
+            framework_error_type_uri(),
+            routed.type_uri,
+            "the unrouted error paths name a different document type than the \
+             framework stamps on a routed rejection"
+        );
+    }
 
     #[test]
     fn dispatcher_routes_every_registered_type() {
