@@ -335,6 +335,38 @@
 
 ### Dependencies
 
+- **`vta-sdk` 0.23 → 0.24, with `vti-common` 0.11.40 → 0.12.** The other half
+  of the same lockstep pin, and the third time this pair has split the graph.
+  `vti-common` 0.11.41 (published 2026-08-16) re-pins onto `vta-sdk` ^0.24
+  while the workspace still asked for ^0.23, so any resolution that did not
+  come from the committed lockfile pulled *both* copies and failed with three
+  E0308s in `did-hosting-control/src/routes/auth.rs` naming two
+  identical-looking `AuthenticateResponse` types.
+
+  **No source change was required, in this repo or in the SDK's shape.**
+  `vta-sdk` 0.24.0 is a single breaking change — `protocols::join_requests::
+  JoinRequestStatusBody::request_id` becomes `Option<Uuid>`, letting an
+  applicant poll a join it never learned the id of
+  (OpenVTC/verifiable-trust-infrastructure#985). This workspace has no
+  reference to join requests at all, so the major moved past us untouched;
+  `protocols::auth` — the module the errors pointed at — is byte-identical
+  between 0.23.3 and 0.24.0. The errors were never about a changed type. They
+  were about two copies of an unchanged one.
+
+  `vti-common` goes to the 0.12 minor rather than a pinned 0.11 patch because
+  the 0.11 line now straddles the boundary (0.11.40 pins ^0.23, 0.11.41 pins
+  ^0.24); a caret on 0.11.41 would keep floating across a divide the pin
+  exists to hold. `cargo tree -d -e normal,build` lists none of `vta-sdk`,
+  `vti-common`, `affinidi-tdk` or `trust-tasks-rs`.
+
+  **The operational lesson, which the earlier occurrences did not make
+  explicit:** the committed lockfile was correct throughout, so nothing here
+  broke — the failure only reproduces in a build that re-resolves. `cargo
+  install --path did-hosting-control` does exactly that unless given
+  `--locked`. Deploy with `--locked`, or a release built from a clean checkout
+  ships whatever crates.io published that morning rather than the pair CI
+  tested.
+
 - **The `trust-tasks-*` family 0.4 → 0.6, with `vta-sdk` 0.23.2 and
   `vti-common` 0.11.40.** The registry published
   `vta/webvh/servers/reconcile/0.1` (trustoverip/dtgwg-trust-tasks-tf#210) in

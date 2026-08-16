@@ -3025,7 +3025,7 @@ dependencies = [
  "url",
  "uuid",
  "vaultrs",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "vti-common",
  "webauthn-rs",
  "webauthn-rs-proto",
@@ -3097,7 +3097,7 @@ dependencies = [
  "trust-tasks-rs 0.6.1",
  "url",
  "uuid",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "vti-common",
  "webauthn-rs",
 ]
@@ -3126,7 +3126,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "webvh-watcher",
  "webvh-witness",
 ]
@@ -3192,7 +3192,7 @@ dependencies = [
  "trust-tasks-rs 0.6.1",
  "utoipa",
  "uuid",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "vti-common",
 ]
 
@@ -7493,7 +7493,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
@@ -9120,9 +9120,9 @@ dependencies = [
 
 [[package]]
 name = "vta-sdk"
-version = "0.23.2"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d53e27ee786ddaaef7365bcc1affa7182c35823d308b1022c976e36eda3ab45"
+checksum = "c334dec68315b74378fa443f9ad0d95bd503f92078b2550312ca2df4c04d283e"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -9162,9 +9162,9 @@ dependencies = [
 
 [[package]]
 name = "vti-common"
-version = "0.11.40"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d469f1da6dd071e8a6115d1bcf22c1f883484ec99924f3d86f8e725621822169"
+checksum = "40105118e649984eb1e861cf3930bb7b1c81f6b2dbafcf443b137e3af0d1c037"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -9194,7 +9194,7 @@ dependencies = [
  "trust-tasks-capability-client",
  "trust-tasks-rs 0.6.1",
  "uuid",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "zeroize",
 ]
 
@@ -9469,7 +9469,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vta-sdk 0.23.2",
+ "vta-sdk 0.24.0",
  "vti-common",
 ]
 
