@@ -4517,7 +4517,10 @@ mod tests {
 
         assert_eq!(
             resp_body["type"],
-            "https://trusttasks.org/spec/trust-task-error/0.3"
+            // Takes the version from the emitter rather than naming one, so a
+            // framework bump moves the assertion with the code under test.
+            // What this test is about is the `code`, not the document version.
+            did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string()
         );
         assert_eq!(resp_body["payload"]["code"], "proofInvalid");
         for did in ["did:example:mallory", "did:example:grantee"] {
@@ -4550,7 +4553,10 @@ mod tests {
 
         assert_eq!(
             resp_body["type"],
-            "https://trusttasks.org/spec/trust-task-error/0.3"
+            // Takes the version from the emitter rather than naming one, so a
+            // framework bump moves the assertion with the code under test.
+            // What this test is about is the `code`, not the document version.
+            did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string()
         );
         assert_eq!(resp_body["payload"]["code"], "proofRequired");
         assert!(
