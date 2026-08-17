@@ -168,16 +168,21 @@ didwebvh-rs = "0.6"
 # pass `--locked`. Deploy with `--locked`; that is the difference between
 # shipping the pair we tested and shipping whatever crates.io published today.
 #
-# The dev graph is a separate question, and it is NOT clean: `did-hosting-control`
-# dev-depends on `affinidi-messaging-test-mediator`, which pulls
-# `affinidi-messaging-mediator` 0.18.11, which pins vta-sdk ^0.21 — so
-# `cargo tree -d -e normal,build,dev` still shows vta-sdk 0.21.9 and, behind it,
-# trust-tasks-rs 0.2.60. That is tolerated, not overlooked: neither copy crosses
+# The dev graph used to be a separate question, and NOT clean: `did-hosting-control`
+# dev-depends on `affinidi-messaging-test-mediator`, which pulled
+# `affinidi-messaging-mediator` 0.18.11, which pinned vta-sdk ^0.21 — so
+# `cargo tree -d -e normal,build,dev` showed vta-sdk 0.21.9 and, behind it,
+# trust-tasks-rs 0.2.60. That was tolerated, not overlooked: neither copy crossed
 # into a type-checking context of ours (the mediator is a test fixture we only
-# spawn), and the alternative is holding our own SDK back to whatever the
-# mediator last published against. It collapses when the messaging stack
-# republishes on vta-sdk ^0.23. Keep the lock's `affinidi-messaging-mediator`
-# at >= 0.18.4 regardless.
+# spawn), and the alternative was holding our own SDK back to whatever the
+# mediator last published against.
+#
+# **It has now collapsed, exactly as predicted.** The messaging stack republished
+# on the current line (mediator 0.18.18 / test-mediator 0.2.51, both on
+# trust-tasks-rs 0.9), so `cargo tree -d -e normal,build,dev` is clean too — one
+# vta-sdk, one trust-tasks-rs, one vti-common, one affinidi-tdk. Keep it that
+# way: a dev-graph split is cheap to acquire and easy to stop noticing. Keep the
+# lock's `affinidi-messaging-mediator` at >= 0.18.4 regardless.
 #
 # `trust-tasks-rs` has now been duplicated in the *shipped* graph twice, and
 # collapsed twice, by the same move: bring every crate that carries it onto one
@@ -191,7 +196,7 @@ didwebvh-rs = "0.6"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.24", features = [
+vta-sdk = { version = "0.25", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -203,7 +208,7 @@ vta-sdk = { version = "0.24", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). On crates.io at 0.6.x. The whole family
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.9.x. The whole family
 # moves as one workspace event — `trust-tasks-rs`'s core types cross the
 # public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
 # mixing majors does not type-check. Bump all five together, and in
@@ -218,6 +223,30 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # but `cargo tree -d -e normal,build` is what tells you, and it listed
 # trust-tasks-rs twice until the last of them moved. Run it; do not assume the
 # five manifest lines were the whole job.
+#
+# What 0.6 → 0.9 changed for us:
+#   * 0.7.0 — `StandardCode` became `#[non_exhaustive]`. Nothing here matches on
+#     it, so no arm was needed. It is also the last time a new framework error
+#     code will break a downstream `match`.
+#   * 0.8.0 — added `StandardCode::Cancelled` and `trust-task-control/0.1`.
+#     Additive in Rust, thanks to the attribute above.
+#   * 0.9.0 — `consume_inbound` gained a REQUIRED `PayloadPolicy` argument
+#     (SPEC §7.2 item 2), and `ValidatedPayload::SCHEMA_JSON` became
+#     `Payload::PAYLOAD_SCHEMA`. We call `consume_inbound` through exactly one
+#     shim (`did-hosting-common`'s `server::trust_tasks::run_pipeline`), so the
+#     policy is decided there once for all ~28 call sites rather than threaded
+#     through each. It is `AcceptUnvalidated` — see the note beside the
+#     `validate` feature below, which gives the same reasoning. We used no
+#     `SCHEMA_JSON`.
+#   * The wire moved even though little source did: the framework now emits
+#     `trust-task-error/0.5` (was `0.3`), because `0.4` added `idConflict` and
+#     `0.5` added `cancelled`, neither of which validates against the older
+#     payload schema's `code` enum. Our one hand-written copy of that version —
+#     `framework_error_type_uri()`, for the unrouted paths where no request
+#     document exists to reject from — had to move with it, and
+#     `unrouted_and_routed_errors_agree_on_the_type_uri` is what caught it.
+#     **That kind of drift is invisible to the compiler.** When bumping this
+#     family, grep for `trust-task-error/0.` before trusting a green build.
 #
 # What 0.4 → 0.6 changed for us:
 #   * 0.5.0 — `TrustTask<P>` gained an optional `ceremony` member (framework
@@ -260,16 +289,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.6", default-features = false }
-trust-tasks-https = { version = "0.6", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.6", default-features = false }
-trust-tasks-proof = { version = "0.6", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.9", default-features = false }
+trust-tasks-https = { version = "0.9", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.9", default-features = false }
+trust-tasks-proof = { version = "0.9", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.6", default-features = false }
+trust-tasks-tsp = { version = "0.9", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the

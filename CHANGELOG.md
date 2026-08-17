@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### Changed — dependencies
+
+- **Trust Tasks 0.6 → 0.9, and `vta-sdk` 0.24 → 0.25.** The whole
+  `trust-tasks-*` family moves together, as it must — `trust-tasks-rs`'s core
+  types cross the public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a
+  graph mixing majors does not type-check.
+
+  Three breaking releases sit in the range. **0.7.0** made `StandardCode`
+  `#[non_exhaustive]` (nothing here matches on it, and it is the last time a new
+  framework error code will break a downstream `match`). **0.8.0** added
+  `StandardCode::Cancelled` and `trust-task-control/0.1`, additive in Rust.
+  **0.9.0** gave `consume_inbound` a REQUIRED `PayloadPolicy` argument
+  (SPEC §7.2 item 2) and replaced `ValidatedPayload::SCHEMA_JSON` with
+  `Payload::PAYLOAD_SCHEMA`, which we never used.
+
+  We reach `consume_inbound` through exactly one shim —
+  `did_hosting_common::server::trust_tasks::run_pipeline` — so the policy is
+  decided there once, for all ~28 call sites, rather than threaded through each.
+  It is `PayloadPolicy::<NoValidator>::AcceptUnvalidated`, which is what this
+  code has always done, now stated rather than implied: the codegen `Payload`
+  structs carry `deny_unknown_fields` plus newtypes that reject `minLength` and
+  pattern violations at deserialise time. That is the same reasoning the
+  workspace `Cargo.toml` already gives for leaving the `validate` feature off.
+
+  **No document is accepted or refused differently by this release.** Moving to
+  `Validate` would be a behaviour change — it can begin refusing documents a
+  peer sends today — and belongs in its own release with its own rollout.
+
+### Changed — wire
+
+- **Framework error documents are now `trust-task-error/0.5`, up from `0.3`.**
+  Not a choice: `0.4` added the `idConflict` standard code and `0.5` added
+  `cancelled` (SPEC §8.3), and neither validates against the older payload
+  schema's `code` enum or its extended-code pattern, so a document carrying one
+  would not validate as `0.3`.
+
+  Per SPEC §5.2 forward-minor compatibility a consumer pinned to `0.3` SHOULD
+  accept `0.5`. Consumers that enumerate error versions rather than matching
+  `trust-task-error/0.x` are the ones to check.
+
+  `framework_error_type_uri()` is the workspace's single hand-written copy of
+  that version — it exists because `trust-tasks-rs` keeps
+  `trust_task_error_type_uri()` `pub(crate)`, and the unrouted paths (body never
+  parsed, so no request document to reject from) have nowhere else to get it.
+  `unrouted_and_routed_errors_agree_on_the_type_uri` caught the drift, as it was
+  written to. Two assertions in `did-hosting-control`'s messaging tests that
+  named `0.3` literally now read the constant instead, so they follow the
+  emitter on the next bump rather than stranding a version behind.
+
+  **Worth remembering for the next bump:** a hand-written spec version is
+  invisible to the compiler. Grep for `trust-task-error/0.` before trusting a
+  green build.
+
+### Fixed — dependency graph
+
+- **The tolerated dev-graph split has collapsed.** `cargo tree -d -e
+  normal,build,dev` previously showed two `vta-sdk` (0.21.9 + 0.24.0) and three
+  `trust-tasks-rs` (0.2.60, 0.4.1, 0.6.1), reached through
+  `affinidi-messaging-test-mediator` → `affinidi-messaging-mediator`. The
+  messaging stack has now republished on the current line (mediator 0.18.18,
+  test-mediator 0.2.51, both on trust-tasks-rs 0.9), so both the shipped **and**
+  dev graphs carry exactly one of `trust-tasks-rs`, `vta-sdk`, `vti-common` and
+  `affinidi-tdk`. The `Cargo.toml` note that predicted this has been updated to
+  record it.
+
 ### Changed — wire
 
 - **The task-consent `payloadDigest` is now a `digestMultibase`, not bare

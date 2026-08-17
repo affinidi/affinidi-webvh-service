@@ -43,8 +43,8 @@ pub use verifier::TransportBoundVerifier;
 use chrono::Utc;
 use serde::Serialize;
 use trust_tasks_rs::{
-    ConsumeOutcome, Dispatcher, ErrorResponse, Payload, ProofPolicy, ProofVerifier,
-    ResolvedParties, TransportHandler, TrustTask, consume_inbound,
+    ConsumeOutcome, Dispatcher, ErrorResponse, NoValidator, Payload, PayloadPolicy, ProofPolicy,
+    ProofVerifier, ResolvedParties, TransportHandler, TrustTask, consume_inbound,
     specs::{
         acl::{change_role, grant, list, revoke, show},
         trust_task_discovery as discovery,
@@ -185,8 +185,33 @@ where
     let now = Utc::now();
     let new_id = || format!("urn:uuid:{}", Uuid::new_v4());
 
-    let outcome: ConsumeOutcome<R> =
-        consume_inbound(transport, policy, doc, my_vid, now, new_id, handler).await;
+    // SPEC.md §7.2 item 2, decided here rather than at each of the ~28 call
+    // sites, because the answer is the same at every one of them and a future
+    // change of mind should be one edit, not twenty-eight.
+    //
+    // `AcceptUnvalidated` is what this shim has always done, now stated rather
+    // than implied. Deserializing into `P` already enforced most of item 2: the
+    // codegen `Payload` structs carry `#[serde(deny_unknown_fields)]` plus
+    // newtypes that reject `minLength` / pattern violations at parse time, which
+    // is the same reasoning the workspace `Cargo.toml` gives for leaving the
+    // `validate` feature off. What `Validate` adds is the residue a Rust type
+    // cannot express — `minProperties`, `minItems` on an optional array,
+    // conditional subschemas.
+    //
+    // Turning it on is a *behaviour* change: it can begin refusing documents a
+    // peer sends today. It needs the `validate` feature, a `PayloadValidator`,
+    // and its own rollout — not a dependency bump.
+    let outcome: ConsumeOutcome<R> = consume_inbound(
+        transport,
+        policy,
+        PayloadPolicy::<NoValidator>::AcceptUnvalidated,
+        doc,
+        my_vid,
+        now,
+        new_id,
+        handler,
+    )
+    .await;
 
     match outcome {
         ConsumeOutcome::Handled(typed_resp) => {
@@ -218,12 +243,20 @@ where
 /// that pins one of them — and that consumer existed: a client enumerating
 /// `0.1`/`0.2` read every `0.3` rejection as a *success*.
 ///
+/// Now `0.5`, tracking `trust-tasks-rs` 0.9. The framework moved twice more for
+/// the same reason it moved to `0.3`: a new standard code that the older payload
+/// schema's `code` enum does not list and whose extended-code pattern does not
+/// match, so a document carrying it would not validate as the older version.
+/// `0.4` carries `idConflict`, `0.5` carries `cancelled` (SPEC §8.3). Per SPEC
+/// §5.2 forward-minor compatibility a consumer pinned to `0.3` SHOULD accept
+/// these.
+///
 /// One definition for the whole workspace, pinned by
 /// `unrouted_and_routed_errors_agree_on_the_type_uri` below, which compares it
 /// against a real `reject_with`. A framework bump fails that test rather than
-/// re-splitting the service in two.
+/// re-splitting the service in two — which is exactly how this bump was caught.
 pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
-    "https://trusttasks.org/spec/trust-task-error/0.3"
+    "https://trusttasks.org/spec/trust-task-error/0.5"
         .parse()
         .expect("framework error Type URI parses")
 }
