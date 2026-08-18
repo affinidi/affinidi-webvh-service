@@ -704,10 +704,8 @@ pub async fn write_offline_bootstrap_request(
     let signed = builder.sign_ephemeral().await?;
     let request_json = serde_json::to_string_pretty(&signed.request)?;
 
-    if let Some(parent) = request_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(request_path, request_json)?;
+    write_secret_file_0600(request_path, request_json.as_bytes())
+        .map_err(|e| format!("write {}: {e}", request_path.display()))?;
 
     // Copy the seed out of the Zeroizing wrapper so it can be persisted
     // by the secret store — caller is responsible for handling it
@@ -1195,10 +1193,8 @@ pub async fn export_sealed_did_secrets(
     let digest = bundle_digest(&sealed);
     let armored = armor::encode(&sealed);
 
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out_path, &armored).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    write_secret_file_0600(out_path, armored.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
 
     Ok(SealedExportInfo {
         out_path: out_path.to_path_buf(),
