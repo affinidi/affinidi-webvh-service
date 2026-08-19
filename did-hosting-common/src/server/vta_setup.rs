@@ -24,17 +24,28 @@ pub const SELF_MANAGED_DAEMON_ONLY: &str = "self-managed mode is daemon-only in 
 
 /// Atomically write `bytes` to `path` with mode 0600 on Unix.
 ///
-/// Implementation: write to a sibling `<path>.tmp.<rand>` file with
-/// `O_CREAT | O_EXCL` (so a concurrent attacker cannot trick us into reusing
-/// a file they pre-created), `fchmod 0600` before any data lands, fsync,
-/// then `rename` into place. The rename is atomic on Unix, so:
+/// Implementation: write to a sibling `<path>.tmp.<rand>` file opened with
+/// `O_CREAT | O_EXCL` **and** `mode(0o600)`, fsync, then `rename` into place.
+/// The mode is an argument to `open(2)`, applied by the kernel at creation —
+/// it is *not* a `chmod` after the fact, so the file never exists at any
+/// looser mode and there is no window to race. `O_EXCL` additionally means
+/// the open fails outright if anything (a file, or a symlink) already exists
+/// at the temp name, so an attacker cannot pre-plant a link for us to write
+/// through. The rename is atomic on Unix, so:
 ///
 /// - There is no window where `path` exists at the process umask.
 /// - Re-running the offline-bootstrap CLI over an existing seed file
 ///   succeeds rather than failing with `EEXIST` (the previous file is
-///   replaced atomically).
+///   replaced atomically). `rename` replaces a symlink at `path` rather than
+///   following it, so a pre-planted link is destroyed, never written through.
 /// - The temp file's permissions are set before the data is written, so
 ///   the bytes are never readable to any other UID.
+///
+/// Missing parent directories are created at mode 0700 so a co-resident user
+/// cannot even *list* the secret filenames — `create_dir_all`'s default 0777
+/// (umask-reduced to 0755) would leak the names and timestamps of every
+/// export. Directories that already exist are left alone: this must not
+/// silently tighten `$HOME` or the operator's chosen output directory.
 ///
 /// On non-Unix targets, falls back to standard `fs::write` (file ACLs are
 /// outside our control on Windows; the wizard prints the path so the operator
@@ -43,7 +54,18 @@ fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     #[cfg(unix)]
     {
@@ -704,10 +726,8 @@ pub async fn write_offline_bootstrap_request(
     let signed = builder.sign_ephemeral().await?;
     let request_json = serde_json::to_string_pretty(&signed.request)?;
 
-    if let Some(parent) = request_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(request_path, request_json)?;
+    write_secret_file_0600(request_path, request_json.as_bytes())
+        .map_err(|e| format!("write {}: {e}", request_path.display()))?;
 
     // Copy the seed out of the Zeroizing wrapper so it can be persisted
     // by the secret store — caller is responsible for handling it
@@ -1195,10 +1215,8 @@ pub async fn export_sealed_did_secrets(
     let digest = bundle_digest(&sealed);
     let armored = armor::encode(&sealed);
 
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out_path, &armored).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    write_secret_file_0600(out_path, armored.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
 
     Ok(SealedExportInfo {
         out_path: out_path.to_path_buf(),
@@ -1385,6 +1403,52 @@ mod tests {
         std::fs::write(request_path, request_json).expect("write request");
         let seed_bytes: [u8; 32] = *seed;
         std::fs::write(seed_path, seed_bytes).expect("write seed");
+    }
+
+    /// The whole point of routing secret-bearing writes through
+    /// [`write_secret_file_0600`] is the resulting mode — so assert it,
+    /// rather than trusting that the helper does what its name says.
+    /// Covers the file (0600), the directories it creates on the way
+    /// (0700, so filenames aren't even listable), and the overwrite path
+    /// (a second call must not trip over `O_EXCL` on the previous file).
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_0600_locks_down_file_and_created_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Two missing levels: both must come out 0700, not umask-default.
+        let dir = tmp.path().join("exports").join("secrets");
+        let path = dir.join("sealed-bundle.age");
+
+        write_secret_file_0600(&path, b"first").expect("write");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "secret file must be owner-read/write only"
+        );
+        assert_eq!(mode(&dir), 0o700, "created secret dir must not be listable");
+        assert_eq!(
+            mode(&tmp.path().join("exports")),
+            0o700,
+            "intermediate dirs must be locked down too"
+        );
+
+        // Overwrite must succeed and must not loosen the mode.
+        write_secret_file_0600(&path, b"second").expect("overwrite");
+        assert_eq!(std::fs::read(&path).expect("read"), b"second");
+        assert_eq!(mode(&path), 0o600, "overwrite must keep 0600");
+
+        // No temp files left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stale temp files: {leftovers:?}");
     }
 
     #[tokio::test]
