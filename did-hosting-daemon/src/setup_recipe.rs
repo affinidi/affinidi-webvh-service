@@ -237,10 +237,22 @@ pub async fn apply_recipe(
         did_hosting_url: Some(public_url.clone()),
         store: StoreConfig {
             data_dir: store_path,
+            dynamodb_table_name: std::env::var("DAEMON_STORE_DYNAMODB_TABLE_NAME")
+                .ok()
+                .or_else(|| std::env::var("DIDWEBVH_STORE_DYNAMODB_TABLE_NAME").ok()),
+            dynamodb_region: std::env::var("DAEMON_STORE_DYNAMODB_REGION")
+                .ok()
+                .or_else(|| std::env::var("DIDWEBVH_STORE_DYNAMODB_REGION").ok()),
             ..StoreConfig::default()
         },
         witness_store: StoreConfig {
             data_dir: witness_store_path,
+            dynamodb_table_name: std::env::var("DAEMON_STORE_DYNAMODB_TABLE_NAME")
+                .ok()
+                .or_else(|| std::env::var("DIDWEBVH_STORE_DYNAMODB_TABLE_NAME").ok()),
+            dynamodb_region: std::env::var("DAEMON_STORE_DYNAMODB_REGION")
+                .ok()
+                .or_else(|| std::env::var("DIDWEBVH_STORE_DYNAMODB_REGION").ok()),
             ..StoreConfig::default()
         },
         limits: did_hosting_server::config::LimitsConfig::default(),

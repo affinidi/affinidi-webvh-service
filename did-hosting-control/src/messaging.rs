@@ -1353,6 +1353,45 @@ pub(crate) async fn run_trust_tasks_envelope(
         }
     };
 
+    // DID-management task URIs (check-name, register, publish, info, list,
+    // delete, change-owner, me/domains, witness/publish) are not handled by
+    // the ACL trust-task dispatcher — they are served by `dispatch_did_op`
+    // in the control plane. Bridge them here: construct a synthetic Message
+    // whose `typ` is the inner task type and whose `body` is the task
+    // payload (matching how bare-type DIDComm messages were historically
+    // sent), run it through `run_webvh_dispatch` (which includes ACL + replay
+    // checks), then repack the (response_type, response_body) pair into a
+    // trust-task response document so the VTA's `unwrap_envelope_reply` sees
+    // a consistent envelope shape.
+    let type_uri = doc.type_uri.to_string();
+    let type_uri = type_uri.as_str();
+    if is_did_management_task(type_uri) {
+        info!(
+            sender = sender,
+            task = type_uri,
+            "trust-tasks envelope: bridging DID-management task to dispatch_did_op"
+        );
+        // Payload fields are what dispatch_did_op reads from msg.body.
+        let payload = doc.payload.clone();
+        let synthetic_msg = Message::new(type_uri.to_string(), payload);
+        let (response_type, response_body) =
+            run_webvh_dispatch(state, sender, &synthetic_msg).await;
+        // Wrap into a trust-task document shape that unwrap_envelope_reply
+        // can discriminate: { "type": response_type, "payload": response_body }.
+        // Use the inner doc's id as threadId so the VTA can correlate.
+        let reply_doc = serde_json::json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": response_type,
+            "threadId": doc.id,
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": response_body,
+        });
+        return Ok(Some((
+            trust_tasks_didcomm::ENVELOPE_TYPE.to_string(),
+            reply_doc,
+        )));
+    }
+
     let my_vid = state
         .config
         .server_did
@@ -1407,6 +1446,17 @@ pub(crate) async fn run_trust_tasks_envelope(
     };
 
     Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)))
+}
+
+/// Return `true` when the Trust Task type URI is a DID-management verb that
+/// must be dispatched through `dispatch_did_op` rather than the ACL trust-task
+/// dispatcher. Matches all `spec/did-management/…` and `spec/webvh/…` request
+/// URIs (response `#response` suffixes are never inbound, so we exclude them).
+fn is_did_management_task(type_uri: &str) -> bool {
+    const DID_MGMT_PREFIX: &str = "https://trusttasks.org/spec/did-management/";
+    const WEBVH_PREFIX: &str = "https://trusttasks.org/spec/webvh/";
+    (type_uri.starts_with(DID_MGMT_PREFIX) || type_uri.starts_with(WEBVH_PREFIX))
+        && !type_uri.ends_with("#response")
 }
 
 /// Build the same body-parse `trust-task-error/0.1` document that the
