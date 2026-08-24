@@ -58,6 +58,36 @@
 
 ### Changed — dependencies
 
+- **Workspace-wide `cargo update`.** Lockfile only — no manifest edits, so every
+  semver range is unchanged and the documented lockstep pins hold: `vta-sdk`
+  stays on 0.25 (0.28 available) and `vti-common` on 0.12 (0.13 available),
+  because moving either requires the matching bump of the other.
+
+  Clears **RUSTSEC-2026-0258** for the copy we control (`h2` 0.4.15 → 0.4.18,
+  above the advisory's stated fix of ≥ 0.4.16). A second copy, `h2` 0.3.27,
+  arrives via the AWS SDK's hyper 0.14 and has no patched 0.3.x; it is ignored
+  in `deny.toml` with a justification, alongside the three `rustls-webpki`
+  entries that share the same root cause. All four clear when the AWS SDK moves
+  to hyper 1.x.
+
+  Also drops the stale `RUSTSEC-2025-0134` ignore — the update removed
+  `rustls-pemfile` from the lock entirely.
+
+  Note for anyone tracing the graph: `affinidi-messaging-didcomm-service` 0.3.27
+  now pulls `trust-tasks-rs` 0.11.4 alongside our direct 0.9. The workspace
+  manifest warns that a graph mixing trust-tasks majors does not type-check — it
+  does here, so the two never meet at our API boundary, but the duplication is
+  worth knowing about.
+
+- **`clippy::result_large_err` allowed where the `Err` type is upstream.** Rust
+  1.98.0 began firing it on seven functions returning
+  `trust_tasks_rs::TrustTask<ErrorPayload>` (752–832 bytes). The type is
+  upstream and cannot be shrunk here; boxing at our boundary would rewrite every
+  handler signature and call site to save one move on a path already about to
+  serialise the error onto the wire. Scoped to the `trust_tasks::handlers`
+  module and to `authorize`, so it reads as "these return an upstream error
+  type" rather than a workspace-wide opt-out.
+
 - **Trust Tasks 0.6 → 0.9, and `vta-sdk` 0.24 → 0.25.** The whole
   `trust-tasks-*` family moves together, as it must — `trust-tasks-rs`'s core
   types cross the public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a
