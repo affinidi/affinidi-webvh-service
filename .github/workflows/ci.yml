@@ -80,8 +80,10 @@ jobs:
         # the default-features build and break operator-driven feature
         # selections at the next minor release.
         #
-        # `method-webvh` and `method-web` (multi-method rollout, T11/T24)
-        # are also feature-gated; same MSRV-pass rationale.
+        # `method-webvh`, `method-web` and `method-webs` are also
+        # feature-gated; same MSRV-pass rationale. `method-webs` matters
+        # most of the three — it is off by default, so no other job in this
+        # workflow would notice it losing MSRV compatibility.
         #
         # `build`, not `check`, and deliberately so — this loop was briefly
         # switched to `check` in #124 and got 3.4x SLOWER (108s -> 364s).
@@ -101,7 +103,7 @@ jobs:
                      store-fjall store-redis store-dynamodb \
                      store-firestore store-cosmosdb passkey \
                      setup-wizard metrics \
-                     method-webvh method-web; do
+                     method-webvh method-web method-webs; do
             echo "::group::MSRV build did-hosting-common --features server-core,$feat"
             cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
               --no-default-features --features "server-core,$feat"
@@ -281,15 +283,19 @@ jobs:
           - case: web-only
             features: "method-web"
             expect: ok
+          # did:webs is implemented but off by default, so unlike the
+          # two above it is not covered by any default-feature job —
+          # this is the only thing that compiles it in isolation, and
+          # proves it carries no accidental dependency on webvh or web
+          # being present.
+          - case: webs-only
+            features: "method-webs"
+            expect: ok
           # Stubs MUST refuse to build with a `compile_error!`. CI
           # asserts the failure message — a future contributor who
           # accidentally removes the stub without supplying a real
           # impl would otherwise see the build "succeed" with the
           # method absent from `method_by_name`.
-          - case: webs-stub
-            features: "method-webs"
-            expect: fail
-            expected_message: "method-webs is not implemented in this release"
           - case: webplus-stub
             features: "method-webplus"
             expect: fail
@@ -342,6 +348,39 @@ jobs:
               exit 1
             fi
           fi
+
+  method-webs:
+    name: cargo test (did:webs)
+    runs-on: ubuntu-latest
+    # `method-webs` is off by default, so `test-default` never compiles a
+    # line of it — without this job the whole method ships untested. It also
+    # replaces what the old `webs-stub` case guarded: that case asserted the
+    # feature refused to build, which caught a contributor deleting the stub
+    # without supplying an impl. Now that an impl exists, the equivalent
+    # guarantee is that the impl is registered and works, which the suite
+    # asserts directly (`enabled_methods_contains_webs`, `dispatcher_routes_webs`).
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Test the write, sync and resolve paths with did:webs enabled
+        run: |
+          cargo test --locked \
+            -p did-hosting-common -p did-hosting-server -p did-hosting-control \
+            --features did-hosting-common/method-webs,did-hosting-server/method-webs,did-hosting-control/method-webs
+      # The daemon only wires features through, but it is the deployment most
+      # operators run — a missing passthrough would leave it accepting
+      # did:webs DIDs it cannot serve, or the reverse.
+      - name: Build the daemon with did:webs enabled
+        run: cargo build --locked -p did-hosting-daemon --features method-webs
+      - name: Clippy with did:webs enabled
+        run: |
+          cargo clippy --locked --all-targets \
+            -p did-hosting-common -p did-hosting-server -p did-hosting-control -p did-hosting-daemon \
+            --features did-hosting-common/method-webs,did-hosting-server/method-webs,did-hosting-control/method-webs,did-hosting-daemon/method-webs \
+            -- -D warnings
 
   cloud-secrets-build:
     name: cargo build (cloud secret backends)
