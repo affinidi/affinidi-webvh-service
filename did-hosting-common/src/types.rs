@@ -361,9 +361,25 @@ impl DidRegisterRequest {
                     return Err("web `did_data` must be a did.json object".into());
                 }
             }
+            "webs" => {
+                // The `keri.cesr` stream, as text. CESR is
+                // JSON-plus-base64url throughout, so it travels as a
+                // JSON string without encoding.
+                //
+                // `method` must be explicit for did:webs: a key event
+                // log has no `id` field, so `derive_method_from_did_data`
+                // cannot infer it. That is not a gap — a KEL establishes
+                // an AID, and the DID it belongs to depends on where it
+                // is published, which the payload does not know.
+                if let Some(s) = did_data.as_str() {
+                    s.as_bytes().to_vec()
+                } else {
+                    return Err("webs `did_data` must be the keri.cesr stream as a string".into());
+                }
+            }
             other => {
                 return Err(format!(
-                    "unknown or unsupported method `{other}`; compiled-in methods: webvh, web",
+                    "unknown or unsupported method `{other}`; known methods: webvh, web, webs",
                 ));
             }
         };

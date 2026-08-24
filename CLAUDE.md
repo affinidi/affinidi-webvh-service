@@ -268,6 +268,48 @@ to each other must keep the document as the source of truth.
   identifier-derived. Keep it that way — don't make behaviour depend on the
   hosting service being present.
 
+## `did:webs` is hosted, and it breaks two of the shared rules on purpose
+
+`method-webs` (off by default on every binary) lets this service host
+`did:webs`. Read `docs/did-webs-hosting.md` before touching it. Two
+things there deliberately do *not* follow the patterns the rest of the
+multi-method work established — if you "fix" either, you break the
+method:
+
+- **It publishes two artifacts and stores one.** `keri.cesr` goes under
+  the ordinary `content:{mnemonic}:log` key; `did.json` is **derived on
+  every read**, never stored. The only document the service may serve is
+  the one the key event log implies, so a stored copy could only ever be
+  right or stale — and stale means serving a document from before a key
+  rotation. Do not add a second content key or a second cache entry for
+  it.
+
+- **Its paths bypass `validate_custom_path`.** A `did:webs` slot's last
+  segment *is* the identifier's KERI AID — case-sensitive base64url —
+  which the shared lowercase-only grammar rejects on the first
+  character. `validate_webs_mnemonic` exempts the trailing AID only.
+  Do **not** loosen the shared rule instead: it is what stops two slots
+  differing only by case, and operator-chosen path segments still need
+  it.
+
+Also worth knowing before you go looking for them:
+
+- **The identifier is built from the slot, not read from the content.** A
+  KEL establishes an AID and nothing else, so `did:webs:{domain}:{mnemonic}`
+  is constructed and the log is then required to establish exactly that
+  AID. This is why `register_did_atomic` takes a `domain`, why a webs
+  record's `domain` is load-bearing rather than cosmetic, and why the
+  host's port separator has to be percent-encoded when the DID is built.
+- **There is no `.well-known` form** — the AID is always the final path
+  segment. Don't add one.
+- **`resolve_webs` must stay ahead of `resolve_web`** in the fallback
+  dispatcher; both serve `/did.json`, and only webs can tell whether the
+  slot behind it is a webs record.
+- **The service never creates a `did:webs` DID.** `affinidi-did-webs` is
+  taken without its `create` feature — the controller holds the KERI
+  keys and publishes the stream here, exactly as a VTA publishes a
+  signed `did.jsonl`.
+
 ## Gotchas worth knowing
 
 - **Wire enums are camelCase.** Vault `secretKind` values are `didSelfIssued`,

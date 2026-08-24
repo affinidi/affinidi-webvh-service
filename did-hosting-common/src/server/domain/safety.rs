@@ -406,9 +406,47 @@ mod tests {
 
     #[test]
     fn extract_host_unknown_method_rejects() {
-        // method-webs is not compiled in by default; treating an
-        // unknown method as Validation matches the contract.
-        let err = extract_did_host("did:webs:scid:example.com:user1").expect_err("unknown method");
+        // A method no build enables. Using a method that *can* be
+        // compiled in would make this assertion depend on the feature
+        // set, which is what it used to do with `did:webs`.
+        let err =
+            extract_did_host("did:example:scid:example.com:user1").expect_err("unknown method");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// The host of a `did:webs` identifier is its first label — the AID
+    /// is the *last* one, not a SCID in front of the host as webvh has.
+    /// Getting this backwards would point the domain-safety check at a
+    /// host nobody configured.
+    #[cfg(feature = "method-webs")]
+    #[test]
+    fn extract_host_webs() {
+        let host = extract_did_host(
+            "did:webs:hosting.example.com:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect("webs is compiled in");
+        assert_eq!(host, "hosting.example.com");
+    }
+
+    /// And the percent-encoded port form decodes, like every other
+    /// method's — the allowlist is keyed on the decoded host.
+    #[cfg(feature = "method-webs")]
+    #[test]
+    fn extract_host_webs_with_port() {
+        let host = extract_did_host(
+            "did:webs:localhost%3A8534:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect("webs is compiled in");
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[cfg(not(feature = "method-webs"))]
+    #[test]
+    fn extract_host_webs_rejects_when_feature_off() {
+        let err = extract_did_host(
+            "did:webs:hosting.example.com:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect_err("webs is not compiled in");
         assert!(matches!(err, AppError::Validation(_)));
     }
 

@@ -306,8 +306,6 @@ pub async fn apply_single_update(
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
-    validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
-
     let now = now_epoch();
 
     // Agent names are scoped to the hosting domain, and the DID identifier is
@@ -317,6 +315,62 @@ pub async fn apply_single_update(
     // than failing the sync: a DID we cannot parse is one we should not be
     // serving names for anyway.
     let did_host = extract_did_host(&update.did_id).unwrap_or_default();
+
+    // Which method is being synced. An edge must tag the record with the
+    // method that actually verified the content: `resolve_webs` will only
+    // answer for a record tagged `webs`, so a did:webs log landing here as
+    // `webvh` would be stored and then served by nobody.
+    let synced_method =
+        did_hosting_common::method::detect_method(update.log_content.as_bytes()).unwrap_or("webvh");
+
+    // Per-method verification. The webvh path is unchanged — structural
+    // only, because the control plane has already walked the proof chain
+    // and an edge re-running it would reject logs an older didwebvh-rs
+    // accepted. did:webs gets the full key-event-log verification instead
+    // of a lighter check, and that asymmetry is deliberate: it is what
+    // keeps an edge from serving a stream a compromised or buggy control
+    // plane pushed, exactly as deriving agent names from the signed
+    // document (rather than from the push) does below.
+    #[cfg(feature = "method-webs")]
+    let webs_document = if synced_method == "webs" {
+        let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
+            &update.did_id,
+            update.log_content.as_bytes(),
+            None,
+        )
+        .map_err(|e| crate::error::AppError::Validation(e.to_string()))?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&derived)
+                .map_err(|e| crate::error::AppError::Internal(e.to_string()))?,
+        )
+    } else {
+        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
+        None
+    };
+    #[cfg(not(feature = "method-webs"))]
+    {
+        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
+    }
+
+    // Services and agent names both come from the current DID document,
+    // wherever this method keeps it — the last log entry's `state` for
+    // webvh, the derivation from the key event log for webs.
+    #[cfg(feature = "method-webs")]
+    let (synced_services, synced_names) = match webs_document.as_ref() {
+        Some(doc) => (
+            Some(did_hosting_common::did::service_types_from_doc(doc)),
+            did_hosting_common::did_ops::agent_names_from_document(doc, &did_host),
+        ),
+        None => (
+            extract_service_types(&update.log_content),
+            extract_agent_names(&update.log_content, &did_host),
+        ),
+    };
+    #[cfg(not(feature = "method-webs"))]
+    let (synced_services, synced_names) = (
+        extract_service_types(&update.log_content),
+        extract_agent_names(&update.log_content, &did_host),
+    );
 
     let record = DidRecord {
         owner: "system".to_string(),
@@ -329,14 +383,21 @@ pub async fn apply_single_update(
         disabled: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
-        method: "webvh".to_string(),
-        domain: String::new(),
+        // Tagged from the content, not from the push. T13's migration
+        // fills `domain` for legacy webvh records; a did:webs record
+        // needs it from the start, because its identifier — and so the
+        // document derived on every read — cannot be rebuilt without it.
+        method: synced_method.to_string(),
+        domain: if synced_method == "webs" {
+            did_host.clone()
+        } else {
+            String::new()
+        },
 
         // Derive from the synced log rather than trusting the control
         // plane to send a services list — the log is the authority, and
         // this keeps the edge node's badges consistent with what it serves.
-        services: extract_service_types(&update.log_content),
+        services: synced_services,
 
         // Same argument, and here it carries security weight: agent names
         // come from the signed document's `alsoKnownAs`, never from the
@@ -356,7 +417,7 @@ pub async fn apply_single_update(
         // single most valuable name to get wrong, so it does not rely on the
         // push being honest. `validate_agent_name_binding` also drops reserved
         // names for the same reason.
-        agent_names: extract_agent_names(&update.log_content, &did_host)
+        agent_names: synced_names
             .into_iter()
             .filter(|name| validate_agent_name_binding(name, &update.mnemonic).is_ok())
             .map(|name| AgentNameEntry {

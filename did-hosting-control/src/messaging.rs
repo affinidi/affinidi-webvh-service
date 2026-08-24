@@ -684,7 +684,8 @@ pub async fn dispatch_did_op(
             })?;
 
             let result =
-                did_ops::register_did_atomic(auth, state, &req.path, did_log, req.force).await?;
+                did_ops::register_did_atomic(auth, state, &req.path, did_log, req.force, None)
+                    .await?;
             server_push::notify_servers_did(state, result.mnemonic.clone());
 
             let server_did = state.config.server_did.as_deref().unwrap_or_default();

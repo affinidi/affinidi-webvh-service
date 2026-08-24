@@ -31,6 +31,18 @@ did-methods = [
   "did-hosting-common/method-webvh",
   "did-hosting-common/method-web",
 ]
+# did:webs, opt-in. Not in `did-methods` (and so not in `default`)
+# because it pulls the KERI stack — a daemon hosting no did:webs DIDs
+# should not carry it. Enabling it turns on both halves: the control
+# plane's write path, so a did:webs publication can be verified and
+# stored, and the server's resolve routes, so it can be served. Turning
+# on only one would give a daemon that accepts DIDs it cannot serve, or
+# serves a store nothing can write to.
+method-webs = [
+  "did-hosting-server/method-webs",
+  "did-hosting-control/method-webs",
+  "did-hosting-common/method-webs",
+]
 keyring = [
   "did-hosting-server/keyring",
   "webvh-witness/keyring",

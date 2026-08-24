@@ -340,19 +340,24 @@ pub async fn register_did(
     // T26: resolve multi-shape body (legacy `did_log` OR new
     // `did_data` + `method`) into `(method, payload_bytes)`.
     let (method, payload) = req.resolve().map_err(AppError::Validation)?;
-    if method != "webvh" {
-        // Method-aware register paths (did:web etc.) land with T26's
-        // follow-up plumbing through the `DidMethod` trait. For now,
-        // refuse explicitly so callers don't see a webvh-validation
-        // error against a did:web payload.
+    // `webs` is accepted when compiled in; `web` still is not. A
+    // did:web document is unsigned, so registering one is purely an
+    // authorization decision, and the storage/serving half of that path
+    // (T26 follow-up) has not landed. did:webs is a different case:
+    // its key event log verifies on its own, which is what the
+    // register path needs in order to be a host rather than a drop box.
+    let webs_enabled = did_hosting_common::method::enabled_methods().contains(&"webs");
+    let accepted = method == "webvh" || (method == "webs" && webs_enabled);
+    if !accepted {
         return Err(AppError::Validation(format!(
-            "registration via REST is currently webvh-only; received method = '{method}'. \
-             Use PUT /api/dids/{{mnemonic}} with the appropriate Content-Type once \
-             T26 follow-up wires per-method storage.",
+            "registration via REST does not support method = '{method}' on this \
+             deployment; enabled methods: {:?}",
+            did_hosting_common::method::enabled_methods(),
         )));
     }
-    let did_log = std::str::from_utf8(&payload)
-        .map_err(|e| AppError::Validation(format!("webvh `did_data` is not valid UTF-8: {e}")))?;
+    let did_log = std::str::from_utf8(&payload).map_err(|e| {
+        AppError::Validation(format!("`did_data` for {method} is not valid UTF-8: {e}"))
+    })?;
 
     // T34: domain resolution — explicit request → ACL default →
     // system default → reject. The resolved domain is recorded for
@@ -383,7 +388,19 @@ pub async fn register_did(
         "domain resolved for atomic register"
     );
 
-    let result = did_ops::register_did_atomic(&auth, &state, &req.path, did_log, req.force).await?;
+    // The resolved domain matters for did:webs specifically: its key
+    // event log establishes an AID, not a DID, so the domain is the
+    // only place the rest of the identifier can come from. webvh reads
+    // its own host out of the log and ignores this.
+    let result = did_ops::register_did_atomic(
+        &auth,
+        &state,
+        &req.path,
+        did_log,
+        req.force,
+        Some(&resolved_domain),
+    )
+    .await?;
 
     // Push the (potentially replaced) log to downstream servers so their
     // resolvers see the new content right away. Same as `upload_did`.

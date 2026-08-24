@@ -13,12 +13,17 @@
 //! 1. **did:webvh** (when `method-webvh` is on). Webvh's URLs end in
 //!    `/did.jsonl` or `/did-witness.json`; both are method-exclusive,
 //!    so registering webvh first doesn't shadow other methods.
-//! 2. **did:web** (when `method-web` is on). Web's URL ends in
-//!    `/did.json`. Lower priority than webvh purely as a convention —
-//!    webvh's bridge handler at `resolve_web` shares the same suffix,
-//!    so once T26 wires up record-method-aware dispatch, the order
-//!    here will matter only for paths neither method covers (they
-//!    can't exist today).
+//! 2. **did:webs** (when `method-webs` is on). `/keri.cesr` is
+//!    method-exclusive, but `/did.json` is **not** — did:web serves it
+//!    too. So webs must come before web, and it claims a `did.json`
+//!    only when the stored record is actually a did:webs record,
+//!    returning `None` otherwise. Ordering them the other way round
+//!    would let did:web's bridge answer for a did:webs slot: it would
+//!    look for a webvh log where a CESR stream is stored, and 404 a
+//!    DID that is hosted perfectly well.
+//! 3. **did:web** (when `method-web` is on). Web's URL ends in
+//!    `/did.json`. Last, so it acts as the fall-through for that
+//!    suffix — which is what its did:webvh bridge has always been.
 //!
 //! ## Why a fallback rather than `Router::route("/{*x}/did.jsonl", ...)`
 //!
@@ -36,6 +41,8 @@ use axum::response::{IntoResponse, Response};
 
 #[cfg(feature = "method-web")]
 use super::resolve_web;
+#[cfg(feature = "method-webs")]
+use super::resolve_webs;
 #[cfg(feature = "method-webvh")]
 use super::resolve_webvh;
 use crate::server::AppState;
@@ -65,6 +72,15 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
     #[cfg(feature = "method-webvh")]
     {
         if let Some(response) = resolve_webvh::dispatch(&state, &parts).await {
+            return response;
+        }
+    }
+
+    // Before did:web — both serve `/did.json`, and only this one can
+    // tell whether the slot behind it is a did:webs record.
+    #[cfg(feature = "method-webs")]
+    {
+        if let Some(response) = resolve_webs::dispatch(&state, &parts).await {
             return response;
         }
     }

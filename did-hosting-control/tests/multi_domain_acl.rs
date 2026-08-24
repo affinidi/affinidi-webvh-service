@@ -212,6 +212,7 @@ async fn allowed_owner_on_authorised_domain_passes_resolve_gate() {
         &request.path,
         &request.did_log.clone().unwrap(),
         false,
+        None,
     )
     .await
     .expect_err("the payload is intentionally malformed → must fail downstream");

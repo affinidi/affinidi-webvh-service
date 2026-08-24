@@ -7,8 +7,9 @@
 use bip39::Language;
 use did_hosting_common::did_ops::{
     self, AgentNameEntry, DidRecord, LogEntryInfo, LogMetadata, agent_name_key, content_log_key,
-    content_witness_key, did_key, extract_agent_names, owner_key,
+    content_witness_key, did_key, owner_key,
 };
+use did_hosting_common::method::publication::Publication;
 use did_hosting_common::server::acl::validate_did_format;
 use did_hosting_common::server::error::AgentNameError;
 use did_hosting_common::server::identity::mnemonic_from_did;
@@ -80,20 +81,19 @@ pub use did_hosting_common::did_ops::{
 // JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
-/// Run the structural + cryptographic-proof validation pipeline on a
-/// `did.jsonl` body before commit. Wraps
-/// `did-hosting-common::did_ops::verify_did_log_proofs` with the local
-/// `AppError::Validation(InvalidLog)` tag so the dispatcher emits
-/// `e.p.did.invalid-log` on any chain failure (parse, signature,
-/// parameter-transition, post-deactivation tamper).
+/// Tag a failed publication with `AppError::Validation(InvalidLog)` so the
+/// DIDComm dispatcher emits `e.p.did.invalid-log`.
 ///
-/// Replaces the previous structural-only `validate_did_jsonl` — proof
-/// verification subsumes the parse check, so callers only need this
-/// one function before commit.
-fn verify_did_log_proofs(content: &str) -> Result<(), AppError> {
+/// The tag is wire contract, not cosmetics: clients branch on that code to
+/// tell "your DID data did not verify" from "you are not the owner" or "that
+/// domain is not yours". It applies to every method — a webvh chain failure
+/// (parse, signature, parameter transition, post-deactivation tamper) and a
+/// webs key-event-log failure (SAID, digest chain, pre-rotation, witness
+/// receipts) are the same answer to the caller: the content you published does
+/// not verify.
+fn publication_error(e: did_hosting_common::method::MethodError) -> AppError {
     use did_hosting_common::server::error::ValidationKind;
-    did_ops::verify_did_log_proofs(content)
-        .map_err(|m| AppError::validation(ValidationKind::InvalidLog, m))
+    AppError::validation(ValidationKind::InvalidLog, e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +345,7 @@ pub async fn register_did_atomic(
     path: &str,
     did_log: &str,
     force: bool,
+    domain: Option<&str>,
 ) -> Result<RequestUriResponse, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
@@ -366,8 +367,31 @@ pub async fn register_did_atomic(
             "only admins can register the root DID".into(),
         ));
     }
-    validate_mnemonic(path)?;
-    verify_did_log_proofs(did_log)?;
+    // Which method is being published decides how the path is spelled.
+    // A did:webs slot ends in the identifier's AID — case-sensitive
+    // base64url — which the shared lowercase-only grammar rejects
+    // outright, so it needs its own validator. See
+    // `validate_webs_mnemonic` for why the shared rule is not simply
+    // loosened.
+    let submitted_method = did_hosting_common::method::detect_method(did_log.as_bytes());
+    if submitted_method == Some("webs") {
+        did_hosting_common::server::mnemonic::validate_webs_mnemonic(path)?;
+    } else {
+        validate_mnemonic(path)?;
+    }
+
+    // Verify the publication with its own method's verifier, and reduce
+    // it to the facts the shared tail below needs. For webvh this runs
+    // exactly the log-proof chain it always did; for webs it verifies
+    // the key event log and proves the stream establishes the AID this
+    // slot's identifier ends in.
+    let publication = did_hosting_common::method::publication::verify_publication(
+        domain.unwrap_or_default(),
+        path,
+        did_log.as_bytes(),
+        None,
+    )
+    .map_err(publication_error)?;
 
     let server_base_url = state
         .config
@@ -381,7 +405,7 @@ pub async fn register_did_atomic(
             )
         })?;
 
-    let did_id = extract_did_id(did_log).ok_or_else(|| {
+    let did_id = publication.did_id.clone().ok_or_else(|| {
         AppError::Validation("did_log's latest entry has no resolvable did:webvh state.id".into())
     })?;
 
@@ -396,8 +420,15 @@ pub async fn register_did_atomic(
     // `assert_did_host_allowed_when_domains_configured` doc.
     check_did_host_safety(state, auth, &did_id).await?;
 
-    did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
-        .map_err(AppError::Validation)?;
+    // Only for methods whose identifier is embedded in the content. A
+    // did:webs identifier is *built* from the slot, so comparing it back
+    // against that slot would be a tautology — the real binding is that
+    // the key event log establishes the AID the identifier ends in, and
+    // `verify_publication` has already enforced it.
+    if publication.method != "webs" {
+        did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
+            .map_err(AppError::Validation)?;
+    }
 
     // Hold the per-path write lock for the read + build + commit
     // window. Without this, two concurrent fresh-slot calls could both
@@ -460,11 +491,28 @@ pub async fn register_did_atomic(
         disabled: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
-        method: "webvh".to_string(),
-        domain: String::new(),
+        // Tagged from the verifier that actually accepted this content,
+        // never from a caller-supplied label — a record whose `method`
+        // disagreed with its bytes would be served by the wrong
+        // resolver.
+        method: publication.method.to_string(),
+        // T13 migration fills `domain` for legacy records; a did:webs
+        // record must carry it from the start, because its identifier
+        // cannot be rebuilt without it.
+        //
+        // Taken from the DID rather than from the request parameter so
+        // it lands in the same *decoded* form every other record uses
+        // (`extract_did_host` percent-decodes `%3A` back to `:`). The
+        // edge derives its copy the same way, so the two agree; storing
+        // the raw parameter here would make the control plane and its
+        // edges disagree about the domain of the same DID.
+        domain: if publication.method == "webs" {
+            did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default()
+        } else {
+            String::new()
+        },
 
-        services: extract_service_types(did_log),
+        services: publication.services(),
 
         // Start from the existing registry (this path also re-registers an
         // EXISTING slot, where `Vec::new()` would silently drop every name),
@@ -489,8 +537,15 @@ pub async fn register_did_atomic(
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
-    let (claimed, released) =
-        reconcile_agent_names(state, &mut new_record, path, did_log, &reg_domain, now).await?;
+    let (claimed, released) = reconcile_agent_names(
+        state,
+        &mut new_record,
+        path,
+        &publication.agent_names(&reg_domain),
+        &reg_domain,
+        now,
+    )
+    .await?;
 
     // 4. Single-batch atomic write: record, log content, owner index, agent-name
     //    index; plus old-owner cleanup on takeover. From a resolver's
@@ -555,31 +610,76 @@ pub async fn register_did_atomic(
 /// fields — the work `publish_did` and every agent-name operation do
 /// identically before they commit.
 ///
-/// Returns the prepared, **uncommitted** record and the DID's resolved hosting
-/// domain (the authority an agent name is scoped to). The caller commits it,
-/// optionally alongside extra batch operations, so a single implementation of
-/// the authorize/verify/safety pipeline backs both the plain publish and the
-/// name-binding ops.
+/// Returns the prepared, **uncommitted** record, the DID's resolved hosting
+/// domain (the authority an agent name is scoped to), and the verified
+/// [`Publication`]. The caller commits the record, optionally alongside extra
+/// batch operations, so a single implementation of the authorize/verify/safety
+/// pipeline backs both the plain publish and the name-binding ops.
 async fn prepare_republish(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
     did_log: &str,
     request_domain: Option<&str>,
-) -> Result<(DidRecord, String), AppError> {
+) -> Result<(DidRecord, String, Publication), AppError> {
     use crate::auth::session::now_epoch;
 
-    validate_mnemonic(mnemonic)?;
+    // The stored record decides how this slot's path is spelled — a
+    // did:webs slot ends in a mixed-case AID the shared grammar
+    // rejects. Reading it from the record rather than sniffing the
+    // submitted bytes means a malformed payload cannot talk its way
+    // into the looser validator.
+    let record_method = state
+        .dids_ks
+        .get::<DidRecord>(did_key(mnemonic))
+        .await?
+        .map(|r| r.method);
+    if record_method.as_deref() == Some("webs") {
+        did_hosting_common::server::mnemonic::validate_webs_mnemonic(mnemonic)?;
+    } else {
+        validate_mnemonic(mnemonic)?;
+    }
+
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    // Proof verification subsumes the structural check. The
-    // didwebvh-rs verifier walks the chain, validates each entry's
-    // signature against `parameters.updateKeys`, and rejects any
-    // tampered or post-deactivation entries.
-    verify_did_log_proofs(did_log)?;
+    // A slot does not change method. Allowing it would let a publish
+    // swap a did:webvh log for a did:webs stream under the same path —
+    // the identifier would change out from under everyone already
+    // resolving it, while the record kept its owner and its agent names.
+    //
+    // Checked *before* verification, on the shape of the bytes alone.
+    // Verifying first would make the refusal depend on the foreign
+    // payload being independently valid: a malformed did:webvh log sent
+    // to a did:webs slot would be reported as a broken log rather than
+    // as the method swap it is, which tells the caller to fix the wrong
+    // thing. `detect_method` is also what `verify_publication` dispatches
+    // on, so the two cannot disagree about what was submitted.
+    if let Some(submitted) = did_hosting_common::method::detect_method(did_log.as_bytes())
+        && submitted != record.method
+    {
+        return Err(AppError::Validation(format!(
+            "slot '{mnemonic}' hosts a did:{} DID; it cannot be republished as did:{submitted}",
+            record.method,
+        )));
+    }
+
+    // Verify with the publishing method's own verifier. For webvh this
+    // is the didwebvh-rs chain walk it always was; for webs it verifies
+    // the key event log and refuses an update that rewinds or forks it.
+    let existing = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic).as_str())
+        .await?;
+    let publication = did_hosting_common::method::publication::verify_publication(
+        &record.domain,
+        mnemonic,
+        did_log.as_bytes(),
+        existing.as_deref(),
+    )
+    .map_err(publication_error)?;
 
     let new_size = did_log.len() as u64;
-    let did_id_val = extract_did_id(did_log);
+    let did_id_val = publication.did_id.clone();
 
     // T20b: same safety check as register_did_atomic — the embedded
     // DID's host must be a configured active domain on this server
@@ -619,7 +719,7 @@ async fn prepare_republish(
     // service (e.g. a node that stops advertising DIDComm), so a stale
     // non-empty cache is just as wrong as a missing one. Also self-heals a
     // legacy `None` if the M-02 boot sweep hasn't reached this record.
-    record.services = extract_service_types(did_log);
+    record.services = publication.services();
 
     // Backfill `record.domain` from the embedded DID's host on first
     // publish for records that pre-date the `request_uri` resolver fix
@@ -646,7 +746,7 @@ async fn prepare_republish(
             .unwrap_or_default()
     };
 
-    Ok((record, domain))
+    Ok((record, domain, publication))
 }
 
 /// Publish (upload) a did.jsonl log for an existing DID slot.
@@ -705,16 +805,25 @@ async fn prepare_republish(
 /// Callers must hold `state.path_locks.guard(mnemonic)`: the collision check
 /// below and the index write it authorises have to be one critical section, or
 /// two concurrent publishes each see a free name and both claim it.
+///
+/// `claims` is the set of names the published document asserts on `domain`,
+/// already extracted by the publishing method — `Publication::agent_names`.
+/// Taking the extracted list rather than the raw content is what lets this
+/// stay method-agnostic: the names come from `alsoKnownAs` either way, but
+/// only the method knows where its current document lives (a webvh log entry's
+/// `state`, a did:web document as published, or the document a did:webs key
+/// event log verified into). The Layer-1 rule — a node cannot serve a name the
+/// DID does not claim — is unchanged; it is enforced one step earlier.
 async fn reconcile_agent_names(
     state: &AppState,
     record: &mut DidRecord,
     mnemonic: &str,
-    did_log: &str,
+    claims: &[String],
     domain: &str,
     now: u64,
 ) -> Result<(Vec<String>, Vec<String>), AppError> {
     let mut claimed = Vec::new();
-    for name in extract_agent_names(did_log, domain) {
+    for name in claims.iter().cloned() {
         match validate_agent_name_binding(&name, mnemonic) {
             Ok(()) => {}
             // Reserved is a refusal, not a skip — see above. This also covers a
@@ -815,7 +924,7 @@ pub async fn publish_did(
     // commit.
     let _guard = state.path_locks.guard(mnemonic).await;
 
-    let (mut record, domain) =
+    let (mut record, domain, publication) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
     let new_size = record.content_size;
     let now = record.updated_at;
@@ -823,8 +932,15 @@ pub async fn publish_did(
     // Keep the authoritative registry in step with what the document claims —
     // applying the same preconditions `set` does, so this path cannot be used
     // to capture a reserved name or take one from another DID.
-    let (claimed, released) =
-        reconcile_agent_names(state, &mut record, mnemonic, did_log, &domain, now).await?;
+    let (claimed, released) = reconcile_agent_names(
+        state,
+        &mut record,
+        mnemonic,
+        &publication.agent_names(&domain),
+        &domain,
+        now,
+    )
+    .await?;
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1013,15 +1129,15 @@ async fn apply_agent_name_op(
     // Authorize + verify the submitted document + advance the record. This
     // yields not_owner / invalid_did_data / unknown_domain exactly as a plain
     // publish would.
-    let (mut record, domain) =
+    let (mut record, domain, publication) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
 
     // The gate: does the submitted document claim the name on this domain?
-    // `extract_agent_names` canonicalises through the `agent-names` crate, so
-    // the comparison is byte-identical to what a resolver will later do.
-    let claimed = extract_agent_names(did_log, &domain)
-        .iter()
-        .any(|n| n == &name);
+    // The names come from the publishing method's own reading of
+    // `alsoKnownAs`, canonicalised through the `agent-names` crate, so the
+    // comparison is byte-identical to what a resolver will later do.
+    let names = publication.agent_names(&domain);
+    let claimed = names.iter().any(|n| n == &name);
     if claimed != op.requires_claim() {
         return Err(AgentNameError::AlsoKnownAsMismatch.into());
     }
@@ -2036,7 +2152,7 @@ mod tests_atomic {
         let path = "alpha";
         let did_log = build_test_did_log("scid-alpha", "control.test", path).await;
 
-        let result = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+        let result = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .expect("fresh-slot register should succeed");
         assert_eq!(result.mnemonic, path);
@@ -2082,7 +2198,7 @@ mod tests_atomic {
         let path = "beta";
 
         let log_v1 = build_test_did_log("scid-beta", "control.test", path).await;
-        let r1 = register_did_atomic(&owner_auth(owner), &state, path, &log_v1, false)
+        let r1 = register_did_atomic(&owner_auth(owner), &state, path, &log_v1, false, None)
             .await
             .unwrap();
         let rec_v1: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
@@ -2090,7 +2206,7 @@ mod tests_atomic {
         // Same owner re-registers (potentially with new log content). No
         // intermediate empty state — old content is replaced in-batch.
         let log_v2 = build_test_did_log("scid-beta", "control.test", path).await;
-        let r2 = register_did_atomic(&owner_auth(owner), &state, path, &log_v2, false)
+        let r2 = register_did_atomic(&owner_auth(owner), &state, path, &log_v2, false, None)
             .await
             .expect("idempotent re-register should succeed without force");
         assert_eq!(r1.mnemonic, r2.mnemonic);
@@ -2114,18 +2230,18 @@ mod tests_atomic {
         let owner_b = "did:example:owner-b";
         let log = build_test_did_log("scid-gamma", "control.test", path).await;
 
-        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
+        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false, None)
             .await
             .unwrap();
 
         // Without force.
-        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, false)
+        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, false, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
 
         // With force — still 403, since caller is not admin.
-        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, true)
+        let err = register_did_atomic(&owner_auth(owner_b), &state, path, &log, true, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
@@ -2146,13 +2262,21 @@ mod tests_atomic {
             path,
             &log,
             false,
+            None,
         )
         .await
         .unwrap();
 
-        let err = register_did_atomic(&admin_auth("did:example:admin"), &state, path, &log, false)
-            .await
-            .unwrap_err();
+        let err = register_did_atomic(
+            &admin_auth("did:example:admin"),
+            &state,
+            path,
+            &log,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(ref m) if m.contains("force")));
     }
 
@@ -2167,7 +2291,7 @@ mod tests_atomic {
         let admin = "did:example:admin";
         let log = build_test_did_log("scid-epsilon", "control.test", path).await;
 
-        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false)
+        register_did_atomic(&owner_auth(owner_a), &state, path, &log, false, None)
             .await
             .unwrap();
         // Seed a witness file as if the original owner had uploaded one.
@@ -2177,7 +2301,7 @@ mod tests_atomic {
             .await
             .unwrap();
 
-        register_did_atomic(&admin_auth(admin), &state, path, &log, true)
+        register_did_atomic(&admin_auth(admin), &state, path, &log, true, None)
             .await
             .expect("admin force takeover should succeed");
 
@@ -2230,6 +2354,7 @@ mod tests_atomic {
             "right-path",
             &log,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -2256,6 +2381,7 @@ mod tests_atomic {
             "valid-path",
             &log,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -2330,9 +2456,10 @@ mod tests_atomic {
         .await;
 
         let did_log = build_test_did_log("scid-ok", "control.test", "alpha").await;
-        let result = register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
-            .await
-            .expect("scoped owner on matching host must succeed");
+        let result =
+            register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false, None)
+                .await
+                .expect("scoped owner on matching host must succeed");
         assert_eq!(result.mnemonic, "alpha");
     }
 
@@ -2388,7 +2515,7 @@ mod tests_atomic {
         .await;
 
         let did_log = build_test_did_log("scid-evil", "domain-b.example", "alpha").await;
-        let err = register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false)
+        let err = register_did_atomic(&owner_auth(owner), &state, "alpha", &did_log, false, None)
             .await
             .expect_err("ACL must reject host outside scope");
         assert!(
@@ -2427,7 +2554,7 @@ mod tests_atomic {
         .await;
 
         let did_log = build_test_did_log("scid-admin", "control.test", "alpha").await;
-        register_did_atomic(&admin_auth(admin), &state, "alpha", &did_log, false)
+        register_did_atomic(&admin_auth(admin), &state, "alpha", &did_log, false, None)
             .await
             .expect("admin role overrides ACL domain scope");
     }
@@ -2442,6 +2569,7 @@ mod tests_atomic {
             "any-path",
             "not valid jsonl",
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -2472,6 +2600,7 @@ mod tests_atomic {
             ".well-known",
             &did_log,
             false,
+            None,
         )
         .await
         .expect("admin may register the root DID at the .well-known slot");
@@ -2504,6 +2633,7 @@ mod tests_atomic {
             ".well-known",
             &did_log,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -2528,6 +2658,7 @@ mod tests_atomic {
             ".hidden",
             &did_log,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -2565,7 +2696,7 @@ mod tests_atomic {
         let did_log = build_test_did_log("scid-stats", "control.test", path).await;
 
         let before = state.stats_collector.get_aggregate().total_updates;
-        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
         let after = state.stats_collector.get_aggregate().total_updates;
@@ -2577,7 +2708,7 @@ mod tests_atomic {
 
         // A second register by the same owner advances again — the counter
         // tracks log-write operations, not unique DIDs.
-        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
         let after_two = state.stats_collector.get_aggregate().total_updates;
@@ -2747,10 +2878,10 @@ mod tests_atomic {
         let path_b = path.to_string();
 
         let task_a = tokio::spawn(async move {
-            register_did_atomic(&auth_a, &state_a, &path_a, &log_a, false).await
+            register_did_atomic(&auth_a, &state_a, &path_a, &log_a, false, None).await
         });
         let task_b = tokio::spawn(async move {
-            register_did_atomic(&auth_b, &state_b, &path_b, &log_b, false).await
+            register_did_atomic(&auth_b, &state_b, &path_b, &log_b, false, None).await
         });
 
         let r_a = task_a.await.unwrap();
@@ -3119,7 +3250,7 @@ mod tests_atomic {
     /// Register a fresh DID at `path` on host `control.test`, owned by `owner`.
     async fn register_owned(state: &AppState, owner: &str, path: &str) {
         let log = build_test_did_log("scid", "control.test", path).await;
-        register_did_atomic(&owner_auth(owner), state, path, &log, false)
+        register_did_atomic(&owner_auth(owner), state, path, &log, false, None)
             .await
             .expect("register");
     }
@@ -3784,7 +3915,7 @@ mod tests_atomic {
         let (state, _dir) = test_state().await;
         let admin = "did:example:admin";
         let log = build_test_did_log("scid", "control.test", ".well-known").await;
-        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false)
+        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false, None)
             .await
             .expect("admin registers the root DID");
 
@@ -3875,7 +4006,7 @@ mod tests_atomic {
         // provisioned by the operator, not by a tenant.
         let admin = "did:example:admin";
         let log = build_test_did_log("scid", "control.test", ".well-known").await;
-        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false)
+        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false, None)
             .await
             .expect("admin registers the root DID");
 
@@ -4002,9 +4133,16 @@ mod tests_atomic {
 
         // Register a brand-new slot whose first document claims A's name.
         let log_b = build_test_did_log_with_names("control.test", "slot-new", &["alice"]).await;
-        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-new", &log_b, false)
-            .await
-            .unwrap_err();
+        let err = register_did_atomic(
+            &owner_auth(owner_b),
+            &state,
+            "slot-new",
+            &log_b,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, AppError::AgentName(AgentNameError::Taken)),
             "expected Taken, got {err:?}"
@@ -4018,9 +4156,16 @@ mod tests_atomic {
 
         // …and the same for a reserved name on a fresh slot.
         let log_r = build_test_did_log_with_names("control.test", "slot-res", &["support"]).await;
-        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-res", &log_r, false)
-            .await
-            .unwrap_err();
+        let err = register_did_atomic(
+            &owner_auth(owner_b),
+            &state,
+            "slot-res",
+            &log_r,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, AppError::AgentName(AgentNameError::Reserved)),
             "expected Reserved, got {err:?}"
@@ -4114,5 +4259,210 @@ mod tests_atomic {
             Some("slot-a"),
             "A's index entry must survive B's release"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // did:webs registration
+    // -----------------------------------------------------------------
+
+    /// End-to-end registration of a `did:webs` DID through the same
+    /// entry point a REST or DIDComm caller uses.
+    ///
+    /// The fixture is the `hyperledger-labs/did-webs-resolver`
+    /// reference publication, so what these assert is agreement with
+    /// the ecosystem, not with ourselves.
+    #[cfg(feature = "method-webs")]
+    mod webs {
+        use super::*;
+
+        const KERI: &[u8] =
+            include_bytes!("../../did-hosting-common/tests/fixtures/ENro7uf0.keri.cesr");
+        const AID: &str = "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe";
+        const DOMAIN: &str = "control.test";
+
+        fn keri() -> String {
+            String::from_utf8(KERI.to_vec()).expect("CESR is UTF-8 text")
+        }
+
+        async fn record_for(state: &AppState, path: &str) -> DidRecord {
+            state
+                .dids_ks
+                .get(did_key(path))
+                .await
+                .unwrap()
+                .expect("record")
+        }
+
+        #[tokio::test]
+        async fn registers_a_webs_did_and_stores_its_key_event_log() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+
+            register_did_atomic(
+                &owner_auth(owner),
+                &state,
+                AID,
+                &keri(),
+                false,
+                Some(DOMAIN),
+            )
+            .await
+            .expect("a verifying key event log registers");
+
+            let record = record_for(&state, AID).await;
+            assert_eq!(
+                record.method, "webs",
+                "tagged by the verifier that accepted it"
+            );
+            assert_eq!(record.owner, owner);
+            assert_eq!(
+                record.did_id.as_deref(),
+                Some(format!("did:webs:{DOMAIN}:{AID}").as_str()),
+                "the identifier is built from the slot, since a KEL carries no domain",
+            );
+            assert_eq!(
+                record.domain, DOMAIN,
+                "a did:webs record must carry its domain — its DID cannot be rebuilt without it",
+            );
+
+            // The CESR stream is stored verbatim under the same content
+            // key every method's log lives at.
+            let stored = state
+                .dids_ks
+                .get_raw(content_log_key(AID).as_str())
+                .await
+                .unwrap()
+                .expect("stored log");
+            assert_eq!(stored, KERI);
+        }
+
+        /// The binding that makes this hosting rather than file-serving:
+        /// a stream may only be published to the slot whose final path
+        /// segment is the AID that stream establishes.
+        #[tokio::test]
+        async fn refuses_a_log_published_to_another_aids_slot() {
+            let (state, _dir) = test_state().await;
+            let other = "EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+            let err = register_did_atomic(
+                &owner_auth("did:example:webs-owner"),
+                &state,
+                other,
+                &keri(),
+                false,
+                Some(DOMAIN),
+            )
+            .await
+            .expect_err("the key event log does not establish this slot's AID");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "expected a validation refusal, got {err:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn refuses_a_tampered_key_event_log() {
+            let (state, _dir) = test_state().await;
+            let mut tampered = KERI.to_vec();
+            let pos = tampered
+                .windows(3)
+                .position(|w| w == b"\"s\"")
+                .expect("inception has an `s` field");
+            tampered[pos + 5] = b'9';
+            let tampered = String::from_utf8(tampered).unwrap();
+
+            let err = register_did_atomic(
+                &owner_auth("did:example:webs-owner"),
+                &state,
+                AID,
+                &tampered,
+                false,
+                Some(DOMAIN),
+            )
+            .await
+            .expect_err("a tampered log must never be stored");
+            assert!(matches!(err, AppError::Validation(_)));
+
+            assert!(
+                state
+                    .dids_ks
+                    .get_raw(content_log_key(AID).as_str())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a refused publication must leave no content behind",
+            );
+        }
+
+        /// A slot's method is fixed at registration. Swapping it would
+        /// change the identifier out from under everyone resolving it
+        /// while the record kept its owner and its agent names.
+        #[tokio::test]
+        async fn a_webs_slot_cannot_be_republished_as_webvh() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_did_atomic(
+                &owner_auth(owner),
+                &state,
+                AID,
+                &keri(),
+                false,
+                Some(DOMAIN),
+            )
+            .await
+            .expect("register");
+
+            let webvh_log = concat!(
+                r#"{"versionId":"1-zQmTest","versionTime":"2025-01-01T00:00:00Z","#,
+                r#""state":{"id":"did:webvh:zQmTest:control.test:other"}}"#,
+            );
+            let err = publish_did(&owner_auth(owner), &state, AID, webvh_log, None)
+                .await
+                .expect_err("a did:webs slot must not accept a did:webvh log");
+            assert!(
+                err.to_string().contains("cannot be republished"),
+                "expected a method-change refusal, got: {err}",
+            );
+        }
+
+        /// A did:webs slot ends in a mixed-case AID, which the shared
+        /// path grammar rejects outright. If the method-aware validator
+        /// regressed, registration would fail before any verification
+        /// ran — so assert the shared rule really would have blocked it.
+        #[tokio::test]
+        async fn the_shared_path_grammar_would_have_rejected_this_slot() {
+            assert!(
+                did_hosting_common::server::mnemonic::validate_custom_path(AID).is_err(),
+                "guard: if the shared grammar starts accepting AIDs, revisit the split",
+            );
+
+            let (state, _dir) = test_state().await;
+            register_did_atomic(
+                &owner_auth("did:example:webs-owner"),
+                &state,
+                AID,
+                &keri(),
+                false,
+                Some(DOMAIN),
+            )
+            .await
+            .expect("the method-aware validator must accept an AID slot");
+        }
+
+        #[tokio::test]
+        async fn refuses_a_webs_registration_without_a_domain() {
+            let (state, _dir) = test_state().await;
+            let err = register_did_atomic(
+                &owner_auth("did:example:webs-owner"),
+                &state,
+                AID,
+                &keri(),
+                false,
+                None,
+            )
+            .await
+            .expect_err("a did:webs DID cannot be built without its domain");
+            assert!(matches!(err, AppError::Validation(_)));
+        }
     }
 }

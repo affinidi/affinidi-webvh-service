@@ -413,11 +413,26 @@ pub fn extract_agent_names(jsonl_content: &str, domain: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(last_line) else {
         return Vec::new();
     };
-    let Some(entries) = value
-        .get("state")
-        .and_then(|s| s.get("alsoKnownAs"))
-        .and_then(|a| a.as_array())
-    else {
+    let Some(state) = value.get("state") else {
+        return Vec::new();
+    };
+    agent_names_from_document(state, domain)
+}
+
+/// Extract the agent names a DID document claims, for a given hosting domain.
+///
+/// The method-agnostic half of [`extract_agent_names`]. That function knows
+/// how to find the current document inside a `did:webvh` log; this one works
+/// on the document itself, whatever produced it — a webvh log entry's `state`,
+/// a `did:web` document as published, or the document a `did:webs` key event
+/// log was verified into.
+///
+/// Keeping the rule in one place is the point. `alsoKnownAs` is where an
+/// agent name is claimed, and the Layer-1 anti-spoofing property depends on
+/// every method deriving names the same way — a second implementation for a
+/// second method is how the two drift and a name silently stops verifying.
+pub fn agent_names_from_document(document: &serde_json::Value, domain: &str) -> Vec<String> {
+    let Some(entries) = document.get("alsoKnownAs").and_then(|a| a.as_array()) else {
         return Vec::new();
     };
 

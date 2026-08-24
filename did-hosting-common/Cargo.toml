@@ -21,13 +21,14 @@ default = ["method-webvh", "method-web"]
 # `src/method/`. The dispatcher (`method_by_name`) is compile-time —
 # disabling a feature removes its arm from the dispatcher AND its
 # resolution-endpoint route from the router (T25). The default build
-# enables `webvh` + `web`; `webs` / `webplus` are scaffolded for future
-# work and ship as stubs that fail compile with a clear pointer
-# (T31 + T38, gated by `method-webs` / `method-webplus`).
+# enables `webvh` + `web`. `method-webs` is implemented but off by
+# default — it pulls the KERI stack, and an operator who hosts no
+# did:webs DIDs should not carry it. `webplus` is still a scaffolded
+# stub that fails compile with a clear pointer.
 
 method-webvh = []
 method-web = []
-method-webs = []
+method-webs = ["dep:affinidi-did-webs"]
 method-webplus = []
 
 metrics = ["server-core", "dep:prometheus"]
@@ -77,6 +78,9 @@ affinidi-secrets-resolver = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
 agent-names = { workspace = true }
 didwebvh-rs = { workspace = true }
+# `method-webs` only. Resolution-side only (no `create` feature) — see the
+# workspace manifest for why the hosting service never holds KERI keys.
+affinidi-did-webs = { workspace = true, optional = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

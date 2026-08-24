@@ -100,6 +100,109 @@ pub fn validate_mnemonic(mnemonic: &str) -> Result<(), AppError> {
     validate_custom_path(mnemonic)
 }
 
+/// Validate a `did:webs` mnemonic — path segments plus a trailing AID.
+///
+/// `did:webs` cannot use [`validate_custom_path`], and the reason is not
+/// cosmetic. A `did:webs` slot's last segment **is** the identifier's KERI
+/// AID: it is the self-certifying value the key event log establishes, it is
+/// case-sensitive base64url, and the service does not get to choose it. A
+/// typical AID —
+/// `ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe` — fails the shared
+/// lowercase-only segment rule on its first character, so *every* `did:webs`
+/// DID would be unhostable under it.
+///
+/// The fix is a per-method validator rather than a loosened shared one. The
+/// lowercase rule earns its keep for operator-chosen paths: it makes two slots
+/// that differ only by case impossible, so a hosted path cannot be shadowed by
+/// a confusable twin. Relaxing it globally would give that up for `did:web`
+/// and `did:webvh` paths, which have no reason to need it. Here the exception
+/// is safe for a different reason — an AID is a high-entropy digest, not a
+/// name anyone picks, so a confusable pair is not something an attacker can
+/// arrange.
+///
+/// Rules:
+/// - Leading segments (if any): the ordinary [`validate_custom_path`] grammar,
+///   reserved-first-segment check included.
+/// - Final segment: 4–63 characters from the CESR base64url alphabet
+///   (`A–Z`, `a–z`, `0–9`, `-`, `_`), case preserved.
+///
+/// This is a *syntactic* check. That the trailing segment is the AID of the
+/// key event log actually published here is enforced on the write path, where
+/// the stream is in hand — see `method::webs::Webs::verify_artifacts`.
+pub fn validate_webs_mnemonic(mnemonic: &str) -> Result<(), AppError> {
+    if mnemonic.is_empty() {
+        return Err(path_err("path must not be empty"));
+    }
+    if mnemonic.len() > 255 {
+        return Err(path_err("path must be at most 255 characters"));
+    }
+    if mnemonic.starts_with('/') || mnemonic.ends_with('/') {
+        return Err(path_err("path must not start or end with '/'"));
+    }
+    // `did:webs` has no root form: the AID is always the final path
+    // segment, so there is never a `.well-known` slot to fall back to.
+    if mnemonic == ROOT_DID_MNEMONIC {
+        return Err(path_err(
+            "did:webs has no root slot — the AID is always the final path segment",
+        ));
+    }
+
+    let segments: Vec<&str> = mnemonic.split('/').collect();
+    let (aid, leading) = segments
+        .split_last()
+        .expect("split on a non-empty string yields at least one segment");
+
+    for (i, segment) in leading.iter().enumerate() {
+        if segment.is_empty() {
+            return Err(path_err(
+                "path must not contain empty segments (double slashes)",
+            ));
+        }
+        validate_segment(segment)?;
+        if i == 0 && RESERVED_NAMES.contains(segment) {
+            return Err(path_err(format!(
+                "'{segment}' is a reserved name and cannot be used as the first path segment",
+            )));
+        }
+    }
+
+    validate_aid_segment(aid)?;
+
+    // A single-segment mnemonic is the AID alone, and it is also the
+    // first segment — so it has to clear the reserved-name check too.
+    if leading.is_empty() && RESERVED_NAMES.contains(aid) {
+        return Err(path_err(format!(
+            "'{aid}' is a reserved name and cannot be used as the first path segment",
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate the trailing AID segment of a `did:webs` mnemonic.
+///
+/// Matches the syntactic AID check `affinidi-did-webs` applies when parsing an
+/// identifier, so a DID that crate accepts is one this service can host, and
+/// one it rejects never reaches storage.
+fn validate_aid_segment(aid: &str) -> Result<(), AppError> {
+    if aid.len() < 4 || aid.len() > 63 {
+        return Err(path_err(
+            "the final path segment of a did:webs path is its AID, and must be \
+             between 4 and 63 characters",
+        ));
+    }
+    if !aid
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(path_err(
+            "the final path segment of a did:webs path is its AID, and must contain \
+             only characters from the base64url alphabet (A-Z, a-z, 0-9, '-', '_')",
+        ));
+    }
+    Ok(())
+}
+
 /// Agent names nobody may claim.
 ///
 /// Distinct from [`RESERVED_NAMES`], which protects *route* prefixes. These
@@ -202,4 +305,80 @@ pub fn validate_agent_name_binding(name: &str, mnemonic: &str) -> Result<(), App
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod webs_mnemonic_tests {
+    use super::*;
+
+    /// A real AID, from the `did:webs` conformance vectors.
+    const AID: &str = "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe";
+
+    #[test]
+    fn the_shared_validator_rejects_every_aid() {
+        // The reason `validate_webs_mnemonic` exists. If this ever
+        // starts passing, the per-method split can be revisited — but
+        // until then, hosting did:webs through the shared grammar is
+        // not merely awkward, it is impossible.
+        assert!(
+            validate_custom_path(AID).is_err(),
+            "an AID is mixed-case, so the lowercase-only segment rule rejects it",
+        );
+    }
+
+    #[test]
+    fn accepts_a_bare_aid() {
+        validate_webs_mnemonic(AID).expect("an AID alone is the common did:webs slot");
+    }
+
+    #[test]
+    fn accepts_path_segments_before_the_aid() {
+        validate_webs_mnemonic(&format!("tenants/acme/{AID}")).expect("leading path is allowed");
+    }
+
+    #[test]
+    fn rejects_uppercase_in_leading_segments() {
+        // Only the AID gets the case exemption; operator-chosen path
+        // segments keep the confusable-proof lowercase rule.
+        assert!(validate_webs_mnemonic(&format!("Tenants/{AID}")).is_err());
+    }
+
+    #[test]
+    fn rejects_a_reserved_first_segment() {
+        assert!(validate_webs_mnemonic(&format!("api/{AID}")).is_err());
+        // Including when the AID is itself the first segment.
+        assert!(validate_webs_mnemonic("api").is_err());
+    }
+
+    #[test]
+    fn rejects_an_aid_outside_base64url() {
+        assert!(validate_webs_mnemonic("not.an.aid").is_err());
+        assert!(validate_webs_mnemonic("has spaces").is_err());
+    }
+
+    #[test]
+    fn rejects_a_too_short_aid() {
+        assert!(validate_webs_mnemonic("abc").is_err());
+    }
+
+    #[test]
+    fn rejects_the_root_slot() {
+        // did:webs always has the AID as its last path segment, so the
+        // `.well-known` root form never applies.
+        assert!(validate_webs_mnemonic(ROOT_DID_MNEMONIC).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_slash_edges() {
+        assert!(validate_webs_mnemonic("").is_err());
+        assert!(validate_webs_mnemonic(&format!("/{AID}")).is_err());
+        assert!(validate_webs_mnemonic(&format!("{AID}/")).is_err());
+        assert!(validate_webs_mnemonic(&format!("tenants//{AID}")).is_err());
+    }
+
+    #[test]
+    fn accepts_the_base64url_specials() {
+        // `-` and `_` are in the CESR alphabet and appear in real AIDs.
+        validate_webs_mnemonic("EAbc-def_ghi").expect("`-` and `_` are legal in an AID");
+    }
 }

@@ -28,17 +28,21 @@
 //! at compile time via `#[cfg(feature = "method-...")]`. Disabling a
 //! method's feature removes its arm from the dispatcher (and its
 //! resolution route from the router — see T25). The default workspace
-//! build enables `method-webvh` + `method-web`; `method-webs` /
-//! `method-webplus` are scaffolded for future work.
+//! build enables `method-webvh` + `method-web`. `method-webs` is
+//! implemented but **off by default**: it pulls the KERI stack, which
+//! an operator hosting no `did:webs` DIDs should not carry.
+//! `method-webplus` is still a scaffolded stub.
 //!
-//! ## T10 scope
+//! ## Picking a method for an incoming publication
 //!
-//! This commit ships **the trait + dispatcher skeleton** with no per-
-//! method impls. `method_by_name` returns `None` for every name; the
-//! dispatcher is wired so T11 (webvh impl) and T24 (web impl) drop in
-//! as small additions.
+//! [`method_by_name`] answers "is this method compiled in", which is
+//! what a request naming a method needs. The management API's request
+//! body carries content rather than a method name, so it uses
+//! [`detect_method`] instead — the payload's own shape decides, and a
+//! caller cannot mislabel a payload into the wrong verifier.
 
 pub mod parse;
+pub mod publication;
 #[cfg(feature = "method-web")]
 pub mod web;
 #[cfg(feature = "method-webplus")]
@@ -175,12 +179,16 @@ pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
     static WEBVH: webvh::Webvh = webvh::Webvh;
     #[cfg(feature = "method-web")]
     static WEB: web::Web = web::Web;
+    #[cfg(feature = "method-webs")]
+    static WEBS: webs::Webs = webs::Webs;
 
     match name {
         #[cfg(feature = "method-webvh")]
         "webvh" => Some(&WEBVH),
         #[cfg(feature = "method-web")]
         "web" => Some(&WEB),
+        #[cfg(feature = "method-webs")]
+        "webs" => Some(&WEBS),
         _ => None,
     }
 }
@@ -200,7 +208,70 @@ pub fn enabled_methods() -> &'static [&'static str] {
         "webvh",
         #[cfg(feature = "method-web")]
         "web",
+        #[cfg(feature = "method-webs")]
+        "webs",
     ]
+}
+
+/// Infer which method a submitted publication belongs to, from the
+/// bytes alone.
+///
+/// The management API's request body carries the content, not the
+/// method, and the method has to be known before anything can verify
+/// it. Rather than trust a caller-supplied label — which could name one
+/// method for a payload that is really another, and so pick a verifier
+/// that waves it through — the shape of the payload decides.
+///
+/// The three enabled methods are distinguishable without ambiguity:
+///
+/// - **webvh** — line-delimited JSON whose first entry carries
+///   `versionId`. No other method's artifact has that field.
+/// - **webs** — a CESR stream containing an inception event. Note the
+///   check is *not* "does it parse": the CESR parser reads a bare JSON
+///   object as a message, so a webvh log line parses as a stream too.
+///   Requiring the inception event is what separates them, and
+///   `webs::Webs::validate` owns that rule.
+/// - **web** — a single JSON object whose `id` is a `did:web:` DID.
+///
+/// Order matters: webvh is checked first because it is the cheapest and
+/// most specific test, and because its log lines would otherwise reach
+/// the webs check, which has to reject them on a subtler ground.
+///
+/// Returns `None` when nothing matches, or when the matching method is
+/// not compiled in — callers map both to the same rejection, since a
+/// payload for a disabled method is exactly as unhostable as an
+/// unrecognised one.
+pub fn detect_method(data: &[u8]) -> Option<&'static str> {
+    let text = std::str::from_utf8(data).ok();
+
+    // ---- webvh: jsonl whose first entry has `versionId` ----
+    #[cfg(feature = "method-webvh")]
+    if let Some(text) = text
+        && let Some(line) = text.lines().find(|l| !l.trim().is_empty())
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+        && v.get("versionId").is_some()
+    {
+        return Some("webvh");
+    }
+
+    // ---- webs: a CESR stream carrying an inception event ----
+    #[cfg(feature = "method-webs")]
+    if webs::Webs.validate(data).is_ok() {
+        return Some("webs");
+    }
+
+    // ---- web: one JSON object with a did:web `id` ----
+    #[cfg(feature = "method-web")]
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data)
+        && v.get("id")
+            .and_then(|i| i.as_str())
+            .is_some_and(|id| id.starts_with("did:web:"))
+    {
+        return Some("web");
+    }
+
+    let _ = text;
+    None
 }
 
 #[cfg(test)]
@@ -330,5 +401,68 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("web"));
         assert!(s.contains("webvh"));
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+
+    #[cfg(feature = "method-webs")]
+    const KERI: &[u8] = include_bytes!("../../tests/fixtures/ENro7uf0.keri.cesr");
+
+    const WEBVH_LOG: &[u8] = br#"{"versionId":"1-QmABC","versionTime":"2025-01-01T00:00:00Z","state":{"id":"did:webvh:QmABC:example.com:user1"}}"#;
+    const WEB_DOC: &[u8] = br#"{"id":"did:web:example.com:user1","verificationMethod":[]}"#;
+
+    #[cfg(feature = "method-webvh")]
+    #[test]
+    fn detects_webvh_from_a_log_line() {
+        assert_eq!(detect_method(WEBVH_LOG), Some("webvh"));
+    }
+
+    #[cfg(feature = "method-web")]
+    #[test]
+    fn detects_web_from_a_document() {
+        assert_eq!(detect_method(WEB_DOC), Some("web"));
+    }
+
+    #[cfg(feature = "method-webs")]
+    #[test]
+    fn detects_webs_from_a_cesr_stream() {
+        assert_eq!(detect_method(KERI), Some("webs"));
+    }
+
+    /// The ambiguity that motivates the ordering: a webvh log line is
+    /// also a parseable CESR stream. If webs were checked first — or if
+    /// its check were "does it parse" rather than "does it carry an
+    /// inception event" — every webvh publish would be routed to the
+    /// KERI verifier and rejected.
+    #[cfg(all(feature = "method-webvh", feature = "method-webs"))]
+    #[test]
+    fn a_webvh_log_is_never_mistaken_for_a_cesr_stream() {
+        assert_eq!(detect_method(WEBVH_LOG), Some("webvh"));
+        assert!(
+            webs::Webs.validate(WEBVH_LOG).is_err(),
+            "a webvh log line must not pass the webs stream check",
+        );
+    }
+
+    /// The converse: a CESR stream must not be read as a did:web
+    /// document. Its first message is a JSON object, but it has no
+    /// `id`, so the web arm cannot claim it either.
+    #[cfg(all(feature = "method-webs", feature = "method-web"))]
+    #[test]
+    fn a_cesr_stream_is_never_mistaken_for_a_web_document() {
+        assert_eq!(detect_method(KERI), Some("webs"));
+    }
+
+    #[test]
+    fn returns_none_for_unrecognised_bytes() {
+        assert_eq!(detect_method(b""), None);
+        assert_eq!(detect_method(b"not anything"), None);
+        // Valid JSON, but no method claims it.
+        assert_eq!(detect_method(br#"{"hello":"world"}"#), None);
+        // A DID document for a method this service does not host.
+        assert_eq!(detect_method(br#"{"id":"did:key:z6Mk"}"#), None);
     }
 }

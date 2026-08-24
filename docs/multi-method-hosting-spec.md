@@ -25,9 +25,19 @@ The hosting infrastructure (ACL, auth, domains, control plane, sync, UI shell, a
 
 The rename is mechanically painful but cheap to delay-cost: the longer we wait, the more `webvh-*` names leak into integrators' code, docs, terraform, monitoring dashboards, etc. Bundling with the multi-domain + Trust-Tasks + client-crate release means one big-bang migration for operators rather than three or four.
 
+> **Status update — `did:webs` has since shipped.** §1 and the "Non-goals"
+> entry below describe the release this spec was written for, where `did:webs`
+> was a scaffolded stub. It is now implemented behind the (still off-by-default)
+> `method-webs` feature: registration, control-plane→edge sync, and resolution
+> of both `keri.cesr` and `did.json`. See **`docs/did-webs-hosting.md`** for the
+> design, and note two places where it does *not* fit the shape this spec
+> anticipated — a `DidMethod` impl cannot express its two artifacts, and its
+> paths cannot use the shared mnemonic grammar. Both are covered there.
+> `did:webplus` remains a stub, exactly as described.
+
 ## 2. Non-goals
 
-- **Shipping `did:webs` or `did:webplus`.** The feature flags exist and the trait surface accommodates them, but the per-method modules are stubs that fail to build with a clear "not implemented in this release" message if enabled.
+- **Shipping `did:webs` or `did:webplus`.** ~~The feature flags exist and the trait surface accommodates them, but the per-method modules are stubs that fail to build with a clear "not implemented in this release" message if enabled.~~ *(`did:webs` shipped later — see the status note above. `did:webplus` is still a stub.)*
 - **DID portability across methods.** A `did:web:example.com:user1` and a `did:webvh:scid:example.com:user1` are *different DIDs* even at the same domain/path — there is no "convert my did:web to did:webvh" tool.
 - **Resolution gateway for *external* DIDs.** This service hosts DIDs registered through it; it does not become a generic DID resolver that fetches arbitrary `did:web:other.example.com` documents from other operators.
 - **Method-specific witness/watcher generalisation.** Witness and watcher remain webvh-protocol features. `did:web` has no witness concept — UI hides those actions for did:web DIDs but we do not invent a method-neutral witness abstraction.

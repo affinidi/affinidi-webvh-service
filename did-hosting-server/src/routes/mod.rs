@@ -8,6 +8,11 @@ pub mod resolve_agent_name;
 mod resolve_shared;
 #[cfg(feature = "method-web")]
 pub mod resolve_web;
+// No `.well-known` route: a did:webs identifier always carries its AID
+// as the final path segment, so the method has no root form. Everything
+// it serves goes through the fallback dispatcher.
+#[cfg(feature = "method-webs")]
+pub mod resolve_webs;
 #[cfg(feature = "method-webvh")]
 pub mod resolve_webvh;
 mod stats;

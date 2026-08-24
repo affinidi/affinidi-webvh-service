@@ -29,6 +29,15 @@ include = [
 [features]
 default = ["keyring", "store-fjall", "ui"]
 metrics = ["did-hosting-common/metrics"]
+# DID methods the control plane can accept publications for. The control
+# plane is the write side, so a method must be enabled here for
+# register/publish to verify and store it — enabling it only on the
+# server would serve a method nothing can put in the store.
+#
+# webvh and web need no feature here: their write paths predate the
+# method abstraction and are always compiled. webs is opt-in for the
+# same reason as everywhere else — it pulls the KERI stack.
+method-webs = ["did-hosting-common/method-webs"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["did-hosting-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]

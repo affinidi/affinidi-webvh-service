@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Added — `did:webs` hosting
+
+- **The service can host `did:webs` DIDs**, behind the new `method-webs`
+  feature: registration and publish on the control plane, control-plane→edge
+  sync, and resolution of both artifacts. **Off by default on every binary** —
+  it pulls the KERI stack, and an operator hosting no `did:webs` DIDs should not
+  carry it. On the daemon, `--features method-webs` turns on both halves at
+  once; standalone deployments enable it on `did-hosting-control` *and*
+  `did-hosting-server`. See `docs/did-webs-hosting.md`.
+
+  Verification is the point of it. `affinidi-did-webs` (taken without its
+  `create` feature — the hosting service never holds KERI keys) verifies every
+  key event's SAID, the digest chain, controller signatures, pre-rotation
+  commitments, delegation seals, witness receipts, and the designated-aliases
+  attestation that `alsoKnownAs` comes from. Two further rules are this
+  service's own: a stream may only be published to the slot whose final path
+  segment is the AID that stream establishes, and an update may not rewind or
+  fork the hosted log.
+
+  Two things did not fit the shape `docs/multi-method-hosting-spec.md`
+  anticipated, and both are deliberate:
+
+  - **`did:webs` publishes two artifacts, and `DidMethod` carries one.** Rather
+    than widen a trait the spec marks "ask first", the CESR stream is stored
+    under the existing `content:{mnemonic}:log` key and `did.json` is **derived
+    on every read**. The only document this service may serve is the one the log
+    implies, so a stored copy could only ever be right or stale — and stale here
+    means serving a document from before a key rotation.
+  - **A `did:webs` slot ends in a mixed-case AID**, which the shared
+    lowercase-only path grammar rejects outright. New `validate_webs_mnemonic`
+    exempts the trailing AID only; leading path segments keep the strict rule,
+    which exists so two slots cannot differ only by case.
+
+- **`POST /api/dids/register` accepts `method: "webs"`** with the `keri.cesr`
+  stream as `did_data` (a string). `method` must be explicit for this method: a
+  key event log has no `id` field to derive it from. `did:web` registration is
+  still refused, unchanged.
+
+### Changed
+
+- **`register_did_atomic` takes a `domain` argument.** A `did:webs` key event log
+  establishes an AID, not a DID — the host and path come from where it is
+  published — so the identifier is constructed from the slot and the log is then
+  required to establish exactly that AID. webvh reads its own host out of the
+  log and ignores the argument. Existing non-REST callers pass `None`.
+- **`reconcile_agent_names` takes the extracted name list** rather than the raw
+  log. The Layer-1 rule (a node cannot serve a name the DID does not claim) is
+  unchanged — it is enforced one step earlier, so each method can say where its
+  current document lives without a second copy of the `alsoKnownAs` rule.
+- **Edges verify a synced `did:webs` log for themselves** instead of trusting the
+  control plane's push. The webvh sync path is unchanged (structural only), for
+  the reason it always was: the control plane has already walked that chain, and
+  an edge re-running it would reject logs an older `didwebvh-rs` accepted.
+
 ### Changed — dependencies
 
 - **Trust Tasks 0.6 → 0.9, and `vta-sdk` 0.24 → 0.25.** The whole

@@ -670,10 +670,16 @@ where
                         .with_message("register requires a non-empty `path`"),
                 ));
             }
-            let result =
-                did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force)
-                    .await
-                    .map_err(|e| reject_apperror(&doc, e))?;
+            let result = did_ops::register_did_atomic(
+                &auth,
+                &state,
+                &req.path,
+                &req.did_log,
+                req.force,
+                None,
+            )
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
             crate::server_push::notify_servers_did(&state, result.mnemonic.clone());
             let server_did = state.config.server_did.clone().unwrap_or_default();
             Ok(doc.respond_with(

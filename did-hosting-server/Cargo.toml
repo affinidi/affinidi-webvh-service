@@ -22,6 +22,10 @@ keyring = ["did-hosting-common/keyring"]
 # methods enabled (matches the common-crate behaviour at T31).
 method-webvh = ["did-hosting-common/method-webvh"]
 method-web = ["did-hosting-common/method-web"]
+# Off by default: pulls the KERI stack, which an operator hosting no
+# did:webs DIDs should not carry. Registers `/{*mnemonic}/keri.cesr` and
+# claims `/{*mnemonic}/did.json` for did:webs records only.
+method-webs = ["did-hosting-common/method-webs"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
@@ -122,6 +126,12 @@ azure_identity = { version = "1.0", optional = true }
 [dev-dependencies]
 tempfile = "3"
 anyhow.workspace = true
+# `tests/webs_resolve.rs` re-derives the DID document from the served
+# artifacts with the method crate directly, so the assertion is against
+# an independent implementation rather than against the same code path
+# that produced the response. Harmless when `method-webs` is off — the
+# test file is `#![cfg]`-gated out.
+affinidi-did-webs = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 ratatui = "0.30"
