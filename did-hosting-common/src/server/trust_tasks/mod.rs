@@ -32,6 +32,22 @@
 
 pub mod entry;
 pub mod ext;
+// Every handler returns `Result<TrustTask<Resp>, ErrorResponse>`, and
+// `ErrorResponse` is `trust_tasks_rs::TrustTask<ErrorPayload>` — 752
+// bytes, over `result_large_err`'s threshold. Rust 1.98.0 started
+// firing the lint here; nothing in this repo changed.
+//
+// Allowed rather than fixed, because the two fixes on offer are both
+// worse. The type is upstream, so we cannot shrink it. Boxing it at our
+// boundary would change the signature of every handler and every call
+// site in the dispatcher to buy one avoided 752-byte move on a path
+// that is already about to do DIDComm or HTTPS I/O — and the error
+// still has to be unboxed to be serialised onto the wire.
+//
+// Scoped to this module on purpose: it says "these handlers return an
+// upstream error type", not "this crate does not care about error
+// size". Drop the allow if `trust-tasks-rs` ever boxes `ErrorPayload`.
+#[allow(clippy::result_large_err)]
 pub mod handlers;
 pub mod send;
 pub mod transport;
