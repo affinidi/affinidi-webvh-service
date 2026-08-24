@@ -11,18 +11,37 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  # Same root cause as the three above: the AWS SDK still rides hyper 0.14,
+  # which pins `h2 0.3`. The advisory's only stated fix is ">= 0.4.16" — there
+  # is no patched 0.3.x — so this cannot be resolved from here.
+  #
+  # We DID fix the copy we control: `h2 0.4.15 -> 0.4.18` in the same commit
+  # that added this entry. The ignore is by advisory ID and so also covers the
+  # 0.4 line; that is the one thing to watch, because a future regression there
+  # would be silenced. `h2 0.4.18` is above the fixed version, and the lockfile
+  # pins it, so a regression would have to arrive via an explicit bump.
+  #
+  # Exposure on the remaining 0.3 copy is narrow: it is the *client* side of
+  # the optional aws-secrets / store-dynamodb backends talking to AWS
+  # endpoints over TLS, so the peer that would have to send the unbounded
+  # empty DATA frames is AWS itself. Advisory severity is Low.
+  # Re-evaluate when the AWS SDK moves to hyper 1.x, which also clears the
+  # three rustls-webpki entries above.
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 — transitive via AWS SDK's hyper 0.14 only; no patched 0.3.x exists. The 0.4 copy we control is bumped to the fixed 0.4.18." },
   # Unmaintained-status advisories on transitive crates. These are not
   # exploitable vulnerabilities — the upstreams that pull them haven't migrated
   # yet, and we don't depend on any of them directly. Revisit as the relevant
   # dependencies update.
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
-  { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained — transitive only (folded into rustls upstream); no direct dependency." },
 ]
 # Removed with the vta-sdk 0.21 / vti-common 0.11.33 bump, which dropped the
 # whole `ssi-*` / `json-ld` subtree and the old `proc-macro-error` generation:
 #   RUSTSEC-2024-0370 (proc-macro-error), RUSTSEC-2026-0173 (proc-macro-error2),
 #   RUSTSEC-2026-0215 (smallstr) — none of those crates are in the lock any more.
+# Removed by the workspace-wide `cargo update` in this release, which dropped
+# `rustls-pemfile` from the lock entirely:
+#   RUSTSEC-2025-0134 (rustls-pemfile unmaintained).
 
 [bans]
 multiple-versions = "allow"
