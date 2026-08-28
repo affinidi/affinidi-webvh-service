@@ -93,9 +93,10 @@ exceptions = [
   { allow = ["MPL-2.0"], crate = "webauthn-rs-proto" },
   { allow = ["MPL-2.0"], crate = "webauthn-attestation-ca" },
   { allow = ["MPL-2.0"], crate = "base64urlsafedata" },
-  # `option-ext` arrived with vta-sdk 0.31, which picked up `dirs 6` for its
-  # config-path lookup (`dirs -> dirs-sys -> option-ext`). Transitive only, and
-  # MPL-2.0 is file-level copyleft on an unmodified upstream crate.
+  # `option-ext` arrived with vta-sdk 0.31, which took a `dirs` dependency
+  # (dirs -> dirs-sys -> option-ext). MPL-2.0 is file-level copyleft and the
+  # crate is consumed unmodified as a library, like the webauthn-rs entries
+  # above.
   { allow = ["MPL-2.0"], crate = "option-ext" },
   { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
   { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
