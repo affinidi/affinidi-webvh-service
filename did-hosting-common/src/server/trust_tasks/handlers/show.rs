@@ -75,11 +75,14 @@ async fn handle_inner(
         .map_err(|e| internal(&doc, e))?;
 
     let resp_entry = existing.as_ref().map(into_spec_entry);
-    let resp_payload = show::Response {
-        entry: resp_entry,
-        ext: None,
-        redacted_fields: Vec::new(),
-    };
+    // The generated payload types are `#[non_exhaustive]` from trust-tasks
+    // 0.17 on: built through the generated builder, whose `try_into` can only
+    // fail on a field left unset.
+    let resp_payload: show::Response = show::Response::builder()
+        .entry(resp_entry)
+        .redacted_fields(Vec::new())
+        .try_into()
+        .expect("show response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
@@ -170,10 +173,12 @@ mod tests {
     }
 
     fn request(issuer_did: &str, subject: &str) -> TrustTask<show::Payload> {
-        let payload = show::Payload {
-            ext: None,
-            subject: subject.to_string().try_into().expect("subject non-empty"),
-        };
+        let subject: show::PayloadSubject =
+            subject.to_string().try_into().expect("subject non-empty");
+        let payload: show::Payload = show::Payload::builder()
+            .subject(subject)
+            .try_into()
+            .expect("test show payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());

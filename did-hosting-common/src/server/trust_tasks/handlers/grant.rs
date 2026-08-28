@@ -187,10 +187,13 @@ async fn handle_inner(
 
     // ─── 5. Build the response document. ──────────────────────────
     let resp_entry = into_spec_entry(&realized);
-    let resp_payload = grant::Response {
-        entry: resp_entry,
-        ext: None,
-    };
+    // The generated payload types are `#[non_exhaustive]` from trust-tasks
+    // 0.17 on: built through the generated builder, whose `try_into` can only
+    // fail on a field left unset.
+    let resp_payload: grant::Response = grant::Response::builder()
+        .entry(resp_entry)
+        .try_into()
+        .expect("grant response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
@@ -313,34 +316,37 @@ mod tests {
     /// for `subject` at `role`, the issuer pinned to `issuer_did`, and
     /// recipient pinned to `SERVICE_DID`.
     fn grant_request(issuer_did: &str, subject: &str, role: &str) -> TrustTask<grant::Payload> {
-        let entry = grant::AclEntry {
-            subject: subject.into(),
-            role: role.into(),
-            scopes: vec![],
-            allowed_keys: None,
-            approve: None,
-            label: Some("test entry".into()),
-            created_at: None,
-            created_by: None,
-            updated_at: None,
-            updated_by: None,
-            expires_at: None,
-            // `step_up` (added in the trust-tasks-rs 0.2 acl/grant schema)
-            // is an optional per-entry AAL hint we don't model — leave it
-            // unset so the entry translates as a plain webvh grant.
-            step_up: None,
+        // The generated types are `#[non_exhaustive]` from trust-tasks 0.17
+        // on; the fields left unset here (`step_up`, the audit stamps) are the
+        // ones the literal used to spell as `None`. `step_up` in particular is
+        // an optional per-entry AAL hint we don't model, so the entry still
+        // translates as a plain webvh grant.
+        let entry: grant::AclEntry = grant::AclEntry::builder()
+            .subject(subject)
+            .role(role)
+            .scopes(vec![])
+            .label(Some(
+                "test entry".parse::<grant::AclEntryLabel>().expect("label"),
+            ))
             // Owner needs domains; we always supply it via the webvh ext
             // so the entry handler accepts it on translate.
-            ext: serde_json::from_value(serde_json::json!({
-                WEBVH_EXT_KEY: { "domains": { "kind": "all" } }
-            }))
-            .unwrap(),
-        };
-        let payload = grant::Payload {
-            entry,
-            ext: None,
-            reason: Some("integration test grant".into()),
-        };
+            .ext(
+                serde_json::from_value::<Option<grant::Ext>>(serde_json::json!({
+                    WEBVH_EXT_KEY: { "domains": { "kind": "all" } }
+                }))
+                .unwrap(),
+            )
+            .try_into()
+            .expect("test ACL entry is well formed");
+        let payload: grant::Payload = grant::Payload::builder()
+            .entry(entry)
+            .reason(Some(
+                "integration test grant"
+                    .parse::<grant::PayloadReason>()
+                    .expect("reason"),
+            ))
+            .try_into()
+            .expect("test grant payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
@@ -599,10 +605,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(before.label, Some("test entry".into()));
+        assert_eq!(
+            before.label,
+            Some("test entry".parse().expect("label")),
+        );
 
         let mut update = grant_request(ADMIN_DID, ALICE_DID, "owner");
-        update.payload.entry.label = Some("Alice — updated".into());
+        update.payload.entry.label = Some("Alice — updated".parse().expect("label"));
         update.payload.entry.ext = serde_json::from_value(serde_json::json!({
             WEBVH_EXT_KEY: {
                 "domains": {

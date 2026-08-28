@@ -31,11 +31,11 @@ rust-version = "1.95.0"
 # Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.20 and vti-common
 # 0.11.30 both depend on affinidi-tdk ^0.8, so all three resolve to a single
 # affinidi-tdk copy. Drop back to 0.7 only if vta-sdk/vti-common ever re-pin.
-affinidi-tdk = "0.8"
+affinidi-tdk = "0.10"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
 # to the `TspHandler`. Without it the handler is stored but never invoked
 # (the crate compiles TSP support out).
-affinidi-messaging-didcomm-service = { version = "0.3", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.5", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15"
 affinidi-secrets-resolver = "0.5"
@@ -207,7 +207,7 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.25", features = [
+vta-sdk = { version = "0.31", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -300,16 +300,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.9", default-features = false }
-trust-tasks-https = { version = "0.9", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.9", default-features = false }
-trust-tasks-proof = { version = "0.9", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.17", default-features = false }
+trust-tasks-https = { version = "0.17", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.17", default-features = false }
+trust-tasks-proof = { version = "0.17", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.9", default-features = false }
+trust-tasks-tsp = { version = "0.17", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the

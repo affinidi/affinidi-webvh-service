@@ -244,10 +244,13 @@ fn build_response(
     let value = serde_json::to_value(&neutral).expect("SpecAclEntry serialises");
     let spec_entry: change_role::AclEntry =
         serde_json::from_value(value).expect("change_role::AclEntry from SpecAclEntry value");
-    let payload = change_role::Response {
-        entry: spec_entry,
-        ext: None,
-    };
+    // The generated payload types are `#[non_exhaustive]` from trust-tasks
+    // 0.17 on: built through the generated builder, whose `try_into` can only
+    // fail on a field left unset.
+    let payload: change_role::Response = change_role::Response::builder()
+        .entry(spec_entry)
+        .try_into()
+        .expect("change-role response has every required field set");
     let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     request.respond_with(id, payload)
 }
@@ -378,13 +381,19 @@ mod tests {
         from: &str,
         to: &str,
     ) -> TrustTask<change_role::Payload> {
-        let payload = change_role::Payload {
-            ext: None,
-            from_role: from.to_string().try_into().expect("fromRole non-empty"),
-            reason: Some("test".into()),
-            subject: subject.into(),
-            to_role: to.to_string().try_into().expect("toRole non-empty"),
-        };
+        let from_role: change_role::PayloadFromRole =
+            from.to_string().try_into().expect("fromRole non-empty");
+        let to_role: change_role::PayloadToRole =
+            to.to_string().try_into().expect("toRole non-empty");
+        let payload: change_role::Payload = change_role::Payload::builder()
+            .from_role(from_role)
+            .reason(Some(
+                "test".parse::<change_role::PayloadReason>().expect("reason"),
+            ))
+            .subject(subject)
+            .to_role(to_role)
+            .try_into()
+            .expect("test change-role payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());

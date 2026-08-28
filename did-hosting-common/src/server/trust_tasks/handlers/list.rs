@@ -176,13 +176,16 @@ async fn handle_inner(
     let truncated = has_more;
 
     let entries: Vec<list::AclEntry> = page.iter().map(|e| into_spec_entry(e)).collect();
-    let resp_payload = list::Response {
-        cursor,
-        entries,
-        ext: None,
-        redacted_fields: Vec::new(),
-        truncated,
-    };
+    // The generated payload types are `#[non_exhaustive]` from trust-tasks
+    // 0.17 on: built through the generated builder, whose `try_into` can only
+    // fail on a field left unset.
+    let resp_payload: list::Response = list::Response::builder()
+        .cursor(cursor)
+        .entries(entries)
+        .redacted_fields(Vec::new())
+        .truncated(truncated)
+        .try_into()
+        .expect("list response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
@@ -344,15 +347,14 @@ mod tests {
         scope: Option<&str>,
         prefix: Option<&str>,
     ) -> TrustTask<list::Payload> {
-        let payload = list::Payload {
-            cursor: cursor.map(|s| s.to_string()),
-            direction: None,
-            ext: None,
-            page_size: page_size.and_then(NonZeroU64::new),
-            role: role.map(|s| s.to_string().try_into().expect("role parses")),
-            scope: scope.map(|s| s.to_string().try_into().expect("scope parses")),
-            subject_prefix: prefix.map(|s| s.to_string().try_into().expect("prefix parses")),
-        };
+        let payload: list::Payload = list::Payload::builder()
+            .cursor(cursor.map(|s| s.to_string()))
+            .page_size(page_size.and_then(NonZeroU64::new))
+            .role(role.map(|s| s.to_string().try_into().expect("role parses")))
+            .scope(scope.map(|s| s.to_string().try_into().expect("scope parses")))
+            .subject_prefix(prefix.map(|s| s.to_string().try_into().expect("prefix parses")))
+            .try_into()
+            .expect("test list payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());

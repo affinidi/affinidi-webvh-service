@@ -3635,15 +3635,12 @@ mod tests {
 
     fn build_list_envelope(issuer_did: &str) -> Message {
         use trust_tasks_rs::specs::acl::list::v0_1 as list;
-        let payload = list::Payload {
-            ext: None,
-            cursor: None,
-            direction: None,
-            page_size: None,
-            role: None,
-            scope: None,
-            subject_prefix: None,
-        };
+        // `#[non_exhaustive]` from trust-tasks 0.17 on: every field of this
+        // list request is optional and left unset, so the builder takes no
+        // calls at all.
+        let payload: list::Payload = list::Payload::builder()
+            .try_into()
+            .expect("empty list payload is well formed");
         let mut doc = trust_tasks_rs::TrustTask::for_payload(
             format!("urn:uuid:{}", uuid::Uuid::new_v4()),
             payload,
@@ -4393,29 +4390,32 @@ mod tests {
     /// control plane.
     fn unsigned_grant_doc(admin_did: &str, subject: &str) -> Value {
         use trust_tasks_rs::specs::acl::grant::v0_1 as grant;
-        let entry = grant::AclEntry {
-            subject: subject.into(),
-            role: "owner".into(),
-            scopes: vec![],
-            allowed_keys: None,
-            approve: None,
-            label: Some("signed e2e grant".into()),
-            created_at: None,
-            created_by: None,
-            updated_at: None,
-            updated_by: None,
-            expires_at: None,
-            step_up: None,
-            ext: serde_json::from_value(json!({
-                "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
-            }))
-            .expect("webvh ext parses"),
-        };
-        let payload = grant::Payload {
-            entry,
-            ext: None,
-            reason: Some("signed end-to-end grant".into()),
-        };
+        let entry: grant::AclEntry = grant::AclEntry::builder()
+            .subject(subject)
+            .role("owner")
+            .scopes(vec![])
+            .label(Some(
+                "signed e2e grant"
+                    .parse::<grant::AclEntryLabel>()
+                    .expect("label"),
+            ))
+            .ext(
+                serde_json::from_value::<Option<grant::Ext>>(json!({
+                    "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
+                }))
+                .expect("webvh ext parses"),
+            )
+            .try_into()
+            .expect("e2e ACL entry is well formed");
+        let payload: grant::Payload = grant::Payload::builder()
+            .entry(entry)
+            .reason(Some(
+                "signed end-to-end grant"
+                    .parse::<grant::PayloadReason>()
+                    .expect("reason"),
+            ))
+            .try_into()
+            .expect("e2e grant payload is well formed");
         let mut doc = trust_tasks_rs::TrustTask::for_payload(
             format!("urn:uuid:{}", uuid::Uuid::new_v4()),
             payload,

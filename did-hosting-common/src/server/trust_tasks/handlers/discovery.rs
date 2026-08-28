@@ -150,7 +150,10 @@ mod tests {
             .iter()
             .map(|p| (*p).to_string().try_into().expect("pattern parses"))
             .collect();
-        let payload = discovery::Payload { patterns };
+        let payload: discovery::Payload = discovery::Payload::builder()
+            .patterns(patterns)
+            .try_into()
+            .expect("test discovery payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(CALLER_DID.into());
         doc.recipient = Some(SERVICE_DID.into());
@@ -259,9 +262,11 @@ mod tests {
     #[test]
     fn registry_includes_change_role_required_ext() {
         let reg = registry();
-        let resp = reg.respond_to(&discovery::Payload {
-            patterns: vec!["acl/change-role".to_string().try_into().unwrap()],
-        });
+        let payload: discovery::Payload = discovery::Payload::builder()
+            .patterns(vec!["acl/change-role".to_string().try_into().unwrap()])
+            .try_into()
+            .expect("discovery payload is well formed");
+        let resp = reg.respond_to(&payload);
         assert_eq!(resp.supported_types.len(), 1);
         match &resp.supported_types[0] {
             ResponseSupportedTypesItem::Object {

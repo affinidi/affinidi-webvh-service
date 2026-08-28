@@ -59,7 +59,8 @@ pub use verifier::TransportBoundVerifier;
 use chrono::Utc;
 use serde::Serialize;
 use trust_tasks_rs::{
-    ConsumeOutcome, Dispatcher, ErrorResponse, NoValidator, Payload, PayloadPolicy, ProofPolicy,
+    ConsumeChecks, ConsumeOutcome, Dispatcher, ErrorResponse, NoValidator, Payload, PayloadPolicy,
+    ProofPolicy,
     ProofVerifier, ResolvedParties, TransportHandler, TrustTask, consume_inbound,
     specs::{
         acl::{change_role, grant, list, revoke, show},
@@ -217,10 +218,23 @@ where
     // Turning it on is a *behaviour* change: it can begin refusing documents a
     // peer sends today. It needs the `validate` feature, a `PayloadValidator`,
     // and its own rollout — not a dependency bump.
+    // SPEC.md §7.2 items 4 and 11, a required argument since trust-tasks 0.17
+    // (`ConsumeChecks`) rather than a default the framework chose for us.
+    //
+    // `not_consequential()` is what this shim has always done — 0.9 ran no
+    // duplicate-execution record at all — so taking it here changes no
+    // behaviour with the dependency bump. It is *not* the right long-term
+    // answer for the ACL writes (`acl/grant`, `acl/revoke`,
+    // `acl/change-role`), which are consequential by §2: a mediator redelivery
+    // of one grant document would be executed twice. Fixing that needs a
+    // `ReplayGuard` with storage behind it and a decision about which
+    // processes share a VID (the control plane, the server and the daemon all
+    // consume), which is its own change rather than a dependency bump.
     let outcome: ConsumeOutcome<R> = consume_inbound(
         transport,
         policy,
         PayloadPolicy::<NoValidator>::AcceptUnvalidated,
+        ConsumeChecks::not_consequential(),
         doc,
         my_vid,
         now,
@@ -242,6 +256,38 @@ where
         }
         ConsumeOutcome::Rejected(err) => DispatchOutcome::Rejected(err),
         ConsumeOutcome::Suppressed => DispatchOutcome::Suppressed,
+        // SPEC.md §7.2 item 11, *Disposition of a duplicate*: not a failure —
+        // the task did not fail, it already happened — so this must never fold
+        // into `Rejected`. Emit what the first execution produced when the
+        // guard retained it, and nothing when it did not (or when that
+        // execution is still running).
+        //
+        // Unreachable while the `ConsumeChecks` above is `not_consequential()`:
+        // with no record kept, nothing is ever found to be a duplicate. Written
+        // out so that wiring a `ReplayGuard` is one edit there and none here.
+        ConsumeOutcome::Duplicate {
+            prior_response,
+            in_flight,
+        } => match prior_response {
+            Some(value) => match serde_json::from_value::<TrustTask<serde_json::Value>>(value) {
+                Ok(prior) => DispatchOutcome::Handled(prior),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "replay guard held a prior response that is not a Trust Task document; \
+                         emitting nothing"
+                    );
+                    DispatchOutcome::Suppressed
+                }
+            },
+            None => {
+                tracing::info!(
+                    in_flight,
+                    "duplicate document absorbed with no prior response to return"
+                );
+                DispatchOutcome::Suppressed
+            }
+        },
     }
 }
 

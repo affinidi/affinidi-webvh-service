@@ -215,10 +215,13 @@ async fn handle_inner(
     };
 
     let resp_entry = response_entry.as_ref().map(into_spec_entry);
-    let resp_payload = revoke::Response {
-        entry: resp_entry,
-        ext: None,
-    };
+    // The generated payload types are `#[non_exhaustive]` from trust-tasks
+    // 0.17 on: built through the generated builder, whose `try_into` can only
+    // fail on a field left unset.
+    let resp_payload: revoke::Response = revoke::Response::builder()
+        .entry(resp_entry)
+        .try_into()
+        .expect("revoke response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
@@ -419,12 +422,16 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string().try_into().expect("scope item parses"))
             .collect();
-        let payload = revoke::Payload {
-            ext: None,
-            reason: Some("integration test".into()),
-            scopes,
-            subject: subject.into(),
-        };
+        let payload: revoke::Payload = revoke::Payload::builder()
+            .reason(Some(
+                "integration test"
+                    .parse::<revoke::PayloadReason>()
+                    .expect("reason"),
+            ))
+            .scopes(scopes)
+            .subject(subject)
+            .try_into()
+            .expect("test revoke payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
