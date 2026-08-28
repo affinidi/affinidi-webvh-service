@@ -388,7 +388,9 @@ mod tests {
         let payload: change_role::Payload = change_role::Payload::builder()
             .from_role(from_role)
             .reason(Some(
-                "test".parse::<change_role::PayloadReason>().expect("reason"),
+                "test"
+                    .parse::<change_role::PayloadReason>()
+                    .expect("reason"),
             ))
             .subject(subject)
             .to_role(to_role)

@@ -605,10 +605,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            before.label,
-            Some("test entry".parse().expect("label")),
-        );
+        assert_eq!(before.label, Some("test entry".parse().expect("label")),);
 
         let mut update = grant_request(ADMIN_DID, ALICE_DID, "owner");
         update.payload.entry.label = Some("Alice — updated".parse().expect("label"));

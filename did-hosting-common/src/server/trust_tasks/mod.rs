@@ -60,8 +60,7 @@ use chrono::Utc;
 use serde::Serialize;
 use trust_tasks_rs::{
     ConsumeChecks, ConsumeOutcome, Dispatcher, ErrorResponse, NoValidator, Payload, PayloadPolicy,
-    ProofPolicy,
-    ProofVerifier, ResolvedParties, TransportHandler, TrustTask, consume_inbound,
+    ProofPolicy, ProofVerifier, ResolvedParties, TransportHandler, TrustTask, consume_inbound,
     specs::{
         acl::{change_role, grant, list, revoke, show},
         trust_task_discovery as discovery,

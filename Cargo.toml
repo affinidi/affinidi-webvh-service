@@ -188,12 +188,21 @@ affinidi-did-webs = "0.7"
 # spawn), and the alternative was holding our own SDK back to whatever the
 # mediator last published against.
 #
-# **It has now collapsed, exactly as predicted.** The messaging stack republished
-# on the current line (mediator 0.18.18 / test-mediator 0.2.51, both on
-# trust-tasks-rs 0.9), so `cargo tree -d -e normal,build,dev` is clean too — one
-# vta-sdk, one trust-tasks-rs, one vti-common, one affinidi-tdk. Keep it that
-# way: a dev-graph split is cheap to acquire and easy to stop noticing. Keep the
-# lock's `affinidi-messaging-mediator` at >= 0.18.4 regardless.
+# **It collapsed once, then split again on the very next bump — which is the
+# lesson.** The messaging stack republished on the trust-tasks 0.9 line
+# (mediator 0.18.18 / test-mediator 0.2.51) and the dev graph went clean; moving
+# the shipped graph to trust-tasks 0.17 immediately re-split it, because
+# test-mediator was still pinned `^0.2` and dragged affinidi-tdk 0.8 /
+# trust-tasks-rs 0.11 back in behind it. Bumping the dev-dep to
+# `affinidi-messaging-test-mediator = "0.4"` (mediator 0.20, trust-tasks-rs
+# 0.17) closed it again.
+#
+# So: this dev-dep is not independent of the trust-tasks family — it carries a
+# copy, and it has to move in the same commit. `cargo tree -d -e
+# normal,build,dev` must list none of `vta-sdk`, `vti-common`, `affinidi-tdk` or
+# `trust-tasks-rs`; a dev-graph split is cheap to acquire and easy to stop
+# noticing. Keep the lock's `affinidi-messaging-mediator` at >= 0.18.4
+# regardless.
 #
 # `trust-tasks-rs` has now been duplicated in the *shipped* graph twice, and
 # collapsed twice, by the same move: bring every crate that carries it onto one

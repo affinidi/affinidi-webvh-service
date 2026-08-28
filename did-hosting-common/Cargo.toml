@@ -163,7 +163,7 @@ affinidi-messaging-didcomm = { workspace = true, optional = true }
 fjall = { workspace = true, optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.50", optional = true }
+firestore = { version = "0.53", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "0.37", features = ["key_auth"], optional = true }
 azure_core = { version = "1.0", optional = true }

@@ -2,6 +2,11 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+// firestore 0.53 made the `db::support` traits private, so the extension
+// methods they carried (`update_obj`, `get_obj_if_exists`, `delete_by_id`,
+// `stream_list_obj`) are no longer callable on `FirestoreDb`. Everything below
+// goes through the fluent builders instead — the same API `FirestoreBatch`
+// already used.
 use firestore::*;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -102,10 +107,15 @@ impl KeyspaceOps for FirestoreKeyspace {
                 key: doc_id.clone(),
                 data: BASE64.encode(&value),
             };
-            // update_obj acts as an upsert in Firestore
+            // `update` acts as an upsert in Firestore
             let _: KvDoc = self
                 .db
-                .update_obj(&self.collection, &doc_id, &doc, None, None, None)
+                .fluent()
+                .update()
+                .in_col(&self.collection)
+                .document_id(&doc_id)
+                .object(&doc)
+                .execute()
                 .await
                 .map_err(|e| AppError::Store(format!("firestore upsert: {e}")))?;
             Ok(())
@@ -117,7 +127,11 @@ impl KeyspaceOps for FirestoreKeyspace {
             let doc_id = encode_doc_id(&key);
             let result: Option<KvDoc> = self
                 .db
-                .get_obj_if_exists(&self.collection, &doc_id, None)
+                .fluent()
+                .select()
+                .by_id_in(&self.collection)
+                .obj()
+                .one(&doc_id)
                 .await
                 .map_err(|e| AppError::Store(format!("firestore get: {e}")))?;
 
@@ -137,7 +151,11 @@ impl KeyspaceOps for FirestoreKeyspace {
         Box::pin(async move {
             let doc_id = encode_doc_id(&key);
             self.db
-                .delete_by_id(&self.collection, &doc_id, None)
+                .fluent()
+                .delete()
+                .from(&self.collection)
+                .document_id(&doc_id)
+                .execute()
                 .await
                 .map_err(|e| AppError::Store(format!("firestore delete: {e}")))?;
             Ok(())
@@ -149,7 +167,11 @@ impl KeyspaceOps for FirestoreKeyspace {
             let doc_id = encode_doc_id(&key);
             let result: Option<KvDoc> = self
                 .db
-                .get_obj_if_exists(&self.collection, &doc_id, None)
+                .fluent()
+                .select()
+                .by_id_in(&self.collection)
+                .obj()
+                .one(&doc_id)
                 .await
                 .map_err(|e| AppError::Store(format!("firestore get: {e}")))?;
             Ok(result.is_some())
@@ -179,12 +201,14 @@ impl KeyspaceOps for FirestoreKeyspace {
 
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
-            let params =
-                FirestoreListDocParams::new(self.collection.clone()).with_page_size(10_000);
-
             let mut stream = self
                 .db
-                .stream_list_obj::<KvDoc>(params)
+                .fluent()
+                .list()
+                .from(&self.collection)
+                .page_size(10_000)
+                .obj::<KvDoc>()
+                .stream_all()
                 .await
                 .map_err(|e| AppError::Store(format!("firestore list: {e}")))?;
 

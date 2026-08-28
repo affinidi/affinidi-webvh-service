@@ -58,6 +58,62 @@
 
 ### Changed — dependencies
 
+- **Trust Tasks 0.9 → 0.17, `affinidi-tdk` 0.8 → 0.10, `vta-sdk` 0.25 → 0.31,
+  `vti-common` 0.12 → 0.15, `affinidi-messaging-didcomm-service` 0.3 → 0.5.**
+  The whole `trust-tasks-*` family moves as one, for the reason the workspace
+  manifest gives: `trust-tasks-rs`'s core types cross the public API of
+  `-https` / `-didcomm` / `-proof` / `-tsp`.
+
+  Two breaking changes reach source. Generated payload types are
+  `#[non_exhaustive]`, so every `acl/*` and `trust-task-discovery` request and
+  response literal is built through its generated builder and the constrained
+  string newtypes (`AclEntryLabel`, `PayloadReason`, …) are parsed rather than
+  `.into()`-ed. And `consume_inbound` now takes a required `ConsumeChecks` —
+  SPEC §7.2 item 4 (freshness) and item 11 (duplicate execution), promoted from
+  framework default to caller argument.
+
+  `ConsumeChecks::not_consequential()` is passed, which is exactly what the shim
+  has always done: 0.9 kept no duplicate-execution record at all, so the bump
+  changes no behaviour. **It is not the right long-term answer for the ACL
+  writes** (`acl/grant`, `acl/revoke`, `acl/change-role`), which are
+  consequential by §2 — a mediator redelivery of one grant document would
+  execute twice. A real `ReplayGuard` needs storage behind it and a decision
+  about which processes share a VID (control plane, server and daemon all
+  consume), so it is its own change rather than a dependency bump. The call site
+  says so, and `ConsumeOutcome::Duplicate` is already handled (§7.2: a duplicate
+  is not a failure, so it must never fold into `Rejected`) — unreachable until a
+  guard is wired, written out so that wiring one is a single edit.
+
+  The framework error document is still `trust-task-error/0.5` under 0.17;
+  `unrouted_and_routed_errors_agree_on_the_type_uri` covers it.
+
+- **`affinidi-messaging-test-mediator` 0.2 → 0.4, to close a dev-graph split.**
+  Not cosmetic, and not separable from the bump above: the test-mediator carries
+  its own `trust-tasks-rs` and `affinidi-tdk`, and at `^0.2` it dragged
+  `affinidi-tdk` 0.8 and `trust-tasks-rs` 0.11 back into the dev graph the
+  moment the shipped graph reached 0.17. `cargo tree -d -e normal,build,dev`
+  listed both twice. 0.4.0 (mediator 0.20, trust-tasks-rs 0.17) collapses them,
+  and the graph is back to one copy each of `vta-sdk`, `vti-common`,
+  `affinidi-tdk` and `trust-tasks-rs` across normal, build *and* dev.
+
+  This is the second time this dev-dep has split the graph on a trust-tasks
+  move. It is now noted in both manifests as a crate that must be bumped in the
+  same commit as the family, rather than left to float.
+
+- **`firestore` 0.50 → 0.53** (and `gcloud-sdk` 0.30 → 0.31 behind it). 0.53
+  makes the `db::support` traits private, so the extension methods the
+  `store-firestore` backend called on `FirestoreDb` — `update_obj`,
+  `get_obj_if_exists`, `delete_by_id`, `stream_list_obj` — are no longer in
+  scope at any path. The four call sites move to the fluent builders, which is
+  the API the crate now intends and the one `FirestoreBatch` in the same file
+  already used. Behaviour is unchanged: same upsert semantics, same
+  page-size-10 000 listing, same document IDs.
+
+- **`deny.toml`: MPL-2.0 exception for `option-ext`.** New in the graph via
+  `vta-sdk` 0.31, which picked up `dirs 6` for its config-path lookup
+  (`dirs → dirs-sys → option-ext`). Transitive only, unmodified upstream, and
+  file-level copyleft — the same shape as the `webauthn-rs` entries beside it.
+
 - **Workspace-wide `cargo update`.** Lockfile only — no manifest edits, so every
   semver range is unchanged and the documented lockstep pins hold: `vta-sdk`
   stays on 0.25 (0.28 available) and `vti-common` on 0.12 (0.13 available),
