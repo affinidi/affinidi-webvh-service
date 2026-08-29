@@ -1942,6 +1942,22 @@ pub(crate) async fn dispatch_trust_task_doc(
     // which would otherwise hand them to `dispatch_did_op` — a table of DID
     // operations that has never heard of them — and answer with a bogus
     // "unknown op" problem report.
+    // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
+    // check below: the shared `build_dispatcher` does not carry this family —
+    // its context is the ACL keyspace — so an auth document would fall through
+    // to `bridge_did_management`, a table of DID operations that has never
+    // heard of it, and come back a bogus "unknown op".
+    if crate::trust_tasks_auth::owns(&type_uri) {
+        let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
+            state.config.trust_tasks.enforce_proofs,
+            state.trust_tasks_verifier.as_deref(),
+        ) {
+            (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
+            _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
+        };
+        return Ok(crate::trust_tasks_auth::dispatch(state, transport, policy, doc).await);
+    }
+
     if crate::trust_tasks_infra::owns(&type_uri) {
         // The dispatcher stays transport-agnostic; we only tell it which binding
         // the document came in on so the registry can record what actually moved.
