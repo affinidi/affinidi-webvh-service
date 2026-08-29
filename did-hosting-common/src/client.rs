@@ -91,7 +91,7 @@ impl WebVHClient {
             .as_secs();
         let msg = Message::build(
             uuid::Uuid::new_v4().to_string(),
-            "https://affinidi.com/webvh/1.0/authenticate".to_string(),
+            "https://trusttasks.org/spec/auth/authenticate/0.1".to_string(),
             json!({
                 "challenge": challenge_resp.challenge,
                 "session_id": challenge_resp.session_id,

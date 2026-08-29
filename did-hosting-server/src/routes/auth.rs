@@ -59,13 +59,11 @@ pub async fn authenticate(
 
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    // L4: accept both legacy + canonical Trust-Task URIs during
-    // the migration window.
-    if !matches!(
-        msg.typ.as_str(),
-        "https://affinidi.com/webvh/1.0/authenticate"
-            | "https://trusttasks.org/spec/auth/authenticate/0.1"
-    ) {
+    // The canonical Trust-Task URI, and only it. The migration window this
+    // used to describe is closed: every client in this workspace sends the
+    // canonical form, and the legacy `affinidi.com/webvh/1.0/authenticate`
+    // arm is gone rather than left as a permanent second spelling.
+    if msg.typ.as_str() != "https://trusttasks.org/spec/auth/authenticate/0.1" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ

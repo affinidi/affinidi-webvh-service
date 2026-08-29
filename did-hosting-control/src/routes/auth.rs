@@ -309,13 +309,12 @@ async fn authenticate_didcomm_jws(
 
     let (msg, signer_did) = didcomm_unpack::unpack_signed(body_str, did_resolver).await?;
 
-    // Accept the same authenticate type URIs did-hosting-server accepts
-    // (canonical + legacy) so the VTA's envelope routes here verbatim.
-    if !matches!(
-        msg.typ.as_str(),
-        "https://affinidi.com/webvh/1.0/authenticate"
-            | "https://trusttasks.org/spec/auth/authenticate/0.1"
-    ) {
+    // The canonical authenticate Type URI — the same one did-hosting-server
+    // accepts, so the VTA's envelope routes here verbatim. The legacy
+    // `affinidi.com/webvh/1.0/authenticate` arm that sat beside it is gone:
+    // it was the last thing keeping a retired vendor URI alive on this
+    // route, and a second accepted spelling is a second thing to keep true.
+    if msg.typ.as_str() != "https://trusttasks.org/spec/auth/authenticate/0.1" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ
