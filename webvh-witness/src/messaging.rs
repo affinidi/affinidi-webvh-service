@@ -19,9 +19,22 @@ use crate::auth::session::create_authenticated_session;
 use crate::error::AppError;
 use crate::server::AppState;
 
-// WebVH witness message types
-const MSG_AUTHENTICATE: &str = "https://affinidi.com/webvh/1.0/authenticate";
-const MSG_AUTHENTICATE_RESPONSE: &str = "https://affinidi.com/webvh/1.0/authenticate-response";
+// WebVH witness message types.
+//
+// Authentication uses the canonical Trust-Task URIs — the same pair
+// `did-hosting-control` and `did-hosting-server` bind, and the same pair this
+// service's own REST route accepts. It bound
+// `affinidi.com/webvh/1.0/authenticate` until every other authenticate surface
+// in the workspace had moved and this was the last one left, which is the
+// state that produces a client working against two services and failing
+// against the third.
+//
+// The `witness/*` types below stay on the vendor authority: the Trust-Task
+// registry's `witness` family is `witness/session/0.1` alone, so there is no
+// canonical spelling to move them to. Renaming them would invent one.
+const MSG_AUTHENTICATE: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
+const MSG_AUTHENTICATE_RESPONSE: &str =
+    "https://trusttasks.org/spec/auth/authenticate/0.1#response";
 const MSG_WITNESS_PROOF_REQUEST: &str = "https://affinidi.com/webvh/1.0/witness/proof-request";
 const MSG_WITNESS_PROOF_RESPONSE: &str = "https://affinidi.com/webvh/1.0/witness/proof-response";
 const MSG_WITNESS_LIST_REQUEST: &str = "https://affinidi.com/webvh/1.0/witness/list-request";
