@@ -170,9 +170,10 @@ fn serialise<T: serde::Serialize>(doc: &T) -> Value {
 
 /// The caller, as established by the framework — never a body value.
 // `ErrorResponse` is the upstream `TrustTask<ErrorPayload>`, which
-// `result_large_err` flags. Same reasoning as the allows in `trust_tasks_did`
-// and `did-hosting-common`'s handlers: the type is upstream, and boxing it here
-// would churn every caller to save one move on a path that is about to
+// `result_large_err` flags — here and on each of the three arms below, all of
+// which return it. Same reasoning as the allows in `trust_tasks_did` and
+// `did-hosting-common`'s handlers: the type is upstream, and boxing it at this
+// boundary would churn every caller to save one move on a path that is about to
 // serialise the error onto the wire anyway.
 #[allow(clippy::result_large_err)]
 fn caller<P>(doc: &TrustTask<P>, parties: &ResolvedParties) -> Result<String, ErrorResponse> {
@@ -201,6 +202,7 @@ fn denied<P>(doc: &TrustTask<P>, what: &str, err: impl std::fmt::Display) -> Err
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn challenge_arm(
     state: &AppState,
     doc: TrustTask<challenge::Payload>,
@@ -229,6 +231,7 @@ async fn challenge_arm(
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }
 
+#[allow(clippy::result_large_err)]
 async fn authenticate_arm(
     state: &AppState,
     doc: TrustTask<authenticate::Payload>,
@@ -263,6 +266,7 @@ async fn authenticate_arm(
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }
 
+#[allow(clippy::result_large_err)]
 async fn refresh_arm(
     state: &AppState,
     doc: TrustTask<refresh::Payload>,
