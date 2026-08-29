@@ -17,9 +17,12 @@
 //!    and issues `{ access_token, refresh_token, access_expires_at,
 //!    refresh_expires_at }`.
 //!
-//! Token refresh is unchanged: a DIDComm message with `typ =
-//! "https://affinidi.com/webvh/1.0/authenticate-response"` carrying
-//! the refresh token, posted to `/api/auth/refresh`.
+//! Token refresh: a DIDComm message with `typ =
+//! "https://trusttasks.org/spec/auth/refresh/0.1"` carrying the refresh
+//! token, posted to `/api/auth/refresh`.
+//!
+//! It used to be typed `…/webvh/1.0/authenticate-response`, which no refresh
+//! endpoint has ever accepted — see `build_refresh_message`.
 //!
 //! ## What this module owns
 //!
@@ -63,10 +66,6 @@ pub const TASK_AUTH_AUTHENTICATE_0_1: &str = super::trust_tasks::TASK_AUTH_AUTHE
 
 /// Trust-Task URL stamped on `POST /api/auth/refresh` requests.
 pub const TASK_AUTH_REFRESH_0_1: &str = super::trust_tasks::TASK_AUTH_REFRESH_0_1;
-
-/// DIDComm v2 message `typ` for the authenticate-response /
-/// refresh envelope.
-pub const MSG_AUTH_RESPONSE: &str = "https://affinidi.com/webvh/1.0/authenticate-response";
 
 /// Borrowed signing identity: a DID + a reference to its 32-byte
 /// Ed25519 secret key. Use this when the key already lives in the

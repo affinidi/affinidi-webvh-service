@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 
-use super::{HostingSigningIdentity, MSG_AUTH_RESPONSE, TASK_AUTH_AUTHENTICATE_0_1};
+use super::{HostingSigningIdentity, TASK_AUTH_AUTHENTICATE_0_1, TASK_AUTH_REFRESH_0_1};
 
 /// SIOPv2 `id_token` lifetime, in seconds. The server enforces
 /// `iat <= now <= exp`; we stamp `exp = iat + 300` (5 minutes), which
@@ -158,11 +158,16 @@ fn ed25519_did_key(signing_key: &SigningKey) -> (String, String) {
 
 /// Construct the wire body for `POST /api/auth/refresh`.
 ///
-/// Refresh is unchanged from the legacy flow: it carries the refresh
-/// token in a DIDComm-style envelope. The control-plane refresh path
-/// was out of scope for the SIOPv2 cutover, so this still produces the
-/// `MSG_AUTH_RESPONSE`-typed signed envelope the daemon expects on the
-/// refresh endpoint.
+/// Carries the refresh token in a signed DIDComm-style envelope, typed with
+/// the canonical `auth/refresh/0.1` URI — the same value already stamped on
+/// the request's Trust-Task header.
+///
+/// It was typed `…/webvh/1.0/authenticate-response` on the grounds that it was
+/// "the envelope the daemon expects". The daemon has no refresh endpoint, and
+/// no service in this workspace has ever accepted that type on
+/// `/api/auth/refresh`: the three that implement the route match
+/// `…/webvh/1.0/authenticate/refresh` and/or `auth/refresh/0.1`. Refresh
+/// through this client could not succeed against any of them.
 pub fn build_refresh_message(
     identity: &HostingSigningIdentity<'_>,
     refresh_token: &str,
@@ -174,7 +179,7 @@ pub fn build_refresh_message(
 
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
-        MSG_AUTH_RESPONSE.to_string(),
+        TASK_AUTH_REFRESH_0_1.to_string(),
         json!({ "refresh_token": refresh_token }),
     )
     .from(identity.did.to_string())
@@ -248,6 +253,61 @@ mod tests {
         // Optional pubkey omitted → absent (matches the server's
         // `skip_serializing_if = "Option::is_none"`).
         assert!(payload.get("session_pubkey_b58btc").is_none());
+    }
+
+    /// The refresh envelope carries the canonical `auth/refresh/0.1` type.
+    ///
+    /// The assertion this file was missing. `authenticate_body_is_trust_task_envelope`
+    /// above pins the authenticate `type`; refresh had no equivalent, and it
+    /// drifted — it was typed `…/webvh/1.0/authenticate-response`, which no
+    /// `/api/auth/refresh` implementation has ever accepted, so refresh through
+    /// this client could not succeed against any service in the workspace.
+    ///
+    /// It survived because the only coverage was
+    /// `tests/wiremock_integration.rs::refresh_happy_path`, whose mock matches
+    /// on `method("POST")` and `path("/api/auth/refresh")` and never looks at
+    /// the body. A stub that does not check the contract cannot fail on a
+    /// contract mismatch, which is the whole reason to assert the wire shape
+    /// here instead.
+    #[test]
+    fn refresh_envelope_carries_the_canonical_refresh_type() {
+        let owned = test_identity();
+        let id = owned.borrow();
+        let jws =
+            build_refresh_message(&id, "refresh-token-abc", 1_700_000_000, "did:key:server-rp")
+                .expect("build must succeed");
+
+        // `pack_signed` emits JWS JSON serialization: the inner message is the
+        // base64url `payload`. Decoded, not verified — the signature is
+        // `pack_signed`'s business; the `typ` is this function's.
+        let outer: serde_json::Value = serde_json::from_str(&jws).expect("JWS is JSON");
+        let payload_b64 = outer
+            .get("payload")
+            .and_then(|p| p.as_str())
+            .expect("JWS carries a payload");
+        let decoded = base64_url_decode(payload_b64);
+        let msg: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("payload is a JSON message");
+
+        assert_eq!(
+            msg.get("type").and_then(|t| t.as_str()),
+            Some(TASK_AUTH_REFRESH_0_1),
+            "the refresh envelope must carry the type the endpoint accepts",
+        );
+        assert_eq!(
+            msg.get("body")
+                .and_then(|b| b.get("refresh_token"))
+                .and_then(|t| t.as_str()),
+            Some("refresh-token-abc"),
+        );
+    }
+
+    /// Minimal unpadded base64url decode — the JWS payload alphabet.
+    fn base64_url_decode(s: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .expect("payload is base64url")
     }
 
     /// The optional session pubkey is carried through verbatim when

@@ -752,7 +752,13 @@ pub async fn refresh(
 
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+    // The canonical refresh URI. This route accepted only
+    // `…/webvh/1.0/authenticate/refresh` — the one refresh acceptor in the
+    // workspace with no canonical arm, while `did-hosting-server` and
+    // `webvh-witness` took both. A client on the canonical form worked against
+    // those two and failed here, which is the same asymmetry that broke the
+    // wallet on the DIDComm router.
+    if msg.typ != "https://trusttasks.org/spec/auth/refresh/0.1" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ

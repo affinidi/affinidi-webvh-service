@@ -131,11 +131,7 @@ pub async fn refresh(
 
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
-    if !matches!(
-        msg.typ.as_str(),
-        "https://affinidi.com/webvh/1.0/authenticate/refresh"
-            | "https://trusttasks.org/spec/auth/refresh/0.1"
-    ) {
+    if msg.typ.as_str() != "https://trusttasks.org/spec/auth/refresh/0.1" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ
