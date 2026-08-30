@@ -115,11 +115,17 @@ interface VtaWalletProvider {
    *  on behalf of a did-self-issued vault entry; long-term key never leaves
    *  the VTA. */
   proxyLogin?(params: {
-    entryId: string;
+    entryId?: string;
     nonce?: string;
     target?: { kind: string; [k: string]: unknown };
     ttlSecondsHint?: number;
   }): Promise<ProxyLoginWireResult>;
+  /** Which persona this site knows the user as, resolving or binding one.
+   *  Mints nothing and issues no session. Present from the wallet build that
+   *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
+  walletProfile?(params: {
+    target?: { kind: string; [k: string]: unknown };
+  }): Promise<{ did: string; entryId: string; bound: boolean }>;
 }
 declare global {
   interface Window {
@@ -200,6 +206,66 @@ export function isWalletProxyAvailable(): boolean {
     typeof window.vtaWallet?.proxyLogin === "function" &&
     typeof window.vtaWallet?.vaultList === "function"
   );
+}
+
+/** True iff the wallet can resolve-or-bind a persona for this origin itself.
+ *
+ *  A capability probe, not a compatibility fold: without it the proxy path
+ *  works only for an operator who bound an entry by hand, and that difference
+ *  deserves an accurate message rather than a `TypeError`. */
+export function isWalletProfileAvailable(): boolean {
+  return (
+    isWalletProxyAvailable() &&
+    typeof window.vtaWallet?.walletProfile === "function"
+  );
+}
+
+/**
+ * Ask the wallet which persona this RP knows the operator as, binding one if
+ * this is a first sign-in.
+ *
+ * Returns a `ProxyVaultEntry` so it drops into `loginWithWalletProxy` and the
+ * visualization below is unchanged — the demo's whole point is showing the
+ * round-trip, and the round-trip did not move. Only the way the entry is found
+ * did: `listProxyCandidates()` asks the wallet to enumerate *every* entry
+ * pinned to this RP in order to find one, which discloses the operator's vault
+ * to answer a question about a single entry, and on a fresh wallet returns
+ * nothing at all.
+ *
+ * The persona DID must be known before `/auth/challenge`, which is bound to it
+ * — so this cannot be folded into `proxyLogin` as one call.
+ */
+export async function resolveProxyEntry(): Promise<{
+  entry: ProxyVaultEntry;
+  bound: boolean;
+}> {
+  if (!isWalletProfileAvailable()) {
+    throw new Error(
+      "This VTI Wallet build cannot choose an identity for a site. Update the extension, or pin a did-self-issued vault entry to this RP by hand.",
+    );
+  }
+  const rpDid = await getRpDid();
+  const profile = await window.vtaWallet!.walletProfile!({
+    target: { kind: "did", did: rpDid },
+  });
+  if (!profile.did || !profile.entryId) {
+    throw new Error("Wallet returned no identity for this site.");
+  }
+  return {
+    // Only the two fields the proxy round-trip reads are known here, and the
+    // rest are not invented: this is the wallet's answer about one entry, not
+    // a vault listing, and a fabricated label or context would be a claim
+    // nothing checked.
+    entry: {
+      id: profile.entryId,
+      label: profile.did,
+      contextId: "",
+      secretKind: "didSelfIssued",
+      principalDid: profile.did,
+      targets: [{ kind: "did", did: rpDid }],
+    },
+    bound: profile.bound,
+  };
 }
 
 // ─── M2B.4 VTA-proxied login (vault/proxy-login/0.1) ──────────────────

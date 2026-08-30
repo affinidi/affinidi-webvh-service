@@ -20,10 +20,12 @@ import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import {
   isWalletAvailable,
+  isWalletProfileAvailable,
   isWalletProxyAvailable,
   listProxyCandidates,
   loginWithWallet,
   loginWithWalletProxy,
+  resolveProxyEntry,
   type ProxyLoginViz,
   type ProxyVaultEntry,
 } from "../lib/wallet";
@@ -37,6 +39,7 @@ export default function Login() {
   const [walletError, setWalletError] = useState<string | null>(null);
   const walletAvailable = isWalletAvailable();
   const proxyAvailable = isWalletProxyAvailable();
+  const profileAvailable = isWalletProfileAvailable();
 
   // M2B.4 — VTA-proxied login.
   // The user picks a did-self-issued vault entry pinned to this RP's
@@ -148,10 +151,32 @@ export default function Login() {
     }
   };
 
-  // M2B.4 — VTA-proxied login. Two-stage flow because the user may
-  // have multiple did-self-issued entries pinned to this RP and we
-  // want them to pick which one.
+  // VTA-proxied login. The wallet owns "which identity does this RP know me
+  // as": it resolves the entry bound to this origin, or asks the operator to
+  // pick a persona on a first sign-in and remembers the answer. The flow this
+  // replaces enumerated every entry pinned to this RP just to find one, and on
+  // a fresh wallet returned nothing and dead-ended with "add an entry, then
+  // try again".
   const handleProxyLoginStart = async () => {
+    setProxyLoading(true);
+    setProxyError(null);
+    setProxyViz(null);
+    try {
+      const { entry, bound } = await resolveProxyEntry();
+      await runProxyLogin(entry, bound);
+    } catch (err: any) {
+      setProxyError(err?.message || "Could not resolve an identity for this site.");
+    } finally {
+      setProxyLoading(false);
+    }
+  };
+
+  // Escape hatch, not the default: pick from every entry pinned to this RP.
+  // Kept because an operator may hold more than one persona here, and the
+  // wallet's answer is the one bound to this origin. Behind an explicit click
+  // because reaching it costs a consent prompt that enumerates the vault to
+  // this page.
+  const handleChooseIdentity = async () => {
     setProxyLoading(true);
     setProxyError(null);
     setProxyViz(null);
@@ -159,7 +184,7 @@ export default function Login() {
       const candidates = await listProxyCandidates();
       if (candidates.length === 0) {
         setProxyError(
-          "No did-self-issued vault entry is pinned to this RP. Open the wallet, add an entry with this RP's DID as a target, then try again.",
+          "No did-self-issued vault entry is pinned to this RP. Use the main proxy sign-in instead — the wallet will ask which identity to use and remember it.",
         );
         return;
       }
@@ -176,7 +201,7 @@ export default function Login() {
     }
   };
 
-  const runProxyLogin = async (entry: ProxyVaultEntry) => {
+  const runProxyLogin = async (entry: ProxyVaultEntry, justBound = false) => {
     setProxyLoading(true);
     setProxyError(null);
     setProxyPicking(false);
@@ -203,7 +228,15 @@ export default function Login() {
         router.replace("/");
       }
     } catch (err: any) {
-      setProxyError(err?.message || "VTA-proxied login failed.");
+      const base = err?.message || "VTA-proxied login failed.";
+      // A persona bound a moment ago has never been seen by this RP, so its
+      // ACL is by far the likeliest cause. Name the DID: the operator cannot
+      // act on a bare refusal, and the DID is not on screen anywhere else.
+      setProxyError(
+        justBound
+          ? `${base}\n\nThis was the first sign-in as ${entry.principalDid}. If the RP refused it, that DID needs to be on its access list.`
+          : base,
+      );
     } finally {
       setProxyLoading(false);
     }
@@ -313,13 +346,31 @@ export default function Login() {
               <Text style={styles.dividerText}>via VTA proxy</Text>
               <View style={styles.dividerLine} />
             </View>
+            {profileAvailable && (
+              <Pressable
+                style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
+                onPress={handleProxyLoginStart}
+                disabled={proxyLoading}
+              >
+                <Text style={styles.secondaryButtonText}>
+                  {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
+                </Text>
+              </Pressable>
+            )}
+            {/* Secondary, and worded as the exception it is. The button above
+                uses whichever identity the wallet has bound to this site; this
+                is for an operator holding more than one here. On a wallet too
+                old to resolve an identity itself it is the only proxy route,
+                so it stays visible in that case. */}
             <Pressable
               style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
-              onPress={handleProxyLoginStart}
+              onPress={handleChooseIdentity}
               disabled={proxyLoading}
             >
               <Text style={styles.secondaryButtonText}>
-                {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
+                {profileAvailable
+                  ? "Login as a different identity…"
+                  : "Login via VTA-proxied SIOP (choose an entry)"}
               </Text>
             </Pressable>
             <Text style={styles.cliHint}>
