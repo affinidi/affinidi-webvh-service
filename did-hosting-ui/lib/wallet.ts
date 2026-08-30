@@ -196,27 +196,21 @@ export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
   });
 }
 
-/** True iff the page-world wallet exposes the proxy-login + vault-list
- *  APIs (M2B.3 / M2B.4 plugin). Older wallet builds advertise only the
- *  classic `login()` — the demo's wallet-proxy button is hidden when
- *  this is false. */
+/** True iff the page-world wallet exposes the whole proxy-login surface this
+ *  screen drives: `walletProfile` to resolve the identity, `proxyLogin` to mint
+ *  as it, and `vaultList` for the pick-a-different-identity path. The demo's
+ *  wallet-proxy buttons are hidden when this is false.
+ *
+ *  Presence detection, not version negotiation — the extension may simply not
+ *  be installed. There is deliberately no separate probe per method: every
+ *  build that has one has all three, so a second probe would only describe a
+ *  wallet that does not exist. */
 export function isWalletProxyAvailable(): boolean {
   return (
     isWalletAvailable() &&
+    typeof window.vtaWallet?.walletProfile === "function" &&
     typeof window.vtaWallet?.proxyLogin === "function" &&
     typeof window.vtaWallet?.vaultList === "function"
-  );
-}
-
-/** True iff the wallet can resolve-or-bind a persona for this origin itself.
- *
- *  A capability probe, not a compatibility fold: without it the proxy path
- *  works only for an operator who bound an entry by hand, and that difference
- *  deserves an accurate message rather than a `TypeError`. */
-export function isWalletProfileAvailable(): boolean {
-  return (
-    isWalletProxyAvailable() &&
-    typeof window.vtaWallet?.walletProfile === "function"
   );
 }
 
@@ -239,9 +233,9 @@ export async function resolveProxyEntry(): Promise<{
   entry: ProxyVaultEntry;
   bound: boolean;
 }> {
-  if (!isWalletProfileAvailable()) {
+  if (!isWalletProxyAvailable()) {
     throw new Error(
-      "This VTI Wallet build cannot choose an identity for a site. Update the extension, or pin a did-self-issued vault entry to this RP by hand.",
+      "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
     );
   }
   const rpDid = await getRpDid();

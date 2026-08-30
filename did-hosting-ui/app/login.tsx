@@ -20,7 +20,6 @@ import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import {
   isWalletAvailable,
-  isWalletProfileAvailable,
   isWalletProxyAvailable,
   listProxyCandidates,
   loginWithWallet,
@@ -39,7 +38,6 @@ export default function Login() {
   const [walletError, setWalletError] = useState<string | null>(null);
   const walletAvailable = isWalletAvailable();
   const proxyAvailable = isWalletProxyAvailable();
-  const profileAvailable = isWalletProfileAvailable();
 
   // M2B.4 — VTA-proxied login.
   // The user picks a did-self-issued vault entry pinned to this RP's
@@ -346,31 +344,26 @@ export default function Login() {
               <Text style={styles.dividerText}>via VTA proxy</Text>
               <View style={styles.dividerLine} />
             </View>
-            {profileAvailable && (
-              <Pressable
-                style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
-                onPress={handleProxyLoginStart}
-                disabled={proxyLoading}
-              >
-                <Text style={styles.secondaryButtonText}>
-                  {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
-                </Text>
-              </Pressable>
-            )}
+            <Pressable
+              style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
+              onPress={handleProxyLoginStart}
+              disabled={proxyLoading}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
+              </Text>
+            </Pressable>
             {/* Secondary, and worded as the exception it is. The button above
                 uses whichever identity the wallet has bound to this site; this
-                is for an operator holding more than one here. On a wallet too
-                old to resolve an identity itself it is the only proxy route,
-                so it stays visible in that case. */}
+                is for an operator holding more than one here, and it costs a
+                consent prompt that enumerates the vault to this page. */}
             <Pressable
               style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
               onPress={handleChooseIdentity}
               disabled={proxyLoading}
             >
               <Text style={styles.secondaryButtonText}>
-                {profileAvailable
-                  ? "Login as a different identity…"
-                  : "Login via VTA-proxied SIOP (choose an entry)"}
+                Login as a different identity…
               </Text>
             </Pressable>
             <Text style={styles.cliHint}>
