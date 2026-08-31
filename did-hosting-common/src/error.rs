@@ -49,3 +49,39 @@ impl fmt::Display for ServerErrorBody {
         f.write_str(&self.error)
     }
 }
+
+/// Bound and sanitize a server-supplied error string before it is surfaced to the
+/// SDK caller (CWE-209): collapse control characters/whitespace and cap length, so
+/// a verbose or input-echoing server body can't leak detail or inject control
+/// characters through the client's error.
+pub(crate) fn redact_server_message(raw: &str) -> String {
+    const MAX_LEN: usize = 200;
+    let despaced: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let normalized = despaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = normalized.chars().take(MAX_LEN).collect();
+    if capped.is_empty() {
+        "unspecified server error".to_string()
+    } else {
+        capped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_server_message_bounds_and_sanitizes() {
+        assert_eq!(redact_server_message("bad request"), "bad request");
+        // A control char (newline) becomes a space; whitespace is normalized.
+        let raw = format!("line1{}line2", char::from(10u8));
+        assert_eq!(redact_server_message(&raw), "line1 line2");
+        // Over-long input is capped.
+        assert!(redact_server_message(&"x".repeat(500)).chars().count() <= 200);
+        // Empty/blank → a fixed placeholder, never an empty message.
+        assert_eq!(redact_server_message("   "), "unspecified server error");
+    }
+}
