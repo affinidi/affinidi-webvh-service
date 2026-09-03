@@ -122,6 +122,9 @@ jsonwebtoken = { workspace = true }
 multibase = { workspace = true }
 rand = { workspace = true }
 bip39 = "2"
+# Not used directly. Present only to activate the workspace-level version pin on
+# tinyvec (SEC-3963), which reaches the graph transitively via bip39 here.
+tinyvec = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 rust-embed = { workspace = true, optional = true }

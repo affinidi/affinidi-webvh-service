@@ -27,6 +27,15 @@ rust-version = "1.95.0"
 
 [workspace.dependencies]
 
+# Transitive pin (SEC-3963). tinyvec 1.13.0 (published 2026-09-03) fails to
+# compile with `error: cannot find macro vec in this scope`, which turned the
+# upstream-drift canary red. tinyvec reaches the graph via
+# bip39 -> unicode-normalization, so hold the resolver on the 1.12 line until
+# upstream ships a working release, then drop this pin. `--locked` CI is
+# unaffected (the committed lock already uses 1.12.0); this only stops the
+# unlocked `cargo update` in upstream-drift from pulling the broken 1.13.0.
+tinyvec = ">=1.12.0, <1.13.0"
+
 # Affinidi Trust Development Kit
 # Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.20 and vti-common
 # 0.11.30 both depend on affinidi-tdk ^0.8, so all three resolve to a single
