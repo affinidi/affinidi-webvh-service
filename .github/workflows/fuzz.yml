@@ -59,6 +59,13 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # did-hosting-common's default features pull the Linux dbus secret-service
+      # keyring backend (libdbus-sys), which needs libdbus-1-dev + pkg-config at
+      # build time. Every other workflow installs these; this one didn't, so the
+      # build panicked in libdbus-sys/build.rs. Matches ci.yml / upstream-drift.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Fuzz ${{ matrix.target }} for ${{ env.MAX_TOTAL_TIME }}s
         run: |
           cargo +nightly fuzz run "${{ matrix.target }}" -- \
