@@ -91,6 +91,13 @@ def main() -> int:
     ap.add_argument("--lock", default="Cargo.lock", help="current (post-update) lockfile")
     ap.add_argument("--baseline-ref", default="HEAD", help="git ref holding the committed baseline lock")
     ap.add_argument("--max-age-hours", type=float, default=48.0)
+    ap.add_argument(
+        "--mode", choices=["abort", "warn"], default="abort",
+        help="abort: fail the build on a too-new/unverifiable dep (fails closed). "
+             "warn: annotate and exit 0 (use where another control, e.g. egress "
+             "restriction, is the enforcing layer and a hard block would only "
+             "turn a drift canary permanently red).",
+    )
     args = ap.parse_args()
 
     try:
@@ -132,12 +139,19 @@ def main() -> int:
         time.sleep(0.3)  # be polite to crates.io
 
     if too_new or unverifiable:
-        print("::error::dep-age-gate tripped; aborting before build.")
+        level = "error" if args.mode == "abort" else "warning"
+        if args.mode == "abort":
+            print("::error::dep-age-gate tripped; aborting before build.")
+        else:
+            print("::warning::dep-age-gate: brand-new dependencies in this resolve "
+                  "(non-blocking). Runner egress is restricted and ephemeral; review "
+                  "if a name here is unexpected.")
         for item in too_new:
-            print(f"::error::dependency younger than {args.max_age_hours}h: {item}")
+            print(f"::{level}::dependency younger than {args.max_age_hours:.0f}h: {item}")
         for item in unverifiable:
-            print(f"::error::could not verify age (failing closed): {item}")
-        return 1
+            note = "failing closed" if args.mode == "abort" else "age unverifiable"
+            print(f"::{level}::{note}: {item}")
+        return 1 if args.mode == "abort" else 0
 
     print("dep-age-gate: all drifted dependencies are older than the threshold.")
     return 0

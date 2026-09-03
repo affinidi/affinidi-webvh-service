@@ -77,13 +77,18 @@ jobs:
       - name: Show what moved
         run: git --no-pager diff --stat Cargo.lock
 
-      # Version-age gate (SEC-3897). Abort before building if `cargo update`
-      # pulled any registry version younger than 48h. Compromised crates are
-      # almost always yanked within a day or two, so a short quarantine dodges
-      # the exposure window this unlocked job would otherwise walk straight into.
-      # Checks only the versions that moved vs the committed lock; fails closed.
-      - name: Age-gate drifted dependencies (<48h)
-        run: python3 .github/scripts/dep-age-gate.py --lock Cargo.lock --baseline-ref HEAD --max-age-hours 48
+      # Version-age heads-up (SEC-3897), non-blocking. Flags any registry
+      # version `cargo update` pulled that is younger than 48h, the window in
+      # which a compromised crate is usually still live before being yanked.
+      # This runs in WARN mode on purpose: a hard abort would turn this drift
+      # canary permanently red, since newest-resolve pulls fresh crates most
+      # days. The enforcing supply-chain control on this unlocked-then-build job
+      # is the harden-runner egress block above (a malicious build script cannot
+      # exfiltrate); the hard-abort quarantine lives on the build-and-trust jobs,
+      # which are instead pinned to a committed lock (SEC-3899). Scoped to the
+      # versions that moved vs the committed lock.
+      - name: Age-gate drifted dependencies (<48h, non-blocking)
+        run: python3 .github/scripts/dep-age-gate.py --lock Cargo.lock --baseline-ref HEAD --max-age-hours 48 --mode warn
 
       # No `RUSTFLAGS: -D warnings` here, unlike ci.yml. A new upstream
       # deprecation should not page anyone; only a genuine compile failure —
