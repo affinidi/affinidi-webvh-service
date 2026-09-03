@@ -22,6 +22,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # cargo-fuzz defaults its build target to x86_64-unknown-linux-musl on Linux,
+  # but the toolchain step only installs the host (gnu) std, so the musl build
+  # fails with `error[E0463]: can't find crate for core` before any fuzzing runs.
+  # Pin the target to the pre-installed gnu host (matches tdk-rs fuzz.yaml). Do
+  # not remove without also adding `targets: x86_64-unknown-linux-musl` above.
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
   # Per-target wall-clock budget. The cron run uses the default; a manual
   # dispatch can override it.
   MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
