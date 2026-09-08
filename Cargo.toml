@@ -28,14 +28,17 @@ rust-version = "1.95.0"
 [workspace.dependencies]
 
 # Affinidi Trust Development Kit
-# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.20 and vti-common
-# 0.11.30 both depend on affinidi-tdk ^0.8, so all three resolve to a single
-# affinidi-tdk copy. Drop back to 0.7 only if vta-sdk/vti-common ever re-pin.
-affinidi-tdk = "0.10"
+# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.34 and vti-common
+# 0.18.0 both depend on affinidi-tdk ^0.12, so all three resolve to a single
+# affinidi-tdk copy. This number is not chosen independently — read it off
+# whichever vta-sdk/vti-common pair the block below pins, and move it in the
+# same commit. A plain `cargo update` that floats vti-common on its own is how
+# a second affinidi-tdk copy gets added; see the vta-sdk note.
+affinidi-tdk = "0.12"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
 # to the `TspHandler`. Without it the handler is stored but never invoked
 # (the crate compiles TSP support out).
-affinidi-messaging-didcomm-service = { version = "0.5", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.6", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15"
 affinidi-secrets-resolver = "0.5"
@@ -88,20 +91,41 @@ ed25519-dalek = "3"
 multibase = "0.9"
 sha2 = "0.11"
 
-# JWT — deliberately held at 10, not the latest 11. `trust-tasks-https`'s `jwt`
-# feature and `vti-common` both pin ^10, so moving to 11 does not replace the
-# old copy, it adds a second one *and* splits us from the JWT surface we hand
-# tokens to. 11 also still depends on ed25519-dalek ^2, so it buys no
-# consolidation there either. Revisit when trust-tasks-https moves.
+# JWT — still deliberately held at 10, but the reason has changed and the old
+# one no longer applies. It used to be that `trust-tasks-https`'s `jwt` feature
+# and `vti-common` *both* pinned ^10, so 10 was the single copy. As of
+# vti-common 0.18 that is gone: vti-common moved to ^11 while trust-tasks-https
+# 0.18.5 stayed on ^10, so the graph carries both copies no matter what we
+# declare, and our declaration only picks which one we compile against.
+#
+# We pick 10, for two reasons that survive the split:
+#   * We cross neither crate's JWT surface. `server::auth::jwt` mints and
+#     verifies *our own* session tokens end to end, handing the library raw/DER
+#     key bytes (`JwtKeys::from_ed25519_bytes`) and never passing a
+#     `jsonwebtoken` type to or from vti-common or trust-tasks-https. So this
+#     is a free choice, not a compatibility one — do not "fix" it by chasing
+#     whichever neighbour moved most recently.
+#   * 11 buys no consolidation anywhere else: it is still on ed25519-dalek
+#     ^2.1.1 and base64 ^0.22, exactly like 10.
+# Revisit if trust-tasks-https moves to 11 — at that point 11 becomes the
+# single copy again and this hold should be dropped.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Axum extras (typed headers for Bearer auth)
 axum-extra = { version = "0.12", features = ["typed-header"] }
 
-# Base64 encoding — held at 0.22, not the latest 0.23. Every Affinidi crate in
-# the graph is on 0.22, so 0.23 would add a third copy (the AWS SDK already
-# drags in 0.21) to gain nothing: base64 is pure encoding and crosses no API.
-base64 = "0.22"
+# Base64 encoding. This used to be held at 0.22 on the reasoning that "every
+# Affinidi crate in the graph is on 0.22" — that premise has since inverted:
+# vta-sdk 0.34 and vti-common 0.18 both moved to ^0.23, and the whole
+# affinidi-crypto / -data-integrity stack behind them with it. Holding at 0.22
+# would have left *us* as the odd copy out.
+#
+# Moving does not reduce the copy count — three remain, and always did: 0.21
+# under webauthn-rs, 0.22 under `headers`/axum-extra and jsonwebtoken, 0.23
+# under the Affinidi stack and us. It only decides which one we compile
+# against, and base64 is pure encoding that crosses no API, so the choice is
+# free. Take the copy the crates we exchange encoded data with are on.
+base64 = "0.23"
 
 # WebAuthn / Passkey
 webauthn-rs = { version = "0.5", features = [
@@ -147,14 +171,14 @@ didwebvh-rs = "0.6"
 # it keeps `affinidi-keri` (and its LMDB store) out of the dep graph.
 affinidi-did-webs = "0.7"
 
-# VTA SDK — 0.32 on crates.io, bumped in lockstep with vti-common 0.16
-# (which re-pins onto vta-sdk ^0.32). Carries the canonical SIOPv2 /
+# VTA SDK — 0.34 on crates.io, bumped in lockstep with vti-common 0.18
+# (which re-pins onto vta-sdk ^0.34). Carries the canonical SIOPv2 /
 # RFC 6749 wire types (`protocols::auth::{Session, TokenBundle,
 # AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`) that the
 # cross-repo auth-architecture work introduced. vta-sdk and vti-common
 # share these types and MUST move together — a mismatched pair resolves
 # to two vta-sdk copies and fails to compile (E0308 on AuthenticateResponse).
-# The four `vti-common = "0.16"` declarations in did-hosting-{common,
+# The four `vti-common = "0.18"` declarations in did-hosting-{common,
 # control,server} and webvh-witness are the other half of that pin; move
 # all five together. Verify afterwards with
 # `cargo tree -d -e normal,build`, which must list none of `vta-sdk`,
@@ -195,7 +219,11 @@ affinidi-did-webs = "0.7"
 # test-mediator was still pinned `^0.2` and dragged affinidi-tdk 0.8 /
 # trust-tasks-rs 0.11 back in behind it. Bumping the dev-dep to
 # `affinidi-messaging-test-mediator = "0.4"` (mediator 0.20, trust-tasks-rs
-# 0.17) closed it again.
+# 0.17) closed it again. The trust-tasks 0.17 → 0.18 move repeated the pattern
+# a third time and was closed the same way: test-mediator `0.4` → `0.5`
+# (mediator 0.22, affinidi-messaging-sdk 0.22, affinidi-tdk 0.12). Three for
+# three — assume the dev-dep needs bumping every time this family moves, and
+# check rather than hope.
 #
 # So: this dev-dep is not independent of the trust-tasks family — it carries a
 # copy, and it has to move in the same commit. `cargo tree -d -e
@@ -216,7 +244,7 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.32", features = [
+vta-sdk = { version = "0.34", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -228,7 +256,7 @@ vta-sdk = { version = "0.32", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). On crates.io at 0.9.x. The whole family
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.18.x. The whole family
 # moves as one workspace event — `trust-tasks-rs`'s core types cross the
 # public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
 # mixing majors does not type-check. Bump all five together, and in
@@ -243,6 +271,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # but `cargo tree -d -e normal,build` is what tells you, and it listed
 # trust-tasks-rs twice until the last of them moved. Run it; do not assume the
 # five manifest lines were the whole job.
+#
+# What 0.17 → 0.18 changed for us: nothing in this workspace, and the reason is
+# worth recording because it is the first bump of this family that cost no
+# source change at all. 0.18.0's sole breaking change is in the `persona`
+# family — `persona/profile/get/1.0` stopped typing its `resolved` entries as
+# the pool-record `Attribute` and gained its own `ResolvedClaim`, so an inline
+# profile entry is representable. We consume no `persona/*` payload, so the
+# break does not reach us. Everything else on the 0.17.x → 0.18.5 path is
+# additive (`auth/step-up/approve-response` recorded status, the
+# `persona/claim-types/list` registry, the `rooms` epoch key chain).
+#
+# The compiler-invisible check still had to be run by hand and still passed:
+# the framework emits `trust-task-error/0.5`, unchanged since 0.9, and our
+# hand-written copy in `server::trust_tasks::framework_error_type_uri()` still
+# agrees. Do not let a clean `cargo check` stand in for that grep.
+#
+# The dev-graph half of the move was NOT free — `affinidi-messaging-test-mediator`
+# needed `0.4` → `0.5`. See the vta-sdk block above.
 #
 # What 0.6 → 0.9 changed for us:
 #   * 0.7.0 — `StandardCode` became `#[non_exhaustive]`. Nothing here matches on
@@ -309,16 +355,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.17", default-features = false }
-trust-tasks-https = { version = "0.17", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.17", default-features = false }
-trust-tasks-proof = { version = "0.17", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.18", default-features = false }
+trust-tasks-https = { version = "0.18", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.18", default-features = false }
+trust-tasks-proof = { version = "0.18", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.17", default-features = false }
+trust-tasks-tsp = { version = "0.18", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
