@@ -50,6 +50,13 @@ jobs:
       # the ones this job legitimately needs, so a compromised dependency cannot
       # exfiltrate. Supply-chain risk from *new* versions is separately closed by
       # the committed fuzz/Cargo.lock (SEC-3899); this is defense in depth.
+      #
+      # The last two endpoints are the Actions cache/artifact backend, which
+      # harden-runner does not allow by default: rust-cache and upload-artifact
+      # negotiate through results-receiver and then transfer via Azure blob
+      # storage. Without them a crash reproducer cannot be uploaded — the one
+      # artifact this job exists to produce — and the cache degrades to a silent
+      # full rebuild every night, since cache failures are only warnings.
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
@@ -67,6 +74,8 @@ jobs:
             security.ubuntu.com:80
             esm.ubuntu.com:443
             motd.ubuntu.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
