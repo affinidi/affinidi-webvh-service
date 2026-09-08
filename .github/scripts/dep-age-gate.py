@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Abort a build when a freshly-drifted dependency is too new to trust (SEC-3897).
+
+The upstream-drift job resolves dependencies unlocked (`cargo update`) and builds
+immediately, so a malicious version published minutes ago would be pulled and its
+build scripts run before anyone could react. Compromised crates are almost always
+yanked within a day or two of discovery, so this gate quarantines any registry
+dependency whose resolved version is younger than a threshold (default 48h).
+
+Scope is limited to what actually moved: the resolved versions in the current
+Cargo.lock that are not in the committed baseline (`git show <ref>:Cargo.lock`).
+Path and git dependencies are skipped (no crates.io release to date). If a
+version's age cannot be established, the gate fails closed on purpose: an
+unverifiable dependency at exactly this moment is the case to be paranoid about.
+
+Exit codes: 0 = all clear, 1 = gate tripped (too-new or unverifiable), 2 = the
+gate could not run (usage error, or an unreadable/unparseable current or
+baseline lock). A 2 is never reported as a pass: the whole point is that a gate
+which cannot verify says so rather than waving the build through.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+USER_AGENT = "affinidi-webvh-service dep-age-gate (security@affinidi.com)"
+API = "https://crates.io/api/v1/crates/{name}/{version}"
+
+
+def parse_registry_pairs(text: str) -> set[tuple[str, str]]:
+    """Extract {(name, version)} for crates.io registry packages from a Cargo.lock.
+
+    Cargo.lock is TOML with one [[package]] table per entry holding name, version,
+    and (for anything not a local path member) a source. Only registry packages
+    carry the crates.io source; path/git deps are dropped.
+
+    Line-matched rather than parsed with `tomllib` so the script still runs on
+    the stock python3 shipped with macOS (3.9), which contributors use to
+    reproduce a drift failure by hand. The cost is that an unrecognised lock
+    layout yields an empty set rather than an error, so callers MUST treat an
+    empty result as a failure to parse — see `main`.
+    """
+    pairs: set[tuple[str, str]] = set()
+    name = version = source = None
+    for line in text.splitlines():
+        if line.strip() == "[[package]]":
+            name = version = source = None
+            continue
+        m = re.match(r'name = "(.+)"', line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r'version = "(.+)"', line)
+        if m:
+            version = m.group(1)
+            continue
+        m = re.match(r'source = "(.+)"', line)
+        if m:
+            source = m.group(1)
+        # A package block ends at a blank line; commit it if it was a registry dep.
+        if line.strip() == "" and name and version:
+            if source == REGISTRY:
+                pairs.add((name, version))
+            name = version = source = None
+    # Flush a trailing block with no closing blank line.
+    if name and version and source == REGISTRY:
+        pairs.add((name, version))
+    return pairs
+
+
+def released_at(name: str, version: str, retries: int = 3) -> datetime:
+    """Return the crates.io publish time for name@version, or raise on failure."""
+    url = API.format(name=name, version=version)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.load(resp)
+            created = data["version"]["created_at"]
+            return datetime.fromisoformat(created.replace("Z", "+00:00"))
+        # `urllib.error.URLError` (an OSError) only covers failures raised while
+        # sending the request. A stall in `getresponse()` surfaces as a bare
+        # `TimeoutError`, and the body read below is outside the handler
+        # entirely, so a dropped connection arrives as `ConnectionResetError` or
+        # `http.client.IncompleteRead`. Catching OSError + HTTPException covers
+        # all of them; ValueError covers `JSONDecodeError` and `fromisoformat`.
+        except (OSError, http.client.HTTPException, KeyError, ValueError) as exc:
+            last = exc
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"could not verify release date for {name} {version}: {last}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--lock", default="Cargo.lock", help="current (post-update) lockfile")
+    ap.add_argument("--baseline-ref", default="HEAD", help="git ref holding the committed baseline lock")
+    ap.add_argument("--max-age-hours", type=float, default=48.0)
+    ap.add_argument(
+        "--mode", choices=["abort", "warn"], default="abort",
+        help="abort: fail the build on a too-new/unverifiable dep (fails closed). "
+             "warn: annotate and exit 0 (use where another control, e.g. egress "
+             "restriction, is the enforcing layer and a hard block would only "
+             "turn a drift canary permanently red).",
+    )
+    args = ap.parse_args()
+
+    try:
+        with open(args.lock, encoding="utf-8") as fh:
+            current = parse_registry_pairs(fh.read())
+    except OSError as exc:
+        print(f"::error::cannot read {args.lock}: {exc}")
+        return 2
+
+    # A lock with no registry packages at all means the parse found nothing to
+    # gate, not that nothing moved. Without this the gate fails OPEN on any
+    # future Cargo.lock format change: `moved` would be empty, the script would
+    # print "nothing to check" and exit 0, and no dependency would ever be
+    # age-checked again. Fail loudly instead.
+    if not current:
+        print(f"::error::no registry packages parsed from {args.lock}; refusing "
+              "to report a clean gate on an empty parse (lock format change?).")
+        return 2
+
+    # A failed baseline read must not be mistaken for an empty baseline: that
+    # would mark every package in the lock as "moved" and fire hundreds of
+    # crates.io requests, tripping rate limits and, in abort mode, failing the
+    # build for a reason unrelated to dependency age.
+    proc = subprocess.run(
+        ["git", "show", f"{args.baseline_ref}:Cargo.lock"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(f"::error::cannot read baseline {args.baseline_ref}:Cargo.lock: "
+              f"{proc.stderr.strip()}")
+        return 2
+    baseline = parse_registry_pairs(proc.stdout)
+    if not baseline:
+        print(f"::error::no registry packages parsed from baseline "
+              f"{args.baseline_ref}:Cargo.lock; every dependency would look "
+              "drifted. Refusing to run.")
+        return 2
+
+    moved = sorted(current - baseline)
+    if not moved:
+        print("dep-age-gate: no registry dependency versions moved; nothing to check.")
+        return 0
+
+    print(f"dep-age-gate: {len(moved)} drifted registry version(s) to age-check "
+          f"(threshold {args.max_age_hours}h).")
+    now = datetime.now(timezone.utc)
+    too_new: list[str] = []
+    unverifiable: list[str] = []
+    for name, version in moved:
+        try:
+            published = released_at(name, version)
+        except RuntimeError as exc:
+            print(f"::warning::{exc}")
+            unverifiable.append(f"{name} {version}")
+            time.sleep(0.3)
+            continue
+        age_h = (now - published).total_seconds() / 3600.0
+        flag = "  <-- TOO NEW" if age_h < args.max_age_hours else ""
+        print(f"  {name} {version}: {age_h:.1f}h old{flag}")
+        if age_h < args.max_age_hours:
+            too_new.append(f"{name} {version} ({age_h:.1f}h)")
+        time.sleep(0.3)  # be polite to crates.io
+
+    if too_new or unverifiable:
+        level = "error" if args.mode == "abort" else "warning"
+        if args.mode == "abort":
+            print("::error::dep-age-gate tripped; aborting before build.")
+        else:
+            print("::warning::dep-age-gate: brand-new dependencies in this resolve "
+                  "(non-blocking). Runner egress is restricted and ephemeral; review "
+                  "if a name here is unexpected.")
+        for item in too_new:
+            print(f"::{level}::dependency younger than {args.max_age_hours:.0f}h: {item}")
+        for item in unverifiable:
+            note = "failing closed" if args.mode == "abort" else "age unverifiable"
+            print(f"::{level}::{note}: {item}")
+        return 1 if args.mode == "abort" else 0
+
+    print("dep-age-gate: all drifted dependencies are older than the threshold.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

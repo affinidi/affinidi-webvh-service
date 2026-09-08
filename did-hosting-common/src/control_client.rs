@@ -203,7 +203,7 @@ impl ControlClient {
     async fn extract_server_error(&self, resp: reqwest::Response) -> WebVHError {
         let status = resp.status().as_u16();
         let message = match resp.json::<ServerErrorBody>().await {
-            Ok(body) => body.to_string(),
+            Ok(body) => crate::error::redact_server_message(&body.to_string()),
             Err(_) => format!("HTTP {status}"),
         };
         WebVHError::Server { status, message }

@@ -27,6 +27,12 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+# Explicit least privilege (SEC-3897): this job only reads the repo. Without a
+# permissions block it would inherit the repository default, which can be far
+# broader than a scheduled resolve-and-build ever needs.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -35,8 +41,31 @@ jobs:
     name: cargo check (unlocked resolve)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Restrict runner egress (SEC-3897). This job resolves dependencies
+      # UNLOCKED and then builds, running third-party build scripts against the
+      # freshest possible graph. Block every network destination except the ones
+      # the resolve/build and the age-gate legitimately need, so a compromised
+      # upstream cannot exfiltrate from the runner.
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            codeload.github.com:443
+            release-assets.githubusercontent.com:443
+            crates.io:443
+            static.crates.io:443
+            index.crates.io:443
+            static.rust-lang.org:443
+            azure.archive.ubuntu.com:80
+            security.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Install libdbus-1-dev
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
@@ -47,6 +76,19 @@ jobs:
 
       - name: Show what moved
         run: git --no-pager diff --stat Cargo.lock
+
+      # Version-age heads-up (SEC-3897), non-blocking. Flags any registry
+      # version `cargo update` pulled that is younger than 48h, the window in
+      # which a compromised crate is usually still live before being yanked.
+      # This runs in WARN mode on purpose: a hard abort would turn this drift
+      # canary permanently red, since newest-resolve pulls fresh crates most
+      # days. The enforcing supply-chain control on this unlocked-then-build job
+      # is the harden-runner egress block above (a malicious build script cannot
+      # exfiltrate); the hard-abort quarantine lives on the build-and-trust jobs,
+      # which are instead pinned to a committed lock (SEC-3899). Scoped to the
+      # versions that moved vs the committed lock.
+      - name: Age-gate drifted dependencies (<48h, non-blocking)
+        run: python3 .github/scripts/dep-age-gate.py --lock Cargo.lock --baseline-ref HEAD --max-age-hours 48 --mode warn
 
       # No `RUSTFLAGS: -D warnings` here, unlike ci.yml. A new upstream
       # deprecation should not page anyone; only a genuine compile failure —

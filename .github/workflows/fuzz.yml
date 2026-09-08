@@ -22,6 +22,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # cargo-fuzz defaults its build target to x86_64-unknown-linux-musl on Linux,
+  # but the toolchain step only installs the host (gnu) std, so the musl build
+  # fails with `error[E0463]: can't find crate for core` before any fuzzing runs.
+  # Pin the target to the pre-installed gnu host (matches tdk-rs fuzz.yaml). Do
+  # not remove without also adding `targets: x86_64-unknown-linux-musl` above.
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
   # Per-target wall-clock budget. The cron run uses the default; a manual
   # dispatch can override it.
   MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
@@ -39,21 +45,73 @@ jobs:
           - verify_did_log_proofs_structured
           - validate_did_id_matches_request
     steps:
-      - uses: actions/checkout@v6
+      # Restrict runner egress (SEC-3897). A fuzz build compiles and runs
+      # third-party crate build scripts; block any network destination except
+      # the ones this job legitimately needs, so a compromised dependency cannot
+      # exfiltrate. Supply-chain risk from *new* versions is separately closed by
+      # the committed fuzz/Cargo.lock (SEC-3899); this is defense in depth.
+      #
+      # The last two endpoints are the Actions cache/artifact backend, which
+      # harden-runner does not allow by default: rust-cache and upload-artifact
+      # negotiate through results-receiver and then transfer via Azure blob
+      # storage. Without them a crash reproducer cannot be uploaded — the one
+      # artifact this job exists to produce — and the cache degrades to a silent
+      # full rebuild every night, since cache failures are only warnings.
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            codeload.github.com:443
+            release-assets.githubusercontent.com:443
+            crates.io:443
+            static.crates.io:443
+            index.crates.io:443
+            static.rust-lang.org:443
+            azure.archive.ubuntu.com:80
+            security.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
 
       # Cache the detached fuzz crate's build artifacts keyed on its own lock.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
 
+      # Pin cargo-fuzz (SEC-3897). Left unpinned, this pulls the newest
+      # cargo-fuzz release on every run, which is both non-reproducible and a
+      # supply-chain intake. Bump the version deliberately in a reviewed PR.
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
+
+      # did-hosting-common's default features pull the Linux dbus secret-service
+      # keyring backend (libdbus-sys), which needs libdbus-1-dev + pkg-config at
+      # build time. Every other workflow installs these; this one didn't, so the
+      # build panicked in libdbus-sys/build.rs. Matches ci.yml / upstream-drift.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      # Enforce the committed lockfile (SEC-3899). cargo-fuzz has no --locked
+      # passthrough, so gate on `cargo fetch --locked`: it fails if fuzz/Cargo.lock
+      # is missing or out of date, which is exactly when an unreviewed dependency
+      # version would otherwise be pulled. The build below then resolves offline
+      # against the vetted graph.
+      - name: Verify fuzz lockfile is current (pin gate)
+        run: cargo +nightly fetch --locked --manifest-path fuzz/Cargo.toml
 
       - name: Fuzz ${{ matrix.target }} for ${{ env.MAX_TOTAL_TIME }}s
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
           cargo +nightly fuzz run "${{ matrix.target }}" -- \
             -max_total_time="${{ env.MAX_TOTAL_TIME }}" \
@@ -64,7 +122,7 @@ jobs:
       # `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/

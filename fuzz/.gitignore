@@ -1,7 +1,11 @@
 /target
 /artifacts
 /coverage
-/Cargo.lock
+
+# Cargo.lock IS committed here on purpose (SEC-3899): pinning the fuzz crate's
+# dependency graph keeps nightly builds reproducible and blocks a malicious
+# newly-published version from being pulled unreviewed. The build enforces it
+# with `cargo fetch --locked` in fuzz.yml. Update via a PR-reviewed bump.
 
 # The fuzzer writes hash-named corpus entries (no extension) into corpus/<target>/.
 # Commit only the curated seed fixtures — ignore everything else under corpus/.
