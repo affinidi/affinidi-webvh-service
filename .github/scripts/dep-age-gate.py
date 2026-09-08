@@ -13,19 +13,21 @@ Path and git dependencies are skipped (no crates.io release to date). If a
 version's age cannot be established, the gate fails closed on purpose: an
 unverifiable dependency at exactly this moment is the case to be paranoid about.
 
-Exit codes: 0 = all clear, 1 = gate tripped (too-new or unverifiable), 2 = usage
-error.
+Exit codes: 0 = all clear, 1 = gate tripped (too-new or unverifiable), 2 = the
+gate could not run (usage error, or an unreadable/unparseable current or
+baseline lock). A 2 is never reported as a pass: the whole point is that a gate
+which cannot verify says so rather than waving the build through.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -40,6 +42,12 @@ def parse_registry_pairs(text: str) -> set[tuple[str, str]]:
     Cargo.lock is TOML with one [[package]] table per entry holding name, version,
     and (for anything not a local path member) a source. Only registry packages
     carry the crates.io source; path/git deps are dropped.
+
+    Line-matched rather than parsed with `tomllib` so the script still runs on
+    the stock python3 shipped with macOS (3.9), which contributors use to
+    reproduce a drift failure by hand. The cost is that an unrecognised lock
+    layout yields an empty set rather than an error, so callers MUST treat an
+    empty result as a failure to parse — see `main`.
     """
     pairs: set[tuple[str, str]] = set()
     name = version = source = None
@@ -80,7 +88,13 @@ def released_at(name: str, version: str, retries: int = 3) -> datetime:
                 data = json.load(resp)
             created = data["version"]["created_at"]
             return datetime.fromisoformat(created.replace("Z", "+00:00"))
-        except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        # `urllib.error.URLError` (an OSError) only covers failures raised while
+        # sending the request. A stall in `getresponse()` surfaces as a bare
+        # `TimeoutError`, and the body read below is outside the handler
+        # entirely, so a dropped connection arrives as `ConnectionResetError` or
+        # `http.client.IncompleteRead`. Catching OSError + HTTPException covers
+        # all of them; ValueError covers `JSONDecodeError` and `fromisoformat`.
+        except (OSError, http.client.HTTPException, KeyError, ValueError) as exc:
             last = exc
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"could not verify release date for {name} {version}: {last}")
@@ -107,11 +121,34 @@ def main() -> int:
         print(f"::error::cannot read {args.lock}: {exc}")
         return 2
 
-    baseline_text = subprocess.run(
+    # A lock with no registry packages at all means the parse found nothing to
+    # gate, not that nothing moved. Without this the gate fails OPEN on any
+    # future Cargo.lock format change: `moved` would be empty, the script would
+    # print "nothing to check" and exit 0, and no dependency would ever be
+    # age-checked again. Fail loudly instead.
+    if not current:
+        print(f"::error::no registry packages parsed from {args.lock}; refusing "
+              "to report a clean gate on an empty parse (lock format change?).")
+        return 2
+
+    # A failed baseline read must not be mistaken for an empty baseline: that
+    # would mark every package in the lock as "moved" and fire hundreds of
+    # crates.io requests, tripping rate limits and, in abort mode, failing the
+    # build for a reason unrelated to dependency age.
+    proc = subprocess.run(
         ["git", "show", f"{args.baseline_ref}:Cargo.lock"],
         capture_output=True, text=True,
-    ).stdout
-    baseline = parse_registry_pairs(baseline_text)
+    )
+    if proc.returncode != 0:
+        print(f"::error::cannot read baseline {args.baseline_ref}:Cargo.lock: "
+              f"{proc.stderr.strip()}")
+        return 2
+    baseline = parse_registry_pairs(proc.stdout)
+    if not baseline:
+        print(f"::error::no registry packages parsed from baseline "
+              f"{args.baseline_ref}:Cargo.lock; every dependency would look "
+              "drifted. Refusing to run.")
+        return 2
 
     moved = sorted(current - baseline)
     if not moved:
