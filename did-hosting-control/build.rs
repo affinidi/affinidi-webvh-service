@@ -6,6 +6,7 @@ fn main() {
         cfg!(feature = "store-fjall"),
         cfg!(feature = "store-redis"),
         cfg!(feature = "store-dynamodb"),
+        cfg!(feature = "store-dynamodb-single"),
         cfg!(feature = "store-firestore"),
         cfg!(feature = "store-cosmosdb"),
     ];
@@ -13,7 +14,7 @@ fn main() {
 
     if enabled_count == 0 {
         println!(
-            "cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb"
+            "cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-dynamodb-single, store-firestore, store-cosmosdb"
         );
     }
     if enabled_count > 1 {
