@@ -331,6 +331,14 @@ Also worth knowing before you go looking for them:
   crates that happen to share that number (`tower-http`, `tokio-util`) — update
   `did-hosting-ui/package.json`, and add a grouped `CHANGELOG.md` entry.
 
+  **Then regenerate `fuzz/Cargo.lock`** (`cargo generate-lockfile
+  --manifest-path fuzz/Cargo.toml`). The fuzz crate is a detached workspace with
+  its own committed lock that records `did-hosting-common`'s version, so every
+  hand-done bump — and every dependency-requirement bump — invalidates it. The
+  nightly Fuzz job gates on `cargo fetch --locked`, and no PR check exercises
+  that path, so a missed regeneration turns the fuzz job red the next morning
+  with no fuzzing having run.
+
 - **Publishing needs `cargo publish --allow-dirty`.** The control plane embeds
   the management UI from `did-hosting-control/ui-dist/` — a gitignored build
   artifact (`npm run build:web` exports there) that an explicit `include` list
