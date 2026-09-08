@@ -155,7 +155,7 @@ impl CosmosDbKeyspace {
     async fn container(&self) -> Result<azure_data_cosmos::clients::ContainerClient, AppError> {
         self.client
             .database_client(&self.database)
-            .container_client(&self.container_name)
+            .container_client(&self.container_name, None)
             .await
             .map_err(|e| AppError::Store(format!("cosmosdb container client: {e}")))
     }
@@ -346,7 +346,7 @@ impl BatchOps for CosmosDbBatch {
                 let container_client = self
                     .client
                     .database_client(&self.database)
-                    .container_client(container_name)
+                    .container_client(container_name, None)
                     .await
                     .map_err(|e| {
                         AppError::Store(format!("cosmosdb batch container client: {e}"))
