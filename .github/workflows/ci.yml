@@ -444,7 +444,17 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           # Matches the `engines.node` floor in did-hosting-ui/package.json.
-          node-version: "20"
+          # 24 is the active LTS (maintained to April 2028) and is the floor
+          # `vitest` 5 requires (`^22.12 || ^24 || >=26` — note it excludes the
+          # odd/non-LTS 25). Node 20 went end-of-life in April 2026; moving off
+          # it is what let the test runner move. Bump this, the `engines.node`
+          # floor and the README prerequisite together.
+          #
+          # Unquoted-major on purpose: this resolves to the LATEST 24.x, and it
+          # has to. React Native 0.86 declares `^24.3.0`, so 24.0–24.2 are
+          # genuinely too old for the tree even though they are "Node 24".
+          # Never pin this to an exact 24.0.x.
+          node-version: "24"
           cache: npm
           cache-dependency-path: did-hosting-ui/package-lock.json
       # `npm ci`, not `npm install` — fails loudly if package-lock.json has

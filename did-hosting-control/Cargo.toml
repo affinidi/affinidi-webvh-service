@@ -90,7 +90,7 @@ did-hosting-common = { version = "0.8", path = "../did-hosting-common", features
 # `AuthenticateInput` directly when dispatching to canonical
 # /auth/* handlers. Pinned to the same minor as the other three
 # declarations (did-hosting-common/-server, webvh-witness) and to
-# the workspace `vta-sdk = "0.24"` — see the lockstep note in
+# the workspace `vta-sdk = "0.35"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
 vti-common = { version = "0.18", default-features = false }
 async-trait = "0.1"
@@ -148,7 +148,7 @@ google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.53", optional = true }
+firestore = { version = "0.54", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "0.38", features = [
   "key_auth",
@@ -173,7 +173,7 @@ base64 = { workspace = true }
 # with the trust-tasks family in the root manifest — `^0.2` against a shipped
 # graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
 # dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
-affinidi-messaging-test-mediator = "0.5"
+affinidi-messaging-test-mediator = "0.6"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.
