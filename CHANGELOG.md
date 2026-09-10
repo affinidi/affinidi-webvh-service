@@ -58,6 +58,41 @@
 
 ### Changed — dependencies
 
+- **Trust Tasks 0.18 → 0.19, `affinidi-tdk` 0.12 → 0.13, `vta-sdk` 0.34 → 0.35,
+  `vti-common` 0.18.0 → 0.18.2, `affinidi-messaging-didcomm-service` 0.6 → 0.7,
+  `affinidi-messaging-sdk` 0.22 → 0.23.** No source change in this workspace:
+  0.19.0's breaking changes are confined to the `rooms/*` family
+  (`rooms/owner/issue-authority` 0.2 makes `validUntil` REQUIRED;
+  `rooms/keys/present` 0.2 drops `audience`/`nonce`), and we consume no
+  `rooms/*` payload.
+
+  The compiler-invisible check was run rather than assumed: the framework still
+  emits `trust-task-error/0.5` at 0.19.4, and the hand-written copy in
+  `server::trust_tasks::framework_error_type_uri()` still agrees.
+
+  The dev graph needed its own bump again — `affinidi-messaging-test-mediator`
+  0.5 → 0.6 (mediator 0.23) — making it four consecutive moves of this family
+  where the dev-dep had to move in the same commit. `cargo tree -d -e
+  normal,build` and `-e normal,build,dev` both list none of `vta-sdk`,
+  `vti-common`, `affinidi-tdk` or `trust-tasks-rs`.
+
+- **Held at trust-tasks 0.19, deliberately.** 0.20.1 is published, but
+  `vta-sdk` 0.35 — the newest — still pins `trust-tasks-rs ^0.19.4`, and
+  `vti-common` 0.18.2 with it. Moving our five manifest lines to 0.20 alone
+  would duplicate `trust-tasks-rs`, `affinidi-tdk` (0.13 vs 0.14) and
+  `affinidi-messaging-sdk` (0.23 vs 0.24). The 0.20 step is gated on
+  verifiable-trust-infrastructure publishing a vta-sdk/vti-common pair on
+  `^0.20`.
+
+- **`firestore` 0.53 → 0.54**, and in-range refreshes across the lock
+  (`reqwest` 0.13.5, `redis` 1.7, `uuid` 1.26.1, `gcloud-sdk` 0.32). `fuzz/Cargo.lock`
+  regenerated to match — it records `did-hosting-common`'s dependency set and
+  the nightly Fuzz job gates on `cargo fetch --locked`.
+
+- **`jsonwebtoken` stays at 10.** `trust-tasks-https` is still on `^10` at
+  0.19.4, so the 10/11 split with `vti-common` persists and our declaration only
+  picks which copy we compile against. We cross neither crate's JWT surface.
+
 - **Trust Tasks 0.9 → 0.17, `affinidi-tdk` 0.8 → 0.10, `vta-sdk` 0.25 → 0.31,
   `vti-common` 0.12 → 0.15, `affinidi-messaging-didcomm-service` 0.3 → 0.5.**
   The whole `trust-tasks-*` family moves as one, for the reason the workspace
@@ -169,6 +204,22 @@
   **No document is accepted or refused differently by this release.** Moving to
   `Validate` would be a behaviour change — it can begin refusing documents a
   peer sends today — and belongs in its own release with its own rollout.
+
+### Changed — UI toolchain
+
+- **Node floor 20 → 24.3, `vitest` 4 → 5.** Node 20 reached end-of-life in
+  April 2026; `vitest` 5 requires `^22.12 || ^24 || >=26`, so the runner could
+  not move until the floor did. 24 is the active LTS (maintained to April 2028).
+
+  The floor is `>=24.3.0`, not `>=24`, because React Native 0.86 declares
+  `^24.3.0` — Node 24.0–24.2 are genuinely too old for the tree. CI's
+  `node-version: "24"` resolves to the latest 24.x, which satisfies it; it must
+  not be pinned to an exact 24.0.x. `engines.node`, the CI `node-version` and
+  the README prerequisite move together.
+
+  In-range npm updates cleared 9 of 12 reported advisories. The remaining three
+  are moderate, inside `expo-router`'s transitive `query-string`, and need a
+  breaking change to clear.
 
 ### Changed — wire
 
