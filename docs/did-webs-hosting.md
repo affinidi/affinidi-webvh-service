@@ -22,7 +22,7 @@ Off by default on every binary, because it pulls the KERI stack and an operator
 hosting no `did:webs` DIDs should not carry it:
 
 ```bash
-cargo build -p did-hosting-daemon --features method-webs
+cargo build --locked -p did-hosting-daemon --features method-webs
 ```
 
 The daemon's `method-webs` turns on **both halves** — the control plane's write

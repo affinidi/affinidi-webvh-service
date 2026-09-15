@@ -28,11 +28,11 @@ authentication.
 
 ```bash
 # Without UI
-cargo build -p did-hosting-control --release
+cargo build --locked -p did-hosting-control --release
 
 # With embedded management UI
 cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build -p did-hosting-control --release --features ui
+cargo build --locked -p did-hosting-control --release --features ui
 ```
 
 The binary is produced at `target/release/did-hosting-control`.

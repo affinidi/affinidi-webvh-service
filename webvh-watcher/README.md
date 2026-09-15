@@ -26,7 +26,7 @@ management — it simply stores and serves replicated DID content.
 ### 1. Build
 
 ```bash
-cargo build -p webvh-watcher --release
+cargo build --locked -p webvh-watcher --release
 ```
 
 The binary is produced at `target/release/webvh-watcher`.

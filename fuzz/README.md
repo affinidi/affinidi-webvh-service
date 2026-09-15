@@ -26,7 +26,7 @@ Requires a nightly toolchain and cargo-fuzz:
 
 ```sh
 rustup toolchain install nightly
-cargo install cargo-fuzz
+cargo install --locked cargo-fuzz
 
 # from the repo root:
 cargo +nightly fuzz run verify_did_log_proofs -- -max_total_time=60

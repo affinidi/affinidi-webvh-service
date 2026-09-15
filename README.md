@@ -56,6 +56,27 @@ Standalone mode:                          Daemon mode:
 - Rust 1.94.0+ (2024 Edition)
 - Node.js 24.3+ (only if building the management UI)
 
+> **Every build and install here passes `--locked`, and that is not
+> decoration.** `Cargo.lock` is this workspace's tested dependency set, and
+> re-resolving it does not currently produce a working graph: `aws-smithy-types`
+> 1.7.0 replaced `Document::Object`'s payload (`HashMap<String, Document>` ->
+> `DocumentObject`) in a *minor* release, which `aws-smithy-json` 0.63.0 — the
+> version the latest `aws-config` depends on — does not compile against while
+> still declaring it compatible. A build that floats past the lockfile fails
+> with `E0308`/`E0004` errors **inside the registry source**, naming files
+> nobody here wrote. It is only reachable with the optional `aws-secrets` or
+> `store-dynamodb` backends on, which is what makes it easy to hit in
+> deployment and never in development.
+>
+> `cargo build` and `cargo test` honour the lockfile on their own, so `--locked`
+> on those turns a silently stale lock into an error. **`cargo install` is the
+> trap: it ignores `Cargo.lock` by default** — so a host install must be
+> spelled `cargo install --locked --path did-hosting-control`.
+>
+> See the note beside the AWS dependencies in `did-hosting-common/Cargo.toml`
+> for which versions are held and when the pin can lift.
+
+
 ### Option 1: Unified daemon (recommended for getting started)
 
 The daemon runs all services on a single port:
@@ -63,7 +84,7 @@ The daemon runs all services on a single port:
 ```bash
 git clone https://github.com/affinidi/did-hosting-service.git
 cd did-hosting-service
-cargo build -p did-hosting-daemon --release
+cargo build --locked -p did-hosting-daemon --release
 ./target/release/did-hosting-daemon
 ```
 
@@ -80,7 +101,7 @@ Run each service independently for distributed deployments:
 
 ```bash
 # Build all services
-cargo build --workspace --release
+cargo build --locked --workspace --release
 
 # Run each service with its own config
 did-hosting-server setup && did-hosting-server
@@ -153,7 +174,7 @@ upload.
 ### Building
 
 ```sh
-cargo build -p did-hosting-server --example client
+cargo build --locked -p did-hosting-server --example client
 ```
 
 ### Usage
