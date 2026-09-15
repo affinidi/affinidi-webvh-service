@@ -150,10 +150,10 @@ method-webplus = []        # stub — fails compile with clear message if enable
 The other crates re-export feature flags so the daemon's `default` chains down to the common crate's `default`.
 
 Build matrix in CI:
-- `cargo build --workspace` (default features, both webvh+web)
-- `cargo build --workspace --no-default-features --features method-webvh`
-- `cargo build --workspace --no-default-features --features method-web`
-- `cargo build --workspace --features method-webvh,method-web,method-webs` (should fail with the stub's compile error)
+- `cargo build --locked --workspace` (default features, both webvh+web)
+- `cargo build --locked --workspace --no-default-features --features method-webvh`
+- `cargo build --locked --workspace --no-default-features --features method-web`
+- `cargo build --locked --workspace --features method-webvh,method-web,method-webs` (should fail with the stub's compile error)
 
 ## 6. The `DidMethod` trait
 
@@ -294,7 +294,7 @@ The work ships as **one tagged release** alongside multi-domain and the client c
 Rename folders, update `Cargo.toml` workspace member list, rewrite `pub use` paths, fix `env!` macro references, rewrite test fixture paths, regenerate `Cargo.lock`. No behavior change.
 
 Acceptance:
-- `cargo build --workspace --all-features` succeeds.
+- `cargo build --locked --workspace --all-features` succeeds.
 - Full test suite passes.
 - Env-var renames documented in CHANGELOG with compat note.
 
@@ -305,7 +305,7 @@ Introduce the `DidMethod` trait, the dispatcher, and the `methods/webvh.rs` impl
 Acceptance:
 - All existing webvh tests pass behind the trait surface.
 - The `dids` keyspace stores `DidRecord`s with `method = "webvh"` after migration.
-- `cargo build --no-default-features --features method-webvh` produces the same binary surface as default builds today.
+- `cargo build --locked --no-default-features --features method-webvh` produces the same binary surface as default builds today.
 
 ### 9.3 Phase M2 — `did:web` method
 

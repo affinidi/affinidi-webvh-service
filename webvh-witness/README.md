@@ -22,7 +22,7 @@ DID document was observed at a specific point in time.
 ### 1. Build
 
 ```bash
-cargo build -p webvh-witness --release
+cargo build --locked -p webvh-witness --release
 ```
 
 The binary is produced at `target/release/webvh-witness`.

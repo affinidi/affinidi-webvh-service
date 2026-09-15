@@ -34,7 +34,7 @@ the interactive setup wizard.
 ```bash
 git clone https://github.com/affinidi/did-hosting-service.git
 cd did-hosting-service
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 ```
 
 The binary is produced at `target/release/did-hosting-server`.
@@ -247,19 +247,19 @@ To compile with a non-default backend:
 
 ```bash
 # AWS Secrets Manager
-cargo build -p did-hosting-server --release --features aws-secrets
+cargo build --locked -p did-hosting-server --release --features aws-secrets
 
 # GCP Secret Manager
-cargo build -p did-hosting-server --release --features gcp-secrets
+cargo build --locked -p did-hosting-server --release --features gcp-secrets
 
 # HashiCorp Vault (Kubernetes / token / AppRole auth)
-cargo build -p did-hosting-server --release --features vault-secrets
+cargo build --locked -p did-hosting-server --release --features vault-secrets
 
 # Native Kubernetes Secret
-cargo build -p did-hosting-server --release --features k8s-secrets
+cargo build --locked -p did-hosting-server --release --features k8s-secrets
 
 # Multiple backends
-cargo build -p did-hosting-server --release --features "keyring,aws-secrets"
+cargo build --locked -p did-hosting-server --release --features "keyring,aws-secrets"
 ```
 
 ### Storage Backends
@@ -280,7 +280,7 @@ external services.
 To build with a non-default storage backend:
 
 ```bash
-cargo build -p did-hosting-server --release \
+cargo build --locked -p did-hosting-server --release \
   --no-default-features --features "keyring,store-redis"
 ```
 
@@ -304,7 +304,7 @@ Both ship in the default feature set, so the most common builds
 need no special handling:
 
 ```bash
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 cargo install did-hosting-server --locked
 ```
 
@@ -317,7 +317,7 @@ cargo install did-hosting-server --locked
 > minimal, opt the methods back in explicitly:
 >
 > ```bash
-> cargo build -p did-hosting-server --release \
+> cargo build --locked -p did-hosting-server --release \
 >   --no-default-features \
 >   --features "keyring,store-fjall,method-webvh,method-web"
 > ```
@@ -359,7 +359,7 @@ with the `DID_HOSTING_` prefix:
 ### Default (with OS keyring)
 
 ```bash
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 ```
 
 This builds with the `keyring` and `store-fjall` features
@@ -513,7 +513,7 @@ workers, and error rates.
 ### Building
 
 ```bash
-cargo build --example perf_test -p did-hosting-server
+cargo build --locked --example perf_test -p did-hosting-server
 ```
 
 ### Usage

@@ -35,11 +35,11 @@ Each service is mounted at a path prefix:
 
 ```bash
 # Without UI
-cargo build -p did-hosting-daemon --release
+cargo build --locked -p did-hosting-daemon --release
 
 # With embedded management UI
 cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build -p did-hosting-daemon --release --features ui
+cargo build --locked -p did-hosting-daemon --release --features ui
 ```
 
 The binary is produced at `target/release/did-hosting-daemon`.
