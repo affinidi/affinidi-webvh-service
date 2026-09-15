@@ -1819,11 +1819,14 @@ pub(crate) async fn run_trust_tasks_envelope(
     let transport =
         trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
 
-    // Route through the unified trust-task dispatcher — the same entry TSP
-    // and HTTPS use. ACL + discovery ops run the typed §7.2 pipeline;
-    // DID-management ops are bridged to `dispatch_did_op`. Both are now
-    // reachable as trust-task envelopes over DIDComm, not just as `MSG_*`.
-    match dispatch_trust_task_doc(state, sender, &transport, doc).await? {
+    // Route through the unified trust-task dispatcher — the same entry TSP and
+    // HTTPS use. Every family is reachable here: the typed
+    // `did-hosting/*/1.0` protocol, auth, infra, ACL + discovery, and the
+    // legacy `MSG_*` bridge.
+    match dispatch_trust_task_doc(state, sender, &transport, doc)
+        .await?
+        .into_document()
+    {
         Some(body) => Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body))),
         None => {
             // SPEC §8.1 routing exception: identity-mismatch with no
@@ -1891,12 +1894,67 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
 /// value for its own wire (TSP → bytes, DIDComm → envelope body, HTTPS →
 /// JSON response). `transport` is the caller's [`TransportHandler`] so the
 /// framework path resolves identities with the right binding.
+/// What a routed Trust Task produced, before any transport turns it into a
+/// reply.
+///
+/// The variants exist because **HTTPS needs the reject code and the other two
+/// transports do not**. SPEC's status table maps a framework rejection onto an
+/// HTTP status; DIDComm and TSP have no status to carry, so they serialise the
+/// document either way. Flattening to `Option<Value>` here — as this router used
+/// to — meant the HTTPS route could not use it and had to re-implement the
+/// routing itself, which is how it came to serve a strict subset: the typed
+/// `did-hosting/*/1.0` family, the auth family and the infra family were all
+/// unreachable over HTTPS, and an agent-name update sent there fell through to a
+/// legacy table that has never heard of it and answered "unknown op".
+pub(crate) enum RoutedReply {
+    /// A framework outcome. Carries the reject code, so HTTPS can map a status.
+    ///
+    /// Boxed: `DispatchOutcome` is ~750 bytes against a `Value`'s few, and this
+    /// enum is returned from every dispatch on every transport.
+    Framework(Box<did_hosting_common::server::trust_tasks::DispatchOutcome>),
+    /// A reply from a bridged or typed op. There is no framework reject code to
+    /// map, and the problem-report shape carries any error, so HTTPS answers
+    /// `200` exactly as the other two transports answer with the document.
+    Document(Value),
+    /// Nothing goes on the wire (SPEC §8.1: identity mismatch with no
+    /// transport-authenticated sender).
+    Suppressed,
+}
+
+impl RoutedReply {
+    /// The reply document, for a transport with no status codes to carry.
+    pub(crate) fn into_document(self) -> Option<Value> {
+        use did_hosting_common::server::trust_tasks::DispatchOutcome;
+        match self {
+            RoutedReply::Framework(outcome) => match *outcome {
+                DispatchOutcome::Handled(doc) => {
+                    Some(serde_json::to_value(&doc).expect("response document serialises"))
+                }
+                DispatchOutcome::Rejected(err) => {
+                    Some(serde_json::to_value(&err).expect("error document serialises"))
+                }
+                DispatchOutcome::Suppressed => None,
+            },
+            RoutedReply::Document(value) => Some(value),
+            RoutedReply::Suppressed => None,
+        }
+    }
+}
+
+/// Route one Trust Task document, for **every** transport.
+///
+/// HTTPS, DIDComm and TSP all arrive here. Each opens its own binding and
+/// establishes its own authenticated sender — that is what a binding is for —
+/// and then the question "what does this document mean" is answered once, here.
+///
+/// The order of the checks below is load bearing and each one carries the
+/// reason it sits where it does; they are not interchangeable.
 pub(crate) async fn dispatch_trust_task_doc(
     state: &AppState,
     sender: &str,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
-) -> Result<Option<Value>, DIDCommServiceError> {
+) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher,
         dispatch_inbound,
@@ -1927,13 +1985,13 @@ pub(crate) async fn dispatch_trust_task_doc(
         )
         .await;
         return Ok(match outcome {
-            DispatchOutcome::Handled(resp) => {
-                Some(serde_json::to_value(&resp).expect("response document serialises"))
-            }
-            DispatchOutcome::Rejected(err) => {
-                Some(serde_json::to_value(&err).expect("error document serialises"))
-            }
-            DispatchOutcome::Suppressed => None,
+            DispatchOutcome::Handled(resp) => RoutedReply::Document(
+                serde_json::to_value(&resp).expect("response document serialises"),
+            ),
+            DispatchOutcome::Rejected(err) => RoutedReply::Document(
+                serde_json::to_value(&err).expect("error document serialises"),
+            ),
+            DispatchOutcome::Suppressed => RoutedReply::Suppressed,
         });
     }
 
@@ -1955,7 +2013,13 @@ pub(crate) async fn dispatch_trust_task_doc(
             (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
             _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
         };
-        return Ok(crate::trust_tasks_auth::dispatch(state, transport, policy, doc).await);
+        return Ok(RoutedReply::Document(
+            crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
+                .await
+                .ok_or(DIDCommServiceError::Internal(
+                    "auth dispatch produced no reply".into(),
+                ))?,
+        ));
     }
 
     if crate::trust_tasks_infra::owns(&type_uri) {
@@ -1964,7 +2028,12 @@ pub(crate) async fn dispatch_trust_task_doc(
         let via = did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
             transport.binding_uri(),
         );
-        return Ok(crate::trust_tasks_infra::dispatch(state, sender, via, doc).await);
+        return Ok(
+            match crate::trust_tasks_infra::dispatch(state, sender, via, doc).await {
+                Some(value) => RoutedReply::Document(value),
+                None => RoutedReply::Suppressed,
+            },
+        );
     }
 
     let framework_owns = build_dispatcher()
@@ -1974,7 +2043,7 @@ pub(crate) async fn dispatch_trust_task_doc(
     if !framework_owns {
         return bridge_did_management(state, sender, my_vid, &doc)
             .await
-            .map(Some);
+            .map(RoutedReply::Document);
     }
 
     let ctx = TrustTaskContext {
@@ -1990,17 +2059,12 @@ pub(crate) async fn dispatch_trust_task_doc(
         _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
     };
 
-    let outcome = dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await;
-    let value = match outcome {
-        DispatchOutcome::Handled(resp) => {
-            serde_json::to_value(&resp).expect("response document serialises")
-        }
-        DispatchOutcome::Rejected(err) => {
-            serde_json::to_value(&err).expect("error document serialises")
-        }
-        DispatchOutcome::Suppressed => return Ok(None),
-    };
-    Ok(Some(value))
+    // The framework path, and the only one whose outcome carries a reject code
+    // — so it is handed back whole rather than serialised here, and HTTPS maps
+    // it to a status.
+    Ok(RoutedReply::Framework(Box::new(
+        dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await,
+    )))
 }
 
 /// Bridge a legacy DID-management Trust Task document to the shared
