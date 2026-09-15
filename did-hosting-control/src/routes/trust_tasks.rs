@@ -36,12 +36,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use trust_tasks_https::{HttpsHandler, status_for_code};
-use trust_tasks_rs::{ErrorPayload, ProofPolicy, RejectReason, TrustTask};
+use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
 use uuid::Uuid;
 
-use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher, dispatch_inbound,
-};
+use did_hosting_common::server::trust_tasks::DispatchOutcome;
 
 use crate::auth::AuthClaims;
 use crate::error::AppError;
@@ -149,64 +147,46 @@ pub async fn dispatch_trust_task(
         }
     }
 
-    // ─── Route by Type URI (parity with the TSP + DIDComm transports).
+    // ─── Route.
     //
-    // Framework ops (ACL + discovery) run the typed §7.2 pipeline below,
-    // mapping outcomes to HTTP status codes. DID-management ops
-    // (`did/publish`, `register`, `delete`, `change-owner`, `info`,
-    // `list`, `check-name`, `witness/publish`) are bridged to
-    // `dispatch_did_op` and returned as `200` with the Trust Task response
-    // document — the problem-report shape carries any error, exactly as on
-    // the DIDComm transport (which has no HTTP status either).
-    let type_uri = doc.type_uri.to_string();
-    if !build_dispatcher()
-        .registered_uris()
-        .contains(&type_uri.as_str())
+    // Through `messaging::dispatch_trust_task_doc`, the same entry DIDComm and
+    // TSP use. This route used to re-implement the routing — an `acl`-dispatcher
+    // membership check, then a fallthrough to the legacy bridge — and the
+    // duplicate had drifted: the typed `did-hosting/*/1.0` family, the auth
+    // family and the infra family are all checked *before* that fallthrough in
+    // the real router and were checked nowhere here. So an agent-name update
+    // over HTTPS reached `dispatch_did_op`, a table of legacy `MSG_*` ops that
+    // has never heard of it, and came back "unknown op" — the exact failure the
+    // router's own comments warn about, reached by the one transport that did
+    // not go through it.
+    //
+    // The comment this replaces claimed "parity with the TSP + DIDComm
+    // transports". It had parity with one branch of five.
+    let transport = HttpsHandler::new(my_vid.to_string(), auth.did.clone());
+    match crate::messaging::dispatch_trust_task_doc(&state, &auth.did, &transport, doc)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
     {
-        let value = crate::messaging::bridge_did_management(&state, &auth.did, my_vid, &doc)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        return Ok((
+        // The framework outcome keeps its reject code, which is the whole reason
+        // the router hands it back whole: SPEC's status table is HTTPS's alone.
+        crate::messaging::RoutedReply::Framework(outcome) => Ok(into_response(*outcome)),
+        // A typed or bridged reply. No framework reject code to map, and the
+        // problem-report shape carries any error — 200 with the document, as
+        // this route already answered for bridged ops.
+        crate::messaging::RoutedReply::Document(value) => Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             serde_json::to_vec(&value).expect("Trust Task response serialises"),
         )
-            .into_response());
+            .into_response()),
+        crate::messaging::RoutedReply::Suppressed => {
+            tracing::error!(
+                should_not_happen = true,
+                "trust-tasks dispatch returned Suppressed on HTTPS — bearer auth always resolves a peer"
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
-
-    // ─── 4. Build the transport adapter + context.
-    let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
-    let ctx = TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-    };
-
-    // ─── 5. Dispatch.
-    //
-    // Map the operator's `enforce_proofs` toggle to a framework
-    // [`ProofPolicy`]:
-    //
-    //   * `true` + verifier configured → `Verify(&verifier)` — proof-
-    //     bearing documents are verified, proofless REQUIRED-spec
-    //     documents are rejected `proof_required`.
-    //   * `false` (default) → `RejectIfPresent` — proof-bearing
-    //     documents are rejected `malformed_request` with the
-    //     framework-shared sanitised wire message (see
-    //     `trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY`). The
-    //     operator-actionable diagnostic moves to a `tracing::warn!`
-    //     in `dispatch_inbound`. Silently dropping a proof would
-    //     mislead the producer about the integrity guarantees of
-    //     the exchange.
-    let policy: ProofPolicy<'_, TransportBoundVerifier> = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => ProofPolicy::Verify(v),
-        _ => ProofPolicy::RejectIfPresent,
-    };
-    let outcome = dispatch_inbound::<TransportBoundVerifier>(&ctx, &transport, policy, doc).await;
-    Ok(into_response(outcome))
 }
 
 /// Build a `trust-task-error` document for a body-parse failure.

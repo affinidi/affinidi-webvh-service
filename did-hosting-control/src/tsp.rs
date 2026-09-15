@@ -97,7 +97,13 @@ pub(crate) async fn run_tsp_trust_task(
     // ops to `dispatch_did_op`, so every op is reachable over TSP as a Trust
     // Task document.
     let transport = TspTransportHandler::new(my_vid.to_string(), sender.to_string());
-    match dispatch_trust_task_doc(state, sender, &transport, doc).await? {
+    // No status codes on this transport, so the reply is the document either
+    // way — `into_document` is where that flattening belongs, beside the router
+    // rather than in each binding.
+    match dispatch_trust_task_doc(state, sender, &transport, doc)
+        .await?
+        .into_document()
+    {
         Some(value) => Ok(Some(
             serde_json::to_vec(&value).expect("response serialises"),
         )),
