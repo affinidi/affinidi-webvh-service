@@ -6,10 +6,13 @@
 //! (`routes::router_without_fallback`) via `tower::ServiceExt::oneshot`:
 //!
 //! (A) An ACL entry for the provisioning VTA DID (seeded at setup by
-//!     `acl::seed_provisioning_vta_acl`) is what lets the VTA past the
-//!     ACL gate on `POST /api/auth/challenge` (the canonical challenge
-//!     handler calls `check_acl`), so without it the VTA's very first
-//!     request is `403 DID not in ACL`.
+//!     `acl::seed_provisioning_vta_acl`) is what lets the VTA obtain a
+//!     session. The *challenge* is issued to anyone — vti-common's
+//!     canonical handler deliberately does not gate it (VTI-SES-006:
+//!     answering only known subjects is an enumeration oracle) — so the
+//!     ACL is read where the challenge is redeemed: without the entry
+//!     there is no session for `POST /api/auth/authenticate` to find,
+//!     and the challenge the VTA holds is unusable.
 //!
 //! (B) `POST /api/auth/` now content-negotiates: a DIDComm-v2 JWS
 //!     envelope (the `did-hosting-server` contract the VTA sends via
@@ -293,20 +296,43 @@ async fn do_challenge(state: &AppState, did: &str) -> (StatusCode, String, Strin
 // Cases
 // ---------------------------------------------------------------------------
 
-/// (A) Without the VTA ACL entry, the VTA's first `POST
-/// /api/auth/challenge` is rejected — the canonical challenge handler
-/// gates on `check_acl`. This is the `403 DID not in ACL` the operator
-/// used to fix by hand; it proves piece (A) is load-bearing.
+/// (A) Without the VTA ACL entry, the VTA cannot authenticate. The
+/// *challenge* is issued — deliberately, per vti-common's canonical
+/// handler (VTI-SES-006/007): a challenge endpoint that refuses an
+/// unknown subject and answers a known one is an enumeration oracle,
+/// so both subjects get a challenge and only an enrolled one gets a
+/// session to redeem it against. The challenge handed to an unenrolled
+/// subject is therefore **unusable**, and that is what this pins:
+/// `/auth/authenticate` finds no session and refuses.
+///
+/// (This used to assert `403` at the challenge gate. That gate was
+/// removed upstream as the oracle it was; the property it was standing
+/// in for — an un-authorized VTA DID gets no session — is asserted
+/// here directly, one step later, where it actually holds.)
 #[tokio::test]
-async fn challenge_rejected_when_vta_not_yet_authorized() {
+async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
     let harness = make_harness().await;
     let vta = key_identity([11u8; 32]);
 
-    let (status, _, _) = do_challenge(&harness.state, &vta.did).await;
+    let (status, session_id, challenge) = do_challenge(&harness.state, &vta.did).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "un-authorized VTA DID must be rejected at the challenge gate"
+        StatusCode::OK,
+        "the challenge endpoint must not distinguish enrolled from unenrolled \
+         subjects — that is the enumeration oracle VTI-SES-006 closes"
+    );
+
+    // The redemption is where authority is decided, and there is none.
+    let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let resp = did_hosting_control::routes::router_without_fallback()
+        .with_state(harness.state.clone())
+        .oneshot(authenticate_request(body))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "un-authorized VTA DID must not obtain a session"
     );
 }
 
