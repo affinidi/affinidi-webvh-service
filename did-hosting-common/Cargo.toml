@@ -159,6 +159,48 @@ affinidi-data-integrity = { workspace = true, optional = true }
 affinidi-messaging-didcomm-service = { workspace = true, optional = true }
 affinidi-messaging-didcomm = { workspace = true, optional = true }
 
+# **The AWS subtree is held down in Cargo.lock, and a blanket `cargo update`
+# breaks it.** `aws-smithy-types` 1.7.0 replaced `Document::Object`'s payload
+# (`HashMap<String, Document>` -> `DocumentObject`) in a *minor* release, which
+# `aws-smithy-json` 0.63.0 does not compile against — while declaring
+# `aws-smithy-types = "1.6.1"`, so cargo considers 1.7.0 a legal resolution. The
+# trap is that both sides of the break are transitive and neither is declared
+# here:
+#
+#   aws-config 1.12.0 (latest)   -> aws-smithy-json ^0.63  -> needs types < 1.7
+#   aws-sdk-dynamodb 1.125.0     -> aws-smithy-json  0.64   -> needs types ^1.7
+#
+# Cargo unifies on 1.7.0, the only version satisfying both, and `aws-smithy-json
+# 0.63.0` then fails to compile with three E0308/E0004 errors *inside the
+# registry source*. The lock therefore holds `aws-sdk-dynamodb` at 1.124.0,
+# `aws-sdk-secretsmanager` at 1.115.0, `aws-runtime` at 1.9.2 and
+# `aws-smithy-types` at 1.6.3 — the last self-consistent set — until `aws-config`
+# releases on `aws-smithy-json` 0.64.
+#
+# This cannot be expressed in a manifest: every line below is a `"1"` caret and
+# the offending crate is not declared anywhere in this workspace. The lock is the
+# only place it can be held, which is exactly why it is written down here.
+#
+# **It is invisible to an ordinary local check.** These backends are optional, so
+# `cargo test --workspace`, `cargo clippy --all-targets` and `cargo check
+# --locked` all pass while they are broken. After any dependency bump, run what
+# CI's `store-dynamodb` and `aws-secrets` jobs run:
+#
+#   cargo build -p did-hosting-common --no-default-features \
+#     --features "server-core,aws-secrets"
+#   cargo build -p did-hosting-common --no-default-features \
+#     --features "server-core,store-dynamodb,method-webvh,method-web"
+#
+# Rebuild the lock from the last good commit rather than chasing `--precise`
+# downgrades one crate at a time: restore `Cargo.lock`, then let `cargo check`
+# make only the changes the new manifest actually requires.
+#
+# And branch from the **current tip of main** when you do. CI builds the
+# PR *merge* commit, so a lockfile fix written on a stale base is auto-merged
+# against main's lockfile line by line — which silently reassembles the broken
+# resolution, and the job fails with a lock that exists in no commit. That is
+# not a flake; rebase and force-push.
+
 # store backends (optional)
 fjall = { workspace = true, optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
