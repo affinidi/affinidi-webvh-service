@@ -27,6 +27,39 @@ rust-version = "1.95.0"
 
 [workspace.dependencies]
 
+# Upper bound on `aws-smithy-types`, which nothing in this workspace calls.
+#
+# **This is here to constrain the resolver, not because anything uses it.**
+# `aws-smithy-types` 1.7.0 replaced `Document::Object`'s payload
+# (`HashMap<String, Document>` -> `DocumentObject`) and added a variant to an
+# enum that is `#[non_exhaustive]` — a breaking change shipped as a MINOR bump.
+# `aws-smithy-json` 0.63.0 declares `aws-smithy-types = "^1.6.1"`, which admits
+# 1.7.0 and then fails to compile against it, inside the registry source:
+#
+#   error[E0308]: expected `DocumentObject`, found `HashMap<String, Document>`
+#   error[E0004]: non-exhaustive patterns: `&_` not covered
+#
+# Cargo unifies `aws-smithy-types` to one version across the graph but keeps
+# both `aws-smithy-json` 0.63 and 0.64 (0.x minors are incompatible majors), so
+# the two coexist and only the 0.63 copy breaks:
+#
+#   aws-config 1.12.0 (its newest) -> aws-smithy-json ^0.63 -> needs types < 1.7
+#   aws-sdk-dynamodb 1.125.0       -> aws-smithy-json  0.64 -> needs types ^1.7
+#
+# Holding `aws-smithy-types` below 1.7 is what keeps the older, self-consistent
+# `aws-sdk-*` line — it is the same set the lockfile already held, expressed
+# where a lockless build can see it.
+#
+# A `[workspace.dependencies]` entry constrains nothing on its own: Cargo
+# honours a version requirement only from a crate that *declares* the
+# dependency, so each crate whose subtree pulls `aws-config` names it below,
+# under the same features.
+#
+# **Remove this the moment `aws-config` ships a release on json 0.64.** The
+# bound is `< 1.7` rather than `= 1.6.3` so patch releases in the working line
+# are still picked up; it is an exclusion of the break, not a freeze.
+aws-smithy-types = ">=1.6.1, <1.7"
+
 # Affinidi Trust Development Kit
 # Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.38 and vti-common
 # 0.18.5 both depend on affinidi-tdk ^0.14, so all three resolve to a single

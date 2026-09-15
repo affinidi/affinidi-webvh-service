@@ -26,7 +26,7 @@ method-web = ["did-hosting-common/method-web"]
 # did:webs DIDs should not carry. Registers `/{*mnemonic}/keri.cesr` and
 # claims `/{*mnemonic}/did.json` for did:webs records only.
 method-webs = ["did-hosting-common/method-webs"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
@@ -44,7 +44,7 @@ vault-secrets = ["did-hosting-common/vault-secrets"]
 k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
 store-redis = ["dep:redis", "did-hosting-common/store-redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # Generate an OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47).
@@ -109,6 +109,12 @@ aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
+
+# Not called from this crate — a resolver bound, explained in the workspace
+# manifest. Named here because a `[workspace.dependencies]` entry constrains
+# nothing on its own: only a crate that declares the dependency contributes its
+# version requirement, and this is a subtree that pulls `aws-config`.
+aws-smithy-types = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
