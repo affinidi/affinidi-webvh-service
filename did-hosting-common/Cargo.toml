@@ -42,7 +42,7 @@ server-core = [
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
-store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
+store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types"]
 store-firestore = ["server-core", "dep:firestore", "dep:futures"]
 store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
 # Native OS keyring secret backend.
@@ -59,7 +59,7 @@ keyring = [
     "dep:windows-native-keyring-store",
     "dep:dbus-secret-service-keyring-store",
 ]
-aws-secrets = ["server-core", "dep:aws-sdk-secretsmanager", "dep:aws-config"]
+aws-secrets = ["server-core", "dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types"]
 gcp-secrets = ["server-core", "dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth", "dep:bytes"]
 azure-secrets = ["server-core", "dep:azure_security_keyvault_secrets", "dep:azure_identity", "dep:azure_core", "dep:futures"]
 # HashiCorp Vault (KV v2) secret backend, authenticating via Kubernetes
@@ -159,10 +159,11 @@ affinidi-data-integrity = { workspace = true, optional = true }
 affinidi-messaging-didcomm-service = { workspace = true, optional = true }
 affinidi-messaging-didcomm = { workspace = true, optional = true }
 
-# **The AWS subtree is held down in Cargo.lock, and a blanket `cargo update`
-# breaks it.** `aws-smithy-types` 1.7.0 replaced `Document::Object`'s payload
-# (`HashMap<String, Document>` -> `DocumentObject`) in a *minor* release, which
-# `aws-smithy-json` 0.63.0 does not compile against — while declaring
+# **The AWS subtree is held below `aws-smithy-types` 1.7, and a blanket `cargo
+# update` used to break it.** `aws-smithy-types` 1.7.0 replaced
+# `Document::Object`'s payload (`HashMap<String, Document>` -> `DocumentObject`)
+# in a *minor* release, which `aws-smithy-json` 0.63.0 does not compile against
+# — while declaring
 # `aws-smithy-types = "1.6.1"`, so cargo considers 1.7.0 a legal resolution. The
 # trap is that both sides of the break are transitive and neither is declared
 # here:
@@ -172,14 +173,21 @@ affinidi-messaging-didcomm = { workspace = true, optional = true }
 #
 # Cargo unifies on 1.7.0, the only version satisfying both, and `aws-smithy-json
 # 0.63.0` then fails to compile with three E0308/E0004 errors *inside the
-# registry source*. The lock therefore holds `aws-sdk-dynamodb` at 1.124.0,
-# `aws-sdk-secretsmanager` at 1.115.0, `aws-runtime` at 1.9.2 and
-# `aws-smithy-types` at 1.6.3 — the last self-consistent set — until `aws-config`
+# registry source*. Holding `aws-smithy-types` below 1.7 keeps
+# `aws-sdk-dynamodb` at 1.124.0, `aws-sdk-secretsmanager` at 1.115.0 and
+# `aws-runtime` at 1.9.2 — the last self-consistent set — until `aws-config`
 # releases on `aws-smithy-json` 0.64.
 #
-# This cannot be expressed in a manifest: every line below is a `"1"` caret and
-# the offending crate is not declared anywhere in this workspace. The lock is the
-# only place it can be held, which is exactly why it is written down here.
+# **This note used to say it could not be expressed in a manifest, and that was
+# wrong.** Every line below is a `"1"` caret and the offending crate is declared
+# nowhere here, which is true and is not the obstacle: Cargo honours a version
+# requirement from any crate that *declares* the dependency, whether or not that
+# crate calls it. So `aws-smithy-types` is now declared — optional, under the
+# same features as `aws-config`, in each of the three crates whose subtree pulls
+# it — and the bound lives in `[workspace.dependencies]`. The lock is no longer
+# the only place it is held, which matters because the lock only protects a
+# build that passes `--locked`: a fresh resolve took the break, and that is how
+# operators building from source kept meeting it after #186.
 #
 # **It is invisible to an ordinary local check.** These backends are optional, so
 # `cargo test --workspace`, `cargo clippy --all-targets` and `cargo check
@@ -214,6 +222,12 @@ azure_core = { version = "1.0", optional = true }
 keyring-core = { version = "1", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+
+# Not called from this crate — a resolver bound, explained in the workspace
+# manifest. Named here because a `[workspace.dependencies]` entry constrains
+# nothing on its own: only a crate that declares the dependency contributes its
+# version requirement, and this is a subtree that pulls `aws-config`.
+aws-smithy-types = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }

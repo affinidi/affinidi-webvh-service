@@ -40,7 +40,7 @@ metrics = ["did-hosting-common/metrics"]
 method-webs = ["did-hosting-common/method-webs"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["did-hosting-common/keyring"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
@@ -63,7 +63,7 @@ store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 # hand-assembling `AppState`. Enable via a `[dev-dependencies]` `features =
 # ["test-support"]` entry. Off by default — never compiled into a release.
 test-support = ["dep:tempfile"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # NOTE: passkey/WebAuthn is always compiled into the control plane — it is
@@ -143,6 +143,12 @@ aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
+
+# Not called from this crate — a resolver bound, explained in the workspace
+# manifest. Named here because a `[workspace.dependencies]` entry constrains
+# nothing on its own: only a crate that declares the dependency contributes its
+# version requirement, and this is a subtree that pulls `aws-config`.
+aws-smithy-types = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
