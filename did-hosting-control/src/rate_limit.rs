@@ -64,6 +64,9 @@ pub const WINDOW_SECS: u64 = 60;
 /// a CDN or deploy a real DDoS mitigation.
 pub const MAX_TRACKED_IPS: usize = 10_000;
 
+/// The `limiter` this refusal names in its 429 body.
+pub const LIMITER_NAME: &str = "auth-challenge-per-ip";
+
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     /// Number of consume attempts in the current window.
@@ -110,9 +113,16 @@ impl IpRateLimiter {
         }
 
         if entry.count >= MAX_PER_WINDOW {
-            return Err(AppError::Validation(format!(
-                "IP rate limit exceeded ({MAX_PER_WINDOW} requests per {WINDOW_SECS}s); try again later",
-            )));
+            // The window resets lazily at `window_start + WINDOW_SECS`, so the
+            // time left in it is exactly when the next attempt can succeed.
+            let retry_after_secs = (entry.window_start + WINDOW_SECS).saturating_sub(now);
+            return Err(AppError::RateLimited {
+                limiter: LIMITER_NAME,
+                message: format!(
+                    "IP rate limit exceeded ({MAX_PER_WINDOW} requests per {WINDOW_SECS}s); try again later",
+                ),
+                retry_after_secs,
+            });
         }
         entry.count += 1;
         Ok(())
@@ -209,7 +219,33 @@ mod tests {
             l.try_consume(p, 1000).unwrap();
         }
         let err = l.try_consume(p, 1000).unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("rate limit")));
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_NAME,
+                retry_after_secs: WINDOW_SECS,
+                ..
+            }
+        ));
+    }
+
+    /// The retry hint is the time left in the current window, not the whole
+    /// window: a refusal 45s into a 60s window says 15.
+    #[test]
+    fn retry_after_is_the_remainder_of_the_window() {
+        let l = IpRateLimiter::new();
+        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        for _ in 0..MAX_PER_WINDOW {
+            l.try_consume(p, 1000).unwrap();
+        }
+        let err = l.try_consume(p, 1045).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                retry_after_secs: 15,
+                ..
+            }
+        ));
     }
 
     /// Window rolls over: after `WINDOW_SECS` elapsed, a fresh round

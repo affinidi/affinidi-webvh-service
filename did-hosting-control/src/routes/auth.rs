@@ -64,7 +64,11 @@ pub async fn challenge(
     // tracker is the single source of truth.
     state
         .pending_challenges
-        .try_issue(&req.did, MAX_PENDING_CHALLENGES_PER_DID)
+        .try_issue(
+            &req.did,
+            MAX_PENDING_CHALLENGES_PER_DID,
+            state.config.auth.pending_challenge_retry_after_secs(),
+        )
         .await
         .inspect_err(|e| {
             warn!(did = %req.did, error = %e, "challenge rate limited");

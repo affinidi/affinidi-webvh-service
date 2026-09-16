@@ -60,6 +60,28 @@ pub enum ClientError {
         body: String,
     },
 
+    /// 429 — a rate limiter refused the request. Retry, but not before
+    /// `retry_after_secs` when it is known.
+    ///
+    /// `limit_source` is the `x-rate-limit-source` header: `did-host` when the
+    /// hosting service's own limiter refused, absent when the `429` came from
+    /// something in front of it (a proxy, a load balancer, a CDN) — which is
+    /// tuned somewhere else entirely, so the two must not be conflated. (Not
+    /// named `source`: `thiserror` reads that name as the error's cause.)
+    #[error(
+        "rate limited by {}: {body}",
+        limit_source.as_deref().unwrap_or("an unattributed upstream")
+    )]
+    RateLimited {
+        /// The `x-rate-limit-source` header, if the response carried one.
+        limit_source: Option<String>,
+        /// `Retry-After` in delta-seconds, if present and in that form.
+        retry_after_secs: Option<u64>,
+        /// Response body (the service's `rate_limited` JSON document, or
+        /// whatever an upstream sent).
+        body: String,
+    },
+
     /// Wire-level protocol error: the daemon returned a 2xx but
     /// the body didn't decode as the expected type, or a header
     /// invariant was violated (e.g. `Trust-Task` mismatch on a
@@ -72,8 +94,12 @@ pub enum ClientError {
 impl ClientError {
     /// Whether the integrator should consider retrying this
     /// operation. Network + 5xx are candidate retries (with
-    /// backoff); the others should be surfaced.
+    /// backoff), and a 429 once its `retry_after_secs` has passed;
+    /// the others should be surfaced.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Network(_) | Self::Server { .. })
+        matches!(
+            self,
+            Self::Network(_) | Self::Server { .. } | Self::RateLimited { .. }
+        )
     }
 }

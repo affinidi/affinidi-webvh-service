@@ -215,6 +215,74 @@ async fn publish_503_maps_to_server_error() {
     }
 }
 
+/// A 429 from the hosting service's own limiter maps to `RateLimited`, carrying
+/// the attribution and the wait from the headers. It used to arrive as a `400`
+/// and read as `Validation`; a bare 429 would have fallen to `Protocol`.
+#[tokio::test]
+async fn challenge_429_maps_to_rate_limited_with_source_and_retry_after() {
+    let server = mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth/challenge"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-rate-limit-source", "did-host")
+                .insert_header("retry-after", "17")
+                .set_body_json(json!({
+                    "error": "rate_limited",
+                    "limiter": "auth-challenge-per-ip",
+                    "message": "IP rate limit exceeded",
+                    "retryAfterSecs": 17,
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server);
+    let err = c.challenge(HOLDER_DID).await.expect_err("429 must surface");
+    assert!(err.is_retryable());
+    match err {
+        ClientError::RateLimited {
+            limit_source,
+            retry_after_secs,
+            body,
+        } => {
+            assert_eq!(limit_source.as_deref(), Some("did-host"));
+            assert_eq!(retry_after_secs, Some(17));
+            assert!(body.contains("auth-challenge-per-ip"));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+/// A 429 with no `x-rate-limit-source` came from something in front of the
+/// service; the client says so instead of attributing it.
+#[tokio::test]
+async fn unlabelled_429_is_not_attributed_to_the_host() {
+    let server = mock_server().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/dids/alice"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server);
+    let err = c
+        .publish_did("t", "alice", "application/jsonl", b"x".to_vec())
+        .await
+        .expect_err("429 must surface");
+    assert!(
+        matches!(
+            err,
+            ClientError::RateLimited {
+                limit_source: None,
+                retry_after_secs: None,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
 /// 415 maps to `Protocol` — a Trust-Task mismatch shouldn't be
 /// silently retried.
 #[tokio::test]

@@ -1,6 +1,32 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, warn};
+
+/// Response header naming the service whose own limiter refused a request.
+///
+/// Part of the ecosystem-wide 429 contract: every refusal a service's *own*
+/// limiter emits carries this header, so a client can tell it apart from a
+/// `429` raised by a reverse proxy, a load balancer, or another service on the
+/// path (the VTA sends `vta`, the VTC `vtc`, the mediator `mediator`). A `429`
+/// without it is, by contract, unattributable. The VTI client reads it in
+/// `vta_sdk::rate_limit`.
+pub const RATE_LIMIT_SOURCE_HEADER: &str = "x-rate-limit-source";
+
+/// This workspace's value for [`RATE_LIMIT_SOURCE_HEADER`]. Every binary here
+/// (control, server, daemon, witness) is a DID host from the client's point of
+/// view, and the operator guidance a client prints for `did-host` applies to
+/// all of them.
+pub const RATE_LIMIT_SOURCE: &str = "did-host";
+
+/// Limiter name for the per-DID cap on concurrently pending auth challenges.
+pub const LIMITER_PENDING_CHALLENGES_PER_DID: &str = "auth-challenge-pending-per-did";
+
+/// Retry hint for a pending-challenge cap raised where the deployment's
+/// configured timings are not known (the conversion from the canonical
+/// `AuthError`): `AuthConfig::pending_challenge_retry_after_secs` over the
+/// default `challenge_ttl` and `session_cleanup_interval`. Route handlers
+/// substitute the configured values via [`AppError::with_retry_after`].
+pub const DEFAULT_PENDING_CHALLENGE_RETRY_AFTER_SECS: u64 = 30 + 600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -51,6 +77,24 @@ pub enum AppError {
 
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
+
+    /// One of this service's own rate limiters refused the request.
+    ///
+    /// Renders to **429** with `x-rate-limit-source: did-host`, a
+    /// `Retry-After` in seconds, and the body `{ "error": "rate_limited",
+    /// "limiter": "<limiter>", "message": "...", "retryAfterSecs": N }`.
+    /// Deliberately not `Validation`: a refusal rendered as `400` reads as a
+    /// malformed request, so no client can recognise it as a limit and back
+    /// off.
+    #[error("rate limited ({limiter}): {message}")]
+    RateLimited {
+        /// Stable, machine-readable name of the limiter that refused, so an
+        /// operator can tell which limit applies.
+        limiter: &'static str,
+        message: String,
+        /// Seconds after which a retry can succeed. Rendered as at least 1.
+        retry_after_secs: u64,
+    },
 
     // ---- Trust-Tasks transport errors (REST `Trust-Task:` header) ----
     //
@@ -175,7 +219,11 @@ impl From<vti_common::auth::backend::AuthError> for AppError {
         use vti_common::auth::backend::AuthError as A;
         match e {
             A::Forbidden | A::DidMethodRejected => AppError::Forbidden(e.to_string()),
-            A::PendingChallengeLimitReached => AppError::Validation(e.to_string()),
+            A::PendingChallengeLimitReached => AppError::RateLimited {
+                limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
+                message: e.to_string(),
+                retry_after_secs: DEFAULT_PENDING_CHALLENGE_RETRY_AFTER_SECS,
+            },
             A::SessionNotFound
             | A::SessionStateMismatch
             | A::ChallengeMismatch
@@ -191,6 +239,23 @@ impl From<vti_common::auth::backend::AuthError> for AppError {
 }
 
 impl AppError {
+    /// Replace the retry hint on an [`AppError::RateLimited`]; any other
+    /// variant is returned unchanged. For route handlers that know the
+    /// deployment's configured timings when the refusal was raised by code
+    /// that does not (the canonical challenge handler).
+    pub fn with_retry_after(self, secs: u64) -> Self {
+        match self {
+            AppError::RateLimited {
+                limiter, message, ..
+            } => AppError::RateLimited {
+                limiter,
+                message,
+                retry_after_secs: secs,
+            },
+            other => other,
+        }
+    }
+
     /// Create a tagged validation error.
     pub fn validation(kind: ValidationKind, msg: impl Into<String>) -> Self {
         let mut s = msg.into();
@@ -327,6 +392,7 @@ impl AppError {
             AppError::Validation(msg) => sanitize_user_message(msg),
             AppError::Conflict(msg) => sanitize_user_message(msg),
             AppError::QuotaExceeded(msg) => sanitize_user_message(msg),
+            AppError::RateLimited { message, .. } => sanitize_user_message(message),
             // Fixed, name-free strings — safe to surface verbatim.
             AppError::AgentName(e) => e.to_string(),
             // 5xx variants — covered by the server-error branch in
@@ -354,6 +420,7 @@ impl IntoResponse for AppError {
             AppError::StepUpRequired(_) => StatusCode::FORBIDDEN,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
+            AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMalformed(_) => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMismatch { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -372,6 +439,34 @@ impl IntoResponse for AppError {
         }
 
         debug!(status = %status.as_u16(), error = %self, "client error");
+
+        if let AppError::RateLimited {
+            limiter,
+            message,
+            retry_after_secs,
+        } = &self
+        {
+            // `Retry-After: 0` would invite an immediate retry into the same
+            // refusal; one second is the smallest honest hint.
+            let retry_after_secs = (*retry_after_secs).max(1);
+            let body = serde_json::json!({
+                "error": "rate_limited",
+                "limiter": limiter,
+                "message": sanitize_user_message(message),
+                "retryAfterSecs": retry_after_secs,
+            });
+            let mut response = (status, axum::Json(body)).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                RATE_LIMIT_SOURCE_HEADER,
+                HeaderValue::from_static(RATE_LIMIT_SOURCE),
+            );
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from(retry_after_secs),
+            );
+            return response;
+        }
 
         // Trust-Task variants use a structured body so callers can switch
         // on the discriminant. Match the VTI canonical impl's shape so
@@ -440,6 +535,69 @@ mod response_tests {
     fn validation_preserves_short_messages_unchanged() {
         let err = AppError::Validation("path 'foo' is already taken".into());
         assert_eq!(err.user_message(), "path 'foo' is already taken");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_renders_the_429_contract() {
+        use http_body_util::BodyExt;
+
+        let response = AppError::RateLimited {
+            limiter: "auth-challenge-per-ip",
+            message: "slow down".into(),
+            retry_after_secs: 17,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+        assert_eq!(response.headers()["retry-after"], "17");
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "rate_limited",
+                "limiter": "auth-challenge-per-ip",
+                "message": "slow down",
+                "retryAfterSecs": 17,
+            })
+        );
+    }
+
+    /// A zero hint would invite an immediate retry into the same refusal.
+    #[test]
+    fn rate_limited_retry_after_is_at_least_one_second() {
+        let response = AppError::RateLimited {
+            limiter: "x",
+            message: String::new(),
+            retry_after_secs: 0,
+        }
+        .into_response();
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+
+    #[test]
+    fn pending_challenge_limit_is_a_rate_limit_not_a_validation_error() {
+        let err: AppError =
+            vti_common::auth::backend::AuthError::PendingChallengeLimitReached.into();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
+                ..
+            }
+        ));
+        assert!(matches!(
+            err.with_retry_after(42),
+            AppError::RateLimited {
+                retry_after_secs: 42,
+                ..
+            }
+        ));
+        assert!(matches!(
+            AppError::Conflict("c".into()).with_retry_after(5),
+            AppError::Conflict(_)
+        ));
     }
 
     #[test]

@@ -36,7 +36,8 @@ pub async fn challenge(
             session_pubkey_b58btc: None,
         },
     )
-    .await?;
+    .await
+    .map_err(|e| e.with_retry_after(state.config.auth.pending_challenge_retry_after_secs()))?;
 
     #[cfg(feature = "metrics")]
     did_hosting_common::server::metrics::inc_auth_challenge();
