@@ -36,7 +36,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
-use crate::error::AppError;
+use crate::error::{AppError, LIMITER_PENDING_CHALLENGES_PER_DID};
+
+/// The `limiter` a refusal on the global cap names in its 429 body. The
+/// per-DID refusal shares [`LIMITER_PENDING_CHALLENGES_PER_DID`] with the
+/// canonical handler's cap on the other binaries: it is the same limit.
+pub const LIMITER_GLOBAL: &str = "auth-challenge-pending-global";
 
 /// Hard cap on the total number of pending challenges across all
 /// DIDs. Defends against an attacker sweeping millions of distinct
@@ -89,7 +94,17 @@ impl PendingChallengeTracker {
     ///
     /// On failure no counters are bumped. `try_issue` may be retried
     /// after a `release` call frees a slot.
-    pub async fn try_issue(&self, did: &str, per_did_cap: u64) -> Result<(), AppError> {
+    ///
+    /// A refusal is an [`AppError::RateLimited`] carrying
+    /// `retry_after_secs`. The tracker cannot know when a slot frees — that
+    /// is when a pending challenge authenticates or the session sweep
+    /// expires it — so the caller supplies the bound from its configuration.
+    pub async fn try_issue(
+        &self,
+        did: &str,
+        per_did_cap: u64,
+        retry_after_secs: u64,
+    ) -> Result<(), AppError> {
         // Read or create the per-DID counter slot. The HashMap entry
         // lives for the lifetime of the process — over time it
         // accumulates one slot per distinct DID seen. That's
@@ -117,15 +132,23 @@ impl PendingChallengeTracker {
         // path for the most-likely attacker shape (sweep of distinct
         // DIDs). The per-DID counter is then advisory.
         if self.global.load(Ordering::Relaxed) >= self.global_cap {
-            return Err(AppError::Validation(format!(
-                "global pending-challenge cap reached ({} concurrent); try again later",
-                self.global_cap,
-            )));
+            return Err(AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                message: format!(
+                    "global pending-challenge cap reached ({} concurrent); try again later",
+                    self.global_cap,
+                ),
+                retry_after_secs,
+            });
         }
         if counter.load(Ordering::Relaxed) >= per_did_cap {
-            return Err(AppError::Validation(format!(
-                "too many pending challenges for this DID (>= {per_did_cap}); try again later",
-            )));
+            return Err(AppError::RateLimited {
+                limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
+                message: format!(
+                    "too many pending challenges for this DID (>= {per_did_cap}); try again later",
+                ),
+                retry_after_secs,
+            });
         }
 
         // Two non-atomic increments — between the global check and
@@ -192,7 +215,7 @@ mod tests {
     async fn issues_within_caps() {
         let t = PendingChallengeTracker::with_global_cap(100);
         for _ in 0..5 {
-            t.try_issue("did:example:a", 10).await.unwrap();
+            t.try_issue("did:example:a", 10, 60).await.unwrap();
         }
         assert_eq!(t.count_for("did:example:a").await, 5);
         assert_eq!(t.global_count(), 5);
@@ -202,10 +225,17 @@ mod tests {
     async fn per_did_cap_rejects_excess() {
         let t = PendingChallengeTracker::with_global_cap(100);
         for _ in 0..3 {
-            t.try_issue("did:example:a", 3).await.unwrap();
+            t.try_issue("did:example:a", 3, 60).await.unwrap();
         }
-        let err = t.try_issue("did:example:a", 3).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("DID")));
+        let err = t.try_issue("did:example:a", 3, 60).await.unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
+                retry_after_secs: 60,
+                ..
+            }
+        ));
     }
 
     /// Sweep-attack defence: many distinct DIDs each within the per-
@@ -215,20 +245,29 @@ mod tests {
         let t = PendingChallengeTracker::with_global_cap(5);
         // Five DIDs, one challenge each, fills the global cap.
         for i in 0..5 {
-            t.try_issue(&format!("did:example:{i}"), 10).await.unwrap();
+            t.try_issue(&format!("did:example:{i}"), 10, 60)
+                .await
+                .unwrap();
         }
         assert_eq!(t.global_count(), 5);
         // Sixth distinct DID is within per-DID cap (0/10) but
         // global is full.
-        let err = t.try_issue("did:example:6", 10).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("global")));
+        let err = t.try_issue("did:example:6", 10, 60).await.unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                retry_after_secs: 60,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
     async fn release_decrements_both_counters() {
         let t = PendingChallengeTracker::with_global_cap(100);
-        t.try_issue("did:example:a", 10).await.unwrap();
-        t.try_issue("did:example:a", 10).await.unwrap();
+        t.try_issue("did:example:a", 10, 60).await.unwrap();
+        t.try_issue("did:example:a", 10, 60).await.unwrap();
         assert_eq!(t.count_for("did:example:a").await, 2);
         assert_eq!(t.global_count(), 2);
 
@@ -244,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn release_saturates_at_zero() {
         let t = PendingChallengeTracker::with_global_cap(100);
-        t.try_issue("did:example:a", 10).await.unwrap();
+        t.try_issue("did:example:a", 10, 60).await.unwrap();
         t.release("did:example:a").await;
         t.release("did:example:a").await; // double-release
         t.release("did:example:a").await; // triple-release

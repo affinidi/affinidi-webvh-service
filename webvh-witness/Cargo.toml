@@ -68,3 +68,10 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# The 429-contract test drives the real router with `oneshot` over a fjall
+# store in a temp dir.
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

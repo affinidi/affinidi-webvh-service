@@ -56,6 +56,47 @@
   the reason it always was: the control plane has already walked that chain, and
   an edge re-running it would reject logs an older `didwebvh-rs` accepted.
 
+### Fixed — rate-limit refusals are `429`, and say who refused
+
+- **Every refusal from this service's own limiters is now a `429`** carrying
+  `x-rate-limit-source: did-host`, `Retry-After` in seconds, and a JSON body
+  `{ "error": "rate_limited", "limiter": "<name>", "message": "…",
+  "retryAfterSecs": N }` — the contract the VTA, VTC and mediator also emit, and
+  that `vta_sdk::rate_limit` reads. They all answered `400` before, which no
+  client can tell apart from a malformed request: nothing backed off, and an
+  operator could not see which service in the path had refused.
+
+  The limiters, by `limiter` name:
+
+  - `auth-challenge-per-ip` — control plane (and daemon) `POST
+    /api/auth/challenge`, 30 per IP per 60 s. `Retry-After` is the time left in
+    the window.
+  - `auth-challenge-pending-per-did` — the per-DID cap on pending challenges: the
+    control plane's own tracker, and the canonical handler's cap on
+    `did-hosting-server` and `webvh-witness`.
+  - `auth-challenge-pending-global` — the control plane's global pending cap.
+
+  For the pending caps `Retry-After` is `challenge_ttl +
+  session_cleanup_interval` (630 s by default): a slot frees when its challenge
+  authenticates, or when the sweep removes it after expiry.
+
+- **New `AppError::RateLimited { limiter, message, retry_after_secs }`** in
+  `did-hosting-common`, and `AuthError::PendingChallengeLimitReached` now
+  converts to it rather than to `Validation`. `PendingChallengeTracker::try_issue`
+  takes the retry hint as a third argument.
+- **`did-hosting-client` gains `ClientError::RateLimited { limit_source,
+  retry_after_secs, body }`**, read from `x-rate-limit-source` and
+  `Retry-After`, and counted by `is_retryable()`. A 429 used to fall through to
+  `Protocol("unexpected status")`; the challenge limit, as a `400`, read as
+  `Validation`. A 429 without the header is reported with `limit_source: None`
+  — a proxy or load balancer, not the host.
+
+  DID resolution (`did.jsonl`, `did.json`, `keri.cesr`) has no limiter, so is
+  unchanged. No Trust Task surface (DIDComm, TSP, or the HTTPS `/trust-tasks`
+  route) reaches any of these limiters — the control plane's
+  `auth/challenge/0.1` arm runs with the canonical per-DID cap disabled — and
+  the Trust Task framework defines no rate-limit error code to answer with.
+
 ### Changed — dependencies
 
 - **Trust Tasks 0.18 → 0.19, `affinidi-tdk` 0.12 → 0.13, `vta-sdk` 0.34 → 0.35,

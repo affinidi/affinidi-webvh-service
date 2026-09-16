@@ -491,23 +491,47 @@ async fn decode_no_body(resp: reqwest::Response) -> Result<(), ClientError> {
     if status.is_success() {
         return Ok(());
     }
+    let headers = resp.headers().clone();
     let body = resp
         .text()
         .await
         .unwrap_or_else(|_| String::from("<unreadable body>"));
-    Err(match status.as_u16() {
+    Err(error_for_status(status, &headers, body))
+}
+
+/// The status-code → [`ClientError`] ladder shared by [`decode`] and
+/// [`decode_no_body`]. Takes the headers because a 429's attribution
+/// (`x-rate-limit-source`) and wait (`Retry-After`) live there, not in the
+/// body.
+fn error_for_status(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: String,
+) -> ClientError {
+    match status.as_u16() {
         400 => ClientError::Validation(body),
         401 => ClientError::Auth(body),
         403 => ClientError::Forbidden(body),
         404 => ClientError::NotFound(body),
         409 => ClientError::Conflict(body),
         415 => ClientError::Protocol(format!("Trust-Task mismatch: {body}")),
+        429 => ClientError::RateLimited {
+            limit_source: headers
+                .get("x-rate-limit-source")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            retry_after_secs: headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok()),
+            body,
+        },
         500..=599 => ClientError::Server {
             status: status.as_u16(),
             body,
         },
         _ => ClientError::Protocol(format!("unexpected status {status}: {body}")),
-    })
+    }
 }
 
 /// Auth challenge response — the integrator-facing flattened form
@@ -567,6 +591,7 @@ where
     T: serde::de::DeserializeOwned,
 {
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = resp
         .bytes()
         .await
@@ -581,20 +606,7 @@ where
     }
 
     let body_text = String::from_utf8_lossy(&bytes).into_owned();
-    let err = match status.as_u16() {
-        400 => ClientError::Validation(body_text),
-        401 => ClientError::Auth(body_text),
-        403 => ClientError::Forbidden(body_text),
-        404 => ClientError::NotFound(body_text),
-        409 => ClientError::Conflict(body_text),
-        415 => ClientError::Protocol(format!("Trust-Task mismatch: {body_text}")),
-        500..=599 => ClientError::Server {
-            status: status.as_u16(),
-            body: body_text,
-        },
-        _ => ClientError::Protocol(format!("unexpected status {status}: {body_text}")),
-    };
-    Err(err)
+    Err(error_for_status(status, &headers, body_text))
 }
 
 #[cfg(test)]
