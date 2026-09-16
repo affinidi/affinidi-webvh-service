@@ -19,12 +19,22 @@ use crate::error::AppError;
 use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;
 
-/// Maximum concurrent pending challenges per DID. Combined with the
+/// Default maximum concurrent pending challenges per DID. Combined with the
 /// global cap on the `pending_challenges` tracker on `AppState`, this
 /// bounds the unauthenticated challenge-endpoint surface against both
 /// per-DID floods and DID-sweep attacks. Shared with the
 /// `auth/challenge/0.1` Trust Task handler, which applies the same caps.
+///
+/// This is the compiled-in default; the effective value is
+/// `AuthConfig::max_pending_challenges_per_did`, which defaults to this and is
+/// read per call by [`issue_challenge`]. The default and the config default
+/// are pinned equal by `pending_challenges::tests::config_defaults_match_constants`.
 pub(crate) const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+
+// Keep the constant referenced in non-test builds (it is otherwise used only
+// from the config-default pin test and the TSP suite) and pin its value, so a
+// change is deliberate and travels with the config default above.
+const _: () = assert!(MAX_PENDING_CHALLENGES_PER_DID == 10);
 
 /// POST /api/auth/challenge — request a challenge nonce.
 ///
@@ -80,13 +90,18 @@ pub async fn challenge(
 /// DID holds an ACL entry: the canonical handler answers an unenrolled subject
 /// without persisting anything, and counting only enrolled subjects would turn
 /// the cap into an enumeration oracle (VTI-SES-007).
+///
+/// The per-DID cap is `AuthConfig::max_pending_challenges_per_did`
+/// (default [`MAX_PENDING_CHALLENGES_PER_DID`]); the global cap is baked into
+/// the tracker at construction from `max_global_pending_challenges`.
 pub(crate) async fn issue_challenge(
     state: &AppState,
     did: String,
 ) -> Result<vta_sdk::protocols::auth::ChallengeResponse, AppError> {
+    let per_did_cap = state.config.auth.max_pending_challenges_per_did;
     let reservation = state
         .pending_challenges
-        .try_issue(&did, MAX_PENDING_CHALLENGES_PER_DID)
+        .try_issue(&did, per_did_cap)
         .inspect_err(|e| {
             warn!(did = %did, error = %e, "challenge rate limited");
         })?;

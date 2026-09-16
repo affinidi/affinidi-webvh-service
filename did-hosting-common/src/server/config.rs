@@ -227,6 +227,23 @@ pub struct AuthConfig {
     /// How long (in minutes) to keep empty DID records before auto-cleanup.
     #[serde(default = "default_cleanup_ttl_minutes")]
     pub cleanup_ttl_minutes: u64,
+    /// Global cap on concurrently-live pending auth challenges across all DIDs
+    /// (did-hosting-control's in-memory `PendingChallengeTracker`).
+    /// Defence-in-depth bound on the unauthenticated
+    /// `POST /api/auth/challenge` surface: an attacker sweeping many distinct
+    /// DIDs cannot accumulate more than this many live challenges before
+    /// issuance fails closed. Mirrors
+    /// `did_hosting_control::pending_challenges::MAX_GLOBAL_PENDING`, the
+    /// compiled-in default; the two are pinned equal by a unit test in that
+    /// crate. Operators on unusually large or small deployments can tune it.
+    #[serde(default = "default_max_global_pending_challenges")]
+    pub max_global_pending_challenges: usize,
+    /// Per-DID cap on concurrently-live pending auth challenges (the sibling
+    /// of `max_global_pending_challenges`). Bounds a single-DID flood. Mirrors
+    /// `did_hosting_control::routes::auth::MAX_PENDING_CHALLENGES_PER_DID`, the
+    /// compiled-in default; also pinned equal by a unit test in that crate.
+    #[serde(default = "default_max_pending_challenges_per_did")]
+    pub max_pending_challenges_per_did: usize,
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -253,6 +270,20 @@ fn default_cleanup_ttl_minutes() -> u64 {
     60
 }
 
+/// Default global pending-challenge cap. Must equal
+/// `did_hosting_control::pending_challenges::MAX_GLOBAL_PENDING` (pinned by a
+/// unit test in that crate — the constant lives there because the tracker
+/// does, and did-hosting-common sits below did-hosting-control in the graph).
+fn default_max_global_pending_challenges() -> usize {
+    10_000
+}
+
+/// Default per-DID pending-challenge cap. Must equal
+/// `did_hosting_control::routes::auth::MAX_PENDING_CHALLENGES_PER_DID`.
+fn default_max_pending_challenges_per_did() -> usize {
+    10
+}
+
 impl AuthConfig {
     /// Validate configuration values are within acceptable ranges.
     pub fn validate(&self) -> Result<(), AppError> {
@@ -269,6 +300,18 @@ impl AuthConfig {
         if self.access_token_expiry < 30 {
             return Err(AppError::Config(
                 "access_token_expiry must be at least 30 seconds".into(),
+            ));
+        }
+        // A zero cap fails every challenge closed — bounded, but it takes
+        // authentication down rather than protecting it, so refuse it at load.
+        if self.max_global_pending_challenges == 0 {
+            return Err(AppError::Config(
+                "max_global_pending_challenges must be at least 1".into(),
+            ));
+        }
+        if self.max_pending_challenges_per_did == 0 {
+            return Err(AppError::Config(
+                "max_pending_challenges_per_did must be at least 1".into(),
             ));
         }
         Ok(())
@@ -296,6 +339,8 @@ impl Default for AuthConfig {
             session_cleanup_interval: default_session_cleanup_interval(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
+            max_global_pending_challenges: default_max_global_pending_challenges(),
+            max_pending_challenges_per_did: default_max_pending_challenges_per_did(),
         }
     }
 }
@@ -878,6 +923,14 @@ pub fn apply_env_overrides(
     env_parse!(
         &format!("{prefix}_CLEANUP_TTL_MINUTES"),
         auth.cleanup_ttl_minutes
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_MAX_GLOBAL_PENDING_CHALLENGES"),
+        auth.max_global_pending_challenges
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_MAX_PENDING_CHALLENGES_PER_DID"),
+        auth.max_pending_challenges_per_did
     );
 
     // Secrets

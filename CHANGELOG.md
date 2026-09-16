@@ -136,6 +136,26 @@
   `for_auth_config`, `with_clock`, `seed_from_sessions`. Counts are `usize`,
   and the methods are synchronous.
 
+### Changed — pending-challenge caps are operator-configurable
+
+- **The control plane's pending-challenge caps can now be tuned.** Both the
+  global cap (default 10,000) and the per-DID cap (default 10) are now
+  `[auth]` config fields — `max_global_pending_challenges` and
+  `max_pending_challenges_per_did` — overridable by env
+  (`*_AUTH_MAX_GLOBAL_PENDING_CHALLENGES`,
+  `*_AUTH_MAX_PENDING_CHALLENGES_PER_DID`). Defaults are unchanged, so
+  behaviour is identical unless an operator sets them; a zero cap is refused at
+  config load. This is defence-in-depth on already-bounded code, letting large
+  or small deployments size the caps to their footprint.
+
+- **The bounded-memory and locking guarantees are now documented in-code.**
+  `pending_challenges.rs` states explicitly that every internal structure is
+  capped at the global cap (memory cannot grow without limit; refusal at the
+  cap is fail-closed, and the per-IP limiter throttles fill rate — CWE-400),
+  and that its `std::sync::Mutex` guard is never held across an `.await` (which
+  would fail to compile as a non-`Send` future — CWE-667). No behaviour change;
+  the rationale now lives beside the code.
+
 ### Changed — dependencies
 
 - **Trust Tasks 0.18 → 0.19, `affinidi-tdk` 0.12 → 0.13, `vta-sdk` 0.34 → 0.35,

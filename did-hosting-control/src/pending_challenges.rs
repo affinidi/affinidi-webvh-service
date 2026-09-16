@@ -11,6 +11,28 @@
 //! Both are O(1) in the session population, which is why this lives in memory
 //! instead of scanning `session:` per request (review SM3).
 //!
+//! Both caps are operator-configurable ([`AuthConfig::max_global_pending_challenges`]
+//! and `AuthConfig::max_pending_challenges_per_did`, env
+//! `*_AUTH_MAX_GLOBAL_PENDING_CHALLENGES` / `*_AUTH_MAX_PENDING_CHALLENGES_PER_DID`);
+//! the defaults are [`MAX_GLOBAL_PENDING`] and
+//! `routes::auth::MAX_PENDING_CHALLENGES_PER_DID`.
+//!
+//! ## Bounded memory (CWE-400)
+//!
+//! Memory cannot grow without limit. [`PendingChallengeTracker::try_issue`]
+//! prunes expired members and then refuses issuance once the live set reaches
+//! the global cap, *before* inserting — so every internal structure
+//! (`entries`, `by_session`, `per_did`, `expiry`) is capped at the global cap.
+//! Empty per-DID deques are removed rather than lingering. Refusal at the cap
+//! is fail-closed by design; the per-IP limiter (`crate::rate_limit`) throttles
+//! the fill rate. See the note on the global-cap check in `try_issue`.
+//!
+//! ## Locking (CWE-667)
+//!
+//! `inner` is a `std::sync::Mutex`, chosen deliberately: its guard is never
+//! held across an `.await`, and doing so would fail to compile (a non-`Send`
+//! future). See the notes on the `inner` field and `lock`.
+//!
 //! ## What is counted: live challenges, which expire by themselves
 //!
 //! The tracker holds the **set** of challenges it issued, each with the instant
@@ -197,6 +219,16 @@ fn secs_until(at: Instant, now: Instant) -> u64 {
 
 /// In-memory set of live challenges. See the module docs.
 pub struct PendingChallengeTracker {
+    /// A `std::sync::Mutex` on purpose, and its guard is **never held across an
+    /// `.await`** (CWE-667, improper locking). Every async method here does its
+    /// awaits *before* it locks — `seed_from_sessions` reads the keyspace
+    /// (`prefix_iter_raw(..).await`) and only then calls `self.lock()` — and
+    /// every locked section below is purely synchronous (no `.await` between
+    /// `lock()` and the guard dropping). This is not merely a convention: an
+    /// `await` under this guard would make the enclosing future hold a
+    /// non-`Send` `MutexGuard` across a suspend point, and the async runtime
+    /// would refuse to compile it. A tokio mutex here would compile such a bug
+    /// silently, so the std mutex is the stricter, deliberate choice.
     inner: Mutex<Inner>,
     challenge_ttl: Duration,
     global_cap: usize,
@@ -226,11 +258,15 @@ impl PendingChallengeTracker {
     }
 
     /// A tracker whose challenges live for the configured `challenge_ttl` —
-    /// the same bound the authenticate handler enforces.
+    /// the same bound the authenticate handler enforces — and whose global cap
+    /// is the configured `max_global_pending_challenges` (default
+    /// [`MAX_GLOBAL_PENDING`]). The per-DID cap is applied per call by
+    /// `routes::auth::issue_challenge`, which reads
+    /// `max_pending_challenges_per_did` from the same config.
     pub fn for_auth_config(auth: &AuthConfig) -> Self {
         Self::with_clock(
             Duration::from_secs(auth.challenge_ttl),
-            MAX_GLOBAL_PENDING,
+            auth.max_global_pending_challenges,
             Arc::new(Instant::now),
         )
     }
@@ -247,6 +283,10 @@ impl PendingChallengeTracker {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // No code path panics while holding the lock, but a poisoned tracker
         // must not take authentication down with it: the set is still sound.
+        //
+        // CWE-667: the returned guard is synchronous-only — hold it across an
+        // `.await` and the future stops being `Send` and fails to compile (see
+        // the note on the `inner` field). Do the keyspace read before locking.
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -262,6 +302,17 @@ impl PendingChallengeTracker {
         let mut inner = self.lock();
         inner.prune(now);
 
+        // CWE-400 (uncontrolled resource consumption): memory here is bounded,
+        // and this check is where. `prune(now)` above drops every expired
+        // member first; then issuance is refused once the live set reaches
+        // `global_cap`, *before* any insert. So `entries`, `by_session`,
+        // `per_did` (empty deques are removed) and `expiry` are each capped at
+        // `global_cap` entries — the set cannot grow without limit. Refusing at
+        // the cap is fail-closed by design (a full set rejects new challenges
+        // rather than evicting live ones), and the per-IP limiter
+        // (`crate::rate_limit`, 30 req / 60 s) throttles how fast the cap can be
+        // approached at all.
+        //
         // Global first: the cheaper rejection for the likeliest attack shape
         // (a sweep of distinct DIDs).
         if inner.entries.len() >= self.global_cap {
@@ -584,6 +635,61 @@ mod tests {
         assert_eq!(secs_until(now + Duration::from_millis(1), now), 1);
         assert_eq!(secs_until(now + Duration::from_millis(1001), now), 2);
         assert_eq!(secs_until(now + Duration::from_secs(5), now), 5);
+    }
+
+    /// A custom global cap is honoured: the (cap+1)th distinct-DID challenge is
+    /// refused on the global limiter, whatever the cap is set to.
+    #[test]
+    fn custom_global_cap_is_honoured() {
+        let (t, _) = tracker(3);
+        for i in 0..3 {
+            issue(&t, &format!("did:example:{i}"), 10, &format!("s{i}"));
+        }
+        assert_eq!(t.global_count(), 3);
+        let err = t.try_issue("did:example:over", 10).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                ..
+            }
+        ));
+    }
+
+    /// `for_auth_config` plumbs the configured `max_global_pending_challenges`
+    /// into the tracker (not the compiled-in default).
+    #[test]
+    fn for_auth_config_uses_the_configured_global_cap() {
+        let auth = AuthConfig {
+            max_global_pending_challenges: 2,
+            ..AuthConfig::default()
+        };
+        let t = PendingChallengeTracker::for_auth_config(&auth);
+        // The per-DID cap is high, so only the global cap can bite.
+        t.bind(t.try_issue("did:example:a", 100).unwrap(), "s0");
+        t.bind(t.try_issue("did:example:b", 100).unwrap(), "s1");
+        let err = t.try_issue("did:example:c", 100).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                ..
+            }
+        ));
+    }
+
+    /// The config defaults must equal the compiled-in constants that document
+    /// them, across the crate boundary (the constants live here; the config
+    /// defaults live in the lower did-hosting-common crate, which cannot
+    /// reference them). This test is the pin that keeps the two in step.
+    #[test]
+    fn config_defaults_match_constants() {
+        let auth = AuthConfig::default();
+        assert_eq!(auth.max_global_pending_challenges, MAX_GLOBAL_PENDING);
+        assert_eq!(
+            auth.max_pending_challenges_per_did,
+            crate::routes::auth::MAX_PENDING_CHALLENGES_PER_DID,
+        );
     }
 }
 
