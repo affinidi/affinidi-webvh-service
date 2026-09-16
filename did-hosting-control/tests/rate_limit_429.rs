@@ -8,10 +8,14 @@
 //! Driven through the real router (`tower::ServiceExt::oneshot`), because the
 //! contract is the HTTP response, not the error value.
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use did_hosting_common::server::config::AuthConfig;
+use did_hosting_control::pending_challenges::PendingChallengeTracker;
 use did_hosting_control::rate_limit::{MAX_PER_WINDOW, WINDOW_SECS};
 use did_hosting_control::test_support::TestServer;
 use http_body_util::BodyExt;
@@ -103,8 +107,96 @@ async fn per_did_pending_challenge_cap_answers_429() {
 
     let response = app.oneshot(challenge_request(did)).await.unwrap();
     let body = assert_rate_limited(response, "auth-challenge-pending-per-did").await;
-    assert_eq!(
-        body["retryAfterSecs"],
-        AuthConfig::default().pending_challenge_retry_after_secs()
+    // A slot frees when the oldest challenge's TTL runs out, which is at most
+    // one `challenge_ttl` from now.
+    let retry = body["retryAfterSecs"].as_u64().unwrap();
+    assert!(
+        (1..=AuthConfig::default().challenge_ttl).contains(&retry),
+        "retry {retry}"
     );
+}
+
+/// A tracker whose clock the test moves, installed on `ts` before routing.
+fn install_manual_clock(ts: &mut TestServer, global_cap: usize) -> Arc<Mutex<Instant>> {
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = now.clone();
+    ts.state.pending_challenges = Arc::new(PendingChallengeTracker::with_clock(
+        Duration::from_secs(AuthConfig::default().challenge_ttl),
+        global_cap,
+        Arc::new(move || *clock.lock().unwrap()),
+    ));
+    now
+}
+
+async fn retry_after_of(response: Response, limiter: &str) -> u64 {
+    assert_rate_limited(response, limiter).await["retryAfterSecs"]
+        .as_u64()
+        .unwrap()
+}
+
+/// Regression: challenges nobody redeems must give their slots back when they
+/// expire. The tracker used to free a slot only when its challenge
+/// authenticated, so ten abandoned challenges locked the DID out until restart
+/// — and the `Retry-After` on that 429 promised a retry that would never
+/// succeed. Now the hint is exact: one second early is still refused, and at
+/// the hinted moment the challenge is issued.
+#[tokio::test]
+async fn abandoned_challenges_free_the_per_did_cap_at_the_promised_time() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 10_000);
+    let app = ts.router();
+    let did = "did:example:abandoned";
+
+    for i in 0..10 {
+        let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+    }
+    let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+    let retry = retry_after_of(response, "auth-challenge-pending-per-did").await;
+    assert_eq!(retry, AuthConfig::default().challenge_ttl);
+
+    *now.lock().unwrap() += Duration::from_secs(retry - 1);
+    let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    *now.lock().unwrap() += Duration::from_secs(1);
+    let response = app.oneshot(challenge_request(did)).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the slots freed when the Retry-After said they would"
+    );
+}
+
+/// The same for the global cap — the case that took the whole control plane
+/// down: enough abandoned challenges across distinct DIDs refused every DID's
+/// login until restart.
+#[tokio::test]
+async fn abandoned_challenges_free_the_global_cap_on_expiry() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 5);
+    let app = ts.router();
+
+    for i in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(challenge_request(&format!("did:example:sweep-{i}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+    }
+    let response = app
+        .clone()
+        .oneshot(challenge_request("did:example:victim"))
+        .await
+        .unwrap();
+    let retry = retry_after_of(response, "auth-challenge-pending-global").await;
+    assert_eq!(retry, AuthConfig::default().challenge_ttl);
+
+    *now.lock().unwrap() += Duration::from_secs(retry);
+    let response = app
+        .oneshot(challenge_request("did:example:victim"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

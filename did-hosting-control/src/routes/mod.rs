@@ -1,5 +1,5 @@
 mod acl;
-mod auth;
+pub(crate) mod auth;
 // `pub(crate)` so the DIDComm dispatch table reuses the REST request types
 // and helpers verbatim — the two transports must not grow separate shapes.
 pub(crate) mod did_manage;

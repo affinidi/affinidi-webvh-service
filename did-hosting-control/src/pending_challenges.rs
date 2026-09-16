@@ -1,74 +1,254 @@
-//! Bounded counter for pending DIDComm authentication challenges.
+//! Bounded set of live DID authentication challenges.
 //!
-//! `POST /api/auth/challenge` is unauthenticated — anyone who can
-//! reach the endpoint can issue a challenge for any DID. The previous
-//! implementation defended against this with two mechanisms:
+//! `POST /api/auth/challenge` is unauthenticated — anyone who can reach the
+//! endpoint can ask for a challenge for any DID. Two caps bound it:
 //!
-//! 1. A per-DID cap of 10 pending challenges, computed by an O(N)
-//!    `prefix_iter_raw("session:")` scan plus an in-process filter.
-//!    Cost grew linearly in the total session population.
-//! 2. No global cap. An attacker sweeping millions of distinct DIDs
-//!    could accumulate ~10 sessions each, with the only bound being
-//!    fjall's disk capacity.
+//! 1. **Per DID** (`MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth`): no DID
+//!    holds more than that many live challenges.
+//! 2. **Global** ([`MAX_GLOBAL_PENDING`]): an attacker sweeping millions of
+//!    distinct DIDs cannot accumulate per-DID-cap × N challenges.
 //!
-//! This module replaces both with an in-memory counter:
-//! - O(1) per-DID counter via `RwLock<HashMap<String, AtomicU64>>`.
-//! - O(1) global counter via a single `AtomicU64`.
-//! - A configurable global cap (default `MAX_GLOBAL_PENDING`), with
-//!   the per-DID cap kept as an external constant the caller passes
-//!   in.
+//! Both are O(1) in the session population, which is why this lives in memory
+//! instead of scanning `session:` per request (review SM3).
 //!
-//! Restart wipes the counter; that's fine because the actual session
-//! records still live in fjall and expire naturally — the counter
-//! just sees a brief over-count after restart until the cleanup task
-//! runs. If under-counting at restart matters, swap to a periodic
-//! reconcile that scans `session:` once at startup; today it's not
-//! worth the boot-time cost for a strictly-defensive cap.
+//! Both caps are operator-configurable ([`AuthConfig::max_global_pending_challenges`]
+//! and `AuthConfig::max_pending_challenges_per_did`, env
+//! `*_AUTH_MAX_GLOBAL_PENDING_CHALLENGES` / `*_AUTH_MAX_PENDING_CHALLENGES_PER_DID`);
+//! the defaults are [`MAX_GLOBAL_PENDING`] and
+//! `routes::auth::MAX_PENDING_CHALLENGES_PER_DID`.
 //!
-//! Out of scope: IP-level rate limiting. That belongs in a
-//! middleware layer (e.g. `tower-governor`) and is deployment-
-//! dependent (trusted-proxy header parsing required behind a load
-//! balancer); track separately.
+//! ## Bounded memory (CWE-400)
+//!
+//! Memory cannot grow without limit. [`PendingChallengeTracker::try_issue`]
+//! prunes expired members and then refuses issuance once the live set reaches
+//! the global cap, *before* inserting — so every internal structure
+//! (`entries`, `by_session`, `per_did`, `expiry`) is capped at the global cap.
+//! Empty per-DID deques are removed rather than lingering. Refusal at the cap
+//! is fail-closed by design; the per-IP limiter (`crate::rate_limit`) throttles
+//! the fill rate. See the note on the global-cap check in `try_issue`.
+//!
+//! ## Locking (CWE-667)
+//!
+//! `inner` is a `std::sync::Mutex`, chosen deliberately: its guard is never
+//! held across an `.await`, and doing so would fail to compile (a non-`Send`
+//! future). See the notes on the `inner` field and `lock`.
+//!
+//! ## What is counted: live challenges, which expire by themselves
+//!
+//! The tracker holds the **set** of challenges it issued, each with the instant
+//! its `challenge_ttl` runs out, and counts the members that have not yet run
+//! out. A challenge leaves the set when
+//!
+//! - it **authenticates** ([`PendingChallengeTracker::release_session`], keyed
+//!   by the session id — releasing one that is already gone is a no-op, so
+//!   there is nothing to underflow), or
+//! - its **TTL passes**. Nothing has to tell the tracker: an expired member is
+//!   not counted and is pruned on the next call.
+//!
+//! An earlier version mirrored the set as two counters incremented on issue and
+//! decremented on successful authentication only. Every other way a challenge
+//! ends — expiring unused, being issued to a DID with no ACL entry (the
+//! canonical handler answers those without persisting anything), or being
+//! authenticated over a different binding than it was issued on — left its
+//! slot taken until restart. Ten abandoned challenges locked a DID out for
+//! good, and ~10,000 locked out the whole control plane: an unauthenticated
+//! denial of service. Expiry is now a property of the member, not an event
+//! someone must remember to deliver, so a missed release can over-count for at
+//! most `challenge_ttl` and never longer.
+//!
+//! A failed authentication does not consume the challenge — the canonical
+//! handler leaves the `ChallengeSent` row in place, so the caller may retry
+//! within the TTL — and so it deliberately does not release the slot either.
+//!
+//! ## Why the TTL and not the session sweep
+//!
+//! The `ChallengeSent` row outlives its TTL until the session sweep runs
+//! (`session_cleanup_interval`), but the canonical authenticate handler refuses
+//! it once `challenge_ttl` has passed. A challenge past its TTL can never be
+//! redeemed, so it is not pending, and holding its slot until the sweep would
+//! stretch a lockout by up to the sweep interval for nothing.
+//!
+//! ## Restart
+//!
+//! The set is in memory; the rows are in the store. At boot
+//! [`PendingChallengeTracker::seed_from_sessions`] reloads the still-redeemable
+//! `ChallengeSent` rows, so a restart neither forgets live challenges (which
+//! would let a caller exceed the caps across a restart) nor inherits phantom
+//! ones.
+//!
+//! ## Retry-After
+//!
+//! A refusal names exactly when a slot frees: the moment the oldest counted
+//! challenge (for the DID, or globally) passes its TTL. That is known here, so
+//! the hint is computed rather than configured.
+//!
+//! Out of scope: IP-level rate limiting — see `crate::rate_limit`.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use did_hosting_common::server::auth::session::{Session, SessionState, now_epoch};
+use did_hosting_common::server::config::AuthConfig;
+use tracing::{info, warn};
 
 use crate::error::{AppError, LIMITER_PENDING_CHALLENGES_PER_DID};
+use crate::store::KeyspaceHandle;
 
 /// The `limiter` a refusal on the global cap names in its 429 body. The
 /// per-DID refusal shares [`LIMITER_PENDING_CHALLENGES_PER_DID`] with the
 /// canonical handler's cap on the other binaries: it is the same limit.
 pub const LIMITER_GLOBAL: &str = "auth-challenge-pending-global";
 
-/// Hard cap on the total number of pending challenges across all
-/// DIDs. Defends against an attacker sweeping millions of distinct
-/// DIDs to accumulate per-DID-cap × N entries; once `total >=
-/// MAX_GLOBAL_PENDING`, all new challenge issuance is rejected.
+/// Hard cap on the total number of live challenges across all DIDs. Defends
+/// against an attacker sweeping many distinct DIDs to accumulate per-DID-cap ×
+/// N entries; once reached, all new issuance is refused until one expires or
+/// authenticates.
 ///
-/// Sized for a generous-but-bounded operator footprint: 10_000
-/// concurrent challenges = ~10x the per-DID cap × 1000 distinct
-/// DIDs in flight at the same time. Tunable via the constructor if
-/// a deployment legitimately needs more.
-pub const MAX_GLOBAL_PENDING: u64 = 10_000;
+/// Sized for a generous-but-bounded operator footprint: 10_000 concurrent
+/// challenges = ~10x the per-DID cap × 1000 distinct DIDs in flight at once.
+pub const MAX_GLOBAL_PENDING: usize = 10_000;
 
-/// In-memory tracker for pending-challenge counts.
-///
-/// Each `try_issue` is O(1): one `RwLock` read for the per-DID
-/// counter slot, then atomic increments on the per-DID and global
-/// counters. `release` is symmetric.
+/// Where the tracker reads the time from. Injectable so a test can move a
+/// challenge past its TTL without sleeping through it.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// A slot reserved by [`PendingChallengeTracker::try_issue`], to be attached to
+/// the session id the challenge was minted under
+/// ([`PendingChallengeTracker::bind`]) or handed back if minting failed
+/// ([`PendingChallengeTracker::cancel`]). Dropping one unused is not a leak:
+/// the slot expires with the TTL like any other.
+#[must_use = "bind the reservation to the issued session id, or cancel it"]
 #[derive(Debug)]
+pub struct Reservation {
+    id: u64,
+}
+
+#[derive(Debug)]
+struct Entry {
+    did: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    next_id: u64,
+    /// The live set. Its length is the global count.
+    entries: HashMap<u64, Entry>,
+    /// Session id → entry, for release on authentication.
+    by_session: HashMap<String, u64>,
+    /// Live entries per DID in expiry order. The deque's length is the per-DID
+    /// count; a DID with none has no key, so the map does not grow with every
+    /// DID ever seen.
+    per_did: HashMap<String, VecDeque<(Instant, u64)>>,
+    /// Every issued entry in expiry order. May hold ids already released;
+    /// those are skipped when they reach the front.
+    expiry: VecDeque<(Instant, u64)>,
+}
+
+impl Inner {
+    fn remove(&mut self, id: u64) -> bool {
+        let Some(entry) = self.entries.remove(&id) else {
+            return false;
+        };
+        if let Some(sid) = entry.session_id {
+            self.by_session.remove(&sid);
+        }
+        if let Some(q) = self.per_did.get_mut(&entry.did) {
+            q.retain(|(_, qid)| *qid != id);
+            if q.is_empty() {
+                self.per_did.remove(&entry.did);
+            }
+        }
+        true
+    }
+
+    /// Drop every entry whose TTL has passed, and any already-released ids at
+    /// the front of the expiry queue.
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(expires_at, id)) = self.expiry.front() {
+            let live = self.entries.contains_key(&id);
+            if live && expires_at > now {
+                break;
+            }
+            self.expiry.pop_front();
+            if live {
+                self.remove(id);
+            }
+        }
+    }
+
+    fn insert(&mut self, did: &str, expires_at: Instant, session_id: Option<String>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        if let Some(sid) = &session_id {
+            self.by_session.insert(sid.clone(), id);
+        }
+        self.entries.insert(
+            id,
+            Entry {
+                did: did.to_string(),
+                session_id,
+            },
+        );
+        insert_sorted(
+            self.per_did.entry(did.to_string()).or_default(),
+            expires_at,
+            id,
+        );
+        insert_sorted(&mut self.expiry, expires_at, id);
+        id
+    }
+}
+
+/// Insert keeping the queue in expiry order. Issuance always appends (a later
+/// issue expires later), so this is O(1) on the hot path; only boot seeding
+/// lands anywhere else.
+fn insert_sorted(q: &mut VecDeque<(Instant, u64)>, expires_at: Instant, id: u64) {
+    let pos = q.partition_point(|(e, _)| *e <= expires_at);
+    q.insert(pos, (expires_at, id));
+}
+
+/// Whole seconds until `at`, rounded up and never below 1 — a `Retry-After` of
+/// 0 invites an immediate retry that is still refused.
+fn secs_until(at: Instant, now: Instant) -> u64 {
+    let d = at.saturating_duration_since(now);
+    let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    secs.max(1)
+}
+
+/// In-memory set of live challenges. See the module docs.
 pub struct PendingChallengeTracker {
-    per_did: RwLock<HashMap<String, Arc<AtomicU64>>>,
-    global: AtomicU64,
-    global_cap: u64,
+    /// A `std::sync::Mutex` on purpose, and its guard is **never held across an
+    /// `.await`** (CWE-667, improper locking). Every async method here does its
+    /// awaits *before* it locks — `seed_from_sessions` reads the keyspace
+    /// (`prefix_iter_raw(..).await`) and only then calls `self.lock()` — and
+    /// every locked section below is purely synchronous (no `.await` between
+    /// `lock()` and the guard dropping). This is not merely a convention: an
+    /// `await` under this guard would make the enclosing future hold a
+    /// non-`Send` `MutexGuard` across a suspend point, and the async runtime
+    /// would refuse to compile it. A tokio mutex here would compile such a bug
+    /// silently, so the std mutex is the stricter, deliberate choice.
+    inner: Mutex<Inner>,
+    challenge_ttl: Duration,
+    global_cap: usize,
+    clock: Clock,
+}
+
+impl std::fmt::Debug for PendingChallengeTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingChallengeTracker")
+            .field("challenge_ttl", &self.challenge_ttl)
+            .field("global_cap", &self.global_cap)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for PendingChallengeTracker {
+    /// The default `challenge_ttl` and global cap. Production builds the
+    /// tracker from its configuration with [`Self::for_auth_config`].
     fn default() -> Self {
-        Self::with_global_cap(MAX_GLOBAL_PENDING)
+        Self::for_auth_config(&AuthConfig::default())
     }
 }
 
@@ -77,61 +257,69 @@ impl PendingChallengeTracker {
         Self::default()
     }
 
-    pub fn with_global_cap(global_cap: u64) -> Self {
+    /// A tracker whose challenges live for the configured `challenge_ttl` —
+    /// the same bound the authenticate handler enforces — and whose global cap
+    /// is the configured `max_global_pending_challenges` (default
+    /// [`MAX_GLOBAL_PENDING`]). The per-DID cap is applied per call by
+    /// `routes::auth::issue_challenge`, which reads
+    /// `max_pending_challenges_per_did` from the same config.
+    pub fn for_auth_config(auth: &AuthConfig) -> Self {
+        Self::with_clock(
+            Duration::from_secs(auth.challenge_ttl),
+            auth.max_global_pending_challenges,
+            Arc::new(Instant::now),
+        )
+    }
+
+    pub fn with_clock(challenge_ttl: Duration, global_cap: usize, clock: Clock) -> Self {
         Self {
-            per_did: RwLock::new(HashMap::new()),
-            global: AtomicU64::new(0),
+            inner: Mutex::new(Inner::default()),
+            challenge_ttl,
             global_cap,
+            clock,
         }
     }
 
-    /// Atomically reserve one pending-challenge slot for `did`.
-    ///
-    /// Rejects if either the per-DID cap (caller-supplied) or the
-    /// global cap has been hit. On success, the caller owes a
-    /// matching `release(did)` once the challenge is consumed
-    /// (authenticated) or expires (cleanup).
-    ///
-    /// On failure no counters are bumped. `try_issue` may be retried
-    /// after a `release` call frees a slot.
-    ///
-    /// A refusal is an [`AppError::RateLimited`] carrying
-    /// `retry_after_secs`. The tracker cannot know when a slot frees — that
-    /// is when a pending challenge authenticates or the session sweep
-    /// expires it — so the caller supplies the bound from its configuration.
-    pub async fn try_issue(
-        &self,
-        did: &str,
-        per_did_cap: u64,
-        retry_after_secs: u64,
-    ) -> Result<(), AppError> {
-        // Read or create the per-DID counter slot. The HashMap entry
-        // lives for the lifetime of the process — over time it
-        // accumulates one slot per distinct DID seen. That's
-        // bounded in practice by the ACL size; an attacker spraying
-        // unique DIDs is bounded by the global cap below, which
-        // refuses to issue *and so* prevents the HashMap from
-        // growing past that point. (We could LRU-evict the per-DID
-        // counters after a quiet period; defer until profiling
-        // shows it's a hotspot.)
-        let counter = {
-            let read = self.per_did.read().await;
-            if let Some(c) = read.get(did) {
-                c.clone()
-            } else {
-                drop(read);
-                let mut write = self.per_did.write().await;
-                write
-                    .entry(did.to_string())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .clone()
-            }
-        };
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // No code path panics while holding the lock, but a poisoned tracker
+        // must not take authentication down with it: the set is still sound.
+        //
+        // CWE-667: the returned guard is synchronous-only — hold it across an
+        // `.await` and the future stops being `Send` and fails to compile (see
+        // the note on the `inner` field). Do the keyspace read before locking.
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
-        // Check the global cap first; this is the cheaper rejection
-        // path for the most-likely attacker shape (sweep of distinct
-        // DIDs). The per-DID counter is then advisory.
-        if self.global.load(Ordering::Relaxed) >= self.global_cap {
+    /// Reserve a slot for a challenge to `did`.
+    ///
+    /// Refused with [`AppError::RateLimited`] when the DID already holds
+    /// `per_did_cap` live challenges or the global cap is reached. The
+    /// refusal's `retry_after_secs` is when the oldest counted challenge
+    /// expires — the earliest moment a retry can succeed. On refusal nothing
+    /// is reserved.
+    pub fn try_issue(&self, did: &str, per_did_cap: usize) -> Result<Reservation, AppError> {
+        let now = (self.clock)();
+        let mut inner = self.lock();
+        inner.prune(now);
+
+        // CWE-400 (uncontrolled resource consumption): memory here is bounded,
+        // and this check is where. `prune(now)` above drops every expired
+        // member first; then issuance is refused once the live set reaches
+        // `global_cap`, *before* any insert. So `entries`, `by_session`,
+        // `per_did` (empty deques are removed) and `expiry` are each capped at
+        // `global_cap` entries — the set cannot grow without limit. Refusing at
+        // the cap is fail-closed by design (a full set rejects new challenges
+        // rather than evicting live ones), and the per-IP limiter
+        // (`crate::rate_limit`, 30 req / 60 s) throttles how fast the cap can be
+        // approached at all.
+        //
+        // Global first: the cheaper rejection for the likeliest attack shape
+        // (a sweep of distinct DIDs).
+        if inner.entries.len() >= self.global_cap {
+            let retry_after_secs = inner
+                .expiry
+                .front()
+                .map_or(1, |(expires_at, _)| secs_until(*expires_at, now));
             return Err(AppError::RateLimited {
                 limiter: LIMITER_GLOBAL,
                 message: format!(
@@ -141,7 +329,12 @@ impl PendingChallengeTracker {
                 retry_after_secs,
             });
         }
-        if counter.load(Ordering::Relaxed) >= per_did_cap {
+        if let Some(q) = inner.per_did.get(did)
+            && q.len() >= per_did_cap
+        {
+            let retry_after_secs = q
+                .front()
+                .map_or(1, |(expires_at, _)| secs_until(*expires_at, now));
             return Err(AppError::RateLimited {
                 limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
                 message: format!(
@@ -151,59 +344,109 @@ impl PendingChallengeTracker {
             });
         }
 
-        // Two non-atomic increments — between the global check and
-        // this fetch_add another caller could nudge the counter past
-        // the cap. The over-shoot is bounded by request concurrency
-        // (a few requests at most) and is benign — an attacker
-        // cannot exploit it to get past the cap by orders of
-        // magnitude. Strict atomicity would require CAS-loops on
-        // both counters, which complicates the code without making
-        // the cap meaningfully tighter.
-        counter.fetch_add(1, Ordering::Relaxed);
-        self.global.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        let id = inner.insert(did, now + self.challenge_ttl, None);
+        Ok(Reservation { id })
     }
 
-    /// Decrement both counters for `did`. Saturating-subtract so a
-    /// double-release (e.g. a session expired AND was authenticated
-    /// in the same window) is a no-op rather than a panic or
-    /// underflow.
-    pub async fn release(&self, did: &str) {
-        let counter = {
-            let read = self.per_did.read().await;
-            read.get(did).cloned()
-        };
-        if let Some(c) = counter {
-            // saturating_sub prevents underflow if release is called
-            // more times than try_issue (e.g. cleanup races
-            // authenticate). Skipped if the per-DID slot is missing
-            // entirely, which can happen after restart.
-            let prev = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
-            if prev.is_ok() {
-                self.global
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    })
-                    .ok();
+    /// Attach the session id the challenge was issued under, so a successful
+    /// authentication can release exactly this slot.
+    pub fn bind(&self, reservation: Reservation, session_id: &str) {
+        let mut inner = self.lock();
+        let Inner {
+            entries,
+            by_session,
+            ..
+        } = &mut *inner;
+        // Already expired (a TTL shorter than minting took): nothing to bind.
+        if let Some(entry) = entries.get_mut(&reservation.id) {
+            entry.session_id = Some(session_id.to_string());
+            by_session.insert(session_id.to_string(), reservation.id);
+        }
+    }
+
+    /// Hand back a slot whose challenge was never issued.
+    pub fn cancel(&self, reservation: Reservation) {
+        self.lock().remove(reservation.id);
+    }
+
+    /// Release the slot of the challenge issued under `session_id`, because it
+    /// authenticated. Idempotent: a session this tracker does not hold (already
+    /// released, expired, or issued before a restart that did not seed it) is a
+    /// no-op, so a double release cannot free someone else's slot.
+    pub fn release_session(&self, session_id: &str) -> bool {
+        let now = (self.clock)();
+        let mut inner = self.lock();
+        inner.prune(now);
+        match inner.by_session.get(session_id).copied() {
+            Some(id) => inner.remove(id),
+            None => false,
+        }
+    }
+
+    /// Reload the still-redeemable `ChallengeSent` rows from the session store,
+    /// so the caps hold across a restart. Call once at boot, before serving.
+    ///
+    /// A row is redeemable while `now - created_at <= challenge_ttl` (the
+    /// authenticate handler's rule); older rows are left for the session sweep.
+    /// Seeding ignores the caps: these challenges were already issued.
+    pub async fn seed_from_sessions(&self, sessions: &KeyspaceHandle) -> Result<usize, AppError> {
+        let rows = sessions.prefix_iter_raw("session:").await?;
+        let now_epoch = now_epoch();
+        let now = (self.clock)();
+        let ttl = self.challenge_ttl.as_secs();
+        let mut inner = self.lock();
+        let mut seeded = 0usize;
+        for (_key, value) in rows {
+            let Ok(session) = serde_json::from_slice::<Session>(&value) else {
+                continue;
+            };
+            if session.state != SessionState::ChallengeSent {
+                continue;
+            }
+            let expires_epoch = session.created_at.saturating_add(ttl);
+            if expires_epoch < now_epoch {
+                continue;
+            }
+            if inner.by_session.contains_key(&session.session_id) {
+                continue;
+            }
+            // `+ 1`: the handler accepts the whole final second (`>` not `>=`).
+            let remaining = Duration::from_secs(expires_epoch - now_epoch + 1);
+            inner.insert(&session.did, now + remaining, Some(session.session_id));
+            seeded += 1;
+        }
+        Ok(seeded)
+    }
+
+    /// [`Self::seed_from_sessions`], logging instead of failing: a tracker that
+    /// could not be seeded under-counts for at most one `challenge_ttl`, which
+    /// is no reason to refuse to start.
+    pub async fn seed_from_sessions_or_warn(&self, sessions: &KeyspaceHandle) {
+        match self.seed_from_sessions(sessions).await {
+            Ok(n) => info!(
+                seeded = n,
+                "pending-challenge tracker seeded from session store"
+            ),
+            Err(e) => {
+                warn!(error = %e, "could not seed pending-challenge tracker from session store")
             }
         }
     }
 
-    /// Test/observability accessor — returns the current pending
-    /// count for a DID, or 0 if no slot has been allocated.
-    #[cfg(test)]
-    pub async fn count_for(&self, did: &str) -> u64 {
-        let read = self.per_did.read().await;
-        read.get(did)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
+    /// Live challenges held for `did`.
+    pub fn count_for(&self, did: &str) -> usize {
+        let now = (self.clock)();
+        let mut inner = self.lock();
+        inner.prune(now);
+        inner.per_did.get(did).map_or(0, VecDeque::len)
     }
 
-    #[cfg(test)]
-    pub fn global_count(&self) -> u64 {
-        self.global.load(Ordering::Relaxed)
+    /// Live challenges across all DIDs.
+    pub fn global_count(&self) -> usize {
+        let now = (self.clock)();
+        let mut inner = self.lock();
+        inner.prune(now);
+        inner.entries.len()
     }
 }
 
@@ -211,91 +454,315 @@ impl PendingChallengeTracker {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn issues_within_caps() {
-        let t = PendingChallengeTracker::with_global_cap(100);
-        for _ in 0..5 {
-            t.try_issue("did:example:a", 10, 60).await.unwrap();
+    const TTL: Duration = Duration::from_secs(30);
+
+    /// A clock the test moves by hand.
+    fn manual_clock() -> (Clock, Arc<Mutex<Instant>>) {
+        let t = Arc::new(Mutex::new(Instant::now()));
+        let c = t.clone();
+        (Arc::new(move || *c.lock().unwrap()), t)
+    }
+
+    fn advance(t: &Mutex<Instant>, d: Duration) {
+        *t.lock().unwrap() += d;
+    }
+
+    fn tracker(global_cap: usize) -> (PendingChallengeTracker, Arc<Mutex<Instant>>) {
+        let (clock, t) = manual_clock();
+        (
+            PendingChallengeTracker::with_clock(TTL, global_cap, clock),
+            t,
+        )
+    }
+
+    fn issue(t: &PendingChallengeTracker, did: &str, cap: usize, sid: &str) {
+        let r = t.try_issue(did, cap).expect("under the cap");
+        t.bind(r, sid);
+    }
+
+    #[test]
+    fn issues_within_caps() {
+        let (t, _) = tracker(100);
+        for i in 0..5 {
+            issue(&t, "did:example:a", 10, &format!("s{i}"));
         }
-        assert_eq!(t.count_for("did:example:a").await, 5);
+        assert_eq!(t.count_for("did:example:a"), 5);
         assert_eq!(t.global_count(), 5);
     }
 
-    #[tokio::test]
-    async fn per_did_cap_rejects_excess() {
-        let t = PendingChallengeTracker::with_global_cap(100);
-        for _ in 0..3 {
-            t.try_issue("did:example:a", 3, 60).await.unwrap();
-        }
-        let err = t.try_issue("did:example:a", 3, 60).await.unwrap_err();
+    #[test]
+    fn per_did_cap_rejects_excess_with_the_time_until_the_oldest_expires() {
+        let (t, clock) = tracker(100);
+        issue(&t, "did:example:a", 3, "s0");
+        advance(&clock, Duration::from_secs(10));
+        issue(&t, "did:example:a", 3, "s1");
+        issue(&t, "did:example:a", 3, "s2");
+
+        let err = t.try_issue("did:example:a", 3).unwrap_err();
+        // The oldest was issued 10s ago with a 30s TTL: 20s until a slot frees.
         assert!(matches!(
             err,
             AppError::RateLimited {
                 limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
-                retry_after_secs: 60,
+                retry_after_secs: 20,
                 ..
             }
         ));
     }
 
-    /// Sweep-attack defence: many distinct DIDs each within the per-
-    /// DID cap should still hit the global cap and be refused.
-    #[tokio::test]
-    async fn global_cap_rejects_sweep_of_distinct_dids() {
-        let t = PendingChallengeTracker::with_global_cap(5);
-        // Five DIDs, one challenge each, fills the global cap.
-        for i in 0..5 {
-            t.try_issue(&format!("did:example:{i}"), 10, 60)
-                .await
-                .unwrap();
+    /// The regression: challenges that are never redeemed must give their
+    /// slots back when they expire. Before, only a successful authentication
+    /// released a slot, so this DID stayed locked out until restart.
+    #[test]
+    fn abandoned_challenges_free_their_per_did_slots_on_expiry() {
+        let (t, clock) = tracker(100);
+        for i in 0..10 {
+            issue(&t, "did:example:a", 10, &format!("s{i}"));
         }
-        assert_eq!(t.global_count(), 5);
-        // Sixth distinct DID is within per-DID cap (0/10) but
-        // global is full.
-        let err = t.try_issue("did:example:6", 10, 60).await.unwrap_err();
+        let err = t.try_issue("did:example:a", 10).unwrap_err();
+        let AppError::RateLimited {
+            retry_after_secs, ..
+        } = err
+        else {
+            panic!("expected a rate limit, got {err:?}");
+        };
+
+        // The hint is truthful: one second short, still refused ...
+        advance(&clock, Duration::from_secs(retry_after_secs - 1));
+        assert!(t.try_issue("did:example:a", 10).is_err());
+        // ... and at the hinted moment, accepted.
+        advance(&clock, Duration::from_secs(1));
+        issue(&t, "did:example:a", 10, "fresh");
+        assert_eq!(t.count_for("did:example:a"), 1);
+        assert_eq!(t.global_count(), 1);
+    }
+
+    #[test]
+    fn abandoned_challenges_free_global_slots_on_expiry() {
+        let (t, clock) = tracker(5);
+        for i in 0..5 {
+            issue(&t, &format!("did:example:{i}"), 10, &format!("s{i}"));
+        }
+        let err = t.try_issue("did:example:6", 10).unwrap_err();
         assert!(matches!(
             err,
             AppError::RateLimited {
                 limiter: LIMITER_GLOBAL,
-                retry_after_secs: 60,
+                retry_after_secs: 30,
+                ..
+            }
+        ));
+
+        advance(&clock, TTL + Duration::from_millis(1));
+        assert_eq!(t.global_count(), 0);
+        issue(&t, "did:example:6", 10, "s6");
+        // Emptied DIDs leave no residue in the per-DID map.
+        assert_eq!(t.lock().per_did.len(), 1);
+    }
+
+    #[test]
+    fn authentication_releases_exactly_its_own_slot() {
+        let (t, _) = tracker(100);
+        issue(&t, "did:example:a", 10, "s1");
+        issue(&t, "did:example:a", 10, "s2");
+        assert!(t.release_session("s1"));
+        assert_eq!(t.count_for("did:example:a"), 1);
+        assert_eq!(t.global_count(), 1);
+        assert!(t.lock().by_session.contains_key("s2"));
+    }
+
+    /// Double release (and release after expiry) cannot underflow or free a
+    /// different challenge's slot.
+    #[test]
+    fn double_release_is_a_noop() {
+        let (t, clock) = tracker(100);
+        issue(&t, "did:example:a", 10, "s1");
+        issue(&t, "did:example:a", 10, "s2");
+        assert!(t.release_session("s1"));
+        assert!(!t.release_session("s1"));
+        assert!(!t.release_session("s1"));
+        assert_eq!(t.count_for("did:example:a"), 1);
+        assert_eq!(t.global_count(), 1);
+
+        advance(&clock, TTL + Duration::from_secs(1));
+        assert!(!t.release_session("s2"), "already expired");
+        assert_eq!(t.global_count(), 0);
+    }
+
+    #[test]
+    fn release_unknown_session_is_a_noop() {
+        let (t, _) = tracker(100);
+        assert!(!t.release_session("never-issued"));
+        assert_eq!(t.global_count(), 0);
+    }
+
+    #[test]
+    fn cancel_hands_the_slot_back() {
+        let (t, _) = tracker(1);
+        let r = t.try_issue("did:example:a", 10).unwrap();
+        t.cancel(r);
+        assert_eq!(t.global_count(), 0);
+        issue(&t, "did:example:b", 10, "s");
+    }
+
+    /// Released ids left in the expiry queue do not hold slots or distort the
+    /// global retry hint.
+    #[test]
+    fn released_entries_do_not_linger_in_the_expiry_queue() {
+        let (t, clock) = tracker(2);
+        issue(&t, "did:example:a", 10, "old");
+        advance(&clock, Duration::from_secs(10));
+        issue(&t, "did:example:b", 10, "mid");
+        assert!(t.release_session("old"));
+        issue(&t, "did:example:c", 10, "new");
+
+        let err = t.try_issue("did:example:d", 10).unwrap_err();
+        // Oldest *live* entry is "mid", issued at +10s with TTL 30s, now +10s.
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                retry_after_secs: 30,
                 ..
             }
         ));
     }
 
-    #[tokio::test]
-    async fn release_decrements_both_counters() {
-        let t = PendingChallengeTracker::with_global_cap(100);
-        t.try_issue("did:example:a", 10, 60).await.unwrap();
-        t.try_issue("did:example:a", 10, 60).await.unwrap();
-        assert_eq!(t.count_for("did:example:a").await, 2);
-        assert_eq!(t.global_count(), 2);
-
-        t.release("did:example:a").await;
-        assert_eq!(t.count_for("did:example:a").await, 1);
-        assert_eq!(t.global_count(), 1);
+    #[test]
+    fn retry_after_rounds_up_and_is_at_least_one() {
+        let now = Instant::now();
+        assert_eq!(secs_until(now, now), 1);
+        assert_eq!(secs_until(now + Duration::from_millis(1), now), 1);
+        assert_eq!(secs_until(now + Duration::from_millis(1001), now), 2);
+        assert_eq!(secs_until(now + Duration::from_secs(5), now), 5);
     }
 
-    /// Saturating semantics: extra releases past zero do not
-    /// underflow into ~u64::MAX. Pinning this catches a regression
-    /// where someone replaces `fetch_update`-with-saturating with a
-    /// raw `fetch_sub`.
-    #[tokio::test]
-    async fn release_saturates_at_zero() {
-        let t = PendingChallengeTracker::with_global_cap(100);
-        t.try_issue("did:example:a", 10, 60).await.unwrap();
-        t.release("did:example:a").await;
-        t.release("did:example:a").await; // double-release
-        t.release("did:example:a").await; // triple-release
-        assert_eq!(t.count_for("did:example:a").await, 0);
-        assert_eq!(t.global_count(), 0);
+    /// A custom global cap is honoured: the (cap+1)th distinct-DID challenge is
+    /// refused on the global limiter, whatever the cap is set to.
+    #[test]
+    fn custom_global_cap_is_honoured() {
+        let (t, _) = tracker(3);
+        for i in 0..3 {
+            issue(&t, &format!("did:example:{i}"), 10, &format!("s{i}"));
+        }
+        assert_eq!(t.global_count(), 3);
+        let err = t.try_issue("did:example:over", 10).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                ..
+            }
+        ));
     }
 
-    /// Releasing a DID that was never issued is a no-op.
+    /// `for_auth_config` plumbs the configured `max_global_pending_challenges`
+    /// into the tracker (not the compiled-in default).
+    #[test]
+    fn for_auth_config_uses_the_configured_global_cap() {
+        let auth = AuthConfig {
+            max_global_pending_challenges: 2,
+            ..AuthConfig::default()
+        };
+        let t = PendingChallengeTracker::for_auth_config(&auth);
+        // The per-DID cap is high, so only the global cap can bite.
+        t.bind(t.try_issue("did:example:a", 100).unwrap(), "s0");
+        t.bind(t.try_issue("did:example:b", 100).unwrap(), "s1");
+        let err = t.try_issue("did:example:c", 100).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_GLOBAL,
+                ..
+            }
+        ));
+    }
+
+    /// The config defaults must equal the compiled-in constants that document
+    /// them, across the crate boundary (the constants live here; the config
+    /// defaults live in the lower did-hosting-common crate, which cannot
+    /// reference them). This test is the pin that keeps the two in step.
+    #[test]
+    fn config_defaults_match_constants() {
+        let auth = AuthConfig::default();
+        assert_eq!(auth.max_global_pending_challenges, MAX_GLOBAL_PENDING);
+        assert_eq!(
+            auth.max_pending_challenges_per_did,
+            crate::routes::auth::MAX_PENDING_CHALLENGES_PER_DID,
+        );
+    }
+}
+
+#[cfg(all(test, feature = "store-fjall"))]
+mod seed_tests {
+    use super::*;
+    use did_hosting_common::server::auth::session::store_session;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::store::{KS_SESSIONS, Store};
+
+    fn row(session_id: &str, did: &str, state: SessionState, created_at: u64) -> Session {
+        Session {
+            session_id: session_id.into(),
+            did: did.into(),
+            challenge: "c".into(),
+            state,
+            created_at,
+            last_seen: created_at,
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr: vec![],
+            acr: String::new(),
+            acr_expires_at: None,
+        }
+    }
+
+    /// A restart must neither forget live challenges nor inherit dead ones.
     #[tokio::test]
-    async fn release_unknown_did_noop() {
-        let t = PendingChallengeTracker::with_global_cap(100);
-        t.release("did:example:never-seen").await;
-        assert_eq!(t.global_count(), 0);
+    async fn seeding_reloads_only_redeemable_challenges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        let now = now_epoch();
+        let did = "did:example:a";
+        for i in 0..3 {
+            store_session(
+                &ks,
+                &row(&format!("live{i}"), did, SessionState::ChallengeSent, now),
+            )
+            .await
+            .unwrap();
+        }
+        store_session(
+            &ks,
+            &row("stale", did, SessionState::ChallengeSent, now - 3600),
+        )
+        .await
+        .unwrap();
+        store_session(&ks, &row(did, did, SessionState::Authenticated, now))
+            .await
+            .unwrap();
+
+        let t = PendingChallengeTracker::with_clock(
+            Duration::from_secs(30),
+            100,
+            Arc::new(Instant::now),
+        );
+        assert_eq!(t.seed_from_sessions(&ks).await.unwrap(), 3);
+        assert_eq!(t.count_for(did), 3);
+        // Seeded slots are held under their session ids: authenticating one
+        // after the restart releases it.
+        assert!(t.release_session("live0"));
+        assert_eq!(t.count_for(did), 2);
+        // Seeding twice does not double count.
+        assert_eq!(t.seed_from_sessions(&ks).await.unwrap(), 1);
+        assert_eq!(t.count_for(did), 3);
     }
 }

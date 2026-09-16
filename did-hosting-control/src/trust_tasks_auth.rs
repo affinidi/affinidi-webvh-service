@@ -62,8 +62,8 @@ use trust_tasks_rs::{
 };
 
 use did_hosting_common::server::trust_tasks::{DispatchOutcome, run_pipeline};
-use vti_common::auth::backend::{AuthenticateInput, ChallengeInput, RefreshInput};
-use vti_common::auth::handlers::{handle_authenticate, handle_challenge, handle_refresh};
+use vti_common::auth::backend::{AuthenticateInput, RefreshInput};
+use vti_common::auth::handlers::{handle_authenticate, handle_refresh};
 
 use crate::server::AppState;
 
@@ -209,8 +209,6 @@ async fn challenge_arm(
     parties: &ResolvedParties,
 ) -> Result<TrustTask<vta_sdk::protocols::auth::ChallengeResponse>, ErrorResponse> {
     let did = caller(&doc, parties)?;
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
-        .map_err(|e| denied(&doc, "challenge/backend", e))?;
 
     // `subject` in the payload is the VID the producer *intends* to
     // authenticate as. It is not taken as the caller: the challenge is bound to
@@ -218,15 +216,19 @@ async fn challenge_arm(
     // on someone else's behalf gets one bound to itself and fails at
     // authenticate. Honouring it would make the challenge a request for a
     // credential naming an arbitrary subject.
-    let resp = handle_challenge(
-        &backend,
-        ChallengeInput {
-            did,
-            session_pubkey_b58btc: None,
-        },
-    )
-    .await
-    .map_err(|e| denied(&doc, "challenge", e))?;
+    //
+    // Issued through the same path as `POST /api/auth/challenge`, so the
+    // per-DID and global pending-challenge caps hold on every binding — before,
+    // this arm called the canonical handler directly with its per-DID limit
+    // disabled, and challenges over DIDComm/TSP were unbounded. (The per-IP
+    // limiter has no meaning here: there is no client IP on a messaging
+    // binding.) The Trust Task specification defines no rate-limit code, so a
+    // refusal takes this arm's existing mapping for every challenge failure —
+    // `permissionDenied`, with the limiter and retry hint in the operator log
+    // only.
+    let resp = crate::routes::auth::issue_challenge(state, did)
+        .await
+        .map_err(|e| denied(&doc, "challenge", e))?;
 
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }
@@ -241,10 +243,11 @@ async fn authenticate_arm(
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
         .map_err(|e| denied(&doc, "authenticate/backend", e))?;
 
+    let session_id = doc.payload.session_id.to_string();
     let resp = handle_authenticate(
         &backend,
         AuthenticateInput {
-            session_id: doc.payload.session_id.to_string(),
+            session_id: session_id.clone(),
             challenge: doc.payload.challenge.to_string(),
             // The verified signer. See the module doc: this is the document's
             // proof identity, bound to the asserted `issuer` when there is one
@@ -262,6 +265,9 @@ async fn authenticate_arm(
     )
     .await
     .map_err(|e| denied(&doc, "authenticate", e))?;
+
+    // The challenge is spent: free its slot, whichever binding issued it.
+    state.pending_challenges.release_session(&session_id);
 
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }

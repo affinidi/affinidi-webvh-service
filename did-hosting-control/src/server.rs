@@ -142,11 +142,12 @@ pub struct AppState {
     /// through one queue, closing the race the last-authority guard
     /// would otherwise have.
     pub acl_locks: did_hosting_common::server::path_locks::PathLocks,
-    /// Bounded counter for pending DIDComm authentication challenges.
-    /// Replaces an O(N) prefix scan in `routes::auth::challenge` with
-    /// O(1) per-DID and global counters; closes the unauthenticated
+    /// Bounded set of live authentication challenges, with per-DID and
+    /// global caps. Replaces an O(N) prefix scan in
+    /// `routes::auth::challenge`; closes the unauthenticated
     /// challenge-endpoint storage-exhaustion + CPU-amplification
-    /// surface (review SM3).
+    /// surface (review SM3). Members expire with `challenge_ttl`, so a
+    /// slot is never held past the life of its challenge.
     pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
     /// Per-IP rate limiter for the unauthenticated challenge endpoint.
     /// Network-layer defence-in-depth that complements the per-DID +
@@ -316,6 +317,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         )
     });
 
+    let pending_challenges =
+        crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -386,11 +390,17 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+        pending_challenges: Arc::new(pending_challenges),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
+
+    // Reload challenges issued before a restart, so the caps hold across it.
+    state
+        .pending_challenges
+        .seed_from_sessions_or_warn(&state.sessions_ks)
+        .await;
 
     backfill_service_badges(&state.store).await;
 

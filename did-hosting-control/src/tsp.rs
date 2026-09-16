@@ -302,4 +302,161 @@ mod tests {
             "response threads to the request id"
         );
     }
+
+    /// `auth/challenge/0.1` over a messaging binding is held to the same
+    /// pending-challenge caps as `POST /api/auth/challenge`. It used to call
+    /// the canonical handler directly with its per-DID limit disabled, so
+    /// challenges over DIDComm/TSP were unbounded. A refusal answers
+    /// `permissionDenied` — the arm's mapping for every challenge failure; the
+    /// specification defines no rate-limit code — and the slots free when the
+    /// challenges expire.
+    #[tokio::test]
+    async fn challenge_over_tsp_is_capped_and_frees_on_expiry() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        use crate::pending_challenges::PendingChallengeTracker;
+
+        let (mut state, _dir) = test_state().await;
+        state.jwt_keys = Some(Arc::new(
+            crate::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
+        ));
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock = now.clone();
+        let ttl = Duration::from_secs(AuthConfig::default().challenge_ttl);
+        state.pending_challenges = Arc::new(PendingChallengeTracker::with_clock(
+            ttl,
+            crate::pending_challenges::MAX_GLOBAL_PENDING,
+            Arc::new(move || *clock.lock().unwrap()),
+        ));
+
+        let challenge = |i: u32| {
+            serde_json::to_vec(&json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": "https://trusttasks.org/spec/auth/challenge/0.1",
+                "recipient": SERVICE_DID,
+                "issuedAt": chrono::Utc::now().to_rfc3339(),
+                "payload": { "purpose": format!("login-{i}") }
+            }))
+            .unwrap()
+        };
+        async fn send(state: &AppState, body: &[u8]) -> Value {
+            let out = run_tsp_trust_task(state, SENDER_DID, body)
+                .await
+                .expect("handler ok")
+                .expect("a response is emitted");
+            serde_json::from_slice(&out).expect("response is JSON")
+        }
+
+        for i in 0..crate::routes::auth::MAX_PENDING_CHALLENGES_PER_DID as u32 {
+            let doc = send(&state, &challenge(i)).await;
+            assert_eq!(
+                doc["type"], "https://trusttasks.org/spec/auth/challenge/0.1#response",
+                "challenge {i} under the cap: {doc}"
+            );
+        }
+        assert_eq!(state.pending_challenges.count_for(SENDER_DID), 10);
+
+        let refused = send(&state, &challenge(99)).await;
+        assert_eq!(
+            refused["payload"]["code"], "permissionDenied",
+            "over the cap: {refused}"
+        );
+        assert_eq!(state.pending_challenges.count_for(SENDER_DID), 10);
+
+        // Nobody redeems them. Once they expire the DID can ask again.
+        *now.lock().unwrap() += ttl + Duration::from_secs(1);
+        let doc = send(&state, &challenge(100)).await;
+        assert_eq!(
+            doc["type"], "https://trusttasks.org/spec/auth/challenge/0.1#response",
+            "{doc}"
+        );
+        assert_eq!(state.pending_challenges.count_for(SENDER_DID), 1);
+    }
+
+    /// A failed authenticate leaves the challenge redeemable, so it keeps its
+    /// slot; a successful one frees exactly that slot — including when the
+    /// challenge was issued on another binding, since release is keyed by the
+    /// session id rather than by which route issued it.
+    #[tokio::test]
+    async fn authenticate_over_tsp_releases_only_on_success() {
+        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+        use did_hosting_common::server::domain::DomainScope;
+
+        // `auth/authenticate/0.1` requires a proof, so the caller is a did:key
+        // that signs its documents, verified without network I/O.
+        let (caller, signer) = crate::signing::test_util::did_key_signer(&[21u8; 32]);
+        let (mut state, _dir) = test_state().await;
+        state.jwt_keys = Some(Arc::new(
+            crate::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
+        ));
+        state.trust_tasks_verifier = Some(Arc::new(
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
+                Arc::new(affinidi_data_integrity::DidKeyResolver),
+            ),
+        ));
+        // Enrolled, so the challenge row is persisted and can be redeemed.
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: caller.clone(),
+                role: Role::Owner,
+                label: None,
+                created_at: crate::auth::session::now_epoch(),
+                max_total_size: None,
+                max_did_count: None,
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Two challenges, issued the way `POST /api/auth/challenge` issues them.
+        let first = crate::routes::auth::issue_challenge(&state, caller.clone())
+            .await
+            .unwrap();
+        let _second = crate::routes::auth::issue_challenge(&state, caller.clone())
+            .await
+            .unwrap();
+        assert_eq!(state.pending_challenges.count_for(&caller), 2);
+
+        let authenticate = async |challenge: &str| {
+            let unsigned = json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
+                "issuer": caller,
+                "recipient": SERVICE_DID,
+                "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "payload": { "sessionId": first.session_id, "challenge": challenge }
+            });
+            let signed = crate::signing::sign_trust_task_document(unsigned, &signer)
+                .await
+                .unwrap();
+            let out = run_tsp_trust_task(&state, &caller, &serde_json::to_vec(&signed).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<Value>(&out).unwrap()
+        };
+
+        let doc = authenticate(&"00".repeat(32)).await;
+        assert_eq!(doc["payload"]["code"], "permissionDenied", "{doc}");
+        assert_eq!(
+            state.pending_challenges.count_for(&caller),
+            2,
+            "a failed authenticate does not consume the challenge, so it keeps its slot"
+        );
+
+        let doc = authenticate(&first.challenge).await;
+        assert_eq!(
+            doc["type"], "https://trusttasks.org/spec/auth/authenticate/0.1#response",
+            "{doc}"
+        );
+        assert_eq!(state.pending_challenges.count_for(&caller), 1);
+        assert!(
+            !state.pending_challenges.release_session(&first.session_id),
+            "already released: a second release is a no-op"
+        );
+        assert_eq!(state.pending_challenges.count_for(&caller), 1);
+    }
 }
