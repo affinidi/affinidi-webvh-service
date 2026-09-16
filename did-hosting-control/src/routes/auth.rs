@@ -22,8 +22,9 @@ use crate::server::AppState;
 /// Maximum concurrent pending challenges per DID. Combined with the
 /// global cap on the `pending_challenges` tracker on `AppState`, this
 /// bounds the unauthenticated challenge-endpoint surface against both
-/// per-DID floods and DID-sweep attacks.
-const MAX_PENDING_CHALLENGES_PER_DID: u64 = 10;
+/// per-DID floods and DID-sweep attacks. Shared with the
+/// `auth/challenge/0.1` Trust Task handler, which applies the same caps.
+pub(crate) const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
 
 /// POST /api/auth/challenge — request a challenge nonce.
 ///
@@ -32,8 +33,10 @@ const MAX_PENDING_CHALLENGES_PER_DID: u64 = 10;
 ///    from any single IP regardless of which DID they're issuing
 ///    challenges for. Trusted-proxy XFF resolution per
 ///    `server.trusted_proxies` config.
-/// 2. Per-DID + global pending-challenge cap (`PendingChallengeTracker`)
-///    — caps the active session population.
+/// 2. Per-DID + global cap on live challenges (`PendingChallengeTracker`).
+///    A slot frees when its challenge authenticates or its
+///    `challenge_ttl` runs out, and a refusal's `Retry-After` is the
+///    moment the oldest counted challenge expires.
 ///
 /// Replaced an earlier O(N) `prefix_iter_raw("session:")` scan with
 /// the O(1) in-memory tracker (review SM3).
@@ -58,31 +61,7 @@ pub async fn challenge(
             warn!(ip = %client_ip, error = %e, "challenge IP rate limited");
         })?;
 
-    // Reserve a pending-challenge slot via the O(1) tracker. Per-DID
-    // cap + global cap (against DID-sweep attacks). The canonical
-    // handler's per-DID limit is disabled in this backend; the
-    // tracker is the single source of truth.
-    state
-        .pending_challenges
-        .try_issue(
-            &req.did,
-            MAX_PENDING_CHALLENGES_PER_DID,
-            state.config.auth.pending_challenge_retry_after_secs(),
-        )
-        .await
-        .inspect_err(|e| {
-            warn!(did = %req.did, error = %e, "challenge rate limited");
-        })?;
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
-    let canonical = vti_common::auth::handlers::handle_challenge(
-        &backend,
-        vti_common::auth::ChallengeInput {
-            did: req.did,
-            session_pubkey_b58btc: None,
-        },
-    )
-    .await?;
+    let canonical = issue_challenge(&state, req.did).await?;
     // did-hosting's ChallengeResponse drops the canonical
     // `teeAttestation` field — did-hosting doesn't run in a TEE.
     Ok(Json(ChallengeResponse {
@@ -90,6 +69,52 @@ pub async fn challenge(
         session_id: canonical.session_id,
         expires_at: canonical.expires_at,
     }))
+}
+
+/// Reserve a pending-challenge slot for `did`, run the canonical challenge
+/// handler, and bind the slot to the session it minted — the one issuance path
+/// for every binding (REST here, DIDComm/TSP in `trust_tasks_auth`).
+///
+/// The canonical handler's own per-DID limit is disabled in this backend; the
+/// tracker is the single source of truth. The slot is taken whether or not the
+/// DID holds an ACL entry: the canonical handler answers an unenrolled subject
+/// without persisting anything, and counting only enrolled subjects would turn
+/// the cap into an enumeration oracle (VTI-SES-007).
+pub(crate) async fn issue_challenge(
+    state: &AppState,
+    did: String,
+) -> Result<vta_sdk::protocols::auth::ChallengeResponse, AppError> {
+    let reservation = state
+        .pending_challenges
+        .try_issue(&did, MAX_PENDING_CHALLENGES_PER_DID)
+        .inspect_err(|e| {
+            warn!(did = %did, error = %e, "challenge rate limited");
+        })?;
+
+    let result = match crate::auth::DidHostingControlAuthBackend::from_state(state) {
+        Ok(backend) => {
+            vti_common::auth::handlers::handle_challenge(
+                &backend,
+                vti_common::auth::ChallengeInput {
+                    did,
+                    session_pubkey_b58btc: None,
+                },
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+
+    match result {
+        Ok(resp) => {
+            state.pending_challenges.bind(reservation, &resp.session_id);
+            Ok(resp)
+        }
+        Err(e) => {
+            state.pending_challenges.cancel(reservation);
+            Err(e)
+        }
+    }
 }
 
 /// POST /api/auth/ — authenticate with a SIOPv2 self-issued `id_token`.
@@ -234,9 +259,7 @@ pub async fn authenticate(
         None
     };
 
-    // ─── 5. Capture the DID up-front so we can release the
-    //        pending-challenge slot regardless of canonical-handler
-    //        outcome.
+    // ─── 5. The verified signer DID.
     let signer_did = verified.issuer.clone();
 
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
@@ -253,14 +276,15 @@ pub async fn authenticate(
     )
     .await;
 
-    // Always release the pending-challenge slot on success.
-    // On failure the slot remains until either the legitimate
-    // caller retries (re-issue replaces) or the session TTL
-    // sweeper reaps it — same behaviour as the pre-migration
-    // flow.
+    // Release the pending-challenge slot on success. A failure does not
+    // consume the challenge — the canonical handler leaves the row, so the
+    // caller may retry within the TTL — so its slot stays held until the
+    // challenge authenticates or expires.
     match result {
         Ok(resp) => {
-            state.pending_challenges.release(&signer_did).await;
+            state
+                .pending_challenges
+                .release_session(&payload.session_id);
             info!(did = %signer_did, "authenticated via SIOPv2 id_token");
             Ok(Json(canonical_to_local_auth_response(resp)).into_response())
         }
@@ -342,7 +366,7 @@ async fn authenticate_didcomm_jws(
     let result = vti_common::auth::handlers::handle_authenticate(
         &backend,
         vti_common::auth::AuthenticateInput {
-            session_id,
+            session_id: session_id.clone(),
             challenge,
             signer_did: signer_did.clone(),
             created_time: msg.created_time,
@@ -355,7 +379,7 @@ async fn authenticate_didcomm_jws(
         Ok(resp) => {
             // Release the pending-challenge slot on success, mirroring
             // the SIOPv2 path's bookkeeping.
-            state.pending_challenges.release(&signer_did).await;
+            state.pending_challenges.release_session(&session_id);
             info!(did = %signer_did, "authenticated via DIDComm-JWS envelope");
             Ok(Json(canonical_to_local_auth_response(resp)).into_response())
         }

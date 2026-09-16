@@ -76,14 +76,15 @@
     `did-hosting-server` and `webvh-witness`.
   - `auth-challenge-pending-global` — the control plane's global pending cap.
 
-  For the pending caps `Retry-After` is `challenge_ttl +
-  session_cleanup_interval` (630 s by default): a slot frees when its challenge
-  authenticates, or when the sweep removes it after expiry.
+  For the canonical per-DID cap on `did-hosting-server` and `webvh-witness`,
+  `Retry-After` is `challenge_ttl + session_cleanup_interval` (630 s by
+  default): a slot frees when its challenge authenticates, or when the sweep
+  removes it after expiry. The control plane's caps compute the exact moment
+  instead (see the next section).
 
 - **New `AppError::RateLimited { limiter, message, retry_after_secs }`** in
   `did-hosting-common`, and `AuthError::PendingChallengeLimitReached` now
-  converts to it rather than to `Validation`. `PendingChallengeTracker::try_issue`
-  takes the retry hint as a third argument.
+  converts to it rather than to `Validation`.
 - **`did-hosting-client` gains `ClientError::RateLimited { limit_source,
   retry_after_secs, body }`**, read from `x-rate-limit-source` and
   `Retry-After`, and counted by `is_retryable()`. A 429 used to fall through to
@@ -92,10 +93,48 @@
   — a proxy or load balancer, not the host.
 
   DID resolution (`did.jsonl`, `did.json`, `keri.cesr`) has no limiter, so is
-  unchanged. No Trust Task surface (DIDComm, TSP, or the HTTPS `/trust-tasks`
-  route) reaches any of these limiters — the control plane's
-  `auth/challenge/0.1` arm runs with the canonical per-DID cap disabled — and
-  the Trust Task framework defines no rate-limit error code to answer with.
+  unchanged. The per-IP limiter has no Trust Task counterpart; the control
+  plane's pending caps now do (next section).
+
+### Fixed — abandoned auth challenges no longer lock out the control plane
+
+- **An auth challenge nobody redeems now gives its slot back when it expires.**
+  The control plane's `PendingChallengeTracker` released a slot only when its
+  challenge authenticated. A challenge that expired unused, one issued to a DID
+  with no ACL entry (answered without persisting anything, so nothing could
+  ever redeem it), or one authenticated over a different binding than it was
+  issued on held its slot until restart. Ten abandoned challenges locked a DID
+  out of `POST /api/auth/challenge` for good, and ~10,000 across any DIDs locked
+  out every login to the control plane (and daemon) — an unauthenticated denial
+  of service, whose `Retry-After` promised a retry that would never succeed.
+
+  The tracker now holds the set of live challenges, each expiring with
+  `challenge_ttl` — the same bound the authenticate handler enforces — so a
+  missed release can over-count for at most one TTL. A successful authenticate
+  releases exactly its own challenge by session id (a second release is a
+  no-op); a failed one leaves the challenge redeemable and keeps its slot. At
+  boot the tracker is seeded from the still-redeemable `ChallengeSent` rows in
+  the session store, so the caps hold across a restart. `Retry-After` on
+  `auth-challenge-pending-per-did` / `auth-challenge-pending-global` is now the
+  moment the oldest counted challenge expires (≤ `challenge_ttl`, 30 s by
+  default), not 630 s.
+
+  `did-hosting-server` and `webvh-witness` were not affected: their per-DID cap
+  counts `ChallengeSent` rows in the store, which the session sweep removes.
+
+- **`auth/challenge/0.1` over DIDComm, TSP and the HTTPS `/trust-tasks` route
+  is held to the same per-DID and global caps** as `POST /api/auth/challenge`.
+  It called the canonical handler with its per-DID cap disabled and bypassed
+  the tracker, so challenges over those bindings were unbounded. The Trust Task
+  framework defines no rate-limit code, so a refusal answers `permissionDenied`
+  — the arm's existing mapping for every challenge failure — with the limiter
+  and retry hint in the operator log.
+
+- **`PendingChallengeTracker` API**: `try_issue(did, per_did_cap)` returns a
+  `Reservation` to `bind` to the issued session id or `cancel`;
+  `release(did)` is replaced by `release_session(session_id)`; new
+  `for_auth_config`, `with_clock`, `seed_from_sessions`. Counts are `usize`,
+  and the methods are synchronous.
 
 ### Changed — dependencies
 

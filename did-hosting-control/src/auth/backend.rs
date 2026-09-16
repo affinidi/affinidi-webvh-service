@@ -8,9 +8,10 @@
 //!
 //! - Per-DID rate limit is **off** at the canonical-handler level
 //!   (`max_pending_challenges_per_did = 0`). did-hosting-control
-//!   keeps its existing O(1) `PendingChallengeTracker` on `AppState`,
-//!   and the route handler calls `try_issue` + `release` around the
-//!   canonical-handler call. The canonical handler's O(N)
+//!   keeps its existing O(1) `PendingChallengeTracker` on `AppState`:
+//!   `routes::auth::issue_challenge` reserves a slot around the
+//!   canonical-handler call (for REST and the `auth/challenge/0.1`
+//!   Trust Task alike), and a successful authenticate releases it. The canonical handler's O(N)
 //!   prefix-scan rate-limit would be redundant + slower; preserving
 //!   the tracker is a deliberate choice (the gating mechanism is
 //!   the same, just measured differently).

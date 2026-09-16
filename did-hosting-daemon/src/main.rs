@@ -1416,6 +1416,11 @@ async fn build_control(
         )
     });
 
+    let pending_challenges =
+        did_hosting_control::pending_challenges::PendingChallengeTracker::for_auth_config(
+            &control_config.auth,
+        );
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -1438,13 +1443,18 @@ async fn build_control(
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(
-            did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
-        ),
+        pending_challenges: Arc::new(pending_challenges),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
     };
+
+    // Reload challenges issued before a restart, so the caps hold across it.
+    // Mirrors `did_hosting_control::server` (startup initialisation parity).
+    state
+        .pending_challenges
+        .seed_from_sessions_or_warn(&state.sessions_ks)
+        .await;
 
     // Seed registry from static config
     did_hosting_control::server::seed_registry(&state).await;

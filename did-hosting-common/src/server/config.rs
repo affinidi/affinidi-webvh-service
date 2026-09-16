@@ -274,10 +274,13 @@ impl AuthConfig {
         Ok(())
     }
 
-    /// `Retry-After` for a refusal on a pending-challenge cap. A pending slot
-    /// frees when its challenge authenticates, or when the challenge has
-    /// expired (`challenge_ttl`) and the session sweep has then run (every
-    /// `session_cleanup_interval`), so their sum bounds the wait.
+    /// `Retry-After` for a refusal on the canonical handler's pending-challenge
+    /// cap (did-hosting-server, webvh-witness). That cap counts `ChallengeSent`
+    /// rows in the store, so a slot frees when its challenge authenticates, or
+    /// when the challenge has expired (`challenge_ttl`) and the session sweep
+    /// has then run (every `session_cleanup_interval`): their sum bounds the
+    /// wait. did-hosting-control does not use this — its in-memory tracker
+    /// frees a slot at `challenge_ttl` and computes the exact hint.
     pub fn pending_challenge_retry_after_secs(&self) -> u64 {
         self.challenge_ttl
             .saturating_add(self.session_cleanup_interval)
