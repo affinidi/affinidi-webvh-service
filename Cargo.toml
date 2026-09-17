@@ -61,17 +61,17 @@ rust-version = "1.95.0"
 aws-smithy-types = ">=1.6.1, <1.7"
 
 # Affinidi Trust Development Kit
-# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.38 and vti-common
-# 0.18.5 both depend on affinidi-tdk ^0.14, so all three resolve to a single
+# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.41 and vti-common
+# 0.18.9 both depend on affinidi-tdk ^0.16, so all three resolve to a single
 # affinidi-tdk copy. This number is not chosen independently — read it off
 # whichever vta-sdk/vti-common pair the block below pins, and move it in the
 # same commit. A plain `cargo update` that floats vti-common on its own is how
 # a second affinidi-tdk copy gets added; see the vta-sdk note.
-affinidi-tdk = "0.14"
+affinidi-tdk = "0.16"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
 # to the `TspHandler`. Without it the handler is stored but never invoked
 # (the crate compiles TSP support out).
-affinidi-messaging-didcomm-service = { version = "0.8", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.10", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15"
 affinidi-secrets-resolver = "0.5"
@@ -205,8 +205,8 @@ didwebvh-rs = "0.6"
 # it keeps `affinidi-keri` (and its LMDB store) out of the dep graph.
 affinidi-did-webs = "0.7"
 
-# VTA SDK — 0.38 on crates.io, bumped in lockstep with vti-common 0.18.5
-# (which re-pins onto vta-sdk ^0.38) and with trust-tasks-rs 0.20.
+# VTA SDK — 0.41 on crates.io, bumped in lockstep with vti-common 0.18.9
+# (which re-pins onto vta-sdk ^0.41) and with trust-tasks-rs 0.21.
 # Carries the canonical SIOPv2 /
 # RFC 6749 wire types (`protocols::auth::{Session, TokenBundle,
 # AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`) that the
@@ -281,7 +281,7 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.38", features = [
+vta-sdk = { version = "0.41", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -293,7 +293,7 @@ vta-sdk = { version = "0.38", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). On crates.io at 0.20.x. The whole family
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.21.x. The whole family
 # moves as one workspace event — `trust-tasks-rs`'s core types cross the
 # public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
 # mixing majors does not type-check. Bump all five together, and in
@@ -308,6 +308,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # but `cargo tree -d -e normal,build` is what tells you, and it listed
 # trust-tasks-rs twice until the last of them moved. Run it; do not assume the
 # five manifest lines were the whole job.
+#
+# What 0.20 → 0.21 changed for us: nothing in this workspace — no source
+# change at all, and the whole workspace (including the feature-gated
+# `server-core`/`store-fjall` server modules and every test target) compiled
+# clean on the first try. This bump's real driver was **TSP rev3**:
+# `affinidi-tsp` 0.1 → 0.2 is the rev3 release (published 2026-09-15), and it
+# pulls the family with it — `affinidi-tdk` 0.14 → 0.16,
+# `affinidi-messaging-didcomm-service` 0.8 → 0.10 (sdk 0.24 → 0.26), vta-sdk
+# 0.38 → 0.41, vti-common 0.18.5 → 0.18.9, and all five trust-tasks lines
+# 0.20 → 0.21, in one commit. rev3 adds the post-quantum ML-DSA envelope
+# suite underneath (visible as new `ml-dsa` / `crypto_secretbox` deps in the
+# lock); none of it crosses our source, which speaks trust-tasks documents,
+# not TSP envelope internals. `cargo tree -d -e normal,build{,,dev}` lists no
+# duplicate of the family.
+#
+# The compiler-invisible check was run again and still passes: the framework
+# emits `trust-task-error/0.5` at 0.21.2, unchanged since 0.9, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
+#
+# The dev-graph half was NOT free again — test-mediator `0.7` → `0.9`
+# (mediator 0.26, affinidi-messaging-sdk 0.26, affinidi-tdk 0.16).
 #
 # What 0.19 → 0.20 changed for us: no source change in this workspace, but
 # one *behavioural* change arrived underneath it, and it is the only thing
@@ -435,21 +456,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.20", default-features = false }
-trust-tasks-https = { version = "0.20", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.20", default-features = false }
-trust-tasks-proof = { version = "0.20", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.21", default-features = false }
+trust-tasks-https = { version = "0.21", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.21", default-features = false }
+trust-tasks-proof = { version = "0.21", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.20", default-features = false }
+trust-tasks-tsp = { version = "0.21", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
 # protocol-agnostic `affinidi-messaging-core` traits shared with DIDComm.
-affinidi-tsp = { version = "0.1", features = ["messaging-core"] }
+affinidi-tsp = { version = "0.2", features = ["messaging-core"] }
 # Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
 # resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
 # Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the

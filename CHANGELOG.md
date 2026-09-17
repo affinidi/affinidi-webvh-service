@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Changed — dependency refresh (TSP rev3)
+
+- **Upgraded the Affinidi / Trust-Tasks stack to the TSP rev3 line.** The
+  driver is `affinidi-tsp` 0.1 → **0.2**, the Trust Spanning Protocol rev3
+  release, which brings the post-quantum ML-DSA envelope suite underneath the
+  transport. It moves as one coordinated family bump: `affinidi-tdk`
+  0.14 → 0.16, `affinidi-messaging-didcomm-service` 0.8 → 0.10 (SDK
+  0.24 → 0.26), `vta-sdk` 0.38 → 0.41, `vti-common` 0.18.5 → 0.18.9, and all
+  five `trust-tasks-*` lines 0.20 → 0.21. Dev-graph `affinidi-messaging-test-mediator`
+  0.7 → 0.9 to match. No workspace source change was required — this service
+  speaks trust-tasks documents, not TSP envelope internals — and the framework
+  still emits `trust-task-error/0.5`. `cargo tree -d` shows no duplicate of the
+  family in the normal, build or dev graphs.
+- **Refreshed the remaining crates within their existing semver ranges**
+  (AWS SDK, `affinidi-did-resolver-*`, `clap`, `jiff`, `reqwest` subtree, …).
+  The deliberate holds are unchanged: our `jsonwebtoken` stays at 10,
+  `aws-smithy-types` stays below 1.7 (1.6.4), and `base64` at 0.23.
+
 ### Added — `did:webs` hosting
 
 - **The service can host `did:webs` DIDs**, behind the new `method-webs`
