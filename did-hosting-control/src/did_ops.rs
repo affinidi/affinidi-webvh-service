@@ -1532,9 +1532,13 @@ pub async fn list_dids(
         }
     }
 
-    // Apply pagination
+    // Apply pagination. Cap the caller-supplied limit so a single request can't
+    // ask for an unbounded page. The per-owner scan is already bounded by the
+    // account's `max_did_count` quota; this additionally bounds the response
+    // size (and the allocation) regardless of what the client passes.
+    const MAX_LIST_LIMIT: usize = 1000;
     let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(1000);
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
     let total = entries.len();
     let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
 

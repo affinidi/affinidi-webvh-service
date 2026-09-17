@@ -339,6 +339,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // and harvest the forwarded JWT.
         http_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Fail fast: this client backs the Admin reverse proxy, so a slow or
+            // hung (even allow-listed) backend must not pin the handler task and
+            // its connection open indefinitely. Matches the edge/daemon clients.
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client construction must succeed"),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),

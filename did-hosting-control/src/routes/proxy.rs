@@ -66,7 +66,7 @@ pub async fn proxy_to_service(
         proxy_req = proxy_req.body(body_bytes);
     }
 
-    let resp = proxy_req
+    let mut resp = proxy_req
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("proxy: {e}")))?;
@@ -74,10 +74,25 @@ pub async fn proxy_to_service(
     // Convert reqwest::Response to axum::Response
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
-    let body = resp
-        .bytes()
+
+    // Read the upstream body with a hard cap (symmetric with the 10 MB request
+    // limit above). Without it, a compromised or misconfigured allow-listed
+    // backend could stream an arbitrarily large body and OOM the control plane.
+    // `chunk()` bounds it regardless of `Content-Length` / chunked encoding.
+    const MAX_PROXY_RESPONSE: usize = 10 * 1024 * 1024;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| AppError::Internal(format!("proxy body: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("proxy body: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_PROXY_RESPONSE {
+            return Err(AppError::Internal(
+                "upstream response exceeds the proxy body limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
 
     let mut response = (status, body).into_response();
     // Strip hop-by-hop headers (RFC 7230 §6.1) and per-connection metadata

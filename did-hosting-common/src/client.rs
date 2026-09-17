@@ -28,7 +28,7 @@ impl WebVHClient {
     /// Create a new client pointing at the given server URL.
     pub fn new(server_url: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::outbound_client(),
             server_url: server_url.trim_end_matches('/').to_string(),
             hosting_url: None,
             access_token: None,

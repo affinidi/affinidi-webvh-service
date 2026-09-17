@@ -200,6 +200,14 @@ pub fn watcher_sync_key(mnemonic: &str) -> String {
 // JSONL validation & extraction
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the number of log entries (versions) a single `did.jsonl`
+/// may carry. This is a denial-of-service guard on the per-entry proof
+/// verification, not a protocol limit — a webvh DID realistically accrues at
+/// most tens to low-hundreds of versions over its lifetime, so this ceiling is
+/// only ever reached by a degenerate or deliberately-inflated chain. Bump it if
+/// a legitimate deployment ever genuinely needs more.
+pub const MAX_LOG_ENTRIES: usize = 10_000;
+
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 ///
 /// In addition to structural shape, the *last* entry's `state.id` must start
@@ -213,7 +221,22 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         return Err("did.jsonl content cannot be empty".into());
     }
 
-    let mut had_entry = false;
+    // Bound the entry count up front, before any O(n) per-entry work (the
+    // deserialize loop here, and the per-entry Ed25519 proof verification in
+    // `verify_did_log_proofs`). The 10 MB request limit alone would still admit
+    // thousands of versions and let a slot owner amplify CPU by republishing a
+    // max-length multi-version log. `MAX_LOG_ENTRIES` is far above any realistic
+    // webvh history, so it only ever refuses a degenerate/abusive chain.
+    let entry_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+    if entry_count == 0 {
+        return Err("did.jsonl content has no entries".into());
+    }
+    if entry_count > MAX_LOG_ENTRIES {
+        return Err(format!(
+            "did.jsonl has too many log entries (limit {MAX_LOG_ENTRIES})"
+        ));
+    }
+
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -221,11 +244,6 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         }
         LogEntry::deserialize_string(line, None)
             .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
-        had_entry = true;
-    }
-
-    if !had_entry {
-        return Err("did.jsonl content has no entries".into());
     }
 
     // Must encode a did:webvh identifier on the latest entry.
@@ -712,6 +730,18 @@ mod tests {
     #[test]
     fn validate_jsonl_invalid_json_rejected() {
         assert!(validate_did_jsonl("not json").is_err());
+    }
+
+    #[test]
+    fn validate_jsonl_too_many_entries_rejected() {
+        // One line over the cap is refused on the count check, before any
+        // per-entry parse/verify work (SEC hardening — DoS guard).
+        let content = "x\n".repeat(MAX_LOG_ENTRIES + 1);
+        let err = validate_did_jsonl(&content).unwrap_err();
+        assert!(
+            err.contains("too many log entries"),
+            "expected entry-count rejection, got: {err}"
+        );
     }
 
     #[test]

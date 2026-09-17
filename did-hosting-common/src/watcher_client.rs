@@ -14,7 +14,7 @@ impl WatcherClient {
     /// Create a new client pointing at the given watcher server URL.
     pub fn new(server_url: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::outbound_client(),
             server_url: server_url.trim_end_matches('/').to_string(),
             token: None,
         }
@@ -23,7 +23,7 @@ impl WatcherClient {
     /// Create a new client with a pre-configured bearer token.
     pub fn with_token(server_url: &str, token: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::outbound_client(),
             server_url: server_url.trim_end_matches('/').to_string(),
             token: Some(token.to_string()),
         }
