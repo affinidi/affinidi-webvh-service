@@ -179,6 +179,13 @@ and `acl` keyspaces).
 | `[watcher_sync]` | Watcher | Push tokens and source servers |
 | `[registry]`     | Control | Service instance registry |
 
+> A default daemon has an empty registry and does not use the reverse proxy, so
+> no extra configuration is needed. **If** you populate `[[registry.instances]]`
+> (or accept `MSG_SERVER_REGISTER`) and proxy to remote instances, you must set
+> `registry.url_allowlist` — the proxy is fail-closed without it. See
+> "Reverse proxy & the registry allowlist" in the
+> [control plane README](../did-hosting-control/README.md).
+
 ### Enable/Disable Services
 
 The `[enable]` section controls which services start:
