@@ -39,6 +39,7 @@ server-core = [
     "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
     "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
     "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
+    "dep:affinidi-tsp",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -158,6 +159,11 @@ affinidi-data-integrity = { workspace = true, optional = true }
 # plane and the server growing two divergent copies of the same rule.
 affinidi-messaging-didcomm-service = { workspace = true, optional = true }
 affinidi-messaging-didcomm = { workspace = true, optional = true }
+# TSP control-message types (`ControlMessage`/`ControlType`) for the inbound
+# relationship answering arm (`server::tsp_relationship`). The messaging SDK
+# re-exports `ControlMessage` but not `ControlType`, so we name both from the
+# TSP crate directly. Same single copy the messaging stack already resolves.
+affinidi-tsp = { workspace = true, optional = true }
 
 # **The AWS subtree is held below `aws-smithy-types` 1.7, and a blanket `cargo
 # update` used to break it.** `aws-smithy-types` 1.7.0 replaced

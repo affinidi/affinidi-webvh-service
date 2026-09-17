@@ -107,6 +107,9 @@ chrono = { workspace = true }
 affinidi-data-integrity = { workspace = true }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
+# TSP control-message type for `WebvhTspHandler::handle_control`'s signature;
+# the accept policy itself lives in `did_hosting_common::server::tsp_relationship`.
+affinidi-tsp = { workspace = true }
 affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }

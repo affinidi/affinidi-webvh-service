@@ -109,6 +109,28 @@ impl TspHandler for ServerTspHandler {
         let _ = dispatch_tsp_message(&self.state, &sender_vid, &msg).await;
         Ok(None)
     }
+
+    /// Answer an inbound TSP relationship control message. This is the arm that
+    /// clears the `no relationship with … discarded` drop the edge logs when it
+    /// has lost its half of the relationship: on the control plane's (or its
+    /// own connect-time) re-invite it accepts, restoring `Bidirectional` so the
+    /// control plane's sync/health pushes are admitted again. Shared policy in
+    /// `did_hosting_common::server::tsp_relationship` — see its module docs.
+    async fn handle_control(
+        &self,
+        ctx: HandlerContext,
+        control: affinidi_tsp::message::control::ControlMessage,
+        sender_vid: String,
+        thread_digest: [u8; 32],
+    ) {
+        did_hosting_common::server::tsp_relationship::answer_inbound_control(
+            &ctx,
+            &control,
+            &sender_vid,
+            thread_digest,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

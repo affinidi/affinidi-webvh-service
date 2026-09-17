@@ -38,6 +38,11 @@ pub mod trust_task;
 /// it in.
 #[cfg(feature = "server-core")]
 pub mod trust_tasks;
+/// Inbound TSP relationship answering arm (Rev 3 §7.2.2). Gated behind
+/// `server-core` because it names the messaging-service `HandlerContext` and
+/// the TSP control-message types, which only the server-side listeners use.
+#[cfg(feature = "server-core")]
+pub mod tsp_relationship;
 pub mod vta_setup;
 
 /// Axum middleware that sets security response headers on every response.
