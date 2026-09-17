@@ -43,6 +43,11 @@ pub mod trust_tasks;
 /// the TSP control-message types, which only the server-side listeners use.
 #[cfg(feature = "server-core")]
 pub mod tsp_relationship;
+/// Durable TSP relationship store (Rev 3 §7.2.2 persistence). Gated behind
+/// `server-core` because it names the messaging SDK's relationship-store types
+/// and webvh's storage keyspaces, both server-only.
+#[cfg(feature = "server-core")]
+pub mod tsp_relationship_store;
 pub mod vta_setup;
 
 /// Axum middleware that sets security response headers on every response.

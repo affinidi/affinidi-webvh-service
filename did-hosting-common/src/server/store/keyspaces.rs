@@ -99,3 +99,12 @@ pub const KS_IDENTITY: &str = "identity";
 /// flight work. Receivers must remain idempotent because the
 /// delivery guarantee is at-least-once.
 pub const KS_OUTBOUND_QUEUE: &str = "outbox";
+
+/// `tsp-rel/v1/<facet><len(our_vid)><our_vid><their_vid>` — durable TSP
+/// relationship state (Rev 3 §7.2.2), the byte backend behind
+/// [`crate::server::tsp_relationship_store`]. Keyed and encoded entirely by the
+/// SDK's `PersistentRelationshipStore`; this crate only supplies the raw
+/// get/put/delete over the keyspace. Persisting it is what stops a restarted
+/// node from forgetting every peer and silently dropping their application
+/// traffic until a re-handshake.
+pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";

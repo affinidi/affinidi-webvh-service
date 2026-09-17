@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, ListenerEvent, Protocols, RestartPolicy,
+    RetryConfig,
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
@@ -346,6 +347,24 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         });
     }
 
+    // 5b. Keep a TSP relationship with the control plane established. Under Rev 3
+    //     §7.2.2 the control plane's application pushes (sync/health) are dropped
+    //     unless this edge holds a relationship with it, and forming one is the
+    //     edge's job — the control plane persists its half and does not re-invite.
+    //     The ensure is idempotent (skips when already Bidirectional) and MUST
+    //     fire on every (re)connect, not just first boot: a control-plane restart,
+    //     or a handshake that never completed, is repaired on the edge's next
+    //     connect. See docs/tsp-transport.md.
+    if let (Some(svc), Some(control_did)) = (didcomm_service, state.config.control_did.as_ref())
+        && state.config.features.tsp
+    {
+        let svc = svc.clone();
+        let control_did = control_did.clone();
+        tokio::spawn(async move {
+            ensure_control_tsp_relationship(svc, control_did).await;
+        });
+    }
+
     // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
     let stats_sync_shutdown = CancellationToken::new();
     let didcomm_sync_interval = state.config.stats.sync_interval_secs;
@@ -474,6 +493,75 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup
 // ---------------------------------------------------------------------------
 
+/// The listener id [`start_didcomm_service`] registers for the edge's mediator
+/// connection. Must match, or the relationship ensure targets a listener that
+/// does not exist.
+const SERVER_LISTENER_ID: &str = "server";
+
+/// Establish, and keep re-establishing, this edge's TSP relationship with its
+/// control plane.
+///
+/// Under Rev 3 §7.2.2 the control plane's application pushes are dropped unless
+/// this edge holds a relationship with it. Forming one is a control message the
+/// edge must actually *send* — a relationship never forms as a side effect of an
+/// application send, so this has to run explicitly, and on **every** (re)connect
+/// before the first send, not just first boot: the durable store keeps a formed
+/// relationship across our own restarts, but a control-plane restart, or a
+/// handshake that never completed, is only repaired when the edge re-invites on
+/// its next connection.
+///
+/// [`DIDCommService::tsp_ensure_relationship`] is idempotent (it skips when the
+/// relationship already admits application messages), so re-running it every
+/// connect is cheap and a duplicate for the initial connect is harmless.
+async fn ensure_control_tsp_relationship(svc: DIDCommService, control_did: String) {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Subscribe before the initial wait so a reconnect that races the first
+    // ensure is not missed.
+    let mut events = svc.subscribe();
+
+    // The initial connection may have completed before `subscribe`, so its
+    // `Connected` event can be absent from the stream — cover it explicitly.
+    if svc
+        .wait_connected(SERVER_LISTENER_ID, CONNECT_TIMEOUT)
+        .await
+        .is_ok()
+    {
+        ensure_control_tsp_relationship_once(&svc, &control_did).await;
+    }
+
+    loop {
+        match events.recv().await {
+            Ok(ListenerEvent::Connected { listener_id }) if listener_id == SERVER_LISTENER_ID => {
+                ensure_control_tsp_relationship_once(&svc, &control_did).await;
+            }
+            Ok(_) => {}
+            // A lagged receiver only means we missed some events; the next
+            // `Connected` still re-ensures, and the relationship is idempotent.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // The service shut down; nothing more to ensure.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn ensure_control_tsp_relationship_once(svc: &DIDCommService, control_did: &str) {
+    match svc
+        .tsp_ensure_relationship(SERVER_LISTENER_ID, control_did)
+        .await
+    {
+        Ok(()) => {
+            debug!(control = %control_did, "TSP: relationship with control plane ensured")
+        }
+        Err(e) => warn!(
+            control = %control_did,
+            error = %e,
+            "TSP: failed to ensure relationship with control plane — control-plane pushes may be \
+             dropped until the next reconnect"
+        ),
+    }
+}
+
 pub async fn start_didcomm_service(
     state: &AppState,
     shutdown: CancellationToken,
@@ -532,7 +620,7 @@ pub async fn start_didcomm_service(
         _ => Protocols::DIDCOMM_ONLY,
     };
 
-    let listener = ListenerConfig {
+    let mut listener = ListenerConfig {
         id: "server".into(),
         profile,
         restart_policy: RestartPolicy::Always {
@@ -542,6 +630,18 @@ pub async fn start_didcomm_service(
         protocols,
         ..Default::default()
     };
+    // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts.
+    // The default store is in-memory, so without this a restart forgets every
+    // peer and then silently drops each peer's application traffic — the peers
+    // still hold the relationship the restarted node forgot — until a
+    // re-handshake. Only meaningful when TSP is on. See docs/tsp-transport.md.
+    if tsp_enabled {
+        listener.relationship_store = Some(
+            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
+                &state.store,
+            )?,
+        );
+    }
 
     let router = messaging::build_server_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;

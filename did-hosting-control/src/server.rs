@@ -721,7 +721,7 @@ pub async fn start_didcomm_service(
         _ => Protocols::DIDCOMM_ONLY,
     };
 
-    let listener = ListenerConfig {
+    let mut listener = ListenerConfig {
         id: "control".into(),
         profile,
         restart_policy: RestartPolicy::Always {
@@ -731,6 +731,19 @@ pub async fn start_didcomm_service(
         protocols,
         ..Default::default()
     };
+    // Persist the control plane's TSP relationships (Rev 3 §7.2.2) across
+    // restarts, so it keeps its half of each edge relationship and does not need
+    // to re-invite: an edge re-invites on its own connect, and this side answers
+    // (`WebvhTspHandler::handle_control`). Without persistence a control restart
+    // would drop every edge until each re-handshakes. Only meaningful when TSP is
+    // on. In daemon mode this is the only listener, so it covers the daemon too.
+    if tsp_enabled {
+        listener.relationship_store = Some(
+            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
+                &state.store,
+            )?,
+        );
+    }
 
     let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
