@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Added — TSP relationship persistence & self-healing (Rev 3 §7.2.2)
+
+- **Nodes now persist their TSP relationships and re-establish them on connect,
+  so an edge stops silently dropping the control plane's pushes after a
+  restart.** Under Rev 3 §7.2.2 a receiver drops any application (sync/health)
+  frame from a VID it holds no relationship with; the SDK's default relationship
+  store is in-memory, so a restart forgot every peer and the node went quiet
+  until a re-handshake that nothing triggered. Two halves fix it, on top of the
+  answering arm shipped earlier:
+  - **Durable store.** Both the control plane and the edge server inject a
+    persistent relationship store (`server::tsp_relationship_store`, a
+    backend-agnostic `RelationshipKv` over any configured `StorageBackend` —
+    fjall, DynamoDB, Firestore, CosmosDB — under the new `KS_TSP_RELATIONSHIPS`
+    keyspace) into their TSP listener, so a formed relationship survives a
+    restart.
+  - **Edge re-invite at connect.** The edge calls the facade's
+    `tsp_ensure_relationship` with its control plane on the initial connection
+    and every reconnection (idempotent — it skips when the relationship already
+    admits application messages), repairing a control-plane restart or a
+    never-completed handshake on the edge's next connect. The control plane
+    persists its half and answers, so it does not re-invite.
+
+  Requires `affinidi-messaging-didcomm-service` **0.11** (adds
+  `ListenerConfig::with_relationship_store` and
+  `DIDCommService::tsp_ensure_relationship`; no SDK bump — stays on 0.26.5). See
+  `docs/tsp-transport.md`.
+
 ### Changed — dependency refresh (TSP rev3)
 
 - **Upgraded the Affinidi / Trust-Tasks stack to the TSP rev3 line.** The
