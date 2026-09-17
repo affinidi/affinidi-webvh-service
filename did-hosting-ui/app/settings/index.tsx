@@ -96,7 +96,12 @@ function StatusRow({ label, enabled }: { label: string; enabled: boolean }) {
 
 export default function SettingsPage() {
   const api = useApi();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, role } = useAuth();
+  // Settings shows control-plane topology (mediator/VTA DIDs, listen address,
+  // registry, TTLs) — the same operator data the backend now gates behind
+  // AdminAuth (`GET /api/config`, `/api/identity/generations`). Non-admins get
+  // an explanatory panel instead of a blank page or a 403 error box.
+  const isAdmin = role === "admin";
 
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -130,9 +135,9 @@ export default function SettingsPage() {
   }, [api]);
 
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || !isAdmin) return;
     loadGenerations();
-  }, [isAuthenticated, loadGenerations]);
+  }, [isAuthenticated, isAdmin, loadGenerations]);
 
   // The "honoured for" countdown is only meaningful if it actually counts down.
   useEffect(() => {
@@ -175,7 +180,7 @@ export default function SettingsPage() {
   };
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !isAdmin) {
       setLoading(false);
       return;
     }
@@ -187,7 +192,7 @@ export default function SettingsPage() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [api, isAuthenticated]);
+  }, [api, isAuthenticated, isAdmin]);
 
   if (!isAuthenticated) {
     return (
@@ -198,6 +203,16 @@ export default function SettingsPage() {
             <Text style={styles.buttonPrimaryText}>Login</Text>
           </Pressable>
         </Link>
+      </View>
+    );
+  }
+
+  if (!isAdmin) {
+    return (
+      <View style={styles.containerCenter}>
+        <Text style={styles.hint}>
+          Settings are available to administrators only.
+        </Text>
       </View>
     );
   }

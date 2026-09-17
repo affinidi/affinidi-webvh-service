@@ -72,6 +72,28 @@ pub async fn update_acl(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found for DID: {did}")))?;
 
+    // Last-authority guard (parity with the control-plane SEC-4045 W5 fix): a
+    // demote that empties the Admin set — self or otherwise — leaves the edge
+    // with no admin and no API path back (ACL create/update are Admin-gated,
+    // and delete blocks self-deletion). Checked against the current role,
+    // before the mutation below applies the new one.
+    if let Some(new_role) = req.role.as_ref()
+        && matches!(entry.role, crate::acl::Role::Admin)
+        && !matches!(new_role, crate::acl::Role::Admin)
+    {
+        let other_admins = list_acl_entries(&state.acl_ks)
+            .await?
+            .into_iter()
+            .filter(|e| matches!(e.role, crate::acl::Role::Admin) && e.did != did)
+            .count();
+        if other_admins == 0 {
+            warn!(caller = %auth.0.did, did = %did, "ACL update rejected: would demote the last remaining admin");
+            return Err(AppError::Conflict(
+                "cannot demote the last remaining admin".into(),
+            ));
+        }
+    }
+
     if let Some(role) = req.role {
         entry.role = role;
     }
