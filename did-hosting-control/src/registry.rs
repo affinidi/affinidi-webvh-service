@@ -425,6 +425,30 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
     }
 }
 
+/// Validate a URL that the admin **proxy** is about to send the caller's
+/// `Authorization` (Admin bearer) to — a strictly stronger gate than
+/// [`validate_registered_url`] (SEC-4045 W6 follow-up).
+///
+/// Registration can afford to be lenient about a *public* host (the registry
+/// also tracks instances for health/display), but the proxy forwards a live
+/// Admin credential to `instance.url`, so an un-allow-listed host is credential
+/// exfiltration. Here an **empty allowlist is fail-closed**: with no allowlist
+/// the proxy refuses every target rather than trusting any registered URL, and
+/// a non-empty allowlist must contain the host (which also still passes the
+/// address-class default-deny in `validate_registered_url`). This closes the
+/// residual where a Service-role DID registered a public attacker host (or one
+/// that resolves internal) and an Admin's token was then forwarded to it.
+pub fn validate_proxy_target_url(url: &str, allowlist: &[String]) -> Result<(), AppError> {
+    if allowlist.is_empty() {
+        return Err(AppError::Forbidden(
+            "proxy refused: no registry.url_allowlist is configured, so the proxy will not forward an \
+             admin credential to a registered instance. Set registry.url_allowlist to the hosts you trust."
+                .into(),
+        ));
+    }
+    validate_registered_url(url, allowlist)
+}
+
 /// Freshly registered instances (no pong yet) stay Active for one grace
 /// period to allow the first ping/pong roundtrip to complete.
 pub fn health_status_from_timestamp(
@@ -586,5 +610,23 @@ mod tests {
         // file:/// has no host
         let err = validate_registered_url("file:///etc/passwd", &allow).unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// The proxy forwards an Admin credential, so an empty allowlist is
+    /// fail-closed even for a perfectly public host, and a non-empty allowlist
+    /// still restricts the target (SEC-4045 W6 follow-up).
+    #[test]
+    fn proxy_target_requires_a_non_empty_allowlist() {
+        // Empty allowlist → the proxy refuses every target, public or not.
+        assert!(validate_proxy_target_url("https://legit.example/", &[]).is_err());
+        assert!(validate_proxy_target_url("https://1.2.3.4/", &[]).is_err());
+
+        // With an allowlist, only listed hosts pass...
+        let allow = list(&["server-1.internal"]);
+        assert!(validate_proxy_target_url("https://server-1.internal/api", &allow).is_ok());
+        // ...an un-listed public attacker host is refused (the exfil vector)...
+        assert!(validate_proxy_target_url("https://evil.example/", &allow).is_err());
+        // ...and the address-class default-deny still applies to a listed-out literal.
+        assert!(validate_proxy_target_url("http://169.254.169.254/", &allow).is_err());
     }
 }
