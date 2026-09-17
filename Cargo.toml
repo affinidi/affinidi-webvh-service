@@ -471,6 +471,14 @@ trust-tasks-tsp = { version = "0.21", default-features = false }
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
 # protocol-agnostic `affinidi-messaging-core` traits shared with DIDComm.
 affinidi-tsp = { version = "0.2", features = ["messaging-core"] }
+# Affinidi Messaging SDK — named directly only for the durable TSP relationship
+# store types (`RelationshipKv`, `PersistentRelationshipStore`,
+# `RelationshipStore`) that back `server::tsp_relationship_store`. Not a new
+# copy: it is the same `affinidi-messaging-sdk` the whole messaging stack
+# already resolves (transitively via vta-sdk / -didcomm-service), pinned here so
+# a crate can name it. Moves with that family; `tsp` feature exposes the store
+# surface.
+affinidi-messaging-sdk = { version = "0.26", features = ["tsp"] }
 # Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
 # resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
 # Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the

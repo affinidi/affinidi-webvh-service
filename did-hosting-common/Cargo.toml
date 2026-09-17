@@ -39,7 +39,7 @@ server-core = [
     "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
     "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
     "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
-    "dep:affinidi-tsp",
+    "dep:affinidi-tsp", "dep:affinidi-messaging-sdk",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -164,6 +164,10 @@ affinidi-messaging-didcomm = { workspace = true, optional = true }
 # re-exports `ControlMessage` but not `ControlType`, so we name both from the
 # TSP crate directly. Same single copy the messaging stack already resolves.
 affinidi-tsp = { workspace = true, optional = true }
+# Durable TSP relationship store types (`RelationshipKv`,
+# `PersistentRelationshipStore`, `RelationshipStore`) for
+# `server::tsp_relationship_store`. Same single copy the stack already resolves.
+affinidi-messaging-sdk = { workspace = true, optional = true }
 
 # **The AWS subtree is held below `aws-smithy-types` 1.7, and a blanket `cargo
 # update` used to break it.** `aws-smithy-types` 1.7.0 replaced

@@ -3082,6 +3082,7 @@ dependencies = [
  "affinidi-did-webs",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",
+ "affinidi-messaging-sdk",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
