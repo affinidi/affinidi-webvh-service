@@ -316,6 +316,16 @@ pub async fn publish_did(
 
     validate_did_jsonl(did_log)?;
 
+    // Verify the proof chain, not just the structure (SEC-4045 W9). The control
+    // plane's write path verifies (`verify_publication` → `verify_did_log_proofs`);
+    // the standalone edge's directly-reachable publish path only checked structure,
+    // so it could serve a log whose proofs / key-rotation never verified. Any log
+    // reaching here is `did:webvh:` (enforced by `validate_did_jsonl`), so the
+    // webvh proof verifier is the right gate — edge and control now enforce one
+    // policy.
+    did_hosting_common::did_ops::verify_did_log_proofs(did_log)
+        .map_err(|e| AppError::Validation(format!("did.jsonl proof verification failed: {e}")))?;
+
     let new_size = did_log.len() as u64;
     let old_size = record.content_size;
     check_total_size_limit(
@@ -409,7 +419,7 @@ pub async fn upload_witness(
     witness_content: &str,
 ) -> Result<WitnessUploadResult, AppError> {
     validate_mnemonic(mnemonic)?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     if witness_content.is_empty() {
         return Err(AppError::Validation(
@@ -422,6 +432,27 @@ pub async fn upload_witness(
         .map_err(|e| AppError::Validation(format!("did-witness.json must be valid JSON: {e}")))?;
 
     let size = witness_content.len();
+    let new_size = size as u64;
+
+    // Witness content counts against the owner's `max_total_size` exactly as the
+    // published log does (SEC-4045 W8). Without this it was an unbounded bypass
+    // of the storage quota. `old_size` is the witness blob currently stored for
+    // this slot (0 on first upload); the quota moves by `new_size - old_size`.
+    let old_size = state
+        .dids_ks
+        .get_raw(content_witness_key(mnemonic))
+        .await?
+        .map(|b| b.len() as u64)
+        .unwrap_or(0);
+    check_total_size_limit(
+        auth,
+        &state.dids_ks,
+        &state.acl_ks,
+        &state.config,
+        old_size,
+        new_size,
+    )
+    .await?;
 
     state
         .dids_ks
@@ -430,6 +461,9 @@ pub async fn upload_witness(
             witness_content.as_bytes().to_vec(),
         )
         .await?;
+
+    // Keep the quota index in step with the bytes just stored.
+    quota_on_size_change(&state.dids_ks, &record.owner, old_size, new_size).await?;
 
     let witness_url = format!(
         "{}/{mnemonic}/did-witness.json",
@@ -619,6 +653,13 @@ pub async fn delete_did(
 
     // Update quota index (content is still stored but quota is freed)
     quota_on_delete(&state.dids_ks, &record.owner, record.content_size).await?;
+
+    // Also free the witness bytes from the quota — they are now counted against
+    // `max_total_size` on upload (SEC-4045 W8), so releasing the slot must
+    // reclaim them too, or the owner's usage would drift upward over deletes.
+    if let Some(witness) = state.dids_ks.get_raw(content_witness_key(mnemonic)).await? {
+        quota_on_size_change(&state.dids_ks, &record.owner, witness.len() as u64, 0).await?;
+    }
 
     state.did_cache.invalidate(&content_log_key(mnemonic));
 

@@ -169,6 +169,32 @@ pub async fn update_acl(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
 
+    // Last-authority guard (parity with the Trust Tasks `change-role`/`revoke`
+    // handlers — the legacy route had none, SEC-4045 W5). A demote that takes
+    // the only remaining Admin out of the Admin set — self or otherwise —
+    // leaves the deployment with no admin and no API path back. Checked against
+    // the *current* role, before the mutation below applies the new one.
+    if let Some(new_role) = updates.role.as_ref()
+        && matches!(entry.role, acl::Role::Admin)
+        && !matches!(new_role, acl::Role::Admin)
+    {
+        let other_admins = acl::list_acl_entries(&state.acl_ks)
+            .await?
+            .into_iter()
+            .filter(|e| matches!(e.role, acl::Role::Admin) && e.did != did)
+            .count();
+        if other_admins == 0 {
+            warn!(
+                caller = %auth.0.did,
+                did = %did,
+                "ACL update rejected: would demote the last remaining admin"
+            );
+            return Err(AppError::Conflict(
+                "cannot demote the last remaining admin".into(),
+            ));
+        }
+    }
+
     if let Some(role) = updates.role {
         entry.role = role;
     }

@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use tracing::info;
 
-use crate::auth::AuthClaims;
+use crate::auth::{AdminAuth, AuthClaims};
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
@@ -42,8 +42,12 @@ pub struct ServerStatsResponse {
 }
 
 /// GET /stats — instant aggregate from in-memory collector.
+///
+/// Admin-only (SEC-4045 W14): server-wide totals are an operator metric, not
+/// something every authenticated owner should read. Per-DID stats stay
+/// owner-scoped via `get_did_stats`.
 pub async fn get_server_stats(
-    auth: AuthClaims,
+    auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatsResponse>, AppError> {
     let resp = if let Some(ref collector) = state.stats_collector {
@@ -66,6 +70,6 @@ pub async fn get_server_stats(
         }
     };
 
-    info!(did = %auth.did, total_dids = resp.total_dids, "server stats retrieved");
+    info!(did = %auth.0.did, total_dids = resp.total_dids, "server stats retrieved");
     Ok(Json(resp))
 }

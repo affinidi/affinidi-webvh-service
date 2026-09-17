@@ -3159,6 +3159,7 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",
  "affinidi-messaging-test-mediator",
+ "affinidi-net-guard",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",

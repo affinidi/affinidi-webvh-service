@@ -721,11 +721,14 @@ pub async fn get_server_stats(
 
 /// GET /api/stats/{mnemonic} — per-DID stats from persistent store.
 pub async fn get_did_stats(
-    _auth: AuthClaims,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
 ) -> Result<Json<did_hosting_common::DidStats>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    // Owner-or-admin only: without this, any authenticated caller could read
+    // another tenant's DID activity metadata by mnemonic (SEC-4045 W2).
+    did_ops::authorize_did_read(&auth, &state, mnemonic).await?;
     let key = format!("stats:{mnemonic}");
     let stats: did_hosting_common::DidStats = state.stats_ks.get(key).await?.unwrap_or_default();
     Ok(Json(stats))
@@ -761,25 +764,49 @@ fn default_range() -> String {
 /// GET /api/timeseries — server-wide time-series data, optionally
 /// filtered to a specific hosting domain via `?domain=`.
 pub async fn get_server_timeseries(
-    _auth: AuthClaims,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
     let points = match params.domain.as_deref() {
         None | Some("") => query_timeseries(&state.timeseries_ks, "_all", &params.range).await?,
-        Some(domain) => query_timeseries_by_domain(&state, domain, &params.range).await?,
+        Some(domain) => {
+            // `?domain=` aggregates every DID on that hosting domain, so a
+            // non-admin caller must be scoped to it — otherwise any Owner reads
+            // any tenant's whole-domain activity (SEC-4045 W2). Admins and
+            // unrestricted (DomainScope::All) callers pass; a scoped Owner must
+            // have the domain in scope.
+            if auth.role != crate::acl::Role::Admin {
+                let scope =
+                    match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
+                        .await?
+                    {
+                        Some(e) => e.domains,
+                        None => did_hosting_common::server::domain::DomainScope::All,
+                    };
+                if !scope.allows(domain) {
+                    return Err(AppError::Forbidden(
+                        "caller is not scoped to this domain".into(),
+                    ));
+                }
+            }
+            query_timeseries_by_domain(&state, domain, &params.range).await?
+        }
     };
     Ok(Json(points))
 }
 
 /// GET /api/timeseries/{mnemonic} — per-DID time-series data.
 pub async fn get_did_timeseries(
-    _auth: AuthClaims,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Path(mnemonic): Path<String>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
+    // Owner-or-admin only — the per-DID time-series is the same cross-tenant
+    // activity metadata the stats handler guards (SEC-4045 W2).
+    did_ops::authorize_did_read(&auth, &state, mnemonic).await?;
     let points = query_timeseries(&state.timeseries_ks, mnemonic, &params.range).await?;
     Ok(Json(points))
 }

@@ -82,6 +82,19 @@ pub async fn dispatch_trust_task(
         }
     };
 
+    // ─── 2a. Replay gate (SEC-4045 W4). The DIDComm envelope path guards
+    //         state-changing DID ops (delete/change-owner/publish) with the
+    //         replay cache; the HTTPS transport reached the shared dispatcher
+    //         with no such gate, so a captured request could be re-executed
+    //         within the freshness window. Keyed on the transport-authenticated
+    //         caller DID + the document id, mirroring the DIDComm path.
+    if let Err(e) = state.replay_cache.check_and_insert(&auth.did, &doc.id) {
+        tracing::warn!(did = %auth.did, doc_id = %doc.id, error = %e, "HTTPS trust-task replay rejected");
+        return Ok(into_response(DispatchOutcome::Rejected(
+            crate::messaging::body_replay_error(),
+        )));
+    }
+
     // ─── 3. Proof-verificationMethod binding pre-check (SECURITY).
     //
     // Two cases, depending on how the JWT was issued:

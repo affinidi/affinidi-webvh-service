@@ -152,6 +152,118 @@ async fn get_authorized_record(
     Ok(record)
 }
 
+/// Authorize a caller to read per-DID metadata (stats / time-series) for
+/// `mnemonic`: the mnemonic must be well-formed and the caller must own the
+/// record (or be an admin). Returns the record so the caller can reuse its
+/// `domain`/`owner` without a second load.
+///
+/// This is the owner-scoping the id-addressed log/record handlers get for free
+/// via [`get_authorized_record`]; the stats/time-series read paths did not route
+/// through it, which let any authenticated caller read another tenant's DID
+/// activity by mnemonic (SEC-4045 W2).
+pub(crate) async fn authorize_did_read(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+) -> Result<DidRecord, AppError> {
+    validate_mnemonic(mnemonic)?;
+    get_authorized_record(&state.dids_ks, mnemonic, auth).await
+}
+
+// ---------------------------------------------------------------------------
+// Per-account quota enforcement (SEC-4045 W3)
+// ---------------------------------------------------------------------------
+//
+// The edge server enforces `max_did_count` / `max_total_size`; the control
+// plane — the authoritative write side, and in daemon mode the ONLY write path
+// — did not, so an admin-set per-account quota was silently a no-op. The
+// control plane has no global default limit (unlike the edge config), so a
+// `None` ACL max means "no cap" and preserves prior behaviour; a quota only
+// bites once an admin sets one on the caller's ACL entry.
+
+/// The caller's current usage from the `owner:` reverse index: (owned-slot
+/// count, summed `content_size`). O(n) in the caller's slots. Filters the
+/// string-prefix collisions the `owner:` index can return (a DID that is a
+/// prefix of a longer DID), exactly as [`list_dids`] does.
+async fn owner_usage(state: &AppState, owner: &str) -> Result<(u64, u64), AppError> {
+    let prefix = format!("owner:{owner}:");
+    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
+    let mut count: u64 = 0;
+    let mut total_size: u64 = 0;
+    for (_key, value) in raw {
+        let mnemonic = String::from_utf8(value)
+            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            if record.owner != owner {
+                continue;
+            }
+            count += 1;
+            total_size = total_size.saturating_add(record.content_size);
+        }
+    }
+    Ok((count, total_size))
+}
+
+/// Enforce the caller's per-account `max_did_count` before adding a new slot.
+/// Admin-exempt. `None` ACL max (or no ACL entry) means no cap.
+async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<(), AppError> {
+    use crate::acl::Role;
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let Some(entry) =
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await?
+    else {
+        return Ok(());
+    };
+    let max = entry.effective_max_did_count(u64::MAX);
+    if max == u64::MAX {
+        return Ok(());
+    }
+    let (count, _) = owner_usage(state, &auth.did).await?;
+    if count >= max {
+        warn!(did = %auth.did, count, max, "DID count quota exceeded (control)");
+        return Err(AppError::QuotaExceeded(format!(
+            "DID count limit reached ({max})"
+        )));
+    }
+    Ok(())
+}
+
+/// Enforce the caller's per-account `max_total_size` before a write that grows
+/// stored content. `old_size` is what the target slot already contributes (0
+/// for a fresh slot); `new_size` is what it will contribute after the write.
+/// Admin-exempt; `None` ACL max (or no ACL entry) means no cap.
+async fn check_total_size_limit(
+    auth: &AuthClaims,
+    state: &AppState,
+    old_size: u64,
+    new_size: u64,
+) -> Result<(), AppError> {
+    use crate::acl::Role;
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let Some(entry) =
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await?
+    else {
+        return Ok(());
+    };
+    let max = entry.effective_max_total_size(u64::MAX);
+    if max == u64::MAX {
+        return Ok(());
+    }
+    let (_, total) = owner_usage(state, &auth.did).await?;
+    let proposed = total.saturating_sub(old_size).saturating_add(new_size);
+    if proposed > max {
+        warn!(did = %auth.did, proposed, max, "total size quota exceeded (control)");
+        return Err(AppError::QuotaExceeded(format!(
+            "total content size limit reached ({max} bytes)"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve a custom path during create, applying force-replace semantics.
 ///
 /// If the path is free, returns it unchanged. If taken and `force` is false,
@@ -287,6 +399,17 @@ pub async fn create_did(
         services: None,
         agent_names: Vec::new(),
     };
+
+    // Per-account DID-count quota (SEC-4045 W3). Only a slot this owner does not
+    // already hold counts against the cap — a force-replace of the caller's own
+    // slot is not a net-new DID, so it must not be refused at the cap.
+    let adds_slot = match state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+        Some(existing) => existing.owner != auth.did,
+        None => true,
+    };
+    if adds_slot {
+        check_did_count_limit(auth, state).await?;
+    }
 
     let mut batch = state.store.batch();
     batch.insert(&state.dids_ks, did_key(&mnemonic), &record)?;
@@ -471,6 +594,16 @@ pub async fn register_did_atomic(
         }
         None => false,
     };
+
+    // Per-account quota (SEC-4045 W3). A fresh slot counts against
+    // `max_did_count`; the published log counts against `max_total_size`
+    // (old size 0 for a fresh slot, else the slot's current content_size).
+    // Both helpers are admin-exempt and no-op when the ACL sets no cap.
+    if existing.is_none() {
+        check_did_count_limit(auth, state).await?;
+    }
+    let old_content_size = existing.as_ref().map(|r| r.content_size).unwrap_or(0);
+    check_total_size_limit(auth, state, old_content_size, did_log.len() as u64).await?;
 
     // Preserve created_at when the same owner is re-publishing; reset
     // on takeover or fresh allocation.
@@ -680,6 +813,12 @@ async fn prepare_republish(
 
     let new_size = did_log.len() as u64;
     let did_id_val = publication.did_id.clone();
+
+    // Per-account total-size quota (SEC-4045 W3). The republished log replaces
+    // this slot's current content, so the owner's usage moves by
+    // `new_size - record.content_size`. `record.content_size` is still the OLD
+    // size here (it is overwritten below). Admin-exempt; no-op with no ACL cap.
+    check_total_size_limit(auth, state, record.content_size, new_size).await?;
 
     // T20b: same safety check as register_did_atomic — the embedded
     // DID's host must be a configured active domain on this server
@@ -1487,6 +1626,14 @@ pub async fn delete_did(
 
     let did_id = record.did_id.clone();
 
+    // Re-check the caller's DomainScope at time-of-use, as create/publish do at
+    // create-time (SEC-4045 W7). Ownership alone is not enough: a domain-scoped
+    // Owner who came to own a DID on another domain would otherwise destroy it.
+    // Only a published slot has a DID to host-check.
+    if let Some(did_id) = did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
+
     ensure_slot_domain_matches(&record, request_domain)?;
 
     let mut batch = state.store.batch();
@@ -1529,6 +1676,12 @@ pub async fn change_did_owner(
     // caller submits a malformed target. Any new-owner format check after
     // this point only runs for authorized callers.
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Re-check the caller's DomainScope at time-of-use (SEC-4045 W7), mirroring
+    // create/publish; ownership is not a substitute for domain scoping.
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
 
     // Canonicalise (trim + format check) before any storage I/O so a
     // typo in the new-owner DID can't silently mismatch later
@@ -1585,6 +1738,10 @@ pub async fn set_did_disabled(
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    // Re-check DomainScope at time-of-use (SEC-4045 W7).
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
     record.disabled = disabled;
     state.dids_ks.insert(did_key(mnemonic), &record).await?;
     info!(
@@ -1606,6 +1763,11 @@ pub async fn rollback_did(
 
     validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Re-check DomainScope at time-of-use (SEC-4045 W7).
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
 
     let bytes = state
         .dids_ks
