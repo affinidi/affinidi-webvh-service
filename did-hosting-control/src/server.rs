@@ -6,6 +6,7 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
 };
+use affinidi_tdk::messaging::protocols::mediator::acls::AccessListModeType;
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
@@ -719,6 +720,19 @@ pub async fn start_didcomm_service(
         },
         auto_delete: true,
         protocols,
+        // A DID's mediator account starts with an empty, `ExplicitAllow`
+        // access list — deny-by-default — until something opens it.
+        // `vta-sdk`'s `acl_setup` module does this for VTA (at its own
+        // startup) and for pnm (on DIDComm connect), but nothing here ever
+        // did it for the control plane's own listener. The result: every
+        // trust task VTA forwards to a hosted webvh server over DIDComm/TSP
+        // is accepted by the mediator and then silently dropped, because
+        // this listener's account was never told to accept forwarded
+        // delivery. `ExplicitDeny` flips the list to deny-list semantics
+        // (nothing explicitly denied, so every sender is allowed) — the same
+        // outcome `acl_setup::build_allow_all_acl` reaches by hand on the
+        // client side.
+        acl_mode: Some(AccessListModeType::ExplicitDeny),
         ..Default::default()
     };
 
