@@ -74,6 +74,9 @@ affinidi-tdk = { workspace = true }
 trust-tasks-rs = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
+# TSP control-message type for `ServerTspHandler::handle_control`'s signature;
+# the accept policy itself lives in `did_hosting_common::server::tsp_relationship`.
+affinidi-tsp = { workspace = true }
 affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }

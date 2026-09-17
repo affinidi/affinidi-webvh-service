@@ -58,6 +58,26 @@ impl TspHandler for WebvhTspHandler {
             None => Ok(None),
         }
     }
+
+    /// Answer an inbound TSP relationship control message. The accept policy —
+    /// accept an invite from any framework-authenticated sender, authorize at
+    /// the task layer — lives in `did_hosting_common` so the control plane and
+    /// the edge server answer identically. See its module docs.
+    async fn handle_control(
+        &self,
+        ctx: HandlerContext,
+        control: affinidi_tsp::message::control::ControlMessage,
+        sender_vid: String,
+        thread_digest: [u8; 32],
+    ) {
+        did_hosting_common::server::tsp_relationship::answer_inbound_control(
+            &ctx,
+            &control,
+            &sender_vid,
+            thread_digest,
+        )
+        .await
+    }
 }
 
 /// Compute the response bytes for an inbound TSP trust-task payload.
