@@ -1873,6 +1873,34 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
     }
 }
 
+/// Trust-task error document for a **replayed** request: the `(sender, id)`
+/// pair was already seen within the freshness window. Mirrors
+/// [`body_parse_error`] so the TSP and HTTPS trust-task transports emit a
+/// consistent routed error (`idConflict`) instead of leaving the re-executed
+/// op unguarded (SEC-4045 W4). The DIDComm envelope path already gates on
+/// `replay_cache`; this closes the sibling transports.
+pub(crate) fn body_replay_error() -> trust_tasks_rs::ErrorResponse {
+    use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
+    // A duplicate document id within the freshness window is exactly an
+    // id-conflict on the wire.
+    let payload: ErrorPayload = RejectReason::IdConflict.into();
+    TrustTask {
+        id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        thread_id: None,
+        parent_thread_id: None,
+        ceremony: None,
+        type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
+        issuer: None,
+        recipient: None,
+        issued_at: Some(chrono::Utc::now()),
+        expires_at: None,
+        payload,
+        context: None,
+        proof: None,
+        extra: Default::default(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified trust-task dispatch (all transports)
 // ---------------------------------------------------------------------------

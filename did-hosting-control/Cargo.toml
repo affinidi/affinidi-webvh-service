@@ -115,6 +115,8 @@ affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8"
+# Egress address-class guard for the registry URL validation (SSRF default-deny).
+affinidi-net-guard = "0.1"
 axum = "0.8"
 axum-extra = { workspace = true }
 clap = { workspace = true }

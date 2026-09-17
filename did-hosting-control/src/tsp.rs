@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use did_hosting_common::server::trust_tasks::TspTransportHandler;
 
-use crate::messaging::{body_parse_error, dispatch_trust_task_doc};
+use crate::messaging::{body_parse_error, body_replay_error, dispatch_trust_task_doc};
 use crate::server::AppState;
 
 /// messaging-service [`TspHandler`] that dispatches inbound TSP trust-task
@@ -104,6 +104,19 @@ pub(crate) async fn run_tsp_trust_task(
             return Ok(Some(body));
         }
     };
+
+    // Replay gate (SEC-4045 W4). The DIDComm envelope path guards state-changing
+    // DID ops with the replay cache; the TSP routed-relay transport reached the
+    // shared dispatcher with no such gate, so a mediator-positioned attacker
+    // could resubmit a captured sealed frame and re-execute a delete/change-owner/
+    // publish within the freshness window. Keyed on the transport-authenticated
+    // sender + the document id, mirroring the DIDComm and HTTPS paths.
+    if let Err(e) = state.replay_cache.check_and_insert(sender, &doc.id) {
+        warn!(sender, doc_id = %doc.id, error = %e, "TSP trust-task replay rejected");
+        let err_doc = body_replay_error();
+        let body = serde_json::to_vec(&err_doc).expect("trust-task-error serialises");
+        return Ok(Some(body));
+    }
 
     let my_vid = state
         .config
