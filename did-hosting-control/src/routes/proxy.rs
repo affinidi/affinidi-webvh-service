@@ -27,6 +27,15 @@ pub async fn proxy_to_service(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("instance {instance_id}")))?;
 
+    // Fail-closed before forwarding the caller's Admin credential (SEC-4045 W6).
+    // The proxy sends the Admin `Authorization` header to `instance.url`, so it
+    // may only target a host the operator explicitly allow-listed (and that
+    // still passes the address-class egress guard). An empty allowlist disables
+    // the proxy rather than trusting whatever URL a Service-role DID registered
+    // — which is what previously let an Admin token be exfiltrated to an
+    // attacker-registered host.
+    registry::validate_proxy_target_url(&instance.url, &state.config.registry.url_allowlist)?;
+
     let base = instance.url.trim_end_matches('/');
     let path = path.trim_start_matches('/');
     let query = req
