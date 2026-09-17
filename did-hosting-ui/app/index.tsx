@@ -83,16 +83,21 @@ export default function Dashboard() {
   }, [api]);
 
   useEffect(() => {
-    if (!isAuthenticated) return;
-    api
-      .getServerStats()
-      .then(setServerStats)
-      .catch(() => {});
+    // `/api/config` and the server-wide aggregate are both admin-only on the
+    // backend now (config carries operator topology; parity with
+    // `/api/services/overview`). Skip them for non-admins — `config` only drives
+    // the daemon/standalone label, and the usage chart / aggregate section is
+    // hidden whenever `serverStats` is null.
+    if (!isAuthenticated || !isAdmin) return;
     api
       .getConfig()
       .then(setConfig)
       .catch(() => {});
-  }, [isAuthenticated, api]);
+    api
+      .getServerStats()
+      .then(setServerStats)
+      .catch(() => {});
+  }, [isAuthenticated, isAdmin, api]);
 
   useEffect(() => {
     if (!isAuthenticated || !isAdmin) return;

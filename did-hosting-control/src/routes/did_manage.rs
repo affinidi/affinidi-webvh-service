@@ -706,7 +706,10 @@ pub struct ServerStatsResponse {
 
 /// GET /api/stats — O(1) aggregate from in-memory atomic counters.
 pub async fn get_server_stats(
-    _auth: AuthClaims,
+    // Server-wide aggregate is operator metrics, not per-tenant data — admin
+    // only, for parity with `/api/services/overview` (AdminAuth) and the edge
+    // `get_server_stats` fix (SEC-4045 W14). Per-DID stats stay owner-scoped.
+    _auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatsResponse>, AppError> {
     let agg = state.stats_collector.get_aggregate();
@@ -769,7 +772,17 @@ pub async fn get_server_timeseries(
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
     let points = match params.domain.as_deref() {
-        None | Some("") => query_timeseries(&state.timeseries_ks, "_all", &params.range).await?,
+        None | Some("") => {
+            // The server-wide (`_all`) aggregate is operator-only, matching
+            // `get_server_stats`. A non-admin owner reads only their own
+            // domain's activity via `?domain=` (handled below, DomainScope-checked).
+            if auth.role != crate::acl::Role::Admin {
+                return Err(AppError::Forbidden(
+                    "server-wide time-series is admin-only; pass ?domain= for a domain you are scoped to".into(),
+                ));
+            }
+            query_timeseries(&state.timeseries_ks, "_all", &params.range).await?
+        }
         Some(domain) => {
             // `?domain=` aggregates every DID on that hosting domain, so a
             // non-admin caller must be scoped to it — otherwise any Owner reads
@@ -1053,18 +1066,25 @@ pub struct ConfigResponse {
 /// Deliberately does **not** pass `None` through to
 /// [`resolve_service_types`], which would build a throwaway `DIDCacheClient`
 /// and hit the network. These run on request-handling paths — `GET
-/// /api/config` is reachable by every authenticated user — so that fallback
-/// would turn a page load into an unauthenticated-ish outbound fetch, once
-/// per request. With a resolver configured, the shared client's cache makes
-/// everything after the first call cheap.
+/// /api/config` is an admin request handler — so that fallback would turn a
+/// page load into an outbound fetch, once per request. With a resolver
+/// configured, the shared client's cache makes everything after the first call
+/// cheap.
 async fn control_advertised_services(state: &AppState) -> Option<Vec<String>> {
     let did = state.config.server_did.as_deref()?;
     let resolver = state.did_resolver.as_ref()?;
     did_hosting_common::server::didcomm_profile::resolve_service_types(did, Some(resolver)).await
 }
 
-/// GET /api/config — return control plane configuration (non-sensitive fields only).
-pub async fn get_config(_auth: AuthClaims, State(state): State<AppState>) -> Json<ConfigResponse> {
+/// GET /api/config — control-plane configuration.
+///
+/// Admin-only. The response carries backend topology — `mediator_did`,
+/// `vta_did`/`vta_url`, `control_did`, `data_dir` (a server filesystem path),
+/// `listen_address`, registry size, token TTLs. Per the project's topology-
+/// secrecy rule (the control↔mediator/VTA association is deliberately never
+/// advertised) this must not reach a tenant, and it matches the edge
+/// `/api/config` (AdminAuth) and the sibling `/api/services/overview`.
+pub async fn get_config(_auth: AdminAuth, State(state): State<AppState>) -> Json<ConfigResponse> {
     let advertised_services = control_advertised_services(&state).await;
     let c = &state.config;
     Json(ConfigResponse {

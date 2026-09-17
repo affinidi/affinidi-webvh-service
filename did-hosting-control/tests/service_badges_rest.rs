@@ -317,9 +317,11 @@ async fn services_overview_exposes_instance_advertised_services() {
 #[tokio::test]
 async fn config_omits_advertised_services_without_a_resolver() {
     let h = make_harness().await;
-    let owner = "did:example:owner";
-    add_acl(&h.state, owner, Role::Owner).await;
-    let token = mint_token(&h.state, owner, Role::Owner).await;
+    // `/api/config` is admin-only — it carries backend topology (mediator/VTA
+    // DIDs, data_dir, listen address). Use an Admin token.
+    let admin = "did:example:admin";
+    add_acl(&h.state, admin, Role::Admin).await;
+    let token = mint_token(&h.state, admin, Role::Admin).await;
 
     let (status, body) = get_json(&h.state, "/api/config", &token).await;
 
