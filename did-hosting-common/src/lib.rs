@@ -6,6 +6,7 @@ pub mod did_hosting_tasks;
 pub mod did_ops;
 pub mod didcomm_types;
 mod error;
+mod http;
 pub mod method;
 mod types;
 mod watcher_client;

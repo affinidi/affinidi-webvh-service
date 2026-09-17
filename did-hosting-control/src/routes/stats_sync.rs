@@ -91,6 +91,21 @@ pub async fn receive_stats(
         return StatusCode::NO_CONTENT;
     }
 
+    // Bound the per-payload delta count. The in-memory stats collector is keyed
+    // by mnemonic with no cardinality limit, so a Service-role edge (or a leaked
+    // service token that already passed the checks above) must not be able to
+    // inflate it without bound in a single request. A real edge only ever syncs
+    // the slots it hosts, which its own quota bounds well below this.
+    const MAX_DELTAS_PER_SYNC: usize = 10_000;
+    if payload.did_deltas.len() > MAX_DELTAS_PER_SYNC {
+        warn!(
+            server_did = %payload.server_did,
+            count = payload.did_deltas.len(),
+            "stats sync rejected: too many deltas in one payload"
+        );
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+
     // Record deltas into in-memory collector (no I/O)
     for delta in &payload.did_deltas {
         state.stats_collector.record_deltas(

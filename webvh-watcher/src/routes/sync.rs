@@ -58,15 +58,20 @@ pub async fn receive_did(
     // Validate mnemonic format to prevent store key injection
     validate_mnemonic(&req.mnemonic)?;
 
-    // Validate log content is a well-formed WebVH log (rejects arbitrary JSON
-    // that happens to parse — a leaked push token must not let attackers
-    // republish bogus DID documents on the watcher's hostname).
+    // Verify the log CRYPTOGRAPHICALLY, not just structurally — the watcher is
+    // an independent verifying mirror, and it serves this content publicly from
+    // its own hostname. Structural validation alone would let a leaked/valid
+    // push token plant a forged-but-well-formed did.jsonl for any mnemonic.
+    // `verify_did_log_proofs` runs the full signature / hash-chain / pre-rotation
+    // checks (and also caps the entry count), matching the edge publish path
+    // (SEC-4045 W9). Logs pushed by a control plane are already verified there,
+    // so legitimate syncs pass.
     if req.log_content.is_empty() {
         return Err(AppError::Validation("log_content cannot be empty".into()));
     }
-    did_hosting_common::did_ops::validate_did_jsonl(&req.log_content).map_err(|e| {
-        warn!(mnemonic = %req.mnemonic, error = %e, "invalid WebVH JSONL in sync push");
-        AppError::Validation(format!("invalid WebVH log content: {e}"))
+    did_hosting_common::did_ops::verify_did_log_proofs(&req.log_content).map_err(|e| {
+        warn!(mnemonic = %req.mnemonic, error = %e, "unverified WebVH JSONL in sync push");
+        AppError::Validation(format!("WebVH log content failed verification: {e}"))
     })?;
 
     let record = WatcherRecord {
