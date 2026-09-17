@@ -112,14 +112,33 @@ pub struct RegistryConfig {
     pub instances: Vec<InstanceConfig>,
     #[serde(default = "default_health_check_interval")]
     pub health_check_interval: u64,
-    /// Hostname allowlist for service registration via the API.
+    /// Hostname allowlist for registered service-instance URLs.
     ///
-    /// When non-empty, `register_service` rejects URLs whose host is not in
-    /// this list. The proxy at `/api/server/{instance}/{*path}` only
-    /// forwards to URLs that have been registered, so the allowlist
-    /// transitively bounds where the proxy can reach. When empty, registry
-    /// URLs are accepted unrestricted (back-compat default for trusted
-    /// internal deployments).
+    /// This bounds two things: which hosts may be **registered** (via the
+    /// registration API / `MSG_SERVER_REGISTER`), and — load-bearing for
+    /// security — which hosts the Admin **reverse proxy**
+    /// (`/api/server|witness/{instance}/{*path}`) will forward the caller's
+    /// Admin `Authorization` credential to.
+    ///
+    /// Matching is on the URL **host only** (scheme and port are ignored),
+    /// case-insensitive, and **exact** — an entry `example.com` does NOT match
+    /// `evil.example.com`.
+    ///
+    /// Behaviour by state (post SEC-4045 W6 hardening):
+    ///
+    /// - **Non-empty:** registration rejects any URL whose host is not listed,
+    ///   and the proxy forwards only to listed hosts. This is the recommended
+    ///   configuration for any deployment that uses the proxy.
+    /// - **Empty (the default):** registration still **default-denies**
+    ///   non-routable / internal *literal* hosts (loopback, RFC1918,
+    ///   link-local incl. `169.254.169.254`, CGNAT, ULA, IPv4-mapped) — a
+    ///   public host is still accepted — and the **proxy is fail-closed**: it
+    ///   refuses every request rather than forward an Admin credential to a
+    ///   host the operator never vetted. So an unconfigured allowlist disables
+    ///   the proxy; it does not open it.
+    ///
+    /// See `validate_registered_url` (registration) and
+    /// `validate_proxy_target_url` (proxy) for the enforcement.
     #[serde(default)]
     pub url_allowlist: Vec<String>,
 }

@@ -120,6 +120,9 @@ keyring_service = "did-hosting-control"
 
 [registry]
 health_check_interval = 60    # seconds
+# Hosts the control plane may register and PROXY TO. Required if you use the
+# reverse proxy — see "Reverse proxy & the registry allowlist" below.
+url_allowlist = ["server-eu.internal", "witness-eu.internal"]
 ```
 
 ### Service Registry
@@ -147,6 +150,56 @@ url = "http://watcher-eu:8533"
 ```
 
 Instances can also be managed dynamically via the registry API.
+
+### Reverse proxy & the registry allowlist (security-critical)
+
+The control plane exposes an **Admin-only reverse proxy** at
+`/api/server/{instance}/{*path}` and `/api/witness/{instance}/{*path}`. It
+forwards the request to a registered instance's `url` **and forwards the
+caller's `Authorization` header** (the Admin bearer) to that backend, since the
+control plane and its backends typically share JWT keys.
+
+Because a live Admin credential is forwarded, the target host is gated by
+`registry.url_allowlist`:
+
+- **Empty allowlist (the default) ⇒ the proxy is disabled (fail-closed).** A
+  proxy request returns `403` (`"proxy refused: no registry.url_allowlist is
+  configured…"`). Registration itself still refuses non-routable / internal
+  *literal* hosts (loopback, RFC1918, `169.254.169.254`, CGNAT, …) even with an
+  empty allowlist, but a public host can be registered — it just cannot be
+  proxied to.
+- **Non-empty allowlist ⇒ the proxy forwards only to listed hosts.** Any other
+  target (a public attacker host, or a name that isn't listed) is refused, so
+  the Admin credential can only ever reach a host you explicitly trust.
+
+> **⚠️ Behaviour change (SEC-4045 W6).** Earlier releases forwarded the Admin
+> credential to **any** registered URL when the allowlist was empty. If you use
+> the reverse proxy and have not set `registry.url_allowlist`, the proxy will now
+> return `403` until you configure it. This is intentional: an unset allowlist
+> previously let a `service`-role registrant point the proxy at an
+> attacker-controlled host and receive an Admin token.
+
+**Configure it securely:**
+
+1. **List every backend host you proxy to**, and nothing else:
+   ```toml
+   [registry]
+   url_allowlist = ["server-eu.internal", "witness-eu.internal"]
+   ```
+   Matching is on the URL **host only** (scheme and port are ignored),
+   case-insensitive, and **exact** — `example.com` does not match
+   `sub.example.com`. If a backend is on an internal IP literal (e.g.
+   `10.0.0.5`), list that literal exactly (it is otherwise refused as
+   non-routable).
+2. **Prefer hostnames you control end-to-end** (private DNS / service names)
+   over raw IPs, and terminate the backends over **TLS** so the forwarded
+   credential is not sent in clear text.
+3. **Keep the list minimal.** Every entry is a host the control plane will hand
+   an Admin credential to; treat it like an egress allowlist.
+4. **Daemon (all-in-one) deployments need no allowlist** — the registry is empty
+   and the proxy is unused, so leaving `url_allowlist` unset is correct and
+   safe. Only *standalone control planes that manage remote instances through
+   the proxy* must set it.
 
 ### Environment Variable Overrides
 
