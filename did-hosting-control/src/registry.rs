@@ -397,7 +397,9 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
     // in and is trusted; this default-deny only bites the unconfigured default.
     if let Ok(ip) = host.parse::<std::net::IpAddr>()
         && !affinidi_net_guard::is_globally_routable(ip)
-        && !allowlist.iter().any(|entry| entry.eq_ignore_ascii_case(&host))
+        && !allowlist
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&host))
     {
         return Err(AppError::Forbidden(
             "registered URL host is a non-routable / internal address; allowlist it explicitly to permit it".into(),

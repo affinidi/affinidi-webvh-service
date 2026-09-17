@@ -777,15 +777,13 @@ pub async fn get_server_timeseries(
             // unrestricted (DomainScope::All) callers pass; a scoped Owner must
             // have the domain in scope.
             if auth.role != crate::acl::Role::Admin {
-                let scope = match did_hosting_common::server::acl::get_acl_entry(
-                    &state.acl_ks,
-                    &auth.did,
-                )
-                .await?
-                {
-                    Some(e) => e.domains,
-                    None => did_hosting_common::server::domain::DomainScope::All,
-                };
+                let scope =
+                    match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
+                        .await?
+                    {
+                        Some(e) => e.domains,
+                        None => did_hosting_common::server::domain::DomainScope::All,
+                    };
                 if !scope.allows(domain) {
                     return Err(AppError::Forbidden(
                         "caller is not scoped to this domain".into(),
