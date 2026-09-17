@@ -1066,17 +1066,16 @@ pub struct ConfigResponse {
 /// Deliberately does **not** pass `None` through to
 /// [`resolve_service_types`], which would build a throwaway `DIDCacheClient`
 /// and hit the network. These run on request-handling paths — `GET
-/// /api/config` is reachable by every authenticated user — so that fallback
-/// would turn a page load into an unauthenticated-ish outbound fetch, once
-/// per request. With a resolver configured, the shared client's cache makes
-/// everything after the first call cheap.
+/// /api/config` is an admin request handler — so that fallback would turn a
+/// page load into an outbound fetch, once per request. With a resolver
+/// configured, the shared client's cache makes everything after the first call
+/// cheap.
 async fn control_advertised_services(state: &AppState) -> Option<Vec<String>> {
     let did = state.config.server_did.as_deref()?;
     let resolver = state.did_resolver.as_ref()?;
     did_hosting_common::server::didcomm_profile::resolve_service_types(did, Some(resolver)).await
 }
 
-/// GET /api/config — return control plane configuration (non-sensitive fields only).
 /// GET /api/config — control-plane configuration.
 ///
 /// Admin-only. The response carries backend topology — `mediator_did`,
