@@ -119,7 +119,7 @@ vta-sdk = { workspace = true }
 # fields, 0.11.4 the `jti` parameter to `AuthBackend::mint_access_token`,
 # and 0.11.30 the move to vta-sdk 0.20. An unlocked build against an
 # earlier line will not compile.
-vti-common = { version = "0.18.9", default-features = false }
+vti-common = { version = "0.19.3", default-features = false }
 async-trait = "0.1"
 
 # server-core dependencies (optional)

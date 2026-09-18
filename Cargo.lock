@@ -9078,9 +9078,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.21.2"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5b41e7486bc6844f92525df0411967471fd6e61c7ff861f0db054644d10edb5"
+checksum = "1ead41903b477d45a840a0b5020750af47a285b709603c483eabfe257291d379"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9449,9 +9449,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.41.1"
+version = "0.43.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4970627d530a44640b244669226de96aae3549eb927670885673e9964eb72aed"
+checksum = "282a0a1a70923ffa5f4973656e834d430057cdd098246d2acb301d7a3909317d"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -9495,9 +9495,9 @@ dependencies = [
 
 [[package]]
 name = "vti-common"
-version = "0.18.9"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8ef2b8795b570e29a2d2df7f69e9cb24ead1a0a369bc06ecb6991d5cacf144b"
+checksum = "1a16391ef4a64e39feacff79b6a08211f74ae454e9bfe39a628b8ce0d6340aaa"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
