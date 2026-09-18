@@ -29,6 +29,8 @@ use tracing::{info, warn};
 
 use did_hosting_common::server::trust_tasks::TspTransportHandler;
 
+use did_hosting_common::server::tsp_binding;
+
 use crate::messaging::{body_parse_error, body_replay_error, dispatch_trust_task_doc};
 use crate::server::AppState;
 
@@ -93,15 +95,25 @@ pub(crate) async fn run_tsp_trust_task(
     sender: &str,
     payload: &[u8],
 ) -> Result<Option<Vec<u8>>, DIDCommServiceError> {
-    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_slice(payload) {
+    // Read whichever dialect the frame is in before parsing it. A conformant
+    // peer sends the `binding/tsp/0.1` envelope; a not-yet-upgraded sibling
+    // sends the bare document. See `tsp_binding` for why both are accepted.
+    let (document, carriage) = tsp_binding::open(payload);
+
+    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_slice(&document) {
         Ok(d) => d,
         Err(e) => {
             warn!(sender, error = %e, "TSP: payload did not parse as TrustTask<Value>");
             // Same `malformed_request` shape the DIDComm/HTTPS transports
             // emit, so a producer sees a consistent error across transports.
+            //
+            // Framed for the carriage it answers. Returning this bare to a
+            // conformant peer is what made the original failure undiagnosable:
+            // the VTA refused the very error that would have explained itself,
+            // and waited out its timeout instead.
             let err_doc = body_parse_error(&e.to_string());
             let body = serde_json::to_vec(&err_doc).expect("trust-task-error serialises");
-            return Ok(Some(body));
+            return Ok(Some(tsp_binding::frame(body, carriage)));
         }
     };
 
@@ -137,9 +149,10 @@ pub(crate) async fn run_tsp_trust_task(
         .await?
         .into_document()
     {
-        Some(value) => Ok(Some(
+        Some(value) => Ok(Some(tsp_binding::frame(
             serde_json::to_vec(&value).expect("response serialises"),
-        )),
+            carriage,
+        ))),
         None => Ok(None),
     }
 }
@@ -275,6 +288,80 @@ mod tests {
         assert!(
             doc.get("type").and_then(Value::as_str).is_some(),
             "dispatch produced a typed trust-task document: {doc}"
+        );
+    }
+
+    /// The reported failure, end to end at this handler.
+    ///
+    /// The VTA wraps every Trust Task in the `binding/tsp/0.1` envelope. This
+    /// handler used to parse the payload straight as a `TrustTask<Value>`, so
+    /// the envelope itself failed Type-URI validation — `type URI path must be
+    /// /spec/<slug>/<major.minor>` — and the `trust-task-error` we sent back to
+    /// say so went out bare, which the VTA refused in turn. Neither half of the
+    /// round trip survived, and minting a persona DID died on a reply timeout
+    /// for an answer that had already been sent and discarded.
+    #[tokio::test]
+    async fn an_enveloped_request_is_understood_and_answered_in_kind() {
+        let (state, _dir) = test_state().await;
+        let body = json!({
+            "id": "urn:uuid:22222222-2222-2222-2222-222222222222",
+            "type": "https://trusttasks.org/spec/acl/grant/0.1",
+            "recipient": SERVICE_DID,
+            "issuedAt": "2026-07-06T00:00:00Z",
+            "payload": {
+                "entry": {
+                    "subject": "did:web:carol.example",
+                    "role": "owner",
+                    "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } }
+                }
+            }
+        });
+        let wire = vta_sdk::tsp_binding::wrap_envelope(&serde_json::to_vec(&body).unwrap());
+
+        let bytes = run_tsp_trust_task(&state, SENDER_DID, &wire)
+            .await
+            .expect("handler does not error")
+            .expect("a response is emitted");
+
+        // The answer is an envelope the VTA can open — not the bare document
+        // it spent its whole timeout budget refusing.
+        let document =
+            vta_sdk::tsp_binding::open_envelope(&bytes).expect("the reply is a binding envelope");
+        let doc: Value = serde_json::from_slice(&document).expect("document is JSON");
+        // And the dispatcher saw *our task*, not the envelope. The reply is a
+        // `proofRequired` rejection — the same outcome the bare-document test
+        // above gets, since neither supplies a proof under the default policy —
+        // but what matters is that it answers `acl/grant`. Before the fix the
+        // envelope's own type URI was all the parser ever saw, so no reply
+        // could name the task inside it.
+        assert_eq!(
+            doc["payload"]["inResponseTo"]["typeUri"], "https://trusttasks.org/spec/acl/grant/0.1",
+            "the reply answers the task the envelope carried: {doc}"
+        );
+        assert_eq!(
+            doc["payload"]["code"], "proofRequired",
+            "it reached proof checking, i.e. past parsing: {doc}"
+        );
+    }
+
+    /// The other side of the tolerance: a sibling still on the pre-binding
+    /// build sends bare and must still get a bare answer back. Wrapping its
+    /// reply would break it exactly the way sending bare broke the VTA.
+    #[tokio::test]
+    async fn a_bare_request_is_still_answered_bare() {
+        let (state, _dir) = test_state().await;
+        let bytes = run_tsp_trust_task(&state, SENDER_DID, b"{not json")
+            .await
+            .expect("handler does not error on bad input")
+            .expect("a response is emitted");
+        assert!(
+            vta_sdk::tsp_binding::open_envelope(&bytes).is_err(),
+            "a bare request's reply is not wrapped"
+        );
+        let doc: Value = serde_json::from_slice(&bytes).expect("response is JSON");
+        assert_eq!(
+            doc["type"],
+            did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string()
         );
     }
 
