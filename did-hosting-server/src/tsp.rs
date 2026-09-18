@@ -5,10 +5,13 @@
 //! payload. **Two payload shapes arrive here**, and we sniff between them:
 //!
 //! 1. A **trust-task document** (`TrustTask<Value>`) — health ping, register
-//!    ack. Dispatched through [`crate::trust_tasks_infra`], the same entry the
-//!    DIDComm envelope route uses. The response is *returned*, so the framework
-//!    seals it back to the sender over TSP: a ping delivered here is ponged
-//!    here.
+//!    ack. Carried either inside the `binding/tsp/0.1` envelope (what a
+//!    conformant peer sends) or bare (this repo's pre-binding dialect);
+//!    [`did_hosting_common::server::tsp_binding`] reads both and says why, and
+//!    the reply goes back in whichever arrived. Dispatched through
+//!    [`crate::trust_tasks_infra`], the same entry the DIDComm envelope route
+//!    uses. The response is *returned*, so the framework seals it back to the
+//!    sender over TSP: a ping delivered here is ponged here.
 //! 2. A serialised DIDComm [`Message`] — the control plane's outbox sends
 //!    sync/domain pushes this way (`control/src/outbox.rs`). Routed to the same
 //!    `do_*` cores the DIDComm listener uses via
@@ -37,6 +40,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use did_hosting_common::server::tsp_binding;
+
 use crate::messaging::dispatch_tsp_message;
 use crate::server::AppState;
 
@@ -60,8 +65,18 @@ impl TspHandler for ServerTspHandler {
         payload: Vec<u8>,
         sender_vid: String,
     ) -> Result<Option<TspResponse>, DIDCommServiceError> {
+        // Read the binding envelope off first, if this frame is in it. A
+        // conformant peer (the VTA) wraps; a not-yet-upgraded sibling sends the
+        // bare document. `tsp_binding` explains why both are accepted, and
+        // `carriage` is what the reply is framed for.
+        //
+        // Shape 2 below is unaffected: the control plane's outbox ships DIDComm
+        // `Message` bytes, which are not trust tasks and were never wrapped, so
+        // they fall through `open` as `Bare` and are read exactly as before.
+        let (document, carriage) = tsp_binding::open(&payload);
+
         // Shape 1: a trust-task document. Tried first — see the module note.
-        if let Ok(doc) = serde_json::from_slice::<trust_tasks_rs::TrustTask<Value>>(&payload) {
+        if let Ok(doc) = serde_json::from_slice::<trust_tasks_rs::TrustTask<Value>>(&document) {
             let type_uri = doc.type_uri.to_string();
             if crate::trust_tasks_infra::owns(&type_uri) {
                 // Infra trust tasks are the periodic health ping (~every 60s)
@@ -71,10 +86,11 @@ impl TspHandler for ServerTspHandler {
                 debug!(sender = %sender_vid, %type_uri, "inbound TSP: trust task");
                 return Ok(
                     match crate::trust_tasks_infra::dispatch(&self.state, &sender_vid, doc).await {
-                        Some(resp) => Some(TspResponse::new(
+                        Some(resp) => Some(TspResponse::new(tsp_binding::frame(
                             serde_json::to_vec(&resp)
                                 .map_err(|e| DIDCommServiceError::Internal(e.to_string()))?,
-                        )),
+                            carriage,
+                        ))),
                         None => None,
                     },
                 );
@@ -88,7 +104,9 @@ impl TspHandler for ServerTspHandler {
         }
 
         // Shape 2: a serialised DIDComm Message from the control plane's outbox.
-        let msg: Message = match serde_json::from_slice(&payload) {
+        // Read from `document`, which is the original payload whenever the
+        // frame was not an envelope — the case this shape is always in.
+        let msg: Message = match serde_json::from_slice(&document) {
             Ok(m) => m,
             Err(e) => {
                 warn!(

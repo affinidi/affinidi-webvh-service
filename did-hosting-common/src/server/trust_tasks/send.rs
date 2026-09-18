@@ -72,7 +72,23 @@ pub async fn send_trust_task(
 ) -> Result<PeerTransport, SendError> {
     match resolve_send_binding(to, fallback, did_resolver).await {
         Some((PeerTransport::Tsp, _)) => {
-            let payload = serde_json::to_vec(doc)?;
+            // Wrapped in the `binding/tsp/0.1` envelope. This sealed the bare
+            // document, which no conformant consumer can read — the same half
+            // of the defect `crate::server::tsp_binding` documents, on the
+            // producing side.
+            //
+            // Receivers must be upgraded before senders: a node still on the
+            // pre-binding build cannot open this. Both inbound handlers in this
+            // release read either dialect, so a fleet upgraded common-first (or
+            // wholesale) is safe; a control plane upgraded ahead of its edge
+            // servers is not. The TSP failure path below does not rescue it —
+            // the send succeeds and the peer merely answers an error — so the
+            // ordering is a deployment obligation, not something this fallback
+            // covers.
+            let payload = crate::server::tsp_binding::frame(
+                serde_json::to_vec(doc)?,
+                crate::server::tsp_binding::Carriage::Envelope,
+            );
             match didcomm.send_tsp(listener_id, to, &payload).await {
                 Ok(()) => {
                     debug!(to, type_uri = %doc.type_uri, "trust task sent over TSP");

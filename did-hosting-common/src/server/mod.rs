@@ -38,6 +38,11 @@ pub mod trust_task;
 /// it in.
 #[cfg(feature = "server-core")]
 pub mod trust_tasks;
+/// The Trust Tasks TSP binding envelope: reading whichever dialect a frame
+/// arrives in and answering in the same one. Shared so the control plane and
+/// the edge server cannot drift apart on the wire.
+#[cfg(feature = "server-core")]
+pub mod tsp_binding;
 /// Inbound TSP relationship answering arm (Rev 3 §7.2.2). Gated behind
 /// `server-core` because it names the messaging-service `HandlerContext` and
 /// the TSP control-message types, which only the server-side listeners use.
