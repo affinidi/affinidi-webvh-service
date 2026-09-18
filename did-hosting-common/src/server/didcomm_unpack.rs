@@ -179,21 +179,34 @@ pub async fn unpack_signed(
         ));
     }
 
-    if let Some(created_time) = message.created_time {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
-            return Err(AppError::Authentication(
-                "message too old (created_time exceeds 5-minute window)".into(),
-            ));
-        }
-        if created_time > now + 60 {
-            return Err(AppError::Authentication(
-                "message created_time is in the future".into(),
-            ));
-        }
+    // `created_time` is REQUIRED, not optional. Freshness and the DIDComm
+    // replay cache are a matched pair (the cache TTL equals the freshness
+    // window and prunes entries past it), so a signed envelope with no
+    // `created_time` would never become "stale" and could be replayed to
+    // re-trigger a state-changing DID op once its replay-cache entry aged out.
+    // `created_time` is inside the JWS-signed payload, so an attacker can't add
+    // or strip it — every compliant sender sets it (this service's own clients,
+    // and the VTA's webvh client, all do), so treating its absence as a
+    // rejection closes the gap without refusing any real client.
+    let created_time = message.created_time.ok_or_else(|| {
+        AppError::Authentication(
+            "signed message is missing `created_time` (required for freshness/replay protection)"
+                .into(),
+        )
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
+        return Err(AppError::Authentication(
+            "message too old (created_time exceeds 5-minute window)".into(),
+        ));
+    }
+    if created_time > now + 60 {
+        return Err(AppError::Authentication(
+            "message created_time is in the future".into(),
+        ));
     }
 
     Ok((message, signer_base))
