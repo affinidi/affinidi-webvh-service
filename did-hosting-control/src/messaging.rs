@@ -2064,6 +2064,43 @@ pub(crate) async fn dispatch_trust_task_doc(
         );
     }
 
+    // An error is terminal: it is somebody's account of a failure, not a request
+    // to act on. Checked before any routing because the routing below has no
+    // arm for it — `build_dispatcher` does not own `trust-task-error`, so it
+    // fell through to `bridge_did_management`, which synthesised a `Message`
+    // from the error's own `type`, handed it to `dispatch_did_op`, and answered
+    // the resulting `e.p.did.validation-error` with a problem report. The peer
+    // did the same with ours. One failure became a permanent exchange between
+    // two services politely answering each other's errors, and it stopped only
+    // when the mediator started rate-limiting.
+    //
+    // The reason is logged, not just the fact: a peer's error is often the only
+    // account of what went wrong anywhere in the exchange, and dropping it is
+    // how the original failure stayed undiagnosable.
+    //
+    // Same rule as `vta_sdk::inbound::classify`, which is where this belongs
+    // once a release carrying it lands — a fact about the document is the same
+    // fact for both ends, and two copies drift (see `tsp_binding`).
+    if type_uri.starts_with("https://trusttasks.org/spec/trust-task-error/") {
+        let code = doc
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let message = doc
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        warn!(
+            sender,
+            %code,
+            %message,
+            "inbound trust-task error from a peer — terminal, not answered"
+        );
+        return Ok(RoutedReply::Suppressed);
+    }
+
     let framework_owns = build_dispatcher()
         .registered_uris()
         .contains(&type_uri.as_str());
@@ -2145,9 +2182,15 @@ pub(crate) async fn bridge_did_management(
     match dispatch_did_op(&auth, state, &msg).await {
         Ok((resp_type, resp_body)) => tt_reply(doc, my_vid, sender, &resp_type, resp_body),
         Err(e) => {
+            // `error = %e` is the point: `code` alone is a taxonomy bucket —
+            // `e.p.did.validation-error` is every `AppError::Validation` whose
+            // kind is `Other` — so without the message an operator reading this
+            // line learns only that *something* did not validate. That is
+            // exactly how a live mint failure stayed unexplained.
             warn!(
                 sender,
                 code = e.didcomm_code(),
+                error = %e,
                 msg_type = %msg.typ,
                 "trust-task DID-management: protocol error"
             );

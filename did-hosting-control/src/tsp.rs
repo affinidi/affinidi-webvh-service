@@ -365,6 +365,34 @@ mod tests {
         );
     }
 
+    /// The loop, pinned. An error document used to fall through to
+    /// `bridge_did_management`, be dispatched as a DID op, fail validation, and
+    /// be answered with a problem report — which the peer answered in kind.
+    /// Nothing may go back for one now, whatever it threads to.
+    #[tokio::test]
+    async fn an_inbound_error_is_terminal_and_is_never_answered() {
+        let (state, _dir) = test_state().await;
+        let error_doc = json!({
+            "id": "urn:uuid:33333333-3333-3333-3333-333333333333",
+            "threadId": "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.5",
+            "recipient": SERVICE_DID,
+            "issuedAt": "2026-07-06T00:00:00Z",
+            "payload": {"code": "e.p.did.validation-error", "message": "nope"},
+        });
+        let wire = vta_sdk::tsp_binding::wrap_envelope(&serde_json::to_vec(&error_doc).unwrap());
+
+        let out = run_tsp_trust_task(&state, SENDER_DID, &wire)
+            .await
+            .expect("handler does not error");
+
+        assert!(
+            out.is_none(),
+            "answering an error is the loop — got: {:?}",
+            out.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+    }
+
     /// A DID-management op (`did/check-name`) sent over TSP as a Trust Task
     /// document is bridged to the legacy `dispatch_did_op` table and comes
     /// back as a Trust Task `#response` document — proving DID-management is
