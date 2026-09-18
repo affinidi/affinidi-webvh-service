@@ -2078,10 +2078,18 @@ pub(crate) async fn dispatch_trust_task_doc(
     // account of what went wrong anywhere in the exchange, and dropping it is
     // how the original failure stayed undiagnosable.
     //
-    // Same rule as `vta_sdk::inbound::classify`, which is where this belongs
-    // once a release carrying it lands — a fact about the document is the same
-    // fact for both ends, and two copies drift (see `tsp_binding`).
-    if type_uri.starts_with("https://trusttasks.org/spec/trust-task-error/") {
+    // The prefix comes from `vta_sdk::inbound`, not a literal here. Which URIs
+    // are terminal errors is a fact about the *document*, so it is the same
+    // fact for whoever reads one — this service, the VTA, any other peer — and
+    // a local copy is a second place for it to drift from. The TSP binding
+    // taught that already (see `tsp_binding`). This was that local copy, kept
+    // only until a release carrying `inbound` existed; 0.43 is it.
+    //
+    // The constant rather than `inbound::classify`: classify takes a `Value`
+    // and this path holds a `TrustTask<Value>`, so calling it would mean
+    // serialising every inbound document to read two fields. The prefix is the
+    // part that can drift; the `starts_with` around it is not.
+    if type_uri.starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX) {
         let code = doc
             .payload
             .get("code")

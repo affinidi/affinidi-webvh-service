@@ -281,7 +281,7 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.41", features = [
+vta-sdk = { version = "0.43", features = [
   "session",
   "provision-integration",
   "provision-client",
