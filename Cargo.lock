@@ -474,11 +474,12 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-common"
-version = "0.16.0"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4084d9a324a52536be23a431eb10582bf41128db9dd9649b0da147d2d0fc8d4c"
+checksum = "09b3efcaa8f9731ea29af36c5c3e70cb55090427fad7924950ea07c2203e1a85"
 dependencies = [
  "aes-gcm",
+ "affinidi-net-guard",
  "ahash",
  "argon2 0.6.0",
  "async-trait",
@@ -524,9 +525,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.26.5"
+version = "0.26.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a084da77f2113c6bd42c59079d21befa96d55699cda025f1d58104f709298fc"
+checksum = "bcc1af738568095a5d2fa99d8d3b6bac4b3a2016b63174df33c9ea945e55050b"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -2842,7 +2843,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.6",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4782,7 +4783,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -6857,7 +6858,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -6896,7 +6897,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -7830,7 +7831,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
