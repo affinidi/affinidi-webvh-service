@@ -440,6 +440,7 @@ export interface ControlPlaneConfig {
   healthCheckIntervalSecs: number;
   configuredInstances: number;
   accessTokenExpiry: number;
+  adminIdleTimeout: number;
   refreshTokenExpiry: number;
   passkeyEnrollmentTtl: number;
   dataDir: string;
@@ -469,6 +470,7 @@ export class ApiError extends Error {
 }
 
 const TOKEN_KEY = "webvh_token";
+const REFRESH_TOKEN_KEY = "webvh_refresh_token";
 
 /** Which auth path produced the current session. Trust-task signing
  *  branches on this: `"wallet"` calls `window.vtaWallet.signTrustTask` (the
@@ -491,6 +493,114 @@ export function setToken(token: string): void {
   } catch {
     // ignore in non-browser contexts
   }
+}
+
+/// The refresh token, which login used to hand us and we used to discard.
+///
+/// Without it the console could not renew: the access token is a fixed
+/// 15-minute JWT, nothing extended it, and the first sign of expiry was a
+/// request failing. It lives beside the access token in `localStorage` —
+/// no worse a place, since a reader of one already has the other.
+export function getRefreshToken(): string | null {
+  try {
+    return localStorage.getItem(REFRESH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setRefreshToken(token: string | null): void {
+  try {
+    if (token === null) localStorage.removeItem(REFRESH_TOKEN_KEY);
+    else localStorage.setItem(REFRESH_TOKEN_KEY, token);
+  } catch {
+    // ignore in non-browser contexts
+  }
+}
+
+const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.1";
+
+/** Seconds since the epoch at which `token` expires, or null if unreadable. */
+function tokenExpiry(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const exp = JSON.parse(atob(payload)).exp;
+    return typeof exp === "number" ? exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Renew when the access token has this long or less to live. */
+const RENEW_WITHIN_SECS = 60;
+/** Floor between renewal attempts, so a failing one cannot spin. */
+const MIN_RETRY_GAP_MS = 5_000;
+
+let renewInFlight: Promise<void> | null = null;
+let lastRenewAttemptMs = 0;
+
+/**
+ * Renew the session if the access token is nearly out.
+ *
+ * Single-flight, and that matters more than ordinary dedupe: refresh
+ * **rotates** the token and the daemon claims the old one atomically, so a
+ * second simultaneous renewal would present a token the first had already
+ * consumed and be rejected.
+ *
+ * The daemon refuses a renewal once the session has been idle past
+ * `auth.admin_idle_timeout`, which is what stops this timer from keeping a
+ * tab signed in forever. Never throws: a failed renewal leaves the session
+ * alone and the caller's own request reports the failure.
+ */
+export async function renewIfNeeded(): Promise<void> {
+  const access = getToken();
+  const refresh = getRefreshToken();
+  if (!access || !refresh) return;
+
+  const exp = tokenExpiry(access);
+  if (exp === null) return;
+  const now = Math.floor(Date.now() / 1000);
+  if (now < exp - RENEW_WITHIN_SECS) return;
+
+  if (renewInFlight) return renewInFlight;
+  if (Date.now() - lastRenewAttemptMs < MIN_RETRY_GAP_MS) return;
+  lastRenewAttemptMs = Date.now();
+
+  renewInFlight = (async () => {
+    try {
+      // Signed with the session keypair, not sent bare. The daemon binds a
+      // REST refresh to the key this browser registered at login, so a
+      // stolen refresh token alone will not rotate the session — which is
+      // what makes this dialect no weaker than the DIDComm one it sits
+      // beside. A session with no bound key (wallet, machine-to-machine)
+      // has nothing to sign with and the daemon does not ask.
+      let envelope: Record<string, unknown> = {
+        type: REFRESH_TASK_URI,
+        id: crypto.randomUUID(),
+        payload: { refreshToken: refresh },
+      };
+      if (hasSessionKeypair()) {
+        envelope = await signEnvelope(envelope);
+      }
+      const res = await fetch("/api/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(envelope),
+      });
+      if (!res.ok) return;
+      const body = await res.json();
+      const nextAccess = body?.access_token ?? body?.tokens?.accessToken;
+      const nextRefresh = body?.refresh_token ?? body?.tokens?.refreshToken;
+      if (typeof nextAccess === "string") setToken(nextAccess);
+      if (typeof nextRefresh === "string") setRefreshToken(nextRefresh);
+    } catch {
+      // Swallowed by design — see the doc comment.
+    } finally {
+      renewInFlight = null;
+    }
+  })();
+  return renewInFlight;
 }
 
 export function getAuthMethod(): AuthMethod | null {
@@ -551,6 +661,9 @@ export function clearSessionPrincipalDid(): void {
 export function clearToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY);
+    // Clear the renewal credential too: a refresh token outliving a logout
+    // would leave the browser able to mint fresh access tokens.
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
     localStorage.removeItem(AUTH_METHOD_KEY);
     localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
   } catch {
@@ -565,6 +678,12 @@ async function request<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
+  // Renew ahead of expiry, so an operator who is using the console is not
+  // signed out mid-task. Skipped for the renewal call itself, which would
+  // otherwise recurse.
+  if (path !== "/api/auth/refresh") {
+    await renewIfNeeded();
+  }
   const token = getToken();
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string>),

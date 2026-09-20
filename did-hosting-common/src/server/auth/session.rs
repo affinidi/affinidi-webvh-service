@@ -108,6 +108,37 @@ pub fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// How stale `last_seen` must be before an activity touch writes.
+///
+/// Without it a busy console rewrites the session row on every request for
+/// no gain: the idle timeout is measured in minutes, so second-level
+/// precision buys nothing and costs a store write per call.
+pub const LAST_SEEN_GRANULARITY_SECS: u64 = 60;
+
+/// Record activity on `session` by advancing `last_seen` to `now`.
+///
+/// `Ok(false)` means the write was skipped as unnecessary — the row is
+/// already fresh within [`LAST_SEEN_GRANULARITY_SECS`], or the clock went
+/// backwards.
+///
+/// **Only real requests should call this.** It is the clock the idle
+/// timeout is measured against, so anything firing on a timer — a token
+/// renewal above all — would, by touching it, hold the session open for as
+/// long as the client ran and put the timeout permanently out of reach.
+pub async fn touch_last_seen(
+    sessions: &KeyspaceHandle,
+    session: &Session,
+    now: u64,
+) -> Result<bool, AppError> {
+    if now < session.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
+        return Ok(false);
+    }
+    let mut updated = session.clone();
+    updated.last_seen = now;
+    store_session(sessions, &updated).await?;
+    Ok(true)
+}
+
 /// Delete a single session and its refresh index.
 pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Result<(), AppError> {
     let session: Option<Session> = sessions.get(session_key(session_id)).await?;
@@ -503,6 +534,71 @@ mod refresh_token_invariant {
         let ks = store.keyspace(KS_SESSIONS).unwrap();
         let keys = JwtKeys::from_ed25519_bytes(&[11u8; 32]).unwrap();
         (ks, keys, dir)
+    }
+
+    /// Activity advances the clock the idle timeout is measured against.
+    #[tokio::test]
+    async fn touching_a_session_advances_last_seen() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:active",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let mut stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Backdate so the granularity throttle does not swallow the write.
+        stored.last_seen = now_epoch() - (LAST_SEEN_GRANULARITY_SECS + 10);
+        store_session(&ks, &stored).await.unwrap();
+        let before = stored.last_seen;
+
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(wrote, "a stale row must be written");
+
+        let after = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.last_seen > before);
+    }
+
+    /// …but not on every request. The idle timeout is measured in minutes,
+    /// so a write per call would buy precision nobody reads.
+    #[tokio::test]
+    async fn touching_a_fresh_session_writes_nothing() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:busy",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(
+            !wrote,
+            "a row touched within the granularity window must not be rewritten"
+        );
     }
 
     /// Both production creators must leave a refresh token on the row.

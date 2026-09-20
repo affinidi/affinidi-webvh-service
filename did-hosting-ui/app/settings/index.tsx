@@ -370,6 +370,10 @@ export default function SettingsPage() {
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Authentication</Text>
         <Row
+          label="Sign Out After Inactivity"
+          value={formatDuration(config.adminIdleTimeout)}
+        />
+        <Row
           label="Access Token Expiry"
           value={formatDuration(config.accessTokenExpiry)}
         />

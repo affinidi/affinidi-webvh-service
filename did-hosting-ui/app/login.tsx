@@ -14,6 +14,7 @@ import {
   api,
   clearSessionPrincipalDid,
   setAuthMethod,
+  setRefreshToken,
   setSessionPrincipalDid,
 } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
@@ -115,6 +116,10 @@ export default function Login() {
       const credential = await getPasskeyCredential(options);
       const result = await api.passkeyLoginFinish(auth_id, credential);
       setAuthMethod("passkey");
+      // Keep the renewal credential. Every login path hands one back and
+      // all three used to drop it, which is why a session could not be
+      // renewed and died on a fixed timer.
+      setRefreshToken(result.refresh_token ?? null);
       login(result.access_token);
       router.replace("/");
     } catch (err: any) {
@@ -140,6 +145,7 @@ export default function Login() {
       // signing should NOT route via vault/sign-trust-task; clear any
       // stale principal-DID hint from a previous proxy-login session.
       clearSessionPrincipalDid();
+      setRefreshToken(result.refreshToken || null);
       login(result.accessToken);
       router.replace("/");
     } catch (err: any) {
@@ -215,6 +221,7 @@ export default function Login() {
       // but `listProxyCandidates` already filters out entries without
       // one — only entries that round-trip with a DID reach this path.
       setSessionPrincipalDid(entry.principalDid!);
+      setRefreshToken(outcome.result.refreshToken || null);
       login(outcome.result.accessToken);
       // When the operator has enabled the flow visualization, stash
       // it and let the modal hold the redirect. Otherwise (the

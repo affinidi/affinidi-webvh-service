@@ -30,6 +30,21 @@ use crate::server::AppState;
 /// allocations before the handler-level Admin check rejects.
 pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 64 * 1024;
 
+/// Maximum body size accepted on the **unauthenticated** auth surface
+/// (`/auth/challenge`, `/auth/`, `/auth/refresh`) in bytes.
+///
+/// Tighter than [`TRUST_TASKS_BODY_LIMIT_BYTES`] because these routes take
+/// no credential before parsing: a refresh document is a type URI, a uuid
+/// and an opaque token, and the largest legitimate body here is a DIDComm-
+/// JWS envelope carrying a SIOPv2 `id_token`. 32 KB is generous for both.
+///
+/// The global limit is 10 MB, which is the right ceiling for DID documents
+/// and website bundles and much too high for a route that will parse
+/// whatever arrives before it knows who sent it. `/trust-tasks` was already
+/// tightened for this class against an *authenticated* attacker; these
+/// routes face an anonymous one.
+pub const AUTH_BODY_LIMIT_BYTES: usize = 32 * 1024;
+
 /// Build the control plane router without the UI fallback (daemon mode).
 ///
 /// ## T8b: Trust-Task header gating
@@ -147,17 +162,17 @@ pub fn router_without_fallback() -> Router<AppState> {
         // Auth (DIDComm challenge-response)
         .route_with_task_permissive(
             "/auth/challenge",
-            post(auth::challenge),
+            post(auth::challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
             (*TASK_AUTH_CHALLENGE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/",
-            post(auth::authenticate),
+            post(auth::authenticate).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
             (*TASK_AUTH_AUTHENTICATE_0_1).clone(),
         )
         .route_with_task_permissive(
             "/auth/refresh",
-            post(auth::refresh),
+            post(auth::refresh).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
             (*TASK_AUTH_REFRESH_0_1).clone(),
         )
         // RP-initiated wallet consent (admin-only). Sends a

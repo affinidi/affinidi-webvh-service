@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::server::acl::Role;
 use crate::server::auth::jwt::JwtKeys;
-use crate::server::auth::session::{SessionState, get_session};
+use crate::server::auth::session::{SessionState, get_session, now_epoch, touch_last_seen};
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 
@@ -104,6 +104,27 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         }
 
         let role = claims.role.parse::<Role>()?;
+
+        // Record the activity the idle timeout is measured against.
+        //
+        // Every client here is a bearer client, so unlike a cookie-session
+        // console there is no token source to tell a browser from a service
+        // integration apart by — the throttle inside `touch_last_seen` is
+        // what keeps this from becoming a store write per request.
+        //
+        // The renewal endpoint deliberately does not pass through this
+        // extractor, so a client's refresh timer cannot keep its own session
+        // alive: only requests that do actual work count as activity.
+        //
+        // Best-effort. A failed touch must not fail an otherwise valid
+        // request — it costs an early sign-out, never access.
+        if let Err(e) = touch_last_seen(state.sessions_ks(), &session, now_epoch()).await {
+            warn!(
+                session_id = %claims.session_id,
+                error = %e,
+                "failed to record session activity; session may idle out early",
+            );
+        }
 
         debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");
 
