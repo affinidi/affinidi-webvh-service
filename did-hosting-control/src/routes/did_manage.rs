@@ -1045,6 +1045,11 @@ pub struct ConfigResponse {
     /// Auth
     pub access_token_expiry: u64,
     pub refresh_token_expiry: u64,
+    /// How long an admin may be inactive before the console signs them out.
+    /// Read-only here: it is a config/env value, and a deployment that sets
+    /// `CONTROL_AUTH_ADMIN_IDLE_TIMEOUT` should see the number it is
+    /// actually running with rather than a control implying otherwise.
+    pub admin_idle_timeout: u64,
     pub passkey_enrollment_ttl: u64,
     /// Deployment
     pub deployment_mode: String,
@@ -1105,6 +1110,7 @@ pub async fn get_config(_auth: AdminAuth, State(state): State<AppState>) -> Json
         configured_instances: c.registry.instances.len() as u64,
         access_token_expiry: c.auth.access_token_expiry,
         refresh_token_expiry: c.auth.refresh_token_expiry,
+        admin_idle_timeout: c.auth.admin_idle_timeout,
         passkey_enrollment_ttl: c.auth.passkey_enrollment_ttl,
         data_dir: c.store.data_dir.display().to_string(),
         log_level: c.log.level.clone(),

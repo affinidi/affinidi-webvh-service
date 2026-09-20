@@ -791,6 +791,15 @@ pub async fn refresh(
 ) -> Result<Json<did_hosting_common::RefreshResponse>, AppError> {
     use did_hosting_common::server::didcomm_unpack;
 
+    // Plain Trust-Task dialect, tried first. The admin console has no
+    // DIDComm stack and never had one, so before this the refresh token it
+    // was handed at login was unusable — it discarded the token and let the
+    // session die instead. Byte-identical to the VTC's REST refresh, so one
+    // browser client speaks to both services with one document builder.
+    if let Some(resp) = try_refresh_trust_task(&state, &body).await? {
+        return Ok(Json(resp));
+    }
+
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
 
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
@@ -801,7 +810,7 @@ pub async fn refresh(
     // `webvh-witness` took both. A client on the canonical form worked against
     // those two and failed here, which is the same asymmetry that broke the
     // wallet on the DIDComm router.
-    if msg.typ != "https://trusttasks.org/spec/auth/refresh/0.1" {
+    if msg.typ != REFRESH_TASK_URI {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",
             msg.typ
@@ -815,6 +824,8 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?
         .to_string();
 
+    refuse_if_idle(&state, &refresh_token).await?;
+
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
     let resp = vti_common::auth::handlers::handle_refresh(
         &backend,
@@ -826,6 +837,103 @@ pub async fn refresh(
     .await?;
     Ok(Json(canonical_to_local_auth_response(resp)))
 }
+
+/// Refuse a renewal for a session that has gone quiet longer than
+/// `auth.admin_idle_timeout`.
+///
+/// Checked here rather than inside the shared `handle_refresh` so this
+/// service owns its own policy and needs no vti-common release to change
+/// it. It runs **before** the handler because the handler's first act is to
+/// claim-and-delete the refresh-token index: refusing afterwards would burn
+/// the caller's token on the way to telling them no, so an idled-out
+/// session could not even report itself consistently on a retry.
+///
+/// A session whose `last_seen` predates the field (`0`) falls back to
+/// `created_at`, so rows written before idle tracking existed are judged
+/// from when they began rather than being refused outright.
+async fn refuse_if_idle(state: &AppState, refresh_token: &str) -> Result<(), AppError> {
+    use did_hosting_common::server::auth::session::{
+        get_session, get_session_by_refresh, now_epoch,
+    };
+
+    let idle_ttl = state.config.auth.admin_idle_timeout;
+    // Read the index rather than `take_session_id_by_refresh`: the take is
+    // the rotation's atomic claim, and consuming it here would destroy the
+    // token this call is only inspecting.
+    let Some(session_id) = get_session_by_refresh(&state.sessions_ks, refresh_token).await? else {
+        // Unknown token: let `handle_refresh` produce the canonical
+        // "not found or consumed" answer rather than inventing one here.
+        return Ok(());
+    };
+    let Some(session) = get_session(&state.sessions_ks, &session_id).await? else {
+        return Ok(());
+    };
+    let last_activity = if session.last_seen == 0 {
+        session.created_at
+    } else {
+        session.last_seen
+    };
+    let idle_for = now_epoch().saturating_sub(last_activity);
+    if idle_for > idle_ttl {
+        warn!(
+            session_id = %session.session_id,
+            did = %session.did,
+            idle_for,
+            idle_ttl,
+            "refresh rejected: session idle past the timeout",
+        );
+        return Err(AppError::Authentication(
+            "session signed out after the configured period of inactivity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refresh from a plain `auth/refresh/0.1` Trust Task document.
+///
+/// Returns `Ok(None)` when the body is not such a document, so the DIDComm
+/// path still sees everything it used to.
+///
+/// No proof is carried and none is required: the opaque refresh token *is*
+/// the bearer credential (RFC 6749 §10.4 rotation), verified by the shared
+/// handler's single-use rotating index. `signer_did` is therefore `None` —
+/// the same posture the DIDComm arm ends in, where the envelope proves who
+/// sent it but the token is what authorises the rotation.
+async fn try_refresh_trust_task(
+    state: &AppState,
+    body: &str,
+) -> Result<Option<did_hosting_common::RefreshResponse>, AppError> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(None);
+    };
+    if doc.get("type").and_then(|t| t.as_str()) != Some(REFRESH_TASK_URI) {
+        return Ok(None);
+    }
+    let refresh_token = doc
+        .get("payload")
+        .and_then(|p| p.get("refreshToken"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Authentication("missing payload.refreshToken in refresh document".into())
+        })?
+        .to_string();
+
+    refuse_if_idle(state, &refresh_token).await?;
+
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)?;
+    let resp = vti_common::auth::handlers::handle_refresh(
+        &backend,
+        vti_common::auth::RefreshInput {
+            refresh_token,
+            signer_did: None,
+        },
+    )
+    .await?;
+    Ok(Some(canonical_to_local_auth_response(resp)))
+}
+
+/// The canonical refresh Type URI, shared by both dialects.
+const REFRESH_TASK_URI: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
 
 #[cfg(test)]
 mod tests {

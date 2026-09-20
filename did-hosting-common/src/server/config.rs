@@ -222,6 +222,17 @@ pub struct AuthConfig {
     pub challenge_ttl: u64,
     #[serde(default = "default_session_cleanup_interval")]
     pub session_cleanup_interval: u64,
+    /// How long an admin session may go without user activity before it may
+    /// no longer be renewed, in seconds.
+    ///
+    /// Distinct from [`Self::access_token_expiry`], which is how often a live
+    /// session rotates its token. The console renews on a timer, so if the
+    /// two were the same clock a tab left open would hold its session for as
+    /// long as the browser ran. This is the value that decides when an
+    /// operator who walked away is signed out; it is measured against
+    /// `Session::last_seen`, which only real requests advance.
+    #[serde(default = "default_admin_idle_timeout")]
+    pub admin_idle_timeout: u64,
     #[serde(default = "default_passkey_enrollment_ttl")]
     pub passkey_enrollment_ttl: u64,
     /// How long (in minutes) to keep empty DID records before auto-cleanup.
@@ -244,6 +255,16 @@ pub struct AuthConfig {
     /// compiled-in default; also pinned equal by a unit test in that crate.
     #[serde(default = "default_max_pending_challenges_per_did")]
     pub max_pending_challenges_per_did: usize,
+}
+
+/// 15 minutes of inactivity.
+///
+/// Longer than the 900s access-token lifetime it sits beside, deliberately:
+/// before this existed an admin was signed out 15 minutes after logging in
+/// whether or not they were working, because nothing renewed the token. The
+/// same number now bounds idleness rather than wall-clock.
+fn default_admin_idle_timeout() -> u64 {
+    900
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -297,6 +318,13 @@ impl AuthConfig {
                 "session_cleanup_interval must be at least 10 seconds".into(),
             ));
         }
+        // A timeout shorter than a minute signs an operator out between
+        // keystrokes; it is a misconfiguration, not a strict policy.
+        if self.admin_idle_timeout < 60 {
+            return Err(AppError::Config(
+                "admin_idle_timeout must be at least 60 seconds".into(),
+            ));
+        }
         if self.access_token_expiry < 30 {
             return Err(AppError::Config(
                 "access_token_expiry must be at least 30 seconds".into(),
@@ -337,6 +365,7 @@ impl Default for AuthConfig {
             refresh_token_expiry: default_refresh_token_expiry(),
             challenge_ttl: default_challenge_ttl(),
             session_cleanup_interval: default_session_cleanup_interval(),
+            admin_idle_timeout: default_admin_idle_timeout(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
             max_global_pending_challenges: default_max_global_pending_challenges(),
@@ -915,6 +944,10 @@ pub fn apply_env_overrides(
     env_parse!(
         &format!("{prefix}_AUTH_SESSION_CLEANUP_INTERVAL"),
         auth.session_cleanup_interval
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_ADMIN_IDLE_TIMEOUT"),
+        auth.admin_idle_timeout
     );
     env_parse!(
         &format!("{prefix}_AUTH_PASSKEY_ENROLLMENT_TTL"),
