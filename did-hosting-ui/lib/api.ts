@@ -569,14 +569,24 @@ export async function renewIfNeeded(): Promise<void> {
 
   renewInFlight = (async () => {
     try {
+      // Signed with the session keypair, not sent bare. The daemon binds a
+      // REST refresh to the key this browser registered at login, so a
+      // stolen refresh token alone will not rotate the session — which is
+      // what makes this dialect no weaker than the DIDComm one it sits
+      // beside. A session with no bound key (wallet, machine-to-machine)
+      // has nothing to sign with and the daemon does not ask.
+      let envelope: Record<string, unknown> = {
+        type: REFRESH_TASK_URI,
+        id: crypto.randomUUID(),
+        payload: { refreshToken: refresh },
+      };
+      if (hasSessionKeypair()) {
+        envelope = await signEnvelope(envelope);
+      }
       const res = await fetch("/api/auth/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: REFRESH_TASK_URI,
-          id: crypto.randomUUID(),
-          payload: { refreshToken: refresh },
-        }),
+        body: JSON.stringify(envelope),
       });
       if (!res.ok) return;
       const body = await res.json();

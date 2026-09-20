@@ -824,7 +824,11 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?
         .to_string();
 
-    refuse_if_idle(&state, &refresh_token).await?;
+    // The DIDComm arm proves its sender through the signed envelope, so it
+    // needs no session-key binding — only the idle policy applies.
+    if let Some(session) = resolve_refresh_session(&state, &refresh_token).await? {
+        refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)?;
+    }
 
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
     let resp = vti_common::auth::handlers::handle_refresh(
@@ -838,12 +842,32 @@ pub async fn refresh(
     Ok(Json(canonical_to_local_auth_response(resp)))
 }
 
+/// Load the session a refresh token belongs to, if any.
+///
+/// Reads the index rather than `take_session_id_by_refresh`: the take is
+/// the rotation's atomic claim, and consuming it here would destroy the
+/// token these pre-checks are only inspecting.
+///
+/// `None` means the token is unknown — left to `handle_refresh` to answer
+/// with its canonical "not found or consumed" rather than pre-empted here.
+async fn resolve_refresh_session(
+    state: &AppState,
+    refresh_token: &str,
+) -> Result<Option<did_hosting_common::server::auth::session::Session>, AppError> {
+    use did_hosting_common::server::auth::session::{get_session, get_session_by_refresh};
+
+    let Some(session_id) = get_session_by_refresh(&state.sessions_ks, refresh_token).await? else {
+        return Ok(None);
+    };
+    get_session(&state.sessions_ks, &session_id).await
+}
+
 /// Refuse a renewal for a session that has gone quiet longer than
 /// `auth.admin_idle_timeout`.
 ///
-/// Checked here rather than inside the shared `handle_refresh` so this
-/// service owns its own policy and needs no vti-common release to change
-/// it. It runs **before** the handler because the handler's first act is to
+/// Checked in this crate rather than inside the shared `handle_refresh` so
+/// the policy is ours and needs no vti-common release to change. It runs
+/// **before** the handler because the handler's first act is to
 /// claim-and-delete the refresh-token index: refusing afterwards would burn
 /// the caller's token on the way to telling them no, so an idled-out
 /// session could not even report itself consistently on a retry.
@@ -851,23 +875,12 @@ pub async fn refresh(
 /// A session whose `last_seen` predates the field (`0`) falls back to
 /// `created_at`, so rows written before idle tracking existed are judged
 /// from when they began rather than being refused outright.
-async fn refuse_if_idle(state: &AppState, refresh_token: &str) -> Result<(), AppError> {
-    use did_hosting_common::server::auth::session::{
-        get_session, get_session_by_refresh, now_epoch,
-    };
+fn refuse_if_idle_session(
+    session: &did_hosting_common::server::auth::session::Session,
+    idle_ttl: u64,
+) -> Result<(), AppError> {
+    use did_hosting_common::server::auth::session::now_epoch;
 
-    let idle_ttl = state.config.auth.admin_idle_timeout;
-    // Read the index rather than `take_session_id_by_refresh`: the take is
-    // the rotation's atomic claim, and consuming it here would destroy the
-    // token this call is only inspecting.
-    let Some(session_id) = get_session_by_refresh(&state.sessions_ks, refresh_token).await? else {
-        // Unknown token: let `handle_refresh` produce the canonical
-        // "not found or consumed" answer rather than inventing one here.
-        return Ok(());
-    };
-    let Some(session) = get_session(&state.sessions_ks, &session_id).await? else {
-        return Ok(());
-    };
     let last_activity = if session.last_seen == 0 {
         session.created_at
     } else {
@@ -889,6 +902,79 @@ async fn refuse_if_idle(state: &AppState, refresh_token: &str) -> Result<(), App
     Ok(())
 }
 
+/// Bind a REST refresh to the device that logged in.
+///
+/// The DIDComm dialect proves its sender through the signed envelope. This
+/// one carries no envelope, so without a check here possession of the
+/// refresh token alone would authorise a rotation from anywhere — strictly
+/// weaker than the dialect it sits beside, on the same endpoint.
+///
+/// The binding reuses what the console already has: the passkey login flow
+/// generates an ephemeral Ed25519 keypair, sends its public multikey as
+/// `session_pubkey_b58btc`, and the server stores it on the session row.
+/// Requiring a Data Integrity proof from that key means a stolen refresh
+/// token is not enough on its own — the attacker also needs a key that
+/// never left the browser that logged in.
+///
+/// **Sessions with no bound key are unchanged.** Wallet and
+/// machine-to-machine sessions sign with their own DID's verification
+/// methods and never supplied a session pubkey; demanding a proof from them
+/// would break a path this change does not otherwise touch. That arm is not
+/// a downgrade an attacker can choose: whether a session has a bound key is
+/// a property of the stored row, not of the request.
+///
+/// Mirrors the case (a) / case (b) split in
+/// `routes::trust_tasks::dispatch_trust_task`, where the same binding is
+/// enforced for every other document the console signs.
+async fn verify_session_bound_proof(
+    doc: &trust_tasks_rs::TrustTask<serde_json::Value>,
+    session: &did_hosting_common::server::auth::session::Session,
+) -> Result<(), AppError> {
+    use affinidi_data_integrity::DidKeyResolver;
+    use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+    use trust_tasks_rs::ProofVerifier;
+
+    let Some(pk) = session.session_pubkey_b58btc.as_deref() else {
+        return Ok(());
+    };
+
+    let Some(proof) = doc.proof.as_ref() else {
+        return Err(AppError::Authentication(
+            "refresh document must carry a proof from this session's key".into(),
+        ));
+    };
+
+    // Check the binding before verifying the signature, so a proof signed by
+    // some other resolvable key is refused for the reason that actually
+    // applies rather than verifying cleanly and being wrong.
+    let expected_vm = format!("did:key:{pk}#{pk}");
+    if proof.verification_method != expected_vm {
+        warn!(
+            session_id = %session.session_id,
+            actual_vm = %proof.verification_method,
+            "refresh proof verificationMethod is not this session's key",
+        );
+        return Err(AppError::Authentication(
+            "refresh proof is not bound to this session".into(),
+        ));
+    }
+
+    // `did:key` resolves locally, so this needs no DID cache and no DIDComm
+    // configuration — which matters, because the point of this dialect is to
+    // serve a client that has neither.
+    TransportBoundVerifier::with_resolver(std::sync::Arc::new(DidKeyResolver))
+        .verify(doc)
+        .await
+        .map_err(|e| {
+            warn!(
+                session_id = %session.session_id,
+                error = %e,
+                "refresh proof failed verification",
+            );
+            AppError::Authentication("refresh proof failed verification".into())
+        })
+}
+
 /// Refresh from a plain `auth/refresh/0.1` Trust Task document.
 ///
 /// Returns `Ok(None)` when the body is not such a document, so the DIDComm
@@ -903,22 +989,32 @@ async fn try_refresh_trust_task(
     state: &AppState,
     body: &str,
 ) -> Result<Option<did_hosting_common::RefreshResponse>, AppError> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(body) else {
+    use trust_tasks_rs::TrustTask;
+
+    // Parsed as the typed envelope, not free-form JSON, so the proof member
+    // arrives in the shape the verifier takes. Bounded by
+    // `routes::AUTH_BODY_LIMIT_BYTES`: this runs before any credential is
+    // checked, so the body is attacker-chosen and must be small before it is
+    // parsed at all.
+    let Ok(doc) = serde_json::from_str::<TrustTask<serde_json::Value>>(body) else {
         return Ok(None);
     };
-    if doc.get("type").and_then(|t| t.as_str()) != Some(REFRESH_TASK_URI) {
+    if doc.type_uri.to_string() != REFRESH_TASK_URI {
         return Ok(None);
     }
     let refresh_token = doc
-        .get("payload")
-        .and_then(|p| p.get("refreshToken"))
+        .payload
+        .get("refreshToken")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             AppError::Authentication("missing payload.refreshToken in refresh document".into())
         })?
         .to_string();
 
-    refuse_if_idle(state, &refresh_token).await?;
+    if let Some(session) = resolve_refresh_session(state, &refresh_token).await? {
+        refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)?;
+        verify_session_bound_proof(&doc, &session).await?;
+    }
 
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)?;
     let resp = vti_common::auth::handlers::handle_refresh(
@@ -943,6 +1039,100 @@ mod tests {
     use affinidi_data_integrity::DidKeyResolver;
     use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
     use serde_json::json;
+
+    use did_hosting_common::server::auth::session::{Session, SessionState};
+
+    /// A stored session, optionally carrying a bound session key.
+    fn session_with(pubkey: Option<&str>, last_seen: u64) -> Session {
+        Session {
+            session_id: "sess-refresh".into(),
+            did: "did:example:alice".into(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: last_seen,
+            last_seen,
+            refresh_token: Some("tok".into()),
+            refresh_expires_at: Some(u64::MAX),
+            tee_attested: false,
+            amr: vec!["passkey".into()],
+            acr: "aal1".into(),
+            acr_expires_at: None,
+            token_id: Some("jti".into()),
+            session_pubkey_b58btc: pubkey.map(str::to_string),
+        }
+    }
+
+    fn refresh_doc(
+        proof: Option<serde_json::Value>,
+    ) -> trust_tasks_rs::TrustTask<serde_json::Value> {
+        let mut v = json!({
+            "type": REFRESH_TASK_URI,
+            "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+            "payload": { "refreshToken": "tok" },
+        });
+        if let Some(p) = proof {
+            v.as_object_mut().unwrap().insert("proof".into(), p);
+        }
+        serde_json::from_value(v).expect("refresh document parses")
+    }
+
+    /// A session that registered a key must prove possession of it. Without
+    /// this, a stolen refresh token alone would rotate the session — the
+    /// gap that made this dialect weaker than the DIDComm one beside it.
+    #[tokio::test]
+    async fn a_bound_session_refresh_without_a_proof_is_refused() {
+        let session = session_with(Some("z6MkExampleKeyMaterialNotReal"), 0);
+        let err = verify_session_bound_proof(&refresh_doc(None), &session)
+            .await
+            .expect_err("a bound session must demand a proof");
+        assert!(format!("{err}").contains("proof"), "{err}");
+    }
+
+    /// …and it must be *that* key, not merely a resolvable one.
+    #[tokio::test]
+    async fn a_proof_from_another_key_is_refused() {
+        let (other_did, signer) = crate::signing::test_util::did_key_signer(&[7u8; 32]);
+        let _ = signer;
+        let session = session_with(Some("z6MkTheSessionsOwnKeyNotThatOne"), 0);
+        let proof = json!({
+            "type": "DataIntegrityProof",
+            "cryptosuite": "eddsa-jcs-2022",
+            "verificationMethod": format!("{other_did}#irrelevant"),
+            "created": "2026-01-01T00:00:00Z",
+            "proofPurpose": "assertionMethod",
+            "proofValue": "z2fake",
+        });
+        let err = verify_session_bound_proof(&refresh_doc(Some(proof)), &session)
+            .await
+            .expect_err("a proof from a foreign key must be refused");
+        assert!(
+            format!("{err}").contains("not bound to this session"),
+            "the refusal should name the binding, got: {err}"
+        );
+    }
+
+    /// Wallet and machine-to-machine sessions never supplied a session key.
+    /// They are unchanged — and this is not a downgrade an attacker can
+    /// pick, because it is a property of the stored row, not the request.
+    #[tokio::test]
+    async fn a_session_with_no_bound_key_needs_no_proof() {
+        let session = session_with(None, 0);
+        verify_session_bound_proof(&refresh_doc(None), &session)
+            .await
+            .expect("an unbound session keeps its previous behaviour");
+    }
+
+    #[test]
+    fn an_idle_session_is_refused_and_a_busy_one_is_not() {
+        let now = did_hosting_common::server::auth::session::now_epoch();
+        let fresh = session_with(None, now - 60);
+        refuse_if_idle_session(&fresh, 900).expect("60s idle is inside a 900s window");
+
+        let stale = session_with(None, now - 1_200);
+        let err =
+            refuse_if_idle_session(&stale, 900).expect_err("1200s idle is outside a 900s window");
+        assert!(format!("{err}").contains("inactivity"), "{err}");
+    }
 
     /// The step-up approve-request document's proof verifies with the
     /// same machinery the finish leg uses (`TransportBoundVerifier`),
