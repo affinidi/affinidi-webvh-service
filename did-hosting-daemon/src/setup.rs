@@ -1007,6 +1007,11 @@ async fn run_self_managed_setup(
             },
         },
     );
+    // A hosting daemon serves HTTP whatever else it speaks, so it always
+    // advertises it. Without this a daemon set up with no mediator minted a DID
+    // with no services, which no VTA could register (Keyring VTI-18).
+    let mut doc = doc;
+    did_hosting_common::did::add_webvh_hosting_service(&mut doc, &public_url);
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
         .await
         .map_err(|e| format!("failed to create DID log entry: {e}"))?;
@@ -1603,29 +1608,30 @@ async fn finalize_daemon_setup(
         eprintln!("  Importing daemon DID into store at path '{did_path}'...");
         let store = Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
-        match did_hosting_server::bootstrap::import_did_at_path(
-            &store, &dids_ks, did_path, log_entry, None,
-        )
-        .await
-        {
-            Ok(res) => {
+        use did_hosting_server::bootstrap::{OwnDidImport, import_own_did, stale_own_did_message};
+        // Fails setup rather than warning — see the recipe path, and Keyring
+        // VTI-17: a warning here let a moved daemon report success while
+        // serving its old DID.
+        let did_id = match import_own_did(&store, &dids_ks, did_path, log_entry).await? {
+            OwnDidImport::Imported(res) => {
                 eprintln!("  Daemon DID imported!");
                 eprintln!("  DID:  {}", res.did_id);
                 eprintln!("  SCID: {}", res.scid);
-                did_hosting_server::setup::update_server_did_in_config(
-                    &output_path.to_path_buf(),
-                    &res.did_id,
-                )?;
-                eprintln!("  server_did updated in {}", output_path.display());
+                res.did_id
             }
-            Err(e) => {
-                eprintln!("  Warning: failed to import daemon DID: {e}");
-                eprintln!(
-                    "  You can retry with `did-hosting-server bootstrap-did --path {did_path}` \
-                     against this config's store path."
-                );
+            OwnDidImport::AlreadyPresent { did_id } => {
+                eprintln!("  Daemon DID already present: {did_id}");
+                did_id
             }
-        }
+            OwnDidImport::HeldByAnother { existing, minted } => {
+                return Err(stale_own_did_message(did_path, existing.as_deref(), &minted).into());
+            }
+        };
+        did_hosting_server::setup::update_server_did_in_config(
+            &output_path.to_path_buf(),
+            &did_id,
+        )?;
+        eprintln!("  server_did updated in {}", output_path.display());
     }
 
     // Admin ACL bootstrap — the daemon's control plane store is shared

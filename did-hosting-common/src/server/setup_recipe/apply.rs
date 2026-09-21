@@ -306,6 +306,18 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
             tsp_endpoint: if advertise_tsp { mediator } else { None },
         },
     );
+    // Only a hosting daemon advertises hosting (Keyring VTI-18). In practice
+    // only a daemon reaches this branch — `SetupRecipe::validate` rejects
+    // self-managed mode for every other service — but `run_vta_for_recipe` is
+    // shared by all of them, and the condition keeps a witness from ever
+    // advertising hosting it does not do if that rule is loosened.
+    let mut doc = doc;
+    if matches!(
+        recipe.deployment.service,
+        super::schema::ServiceKind::Daemon
+    ) {
+        crate::did::add_webvh_hosting_service(&mut doc, public_url);
+    }
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
         .await
         .map_err(|e| AppError::Config(format!("failed to create DID log entry: {e}")))?;

@@ -274,24 +274,32 @@ pub async fn run_wizard(
         let store = crate::store::Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
 
-        match crate::bootstrap::import_did_at_path(&store, &dids_ks, &did_path, log_entry, None)
-            .await
-        {
-            Ok(result) => {
-                eprintln!("  Server DID imported!");
-                eprintln!("  DID:  {}", result.did_id);
-                eprintln!("  SCID: {}", result.scid);
-
-                update_server_did_in_config(&output_path, &result.did_id)?;
-                eprintln!("  server_did updated in {}", output_path.display());
-            }
-            Err(e) => {
-                eprintln!("  Warning: failed to import server DID: {e}");
-                eprintln!(
-                    "  You can retry later with `did-hosting-server bootstrap-did --path {did_path}`"
-                );
-            }
-        }
+        // Fails setup rather than warning (Keyring VTI-17): a warning here let a
+        // moved service report success while serving its old DID.
+        let did_id =
+            match crate::bootstrap::import_own_did(&store, &dids_ks, &did_path, log_entry).await? {
+                crate::bootstrap::OwnDidImport::Imported(result) => {
+                    eprintln!("  Server DID imported!");
+                    eprintln!("  DID:  {}", result.did_id);
+                    eprintln!("  SCID: {}", result.scid);
+                    result.did_id
+                }
+                crate::bootstrap::OwnDidImport::AlreadyPresent { did_id } => {
+                    eprintln!("  Server DID already present: {did_id}");
+                    did_id
+                }
+                crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
+                    return Err(Box::<dyn std::error::Error>::from(
+                        crate::bootstrap::stale_own_did_message(
+                            &did_path,
+                            existing.as_deref(),
+                            &minted,
+                        ),
+                    ));
+                }
+            };
+        update_server_did_in_config(&output_path, &did_id)?;
+        eprintln!("  server_did updated in {}", output_path.display());
     }
 
     // 15. Summary
@@ -859,7 +867,7 @@ pub async fn run_setup_offline_complete(
     eprintln!("  Secrets stored in secret store.");
 
     // Import the server's own DID into the local store at the derived path.
-    // Mirrors the online wizard's bootstrap::import_did_at_path step.
+    // Mirrors the online wizard: import the server DID with `import_own_did`.
     if let Some(ref log_entry) = result.log_entry {
         eprintln!();
         eprintln!(
@@ -870,30 +878,32 @@ pub async fn run_setup_offline_complete(
         let store = crate::store::Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
 
-        match crate::bootstrap::import_did_at_path(
-            &store,
-            &dids_ks,
-            &state.did_path,
-            log_entry,
-            None,
-        )
-        .await
-        {
-            Ok(import) => {
-                eprintln!("  Server DID imported!");
-                eprintln!("  DID:  {}", import.did_id);
-                eprintln!("  SCID: {}", import.scid);
-                update_server_did_in_config(&state.config_output, &import.did_id)?;
-                eprintln!("  server_did updated in {}", state.config_output.display());
-            }
-            Err(e) => {
-                eprintln!("  Warning: failed to import server DID: {e}");
-                eprintln!(
-                    "  You can retry with `did-hosting-server bootstrap-did --path {}`",
-                    state.did_path
-                );
-            }
-        }
+        // Fails setup rather than warning (Keyring VTI-17): a warning here let a
+        // moved service report success while serving its old DID.
+        let did_id =
+            match crate::bootstrap::import_own_did(&store, &dids_ks, &state.did_path, log_entry)
+                .await?
+            {
+                crate::bootstrap::OwnDidImport::Imported(result) => {
+                    eprintln!("  Server DID imported (scid={})", result.scid);
+                    result.did_id
+                }
+                crate::bootstrap::OwnDidImport::AlreadyPresent { did_id } => {
+                    eprintln!("  Server DID already present: {did_id}");
+                    did_id
+                }
+                crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
+                    return Err(Box::<dyn std::error::Error>::from(
+                        crate::bootstrap::stale_own_did_message(
+                            &state.did_path,
+                            existing.as_deref(),
+                            &minted,
+                        ),
+                    ));
+                }
+            };
+        update_server_did_in_config(&state.config_output, &did_id)?;
+        eprintln!("  server_did updated in {}", state.config_output.display());
     } else {
         eprintln!();
         eprintln!("  Warning: sealed response carried no WebvhLog — server DID not imported.");
