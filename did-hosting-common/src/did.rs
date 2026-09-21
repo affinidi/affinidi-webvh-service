@@ -82,6 +82,36 @@ pub struct DidDocumentOptions<'a> {
     pub tsp_endpoint: Option<&'a str>,
 }
 
+/// Advertise a `WebVHHosting` service at `uri` on a document built by
+/// [`build_did_document`], after any transport services it already has.
+///
+/// The shape is exactly what VTI's `did-host-http` template emits, and what a
+/// VTA's `servers add` reads: an object endpoint carrying `uri`, not a bare
+/// string.
+///
+/// Keyring VTI-18. A self-managed hosting daemon minted without a mediator
+/// had **no services at all** — the transport services both need one — so it
+/// served DIDs perfectly well and no VTA could register it: `servers add`
+/// requires a `TSPTransport`, `DIDCommMessaging` or `WebVHHosting` entry. A
+/// hosting daemon serves HTTP whatever else it speaks, so this entry is simply
+/// true of it and needs nothing the operator has not already configured.
+///
+/// Appended rather than folded into [`DidDocumentOptions`]: that struct is
+/// public and built by literal, so a new field would break every caller.
+/// Appending also keeps the canonical order — TSP, then DIDComm, then HTTP.
+pub fn add_webvh_hosting_service(doc: &mut serde_json::Value, uri: &str) {
+    let did_id = doc["id"].as_str().unwrap_or_default().to_string();
+    let entry = json!({
+        "id": format!("{did_id}#webvh-hosting"),
+        "type": "WebVHHosting",
+        "serviceEndpoint": { "uri": uri },
+    });
+    match doc.get_mut("service").and_then(|s| s.as_array_mut()) {
+        Some(services) => services.push(entry),
+        None => doc["service"] = json!([entry]),
+    }
+}
+
 /// Build a standard DID document with `{SCID}` placeholders.
 ///
 /// The returned JSON value uses the did:webvh identifier format with an
@@ -343,6 +373,62 @@ pub async fn create_log_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyring VTI-18: a self-managed daemon with no mediator used to mint a
+    /// document with no `service` member at all. The hosting entry alone must
+    /// be enough to create one.
+    #[test]
+    fn hosting_is_advertised_on_a_document_with_no_services() {
+        let mut doc =
+            build_did_document("example.com", ".well-known", "z6MkKey", &Default::default());
+        assert!(
+            doc.get("service").is_none(),
+            "precondition: no transport, no services"
+        );
+
+        add_webvh_hosting_service(&mut doc, "https://example.com");
+
+        let services = doc["service"]
+            .as_array()
+            .expect("a service array now exists");
+        assert_eq!(services.len(), 1);
+        // Exactly the shape VTI's `did-host-http` template emits and a VTA's
+        // `servers add` reads: an object endpoint carrying `uri`.
+        assert_eq!(services[0]["type"], "WebVHHosting");
+        assert_eq!(
+            services[0]["serviceEndpoint"],
+            json!({ "uri": "https://example.com" })
+        );
+        assert_eq!(
+            services[0]["id"],
+            json!(format!("{}#webvh-hosting", doc["id"].as_str().unwrap()))
+        );
+    }
+
+    /// With transports present it goes last, keeping the canonical order —
+    /// TSP, then DIDComm, then HTTP — rather than displacing either.
+    #[test]
+    fn hosting_goes_after_the_transport_services() {
+        let mut doc = build_did_document(
+            "example.com",
+            ".well-known",
+            "z6MkKey",
+            &DidDocumentOptions {
+                key_agreement_multibase: Some("z6LSKa"),
+                mediator_endpoint: Some("did:web:mediator.example"),
+                tsp_endpoint: Some("did:web:mediator.example"),
+            },
+        );
+        add_webvh_hosting_service(&mut doc, "https://example.com");
+
+        let types: Vec<&str> = doc["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["TSPTransport", "DIDCommMessaging", "WebVHHosting"]);
+    }
 
     #[test]
     fn encode_host_with_port() {

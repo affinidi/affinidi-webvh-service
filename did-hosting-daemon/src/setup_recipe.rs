@@ -313,28 +313,33 @@ pub async fn apply_recipe(
         let did_path = derive_did_path(&public_url);
         let store = Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
-        match did_hosting_server::bootstrap::import_did_at_path(
-            &store, &dids_ks, &did_path, log_entry, None,
-        )
-        .await
-        {
-            Ok(result) => {
+        use did_hosting_server::bootstrap::{OwnDidImport, import_own_did, stale_own_did_message};
+        // A DID that cannot be served is a failed setup, not a warning. This
+        // used to print one and carry on, so a daemon moved to a new host
+        // reported success and health while serving its old identity
+        // (Keyring VTI-17).
+        let did_id = match import_own_did(&store, &dids_ks, &did_path, log_entry).await? {
+            OwnDidImport::Imported(result) => {
                 eprintln!(
                     "  [setup-recipe] daemon DID imported at '{did_path}' (scid={})",
                     result.scid
                 );
-                did_hosting_server::setup::update_server_did_in_config(
-                    &recipe.output.config_path,
-                    &result.did_id,
-                )
-                .map_err(|e| AppError::Config(format!("update server_did: {e}")))?;
+                result.did_id
             }
-            Err(e) => {
-                eprintln!(
-                    "  [setup-recipe] WARNING failed to import daemon DID: {e}\n             retry: did-hosting-server bootstrap-did --path {did_path}"
-                );
+            OwnDidImport::AlreadyPresent { did_id } => {
+                eprintln!("  [setup-recipe] daemon DID already present at '{did_path}'");
+                did_id
             }
-        }
+            OwnDidImport::HeldByAnother { existing, minted } => {
+                return Err(AppError::Config(stale_own_did_message(
+                    &did_path,
+                    existing.as_deref(),
+                    &minted,
+                )));
+            }
+        };
+        did_hosting_server::setup::update_server_did_in_config(&recipe.output.config_path, &did_id)
+            .map_err(|e| AppError::Config(format!("update server_did: {e}")))?;
     }
 
     if let Some(admin_did) = resolve_admin_did(&recipe) {

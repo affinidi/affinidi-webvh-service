@@ -308,23 +308,31 @@ pub async fn apply_recipe(
         let did_path = derive_did_path(&public_url_owned);
         let store = Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
-        match crate::bootstrap::import_did_at_path(&store, &dids_ks, &did_path, log_entry, None)
-            .await
-        {
-            Ok(result) => {
-                eprintln!(
-                    "  [setup-recipe] server DID imported at '{did_path}' (scid={})",
-                    result.scid
-                );
-                update_server_did_in_config(&recipe.output.config_path, &result.did_id)
-                    .map_err(|e| AppError::Config(format!("update server_did: {e}")))?;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  [setup-recipe] WARNING failed to import server DID: {e}\n             retry: did-hosting-server bootstrap-did --path {did_path}"
-                );
-            }
-        }
+        // Fails setup rather than warning (Keyring VTI-17): a warning here let a
+        // moved service report success while serving its old DID.
+        let did_id =
+            match crate::bootstrap::import_own_did(&store, &dids_ks, &did_path, log_entry).await? {
+                crate::bootstrap::OwnDidImport::Imported(result) => {
+                    eprintln!(
+                        "  [setup-recipe] server DID imported at '{did_path}' (scid={})",
+                        result.scid
+                    );
+                    result.did_id
+                }
+                crate::bootstrap::OwnDidImport::AlreadyPresent { did_id } => {
+                    eprintln!("  [setup-recipe] server DID already present at '{did_path}'");
+                    did_id
+                }
+                crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
+                    return Err(AppError::Config(crate::bootstrap::stale_own_did_message(
+                        &did_path,
+                        existing.as_deref(),
+                        &minted,
+                    )));
+                }
+            };
+        update_server_did_in_config(&recipe.output.config_path, &did_id)
+            .map_err(|e| AppError::Config(format!("update server_did: {e}")))?;
     }
 
     // Admin ACL seeding (if requested by the recipe).
