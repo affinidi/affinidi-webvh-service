@@ -76,6 +76,12 @@ pub async fn authenticate(
     let (msg, sender_base) =
         did_hosting_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
+    // #207: a signed message is forwardable, so it must be addressed here.
+    did_hosting_common::server::didcomm_unpack::require_addressed_to(
+        &msg,
+        state.config.server_did.as_deref(),
+    )?;
+
     if msg.typ.as_str() != "https://trusttasks.org/spec/auth/authenticate/0.1" {
         return Err(AppError::Authentication(format!(
             "unexpected message type: {}",

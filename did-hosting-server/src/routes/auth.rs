@@ -60,6 +60,9 @@ pub async fn authenticate(
 
     let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
+    // #207: a signed message is forwardable, so it must be addressed here.
+    didcomm_unpack::require_addressed_to(&msg, state.config.server_did.as_deref())?;
+
     // The canonical Trust-Task URI, and only it. The migration window this
     // used to describe is closed: every client in this workspace sends the
     // canonical form, and the legacy `affinidi.com/webvh/1.0/authenticate`

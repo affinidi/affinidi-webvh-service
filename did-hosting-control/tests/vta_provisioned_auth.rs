@@ -211,15 +211,26 @@ fn didcomm_authenticate_body(
     challenge: &str,
     now: u64,
 ) -> String {
-    let msg = Message::build(
+    didcomm_authenticate_body_to(id, session_id, challenge, now, Some(vec![RP_DID]))
+}
+
+/// As [`didcomm_authenticate_body`], addressed to `to` (`None` = no `to`).
+fn didcomm_authenticate_body_to(
+    id: &KeyIdentity,
+    session_id: &str,
+    challenge: &str,
+    now: u64,
+    to: Option<Vec<&str>>,
+) -> String {
+    let mut msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         "https://trusttasks.org/spec/auth/authenticate/0.1".to_string(),
         json!({ "session_id": session_id, "challenge": challenge }),
     )
     .from(id.did.clone())
-    .to(RP_DID.to_string())
     .created_time(now)
     .finalize();
+    msg.to = to.map(|v| v.into_iter().map(String::from).collect());
 
     pack_signed(&msg, &id.kid, &id.signing_key_bytes).expect("pack_signed")
 }
@@ -387,6 +398,56 @@ async fn provisioning_vta_authenticates_via_didcomm_jws_and_gets_admin_session()
         claims["role"].as_str(),
         Some("admin"),
         "authenticated VTA session must carry admin role (publish-capable)"
+    );
+}
+
+/// affinidi-webvh-service#207: a signed sign-in is forwardable, so one
+/// addressed to another service — the relay — is refused, as is one that
+/// names no recipient or more than one. None of them consumes the
+/// session, so the holder's own sign-in still succeeds afterwards.
+#[tokio::test]
+async fn a_signed_sign_in_not_addressed_to_the_control_plane_is_refused() {
+    let harness = make_harness().await;
+    let vta = key_identity([23u8; 32]);
+    seed_provisioning_vta_acl(&harness.state.acl_ks, &vta.did)
+        .await
+        .expect("seed vta acl");
+    let (status, session_id, challenge) = do_challenge(&harness.state, &vta.did).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (to, want, why) in [
+        (
+            Some(vec!["did:web:some-other-service.example"]),
+            StatusCode::UNAUTHORIZED,
+            "addressed to another service (the relay)",
+        ),
+        (
+            Some(vec![RP_DID, "did:web:some-other-service.example"]),
+            StatusCode::UNAUTHORIZED,
+            "addressed to this service and another",
+        ),
+        (None, StatusCode::BAD_REQUEST, "no `to` at all"),
+        (Some(vec![]), StatusCode::BAD_REQUEST, "an empty `to`"),
+    ] {
+        let body = didcomm_authenticate_body_to(&vta, &session_id, &challenge, now_secs(), to);
+        let resp = did_hosting_control::routes::router_without_fallback()
+            .with_state(harness.state.clone())
+            .oneshot(authenticate_request(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), want, "{why}");
+    }
+
+    let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let resp = did_hosting_control::routes::router_without_fallback()
+        .with_state(harness.state.clone())
+        .oneshot(authenticate_request(body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the refused messages must not have consumed the session"
     );
 }
 

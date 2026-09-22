@@ -82,8 +82,15 @@ impl ControlClient {
     ///
     /// On success the client stores the access token internally so that
     /// subsequent calls to authenticated endpoints work automatically.
+    ///
+    /// `control_did` is the control plane's own DID. The signed message names it as its
+    /// sole recipient (`to`): the control plane refuses a sign-in addressed to
+    /// anyone else, since a signed message can be forwarded
+    /// (affinidi-webvh-service#207). Take it from configuration, never from
+    /// a response of the service being signed in to.
     pub async fn authenticate(
         &mut self,
+        control_did: &str,
         did: &str,
         secret: &Secret,
     ) -> Result<AuthenticateResponse> {
@@ -123,6 +130,7 @@ impl ControlClient {
             }),
         )
         .from(did.to_string())
+        .to(control_did.to_string())
         .created_time(created_time)
         .finalize();
 

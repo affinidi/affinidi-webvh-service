@@ -109,6 +109,36 @@ async fn resolve_verifying_key(
         .map_err(|_| AppError::Authentication("public key must be 32 bytes".into()))
 }
 
+/// Refuse a signed sign-in message not addressed to this service
+/// (affinidi-webvh-service#207; the rule is SPEC §7.2 item 5, as in VTI #1638).
+///
+/// A JWS-signed message is readable and forwardable by anyone holding it — the
+/// signature proves who wrote it, not who it was for. Without this check a
+/// service the holder signed in to could relay the message to this one and be
+/// issued a session as the holder. So the message must name exactly one
+/// recipient, and it must be this service's own DID, by exact string equality.
+///
+/// Call it on every sign-in path that accepts a signed (not encrypted)
+/// envelope, before the canonical handler runs.
+pub fn require_addressed_to(msg: &Message, own_did: Option<&str>) -> Result<(), AppError> {
+    let own = own_did.ok_or_else(|| {
+        AppError::Config(
+            "server_did not configured; a signed sign-in cannot be addressed to this service"
+                .into(),
+        )
+    })?;
+    match msg.to.as_deref() {
+        None | Some([]) => Err(AppError::Validation(
+            "malformedRequest: a signed sign-in message must name this service in `to`".into(),
+        )),
+        Some([one]) if one == own => Ok(()),
+        Some(to) => Err(AppError::Authentication(format!(
+            "wrongRecipient: this message is addressed to {}, not to this service ({own})",
+            to.join(", ")
+        ))),
+    }
+}
+
 /// Unpack a DIDComm signed (JWS) message and verify the JWS signer matches `msg.from`.
 ///
 /// Resolves the signer's public key from the JWS protected-header `kid`, verifies
@@ -407,6 +437,44 @@ fn extract_signer_kid_compact(header_b64: &str) -> Result<String, AppError> {
     header
         .kid
         .ok_or_else(|| AppError::Authentication("id_token header missing kid".into()))
+}
+
+#[cfg(test)]
+mod addressed_to_tests {
+    use super::require_addressed_to;
+    use affinidi_tdk::didcomm::Message;
+    use serde_json::json;
+
+    fn msg(to: Option<Vec<&str>>) -> Message {
+        let mut m = Message::build("id-1".to_string(), "t".to_string(), json!({})).finalize();
+        m.to = to.map(|v| v.into_iter().map(String::from).collect());
+        m
+    }
+
+    /// affinidi-webvh-service#207: only a message addressed to this service,
+    /// and to it alone, signs in here.
+    #[test]
+    fn a_signed_sign_in_must_be_addressed_to_this_service_alone() {
+        let own = Some("did:web:svc.example");
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), own).is_ok());
+        // Another service — the relay.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:other.example"])), own).is_err());
+        // Several recipients: valid at each, so not bound to this one.
+        assert!(
+            require_addressed_to(
+                &msg(Some(vec!["did:web:svc.example", "did:web:other.example"])),
+                own
+            )
+            .is_err()
+        );
+        // None.
+        assert!(require_addressed_to(&msg(None), own).is_err());
+        assert!(require_addressed_to(&msg(Some(vec![])), own).is_err());
+        // Exact equality, no normalisation.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example "])), own).is_err());
+        // A service with no DID cannot be addressed.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), None).is_err());
+    }
 }
 
 #[cfg(test)]
