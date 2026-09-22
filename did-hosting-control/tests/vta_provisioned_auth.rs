@@ -441,13 +441,28 @@ async fn a_signed_sign_in_not_addressed_to_the_control_plane_is_refused() {
     let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
-        .oneshot(authenticate_request(body))
+        .oneshot(authenticate_request(body.clone()))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
         "the refused messages must not have consumed the session"
+    );
+
+    // And that accepted sign-in is single-use: replaying the very same
+    // envelope is refused. The `to` binding carries no replay protection of
+    // its own — `unpack_signed`'s freshness window and the canonical
+    // handler's single-use challenge row do.
+    let resp = did_hosting_control::routes::router_without_fallback()
+        .with_state(harness.state.clone())
+        .oneshot(authenticate_request(body))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a correctly-addressed sign-in must not be replayable for a second session"
     );
 }
 

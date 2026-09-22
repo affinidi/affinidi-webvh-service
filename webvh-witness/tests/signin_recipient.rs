@@ -143,6 +143,7 @@ async fn assert_only_addressed_sign_in_succeeds(app: axum::Router, id: &KeyIdent
     }
 
     let resp = app
+        .clone()
         .oneshot(post(
             "/api/auth/",
             authenticate_body(id, &session_id, &challenge, Some(vec![OWN_DID])),
@@ -153,6 +154,24 @@ async fn assert_only_addressed_sign_in_succeeds(app: axum::Router, id: &KeyIdent
         resp.status(),
         StatusCode::OK,
         "a sign-in addressed to this service succeeds, and the refused ones did not consume the session"
+    );
+
+    // The same correctly-addressed envelope, replayed: the sign-in is
+    // single-use, so the second presentation is refused. `to` binding does
+    // not carry replay protection by itself — `unpack_signed`'s 5-minute
+    // freshness window and the canonical handler's single-use challenge row
+    // do — and this asserts those still hold at the route.
+    let resp = app
+        .oneshot(post(
+            "/api/auth/",
+            authenticate_body(id, &session_id, &challenge, Some(vec![OWN_DID])),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a correctly-addressed sign-in must not be replayable for a second session"
     );
 }
 
