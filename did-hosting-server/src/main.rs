@@ -180,11 +180,17 @@ enum Command {
         #[arg(long)]
         did_witness: Option<PathBuf>,
         /// Witness service URL for requesting a proof (auto-bootstrap only)
-        #[arg(long)]
+        #[arg(long, requires = "witness_did")]
         witness_url: Option<String>,
         /// Witness ID to use when requesting a proof (auto-bootstrap only)
         #[arg(long)]
         witness_id: Option<String>,
+        /// The witness server's own DID (its `server_did`), required with
+        /// --witness-url. The sign-in is addressed to it, and the witness
+        /// server refuses one addressed elsewhere. This is not --witness-id,
+        /// which names one of the witnesses that server hosts.
+        #[arg(long)]
+        witness_did: Option<String>,
     },
     /// Recover a soft-deleted DID
     RecoverDid {
@@ -674,6 +680,7 @@ async fn main() {
             did_witness,
             witness_url,
             witness_id,
+            witness_did,
         }) => {
             if let Err(e) = run_bootstrap_did(
                 cli.config,
@@ -682,6 +689,7 @@ async fn main() {
                 did_witness,
                 witness_url,
                 witness_id,
+                witness_did,
             )
             .await
             {
@@ -914,6 +922,7 @@ async fn run_bootstrap_did(
     did_witness: Option<PathBuf>,
     witness_url: Option<String>,
     witness_id: Option<String>,
+    witness_did: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
@@ -1002,7 +1011,7 @@ async fn run_bootstrap_did(
         .await?;
 
         // Optional: request witness proof
-        if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
+        if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
             use did_hosting_common::WitnessClient;
 
             eprintln!("  Requesting witness proof...");
@@ -1012,7 +1021,7 @@ async fn run_bootstrap_did(
 
             let mut witness_client = WitnessClient::new(&w_url);
             if let Err(e) = witness_client
-                .authenticate(&result.did_id, &signing_secret)
+                .authenticate(&w_did, &result.did_id, &signing_secret)
                 .await
             {
                 eprintln!("  Warning: witness authentication failed: {e}");

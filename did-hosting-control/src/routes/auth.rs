@@ -352,6 +352,9 @@ async fn authenticate_didcomm_jws(
 
     let (msg, signer_did) = didcomm_unpack::unpack_signed(body_str, did_resolver).await?;
 
+    // #207: a signed message is forwardable, so it must be addressed here.
+    didcomm_unpack::require_addressed_to(&msg, state.config.server_did.as_deref())?;
+
     // The canonical authenticate Type URI — the same one did-hosting-server
     // accepts, so the VTA's envelope routes here verbatim. The legacy
     // `affinidi.com/webvh/1.0/authenticate` arm that sat beside it is gone:
