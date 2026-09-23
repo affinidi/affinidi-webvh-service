@@ -261,6 +261,10 @@ async fn authenticate_arm(
             // A session pubkey is the HTTPS/passkey delegation path's concern;
             // a trust-task producer signs with its own key.
             session_pubkey_b58btc: None,
+            // Reached only over DIDComm authcrypt / TSP, both of which only
+            // this service can open, and `run_pipeline` has checked the
+            // document's `recipient` against `my_vid`.
+            audience: vti_common::auth::AudienceBinding::Transport,
         },
     )
     .await

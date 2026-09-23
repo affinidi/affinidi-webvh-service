@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Changed — messaging-stack refresh for the TSP relationship fixes
+
+- **Took the latest TSP fixes on the 0.26 messaging line.**
+  `affinidi-messaging-sdk` 0.26.10 → **0.26.27**: two endpoints that
+  re-establish a TSP relationship at the same time (fresh environment, or both
+  restarting) no longer fail with `invalid transition: SendInvite in state
+  InviteReceived` (0.26.12); a reply-registration race is closed (0.26.19); and
+  a TSP send retries when its connection is closed under it (0.26.26).
+  `vta-sdk` 0.43 → **0.50** with `vti-common` 0.19.3 → **0.23.1** (the lockstep
+  pair, all four `vti-common` declarations), `trust-tasks-*` 0.21.2/0.21.3 →
+  **0.21.21**; dev-graph `affinidi-messaging-test-mediator` 0.9.1 → 0.9.17
+  (mediator 0.26.2 → 0.28.36). One copy of each of `affinidi-messaging-sdk`,
+  `affinidi-tdk`, `trust-tasks-rs`, `vta-sdk` and `vti-common`.
+- **Two mechanical source changes for vti-common 0.23.** `AuthError` is now
+  `#[non_exhaustive]` with three new variants: `SessionIdleTimeout` and
+  `WrongRecipient` map to `AppError::Authentication`, `MissingRecipient` to
+  `AppError::Validation`, and a wildcard arm fails closed as `Authentication`.
+  `AuthenticateInput` gained a required `audience`; all five sign-in paths pass
+  `AudienceBinding::Transport`, because each has already bound the document to
+  this service before the canonical handler runs (`require_addressed_to` on the
+  signed-DIDComm paths, the id_token `aud` check on SIOPv2, and authcrypt/TSP
+  plus the framework's `recipient` check on the auth trust tasks).
+- **Not yet on sdk 0.27 / `-didcomm-service` 0.12.** Those move the messaging
+  SDK to 0.27 and trust-tasks to 0.22, but the newest published `vta-sdk`
+  (0.50.0) still requires sdk ^0.26 / trust-tasks ^0.21 / affinidi-tdk ^0.16,
+  so taking them now would put a second copy of each in the shipped graph. The
+  move follows the next `vta-sdk` release (verifiable-trust-infrastructure main
+  is already on sdk 0.27 / tdk 0.17 / trust-tasks 0.22).
+
 ### Added — TSP relationship persistence & self-healing (Rev 3 §7.2.2)
 
 - **Nodes now persist their TSP relationships and re-establish them on connect,
