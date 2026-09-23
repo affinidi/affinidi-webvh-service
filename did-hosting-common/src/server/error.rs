@@ -231,9 +231,17 @@ impl From<vti_common::auth::backend::AuthError> for AppError {
             | A::SignerMismatch
             | A::StaleMessage
             | A::RefreshTokenInvalid
-            | A::RefreshTokenExpired => AppError::Authentication(e.to_string()),
+            | A::RefreshTokenExpired
+            | A::SessionIdleTimeout
+            | A::WrongRecipient { .. } => AppError::Authentication(e.to_string()),
+            A::MissingRecipient => AppError::Validation(e.to_string()),
             A::AttestationFailed(msg) => AppError::Internal(format!("tee attestation: {msg}")),
             A::Internal(msg) => AppError::Internal(msg),
+            // `AuthError` is `#[non_exhaustive]` since vti-common 0.20, so a
+            // wildcard is mandatory here. A variant this build does not know
+            // is still an auth-flow refusal: fail closed as a 401 rather than
+            // surface it as a server fault.
+            _ => AppError::Authentication(e.to_string()),
         }
     }
 }

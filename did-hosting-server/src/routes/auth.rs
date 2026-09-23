@@ -97,6 +97,9 @@ pub async fn authenticate(
             // both inside `check_freshness`.
             created_time: msg.created_time,
             session_pubkey_b58btc: None,
+            // `require_addressed_to` above has already bound the signed
+            // message to this service's DID (#207).
+            audience: vti_common::auth::AudienceBinding::Transport,
         },
     )
     .await?;

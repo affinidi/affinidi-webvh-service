@@ -287,6 +287,8 @@ pub async fn authenticate(
             // SIOPv2 / REST — no DIDComm created_time to thread.
             created_time: None,
             session_pubkey_b58btc,
+            // The id_token's `aud` was checked against `server_did` above.
+            audience: vti_common::auth::AudienceBinding::Transport,
         },
     )
     .await;
@@ -389,6 +391,9 @@ async fn authenticate_didcomm_jws(
             signer_did: signer_did.clone(),
             created_time: msg.created_time,
             session_pubkey_b58btc: None,
+            // `require_addressed_to` above has already bound the signed
+            // message to this service's DID (#207).
+            audience: vti_common::auth::AudienceBinding::Transport,
         },
     )
     .await;
