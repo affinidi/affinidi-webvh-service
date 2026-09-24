@@ -54,18 +54,31 @@ pub async fn sync_to_control(
     }
 }
 
-/// Push per-DID stat deltas to the control plane via DIDComm.
+/// Push per-DID stat deltas to the control plane over the messaging transport.
 ///
 /// Same semantics as `sync_to_control` but routes through the mediator
 /// instead of requiring direct HTTP access to the control plane.
-pub async fn sync_to_control_didcomm(
+///
+/// The binding follows registration's rule (`control_register`): a control
+/// plane whose DID document advertises `TSPTransport` gets a
+/// `.../server/stats-sync/0.1` trust task, which `send_trust_task` carries over
+/// TSP; anything else gets the legacy `MSG_STATS_SYNC` DIDComm message, because
+/// a control plane that predates the trust-task arm would drop the document
+/// unrouted. That makes the control plane an upgrade-first dependency: one that
+/// advertises TSP but lacks the `stats-sync` arm loses these deltas.
+pub async fn sync_to_control_messaging(
     svc: &DIDCommService,
+    state: &crate::server::AppState,
     server_did: &str,
     control_did: &str,
     collector: &StatsCollector,
 ) {
     use affinidi_messaging_didcomm::Message;
     use did_hosting_common::didcomm_types::MSG_STATS_SYNC;
+    use did_hosting_common::server::didcomm_profile::{
+        PeerTransport, TransportFallback, resolve_transport,
+    };
+    use did_hosting_common::server::trust_tasks::send::{build_request, send_trust_task};
     use serde_json::json;
 
     let deltas = collector.drain_for_sync();
@@ -88,6 +101,42 @@ pub async fn sync_to_control_didcomm(
         })
         .collect();
 
+    let body = json!({
+        "server_did": server_did,
+        "seq": seq,
+        "did_deltas": did_deltas,
+    });
+
+    let control_speaks_tsp = matches!(
+        resolve_transport(control_did, state.did_resolver.as_ref()).await,
+        Some((PeerTransport::Tsp, _))
+    );
+
+    if control_speaks_tsp {
+        let fallback = TransportFallback::from_config(
+            state.config.mediator_did.as_deref(),
+            state.config.features.tsp,
+        );
+        let sent = match build_request(MSG_STATS_SYNC, server_did, control_did, body) {
+            Ok(doc) => send_trust_task(
+                svc,
+                "server",
+                server_did,
+                control_did,
+                &doc,
+                &fallback,
+                state.did_resolver.as_ref(),
+            )
+            .await
+            .map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            debug!(error = %e, "failed to sync stats to control plane (trust task)");
+        }
+        return;
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -96,11 +145,7 @@ pub async fn sync_to_control_didcomm(
     let msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
         MSG_STATS_SYNC.to_string(),
-        json!({
-            "server_did": server_did,
-            "seq": seq,
-            "did_deltas": did_deltas,
-        }),
+        body,
     )
     .from(server_did.to_string())
     .to(control_did.to_string())
