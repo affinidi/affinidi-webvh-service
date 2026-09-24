@@ -21,11 +21,14 @@
  *     session-bound `did:key`, and lets the AffinidiVerifier verify
  *     the signature.
  *
- * The private key is generated as a non-extractable `CryptoKey` —
- * IndexedDB stores the opaque wrapper, not the raw bytes; even
- * inspection through devtools cannot extract the private key material.
- * The browser's CryptoKey-to-IDB serialiser is structured-clone-aware
- * and keeps the non-extractable invariant across the round-trip.
+ * The private key is generated non-extractable (`generateKey(…, false,
+ * …)`) — IndexedDB stores the opaque wrapper, not the raw bytes, and
+ * neither devtools nor any other script in this origin can export the
+ * private key material. The browser's CryptoKey-to-IDB serialiser is
+ * structured-clone-aware and keeps the non-extractable invariant across
+ * the round-trip. That flag applies to the private key alone; the
+ * public key of a generated pair is always extractable, which is what
+ * lets `generateSessionKeypair()` read the raw 32 public bytes out.
  *
  * Storage scope: per-origin (the standard IndexedDB scope). Multiple
  * tabs on the same origin share the same persisted keypair, which
@@ -70,14 +73,24 @@ export async function generateSessionKeypair(): Promise<{
   }
 
   // Ed25519 in WebCrypto is supported on Chrome 137+, Firefox 130+,
-  // Safari 17+. `extractable=true` is needed to export the raw public
-  // key bytes; the private key stays inside the CryptoKey wrapper and
-  // is used only via `crypto.subtle.sign(...)`. IndexedDB's
-  // structured-clone serialiser preserves the wrapper across the
-  // round-trip without exposing key material.
+  // Safari 17+.
+  //
+  // The `extractable` argument governs the **private** key only. For an
+  // asymmetric generateKey, WebCrypto sets `publicKey.[[extractable]]`
+  // to `true` unconditionally (Web Cryptography API, "generateKey" —
+  // the public key of a key pair is always extractable), so the
+  // `exportKey("raw", publicKey)` below returns the 32 public bytes
+  // either way. Passing `true` here would buy nothing for the public
+  // key and would make `exportKey("pkcs8" | "jwk", privateKey)` succeed
+  // — i.e. hand the session signing key to any script running in this
+  // origin. `false` makes that export throw `InvalidAccessError`, which
+  // is the whole point: the private key is usable only via
+  // `crypto.subtle.sign(...)` and cannot be read out. Structured clone
+  // carries a non-extractable key into IndexedDB with the flag intact,
+  // so persistence does not reopen the hole.
   const keypair = (await crypto.subtle.generateKey(
     { name: "Ed25519" },
-    true,
+    false,
     ["sign", "verify"],
   )) as CryptoKeyPair;
 
