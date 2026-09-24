@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed — stats sync uses TSP when the control plane advertises it
+
+- **Stats sync was the last control↔server exchange hard-coded to DIDComm.**
+  A server now sends its periodic per-DID deltas as a
+  `.../server/stats-sync/0.1` trust task when the control plane's DID document
+  advertises `TSPTransport`, so `send_trust_task` carries it (and the ack) over
+  TSP; otherwise it keeps sending the legacy `MSG_STATS_SYNC` DIDComm message.
+  The control plane gains the matching `trust_tasks_infra` arm, and the server
+  owns the `#response` ack. **Upgrade the control plane first** — one that
+  advertises TSP but predates this arm drops the trust task, losing those
+  deltas.
+- **A stats sync must report under its own DID.** The DIDComm and trust-task
+  routes now reject a `server_did` that differs from the transport-proven
+  sender (`e.p.stats.sender_mismatch`), as the REST route already did against
+  its JWT. `server_did` keys the replay window, so a foreign one could advance
+  another server's sequence and have its genuine deltas skipped as stale.
+
 ### Changed — messaging-stack refresh for the TSP relationship fixes
 
 - **Took the latest TSP fixes on the 0.26 messaging line.**

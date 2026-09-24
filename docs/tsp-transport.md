@@ -126,7 +126,7 @@ correct reading: that node is reachable over HTTP only.
 
 ## Control ↔ server infrastructure ops
 
-Server registration and health are **trust tasks**, so the binding is chosen
+Server registration, health, and stats sync are **trust tasks**, so the binding is chosen
 from the peer's DID document rather than hard-coded.
 
 The `MSG_*` constants in `didcomm_types` are already canonical Trust-Task Type
@@ -137,6 +137,8 @@ MSG_SERVER_REGISTER       …/spec/did-management/server/register/0.1
 MSG_SERVER_REGISTER_ACK   …/spec/did-management/server/register/0.1#response
 MSG_HEALTH_PING           …/spec/did-management/server/health/0.1
 MSG_HEALTH_PONG           …/spec/did-management/server/health/0.1#response
+MSG_STATS_SYNC            …/spec/did-management/server/stats-sync/0.1
+MSG_STATS_ACK             …/spec/did-management/server/stats-sync/0.1#response
 ```
 
 They are reused verbatim as document Type URIs, so an op has **one identity** on
@@ -168,7 +170,8 @@ or pong — it sat in the dashboard as `Unreachable` forever.
 ### Seeing which transport a server is actually using
 
 The Servers card shows a **Control link** block with the transport that really
-carried the last message in each direction — `↓ in` (registration, health pong)
+carried the last message in each direction — `↓ in` (registration, health pong,
+stats sync)
 and `↑ out` (health ping). It is recorded, not inferred.
 
 That distinction matters. `advertisedServices` is what a peer *can* speak;
@@ -211,6 +214,16 @@ heard of `server/register` — leaving the server silently unregistered. Once ev
 control plane in a fleet understands the task, this collapses to
 `send_trust_task` unconditionally; `trust-task-discovery/0.1` is the principled
 way to detect that, and is deliberately not attempted yet.
+
+**Stats sync follows the same rule.** A server whose control plane advertises
+`TSPTransport` sends its periodic deltas as a `server/stats-sync/0.1` trust task
+(and the ack comes back the same way); otherwise it sends the legacy
+`MSG_STATS_SYNC`. Advertising TSP is taken as the signal, which is the same bet
+registration makes and carries the same caveat: a control plane that advertises
+TSP but predates the `stats-sync` arm drops the document unrouted, and those
+deltas are lost. **Upgrade the control plane before its servers.** Before this,
+stats were the one periodic exchange still hard-coded to DIDComm, so a
+TSP-configured pair showed a DIDComm round-trip every `stats.sync_interval_secs`.
 
 Servers declare `trust_task_capable: true` in their registration body. The
 control plane records it on `ServiceInstance` and only then sends trust-task

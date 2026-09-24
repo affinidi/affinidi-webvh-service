@@ -365,7 +365,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         });
     }
 
-    // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
+    // 6. Spawn stats sync task — TSP or DIDComm, per the control DID (main runtime)
     let stats_sync_shutdown = CancellationToken::new();
     let didcomm_sync_interval = state.config.stats.sync_interval_secs;
     if let (Some(svc), Some(control_did), Some(server_did)) = (
@@ -379,6 +379,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         let control_did = control_did.clone();
         let server_did = server_did.clone();
         let collector = stats_collector.clone();
+        let sync_state = state.clone();
         tokio::spawn(async move {
             let mut timer =
                 tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
@@ -386,8 +387,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        stats::sync_to_control_didcomm(
+                        stats::sync_to_control_messaging(
                             &svc,
+                            &sync_state,
                             &server_did,
                             &control_did,
                             &collector,

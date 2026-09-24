@@ -1,4 +1,5 @@
-//! Control-plane infrastructure trust tasks: server registration and health.
+//! Control-plane infrastructure trust tasks: server registration, health, and
+//! stats sync.
 //!
 //! These are the control↔server ops that used to exist only as legacy `MSG_*`
 //! DIDComm messages, which made them DIDComm-only and therefore invisible to a
@@ -18,6 +19,8 @@
 //! MSG_SERVER_REGISTER_ACK  .../spec/did-management/server/register/0.1#response
 //! MSG_HEALTH_PING          .../spec/did-management/server/health/0.1
 //! MSG_HEALTH_PONG          .../spec/did-management/server/health/0.1#response
+//! MSG_STATS_SYNC           .../spec/did-management/server/stats-sync/0.1
+//! MSG_STATS_ACK            .../spec/did-management/server/stats-sync/0.1#response
 //! ```
 //!
 //! So we reuse them verbatim as document Type URIs. The op has one identity
@@ -34,8 +37,8 @@
 //!
 //! ## Why this bypasses the §7.2 pipeline
 //!
-//! Registration authenticates via the ACL (`Service` role) against the
-//! transport-proven sender, exactly as the DIDComm route did. Health pong
+//! Registration and stats sync authenticate via the ACL (`Service` role)
+//! against the transport-proven sender, exactly as their DIDComm routes do. Health pong
 //! carries no authority at all — it only marks an already-registered instance
 //! Active, keyed by sender DID. Neither needs proof verification or audience
 //! binding beyond what the transport already guarantees, and running them
@@ -47,7 +50,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use did_hosting_common::didcomm_types::{
-    MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK,
+    MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 
@@ -60,7 +63,10 @@ use crate::server::AppState;
 /// we act on, while `register/0.1#response` is an ack *we* emit and must never
 /// route back into ourselves.
 pub fn owns(type_uri: &str) -> bool {
-    matches!(type_uri, MSG_SERVER_REGISTER | MSG_HEALTH_PONG)
+    matches!(
+        type_uri,
+        MSG_SERVER_REGISTER | MSG_HEALTH_PONG | MSG_STATS_SYNC
+    )
 }
 
 /// Handle an infrastructure trust task from `sender`.
@@ -122,6 +128,25 @@ async fn dispatch_inner(
                         code = rej.code,
                         comment = %rej.comment,
                         "server registration rejected (trust task)"
+                    );
+                    Some(serde_json::to_value(&err).expect("error document serialises"))
+                }
+            }
+        }
+        MSG_STATS_SYNC => {
+            let reply_id = uuid::Uuid::new_v4().to_string();
+            match crate::messaging::do_stats_sync(state, sender, &doc.payload).await {
+                Ok(ack) => {
+                    let resp = doc.respond_with(reply_id, ack);
+                    debug_assert_eq!(resp.type_uri.to_string(), MSG_STATS_ACK);
+                    Some(serde_json::to_value(&resp).expect("ack document serialises"))
+                }
+                Err(rej) => {
+                    let err = doc.reject_with(
+                        reply_id,
+                        trust_tasks_rs::RejectReason::PermissionDenied {
+                            reason: rej.comment.clone(),
+                        },
                     );
                     Some(serde_json::to_value(&err).expect("error document serialises"))
                 }

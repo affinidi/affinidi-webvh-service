@@ -1,4 +1,4 @@
-//! Server-side infrastructure trust tasks: health ping, register ack.
+//! Server-side infrastructure trust tasks: health ping, register ack, stats ack.
 //!
 //! The mirror of `did-hosting-control`'s `trust_tasks_infra`. Both sides speak
 //! the same Type URIs — the `MSG_*` constants, which are already canonical
@@ -20,13 +20,16 @@
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SERVER_REGISTER_ACK};
+use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK};
 
 use crate::server::AppState;
 
 /// Does this Type URI belong to the infrastructure ops handled here?
 pub fn owns(type_uri: &str) -> bool {
-    matches!(type_uri, MSG_HEALTH_PING | MSG_SERVER_REGISTER_ACK)
+    matches!(
+        type_uri,
+        MSG_HEALTH_PING | MSG_SERVER_REGISTER_ACK | MSG_STATS_ACK
+    )
 }
 
 /// Handle an infrastructure trust task from `sender`.
@@ -54,6 +57,10 @@ pub async fn dispatch(
             do_register_ack(&doc.payload);
             None
         }
+        // Advisory, like the legacy DIDComm route's `ignore_handler`: stats
+        // are fire-and-forget. Owned so the ack isn't warned about as an
+        // unimplemented type on every sync tick.
+        MSG_STATS_ACK => None,
         other => {
             warn!(type_uri = other, "trust_tasks_infra: unowned type URI");
             None

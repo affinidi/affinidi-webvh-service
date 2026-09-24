@@ -119,7 +119,7 @@ async fn add_acl(state: &AppState, did: &str, role: Role) {
 }
 
 use did_hosting_common::didcomm_types::{
-    MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK,
+    MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 use did_hosting_common::server::trust_tasks::send::build_request;
@@ -277,18 +277,105 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
     assert!(matches!(after.status, registry::ServiceStatus::Active));
 }
 
-/// The dispatcher must claim only its two ops. `owns` gates `dispatch`, and if
+/// The dispatcher must claim only its own ops. `owns` gates `dispatch`, and if
 /// it over-claimed it would swallow DID-management tasks bound for the bridge.
 #[test]
-fn owns_only_register_and_health_pong() {
+fn owns_only_register_health_pong_and_stats_sync() {
     use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SYNC_UPDATE};
 
     assert!(trust_tasks_infra::owns(MSG_SERVER_REGISTER));
     assert!(trust_tasks_infra::owns(MSG_HEALTH_PONG));
+    assert!(trust_tasks_infra::owns(MSG_STATS_SYNC));
     // The control plane *sends* these; it must never route them to itself.
     assert!(!trust_tasks_infra::owns(MSG_HEALTH_PING));
     assert!(!trust_tasks_infra::owns(MSG_SERVER_REGISTER_ACK));
+    assert!(!trust_tasks_infra::owns(MSG_STATS_ACK));
     assert!(!trust_tasks_infra::owns(MSG_SYNC_UPDATE));
+}
+
+// Stats sync keys its replay window on a process-wide map, so each test uses
+// its own server DID to stay independent of the others running alongside it.
+
+fn stats_body(server_did: &str, seq: u64, resolves: u64) -> Value {
+    json!({
+        "server_did": server_did,
+        "seq": seq,
+        "did_deltas": [{
+            "mnemonic": "alice",
+            "resolve_delta": resolves,
+            "update_delta": 0,
+            "last_resolved_at": now_epoch(),
+            "last_updated_at": null,
+        }],
+    })
+}
+
+/// A `server/stats-sync/0.1` trust task — what a server sends when the control
+/// plane advertises TSP — records the deltas and answers with the `#response`
+/// variant, exactly as the legacy `MSG_STATS_SYNC` DIDComm route does.
+#[tokio::test]
+async fn stats_sync_trust_task_records_deltas_and_acks() {
+    const DID: &str = "did:webvh:QmS:webvh.example.com:stats-accept";
+    let h = make_harness().await;
+    add_acl(&h.state, DID, Role::Service).await;
+
+    let doc = build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5))
+        .expect("MSG_STATS_SYNC must parse as a TypeUri");
+    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+        .await
+        .expect("stats sync must produce an ack");
+
+    assert_eq!(resp["type"], MSG_STATS_ACK, "got {resp}");
+    assert_eq!(resp["payload"]["status"], "accepted");
+    assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 5);
+
+    // A replay of the same sequence is acked but not double-counted.
+    let replay =
+        build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5)).expect("build");
+    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), replay)
+        .await
+        .expect("ack");
+    assert_eq!(resp["payload"]["status"], "skipped");
+    assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 5);
+}
+
+/// Stats writes are ACL-gated like the REST and DIDComm routes: an Owner-role
+/// DID must not be able to inflate another server's counters.
+#[tokio::test]
+async fn stats_sync_trust_task_requires_service_role() {
+    const DID: &str = "did:webvh:QmS:webvh.example.com:stats-owner";
+    let h = make_harness().await;
+    add_acl(&h.state, DID, Role::Owner).await;
+
+    let doc =
+        build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5)).expect("build");
+    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+        .await
+        .expect("rejection is still a document");
+
+    assert_ne!(resp["type"], MSG_STATS_ACK, "must not ack: {resp}");
+    assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 0);
+}
+
+/// `server_did` keys the replay window, so a Service may not report under
+/// another server's DID — it could advance that server's sequence and have
+/// its genuine deltas skipped as stale. The REST route binds it to the JWT;
+/// the messaging routes bind it to the transport-proven sender.
+#[tokio::test]
+async fn stats_sync_rejects_a_foreign_server_did() {
+    const DID: &str = "did:webvh:QmS:webvh.example.com:stats-spoofer";
+    const VICTIM: &str = "did:webvh:QmS:webvh.example.com:stats-victim";
+    let h = make_harness().await;
+    add_acl(&h.state, DID, Role::Service).await;
+
+    let doc =
+        build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(VICTIM, 99, 5)).expect("build");
+    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+        .await
+        .expect("rejection is still a document");
+
+    assert_ne!(resp["type"], MSG_STATS_ACK, "must not ack: {resp}");
+    assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 0);
 }
 
 /// The registration that *enrols* the instance must itself be observed.

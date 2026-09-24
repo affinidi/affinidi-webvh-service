@@ -1154,9 +1154,30 @@ async fn handle_stats_sync(
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    use crate::routes::stats_sync;
-
     let sender = require_sender(&ctx)?;
+
+    let response = match do_stats_sync(&state, sender, &message.body).await {
+        Ok(ack) => DIDCommResponse::new(MSG_STATS_ACK.to_string(), ack),
+        Err(rej) => DIDCommResponse::new(
+            MSG_PROBLEM_REPORT.to_string(),
+            json!({ "code": rej.code, "comment": rej.comment }),
+        ),
+    };
+    Ok(Some(response.thid(message.id.clone())))
+}
+
+/// Transport-agnostic core of stats sync.
+///
+/// Shared by the legacy `MSG_STATS_SYNC` DIDComm route and the
+/// `.../server/stats-sync/0.1` trust task arriving over DIDComm **or** TSP, so
+/// the two can never drift. Returns the ack body — `accepted`, or `skipped` for
+/// a stale sequence — or a rejection when the sender is not a Service.
+pub(crate) async fn do_stats_sync(
+    state: &AppState,
+    sender: &str,
+    body: &Value,
+) -> Result<Value, InfraRejection> {
+    use crate::routes::stats_sync;
 
     // Require Service role — matches REST `/api/control/stats` which is gated
     // on ServiceAuth. An Owner-role DID must not be able to write per-DID
@@ -1166,81 +1187,71 @@ async fn handle_stats_sync(
         check_acl(&state.acl_ks, sender).await,
         Ok(crate::acl::Role::Service)
     ) {
-        warn!(
-            did = sender,
-            "stats sync via DIDComm rejected: Service role required"
-        );
-        return Ok(Some(
-            DIDCommResponse::new(
-                MSG_PROBLEM_REPORT.to_string(),
-                json!({ "code": "e.p.stats.unauthorized", "comment": "service role required" }),
-            )
-            .thid(message.id.clone()),
+        warn!(did = sender, "stats sync rejected: Service role required");
+        return Err(InfraRejection::new(
+            "e.p.stats.unauthorized",
+            "service role required",
         ));
     }
 
-    let seq = message
-        .body
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let server_did = message
-        .body
+    // Bind the payload to the transport-proven sender, as the REST handler
+    // binds it to the JWT. `server_did` keys the replay window, so accepting a
+    // foreign one would let one server advance — and so suppress — another's.
+    let server_did = body
         .get("server_did")
         .and_then(|v| v.as_str())
         .unwrap_or(sender);
-
-    // Idempotency check (reuse REST handler's static map)
-    if !stats_sync::accept_seq(server_did, seq) {
-        debug!(server_did, seq, "stats sync via DIDComm: stale sequence");
-        return Ok(Some(
-            DIDCommResponse::new(
-                MSG_STATS_ACK.to_string(),
-                json!({ "status": "skipped", "reason": "stale_seq" }),
-            )
-            .thid(message.id.clone()),
+    if server_did != sender {
+        warn!(
+            did = sender,
+            server_did, "stats sync rejected: server_did does not match sender"
+        );
+        return Err(InfraRejection::new(
+            "e.p.stats.sender_mismatch",
+            "server_did does not match sender",
         ));
     }
 
-    // Record deltas
-    if let Some(deltas) = message.body.get("did_deltas").and_then(|v| v.as_array()) {
-        for d in deltas {
-            let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
-            if mnemonic.is_empty() {
-                continue;
-            }
-            let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
-            let update_delta = d.get("update_delta").and_then(|v| v.as_u64()).unwrap_or(0);
-            let last_resolved_at = d.get("last_resolved_at").and_then(|v| v.as_u64());
-            let last_updated_at = d.get("last_updated_at").and_then(|v| v.as_u64());
+    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
 
-            state.stats_collector.record_deltas(
-                mnemonic,
-                resolve_delta,
-                update_delta,
-                last_resolved_at,
-                last_updated_at,
-            );
-        }
+    // Idempotency check (reuse REST handler's static map)
+    if !stats_sync::accept_seq(server_did, seq) {
+        debug!(server_did, seq, "stats sync: stale sequence");
+        return Ok(json!({ "status": "skipped", "reason": "stale_seq" }));
     }
 
-    let delta_count = message
-        .body
+    let deltas = body
         .get("did_deltas")
         .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for d in deltas {
+        let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
+        if mnemonic.is_empty() {
+            continue;
+        }
+        let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
+        let update_delta = d.get("update_delta").and_then(|v| v.as_u64()).unwrap_or(0);
+        let last_resolved_at = d.get("last_resolved_at").and_then(|v| v.as_u64());
+        let last_updated_at = d.get("last_updated_at").and_then(|v| v.as_u64());
+
+        state.stats_collector.record_deltas(
+            mnemonic,
+            resolve_delta,
+            update_delta,
+            last_resolved_at,
+            last_updated_at,
+        );
+    }
 
     debug!(
         server_did,
-        seq, delta_count, "stats sync via DIDComm accepted"
+        seq,
+        delta_count = deltas.len(),
+        "stats sync accepted"
     );
 
-    Ok(Some(
-        DIDCommResponse::new(MSG_STATS_ACK.to_string(), json!({ "status": "accepted" }))
-            .thid(message.id.clone()),
-    ))
+    Ok(json!({ "status": "accepted" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,15 +1317,15 @@ async fn handle_health_pong(
 // Server registration handler
 // ---------------------------------------------------------------------------
 
-/// A rejection the registration core can report, rendered differently by each
-/// transport: the legacy DIDComm route packs it into an `MSG_PROBLEM_REPORT`
+/// A rejection an infrastructure core (registration, stats sync) can report,
+/// rendered differently by each transport: the legacy DIDComm route packs it into an `MSG_PROBLEM_REPORT`
 /// message; the trust-task route turns it into a framework `ErrorResponse`.
-pub(crate) struct RegisterRejection {
+pub(crate) struct InfraRejection {
     pub code: &'static str,
     pub comment: String,
 }
 
-impl RegisterRejection {
+impl InfraRejection {
     fn new(code: &'static str, comment: impl Into<String>) -> Self {
         Self {
             code,
@@ -1333,7 +1344,7 @@ pub(crate) async fn do_server_register(
     state: &AppState,
     sender: &str,
     body: &Value,
-) -> Result<Value, RegisterRejection> {
+) -> Result<Value, InfraRejection> {
     use crate::acl::check_acl;
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
 
@@ -1352,7 +1363,7 @@ pub(crate) async fn do_server_register(
                 role = %other,
                 "server registration rejected: Service role required"
             );
-            return Err(RegisterRejection::new(
+            return Err(InfraRejection::new(
                 "e.p.registration.unauthorized",
                 "service role required to register as a server",
             ));
@@ -1362,7 +1373,7 @@ pub(crate) async fn do_server_register(
                 did = sender,
                 "server registration rejected: DID not in ACL (requires pre-approval)"
             );
-            return Err(RegisterRejection::new(
+            return Err(InfraRejection::new(
                 "e.p.registration.unauthorized",
                 "server DID must be pre-approved in the ACL before registering",
             ));
@@ -1388,7 +1399,7 @@ pub(crate) async fn do_server_register(
             requested = public_url,
             "server registration rejected: URL host not in registry.url_allowlist",
         );
-        return Err(RegisterRejection::new(
+        return Err(InfraRejection::new(
             "e.p.registration.unauthorized",
             e.user_message(),
         ));
@@ -1518,7 +1529,7 @@ pub(crate) async fn do_server_register(
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
         warn!(did = sender, error = %e, "server registration failed");
-        return Err(RegisterRejection::new(
+        return Err(InfraRejection::new(
             "e.p.registration.internal-error",
             e.to_string(),
         ));

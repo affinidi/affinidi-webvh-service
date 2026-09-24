@@ -5,7 +5,7 @@
 //! payload. **Two payload shapes arrive here**, and we sniff between them:
 //!
 //! 1. A **trust-task document** (`TrustTask<Value>`) — health ping, register
-//!    ack. Carried either inside the `binding/tsp/0.1` envelope (what a
+//!    or stats ack. Carried either inside the `binding/tsp/0.1` envelope (what a
 //!    conformant peer sends) or bare (this repo's pre-binding dialect);
 //!    [`did_hosting_common::server::tsp_binding`] reads both and says why, and
 //!    the reply goes back in whichever arrived. Dispatched through
@@ -203,15 +203,22 @@ mod tests {
         );
     }
 
-    /// The infra dispatcher owns exactly the two ops the server implements —
-    /// and must not claim the sync/domain types, which travel as `Message`s.
+    /// The infra dispatcher owns exactly the ops the server implements — and
+    /// must not claim the sync/domain types, which travel as `Message`s.
     #[test]
-    fn infra_owns_only_health_ping_and_register_ack() {
+    fn infra_owns_only_health_ping_and_acks() {
         use crate::trust_tasks_infra::owns;
-        use did_hosting_common::didcomm_types::{MSG_DOMAIN_ASSIGN, MSG_SERVER_REGISTER_ACK};
+        use did_hosting_common::didcomm_types::{
+            MSG_DOMAIN_ASSIGN, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
+        };
 
         assert!(owns(MSG_HEALTH_PING));
         assert!(owns(MSG_SERVER_REGISTER_ACK));
+        // The stats ack answers every sync tick; unowned, it would be warned
+        // about as an unimplemented type each time.
+        assert!(owns(MSG_STATS_ACK));
+        // The server *sends* the request; it must never route it to itself.
+        assert!(!owns(MSG_STATS_SYNC));
         assert!(!owns(MSG_SYNC_UPDATE));
         assert!(!owns(MSG_DOMAIN_ASSIGN));
     }
