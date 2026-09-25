@@ -30,6 +30,30 @@ id)`. See `did_hosting_common::server::trust_tasks::bound`.
   `issuedAt`, and signed with its operational key (`authentication`). Edges
   sign their acks and pongs the same way. `trust-task-error` documents stay
   unsigned.
+- **Edges keep a high-water mark per DID and per slot that a delete does not
+  clear.** A DID re-created after `sync/delete` must extend everything the edge
+  ever served for it, so a delete-then-resync cannot roll a DID back to before a
+  rotation or bring back a deactivated one. A slot never changes method; a new
+  DID (new SCID) may reuse a deleted slot.
+- **Edges bind each synced DID to its slot and host** (the log's identifier must
+  resolve at that mnemonic on the edge's public URL or an assigned domain),
+  verify `did:webs` updates as continuations of the held and high-water logs,
+  and verify witness proofs — a witnessed DID without its proofs is refused.
+- **The outbox removes an entry only on the target's signed acknowledgement**
+  of the exact document sent (or its signed, non-retryable refusal), re-signing
+  on every retry and re-sending after 60s without an ack; one op in flight per
+  server. Edges re-register at startup, on every mediator reconnect and every
+  10 minutes; each registration re-syncs the delta, queues deletes the edge
+  missed, and replicates every domain record.
+- **Pre-authorisation filtering.** A privileged document from a sender with no
+  ACL entry is refused before any signature or DID-resolution work and never
+  reaches the replay cache. The replay cache refuses (retryable `unavailable`)
+  instead of evicting at its bounds, caps each signer, and expires in O(1).
+- **Other hardening.** The task-consent decision requires `recipient`, a fresh
+  `issuedAt` and is replay-checked; REST DIDComm-JWS sign-in and refresh require
+  a key listed under `authentication`; `POST /api/control/stats` takes a signed
+  stats-sync document instead of a bearer token; proofs from a deactivated
+  `did:webvh` signer are refused.
 - **`TransportBoundVerifier` requires an in-band `issuer`, always.** A proof
   with no `issuer` used to verify as a bare signature, with the issuer then
   filled from the transport's sender; it is now refused. The one delegated shape

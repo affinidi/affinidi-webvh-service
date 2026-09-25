@@ -221,16 +221,49 @@ async fn run_consent_decision(
         );
         return Ok(None);
     }
-    // Audience binding: a decision signed for another executor must not
-    // resolve a pending consent here.
-    if let (Some(recipient), Some(control_did)) =
-        (doc.recipient.as_deref(), state.config.server_did.as_deref())
-        && recipient != control_did
+    // Audience binding (REQUIRED): a decision signed for another executor —
+    // or for no one in particular — must not resolve a pending consent here.
+    if doc.recipient.is_none() || doc.recipient.as_deref() != state.config.server_did.as_deref() {
+        warn!(
+            sender = sender,
+            recipient = ?doc.recipient,
+            "task-consent decision is not addressed to this control plane — ignoring"
+        );
+        return Ok(None);
+    }
+    // Freshness (REQUIRED): the signed `issuedAt` inside the window, the same
+    // bound every other signed inbound document is held to.
+    let now = chrono::Utc::now();
+    let fresh = doc.issued_at.is_some_and(|at| {
+        at >= now
+            - chrono::Duration::seconds(
+                did_hosting_common::server::didcomm_unpack::FRESHNESS_WINDOW_SECS as i64,
+            )
+            && at
+                <= now
+                    + chrono::Duration::seconds(
+                        did_hosting_common::server::didcomm_unpack::FUTURE_SKEW_SECS as i64,
+                    )
+    });
+    if !fresh || doc.expires_at.is_some_and(|at| at <= now) {
+        warn!(
+            sender = sender,
+            "task-consent decision is stale, future-dated, expired or undated — ignoring"
+        );
+        return Ok(None);
+    }
+    // Cheap pre-filter before any signature work (which may re-resolve the
+    // signer's DID): only a holder with a consent pending can answer one.
+    if !state
+        .pending_confirms
+        .lock()
+        .await
+        .values()
+        .any(|p| p.holder_did == sender)
     {
         warn!(
             sender = sender,
-            recipient = %recipient,
-            "task-consent decision recipient is not this control plane — ignoring"
+            "task-consent decision from a DID with nothing pending — ignoring"
         );
         return Ok(None);
     }
@@ -244,6 +277,11 @@ async fn run_consent_decision(
             error = %e,
             "task-consent decision proof failed verification — ignoring"
         );
+        return Ok(None);
+    }
+    // Replay: the same signed decision twice is one decision.
+    if state.replay_cache.check(sender, &doc.id).is_err() {
+        warn!(sender = sender, "task-consent decision replayed — ignoring");
         return Ok(None);
     }
 
@@ -878,6 +916,18 @@ pub(crate) async fn do_stats_sync(
         .and_then(|v| v.as_array())
         .map(Vec::as_slice)
         .unwrap_or_default();
+    const MAX_DELTAS_PER_SYNC: usize = 10_000;
+    if deltas.len() > MAX_DELTAS_PER_SYNC {
+        warn!(
+            did = signer,
+            count = deltas.len(),
+            "stats sync rejected: too many deltas"
+        );
+        return Err(InfraRejection::new(
+            "e.p.stats.too-large",
+            "too many deltas in one sync",
+        ));
+    }
     for d in deltas {
         let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
         if mnemonic.is_empty() {
@@ -1322,6 +1372,7 @@ pub(crate) async fn do_server_register(
         })
         .unwrap_or_default();
     server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
+    server_push::sync_all_domains_to_server(state, signer.to_string());
 
     Ok(json!({
         "instance_id": instance_id,
@@ -1761,6 +1812,26 @@ async fn route_trust_task_doc(
             %message,
             "inbound trust-task error from a peer — terminal, not answered"
         );
+        // A server's *signed*, non-retryable refusal of an op this control
+        // plane sent settles that outbox entry: the target has said it will not
+        // apply it, so re-sending would only stall its queue. An unsigned error
+        // settles nothing — anyone could send one.
+        let retryable = doc
+            .payload
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if doc.proof.is_some()
+            && !retryable
+            && matches!(
+                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                Ok(Some(_))
+            )
+            && let Ok(signer) =
+                verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+        {
+            crate::trust_tasks_infra::acknowledge_outbox(state, &signer, &doc).await;
+        }
         return Ok(RoutedReply::Suppressed);
     }
 
@@ -1776,6 +1847,29 @@ async fn route_trust_task_doc(
     //    The exemptions are the two documents that authorise nothing and that a
     //    peer must be able to send before it can sign anything useful:
     //    capability discovery, and asking for an auth challenge.
+    //
+    //    Before any signature work — which can mean resolving a DID over the
+    //    network — the reported sender must at least *have* an ACL entry: every
+    //    privileged op requires one, so a stranger is turned away for the cost
+    //    of a key lookup, and never reaches the resolver or the replay cache.
+    //    This is a cheap pre-filter, not the authorisation; the proof still has
+    //    to bind the document to that same DID below.
+    if !is_proofless(&type_uri)
+        && !matches!(
+            did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+            Ok(Some(_))
+        )
+    {
+        warn!(sender, %type_uri, "trust task refused: sender has no ACL entry");
+        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                trust_tasks_rs::RejectReason::PermissionDenied {
+                    reason: "caller is not present in the maintainer's ACL".into(),
+                },
+            ),
+        ))));
+    }
     let principal = if is_proofless(&type_uri) {
         sender.to_string()
     } else {
@@ -1794,18 +1888,21 @@ async fn route_trust_task_doc(
     // Replay gate, keyed on what the proof covers: the proven issuer and the
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
+    // At its bounds the cache refuses (retryable) rather than forgetting.
     if !is_proofless(&type_uri)
-        && state
-            .replay_cache
-            .check_and_insert(&principal, &doc.id)
-            .is_err()
+        && let Err(e) = state.replay_cache.check(&principal, &doc.id)
     {
-        warn!(did = %principal, doc_id = %doc.id, %type_uri, "trust task refused: replay");
+        warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
+        let reason = match e {
+            did_hosting_common::server::replay::ReplayError::Duplicate => {
+                trust_tasks_rs::RejectReason::IdConflict
+            }
+            did_hosting_common::server::replay::ReplayError::Full => {
+                trust_tasks_rs::RejectReason::Unavailable { retry_after: None }
+            }
+        };
         return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-            doc.reject_with(
-                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                trust_tasks_rs::RejectReason::IdConflict,
-            ),
+            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
         ))));
     }
 
@@ -3737,6 +3834,120 @@ mod tests {
         assert!(err.get("proof").is_none());
     }
 
+    /// A queued op is settled only by its target's *signed* acknowledgement
+    /// of the exact document sent; an ack from another Service-role server
+    /// does not settle it.
+    #[tokio::test]
+    async fn an_outbox_entry_is_settled_by_its_targets_signed_ack() {
+        let (state, _dir) = signing_state().await;
+        let (edge, edge_key) = crate::signing::test_util::did_key_signer(&[81u8; 32]);
+        let (other, other_key) = crate::signing::test_util::did_key_signer(&[82u8; 32]);
+        seed_role(&state, &edge, Role::Service).await;
+        seed_role(&state, &other, Role::Service).await;
+        crate::outbox::enqueue(
+            &state.store,
+            &edge,
+            MSG_SYNC_UPDATE,
+            json!({"mnemonic": "alice"}),
+        )
+        .await
+        .unwrap();
+        let (key, entry) = crate::outbox::list_pending_for_target(&state.store, &edge)
+            .await
+            .unwrap()
+            .remove(0);
+        crate::outbox::record_sent(&state.store, key, &entry, "urn:uuid:sent-1")
+            .await
+            .unwrap();
+
+        let ack = |issuer: &str| {
+            let mut doc = request_doc(
+                MSG_SYNC_UPDATE_ACK,
+                Some(issuer),
+                json!({"mnemonic": "alice", "status": "applied"}),
+            );
+            doc["threadId"] = json!("urn:uuid:sent-1");
+            doc
+        };
+        // Unsigned, and signed by another server: nothing settled.
+        super::run_trust_tasks_envelope(&state, &edge, &envelope(ack(&edge)))
+            .await
+            .unwrap();
+        super::run_trust_tasks_envelope(
+            &state,
+            &other,
+            &envelope(sign(ack(&other), &other_key).await),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::outbox::list_pending_for_target(&state.store, &edge)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // The target's signed ack settles it.
+        super::run_trust_tasks_envelope(
+            &state,
+            &edge,
+            &envelope(sign(ack(&edge), &edge_key).await),
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::outbox::list_pending_for_target(&state.store, &edge)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Regression: a signer with no ACL entry is turned away before any
+    /// signature work, and leaves nothing in the replay cache.
+    #[tokio::test]
+    async fn an_unauthorised_signer_does_not_populate_the_replay_cache() {
+        let (state, _dir) = signing_state().await;
+        let (stranger, key) = crate::signing::test_util::did_key_signer(&[83u8; 32]);
+        let doc = sign(
+            request_doc(MSG_DID_REQUEST, Some(&stranger), json!({ "path": "alice" })),
+            &key,
+        )
+        .await;
+        for _ in 0..2 {
+            let reply = dispatch_envelope(&state, &stranger, doc.clone()).await;
+            assert_eq!(reply["payload"]["code"], "permissionDenied", "{reply}");
+        }
+        assert!(state.replay_cache.is_empty());
+    }
+
+    /// A decision with no recipient, or a stale one, resolves nothing, even
+    /// when validly signed by the addressed holder.
+    #[tokio::test]
+    async fn task_consent_decision_without_recipient_or_stale_is_refused() {
+        let control_did = "did:webvh:test:control.example.com";
+        let (state, _dir) = consent_state(control_did).await;
+        let (holder, key) = crate::signing::test_util::did_key_signer(&[91u8; 32]);
+        for mutate in [
+            |d: &mut Value| {
+                d.as_object_mut().unwrap().remove("recipient");
+            },
+            |d: &mut Value| d["issuedAt"] = json!("2020-01-01T00:00:00Z"),
+        ] {
+            let mut doc =
+                unsigned_decision(Some(&holder), control_did, "chal", "digest", "approve");
+            mutate(&mut doc);
+            let signed = crate::signing::sign_trust_task_document(doc, &key)
+                .await
+                .unwrap();
+            let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), signed);
+            let out = super::run_consent_decision(&state, &holder, &msg)
+                .await
+                .unwrap();
+            assert!(out.is_none(), "must be ignored");
+        }
+    }
+
     fn register_payload() -> Value {
         json!({
             "public_url": "https://edge.example",
@@ -3963,7 +4174,7 @@ mod tests {
             "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
             "type": TASK_CONSENT_DECISION_0_1.as_str(),
             "recipient": recipient,
-            "issuedAt": "2026-07-29T00:00:30Z",
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             "payload": {
                 "challenge": challenge,
                 "payloadDigest": digest,

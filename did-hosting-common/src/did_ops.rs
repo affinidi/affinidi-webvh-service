@@ -281,6 +281,33 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
 /// failures and a "proof verification failed: ..." prefix on the
 /// upstream verifier's report.
 pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
+    verify_did_log_chain(content, None).map(|_| ())
+}
+
+/// [`verify_did_log_proofs`] plus the DID's witness proofs.
+///
+/// For a hosting node that serves a log it did not author: when the log
+/// configures witnesses, the published witness proofs must be supplied and must
+/// meet the threshold — a witnessed DID is refused outright without them rather
+/// than served unwitnessed.
+pub fn verify_did_log_and_witness_proofs(
+    content: &str,
+    witness_content: Option<&str>,
+) -> Result<(), String> {
+    let witnessed = verify_did_log_chain(content, witness_content)?;
+    if witnessed && witness_content.is_none_or(|w| w.trim().is_empty()) {
+        return Err(
+            "the DID log configures witnesses but no witness proofs were supplied; refusing to \
+             serve it unwitnessed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Walk and validate the chain; returns whether the (current) parameters
+/// configure witnesses.
+fn verify_did_log_chain(content: &str, witness_content: Option<&str>) -> Result<bool, String> {
     // Re-run the structural parse so callers can use this function
     // as a single gate. Cheap relative to the proof-verification cost.
     validate_did_jsonl(content)?;
@@ -307,6 +334,12 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         });
     }
 
+    if let Some(raw) = witness_content.filter(|w| !w.trim().is_empty()) {
+        let proofs = DIDWebVHState::parse_witness_proofs(raw)
+            .map_err(|e| format!("invalid witness proofs: {e}"))?;
+        state.set_witness_proofs(proofs);
+    }
+
     let report = state
         .validate()
         .map_err(|e| format!("proof verification failed: {e}"))?;
@@ -317,7 +350,15 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         .assert_complete()
         .map_err(|e| format!("proof verification failed (chain incomplete): {e}"))?;
 
-    Ok(())
+    let witnessed = state.log_entries().last().is_some_and(|e| {
+        e.validated_parameters
+            .witness
+            .as_ref()
+            .and_then(|w| serde_json::to_value(w).ok())
+            .and_then(|v| v.get("threshold").and_then(|t| t.as_u64()))
+            .is_some_and(|t| t > 0)
+    });
+    Ok(witnessed)
 }
 
 /// Check that `next` is an acceptable successor of the `did.jsonl` a host

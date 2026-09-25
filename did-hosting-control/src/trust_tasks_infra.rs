@@ -170,18 +170,55 @@ async fn dispatch_inner(
         }
         uri @ (MSG_SYNC_UPDATE_ACK | MSG_SYNC_BATCH_ACK | MSG_SYNC_DELETE_ACK) => {
             crate::messaging::do_sync_ack(sender, uri, &doc.payload);
+            acknowledge_outbox(state, sender, &doc).await;
             None
         }
         uri @ (MSG_DOMAIN_ASSIGN_ACK | MSG_DOMAIN_UNASSIGN_ACK | MSG_DOMAIN_PURGE_ACK) => {
             crate::messaging::do_domain_ack(state, sender, uri, &doc.payload).await;
+            acknowledge_outbox(state, sender, &doc).await;
             None
         }
-        // Advisory: the upsert ack carries nothing the registry tracks.
-        MSG_DOMAIN_UPSERT_ACK => None,
+        // The upsert ack carries nothing the registry tracks; it only settles
+        // the outbox entry.
+        MSG_DOMAIN_UPSERT_ACK => {
+            acknowledge_outbox(state, sender, &doc).await;
+            None
+        }
         // `owns` gates this; a mismatch means the two drifted.
         other => {
             warn!(type_uri = other, "trust_tasks_infra: unowned type URI");
             None
         }
+    }
+}
+
+/// Settle the outbox entry an acknowledgement answers: the document it threads
+/// to, from the server that signed it. Only a Service-role signer settles
+/// anything — `sender` is the proven issuer.
+pub(crate) async fn acknowledge_outbox(
+    state: &AppState,
+    sender: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+) {
+    let thread = doc.thread_id.as_deref().or_else(|| {
+        doc.payload
+            .get("inResponseTo")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+    });
+    let Some(thread) = thread else {
+        return;
+    };
+    if !matches!(
+        crate::acl::check_acl(&state.acl_ks, sender).await,
+        Ok(crate::acl::Role::Service)
+    ) {
+        warn!(sender, "acknowledgement ignored: Service role required");
+        return;
+    }
+    match crate::outbox::acknowledge(&state.store, sender, thread).await {
+        Ok(true) => state.outbox_notify.notify_one(),
+        Ok(false) => tracing::debug!(sender, thread, "acknowledgement for no awaited entry"),
+        Err(e) => warn!(sender, error = %e, "failed to settle acknowledged outbox entry"),
     }
 }

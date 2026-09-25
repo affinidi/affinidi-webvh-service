@@ -324,9 +324,8 @@ mod tests {
             vta_sdk::tsp_binding::open_envelope(&bytes).expect("the reply is a binding envelope");
         let doc: Value = serde_json::from_slice(&document).expect("document is JSON");
         // And the dispatcher saw *our task*, not the envelope. The reply is a
-        // `proofRequired` rejection — the same outcome the bare-document test
-        // above gets, since neither supplies a proof under the default policy —
-        // but what matters is that it answers `acl/grant`. Before the fix the
+        // rejection — the sender has no ACL entry, so it is turned away before
+        // any proof work — but what matters is that it answers `acl/grant`. Before the fix the
         // envelope's own type URI was all the parser ever saw, so no reply
         // could name the task inside it.
         assert_eq!(
@@ -334,8 +333,8 @@ mod tests {
             "the reply answers the task the envelope carried: {doc}"
         );
         assert_eq!(
-            doc["payload"]["code"], "proofRequired",
-            "it reached proof checking, i.e. past parsing: {doc}"
+            doc["payload"]["code"], "permissionDenied",
+            "it reached the authorisation gate, i.e. past parsing: {doc}"
         );
     }
 

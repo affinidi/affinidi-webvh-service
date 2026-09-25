@@ -57,7 +57,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         features: FeaturesConfig::default(),
         server_did: Some("did:webvh:test:server.example.com".into()),
         mediator_did: None,
-        public_url: Some("http://localhost:8530".into()),
+        public_url: Some("http://did-webs-service:7676".into()),
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config.clone(),
@@ -349,6 +349,7 @@ async fn a_webs_did_syncs_from_the_control_plane_and_then_serves() {
         &state.store,
         &update,
         &state.did_cache,
+        state.config.public_url.as_deref(),
     )
     .await
     .expect("a verifying did:webs log must sync to an edge");
@@ -403,7 +404,59 @@ async fn an_edge_refuses_a_tampered_webs_log_from_the_control_plane() {
         &state.store,
         &update,
         &state.did_cache,
+        state.config.public_url.as_deref(),
     )
     .await
     .expect_err("an edge verifies the key event log itself, push or no push");
+}
+
+/// An edge refuses to rewind a held did:webs key event log — including after
+/// the slot was deleted, since its high-water mark survives the delete.
+#[tokio::test]
+async fn an_edge_refuses_to_rewind_a_webs_log_even_after_a_delete() {
+    let (state, _dir) = make_state().await;
+    let update = |log: &[u8]| did_hosting_common::DidSyncUpdate {
+        mnemonic: AID.to_string(),
+        did_id: did_id(),
+        log_content: String::from_utf8(log.to_vec()).unwrap(),
+        witness_content: None,
+        version_count: 1,
+    };
+    let apply = |u: did_hosting_common::DidSyncUpdate| {
+        let state = state.clone();
+        async move {
+            did_hosting_server::control_register::apply_single_update(
+                &state.dids_ks,
+                &state.store,
+                &u,
+                &state.did_cache,
+                state.config.public_url.as_deref(),
+            )
+            .await
+        }
+    };
+    apply(update(KERI)).await.expect("full log applies");
+
+    let second_event = KERI
+        .windows(4)
+        .skip(1)
+        .position(|w| w == br#"{"v""#)
+        .map(|p| p + 1)
+        .expect("stream has more than one message");
+    let truncated = &KERI[..second_event];
+    apply(update(truncated))
+        .await
+        .expect_err("a held log may not be rewound");
+
+    // Delete the slot's content, as `sync/delete` does; the high-water mark
+    // remains.
+    state
+        .dids_ks
+        .remove(did_hosting_common::did_ops::content_log_key(AID))
+        .await
+        .unwrap();
+    state.dids_ks.remove(did_key(AID)).await.unwrap();
+    apply(update(truncated))
+        .await
+        .expect_err("a deleted DID may not come back rewound");
 }

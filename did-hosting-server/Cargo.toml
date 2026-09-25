@@ -90,6 +90,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 didwebvh-rs = { workspace = true }
+url = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true, optional = true }
 hex = "0.4"

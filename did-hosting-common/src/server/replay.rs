@@ -1,35 +1,34 @@
 //! Anti-replay cache for inbound signed messages and Trust Task documents.
 //!
-//! Signed input is checked for freshness (`created_time` / `issuedAt` inside
+//! Signed input is checked for freshness (`issuedAt` inside
 //! [`FRESHNESS_WINDOW_SECS`](super::didcomm_unpack::FRESHNESS_WINDOW_SECS), at most
 //! [`FUTURE_SKEW_SECS`](super::didcomm_unpack::FUTURE_SKEW_SECS) ahead). That alone
 //! doesn't prevent replay: a captured signed document can be re-submitted
 //! within the window and still verify, re-triggering a state-changing
 //! operation (a DID delete, an owner change, an edge sync or domain purge).
 //!
-//! This module adds an in-memory `(signer, id)` cache keyed by
-//! `(String, String)`. Callers run `check_and_insert` after the signer has
-//! been verified but before dispatch; replays surface as
-//! `e.p.did.replay-detected`. TTL = [`REPLAY_WINDOW_SECS`], so any pair that
-//! the freshness gate would still accept is still in the cache.
+//! This module keeps an in-memory `(signer, id)` record for
+//! [`REPLAY_WINDOW_SECS`], so any pair the freshness gate would still accept
+//! is still remembered. Callers insert only after the signer has been
+//! authorised and verified, so an unauthenticated flood cannot occupy it.
 //!
-//! Lives in `did-hosting-common` because both the control plane and the edge
-//! servers gate their signed inbound traffic on it.
+//! # Bounds: refuse, never evict
 //!
-//! # Sizing
+//! Evicting old records to make room would let a flood push a genuine record
+//! out and then replay it. So at its bounds the cache **refuses** new records
+//! ([`ReplayError::Full`]) — the request is turned away as temporarily
+//! unavailable, and is safe to retry — rather than forgetting anything. Two
+//! bounds apply: a global one ([`MAX_ENTRIES`]) and one per signer
+//! ([`MAX_ENTRIES_PER_SIGNER`]), so one (authorised) signer cannot exhaust the
+//! space for everyone else.
 //!
-//! At 100 msg/s sustained throughput × 300 s window = ~30k entries.
-//! `MAX_ENTRIES` caps the map at 50k — when the cap is hit, the oldest
-//! 5% are evicted in one pass. That degrades us to "freshness-only"
-//! replay protection under flood (an attacker can force eviction and
-//! then replay); accept that — the alternative is unbounded memory
-//! growth, which is worse.
+//! Expiry is O(1) amortised: records are kept in insertion order (insert time
+//! is monotonic), so expired ones are popped from the front.
 //!
-//! Restart wipes the cache. The 5-minute TTL bounds the window in which
-//! a captured envelope captured pre-restart can be replayed post-
-//! restart; keeping the cache in memory only is intentional.
+//! Restart wipes the cache. The window bounds how long a document captured
+//! before a restart can be replayed after it; memory-only is intentional.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use super::auth::session::now_epoch;
@@ -37,27 +36,64 @@ use super::didcomm_unpack::REPLAY_WINDOW_SECS;
 
 use super::error::AppError;
 
-/// Hard cap on the number of `(sender, msg_id)` entries the cache
-/// retains. Once exceeded, the oldest 5% are dropped in one pass.
-/// Tuned for ~100 msg/s sustained throughput at the
-/// `REPLAY_WINDOW_SECS` TTL (~36k steady-state); the headroom
-/// covers brief throughput spikes without forcing eviction.
-const MAX_ENTRIES: usize = 50_000;
+/// Global cap on remembered `(signer, id)` pairs.
+pub const MAX_ENTRIES: usize = 50_000;
 
-/// Fraction of `MAX_ENTRIES` evicted when the cap is hit. 5% leaves
-/// the cache mostly full so the next eviction isn't far away (avoids
-/// the quadratic-ish cost of evicting one entry at a time on every
-/// subsequent insert under sustained pressure).
-const EVICT_FRACTION_NUMERATOR: usize = 5;
-const EVICT_FRACTION_DENOMINATOR: usize = 100;
+/// Cap on remembered pairs for any one signer.
+pub const MAX_ENTRIES_PER_SIGNER: usize = 5_000;
 
-/// `(sender_did, msg_id)` keys to insert-time epoch. The map is
-/// guarded by a single `Mutex` because all access is short and
-/// non-async. Lock contention scales with the inbound signed-message
-/// rate, which is per-process and bounded.
+/// Why a record was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The `(signer, id)` pair was already accepted inside the window.
+    Duplicate,
+    /// The cache is at a bound; the request is refused (retryable).
+    Full,
+}
+
+impl From<ReplayError> for AppError {
+    fn from(e: ReplayError) -> Self {
+        match e {
+            ReplayError::Duplicate => {
+                AppError::Validation("duplicate message id (replay-detected)".into())
+            }
+            ReplayError::Full => AppError::Internal(
+                "replay cache is full; refusing new signed requests until records expire".into(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    seen: HashMap<(String, String), u64>,
+    order: VecDeque<(u64, (String, String))>,
+    per_signer: HashMap<String, usize>,
+}
+
+impl Inner {
+    fn expire(&mut self, now: u64) {
+        while let Some((at, _)) = self.order.front() {
+            if now.saturating_sub(*at) <= REPLAY_WINDOW_SECS {
+                break;
+            }
+            let (_, key) = self.order.pop_front().expect("front exists");
+            self.seen.remove(&key);
+            if let Some(n) = self.per_signer.get_mut(&key.0) {
+                *n -= 1;
+                if *n == 0 {
+                    self.per_signer.remove(&key.0);
+                }
+            }
+        }
+    }
+}
+
+/// `(signer, id)` records with insert-time epochs. A single `Mutex`: every
+/// access is short and non-async.
 #[derive(Debug, Default)]
 pub struct ReplayCache {
-    entries: Mutex<HashMap<(String, String), u64>>,
+    inner: Mutex<Inner>,
 }
 
 impl ReplayCache {
@@ -65,70 +101,44 @@ impl ReplayCache {
         Self::default()
     }
 
-    /// Reject the message if `(sender, msg_id)` was seen within the
-    /// freshness window; otherwise record it.
-    ///
-    /// Returns `Err(AppError::Validation)` tagged so
-    /// `AppError::didcomm_code()` emits `e.p.did.replay-detected` (a new
-    /// code; mapped via the generic validation path, with a
-    /// distinguishable comment).
-    ///
-    /// The Mutex is held only for the lookup + maybe-prune + insert;
-    /// no awaits occur while it is held.
-    pub fn check_and_insert(&self, sender: &str, msg_id: &str) -> Result<(), AppError> {
-        let now = now_epoch();
-        let key = (sender.to_string(), msg_id.to_string());
+    /// Record `(signer, id)`, or refuse it as a replay or because the cache is
+    /// at a bound.
+    pub fn check(&self, signer: &str, id: &str) -> Result<(), ReplayError> {
+        self.check_at(signer, id, now_epoch())
+    }
 
-        let mut guard = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Replay check: the same (sender, msg_id) within the window?
-        if let Some(&seen_at) = guard.get(&key)
-            && now.saturating_sub(seen_at) <= REPLAY_WINDOW_SECS
+    fn check_at(&self, signer: &str, id: &str, now: u64) -> Result<(), ReplayError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.expire(now);
+        let key = (signer.to_string(), id.to_string());
+        if inner.seen.contains_key(&key) {
+            return Err(ReplayError::Duplicate);
+        }
+        if inner.seen.len() >= MAX_ENTRIES
+            || inner.per_signer.get(signer).copied().unwrap_or(0) >= MAX_ENTRIES_PER_SIGNER
         {
-            return Err(AppError::Validation(format!(
-                "duplicate message id from {} (replay-detected)",
-                sender
-            )));
+            return Err(ReplayError::Full);
         }
-
-        // Prune expired entries opportunistically. O(n) but bounded by
-        // MAX_ENTRIES; cheap relative to the cost of a real DIDComm
-        // request.
-        guard.retain(|_, &mut ts| now.saturating_sub(ts) <= REPLAY_WINDOW_SECS);
-
-        // If still at the cap (e.g. inbound rate is high enough that
-        // pruning didn't free anything), drop the oldest 5% to keep
-        // the map bounded. Under sustained flood this degrades to
-        // freshness-only protection — acceptable per the module doc.
-        if guard.len() >= MAX_ENTRIES {
-            let evict_count = MAX_ENTRIES * EVICT_FRACTION_NUMERATOR / EVICT_FRACTION_DENOMINATOR;
-            let mut by_age: Vec<((String, String), u64)> =
-                guard.iter().map(|(k, &v)| (k.clone(), v)).collect();
-            by_age.sort_by_key(|(_, ts)| *ts);
-            for (k, _) in by_age.into_iter().take(evict_count) {
-                guard.remove(&k);
-            }
-        }
-
-        guard.insert(key, now);
+        inner.seen.insert(key.clone(), now);
+        inner.order.push_back((now, key));
+        *inner.per_signer.entry(signer.to_string()).or_default() += 1;
         Ok(())
     }
 
-    /// Number of entries currently held. Test-only — production code
-    /// has no use for it.
-    #[cfg(test)]
+    /// [`Self::check`] with the error as an [`AppError`].
+    pub fn check_and_insert(&self, signer: &str, id: &str) -> Result<(), AppError> {
+        self.check(signer, id).map_err(AppError::from)
+    }
+
+    /// Number of records currently held.
     pub fn len(&self) -> usize {
-        self.entries
+        self.inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
+            .seen
             .len()
     }
 
-    /// Test-only companion to `len` — clippy demands it.
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -139,79 +149,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_insert_succeeds() {
+    fn first_insert_succeeds_and_duplicate_is_refused() {
         let cache = ReplayCache::new();
-        cache.check_and_insert("did:example:a", "msg-1").unwrap();
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_within_window_rejected() {
-        let cache = ReplayCache::new();
-        cache.check_and_insert("did:example:a", "msg-1").unwrap();
+        cache.check("did:example:a", "msg-1").unwrap();
+        assert_eq!(
+            cache.check("did:example:a", "msg-1"),
+            Err(ReplayError::Duplicate)
+        );
         let err = cache
             .check_and_insert("did:example:a", "msg-1")
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("replay-detected")));
     }
 
-    /// Distinct `(sender, msg_id)` pairs do not collide. Specifically:
-    /// same sender + different msg_id, and different sender + same
-    /// msg_id, both accepted. Pinning this prevents a regression where
-    /// one component accidentally becomes the sole cache key.
     #[test]
-    fn distinct_sender_or_msg_id_accepted() {
+    fn distinct_signer_or_id_accepted() {
         let cache = ReplayCache::new();
-        cache.check_and_insert("did:example:a", "msg-1").unwrap();
-        cache.check_and_insert("did:example:a", "msg-2").unwrap();
-        cache.check_and_insert("did:example:b", "msg-1").unwrap();
+        cache.check("did:example:a", "msg-1").unwrap();
+        cache.check("did:example:a", "msg-2").unwrap();
+        cache.check("did:example:b", "msg-1").unwrap();
         assert_eq!(cache.len(), 3);
     }
 
-    /// Manually inject an expired entry by predating its timestamp,
-    /// then assert that `check_and_insert` accepts a re-submission of
-    /// the same key. This pins the TTL gate without sleeping for 5
-    /// minutes in a unit test.
     #[test]
-    fn expired_entry_can_be_re_inserted() {
+    fn a_record_expires_after_the_window() {
         let cache = ReplayCache::new();
-        let key = ("did:example:a".to_string(), "msg-1".to_string());
-        // Pre-seed an entry that's older than the window.
-        {
-            let mut guard = cache.entries.lock().unwrap();
-            guard.insert(
-                key.clone(),
-                now_epoch().saturating_sub(REPLAY_WINDOW_SECS + 60),
-            );
-        }
-        // Now the same pair should be accepted (replayed past the window).
-        cache.check_and_insert(&key.0, &key.1).unwrap();
+        cache.check_at("did:example:a", "msg-1", 1_000).unwrap();
+        assert_eq!(
+            cache.check_at("did:example:a", "msg-1", 1_000 + REPLAY_WINDOW_SECS),
+            Err(ReplayError::Duplicate),
+            "still inside the window"
+        );
+        cache
+            .check_at("did:example:a", "msg-1", 1_001 + REPLAY_WINDOW_SECS)
+            .expect("expired, so accepted again");
+        assert_eq!(cache.len(), 1);
     }
 
-    /// Eviction kicks in when the cache hits MAX_ENTRIES. Pre-seeds
-    /// MAX_ENTRIES - 1 entries with current timestamps (so the prune
-    /// pass doesn't drop any), then inserts one more. The cap holds
-    /// because no expired entries exist; the EVICT_FRACTION pass
-    /// drops the oldest ~5% before the new one lands. Caps an
-    /// unbounded-memory footgun under sustained-novel-id flood.
+    /// At a bound the cache refuses rather than forgets: a remembered record is
+    /// never pushed out by new ones, so it can never be replayed.
     #[test]
-    fn flood_evicts_oldest_to_stay_under_cap() {
+    fn a_full_signer_is_refused_and_nothing_is_forgotten() {
         let cache = ReplayCache::new();
-        // Inject MAX_ENTRIES with strictly-monotonic timestamps so the
-        // sort order is deterministic.
-        {
-            let mut guard = cache.entries.lock().unwrap();
-            let base = now_epoch();
-            for i in 0..MAX_ENTRIES {
-                guard.insert((format!("did:flood:{i}"), "x".to_string()), base + i as u64);
-            }
+        for i in 0..MAX_ENTRIES_PER_SIGNER {
+            cache.check_at("did:flood", &i.to_string(), 1_000).unwrap();
         }
-        assert_eq!(cache.len(), MAX_ENTRIES);
+        assert_eq!(
+            cache.check_at("did:flood", "one-more", 1_000),
+            Err(ReplayError::Full)
+        );
+        assert_eq!(
+            cache.check_at("did:flood", "0", 1_000),
+            Err(ReplayError::Duplicate),
+            "the oldest record is still remembered"
+        );
+        // Another signer is unaffected by one signer's flood.
+        cache.check_at("did:other", "x", 1_000).unwrap();
+    }
 
-        // One more insert triggers the eviction branch.
-        cache.check_and_insert("did:flood:fresh", "x").unwrap();
-        let evict = MAX_ENTRIES * EVICT_FRACTION_NUMERATOR / EVICT_FRACTION_DENOMINATOR;
-        let expected_after = MAX_ENTRIES - evict + 1; // +1 = new insert
-        assert_eq!(cache.len(), expected_after);
+    #[test]
+    fn the_global_bound_refuses_new_records() {
+        let cache = ReplayCache::new();
+        for i in 0..MAX_ENTRIES {
+            let signer = format!("did:s{}", i % 100);
+            cache.check_at(&signer, &i.to_string(), 1_000).unwrap();
+        }
+        assert_eq!(
+            cache.check_at("did:fresh", "x", 1_000),
+            Err(ReplayError::Full)
+        );
     }
 }

@@ -3322,6 +3322,7 @@ dependencies = [
  "tracing-subscriber",
  "trust-tasks-didcomm",
  "trust-tasks-rs",
+ "url",
  "utoipa",
  "uuid",
  "vta-sdk",

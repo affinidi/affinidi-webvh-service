@@ -286,6 +286,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let storage_http = state.http_client.clone();
     let storage_control_url = state.config.control_url.clone();
     let storage_server_did = state.config.server_did.clone();
+    let storage_control_did = state.config.control_did.clone();
+    let storage_identity = state.identity.clone();
     let storage_stats_config = stats_config;
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
@@ -302,6 +304,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     http: storage_http,
                     control_url: storage_control_url,
                     server_did: storage_server_did,
+                    control_did: storage_control_did,
+                    identity: storage_identity,
                 },
                 &mut storage_shutdown,
             )
@@ -343,7 +347,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         let reg_state = state.clone();
         let reg_svc = svc.clone();
         tokio::spawn(async move {
-            control_register::register_via_didcomm(&reg_state, &reg_svc).await;
+            keep_registered(reg_state, reg_svc).await;
         });
     }
 
@@ -515,6 +519,34 @@ const SERVER_LISTENER_ID: &str = "server";
 /// [`DIDCommService::tsp_ensure_relationship`] is idempotent (it skips when the
 /// relationship already admits application messages), so re-running it every
 /// connect is cheap and a duplicate for the initial connect is harmless.
+/// How often an edge re-registers with its control plane even when nothing
+/// else prompts it. Registration reports the DIDs this edge holds, and the
+/// control plane answers with whatever it is missing or behind on (and deletes
+/// for what it should no longer serve) — so this bounds how long an edge can
+/// serve stale state after missing pushes.
+pub const RESYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Register with the control plane at startup, again on every mediator
+/// reconnect, and every [`RESYNC_INTERVAL`] — each registration is a delta
+/// re-sync request.
+async fn keep_registered(state: AppState, svc: DIDCommService) {
+    let mut events = svc.subscribe();
+    control_register::register_via_didcomm(&state, &svc).await;
+    let mut timer = tokio::time::interval(RESYNC_INTERVAL);
+    timer.tick().await; // the first tick is immediate; registration just ran
+    loop {
+        tokio::select! {
+            _ = timer.tick() => {}
+            event = events.recv() => match event {
+                Ok(ListenerEvent::Connected { listener_id }) if listener_id == SERVER_LISTENER_ID => {}
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        }
+        control_register::register_via_didcomm(&state, &svc).await;
+    }
+}
+
 async fn ensure_control_tsp_relationship(svc: DIDCommService, control_did: String) {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -757,6 +789,8 @@ struct StorageThreadParams {
     http: reqwest::Client,
     control_url: Option<String>,
     server_did: Option<String>,
+    control_did: Option<String>,
+    identity: Option<Arc<did_hosting_common::server::identity::ServiceIdentity>>,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
@@ -771,6 +805,8 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         http,
         control_url,
         server_did,
+        control_did,
+        identity,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -819,8 +855,10 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                     }
                 }
                 _ = sync_timer.tick(), if sync_enabled => {
-                    if let (Some(url), Some(did)) = (&control_url, &server_did) {
-                        stats::sync_to_control(&http, url, did, &collector).await;
+                    if let (Some(url), Some(did), Some(control), Some(identity)) =
+                        (&control_url, &server_did, &control_did, &identity)
+                    {
+                        stats::sync_to_control(&http, url, did, control, identity, &collector).await;
                     }
                 }
                 _ = shutdown_rx.changed() => {

@@ -91,6 +91,29 @@ async fn resolve_verifying_key(
         .await
         .map_err(|e| AppError::Authentication(format!("failed to resolve DID {base_did}: {e}")))?;
 
+    // Signing in is authentication, so the key must be one the DID lists under
+    // `authentication` — not merely any key in its document (an
+    // `assertionMethod` key is for attestations, a `keyAgreement` key for
+    // encryption).
+    let fragment = kid.find('#').map(|i| &kid[i..]);
+    let refers = |id: &str| id == kid || fragment.is_some_and(|f| id == f);
+    let listed = resolved.doc.authentication.iter().any(|r| {
+        match r {
+        affinidi_tdk::did_common::verification_method::VerificationRelationship::Reference(id) => {
+            refers(id)
+        }
+        affinidi_tdk::did_common::verification_method::VerificationRelationship::VerificationMethod(
+            m,
+        ) => refers(m.id.as_str()),
+        _ => false,
+    }
+    });
+    if !listed {
+        return Err(AppError::Authentication(format!(
+            "verification method {kid} is not an authentication key of {base_did}"
+        )));
+    }
+
     let vm = resolved.doc.get_verification_method(kid).ok_or_else(|| {
         AppError::Authentication(format!(
             "verification method {kid} not found in DID document"
@@ -711,5 +734,47 @@ mod tests {
         .await
         .expect("did:key resolver");
         assert!(verify_siop_id_token(&token, &resolver).await.is_err());
+    }
+
+    /// A signed sign-in or refresh must use a key the DID lists under
+    /// `authentication`; an `assertionMethod`-only key is refused.
+    #[tokio::test]
+    async fn sign_in_keys_must_be_authentication_keys() {
+        use affinidi_secrets_resolver::secrets::Secret;
+        let secret = Secret::generate_ed25519(None, Some(&[4u8; 32]));
+        let pk = secret.get_public_keymultibase().unwrap();
+        let mut resolver = DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .unwrap();
+        for (did, rel) in [
+            ("did:web:auth.example", "authentication"),
+            ("did:web:assert.example", "assertionMethod"),
+        ] {
+            let doc: affinidi_tdk::did_common::Document =
+                serde_json::from_value(serde_json::json!({
+                    "id": did,
+                    "verificationMethod": [{
+                        "id": format!("{did}#key-1"),
+                        "type": "Multikey",
+                        "controller": did,
+                        "publicKeyMultibase": pk,
+                    }],
+                    rel: [format!("{did}#key-1")],
+                }))
+                .unwrap();
+            resolver.add_did_document(did, doc).await;
+        }
+        resolve_verifying_key(&resolver, "did:web:auth.example#key-1")
+            .await
+            .expect("authentication key accepted");
+        let err = resolve_verifying_key(&resolver, "did:web:assert.example#key-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an authentication key"),
+            "{err}"
+        );
     }
 }

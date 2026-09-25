@@ -121,9 +121,16 @@ where
             );
             e.reject_reason()
         })?;
-    if REPLAY_CACHE.check_and_insert(&did, &doc.id).is_err() {
-        warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
-        return Err(RejectReason::IdConflict);
+    match REPLAY_CACHE.check(&did, &doc.id) {
+        Ok(()) => {}
+        Err(did_hosting_common::server::replay::ReplayError::Duplicate) => {
+            warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
+            return Err(RejectReason::IdConflict);
+        }
+        Err(did_hosting_common::server::replay::ReplayError::Full) => {
+            warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full");
+            return Err(RejectReason::Unavailable { retry_after: None });
+        }
     }
     let issued_at = doc
         .issued_at
@@ -201,21 +208,14 @@ fn error_value(err: trust_tasks_rs::ErrorResponse) -> trust_tasks_rs::TrustTask<
 /// Sign a reply document with this server's identity so the control plane can
 /// attribute it, returning it ready for the wire.
 ///
-/// Error documents go out unsigned: they are terminal on the control plane,
-/// which only logs them. A success reply this server cannot sign is dropped —
-/// the control plane refuses unsigned acks, so sending it would only log a
-/// refusal at the other end.
+/// Error documents are signed too: a signed, non-retryable refusal is what lets
+/// the control plane stop re-sending an op this server will never apply (an
+/// unsigned one settles nothing there). A reply this server cannot sign is
+/// dropped — the control plane refuses unsigned acks.
 pub async fn seal_reply(
     state: &AppState,
     reply: trust_tasks_rs::TrustTask<Value>,
 ) -> Option<Value> {
-    if reply
-        .type_uri
-        .to_string()
-        .starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX)
-    {
-        return serde_json::to_value(&reply).ok();
-    }
     let (Some(identity), Some(server_did)) = (
         state.identity.as_deref(),
         state.config.server_did.as_deref(),
@@ -471,9 +471,15 @@ async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String
         version_count,
     };
 
-    apply_single_update(&state.dids_ks, &state.store, &update, &state.did_cache)
-        .await
-        .map_err(|e| e.to_string())?;
+    apply_single_update(
+        &state.dids_ks,
+        &state.store,
+        &update,
+        &state.did_cache,
+        state.config.public_url.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     // Duplicate of the canonical info line in
     // `control_register::apply_single_update`; keep it at debug so each synced

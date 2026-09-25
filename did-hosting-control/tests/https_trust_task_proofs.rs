@@ -224,3 +224,56 @@ async fn https_reply_is_signed_by_the_control_plane() {
         .await
         .expect("HTTPS reply is signed by the control plane for the caller");
 }
+
+async fn post_stats(h: &TestServer, doc: &Value) -> StatusCode {
+    h.router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/control/stats")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(doc).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds")
+        .status()
+}
+
+/// HTTPS stats sync is a signed document from a Service-role server; there is
+/// no bearer token and nothing else is accepted.
+#[tokio::test]
+async fn https_stats_sync_requires_a_signed_document_from_a_service() {
+    let h = harness().await;
+    let (edge, _, key) = did_key_signer(33);
+    h.add_acl(&edge, Role::Service).await;
+    let stats = |issuer: &str| {
+        json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": "https://trusttasks.org/spec/did-management/server/stats-sync/0.1",
+            "issuer": issuer,
+            "recipient": CONTROL,
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": { "server_did": issuer, "seq": 1, "did_deltas": [] },
+        })
+    };
+
+    assert_eq!(
+        post_stats(&h, &stats(&edge)).await,
+        StatusCode::FORBIDDEN,
+        "unsigned"
+    );
+    assert_eq!(
+        post_stats(&h, &sign_as(stats(&edge), &key).await).await,
+        StatusCode::OK,
+        "signed by the Service"
+    );
+
+    let (owner, _, owner_key) = did_key_signer(34);
+    h.add_acl(&owner, Role::Owner).await;
+    assert_eq!(
+        post_stats(&h, &sign_as(stats(&owner), &owner_key).await).await,
+        StatusCode::FORBIDDEN,
+        "signed, but not a Service"
+    );
+}

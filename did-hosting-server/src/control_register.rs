@@ -272,9 +272,10 @@ pub async fn apply_did_updates(
     store: &Store,
     updates: &[DidSyncUpdate],
     did_cache: &crate::cache::ContentCache,
+    public_url: Option<&str>,
 ) {
     for update in updates {
-        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache).await {
+        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache, public_url).await {
             warn!(
                 mnemonic = %update.mnemonic,
                 error = %e,
@@ -284,40 +285,244 @@ pub async fn apply_did_updates(
     }
 }
 
-/// Verify a webvh sync update before it replaces anything: the chain is valid,
-/// it establishes the DID the push names, and it strictly extends the log this
-/// edge already holds for the slot.
-async fn verify_webvh_update(
-    dids_ks: &KeyspaceHandle,
-    update: &DidSyncUpdate,
-) -> Result<(), crate::error::AppError> {
-    use crate::error::AppError;
-    use did_hosting_common::did_ops::{extract_did_id, verify_did_log_proofs, verify_log_extends};
+/// What [`verify_update`] established about an update.
+struct VerifiedUpdate {
+    /// The DID's stable identity: the SCID for webvh, the identifier for webs.
+    identity: String,
+    #[cfg(feature = "method-webs")]
+    webs_document: Option<serde_json::Value>,
+}
 
-    verify_did_log_proofs(&update.log_content).map_err(AppError::Validation)?;
-    match extract_did_id(&update.log_content) {
-        Some(id) if id == update.did_id => {}
-        other => {
-            return Err(AppError::Validation(format!(
-                "sync update names {} but its log establishes {}",
-                update.did_id,
-                other.as_deref().unwrap_or("no DID")
-            )));
-        }
-    }
+/// The last DID a slot served. Kept after a delete (see `apply_single_update`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlotHighWater {
+    identity: String,
+    did_id: String,
+    method: String,
+}
+
+/// The high-water log key for a DID identity (SCID / webs identifier).
+fn high_water_identity_key(identity: &str) -> String {
+    format!("hw:id:{identity}")
+}
+
+/// The high-water record key for a slot.
+fn high_water_slot_key(mnemonic: &str) -> String {
+    format!("hw:slot:{mnemonic}")
+}
+
+/// Verify a sync update before it replaces anything:
+///
+/// 1. **Binding** — the identifier the push names is the one the log
+///    establishes, and it resolves at exactly this slot on a host this server
+///    serves (its public URL or an assigned domain). A valid log cannot be
+///    filed under another slot or served for another host.
+/// 2. **Chain** — webvh: every entry's hash, proof against the authorised
+///    `updateKeys`, pre-rotation and parameter transition, and the witness
+///    proofs when witnesses are configured; webs: the full key event log.
+/// 3. **History** — the log must strictly extend every history this edge has
+///    ever served for the same DID: the log it holds now, and the high-water
+///    log it kept for that DID's identity, which a delete does not clear. A
+///    rollback, a fork, a resurrected deactivation or a re-created DID that
+///    starts over are all refused. A slot that held a different DID may be
+///    re-used by a new one (a new DID is a new identity with its own history);
+///    a slot never changes method.
+async fn verify_update(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+    update: &DidSyncUpdate,
+    synced_method: &str,
+    public_url: Option<&str>,
+) -> Result<VerifiedUpdate, crate::error::AppError> {
+    use crate::error::AppError;
+    use did_hosting_common::did_ops::verify_log_extends;
+
+    verify_binding(store, update, synced_method, public_url).await?;
+
     let held = dids_ks
         .get_raw(content_log_key(&update.mnemonic))
         .await?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    verify_log_extends(held.as_deref(), &update.log_content).map_err(AppError::Validation)
+    let held_record: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await?;
+    let slot_mark: Option<SlotHighWater> =
+        dids_ks.get(high_water_slot_key(&update.mnemonic)).await?;
+    for method in held_record
+        .as_ref()
+        .map(|r| r.method.as_str())
+        .into_iter()
+        .chain(slot_mark.as_ref().map(|m| m.method.as_str()))
+    {
+        if method != synced_method {
+            return Err(AppError::Validation(format!(
+                "slot {} holds a {method} DID; refusing to replace it with a {synced_method} log",
+                update.mnemonic
+            )));
+        }
+    }
+
+    let identity = match synced_method {
+        "webvh" => {
+            did_hosting_common::did_ops::verify_did_log_and_witness_proofs(
+                &update.log_content,
+                update.witness_content.as_deref(),
+            )
+            .map_err(AppError::Validation)?;
+            webvh_scid(&update.did_id).ok_or_else(|| {
+                AppError::Validation(format!("{} is not a did:webvh identifier", update.did_id))
+            })?
+        }
+        _ => update.did_id.clone(),
+    };
+
+    #[cfg(feature = "method-webs")]
+    let webs_document = if synced_method == "webs" {
+        let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
+            &update.did_id,
+            update.log_content.as_bytes(),
+            None,
+        )
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&derived)
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(feature = "method-webs"))]
+    if synced_method != "webvh" {
+        return Err(AppError::Validation(format!(
+            "this server cannot verify {synced_method} logs"
+        )));
+    }
+
+    // Every history of this same DID the edge has served.
+    let high_water = dids_ks
+        .get_raw(high_water_identity_key(&identity))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let held_identity = held_record
+        .as_ref()
+        .and_then(|r| r.did_id.as_deref())
+        .map(|id| match synced_method {
+            "webvh" => webvh_scid(id).unwrap_or_default(),
+            _ => id.to_string(),
+        });
+    let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
+    for previous in [same_did_held, high_water].into_iter().flatten() {
+        match synced_method {
+            "webvh" => verify_log_extends(Some(&previous), &update.log_content)
+                .map_err(AppError::Validation)?,
+            #[cfg(feature = "method-webs")]
+            _ => did_hosting_common::method::webs::Webs::verify_continuation(
+                &update.did_id,
+                previous.as_bytes(),
+                update.log_content.as_bytes(),
+            )
+            .map_err(|e| AppError::Validation(e.to_string()))?,
+            #[cfg(not(feature = "method-webs"))]
+            _ => unreachable!("refused above"),
+        }
+    }
+
+    Ok(VerifiedUpdate {
+        identity,
+        #[cfg(feature = "method-webs")]
+        webs_document,
+    })
+}
+
+/// The SCID of a `did:webvh:{scid}:…` identifier.
+fn webvh_scid(did_id: &str) -> Option<String> {
+    did_id
+        .strip_prefix("did:webvh:")?
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Step 1 of [`verify_update`]: the identifier is the log's, and it resolves
+/// at this slot on a host this server serves.
+async fn verify_binding(
+    store: &Store,
+    update: &DidSyncUpdate,
+    synced_method: &str,
+    public_url: Option<&str>,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+
+    if synced_method == "webvh" {
+        match did_hosting_common::did_ops::extract_did_id(&update.log_content) {
+            Some(id) if id == update.did_id => {}
+            other => {
+                return Err(AppError::Validation(format!(
+                    "sync update names {} but its log establishes {}",
+                    update.did_id,
+                    other.as_deref().unwrap_or("no DID")
+                )));
+            }
+        }
+    }
+
+    // The hosts this server serves: its public URL and each assigned domain.
+    let mut bases: Vec<String> = public_url.map(str::to_string).into_iter().collect();
+    for entry in did_hosting_common::server::assignment::list(store).await? {
+        let host = entry.domain.split('/').next().unwrap_or(&entry.domain);
+        bases.push(format!("https://{host}"));
+        bases.push(format!("https://{}", entry.domain));
+    }
+    if bases.is_empty() {
+        return Err(AppError::Validation(
+            "this server has no public URL or assigned domain to bind synced DIDs to".into(),
+        ));
+    }
+
+    let bound = match synced_method {
+        "webvh" => bases.iter().any(|base| {
+            did_hosting_common::did_ops::validate_did_id_matches_request(
+                &update.did_id,
+                &update.mnemonic,
+                base,
+            )
+            .is_ok()
+        }),
+        // did:webs:{host}:{path…}:{aid} — the slot is the path including the
+        // AID, so the identifier must end in exactly that.
+        _ => {
+            let host = extract_did_host(&update.did_id).unwrap_or_default();
+            let suffix = format!(":{}", update.mnemonic.replace('/', ":"));
+            update.did_id.ends_with(&suffix)
+                && bases.iter().any(|base| {
+                    url::Url::parse(base).ok().is_some_and(|u| {
+                        let authority = match u.port() {
+                            Some(p) => format!("{}:{p}", u.host_str().unwrap_or_default()),
+                            None => u.host_str().unwrap_or_default().to_string(),
+                        };
+                        authority == host
+                    })
+                })
+        }
+    };
+    if !bound {
+        return Err(AppError::Validation(format!(
+            "{} does not resolve at slot {} on a host this server serves",
+            update.did_id, update.mnemonic
+        )));
+    }
+    Ok(())
 }
 
 /// Apply a single DID sync update atomically.
+///
+/// `public_url` is this server's configured public URL, one of the bases a
+/// synced DID's identifier may be hosted under (with each assigned domain).
 pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     update: &DidSyncUpdate,
     did_cache: &crate::cache::ContentCache,
+    public_url: Option<&str>,
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
@@ -338,41 +543,14 @@ pub async fn apply_single_update(
     let synced_method =
         did_hosting_common::method::detect_method(update.log_content.as_bytes()).unwrap_or("webvh");
 
-    // Per-method verification. The edge verifies what it is asked to serve
-    // itself, rather than trusting the control plane to have done so: a
-    // compromised or buggy control plane must not be able to make an edge serve
-    // a log the DID's own keys never authorised.
-    //
-    // - webvh: the full chain — entry hashes, each entry's proof against the
-    //   authorised `updateKeys`, pre-rotation commitments, parameter
-    //   transitions (`verify_did_log_proofs`) — and then the history check
-    //   against the log already held (`verify_log_extends`): only a strict
-    //   extension is accepted, never a rollback to a version from before a key
-    //   rotation, and never anything after a deactivation.
-    // - did:webs: the full key-event-log verification.
-    //
-    // The identifier the push names must be the one the log establishes, so a
-    // valid log cannot be filed under another DID's slot.
+    // The edge verifies what it is asked to serve itself, rather than trusting
+    // the control plane to have done so: a compromised or buggy control plane
+    // must not be able to make an edge serve a log the DID's own keys never
+    // authorised, an old version of one, or one filed under another slot.
+    // See `verify_update` for the full list.
+    let verified = verify_update(dids_ks, store, update, synced_method, public_url).await?;
     #[cfg(feature = "method-webs")]
-    let webs_document = if synced_method == "webs" {
-        let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
-            &update.did_id,
-            update.log_content.as_bytes(),
-            None,
-        )
-        .map_err(|e| crate::error::AppError::Validation(e.to_string()))?;
-        Some(
-            serde_json::from_slice::<serde_json::Value>(&derived)
-                .map_err(|e| crate::error::AppError::Internal(e.to_string()))?,
-        )
-    } else {
-        verify_webvh_update(dids_ks, update).await?;
-        None
-    };
-    #[cfg(not(feature = "method-webs"))]
-    {
-        verify_webvh_update(dids_ks, update).await?;
-    }
+    let webs_document = verified.webs_document;
 
     // Services and agent names both come from the current DID document,
     // wherever this method keeps it — the last log entry's `state` for
@@ -491,6 +669,23 @@ pub async fn apply_single_update(
             witness.as_bytes().to_vec(),
         );
     }
+    // High-water marks: the furthest history this edge has served for this DID
+    // and for this slot. Never removed — not by `sync/delete`, not by a domain
+    // purge — so a delete followed by a re-sync cannot roll either back.
+    batch.insert_raw(
+        dids_ks,
+        high_water_identity_key(&verified.identity),
+        update.log_content.as_bytes().to_vec(),
+    );
+    batch.insert(
+        dids_ks,
+        high_water_slot_key(&update.mnemonic),
+        &SlotHighWater {
+            identity: verified.identity.clone(),
+            did_id: update.did_id.clone(),
+            method: synced_method.to_string(),
+        },
+    )?;
     batch.commit().await?;
 
     did_cache.invalidate(&content_log_key(&update.mnemonic));

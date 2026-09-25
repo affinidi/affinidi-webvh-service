@@ -69,6 +69,9 @@ pub fn sync_all_dids_to_server(
 
         let mut count = 0u64; // DIDs queued
         let mut frames = 0u64; // outbox rows (transport frames) enqueued
+        // Mnemonics this control plane publishes; whatever the server reports
+        // beyond these it should no longer serve (a delete it missed).
+        let mut published: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         let mut pending_bytes = 0usize;
 
@@ -81,6 +84,7 @@ pub fn sync_all_dids_to_server(
             if record.version_count == 0 {
                 continue;
             }
+            published.insert(record.mnemonic.clone());
 
             // Delta: the registering server already has this DID at this
             // version or newer — nothing to push.
@@ -162,6 +166,28 @@ pub fn sync_all_dids_to_server(
             } else {
                 frames += 1;
             }
+        }
+
+        // Deletes the server missed: it reports a DID this control plane no
+        // longer publishes. Queued after the updates, in order.
+        let mut deletes = 0u64;
+        for mnemonic in reported.keys().filter(|m| !published.contains(*m)) {
+            if let Err(e) = crate::outbox::enqueue(
+                &store,
+                &server_did,
+                MSG_SYNC_DELETE,
+                json!({ "mnemonic": mnemonic }),
+            )
+            .await
+            {
+                warn!(server_did = %server_did, %mnemonic, error = %e, "resync: delete enqueue failed");
+            } else {
+                deletes += 1;
+            }
+        }
+        if deletes > 0 {
+            notify.notify_one();
+            info!(server_did = %server_did, deletes, "resync: queued deletes the server missed");
         }
 
         if count > 0 {
@@ -433,6 +459,27 @@ pub async fn send_domain_upsert(
     })?;
     crate::outbox::enqueue_and_notify(state, target_did, MSG_DOMAIN_UPSERT, body).await?;
     Ok(())
+}
+
+/// Replicate every control-side `DomainEntry` to one server — run on each
+/// (re-)registration so a server that missed upserts while unreachable
+/// converges on the control plane's domain records and statuses.
+pub fn sync_all_domains_to_server(state: &AppState, server_did: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let domains = match did_hosting_common::server::domain::list_domains(&state.store).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(server_did = %server_did, error = %e, "domain resync: list failed");
+                return;
+            }
+        };
+        for entry in &domains {
+            if let Err(e) = send_domain_upsert(&state, &server_did, entry).await {
+                warn!(server_did = %server_did, domain = %entry.name, error = %e, "domain resync: enqueue failed");
+            }
+        }
+    });
 }
 
 /// Fan an upsert out to every registered server. Used after every

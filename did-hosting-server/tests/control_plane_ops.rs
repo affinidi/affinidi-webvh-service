@@ -67,7 +67,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         },
         server_did: Some(SERVER_DID.into()),
         mediator_did: None,
-        public_url: Some("http://localhost:8530".into()),
+        public_url: Some("https://server.example.com".into()),
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config,
@@ -633,4 +633,171 @@ async fn acks_are_signed_by_the_edge() {
     verify_sender_bound(&sealed, Some(&edge), None, &control_did, &verifier())
         .await
         .expect("the ack is signed by the edge for the control plane");
+}
+
+/// Delete, then re-sync an older version of the same DID: refused. The edge's
+/// high-water mark for the DID survives the delete, so a re-created DID must
+/// extend everything it ever served.
+#[tokio::test]
+async fn a_rollback_through_delete_and_resync_is_refused() {
+    let (state, _dir) = make_state().await;
+    let (mut webvh, key) = new_log("alice").await;
+    let v1 = jsonl(&webvh);
+    let id = did_id(&v1);
+    append(&mut webvh, &key, 1).await;
+    let v2 = jsonl(&webvh);
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    let del = apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({"mnemonic": "alice"})).await,
+    )
+    .await;
+    assert!(!is_error(&del), "{del:?}");
+
+    let back = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v1)).await,
+    )
+    .await;
+    assert!(
+        is_error(&back),
+        "a pre-rotation log must not come back: {back:?}"
+    );
+    assert!(
+        stored(&state, "alice").await.is_none(),
+        "nothing re-created"
+    );
+
+    // Re-creating it at (or beyond) the high-water mark is fine.
+    let again = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    assert!(!is_error(&again), "{again:?}");
+}
+
+/// Delete a deactivated DID, then re-sync its pre-deactivation history:
+/// refused. A deactivated DID stays deactivated.
+#[tokio::test]
+async fn a_deactivated_did_cannot_be_resurrected_through_delete() {
+    let (state, _dir) = make_state().await;
+    let (mut webvh, key) = new_log("alice").await;
+    let id = did_id(&jsonl(&webvh));
+    append(&mut webvh, &key, 1).await;
+    let v2 = jsonl(&webvh);
+    webvh.deactivate(&key).await.expect("deactivate");
+    let deactivated = jsonl(&webvh);
+    apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &id, &deactivated),
+        )
+        .await,
+    )
+    .await;
+    apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({"mnemonic": "alice"})).await,
+    )
+    .await;
+
+    let back = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    assert!(is_error(&back), "{back:?}");
+    assert!(stored(&state, "alice").await.is_none());
+}
+
+/// A valid log cannot be filed under a slot it does not resolve at.
+#[tokio::test]
+async fn a_valid_log_filed_under_another_slot_is_refused() {
+    let (state, _dir) = make_state().await;
+    let (alice_id, alice_log) = valid_did_log("alice").await;
+    let r = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("bob", &alice_id, &alice_log),
+        )
+        .await,
+    )
+    .await;
+    assert!(is_error(&r), "{r:?}");
+    assert!(stored(&state, "bob").await.is_none());
+}
+
+/// ...nor for a host this server does not serve.
+#[tokio::test]
+async fn a_log_for_a_host_this_server_does_not_serve_is_refused() {
+    let (mut state, _dir) = make_state().await;
+    let mut cfg = (*state.config).clone();
+    cfg.public_url = Some("https://other-host.example".into());
+    state.config = Arc::new(cfg);
+    let (id, log) = valid_did_log("alice").await;
+    let r = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &log)).await,
+    )
+    .await;
+    assert!(is_error(&r), "{r:?}");
+}
+
+/// A different DID may take over a slot whose DID was deleted — it is a new
+/// identity with its own history — but the old DID still cannot come back
+/// rolled back.
+#[tokio::test]
+async fn a_new_did_may_reuse_a_deleted_slot() {
+    let (state, _dir) = make_state().await;
+    let (id, log) = valid_did_log("alice").await;
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &log)).await,
+    )
+    .await;
+    apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({"mnemonic": "alice"})).await,
+    )
+    .await;
+
+    // A different key → a different SCID at the same slot.
+    let secret = Secret::generate_ed25519(None, Some(&[8u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "server.example.com",
+        "alice",
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let mut other = didwebvh_rs::DIDWebVHState::default();
+    other
+        .create_log_entry(Some(hours_ago(2)), &doc, &params(&signing), &signing)
+        .await
+        .unwrap();
+    let other_log = jsonl(&other);
+    let other_id = did_id(&other_log);
+    assert_ne!(other_id, id);
+    let r = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &other_id, &other_log),
+        )
+        .await,
+    )
+    .await;
+    assert!(!is_error(&r), "{r:?}");
 }

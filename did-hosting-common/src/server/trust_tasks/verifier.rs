@@ -57,6 +57,11 @@
 //! under the signer's `authentication` relationship. `assertionMethod` is
 //! reserved for attestation artefacts (credentials) and is refused here.
 //!
+//! ## Deactivated signers
+//!
+//! A `did:webvh` signer whose DID is deactivated is refused on the operational
+//! path, whatever its last document lists (see `DeactivationCache`).
+//!
 //! ## Key rotation and the DID cache
 //!
 //! Keys are resolved through the DID cache, whose TTL is bounded
@@ -122,10 +127,12 @@ impl RefreshLimiter {
     }
 }
 
-/// Evicts a DID from the shared DID cache, rate-limited per DID.
+/// Evicts a DID from the shared DID cache (and its deactivation verdict),
+/// rate-limited per DID.
 struct CacheRefresher {
     client: DIDCacheClient,
     limiter: RefreshLimiter,
+    deactivation: Arc<DeactivationCache>,
 }
 
 #[async_trait]
@@ -135,7 +142,56 @@ impl StaleKeyRefresh for CacheRefresher {
             return false;
         }
         self.client.remove(did).await;
+        self.deactivation.forget(did);
         true
+    }
+}
+
+/// Whether a `did:webvh` signer has deactivated its DID, remembered for the
+/// DID cache TTL.
+///
+/// The DID cache keeps only the document and drops resolution metadata, and a
+/// deactivated webvh DID still resolves to its last document — keys included.
+/// So deactivation is read from the DID's own log (`didwebvh-rs` resolution
+/// metadata). A DID whose deactivation cannot be established is refused: an
+/// unreadable log proves nothing about the key.
+#[derive(Default)]
+struct DeactivationCache {
+    verdicts: Mutex<HashMap<String, (Instant, bool)>>,
+}
+
+impl DeactivationCache {
+    fn forget(&self, did: &str) {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(did);
+    }
+
+    async fn is_deactivated(&self, did: &str) -> Result<bool, DataIntegrityError> {
+        let ttl = Duration::from_secs(u64::from(crate::server::identity::DID_CACHE_TTL_SECS));
+        if let Some((at, verdict)) = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(did)
+            && at.elapsed() < ttl
+        {
+            return Ok(*verdict);
+        }
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        let deactivated = state
+            .resolve(did, Default::default())
+            .await
+            .map(|(_, meta)| meta.deactivated)
+            .map_err(|e| {
+                DataIntegrityError::Resolver(format!("cannot establish status of {did}: {e}"))
+            })?;
+        self.verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(did.to_string(), (Instant::now(), deactivated));
+        Ok(deactivated)
     }
 }
 
@@ -144,6 +200,8 @@ impl StaleKeyRefresh for CacheRefresher {
 struct AuthenticationKeyResolver {
     client: DIDCacheClient,
     decode: trust_tasks_proof::affinidi::CachedDidResolver,
+    /// `None` only in tests that resolve from documents placed in the cache.
+    deactivation: Option<Arc<DeactivationCache>>,
 }
 
 #[async_trait]
@@ -167,6 +225,15 @@ impl VerificationMethodResolver for AuthenticationKeyResolver {
         if !listed {
             return Err(DataIntegrityError::Resolver(format!(
                 "verificationMethod {vm} is not an authentication key of {did}"
+            )));
+        }
+        // A deactivated DID's keys sign nothing.
+        if did.starts_with("did:webvh:")
+            && let Some(deactivation) = &self.deactivation
+            && deactivation.is_deactivated(did).await?
+        {
+            return Err(DataIntegrityError::Resolver(format!(
+                "{did} is deactivated; its keys are no longer valid"
             )));
         }
         self.decode.resolve_vm(vm).await
@@ -205,15 +272,18 @@ impl TransportBoundVerifier {
     /// cached document is retried once against a fresh one.
     pub fn with_did_cache(client: DIDCacheClient) -> Self {
         let decode = trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client.clone()));
+        let deactivation = Arc::new(DeactivationCache::default());
         Self {
             resolver: Arc::new(decode.clone()),
             authentication_resolver: Arc::new(AuthenticationKeyResolver {
                 client: client.clone(),
                 decode,
+                deactivation: Some(deactivation.clone()),
             }),
             refresher: Some(Arc::new(CacheRefresher {
                 client,
                 limiter: RefreshLimiter::default(),
+                deactivation,
             })),
             options: VerifyOptions::default(),
             delegate: None,
@@ -764,6 +834,7 @@ mod tests {
         let resolver = AuthenticationKeyResolver {
             client: client.clone(),
             decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+            deactivation: None,
         };
         resolver
             .resolve_vm("did:web:auth.example#key-1")
@@ -777,6 +848,55 @@ mod tests {
             err.to_string().contains("not an authentication key"),
             "{err}"
         );
+    }
+
+    /// A deactivated `did:webvh` signer is refused even though its last
+    /// document still lists the key.
+    #[tokio::test]
+    async fn a_deactivated_webvh_signer_is_refused() {
+        use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
+
+        let secret = Secret::generate_ed25519(None, Some(&[6u8; 32]));
+        let pk = secret.get_public_keymultibase().unwrap();
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let live = "did:webvh:QmLive:live.example";
+        let dead = "did:webvh:QmDead:dead.example";
+        for did in [live, dead] {
+            let doc: affinidi_tdk::did_common::Document = serde_json::from_value(json!({
+                "id": did,
+                "verificationMethod": [{
+                    "id": format!("{did}#key-1"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": pk,
+                }],
+                "authentication": [format!("{did}#key-1")],
+            }))
+            .unwrap();
+            client.add_did_document(did, doc).await;
+        }
+        let deactivation = Arc::new(DeactivationCache::default());
+        {
+            let mut v = deactivation.verdicts.lock().unwrap();
+            v.insert(live.into(), (Instant::now(), false));
+            v.insert(dead.into(), (Instant::now(), true));
+        }
+        let resolver = AuthenticationKeyResolver {
+            client: client.clone(),
+            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+            deactivation: Some(deactivation),
+        };
+        resolver
+            .resolve_vm(&format!("{live}#key-1"))
+            .await
+            .expect("a live signer resolves");
+        let err = resolver
+            .resolve_vm(&format!("{dead}#key-1"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deactivated"), "{err}");
     }
 
     // ─── Cross-language interop with the JS wallet ───

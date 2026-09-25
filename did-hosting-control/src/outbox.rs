@@ -5,18 +5,27 @@
 //! `sync-delete`) is persisted to `KS_OUTBOUND_QUEUE` before any
 //! delivery attempt. The [`run_outbox_loop`] worker drains the queue
 //! in per-target FIFO order, retries transient failures with
-//! exponential backoff, and only removes an entry once the
-//! recipient's mediator has accepted it.
+//! exponential backoff, and only removes an entry once the **recipient
+//! itself** has acknowledged it: a signed `#response` from the target
+//! server's DID for the exact document sent ([`acknowledge`]). A mediator
+//! accepting the frame is not delivery — an edge that is offline longer than
+//! the freshness window would otherwise lose every queued op for good.
+//!
+//! Each (re)send is a freshly signed document with a new id, so a retry is
+//! never refused as stale or as a replay. If no ack arrives within
+//! [`ACK_TIMEOUT_SECS`] the entry is sent again.
 //!
 //! ## Guarantees
 //!
-//! - **At-least-once delivery.** A control crash mid-send keeps the
-//!   entry; the next tick (or post-restart boot) retries. Recipients
+//! - **At-least-once delivery.** An entry stays until the target acks it;
+//!   a control crash, a lost frame or an offline edge all end in a retry. Recipients
 //!   MUST be idempotent — the existing `handle_domain_*` /
 //!   `handle_sync_*` handlers already are.
 //! - **Per-target FIFO.** Entries for the same `target_did` are
-//!   processed in enqueue order. A failing entry blocks subsequent
-//!   entries for that target (head-of-line) until it succeeds, is
+//!   processed in enqueue order, one in flight at a time. A failing or
+//!   unacknowledged entry blocks subsequent entries for that target
+//!   (head-of-line) until it is acknowledged, is refused by the target (a
+//!   signed terminal error, [`acknowledge`]), is
 //!   dropped via [`MAX_ATTEMPTS`], or ages out via [`MAX_AGE_SECS`].
 //! - **Restart-safe.** Queue state lives in fjall — survives control-
 //!   plane restarts. The worker resumes on boot.
@@ -96,6 +105,33 @@ pub struct OutboxEntry {
     /// Last error string, for operator-visible diagnostics. Truncated
     /// to ~200 chars to keep keyspace rows small.
     pub last_error: Option<String>,
+    /// The id of the signed document last sent for this entry, while its
+    /// acknowledgement is awaited. `None` when not yet sent (or the last send
+    /// failed).
+    #[serde(default)]
+    pub awaiting_ack: Option<String>,
+}
+
+/// How long the worker waits for a target's signed acknowledgement before
+/// sending the entry again.
+pub const ACK_TIMEOUT_SECS: u64 = 60;
+
+/// What the worker should do with the entry at the head of a target's queue.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadAction {
+    /// Send (or re-send) it now.
+    Send,
+    /// Leave it: an ack is awaited, or a backoff is running.
+    Wait,
+}
+
+/// Decide what to do with a head entry at `now`.
+pub fn head_action(entry: &OutboxEntry, now: u64) -> HeadAction {
+    if entry.next_attempt_at > now {
+        HeadAction::Wait
+    } else {
+        HeadAction::Send
+    }
 }
 
 fn outbox_ks(store: &Store) -> Result<KeyspaceHandle, AppError> {
@@ -154,6 +190,7 @@ pub async fn enqueue(
         attempts: 0,
         next_attempt_at: now,
         last_error: None,
+        awaiting_ack: None,
     };
     let uuid_short = uuid::Uuid::new_v4().simple().to_string();
     let key = outbox_key(target_did, now_micros(), &uuid_short[..12]);
@@ -246,9 +283,43 @@ pub async fn record_failure(
         attempts: entry.attempts.saturating_add(1),
         last_error: Some(truncated(err)),
         next_attempt_at: now_epoch().saturating_add(compute_backoff(entry.attempts + 1)),
+        awaiting_ack: None,
         ..entry.clone()
     };
     outbox_ks(store)?.insert(key, &next).await
+}
+
+/// Record that the entry was handed to the transport as document `doc_id`;
+/// it now waits up to [`ACK_TIMEOUT_SECS`] for the target's ack.
+pub async fn record_sent(
+    store: &Store,
+    key: Vec<u8>,
+    entry: &OutboxEntry,
+    doc_id: &str,
+) -> Result<(), AppError> {
+    let next = OutboxEntry {
+        attempts: entry.attempts.saturating_add(1),
+        next_attempt_at: now_epoch().saturating_add(ACK_TIMEOUT_SECS),
+        awaiting_ack: Some(doc_id.to_string()),
+        ..entry.clone()
+    };
+    outbox_ks(store)?.insert(key, &next).await
+}
+
+/// The target `signer` acknowledged (or terminally refused) document `doc_id`:
+/// remove the entry awaiting it. Returns whether one was found.
+///
+/// `signer` must be the proven issuer of the acknowledgement — an entry is
+/// only ever removed on its own target's signature, so no other party can make
+/// the control plane forget an op it has not delivered.
+pub async fn acknowledge(store: &Store, signer: &str, doc_id: &str) -> Result<bool, AppError> {
+    for (key, entry) in list_pending_for_target(store, signer).await? {
+        if entry.awaiting_ack.as_deref() == Some(doc_id) {
+            remove(store, key).await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The signed Trust Task document an outbox entry is delivered as.
@@ -292,7 +363,7 @@ async fn deliver(
     signer: &Secret,
     fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let doc = signed_document(control_did, entry, signer).await?;
     send_trust_task(
         didcomm,
@@ -304,12 +375,13 @@ async fn deliver(
         did_resolver,
     )
     .await
-    .map(|_| ())
+    .map(|_| doc.id.clone())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
-    pub delivered: u64,
+    /// Entries handed to the transport this tick (awaiting their ack).
+    pub sent: u64,
     pub deferred: u64,
     pub dropped: u64,
 }
@@ -385,11 +457,18 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                 report.dropped += 1;
                 continue;
             }
-            if entry.next_attempt_at > now {
-                // Head-of-line is still backing off — stop processing
-                // this target's chain so we preserve order.
+            if head_action(&entry, now) == HeadAction::Wait {
+                // Head-of-line is backing off or awaiting its ack — stop
+                // processing this target's chain so we preserve order.
                 report.deferred += 1;
                 break;
+            }
+            if entry.awaiting_ack.is_some() {
+                debug!(
+                    target_did = %target,
+                    msg_type = %entry.msg_type,
+                    "outbox: no acknowledgement within the timeout; re-sending"
+                );
             }
 
             match deliver(
@@ -402,15 +481,18 @@ pub async fn run_tick(state: &AppState) -> TickReport {
             )
             .await
             {
-                Ok(()) => {
-                    info!(
+                Ok(doc_id) => {
+                    // Handed to the transport, not delivered: the entry stays
+                    // until the target acknowledges this document.
+                    debug!(
                         target_did = %target,
                         msg_type = %entry.msg_type,
                         attempts = entry.attempts + 1,
-                        "outbox: delivered"
+                        %doc_id,
+                        "outbox: sent; awaiting acknowledgement"
                     );
-                    let _ = remove(&state.store, key).await;
-                    report.delivered += 1;
+                    let _ = record_sent(&state.store, key, &entry, &doc_id).await;
+                    report.sent += 1;
                 }
                 Err(e) => {
                     let err_str = e.to_string();
@@ -423,12 +505,11 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                     );
                     let _ = record_failure(&state.store, key, &entry, &err_str).await;
                     report.deferred += 1;
-                    // Preserve per-target ordering on transient
-                    // failure: don't try later entries until the head
-                    // succeeds (or ages out).
-                    break;
                 }
             }
+            // One in flight per target: the next entry goes once this one is
+            // acknowledged (`acknowledge` wakes the worker).
+            break;
         }
     }
     report
@@ -449,13 +530,13 @@ pub async fn run_outbox_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let report = run_tick(&state).await;
-                if report.delivered > 0 || report.dropped > 0 {
+                if report.sent > 0 || report.dropped > 0 {
                     info!(?report, "outbox tick");
                 }
             }
             _ = notify.notified() => {
                 let report = run_tick(&state).await;
-                if report.delivered > 0 || report.dropped > 0 {
+                if report.sent > 0 || report.dropped > 0 {
                     info!(?report, "outbox tick (notified)");
                 }
             }
@@ -571,5 +652,70 @@ mod tests {
         assert!(t.ends_with('…'));
         // 200 char prefix + … (1 char in str sense; multi-byte)
         assert_eq!(t.chars().count(), 201);
+    }
+
+    /// An entry is removed only on its own target's acknowledgement of the
+    /// exact document last sent — not on send, not for another target, not
+    /// for another document.
+    #[tokio::test]
+    async fn an_entry_is_settled_only_by_its_targets_ack_of_the_sent_document() {
+        let store = fjall_store().await;
+        enqueue(&store, "did:example:edge", "ty/1.0", json!({"k": 1}))
+            .await
+            .unwrap();
+        let (key, entry) = list_pending_for_target(&store, "did:example:edge")
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(head_action(&entry, now_epoch()), HeadAction::Send);
+
+        record_sent(&store, key, &entry, "urn:uuid:doc-1")
+            .await
+            .unwrap();
+        let (_, sent) = list_pending_for_target(&store, "did:example:edge")
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(sent.awaiting_ack.as_deref(), Some("urn:uuid:doc-1"));
+        assert_eq!(
+            head_action(&sent, now_epoch()),
+            HeadAction::Wait,
+            "a sent entry waits for its ack instead of being removed"
+        );
+        assert_eq!(
+            head_action(&sent, now_epoch() + ACK_TIMEOUT_SECS + 1),
+            HeadAction::Send,
+            "no ack in time → re-send"
+        );
+
+        assert!(
+            !acknowledge(&store, "did:example:other", "urn:uuid:doc-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !acknowledge(&store, "did:example:edge", "urn:uuid:other")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            list_pending_for_target(&store, "did:example:edge")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(
+            acknowledge(&store, "did:example:edge", "urn:uuid:doc-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            list_pending_for_target(&store, "did:example:edge")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
