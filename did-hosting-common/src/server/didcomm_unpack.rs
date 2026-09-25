@@ -197,7 +197,11 @@ pub async fn unpack_signed(
     let kid = extract_signer_kid(input)?;
     let verifying_key = resolve_verifying_key(did_resolver, &kid).await?;
 
-    let result = unpack::unpack(input, None, None, None, Some(&verifying_key))
+    // Verify under the resolved key *as the key of `kid`*: the reported
+    // `signer_kid` is then the key id the signature was checked against.
+    let verify_key = affinidi_tdk::didcomm::jws::verify::VerifyKey::Ed25519(verifying_key);
+    let signer = affinidi_tdk::didcomm::SignerKey::new(&kid, &verify_key);
+    let result = unpack::unpack_bound(input, None, None, None, Some(signer))
         .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
 
     let (message, signer_kid) = match result {
