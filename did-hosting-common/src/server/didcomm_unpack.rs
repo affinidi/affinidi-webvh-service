@@ -23,6 +23,18 @@ use super::error::AppError;
 /// fresh enough to accept is still tracked for replay detection.
 pub const FRESHNESS_WINDOW_SECS: u64 = 300;
 
+/// How far into the future a signed message or document's timestamp may sit
+/// and still be accepted, absorbing ordinary clock skew between peers.
+pub const FUTURE_SKEW_SECS: u64 = 60;
+
+/// How long a replay cache must remember an accepted `(sender, id)` pair.
+///
+/// Not just [`FRESHNESS_WINDOW_SECS`]: a message stamped at the edge of the
+/// future tolerance stays inside the freshness window for
+/// `FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS` after it was first accepted, so
+/// a cache that forgot it sooner would accept it a second time.
+pub const REPLAY_WINDOW_SECS: u64 = FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS;
+
 /// Extract the signer's key ID from a JWS protected header without verifying the signature.
 ///
 /// Rejects multi-signature JWS envelopes outright — the threat model assumes a
@@ -233,7 +245,7 @@ pub async fn unpack_signed(
             "message too old (created_time exceeds 5-minute window)".into(),
         ));
     }
-    if created_time > now + 60 {
+    if created_time > now + FUTURE_SKEW_SECS {
         return Err(AppError::Authentication(
             "message created_time is in the future".into(),
         ));

@@ -196,6 +196,32 @@ nothing visible to anyone who could not already act on it. Until then, note that
 the unauthenticated `/api/server-info` lives on the **control plane** (not the
 edge), so nothing about the topology leaks today. Keep it that way.
 
+## Privileged messages are authorised on their proof, never on the transport
+
+Every inbound message that changes state or discloses more than public data —
+control→edge sync and domain ops, edge→control registration/stats/pongs/acks,
+DID management, ACL, auth — is a Trust Task document authorised on its **own
+Data Integrity proof**: `issuer` in-band and exactly the expected peer, the
+proof's `verificationMethod` controlled by that issuer, `recipient` = this
+service, fresh `issuedAt`, replay-keyed on `(issuer, id)`. The one entry point
+is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
+(the control plane's `dispatch_trust_task_doc` gate; the edge's
+`verify_control_plane`).
+
+- **A transport's sender is a routing hint.** `ctx.sender_did`, a TSP sender
+  VID, a DIDComm `from` — each is only required to *agree* with the proof.
+  Never authorise, ACL-check, or key a replay cache on one. Don't add a bare
+  `MSG_*` route that acts on `ctx.sender_did`; add a trust-task arm behind the
+  gate.
+- **Outbound privileged documents are signed** (`build_signed_request`, signed
+  at send time so retries stay fresh). A new control↔edge op needs both halves.
+- **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
+  an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
+  (`with_session_delegate`).
+- **Edges verify what they serve.** A synced webvh log must pass the chain
+  check and strictly extend the held log (`verify_log_extends`); a deactivated
+  DID takes no further entries.
+
 ## Cross-service networking & integration discipline
 
 This service's primary client is the VTA's `webvh_client`

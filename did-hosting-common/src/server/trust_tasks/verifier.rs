@@ -1,63 +1,51 @@
-//! [`TransportBoundVerifier`] — a [`ProofVerifier`] that enforces the
-//! in-band issuer↔`verificationMethod` binding **only when the document
-//! actually asserts an `issuer`**, and otherwise verifies the signature
-//! alone.
+//! [`TransportBoundVerifier`] — a [`ProofVerifier`] that binds every proof to
+//! the document's in-band `issuer`.
 //!
-//! ## Why this exists (read before "simplifying" it)
+//! ## The rule
 //!
-//! `trust-tasks-proof`'s stock `affinidi::Verifier` (≥ 0.2) hard-rejects
-//! any proof-bearing document that has no in-band `issuer`:
+//! A proof-bearing document is accepted only when:
 //!
-//! > "document carries a proof but no in-band issuer to bind it to"
+//! 1. it carries an in-band `issuer` — **always**; a document that names no
+//!    issuer is refused, whatever transport carried it; and
+//! 2. the proof's `verificationMethod` is controlled by that issuer
+//!    (`vm_DID == issuer`, exact string match per SPEC.md §4.8), **or** the
+//!    verifier was built for one bearer session with
+//!    [`TransportBoundVerifier::with_session_delegate`] and the proof is signed
+//!    by exactly that session's key on behalf of exactly that session's
+//!    principal; and
+//! 3. the signature verifies over the document.
 //!
-//! That rule assumes the proof signer and the responsible party are the
-//! same entity (`issuer == verificationMethod` DID). It is correct for a
-//! *self-signed* producer (our wallet path: the holder/principal DID signs
-//! with its own key, so `issuer == vm`), but it breaks the **passkey
-//! delegation** model:
+//! The issuer is therefore always something the proof establishes, never
+//! something the transport asserted. Callers authorise on
+//! `ResolvedParties::issuer`, and with this verifier in front of them that value
+//! is the proven signer on every binding.
 //!
-//! * A passkey can't produce an `eddsa-jcs-2022` Data Integrity proof, so
-//!   the browser generates an **ephemeral session keypair** at login and
-//!   signs trust-tasks with it. The proof's `verificationMethod` is the
-//!   session `did:key`, which is *deliberately not* the user's DID.
-//! * The responsible party (the user's real DID, the ACL identity) is
-//!   carried by the **transport** — the bearer JWT's `sub`. The HTTPS
-//!   route's pre-check (`routes::trust_tasks::dispatch_trust_task`)
-//!   cryptographically binds the session key to that JWT
-//!   (`proof.verificationMethod == JWT-bound session pubkey`).
+//! ## Why the issuer is required, not merely checked when present
 //!
-//! So for passkey the wire document leaves `issuer` absent: SPEC §4.8.1
-//! transport-fill resolves it to the JWT subject, and authorization keys on
-//! that. There is **no single `issuer` value** that satisfies the stock
-//! verifier (wants the session `did:key`), the framework's
-//! `resolve_parties` identity cross-check (wants the JWT subject), and ACL
-//! authorization (wants the JWT subject) at once — the session key is a
-//! *delegate*, an axis the stock verifier doesn't model.
+//! An issuer-less document verifies as a bare possession check: *someone* holds
+//! the key named by `verificationMethod`. The framework then fills the issuer
+//! from the transport's reported sender (SPEC §4.8.1) and every handler
+//! authorises on that. So the only thing binding the signer to the identity the
+//! handler acts for is the transport's report of who sent the message — and a
+//! transport's report is not a proof. Any signer could pair its own valid proof
+//! with somebody else's name on the envelope. Requiring the issuer in-band, and
+//! binding it to the key, makes the document itself say who it is from.
 //!
-//! ## The policy: bind when present, signature-only when absent
+//! ## The passkey session delegate
 //!
-//! * **`issuer` present** → enforce `vm_DID == issuer` exactly, identical
-//!   to the stock verifier. A producer that asserts an identity cannot
-//!   spoof it (covers e.g. an authenticated DIDComm sender claiming a
-//!   different `issuer` than the key it signed with).
-//! * **`issuer` absent** → verify the signature only. The responsible
-//!   party is established by the *transport*, not by the proof:
-//!     - On HTTPS the bearer pre-check has already pinned the signing key
-//!       to the authenticated caller before dispatch.
-//!     - On any transport, `resolve_parties` fills `issuer` from the
-//!       transport-authenticated sender; if the transport authenticated
-//!       *nobody* (e.g. anoncrypt DIDComm), `parties.issuer` is `None` and
-//!       every handler rejects with `permission_denied` before acting — so
-//!       a free-floating signature can never authorize as anyone.
+//! A passkey can't produce an `eddsa-jcs-2022` proof, so the Web UI signs with
+//! an ephemeral session key generated at login. That key's `did:key` is
+//! deliberately not the user's DID; the bearer JWT's `sub` is, and the login
+//! flow binds the session public key into the JWT. For that one case the HTTPS
+//! route builds a per-request verifier with
+//! [`TransportBoundVerifier::with_session_delegate`]`(jwt.sub, session_vm)`, and
+//! a document is then accepted when its `issuer` is the JWT subject and its
+//! proof is signed by exactly the JWT-bound session key. The delegate is never
+//! configured on a shared verifier, so no other transport can use it.
 //!
-//! This is exactly the pre-0.2 (`trust-tasks-proof` 0.1.x) behaviour for
-//! the issuer-absent case, restored locally and *scoped to absence* so the
-//! anti-spoofing guarantee is retained whenever an identity is asserted.
-//!
-//! **Invariant under test:** an `issuer`-present-but-`vm`-mismatched
-//! document MUST still be rejected. See `tests::issuer_present_mismatch_*`.
-//! Do not collapse this into an unconditional "skip binding" — that would
-//! reopen the spoofing hole on transports with no authenticated sender.
+//! **Invariants under test:** an issuer-less document is rejected; an
+//! issuer-present-but-`vm`-mismatched document is rejected; a delegate accepts
+//! only its own key for only its own principal. See `tests`.
 
 use std::sync::Arc;
 
@@ -68,12 +56,21 @@ use async_trait::async_trait;
 use serde::Serialize;
 use trust_tasks_rs::{ProofVerifier, TrustTask, VerificationError};
 
-/// A [`ProofVerifier`] that binds the proof to the in-band `issuer` when
-/// one is present and verifies the signature alone when it is absent. See
-/// the module docs for the security rationale.
+/// One bearer session's signing delegate: the only key, and the only
+/// principal, a delegated proof may name.
+#[derive(Clone, Debug)]
+struct SessionDelegate {
+    principal: String,
+    verification_method: String,
+}
+
+/// A [`ProofVerifier`] that requires an in-band `issuer` and binds the proof's
+/// `verificationMethod` to it. See the module docs for the security rationale.
+#[derive(Clone)]
 pub struct TransportBoundVerifier {
     resolver: Arc<dyn VerificationMethodResolver>,
     options: VerifyOptions,
+    delegate: Option<SessionDelegate>,
 }
 
 impl TransportBoundVerifier {
@@ -85,7 +82,15 @@ impl TransportBoundVerifier {
         Self {
             resolver,
             options: VerifyOptions::default(),
+            delegate: None,
         }
+    }
+
+    /// Construct a verifier over a configured DID cache client.
+    pub fn with_did_cache(client: affinidi_did_resolver_cache_sdk::DIDCacheClient) -> Self {
+        Self::with_resolver(Arc::new(
+            trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+        ))
     }
 
     /// Override the [`VerifyOptions`] (expected proof purpose, domain /
@@ -94,6 +99,32 @@ impl TransportBoundVerifier {
         self.options = options;
         self
     }
+
+    /// Additionally accept documents whose `issuer` is `principal` and whose
+    /// proof is signed by exactly `verification_method` — a bearer session's
+    /// JWT-bound signing key acting for the JWT subject.
+    ///
+    /// Build this per request, from an already-verified bearer token, and never
+    /// on a verifier shared across callers.
+    pub fn with_session_delegate(
+        mut self,
+        principal: impl Into<String>,
+        verification_method: impl Into<String>,
+    ) -> Self {
+        self.delegate = Some(SessionDelegate {
+            principal: principal.into(),
+            verification_method: verification_method.into(),
+        });
+        self
+    }
+}
+
+/// The DID that controls a verification method URL (the part before `#`).
+pub fn controller_did(verification_method: &str) -> &str {
+    verification_method
+        .split('#')
+        .next()
+        .unwrap_or(verification_method)
 }
 
 #[async_trait]
@@ -126,25 +157,23 @@ impl ProofVerifier for TransportBoundVerifier {
             obj.remove("proof");
         }
 
-        // ─── 3b. CONDITIONAL issuer↔verificationMethod binding.
-        //
-        // Enforce the binding ONLY when the document asserts an in-band
-        // `issuer`. When absent, the responsible party is established by the
-        // transport (see module docs) and the proof is a possession check;
-        // skipping the binding here is what the pre-0.2 verifier did. Do not
-        // make this unconditional — keep the `Some` arm exactly as strict as
-        // the stock verifier.
-        if let Some(issuer) = doc_value.get("issuer").and_then(|v| v.as_str()) {
-            let vm_did = proof
-                .verification_method
-                .split('#')
-                .next()
-                .unwrap_or(&proof.verification_method);
-            if vm_did != issuer {
-                return Err(VerificationError::IssuerMismatch(format!(
-                    "verificationMethod is controlled by {vm_did}, not the document issuer {issuer}"
-                )));
-            }
+        // ─── 3b. issuer↔verificationMethod binding — unconditional.
+        let Some(issuer) = doc_value.get("issuer").and_then(|v| v.as_str()) else {
+            return Err(VerificationError::IssuerMismatch(
+                "document carries a proof but no in-band issuer to bind it to".to_string(),
+            ));
+        };
+        let vm = proof.verification_method.as_str();
+        let self_signed = controller_did(vm) == issuer;
+        let delegated = self
+            .delegate
+            .as_ref()
+            .is_some_and(|d| d.verification_method == vm && d.principal == issuer);
+        if !self_signed && !delegated {
+            return Err(VerificationError::IssuerMismatch(format!(
+                "verificationMethod is controlled by {}, not the document issuer {issuer}",
+                controller_did(vm)
+            )));
         }
 
         // ─── 4. Verify the signature against the resolved key.
@@ -246,17 +275,71 @@ mod tests {
         (doc, did_key)
     }
 
-    /// Passkey path: `issuer` absent → signature-only verification passes.
-    /// This is the case the stock `affinidi::Verifier` rejects with
-    /// "no in-band issuer to bind it to".
+    /// GUARD: `issuer` absent → rejected, even though the signature itself is
+    /// valid. A proof that names no issuer must never verify as a bare
+    /// possession check.
     #[tokio::test]
-    async fn issuer_absent_verifies_signature_only() {
+    async fn issuer_absent_rejected() {
         let (doc, _did) = sign(base_body()).await;
         assert!(doc.issuer.is_none(), "test fixture must omit issuer");
+        let err = verifier().verify(&doc).await.expect_err("must reject");
+        assert!(
+            matches!(err, VerificationError::IssuerMismatch(_)),
+            "expected IssuerMismatch, got {err:?}"
+        );
+    }
+
+    /// Passkey session delegate: `issuer` is the principal, the proof is signed
+    /// by the delegate key → accepted.
+    #[tokio::test]
+    async fn session_delegate_accepts_its_key_for_its_principal() {
+        let mut body = base_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("issuer".to_string(), json!("did:web:alice.example"));
+        let (doc, signer_did) = sign(body).await;
+        let vm = doc.proof.as_ref().unwrap().verification_method.clone();
+        assert!(vm.starts_with(&signer_did));
         verifier()
+            .with_session_delegate("did:web:alice.example", vm)
             .verify(&doc)
             .await
-            .expect("issuer-absent proof verifies");
+            .expect("delegated proof verifies");
+    }
+
+    /// GUARD: a delegate is scoped to one principal — the same key acting for a
+    /// different issuer is refused.
+    #[tokio::test]
+    async fn session_delegate_rejects_other_principal() {
+        let mut body = base_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("issuer".to_string(), json!("did:web:admin.example"));
+        let (doc, _) = sign(body).await;
+        let vm = doc.proof.as_ref().unwrap().verification_method.clone();
+        let err = verifier()
+            .with_session_delegate("did:web:alice.example", vm)
+            .verify(&doc)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, VerificationError::IssuerMismatch(_)));
+    }
+
+    /// GUARD: a delegate is scoped to one key — a different key acting for the
+    /// principal is refused.
+    #[tokio::test]
+    async fn session_delegate_rejects_other_key() {
+        let mut body = base_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("issuer".to_string(), json!("did:web:alice.example"));
+        let (doc, _) = sign(body).await;
+        let err = verifier()
+            .with_session_delegate("did:web:alice.example", "did:key:z6MkOther#z6MkOther")
+            .verify(&doc)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, VerificationError::IssuerMismatch(_)));
     }
 
     /// Wallet path: `issuer` present and equal to the signer's DID → the
@@ -299,11 +382,17 @@ mod tests {
         );
     }
 
-    /// The signature-only path still actually verifies the signature: a
-    /// tampered payload (after signing) is rejected, not waved through.
+    /// The signature is actually verified: a tampered payload (after signing)
+    /// is rejected, not waved through.
     #[tokio::test]
-    async fn issuer_absent_tampered_payload_rejected() {
-        let (mut doc, _did) = sign(base_body()).await;
+    async fn tampered_payload_rejected() {
+        let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+        let pk_mb = secret.get_public_keymultibase().unwrap();
+        let mut body = base_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("issuer".to_string(), json!(format!("did:key:{pk_mb}")));
+        let (mut doc, _did) = sign(body).await;
         // Mutate a signed field; the proof no longer covers the document.
         doc.payload = json!({ "entry": { "subject": "did:web:mallory.example", "role": "admin" } });
         let err = verifier()

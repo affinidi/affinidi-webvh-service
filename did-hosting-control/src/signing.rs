@@ -48,23 +48,8 @@ pub fn control_assertion_secret(state: &AppState, control_did: &str) -> Result<S
             "service identity not loaded; cannot sign the outbound request document".into(),
         )
     })?;
-    let generation = identity.current();
-    if generation.did != control_did {
-        return Err(AppError::Internal(format!(
-            "current identity generation DID {} does not match the configured server_did {control_did}",
-            generation.did
-        )));
-    }
-    identity
-        .secrets()
-        .into_iter()
-        .find(|s| s.id == generation.signing_kid)
-        .ok_or_else(|| {
-            AppError::Internal(format!(
-                "no signing secret loaded for {}; cannot sign the outbound request document",
-                generation.signing_kid
-            ))
-        })
+    did_hosting_common::server::trust_tasks::identity_signing_secret(identity, control_did)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 /// Sign an unsigned Trust Task document (no `proof` member) and return it

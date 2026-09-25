@@ -225,6 +225,23 @@ pub fn build_request(
     Ok(doc)
 }
 
+/// [`build_request`], signed by `signer`.
+///
+/// Every request one of these services sends to another is a privileged
+/// document the receiver will refuse without a proof bound to the sender
+/// (see [`super::bound`]), so this — not the bare [`build_request`] — is what
+/// callers put on the wire. `signer` must be `from`'s current assertion key.
+pub async fn build_signed_request(
+    type_uri: &str,
+    from: &str,
+    to: &str,
+    payload: Value,
+    signer: &affinidi_tdk::secrets_resolver::secrets::Secret,
+) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
+    let doc = build_request(type_uri, from, to, payload)?;
+    Ok(super::bound::sign_document(&doc, signer).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

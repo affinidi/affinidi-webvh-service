@@ -1,8 +1,8 @@
 //! Control plane registration — announces this server to the control plane
 //! via DIDComm through the shared mediator connection.
 //!
-//! On startup, the server sends a `server/register` DIDComm message to the
-//! control plane's DID using the `DIDCommService::send_message()` API.
+//! On startup, the server sends a signed `server/register` trust task to the
+//! control plane's DID over whichever binding its DID document advertises.
 //! The control plane validates the server's DID against its ACL (must be
 //! pre-approved with service role) and adds it to the service registry.
 //!
@@ -11,23 +11,20 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use did_hosting_common::DidSyncUpdate;
 use did_hosting_common::did_ops::{
     AgentNameEntry, DidRecord, agent_name_key, content_log_key, content_witness_key, did_key,
-    extract_agent_names, extract_service_types, owner_key, validate_did_jsonl,
+    extract_agent_names, extract_service_types, owner_key,
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-use did_hosting_common::server::didcomm_profile::{
-    PeerTransport, TransportFallback, resolve_transport,
-};
+use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use did_hosting_common::server::mnemonic::validate_agent_name_binding;
 use did_hosting_common::server::trust_tasks::send::{
-    Retry, build_request, send_trust_task_with_retry,
+    Retry, build_signed_request, send_trust_task_with_retry,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -191,74 +188,64 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         "preloaded_dids": preloaded_dids,
     });
 
-    // Framing follows the transport, and for one hard reason: a **TSP-only**
-    // server has no DIDComm wire on which to send the legacy
-    // `MSG_SERVER_REGISTER` message, so its only way into the registry is a
-    // trust task over TSP. Meanwhile a DIDComm-reachable server keeps sending
-    // the legacy message, because an *older* control plane has no
-    // `trust_tasks_infra` arm and would bounce a register trust task into
-    // `bridge_did_management` — which has never heard of `server/register` —
-    // leaving the server silently unregistered.
-    //
-    // Once every control plane in a fleet understands the trust task, this
-    // branch collapses to `send_trust_task` unconditionally. Discovery
-    // (`trust-task-discovery/0.1`) is the principled way to detect that; it is
-    // deliberately not attempted here.
-    let control_speaks_tsp = matches!(
-        resolve_transport(&control_did, state.did_resolver.as_ref()).await,
-        Some((PeerTransport::Tsp, _))
-    );
-
-    // This node's configured mediator, used as the send fallback when the
-    // peer's document advertises no transport (see `resolve_send_binding`).
+    // Always a signed trust task. Registration makes this server a sync target
+    // for every tenant's DIDs, so the control plane admits it only on a
+    // document this server's DID signed (see `do_server_register`); the
+    // bare-message form it replaced carried no proof and is no longer routed.
+    // The binding — TSP or the DIDComm envelope — follows the control plane's
+    // DID document.
     let fallback = TransportFallback::from_config(
         state.config.mediator_did.as_deref(),
         state.config.features.tsp,
     );
-
-    let outcome = if control_speaks_tsp {
-        match build_request(MSG_SERVER_REGISTER, &server_did, &control_did, body) {
-            Ok(doc) => send_trust_task_with_retry(
-                didcomm_svc,
-                "server",
+    let signer = match state.identity.as_deref() {
+        Some(identity) => {
+            match did_hosting_common::server::trust_tasks::identity_signing_secret(
+                identity,
                 &server_did,
-                &control_did,
-                &doc,
-                &fallback,
-                state.did_resolver.as_ref(),
-                Retry {
-                    attempts: 10,
-                    delay: std::time::Duration::from_secs(5),
-                },
-            )
-            .await
-            .map(|transport| {
-                info!(?transport, "server registration sent as trust task");
-            }),
-            Err(e) => Err(e),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "cannot register: no signing key for this server's DID");
+                    return;
+                }
+            }
         }
-    } else {
-        let msg = Message::build(
-            uuid::Uuid::new_v4().to_string(),
-            MSG_SERVER_REGISTER.to_string(),
-            body,
-        )
-        .from(server_did.clone())
-        .to(control_did.clone())
-        .created_time(crate::auth::session::now_epoch())
-        .finalize();
+        None => {
+            warn!(
+                "cannot register: service identity not loaded, so the registration cannot be signed"
+            );
+            return;
+        }
+    };
 
-        // Send with built-in retry (waits for reconnection between attempts)
-        didcomm_svc
-            .send_message_with_retry(
-                "server",
-                msg,
-                &control_did,
-                10,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    let outcome = match build_signed_request(
+        MSG_SERVER_REGISTER,
+        &server_did,
+        &control_did,
+        body,
+        &signer,
+    )
+    .await
+    {
+        Ok(doc) => send_trust_task_with_retry(
+            didcomm_svc,
+            "server",
+            &server_did,
+            &control_did,
+            &doc,
+            &fallback,
+            state.did_resolver.as_ref(),
+            Retry {
+                attempts: 10,
+                delay: std::time::Duration::from_secs(5),
+            },
+        )
+        .await
+        .map(|transport| {
+            info!(?transport, "server registration sent as trust task");
+        }),
+        Err(e) => Err(e),
     };
 
     match outcome {
@@ -297,6 +284,34 @@ pub async fn apply_did_updates(
     }
 }
 
+/// Verify a webvh sync update before it replaces anything: the chain is valid,
+/// it establishes the DID the push names, and it strictly extends the log this
+/// edge already holds for the slot.
+async fn verify_webvh_update(
+    dids_ks: &KeyspaceHandle,
+    update: &DidSyncUpdate,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    use did_hosting_common::did_ops::{extract_did_id, verify_did_log_proofs, verify_log_extends};
+
+    verify_did_log_proofs(&update.log_content).map_err(AppError::Validation)?;
+    match extract_did_id(&update.log_content) {
+        Some(id) if id == update.did_id => {}
+        other => {
+            return Err(AppError::Validation(format!(
+                "sync update names {} but its log establishes {}",
+                update.did_id,
+                other.as_deref().unwrap_or("no DID")
+            )));
+        }
+    }
+    let held = dids_ks
+        .get_raw(content_log_key(&update.mnemonic))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    verify_log_extends(held.as_deref(), &update.log_content).map_err(AppError::Validation)
+}
+
 /// Apply a single DID sync update atomically.
 pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
@@ -323,14 +338,21 @@ pub async fn apply_single_update(
     let synced_method =
         did_hosting_common::method::detect_method(update.log_content.as_bytes()).unwrap_or("webvh");
 
-    // Per-method verification. The webvh path is unchanged — structural
-    // only, because the control plane has already walked the proof chain
-    // and an edge re-running it would reject logs an older didwebvh-rs
-    // accepted. did:webs gets the full key-event-log verification instead
-    // of a lighter check, and that asymmetry is deliberate: it is what
-    // keeps an edge from serving a stream a compromised or buggy control
-    // plane pushed, exactly as deriving agent names from the signed
-    // document (rather than from the push) does below.
+    // Per-method verification. The edge verifies what it is asked to serve
+    // itself, rather than trusting the control plane to have done so: a
+    // compromised or buggy control plane must not be able to make an edge serve
+    // a log the DID's own keys never authorised.
+    //
+    // - webvh: the full chain — entry hashes, each entry's proof against the
+    //   authorised `updateKeys`, pre-rotation commitments, parameter
+    //   transitions (`verify_did_log_proofs`) — and then the history check
+    //   against the log already held (`verify_log_extends`): only a strict
+    //   extension is accepted, never a rollback to a version from before a key
+    //   rotation, and never anything after a deactivation.
+    // - did:webs: the full key-event-log verification.
+    //
+    // The identifier the push names must be the one the log establishes, so a
+    // valid log cannot be filed under another DID's slot.
     #[cfg(feature = "method-webs")]
     let webs_document = if synced_method == "webs" {
         let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
@@ -344,12 +366,12 @@ pub async fn apply_single_update(
                 .map_err(|e| crate::error::AppError::Internal(e.to_string()))?,
         )
     } else {
-        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
+        verify_webvh_update(dids_ks, update).await?;
         None
     };
     #[cfg(not(feature = "method-webs"))]
     {
-        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
+        verify_webvh_update(dids_ks, update).await?;
     }
 
     // Services and agent names both come from the current DID document,

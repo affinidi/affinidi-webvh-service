@@ -6,7 +6,7 @@
 //! | binding | how a peer authenticated |
 //! |---|---|
 //! | HTTPS | canonical challenge → authenticate, with a signed document |
-//! | DIDComm | bespoke `MSG_AUTHENTICATE`: the authcrypt sender *is* the auth, body ignored |
+//! | DIDComm | bespoke `MSG_AUTHENTICATE`: the reported sender *is* the auth, body ignored (route since removed) |
 //! | TSP | nothing at all |
 //!
 //! So a wallet connected over TSP could not log in, and a wallet over DIDComm
@@ -31,20 +31,22 @@
 //! transport layer must produce this from a cryptographic check — never echo it
 //! from the request body unchecked."*
 //!
-//! Two things could satisfy that here. The transport-authenticated sender
-//! (authcrypt / TSP prove it) is what the bespoke DIDComm handler used. The
+//! Two things were candidates here. The transport's reported sender is what
+//! the bespoke DIDComm handler used — but a report is not a cryptographic check
+//! this service performs. The
 //! **document proof** is what the canonical spec means: `auth/authenticate/0.1`
 //! exists so that possession of a challenge plus a signature over it proves
 //! control of a VID, independent of how the bytes travelled.
 //!
-//! This takes the document proof. `ResolvedParties::issuer` is that value, and
-//! it is cryptographically established either way by
-//! [`TransportBoundVerifier`](did_hosting_common::server::trust_tasks::TransportBoundVerifier):
-//! when the document asserts an `issuer`, the proof's `verificationMethod` DID
-//! must equal it; when it does not, the framework fills `issuer` from the
-//! transport-authenticated sender and a transport that authenticated nobody
-//! leaves it `None`, which is refused below. There is no path here where an
-//! unverified body value becomes a session.
+//! This takes the document proof. `ResolvedParties::issuer` is that value:
+//! [`TransportBoundVerifier`](did_hosting_common::server::trust_tasks::TransportBoundVerifier)
+//! requires an in-band `issuer` and binds the proof's `verificationMethod` to
+//! it, and `dispatch_trust_task_doc`'s gate has already refused any
+//! `auth/authenticate` document that is unsigned or whose issuer disagrees with
+//! the transport's sender. There is no path here where an unverified body value,
+//! or a transport's report of the sender, becomes a session. (`auth/challenge`
+//! is the one member of the family routed without a proof: it only mints the
+//! nonce the authenticate document must then sign.)
 //!
 //! The stricter reading is the right one for a family whose entire purpose is
 //! proving identity: accepting the transport's word would make `challenge`
@@ -250,8 +252,7 @@ async fn authenticate_arm(
             session_id: session_id.clone(),
             challenge: doc.payload.challenge.to_string(),
             // The verified signer. See the module doc: this is the document's
-            // proof identity, bound to the asserted `issuer` when there is one
-            // and filled from the authenticated transport when there is not.
+            // in-band `issuer`, which the proof is bound to.
             signer_did,
             // Freshness is the framework's job here — `validate_freshness` has
             // already bounded `issuedAt` against the acceptance window by the
@@ -261,9 +262,9 @@ async fn authenticate_arm(
             // A session pubkey is the HTTPS/passkey delegation path's concern;
             // a trust-task producer signs with its own key.
             session_pubkey_b58btc: None,
-            // Reached only over DIDComm authcrypt / TSP, both of which only
-            // this service can open, and `run_pipeline` has checked the
-            // document's `recipient` against `my_vid`.
+            // The document's `recipient` is covered by its proof and has been
+            // checked against `my_vid` twice already — by the proof gate in
+            // `dispatch_trust_task_doc` and by `run_pipeline`.
             audience: vti_common::auth::AudienceBinding::Transport,
         },
     )

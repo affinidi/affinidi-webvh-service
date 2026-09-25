@@ -1,5 +1,13 @@
 # WebVH DIDComm DID Management Protocol
 
+> **Superseded transport.** The bare DIDComm messages and the HTTP-signed
+> `POST /api/didcomm` endpoint described here have been removed. The same
+> operations are carried as signed Trust Task documents — inside the DIDComm
+> trust-task envelope, over TSP, or on `POST /api/trust-tasks` — and each
+> document must carry a proof whose `verificationMethod` is controlled by its
+> in-band `issuer`, addressed to the control plane. See `CHANGELOG.md`
+> ("privileged messages must carry a proof bound to their sender").
+
 **Version:** 1.0
 **Status:** Draft
 **Protocol URI Base:** `https://affinidi.com/webvh/1.0/did`

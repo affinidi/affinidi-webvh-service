@@ -1626,40 +1626,51 @@ interface SpecAclEntry {
 }
 
 /**
- * Set of REQUIRED-spec type URIs that MUST carry a Data Integrity
- * proof per the upstream Trust Tasks 0.1.1 framework. Proofless
- * documents on these types are rejected with `proof_required`
- * regardless of consumer policy (framework's
- * `Payload::IS_PROOF_REQUIRED` const enforced authoritatively).
+ * The only trust task the admin UI may send without a Data Integrity proof.
  *
- * `acl/list`, `acl/show`, and `trust-task-discovery` are
- * RECOMMENDED / OPTIONAL for *proofs* — they're accepted proofless.
- * NOTE: this set governs proofs only. `recipient` is a separate,
- * universally-REQUIRED field under Trust Tasks 0.2 and is set on every
- * envelope in `trustTask()` regardless of membership here — do not fold
- * recipient handling back into this gate.
+ * The control plane refuses every privileged document that is not signed and
+ * bound to its sender — ACL reads (`acl/list`, `acl/show`) included, not just
+ * the mutations — so every envelope is signed except capability discovery,
+ * which authorises nothing.
  */
-const REQUIRED_PROOF_TYPES = new Set<string>([
-  "https://trusttasks.org/spec/acl/grant/0.1",
-  "https://trusttasks.org/spec/acl/revoke/0.1",
-  "https://trusttasks.org/spec/acl/change-role/0.1",
+const PROOFLESS_TYPES = new Set<string>([
+  "https://trusttasks.org/spec/trust-task-discovery/0.1",
 ]);
+
+/**
+ * The DID the current bearer session authenticated — the access token's
+ * `sub`. Read, not verified: the server verified it when it issued the token
+ * and verifies it again on every request. The UI needs it because every signed
+ * envelope must name its `issuer` in-band.
+ */
+export function getSessionSubjectDid(): string | null {
+  const token = getToken();
+  const payload = token?.split(".")[1];
+  if (!payload) return null;
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const claims = JSON.parse(atob(padded)) as { sub?: unknown };
+    return typeof claims.sub === "string" ? claims.sub : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * POST `/api/trust-tasks` with a typed envelope; throw an `ApiError`
  * for `trust-task-error/0.1` responses, return the typed response
  * payload otherwise.
  *
- * REQUIRED-spec envelopes (`acl/grant`, `acl/revoke`,
- * `acl/change-role`) carry an `eddsa-jcs-2022` Data Integrity proof
- * signed by the ephemeral session keypair generated at login. The
- * proof's `verificationMethod` is the `did:key` of the
- * session pubkey; the server's `dispatch_trust_task` verifies that
- * matches the JWT-bound pubkey before the framework's verifier runs.
+ * Every envelope except discovery carries an `eddsa-jcs-2022` Data Integrity
+ * proof: from the wallet on a wallet login, or from the ephemeral session
+ * keypair generated at a passkey login. For the session key, the proof's
+ * `verificationMethod` is the `did:key` of the session pubkey, and the server
+ * accepts it only as that exact key acting for the JWT subject.
  *
- * `issuer` stays omitted — the bearer JWT carries the caller's DID and
- * SPEC.md §4.8.1's "transport-derived fills the absent in-band" rule
- * populates the issuer server-side. `recipient`, by contrast, is set on
+ * `issuer` is always set in-band, to the session's subject DID. The server
+ * refuses a proof that names no issuer — an issuer-less proof would only show
+ * that *someone* signed, not who the document is from. `recipient`, too, is set on
  * *every* envelope: under the Trust Tasks 0.2 framework every spec the UI
  * sends is recipient-REQUIRED (`IS_RECIPIENT_REQUIRED = true`), proofless
  * reads (acl/list, acl/show, trust-task-discovery) included. SPEC §7.2 item
@@ -1707,8 +1718,14 @@ async function sendTrustTaskOnce<Req, Resp>(
   }
   envelope.recipient = info.server_did;
 
-  // REQUIRED-spec envelopes additionally carry a Data Integrity proof.
-  if (REQUIRED_PROOF_TYPES.has(typeUri)) {
+  // Every signed envelope names its issuer: the DID this session authenticated.
+  const subject = getSessionSubjectDid();
+  if (!subject) {
+    throw new ApiError(401, "Not signed in — trust tasks need an authenticated session to sign as.");
+  }
+
+  if (!PROOFLESS_TYPES.has(typeUri)) {
+    envelope.issuer = subject;
     // Two signing paths, picked by which login flow produced the JWT:
     //
     // (1) Wallet login → the VTI browser extension's holder did:peer is the
@@ -1754,14 +1771,8 @@ async function sendTrustTaskOnce<Req, Resp>(
       //     `proof.verificationMethod == authenticated caller` would fail,
       //     and we'd get `proof_invalid`.
       const sessionPrincipalDid = getSessionPrincipalDid();
-      const envelopeWithIssuer: Record<string, unknown> = sessionPrincipalDid
-        ? {
-            ...(envelope as unknown as Record<string, unknown>),
-            issuer: sessionPrincipalDid,
-          }
-        : (envelope as unknown as Record<string, unknown>);
       const signed = await wallet.signTrustTask({
-        envelope: envelopeWithIssuer,
+        envelope: envelope as unknown as Record<string, unknown>,
         ...(sessionPrincipalDid ? { asDid: sessionPrincipalDid } : {}),
       });
       // Replace our envelope with the signed one (the wallet may have

@@ -1,8 +1,29 @@
-//! DIDComm sync handlers for the DID Hosting server edge node.
+//! Control-plane → edge operations for the DID Hosting server.
 //!
-//! The server is a read-only node that receives `sync-update` and
-//! `sync-delete` messages from the control plane via the mediator.
-//! All DID provisioning (VTA protocol) is handled by the control plane.
+//! The server is a read-only node: the control plane pushes it DID sync
+//! (`sync/update`, `sync/batch`, `sync/delete`) and domain operations
+//! (`domain/assign`, `unassign`, `purge`, `upsert`). All DID provisioning is
+//! handled by the control plane.
+//!
+//! ## Every operation is a document the control plane signed
+//!
+//! These operations overwrite, delete or purge hosted DIDs, so the only thing
+//! allowed to trigger them is the configured control plane — and "the control
+//! plane" means *a document signed by the control plane's DID*, not a message a
+//! transport reported as coming from it. Each operation travels as a Trust Task
+//! document (inside the DIDComm trust-task envelope, or as a TSP frame) and is
+//! applied only after [`verify_control_plane`] has established, from the
+//! document's own proof, that:
+//!
+//! - its `issuer` is exactly `control_did`, and the proof's
+//!   `verificationMethod` is one of that DID's keys;
+//! - it is addressed to this server (`recipient == server_did`);
+//! - it is fresh (`issuedAt`) and not a replay of a document already applied.
+//!
+//! The cores below take a [`VerifiedControlPlane`], which only that function
+//! constructs, so an unverified path to them does not type-check. The
+//! transport's own report of the sender is used for nothing but a consistency
+//! check against the proof.
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
@@ -15,29 +36,209 @@ use tracing::{debug, info, warn};
 
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
+use did_hosting_common::server::replay::ReplayCache;
+use did_hosting_common::server::trust_tasks::{TransportBoundVerifier, verify_sender_bound};
 
-// (The ACL helpers used to be needed here for per-handler `Admin|Service` checks
-// on the domain ops; the wave-2 follow-up replaced those with
-// `require_control_plane` so the ACL surface is no longer touched from this file.)
 use crate::server::AppState;
 
-/// Sync messages overwrite or delete arbitrary DIDs by mnemonic, so they must
-/// originate from the configured control plane — not merely any Service-role
-/// DID in the local ACL. If no `control_did` is configured all sync messages
-/// are rejected, which is correct: a server without a control plane has no
-/// legitimate sender for them.
-fn require_control_plane(sender: &str, state: &AppState) -> Result<(), (String, Value)> {
-    if state.config.control_did.as_deref() != Some(sender) {
-        warn!(
-            did = sender,
-            "sync message rejected: sender is not the configured control plane"
-        );
-        return Err(problem_report(
-            "e.p.did.unauthorized",
-            "sync messages must originate from the configured control plane",
-        ));
+/// The control-plane operations this server applies. Each is a signed Trust
+/// Task document; see the module docs.
+pub const CONTROL_PLANE_OPS: &[&str] = &[
+    MSG_SYNC_UPDATE,
+    MSG_SYNC_BATCH,
+    MSG_SYNC_DELETE,
+    MSG_DOMAIN_ASSIGN,
+    MSG_DOMAIN_UNASSIGN,
+    MSG_DOMAIN_PURGE,
+    MSG_DOMAIN_UPSERT,
+];
+
+/// Documents already applied, keyed on `(issuer, document id)`. Process-wide:
+/// an edge has exactly one control plane, and the cache only needs to outlive
+/// the freshness window.
+static REPLAY_CACHE: std::sync::LazyLock<ReplayCache> = std::sync::LazyLock::new(ReplayCache::new);
+
+/// Proof that a document was signed by the configured control plane, addressed
+/// to this server, fresh, and not previously applied. Constructed only by
+/// [`verify_control_plane`].
+#[derive(Debug)]
+pub struct VerifiedControlPlane {
+    /// The control plane's DID (the proven issuer).
+    pub did: String,
+    /// The document's signed `issuedAt`, epoch seconds.
+    pub issued_at: u64,
+}
+
+/// The proof verifier this server checks control-plane documents with, built
+/// over its DID resolver. `None` when no resolver is configured, in which case
+/// no control-plane document can be accepted.
+pub fn state_verifier(state: &AppState) -> Option<TransportBoundVerifier> {
+    state
+        .did_resolver
+        .clone()
+        .map(TransportBoundVerifier::with_did_cache)
+}
+
+/// Establish that `doc` comes from the configured control plane. See the module
+/// docs for what is checked. `transport_sender` is the carrying transport's
+/// report, which must agree with the proof but is never sufficient alone.
+pub async fn verify_control_plane<P>(
+    state: &AppState,
+    transport_sender: Option<&str>,
+    doc: &trust_tasks_rs::TrustTask<P>,
+    verifier: &TransportBoundVerifier,
+) -> Result<VerifiedControlPlane, trust_tasks_rs::RejectReason>
+where
+    P: serde::Serialize + Send + Sync,
+{
+    use trust_tasks_rs::RejectReason;
+
+    // No configured control plane → no legitimate sender for these ops.
+    let control_did =
+        state
+            .config
+            .control_did
+            .as_deref()
+            .ok_or_else(|| RejectReason::PermissionDenied {
+                reason: "this server has no configured control plane".into(),
+            })?;
+    let my_did =
+        state
+            .config
+            .server_did
+            .as_deref()
+            .ok_or_else(|| RejectReason::PermissionDenied {
+                reason: "this server has no configured DID".into(),
+            })?;
+    let did = verify_sender_bound(doc, Some(control_did), transport_sender, my_did, verifier)
+        .await
+        .map_err(|e| {
+            warn!(
+                sender = transport_sender.unwrap_or("unknown"),
+                type_uri = %doc.type_uri,
+                error = %e,
+                "control-plane document rejected: not signed by the configured control plane"
+            );
+            e.reject_reason()
+        })?;
+    if REPLAY_CACHE.check_and_insert(&did, &doc.id).is_err() {
+        warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
+        return Err(RejectReason::IdConflict);
     }
-    Ok(())
+    let issued_at = doc
+        .issued_at
+        .map(|t| t.timestamp().max(0) as u64)
+        .unwrap_or_default();
+    Ok(VerifiedControlPlane { did, issued_at })
+}
+
+/// Apply one control-plane operation document and return the (unsigned) reply
+/// document: the op's `#response` on success, a `trust-task-error` otherwise.
+///
+/// Shared by the DIDComm envelope route and the TSP handler. Returns `None`
+/// for a type that is not a control-plane operation.
+pub async fn dispatch_control_plane_op(
+    state: &AppState,
+    transport_sender: Option<&str>,
+    doc: trust_tasks_rs::TrustTask<Value>,
+    verifier: &TransportBoundVerifier,
+) -> Option<trust_tasks_rs::TrustTask<Value>> {
+    let type_uri = doc.type_uri.to_string();
+    if !CONTROL_PLANE_OPS.contains(&type_uri.as_str()) {
+        return None;
+    }
+    let reply_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let control = match verify_control_plane(state, transport_sender, &doc, verifier).await {
+        Ok(c) => c,
+        Err(reason) => return Some(error_value(doc.reject_with(reply_id, reason))),
+    };
+
+    let result = match type_uri.as_str() {
+        MSG_SYNC_UPDATE => do_sync_update(&control, state, &doc.payload).await,
+        MSG_SYNC_BATCH => do_sync_batch(&control, state, &doc.payload).await,
+        MSG_SYNC_DELETE => do_sync_delete(&control, state, &doc.payload).await,
+        MSG_DOMAIN_ASSIGN => do_domain_assign(&control, state, &doc.payload).await,
+        MSG_DOMAIN_UNASSIGN => do_domain_unassign(&control, state, &doc.payload).await,
+        MSG_DOMAIN_PURGE => do_domain_purge(&control, state, &doc.payload).await,
+        MSG_DOMAIN_UPSERT => do_domain_upsert(&control, state, &doc.payload).await,
+        _ => unreachable!("CONTROL_PLANE_OPS gates this match"),
+    };
+    Some(match result {
+        Ok((ack_type, body)) if ack_type != MSG_PROBLEM_REPORT => {
+            let reply = doc.respond_with(reply_id, body);
+            debug_assert_eq!(reply.type_uri.to_string(), ack_type);
+            reply
+        }
+        Ok((_, body)) => error_value(
+            doc.reject_with(
+                reply_id,
+                trust_tasks_rs::RejectReason::TaskFailed {
+                    reason: body
+                        .get("comment")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the operation was refused")
+                        .to_string(),
+                    details: Some(body),
+                },
+            ),
+        ),
+        Err(e) => error_value(doc.reject_with(
+            reply_id,
+            trust_tasks_rs::RejectReason::TaskFailed {
+                reason: e,
+                details: None,
+            },
+        )),
+    })
+}
+
+/// An error document as the untyped reply shape the transports carry.
+fn error_value(err: trust_tasks_rs::ErrorResponse) -> trust_tasks_rs::TrustTask<Value> {
+    let value = serde_json::to_value(&err).expect("error document serialises");
+    serde_json::from_value(value).expect("error document re-reads as a TrustTask")
+}
+
+/// Sign a reply document with this server's identity so the control plane can
+/// attribute it, returning it ready for the wire.
+///
+/// Error documents go out unsigned: they are terminal on the control plane,
+/// which only logs them. A success reply this server cannot sign is dropped —
+/// the control plane refuses unsigned acks, so sending it would only log a
+/// refusal at the other end.
+pub async fn seal_reply(
+    state: &AppState,
+    reply: trust_tasks_rs::TrustTask<Value>,
+) -> Option<Value> {
+    if reply
+        .type_uri
+        .to_string()
+        .starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX)
+    {
+        return serde_json::to_value(&reply).ok();
+    }
+    let (Some(identity), Some(server_did)) = (
+        state.identity.as_deref(),
+        state.config.server_did.as_deref(),
+    ) else {
+        warn!("cannot sign reply: service identity or server_did not loaded");
+        return None;
+    };
+    let secret = match did_hosting_common::server::trust_tasks::identity_signing_secret(
+        identity, server_did,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "cannot sign reply");
+            return None;
+        }
+    };
+    match did_hosting_common::server::trust_tasks::sign_document(&reply, &secret).await {
+        Ok(signed) => serde_json::to_value(&signed).ok(),
+        Err(e) => {
+            warn!(error = %e, "cannot sign reply");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -46,31 +247,20 @@ fn require_control_plane(sender: &str, state: &AppState) -> Result<(), (String, 
 
 /// Build the DIDComm router for the DID Hosting server.
 ///
-/// Handles only sync messages from the control plane (sync-update,
-/// sync-delete) and domain assignment messages (assign / unassign,
-/// T28). VTA provisioning is handled by the control plane.
+/// Every control-plane operation arrives as a signed Trust Task document in
+/// the trust-task envelope; there are no bare-message routes for them.
 pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceError> {
     Ok(Router::new()
         .extension(state)
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
-        .route(MSG_SERVER_REGISTER_ACK, handler_fn(handle_register_ack))?
-        .route(MSG_HEALTH_PING, handler_fn(handle_health_ping))?
         // Trust-task documents carried over DIDComm. The same documents arrive
-        // over TSP as raw frames (`crate::tsp`), and both land in
-        // `trust_tasks_infra::dispatch` — that is the transport-agnostic swap.
+        // over TSP as raw frames (`crate::tsp`), and both land in the same
+        // dispatchers — that is the transport-agnostic swap.
         .route(
             trust_tasks_didcomm::ENVELOPE_TYPE,
             handler_fn(handle_trust_tasks_envelope),
         )?
-        .route(MSG_STATS_ACK, handler_fn(ignore_handler))?
-        .route(MSG_SYNC_UPDATE, handler_fn(handle_sync_update))?
-        .route(MSG_SYNC_BATCH, handler_fn(handle_sync_batch))?
-        .route(MSG_SYNC_DELETE, handler_fn(handle_sync_delete))?
-        .route(MSG_DOMAIN_ASSIGN, handler_fn(handle_domain_assign))?
-        .route(MSG_DOMAIN_UNASSIGN, handler_fn(handle_domain_unassign))?
-        .route(MSG_DOMAIN_PURGE, handler_fn(handle_domain_purge))?
-        .route(MSG_DOMAIN_UPSERT, handler_fn(handle_domain_upsert))?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -78,45 +268,6 @@ pub fn build_server_router(state: AppState) -> Result<Router, DIDCommServiceErro
                 .require_sender_did(true),
         )
         .layer(middleware_fn(filtered_request_logging)))
-}
-
-/// Apply an inbound sync/domain message delivered over **TSP** by routing
-/// its `type` to the same `do_*` cores the DIDComm router uses.
-///
-/// TSP frames arrive on the shared mediator socket already sealed and with
-/// a cryptographically-authenticated `sender` — the same guarantees the
-/// DIDComm router's `require_encrypted(true).require_sender_did(true)`
-/// policy provides — and each `do_*` core additionally authorises the
-/// sender via `require_control_plane`. Returns the `(ack_type, ack_body)`
-/// the DIDComm path would reply with (the TSP handler currently drops it —
-/// delivery is fire-and-forget, mirroring the control outbox's
-/// send-success-is-delivery model), or `None` for a type this server does
-/// not handle over TSP.
-pub async fn dispatch_tsp_message(
-    state: &AppState,
-    sender: &str,
-    msg: &Message,
-) -> Option<(String, Value)> {
-    let result = match msg.typ.as_str() {
-        MSG_SYNC_UPDATE => do_sync_update(sender, state, msg).await,
-        MSG_SYNC_BATCH => do_sync_batch(sender, state, msg).await,
-        MSG_SYNC_DELETE => do_sync_delete(sender, state, msg).await,
-        MSG_DOMAIN_ASSIGN => do_domain_assign(sender, state, msg).await,
-        MSG_DOMAIN_UNASSIGN => do_domain_unassign(sender, state, msg).await,
-        MSG_DOMAIN_PURGE => do_domain_purge(sender, state, msg).await,
-        MSG_DOMAIN_UPSERT => do_domain_upsert(sender, state, msg).await,
-        other => {
-            warn!(
-                msg_type = other,
-                sender, "TSP: unhandled server message type"
-            );
-            return None;
-        }
-    };
-    Some(match result {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.did.internal-error", &e),
-    })
 }
 
 /// Request logging middleware that silences noisy health/stats messages.
@@ -127,10 +278,8 @@ async fn filtered_request_logging(
     next: Next,
 ) -> MiddlewareResult {
     const QUIET: &[&str] = &[
-        MSG_HEALTH_PING,
-        MSG_HEALTH_PONG,
-        MSG_STATS_ACK,
         MESSAGE_PICKUP_STATUS_TYPE,
+        trust_tasks_didcomm::ENVELOPE_TYPE,
     ];
 
     let msg_type = message.typ.clone();
@@ -148,20 +297,6 @@ async fn filtered_request_logging(
     result
 }
 
-// ---------------------------------------------------------------------------
-// Registration ack
-// ---------------------------------------------------------------------------
-
-/// Legacy `MSG_SERVER_REGISTER_ACK` DIDComm route. Delegates to the same core
-/// the trust-task dispatcher uses.
-async fn handle_register_ack(
-    _ctx: HandlerContext,
-    message: Message,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    crate::trust_tasks_infra::do_register_ack(&message.body);
-    Ok(None)
-}
-
 /// Inbound trust-task document carried in a DIDComm envelope.
 ///
 /// The reply is returned rather than sent, so the messaging framework routes it
@@ -171,7 +306,9 @@ async fn handle_trust_tasks_envelope(
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
+    // A routing hint only: every privileged document is authorised on its
+    // proof, and this is merely required to agree with it.
+    let sender = ctx.sender_did.as_deref();
 
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
         Ok(d) => d,
@@ -185,96 +322,42 @@ async fn handle_trust_tasks_envelope(
         }
     };
 
-    let type_uri = doc.type_uri.to_string();
-    if !crate::trust_tasks_infra::owns(&type_uri) {
-        warn!(
-            sender,
-            type_uri = %type_uri,
-            "trust-tasks envelope: server does not implement this type"
-        );
+    let Some(reply) = dispatch_inbound_document(&state, sender, doc).await else {
         return Ok(None);
+    };
+    Ok(Some(
+        DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), reply)
+            .thid(message.id.clone()),
+    ))
+}
+
+/// Route an inbound Trust Task document — from either transport — to the
+/// control-plane operations or the infrastructure ops, returning the sealed
+/// reply, if any.
+pub async fn dispatch_inbound_document(
+    state: &AppState,
+    sender: Option<&str>,
+    doc: trust_tasks_rs::TrustTask<Value>,
+) -> Option<Value> {
+    let type_uri = doc.type_uri.to_string();
+    if CONTROL_PLANE_OPS.contains(&type_uri.as_str()) {
+        let Some(verifier) = state_verifier(state) else {
+            warn!(%type_uri, "control-plane document refused: no DID resolver configured to verify it");
+            return None;
+        };
+        let reply = dispatch_control_plane_op(state, sender, doc, &verifier).await?;
+        return seal_reply(state, reply).await;
     }
-
-    match crate::trust_tasks_infra::dispatch(&state, sender, doc).await {
-        Some(resp) => Ok(Some(
-            DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), resp)
-                .thid(message.id.clone()),
-        )),
-        None => Ok(None),
+    if crate::trust_tasks_infra::owns(&type_uri) {
+        let reply = crate::trust_tasks_infra::dispatch(state, sender, doc).await?;
+        return seal_reply(state, reply).await;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Health ping (control plane → server → control plane)
-// ---------------------------------------------------------------------------
-
-/// Legacy `MSG_HEALTH_PING` DIDComm route. Kept so an older control plane —
-/// which has no trust-task ping — still gets a pong. Delegates to the same core
-/// the trust-task dispatcher uses, so the two answers can never diverge.
-async fn handle_health_ping(
-    _ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let pong = crate::trust_tasks_infra::do_health_ping(&state).await;
-    Ok(Some(
-        DIDCommResponse::new(MSG_HEALTH_PONG.to_string(), pong).thid(message.id.clone()),
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Sync handlers (control plane → server via mediator)
-// ---------------------------------------------------------------------------
-
-async fn handle_sync_update(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-
-    let (response_type, response_body) = match do_sync_update(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.did.internal-error", &e),
-    };
-
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
-
-async fn handle_sync_batch(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-
-    let (response_type, response_body) = match do_sync_batch(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.did.internal-error", &e),
-    };
-
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
-
-async fn handle_sync_delete(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-
-    let (response_type, response_body) = match do_sync_delete(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.did.internal-error", &e),
-    };
-
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
+    warn!(
+        sender,
+        %type_uri,
+        "trust task of a type this server does not implement"
+    );
+    None
 }
 
 async fn handle_fallback(
@@ -298,14 +381,12 @@ async fn handle_fallback(
 // ---------------------------------------------------------------------------
 
 async fn do_sync_update(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-    let mnemonic = apply_sync_update_body(state, &msg.body).await?;
+    let mnemonic = apply_sync_update_body(state, body).await?;
+    debug!(did = %control.did, %mnemonic, "applied sync update");
     Ok((
         MSG_SYNC_UPDATE_ACK.to_string(),
         json!({ "mnemonic": mnemonic, "status": "applied" }),
@@ -320,15 +401,11 @@ async fn do_sync_update(
 /// malformed entry can't strand the rest of the batch. Anything skipped is
 /// re-sent on the next delta sync.
 async fn do_sync_batch(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-    let updates = msg
-        .body
+    let updates = body
         .get("updates")
         .and_then(|v| v.as_array())
         .ok_or("missing 'updates' array in sync-batch")?;
@@ -345,7 +422,7 @@ async fn do_sync_batch(
         }
     }
     debug!(
-        did = sender,
+        did = %control.did,
         applied,
         failed,
         count = updates.len(),
@@ -415,18 +492,13 @@ async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String
 }
 
 async fn do_sync_delete(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
     use crate::did_ops;
 
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-
-    let mnemonic = msg
-        .body
+    let mnemonic = body
         .get("mnemonic")
         .and_then(|v| v.as_str())
         .ok_or("missing 'mnemonic' in sync-delete")?;
@@ -446,7 +518,7 @@ async fn do_sync_delete(
         batch.remove(&state.dids_ks, did_ops::watcher_sync_key(mnemonic));
         batch.commit().await.map_err(|e| e.to_string())?;
 
-        info!(did = sender, mnemonic = %mnemonic, "deleted DID via sync from control plane");
+        info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
     } else {
         info!(mnemonic = %mnemonic, "sync delete: DID not found locally");
     }
@@ -464,69 +536,26 @@ async fn do_sync_delete(
 // The control plane is the source of truth for which domains a server
 // hosts. Both handlers are idempotent — re-assigning an already-
 // assigned domain or unassigning an unknown domain returns a status
-// ack rather than an error. Only Admin or Service-role callers are
-// allowed; an ACL'd Service role is what the control-plane DID gets
-// at register time (see `control_register::run`).
-
-async fn handle_domain_assign(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    let (response_type, response_body) = match do_domain_assign(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.domain.internal-error", &e),
-    };
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
-
-async fn handle_domain_unassign(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    let (response_type, response_body) = match do_domain_unassign(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.domain.internal-error", &e),
-    };
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
+// ack rather than an error. Only documents signed by the configured control
+// plane reach these cores (see `VerifiedControlPlane`).
 
 async fn do_domain_assign(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::assignment::{AssignOutcome, assign};
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, CancelOutcome};
 
-    // Domain ops are at least as destructive as sync (`domain.purge`
-    // deletes every DID under the name); apply the same control-plane
-    // pinning rather than the looser Admin|Service ACL check that
-    // accepts any peer admin / sibling service. Closes the gap where
-    // a stale admin enrollment or compromised sibling could send a
-    // forged domain.{assign,unassign,purge,upsert} and mutate this
-    // server's local assignments.
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-
-    let domain_raw = msg
-        .body
+    let domain_raw = body
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/assign")?;
     let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
 
     let now = crate::auth::session::now_epoch();
-    let outcome = assign(&state.store, &domain, sender, now)
+    let outcome = assign(&state.store, &domain, &control.did, now)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -543,7 +572,7 @@ async fn do_domain_assign(
         .map_err(|e| e.to_string())?;
     if let CancelOutcome::Removed(prev) = cancelled {
         info!(
-            did = sender,
+            did = %control.did,
             domain = %domain,
             scheduled_at = prev.scheduled_at,
             grace_seconds = prev.grace_seconds,
@@ -552,7 +581,7 @@ async fn do_domain_assign(
     }
 
     info!(
-        did = sender,
+        did = %control.did,
         domain = %domain,
         status,
         "{log_msg}"
@@ -565,21 +594,15 @@ async fn do_domain_assign(
 }
 
 async fn do_domain_unassign(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, parse_grace_string};
 
-    // See do_domain_assign — control-plane pinning, not Admin|Service.
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-
-    let domain_raw = msg
-        .body
+    let domain_raw = body
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/unassign")?;
@@ -621,7 +644,7 @@ async fn do_domain_unassign(
             now,
             grace_seconds,
             "grace-expired",
-            sender,
+            &control.did,
         )
         .await
         {
@@ -633,7 +656,7 @@ async fn do_domain_unassign(
             );
         } else {
             info!(
-                did = sender,
+                did = %control.did,
                 domain = %domain,
                 grace_seconds,
                 "pending purge scheduled"
@@ -642,7 +665,7 @@ async fn do_domain_unassign(
     }
 
     info!(
-        did = sender,
+        did = %control.did,
         domain = %domain,
         status,
         "{log_msg}"
@@ -651,21 +674,6 @@ async fn do_domain_unassign(
     Ok((
         MSG_DOMAIN_UNASSIGN_ACK.to_string(),
         json!({ "domain": domain, "status": status }),
-    ))
-}
-
-async fn handle_domain_purge(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    let (response_type, response_body) = match do_domain_purge(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.domain.internal-error", &e),
-    };
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
     ))
 }
 
@@ -678,24 +686,16 @@ async fn handle_domain_purge(
 /// whose grace timer is still running. Either way the pending
 /// purge entry (if any) is cleared after the synchronous purge.
 async fn do_domain_purge(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::assignment;
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::domain_purge::purge_domain_dids;
     use did_hosting_common::server::pending_purge;
 
-    // See do_domain_assign — control-plane pinning. domain.purge wipes
-    // every DID under the name; a peer admin / sibling service should
-    // never reach this handler.
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-
-    let domain_raw = msg
-        .body
+    let domain_raw = body
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/purge")?;
@@ -711,27 +711,25 @@ async fn do_domain_purge(
     //   3. Mediator comes back, delivers the stale purge.
     //   4. Without this check, the data the operator chose to keep
     //      gets wiped.
-    // If a current assignment row exists AND the message's
-    // `created_time` is older than the assignment's `assigned_at`,
-    // refuse the purge. Messages without `created_time` are treated
-    // as fresh for backwards compatibility — older DIDComm peers
-    // don't set the header, and the existing `MAX_AGE_SECS` outbox
-    // sweep already drops very stale messages on the wire.
-    if let Ok(Some(current)) = assignment::get(&state.store, &domain).await {
-        let msg_created = msg.created_time.unwrap_or(0);
-        if msg_created != 0 && msg_created < current.assigned_at {
-            warn!(
-                did = sender,
-                domain = %domain,
-                msg_created_time = msg_created,
-                assignment_assigned_at = current.assigned_at,
-                "domain/purge refused: message older than current assignment (likely a stale purge replayed after reassign-within-grace)"
-            );
-            return Ok(problem_report(
-                "e.p.domain.stale-purge",
-                "purge message predates the current assignment; refusing to wipe data that has since been re-assigned",
-            ));
-        }
+    // If a current assignment row exists AND the document's signed
+    // `issuedAt` is older than the assignment's `assigned_at`, refuse the
+    // purge. `issuedAt` is covered by the control plane's proof, so unlike
+    // the DIDComm `created_time` this used to read it is always present and
+    // cannot be restamped in transit.
+    if let Ok(Some(current)) = assignment::get(&state.store, &domain).await
+        && control.issued_at < current.assigned_at
+    {
+        warn!(
+            did = %control.did,
+            domain = %domain,
+            issued_at = control.issued_at,
+            assignment_assigned_at = current.assigned_at,
+            "domain/purge refused: document older than current assignment (likely a stale purge replayed after reassign-within-grace)"
+        );
+        return Ok(problem_report(
+            "e.p.domain.stale-purge",
+            "purge message predates the current assignment; refusing to wipe data that has since been re-assigned",
+        ));
     }
 
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
@@ -742,7 +740,7 @@ async fn do_domain_purge(
     let _ = pending_purge::cancel(&state.store, &domain).await;
 
     info!(
-        did = sender,
+        did = %control.did,
         domain = %domain,
         deleted = report.deleted,
         skipped_no_domain = report.skipped_no_domain,
@@ -757,21 +755,6 @@ async fn do_domain_purge(
             "deleted": report.deleted,
             "skipped_no_domain": report.skipped_no_domain,
         }),
-    ))
-}
-
-async fn handle_domain_upsert(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    let (response_type, response_body) = match do_domain_upsert(sender, &state, &message).await {
-        Ok(r) => r,
-        Err(e) => problem_report("e.p.domain.internal-error", &e),
-    };
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
     ))
 }
 
@@ -793,9 +776,9 @@ async fn handle_domain_upsert(
 /// Idempotent. Re-sending the same entry produces an
 /// `already_current` status in the ack rather than churn.
 async fn do_domain_upsert(
-    sender: &str,
+    control: &VerifiedControlPlane,
     state: &AppState,
-    msg: &Message,
+    body: &Value,
 ) -> Result<(String, Value), String> {
     use did_hosting_common::server::domain::{
         DISABLE_PURGE_REASON, DomainEntry, DomainStatus, create_domain, get_domain,
@@ -803,14 +786,7 @@ async fn do_domain_upsert(
     };
     use did_hosting_common::server::pending_purge;
 
-    // See do_domain_assign — control-plane pinning. domain.upsert
-    // mutates the canonical domain record and silently changes
-    // status / metadata; restrict to the configured control plane.
-    if let Err(report) = require_control_plane(sender, state) {
-        return Ok(report);
-    }
-
-    let entry: DomainEntry = serde_json::from_value(msg.body.clone())
+    let entry: DomainEntry = serde_json::from_value(body.clone())
         .map_err(|e| format!("malformed 'entry' in domain/upsert (expected a DomainEntry): {e}"))?;
     let canonical = normalize_domain_name(&entry.name).map_err(|e| e.to_string())?;
     if canonical != entry.name {
@@ -850,7 +826,7 @@ async fn do_domain_upsert(
                     disabled_at,
                     grace_seconds,
                     DISABLE_PURGE_REASON,
-                    sender,
+                    &control.did,
                 )
                 .await
                 {
@@ -872,7 +848,7 @@ async fn do_domain_upsert(
 
     let action = if existed { "updated" } else { "created" };
     info!(
-        did = sender,
+        did = %control.did,
         domain = %canonical,
         action,
         status = status_str,
@@ -892,13 +868,6 @@ async fn do_domain_upsert(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn require_sender(ctx: &HandlerContext) -> Result<&str, DIDCommServiceError> {
-    ctx.sender_did
-        .as_deref()
-        .map(|did| did.split('#').next().unwrap_or(did))
-        .ok_or_else(|| DIDCommServiceError::Internal("missing sender DID".into()))
-}
 
 fn problem_report(code: &str, comment: &str) -> (String, Value) {
     (

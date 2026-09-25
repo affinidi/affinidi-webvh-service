@@ -189,8 +189,18 @@ pub const MSG_DOMAIN_UNASSIGN_ACK: &str =
 /// Servers that don't yet `assigned` the domain still apply the
 /// upsert so the entry is ready when they later receive a
 /// `domain/assign`.
-pub const MSG_DOMAIN_UPSERT: &str = "https://affinidi.com/webvh/1.0/domain/upsert";
-pub const MSG_DOMAIN_UPSERT_ACK: &str = "https://affinidi.com/webvh/1.0/domain/upsert-ack";
+///
+/// Carried as a signed Trust Task document like every other control→edge op,
+/// so it needs a Type URI the framework parses; the retired
+/// `affinidi.com/webvh/1.0/domain/upsert` string is not one. An outbox entry
+/// queued under it by an older control plane is delivered under this URI (see
+/// [`MSG_DOMAIN_UPSERT_LEGACY`]).
+pub const MSG_DOMAIN_UPSERT: &str = "https://trusttasks.org/spec/did-management/domain/upsert/0.1";
+pub const MSG_DOMAIN_UPSERT_ACK: &str =
+    "https://trusttasks.org/spec/did-management/domain/upsert/0.1#response";
+/// The pre-Trust-Task spelling of [`MSG_DOMAIN_UPSERT`]. Only ever read, from
+/// outbox entries persisted before the rename.
+pub const MSG_DOMAIN_UPSERT_LEGACY: &str = "https://affinidi.com/webvh/1.0/domain/upsert";
 
 /// Admin "Purge now" Trust Task (T30). Bypasses the grace period
 /// scheduled by an unassignment and deletes every DID on the named

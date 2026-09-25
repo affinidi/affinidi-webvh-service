@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+### Changed (breaking) — privileged messages must carry a proof bound to their sender
+
+Every message that changes state or discloses more than public data is now
+authorised on a Data Integrity proof carried in the document itself, never on
+the messaging transport's report of who sent it. A document is acted on only
+when it carries a `proof` whose `verificationMethod` is controlled by its
+in-band `issuer`, the `issuer` is the expected peer (exact match), it is
+addressed to the receiving service (`recipient`), and its `issuedAt` is inside
+the freshness window. Replay protection is keyed on `(proven issuer, document
+id)`. See `did_hosting_common::server::trust_tasks::bound`.
+
+- **`TransportBoundVerifier` requires an in-band `issuer`, always.** A proof
+  with no `issuer` used to verify as a bare signature, with the issuer then
+  filled from the transport's sender; it is now refused. The one delegated shape
+  kept is the passkey session key, accepted only on `POST /api/trust-tasks`, and
+  only as the exact JWT-bound key acting for the JWT subject
+  (`with_session_delegate`).
+- **Control plane → edge (sync, domain ops, health ping).** The outbox and the
+  health loop send signed Trust Task documents (TSP frame or DIDComm
+  trust-task envelope, chosen from the edge's DID document). Edges apply
+  `sync/update`, `sync/batch`, `sync/delete` and `domain/{assign,unassign,
+  purge,upsert}` only when signed by the configured `control_did` and addressed
+  to their own DID. The bare `MSG_SYNC_*` / `MSG_DOMAIN_*` / `MSG_HEALTH_PING`
+  DIDComm routes and the serialised-`Message`-over-TSP form are removed.
+  `domain/upsert` moves to `https://trusttasks.org/spec/did-management/domain/upsert/0.1`
+  (queued entries under the old URI are delivered under the new one).
+- **Edges verify the DID logs they are asked to serve.** A `sync/update` is
+  applied only if the log's proof chain verifies (entry hashes, update-key
+  authorisation, pre-rotation), it establishes the DID the push names, and it
+  strictly extends the log already held: a shorter or diverging log is refused
+  as a rollback or fork, and a deactivated DID accepts no further entries.
+- **Edge → control plane (registration, stats, health pong, sync and domain
+  acks).** Sent as signed trust tasks; the bare `MSG_SERVER_REGISTER`,
+  `MSG_STATS_SYNC`, `MSG_HEALTH_PONG` and ack routes are removed. Registration,
+  stats, pongs and domain acks additionally require the signer to hold the
+  `Service` role (pongs previously had no ACL check).
+- **DID management, ACL and auth trust tasks (DIDComm envelope, TSP, HTTPS).**
+  Every trust task except `trust-task-discovery` and `auth/challenge` must be
+  signed by its issuer, and the issuer must be the transport's sender. This
+  includes the typed `did-hosting/*/1.0` ops and the ACL reads (`acl/list`,
+  `acl/show`), which previously went through unsigned.
+- **Removed the non-Trust-Task DID-management transports.** The bare DIDComm
+  `MSG_DID_*`, `MSG_AGENT_NAME_*`, `MSG_ME_DOMAINS` routes and the HTTP-signed
+  `POST /api/didcomm` endpoint are gone; the same operations are reachable as
+  signed documents in the trust-task envelope, over TSP, or on
+  `POST /api/trust-tasks`. A peer still sending a bare type gets a
+  problem report naming it.
+- **`MSG_AUTHENTICATE` over DIDComm requires a signed challenge.** The bare
+  route that issued a session to the reported sender is removed; sign-in over
+  DIDComm/TSP is the `auth/challenge/0.1` → `auth/authenticate/0.1` trust-task
+  pair, whose authenticate document must be signed by the authenticating DID.
+- **`trust_tasks.enforce_proofs = false` is refused at startup.** There is no
+  longer a mode in which proofs are ignored.
+- **Web UI.** Every trust-task envelope except discovery is signed and names
+  the session's subject DID as `issuer`.
+
+**Upgrade the whole fleet together.** A control plane and its edges on either
+side of this change cannot talk to each other. Clients that must change:
+the VTA's DID-management client over DIDComm/TSP
+(`verifiable-trust-infrastructure` `vta-service/src/webvh_didcomm.rs`) must sign
+each document with the VTA DID as `issuer`; the browser extension's DIDComm
+sign-in (`pnm-browser-plugin` `packages/core/src/rp-login/didcomm.ts`) must use
+the challenge → signed-authenticate trust tasks instead of a bare
+`MSG_AUTHENTICATE`. REST API callers (bearer JWT from the signed REST sign-in)
+are unaffected.
+
 ### Fixed — stats sync uses TSP when the control plane advertises it
 
 - **Stats sync was the last control↔server exchange hard-coded to DIDComm.**

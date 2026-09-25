@@ -22,7 +22,6 @@ use tracing::{debug, info, warn};
 
 use crate::acl::check_acl;
 use crate::auth::AuthClaims;
-use crate::auth::session::create_authenticated_session;
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -42,34 +41,12 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // Standard DIDComm
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
-        // VTA provisioning protocol
-        .route(MSG_AUTHENTICATE, handler_fn(handle_authenticate))?
-        .route(MSG_DID_REQUEST, handler_fn(handle_webvh_message))?
-        // `did/publish` is retired (spec supersededBy: `did/register`) —
-        // the register arm's owner-update rule carries the reserved-slot
-        // completion the two-step flow used to finish with a publish.
-        .route(MSG_DID_REGISTER, handler_fn(handle_webvh_message))?
-        .route(MSG_WITNESS_PUBLISH, handler_fn(handle_webvh_message))?
-        .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
-        .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
-        .route(MSG_DELETE, handler_fn(handle_webvh_message))?
-        .route(MSG_DID_CHANGE_OWNER, handler_fn(handle_webvh_message))?
-        // me/domains — net-new DIDComm route (Phase 2a.3) bound
-        // directly to the canonical Trust-Task spec URI; no legacy
-        // `affinidi.com/...` form exists. Shares its handler logic
-        // with the REST `GET /api/me/domains` endpoint via
-        // `fetch_me_domains_for_caller` so both transports return
-        // byte-identical payloads.
-        .route(MSG_ME_DOMAINS, handler_fn(handle_webvh_message))?
-        // agent-name/* — DIDComm routes so a VTA on this transport can name
-        // the DIDs it provisions instead of falling back to HTTPS for that
-        // one step. `update` carries the declarative `state: active|parked`
-        // that replaced the retired set / enable / disable verb trio; each
-        // arm calls the same `did_ops` function as its REST twin.
-        .route(MSG_AGENT_NAME_UPDATE, handler_fn(handle_webvh_message))?
-        .route(MSG_AGENT_NAME_REMOVE, handler_fn(handle_webvh_message))?
-        .route(MSG_AGENT_NAME_LIST, handler_fn(handle_webvh_message))?
-        .route(MSG_AGENT_NAME_CHECK, handler_fn(handle_webvh_message))?
+        // Every DID-management, auth and infrastructure operation arrives as a
+        // signed Trust Task document in the trust-task envelope below; the
+        // bare-message routes that used to sit here authorised on the
+        // transport's report of the sender alone and have been removed. A peer
+        // still sending one gets `handle_fallback`'s problem report naming the
+        // type, not a silent timeout.
         // Wallet consent decision (RP→wallet task-consent protocol).
         // The matching outbound `task-consent/request/0.1` is sent by
         // the REST endpoint `POST /api/task-consent/request`.
@@ -77,21 +54,6 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
             did_hosting_common::did_hosting_tasks::TASK_CONSENT_DECISION_0_1.as_str(),
             handler_fn(handle_consent_decision),
         )?
-        // Server registration
-        .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
-        // Health pong from servers
-        .route(MSG_HEALTH_PONG, handler_fn(handle_health_pong))?
-        // Stats sync from servers
-        .route(MSG_STATS_SYNC, handler_fn(handle_stats_sync))?
-        // Sync acknowledgements from servers
-        .route(MSG_SYNC_UPDATE_ACK, handler_fn(handle_sync_ack))?
-        .route(MSG_SYNC_DELETE_ACK, handler_fn(handle_sync_ack))?
-        // Domain-op acknowledgements from servers (assign / unassign / purge).
-        // Informational only — control treats these as fire-and-forget and
-        // derives ground truth from the server's next registration cycle.
-        .route(MSG_DOMAIN_ASSIGN_ACK, handler_fn(handle_domain_ack))?
-        .route(MSG_DOMAIN_UNASSIGN_ACK, handler_fn(handle_domain_ack))?
-        .route(MSG_DOMAIN_PURGE_ACK, handler_fn(handle_domain_ack))?
         // Trust Tasks envelope (v0.7.0+) — routes the five `acl/*`
         // ops and `trust-task-discovery` through the same handlers
         // the HTTPS transport hits at `POST /api/trust-tasks`.
@@ -142,79 +104,6 @@ async fn filtered_request_logging(
 // VTA provisioning handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_authenticate(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    info!(sender = sender, msg_type = %message.typ, "inbound DIDComm: authenticate");
-
-    let (response_type, response_body) = run_authenticate(&state, sender).await?;
-
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
-
-/// Compute the wire-level (response_type, response_body) for an inbound
-/// `MSG_AUTHENTICATE`. Extracted so it's directly testable without needing
-/// an `ATM`-backed `HandlerContext`.
-///
-/// On `Err(...)`, the router drops to its `error_handler` and returns a
-/// generic problem report — reserved for misconfigured states (no JWT key
-/// loaded). All ACL/session failures land in the `Ok(...)` tuple as
-/// problem-report bodies so the wire-level error code is stable.
-async fn run_authenticate(
-    state: &AppState,
-    sender: &str,
-) -> Result<(String, Value), DIDCommServiceError> {
-    let pair = match check_acl(&state.acl_ks, sender).await {
-        Ok(role) => {
-            let jwt_keys = state
-                .jwt_keys
-                .as_ref()
-                .ok_or_else(|| DIDCommServiceError::Internal("JWT keys not configured".into()))?;
-
-            // Mediator auth is the DIDComm-authenticate path: single
-            // DID-key factor → aal1.
-            match create_authenticated_session(
-                &state.sessions_ks,
-                jwt_keys,
-                sender,
-                &role,
-                state.config.auth.access_token_expiry,
-                state.config.auth.refresh_token_expiry,
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(tokens) => {
-                    info!(did = sender, role = %role, "mediator auth: session created");
-                    (
-                        MSG_AUTH_RESPONSE.to_string(),
-                        json!({
-                            "session_id": tokens.session_id,
-                            "access_token": tokens.access_token,
-                            "access_expires_at": tokens.access_expires_at,
-                            "refresh_token": tokens.refresh_token,
-                            "refresh_expires_at": tokens.refresh_expires_at,
-                        }),
-                    )
-                }
-                Err(e) => problem_report("e.p.did.internal-error", &e.to_string()),
-            }
-        }
-        Err(e) => {
-            let code = map_app_error_code(&e);
-            warn!(code, did = sender, "mediator auth: ACL denied");
-            problem_report(code, &e.to_string())
-        }
-    };
-    Ok(pair)
-}
-
 /// Extract `(challenge, payloadDigest, approved)` from a
 /// `task-consent/decision/0.1` payload, or `None` when a required member
 /// is absent or `decision` is not one of the spec's two values.
@@ -239,12 +128,10 @@ fn parse_decision_payload(payload: &Value) -> Option<(&str, &str, bool)> {
 ///
 /// The decision's Data Integrity proof — not the transport session — is
 /// the authorization (per the task-consent spec), so it is **required**
-/// and verified before anything else. The authcrypt envelope binds the
-/// sender on top of that: the DIDComm service layer has already
-/// authenticated `ctx.sender_did` as the holder DID, and the decision is
-/// only honoured when the proof's `verificationMethod` DID, the in-band
-/// `issuer` (when present) and the authcrypt sender all name the holder
-/// the request was addressed to. We correlate by `challenge`, require
+/// and verified before anything else. The decision is only honoured when
+/// the proof's `verificationMethod` DID, the in-band `issuer` (required) and
+/// the transport's reported sender all name the holder the request was
+/// addressed to; the reported sender alone establishes nothing. We correlate by `challenge`, require
 /// the echoed `payloadDigest` to match the one we sent (the binding
 /// between what the human approved and what the parked admin call
 /// proceeds with), and resolve the parked REST request with the user's
@@ -310,9 +197,9 @@ async fn run_consent_decision(
         );
         return Ok(None);
     };
-    // The proven signer must be the authcrypt sender (and so, below, the
-    // addressed holder). `TransportBoundVerifier` additionally enforces
-    // `verificationMethod` DID == `issuer` whenever `issuer` is present.
+    // The proven signer must be the reported sender (and so, below, the
+    // addressed holder). `TransportBoundVerifier` additionally requires an
+    // in-band `issuer` and enforces `verificationMethod` DID == `issuer`.
     let proof_did = proof
         .verification_method
         .split_once('#')
@@ -326,13 +213,11 @@ async fn run_consent_decision(
         );
         return Ok(None);
     }
-    if let Some(issuer) = doc.issuer.as_deref()
-        && issuer != sender
-    {
+    if doc.issuer.as_deref() != Some(sender) {
         warn!(
             sender = sender,
-            issuer = %issuer,
-            "task-consent decision issuer does not match the sender — ignoring"
+            issuer = ?doc.issuer,
+            "task-consent decision issuer is absent or does not match the sender — ignoring"
         );
         return Ok(None);
     }
@@ -431,67 +316,6 @@ async fn run_consent_decision(
     )))
 }
 
-async fn handle_webvh_message(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    info!(sender = sender, msg_type = %message.typ, "inbound DIDComm: webvh message");
-
-    let (response_type, response_body) = run_webvh_dispatch(&state, sender, &message).await;
-
-    Ok(Some(
-        DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
-    ))
-}
-
-/// Compute the wire-level (response_type, response_body) for any inbound
-/// VTA management message — wraps the ACL check, replay-cache gate, and
-/// `dispatch_did_op` so the auth + dispatch pipeline is testable as a
-/// single unit, without an `ATM`-backed `HandlerContext`. Always
-/// returns a tuple; ACL denials, replay rejections, and dispatch
-/// errors surface as problem-report bodies.
-async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -> (String, Value) {
-    // Replay gate: reject any (sender, msg.id) we've seen within the
-    // freshness window. Runs after ACL so an unauthenticated flood
-    // can't poison the cache for legitimate senders.
-    match check_acl(&state.acl_ks, sender).await {
-        Ok(role) => {
-            if let Err(e) = state.replay_cache.check_and_insert(sender, &message.id) {
-                let code = map_app_error_code(&e);
-                warn!(code, msg_type = %message.typ, did = sender, msg_id = %message.id, "DIDComm replay rejected");
-                return problem_report(code, &e.to_string());
-            }
-            let auth = AuthClaims {
-                did: sender.to_string(),
-                role,
-                // Per-message DIDComm auth has no session record.
-                session_id: String::new(),
-                session_pubkey_b58btc: None,
-                // DIDComm authcrypt-sender auth is a base (did) factor.
-                amr: vec!["did".to_string()],
-                acr: "aal1".to_string(),
-            };
-            match dispatch_did_op(&auth, state, message).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let code = map_app_error_code(&e);
-                    let comment = e.to_string();
-                    warn!(code, comment, msg_type = %message.typ, did = sender, "DIDComm protocol error");
-                    problem_report(code, &comment)
-                }
-            }
-        }
-        Err(e) => {
-            let code = map_app_error_code(&e);
-            let comment = e.to_string();
-            warn!(code, comment, msg_type = %message.typ, did = sender, "mediator: ACL denied");
-            problem_report(code, &comment)
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DID operation dispatch
 // ---------------------------------------------------------------------------
@@ -544,16 +368,12 @@ pub(crate) fn spec_did_record_json(
     Value::Object(rec)
 }
 
-/// Single transport-agnostic dispatch table for VTA DID-management
-/// `MSG_*` types.
+/// Transport-agnostic dispatch table for the DID-management `MSG_*` Type URIs.
 ///
-/// Both DIDComm transports — the framework router (mediator-routed,
-/// E2E-encrypted) and the HTTP-signed `POST /api/didcomm` route
-/// (signed-but-not-encrypted) — call this. Without it, the two had
-/// drifted: the HTTP-signed dispatcher was missing `MSG_DID_REGISTER`
-/// entirely, and the two emitted different protocol error codes for
-/// identical wire conditions. See
-/// `docs/dispatcher-consolidation-design.md` for the rationale.
+/// Reached only through [`bridge_did_management`], after
+/// [`dispatch_trust_task_doc`] has verified the document's proof and ACL'd its
+/// signer into `auth`. It reads only `msg.typ` and `msg.body`, so it has no view
+/// of — and places no trust in — any transport.
 pub async fn dispatch_did_op(
     auth: &AuthClaims,
     state: &AppState,
@@ -995,186 +815,19 @@ pub async fn dispatch_did_op(
 }
 
 // ---------------------------------------------------------------------------
-// Sync acknowledgement handler
+// Stats sync (server → control plane)
 // ---------------------------------------------------------------------------
 
-async fn handle_sync_ack(
-    ctx: HandlerContext,
-    message: Message,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
-    let status = message
-        .body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let mnemonic = message
-        .body
-        .get("mnemonic")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let ack_type = if message.typ.contains("update") {
-        "update"
-    } else {
-        "delete"
-    };
-    info!(
-        sender,
-        mnemonic, status, ack_type, "DID sync: server acknowledged {ack_type}"
-    );
-    Ok(None)
-}
-
-/// Handler for `domain/assign-ack`, `domain/unassign-ack`, `domain/purge-ack`.
+/// Transport-agnostic core of stats sync, for the `.../server/stats-sync/0.1`
+/// trust task over DIDComm **or** TSP.
 ///
-/// Servers send these after applying the matching outbound domain op. The
-/// handler:
-/// 1. Logs the acknowledgement.
-/// 2. Updates the sender's `ServiceInstance.served_domains` in the registry
-///    so the UI reflects the change immediately, without waiting for the
-///    next `MSG_SERVER_REGISTER` from the server. Without this, a domain
-///    assigned to a server stays invisible in the registry view until the
-///    server restarts.
-async fn handle_domain_ack(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    use crate::acl::check_acl;
-
-    let sender = ctx.sender_did.as_deref().unwrap_or("unknown");
-    let status = message
-        .body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let domain = message
-        .body
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let op = if message.typ.contains("assign-ack") && !message.typ.contains("unassign-ack") {
-        "assign"
-    } else if message.typ.contains("unassign-ack") {
-        "unassign"
-    } else {
-        "purge"
-    };
-    info!(
-        sender,
-        domain, status, op, "server acknowledged domain {op}"
-    );
-
-    // Mirror the server's view of `served_domains` into our registry.
-    // `assigned` / `already_assigned` → add; everything else (unassign,
-    // purge, failures) → remove.
-    //
-    // Authz gate matches `handle_server_register`: only DIDs that
-    // resolve to `Role::Service` in the local ACL are allowed to
-    // mutate registry state via acks. The DIDComm router has no
-    // sender allowlist, so any authcrypt-capable peer could reach
-    // this handler — without the ACL check, a Service-role peer (or
-    // any other DID that managed to land on the box) could lie about
-    // its OWN served_domains: drop a domain to make the UI report it
-    // un-served (and the next purge-fanout will skip it), or claim
-    // an assigned for a domain it doesn't host.
-    if domain == "unknown" || sender == "unknown" {
-        return Ok(None);
-    }
-    match check_acl(&state.acl_ks, sender).await {
-        Ok(crate::acl::Role::Service) => {} // proceed
-        Ok(other) => {
-            warn!(
-                did = sender,
-                role = %other,
-                domain,
-                op,
-                "domain ack rejected: Service role required"
-            );
-            return Ok(None);
-        }
-        Err(_) => {
-            warn!(
-                did = sender,
-                domain, op, "domain ack rejected: DID not in ACL"
-            );
-            return Ok(None);
-        }
-    }
-    let instance_id = sender.replace(':', "_");
-    match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
-        Ok(Some(mut instance)) => {
-            let add = op == "assign" && matches!(status, "assigned" | "already_assigned");
-            let mutated = if add {
-                if !instance.served_domains.iter().any(|d| d == domain) {
-                    instance.served_domains.push(domain.to_string());
-                    instance.served_domains.sort();
-                    true
-                } else {
-                    false
-                }
-            } else {
-                let before = instance.served_domains.len();
-                instance.served_domains.retain(|d| d != domain);
-                instance.served_domains.len() != before
-            };
-            if mutated
-                && let Err(e) =
-                    crate::registry::register_instance(&state.registry_ks, &instance).await
-            {
-                warn!(
-                    instance_id, error = %e,
-                    "failed to update served_domains after domain ack"
-                );
-            }
-        }
-        Ok(None) => {
-            // Server isn't in the registry yet (ack arrived before
-            // MSG_SERVER_REGISTER, or the operator wiped the registry).
-            // Logging only — the next register cycle will reconcile.
-            warn!(
-                instance_id,
-                "domain ack received for unregistered server — skipping registry update"
-            );
-        }
-        Err(e) => {
-            warn!(instance_id, error = %e, "failed to load instance for ack reconciliation");
-        }
-    }
-
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------------
-// Stats sync handler (server → control plane via DIDComm)
-// ---------------------------------------------------------------------------
-
-async fn handle_stats_sync(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-
-    let response = match do_stats_sync(&state, sender, &message.body).await {
-        Ok(ack) => DIDCommResponse::new(MSG_STATS_ACK.to_string(), ack),
-        Err(rej) => DIDCommResponse::new(
-            MSG_PROBLEM_REPORT.to_string(),
-            json!({ "code": rej.code, "comment": rej.comment }),
-        ),
-    };
-    Ok(Some(response.thid(message.id.clone())))
-}
-
-/// Transport-agnostic core of stats sync.
-///
-/// Shared by the legacy `MSG_STATS_SYNC` DIDComm route and the
-/// `.../server/stats-sync/0.1` trust task arriving over DIDComm **or** TSP, so
-/// the two can never drift. Returns the ack body — `accepted`, or `skipped` for
-/// a stale sequence — or a rejection when the sender is not a Service.
+/// `signer` is the document's proven issuer (see
+/// [`dispatch_trust_task_doc`]), never a transport's report. Returns the ack
+/// body — `accepted`, or `skipped` for a stale sequence — or a rejection when
+/// the signer is not a Service.
 pub(crate) async fn do_stats_sync(
     state: &AppState,
-    sender: &str,
+    signer: &str,
     body: &Value,
 ) -> Result<Value, InfraRejection> {
     use crate::routes::stats_sync;
@@ -1184,31 +837,31 @@ pub(crate) async fn do_stats_sync(
     // stats deltas: doing so would let any tenant tamper with another
     // server's resolved/update counters.
     if !matches!(
-        check_acl(&state.acl_ks, sender).await,
+        check_acl(&state.acl_ks, signer).await,
         Ok(crate::acl::Role::Service)
     ) {
-        warn!(did = sender, "stats sync rejected: Service role required");
+        warn!(did = signer, "stats sync rejected: Service role required");
         return Err(InfraRejection::new(
             "e.p.stats.unauthorized",
             "service role required",
         ));
     }
 
-    // Bind the payload to the transport-proven sender, as the REST handler
+    // Bind the payload to the transport-proven signer, as the REST handler
     // binds it to the JWT. `server_did` keys the replay window, so accepting a
     // foreign one would let one server advance — and so suppress — another's.
     let server_did = body
         .get("server_did")
         .and_then(|v| v.as_str())
-        .unwrap_or(sender);
-    if server_did != sender {
+        .unwrap_or(signer);
+    if server_did != signer {
         warn!(
-            did = sender,
-            server_did, "stats sync rejected: server_did does not match sender"
+            did = signer,
+            server_did, "stats sync rejected: server_did does not match signer"
         );
         return Err(InfraRejection::new(
             "e.p.stats.sender_mismatch",
-            "server_did does not match sender",
+            "server_did does not match signer",
         ));
     }
 
@@ -1258,15 +911,25 @@ pub(crate) async fn do_stats_sync(
 // Health pong handler (server → control plane)
 // ---------------------------------------------------------------------------
 
-/// Transport-agnostic core of health-pong handling.
+/// Transport-agnostic core of health-pong handling, for the
+/// `.../server/health/0.1#response` trust task over DIDComm or TSP.
 ///
-/// Reads only `(sender, body)`, so the same code marks an instance Active
-/// whether the pong arrived as a legacy `MSG_HEALTH_PONG` DIDComm message or
-/// as a `.../server/health/0.1#response` trust task over DIDComm or TSP.
+/// `signer` is the pong's proven issuer. Only a Service-role DID may mark an
+/// instance Active: the registry's liveness view decides which servers the
+/// dashboard reports healthy, so it must not be writable by any DID that can
+/// reach the mediator.
 ///
 /// A pong is terminal: it never produces a reply.
-pub(crate) async fn do_health_pong(state: &AppState, sender: &str, body: &Value) {
+pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value) {
     use crate::registry::{self, ServiceStatus};
+
+    if !matches!(
+        check_acl(&state.acl_ks, signer).await,
+        Ok(crate::acl::Role::Service)
+    ) {
+        warn!(did = signer, "health pong ignored: Service role required");
+        return;
+    }
 
     let status = body
         .get("status")
@@ -1277,10 +940,10 @@ pub(crate) async fn do_health_pong(state: &AppState, sender: &str, body: &Value)
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    debug!(sender, status, version, "health pong received from server");
+    debug!(signer, status, version, "health pong received from server");
 
-    // Find the instance by sender DID and mark it active
-    let instance_id = sender.replace(':', "_");
+    // Find the instance by signer DID and mark it active
+    let instance_id = signer.replace(':', "_");
     let now = crate::auth::session::now_epoch();
     if let Err(e) = registry::update_instance_status(
         &state.registry_ks,
@@ -1294,32 +957,110 @@ pub(crate) async fn do_health_pong(state: &AppState, sender: &str, body: &Value)
     }
 }
 
-/// Legacy `MSG_HEALTH_PONG` DIDComm route. Kept so an older server, which
-/// replies to a legacy ping with a legacy pong, still marks itself Active.
-async fn handle_health_pong(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    do_health_pong(&state, sender, &message.body).await;
-    crate::registry::record_inbound_transport(
-        &state.registry_ks,
-        sender,
-        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
-        crate::auth::session::now_epoch(),
-    )
-    .await;
-    Ok(None)
+// ---------------------------------------------------------------------------
+// Sync / domain acknowledgements (server → control plane)
+// ---------------------------------------------------------------------------
+
+/// A server acknowledged a `sync/*` push. Informational: logged, nothing else.
+pub(crate) fn do_sync_ack(signer: &str, type_uri: &str, body: &Value) {
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let mnemonic = body
+        .get("mnemonic")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    info!(
+        signer,
+        mnemonic, status, type_uri, "DID sync: server acknowledged"
+    );
+}
+
+/// A server acknowledged a `domain/{assign,unassign,purge}` push.
+///
+/// Mirrors the server's view of `served_domains` into the registry so the UI
+/// reflects the change without waiting for the next registration:
+/// `assigned` / `already_assigned` on an assign ack adds the domain, anything
+/// else removes it. `signer` is the ack's proven issuer and must hold the
+/// Service role — otherwise any DID could rewrite a server's `served_domains`
+/// (dropping a domain hides it from the next purge fan-out).
+pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str, body: &Value) {
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let Some(domain) = body.get("domain").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let op = match type_uri {
+        MSG_DOMAIN_ASSIGN_ACK => "assign",
+        MSG_DOMAIN_UNASSIGN_ACK => "unassign",
+        _ => "purge",
+    };
+    info!(
+        signer,
+        domain, status, op, "server acknowledged domain {op}"
+    );
+
+    match check_acl(&state.acl_ks, signer).await {
+        Ok(crate::acl::Role::Service) => {}
+        Ok(other) => {
+            warn!(did = signer, role = %other, domain, op, "domain ack rejected: Service role required");
+            return;
+        }
+        Err(_) => {
+            warn!(
+                did = signer,
+                domain, op, "domain ack rejected: DID not in ACL"
+            );
+            return;
+        }
+    }
+    let instance_id = signer.replace(':', "_");
+    match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
+        Ok(Some(mut instance)) => {
+            let add = op == "assign" && matches!(status, "assigned" | "already_assigned");
+            let mutated = if add {
+                if !instance.served_domains.iter().any(|d| d == domain) {
+                    instance.served_domains.push(domain.to_string());
+                    instance.served_domains.sort();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                let before = instance.served_domains.len();
+                instance.served_domains.retain(|d| d != domain);
+                instance.served_domains.len() != before
+            };
+            if mutated
+                && let Err(e) =
+                    crate::registry::register_instance(&state.registry_ks, &instance).await
+            {
+                warn!(instance_id, error = %e, "failed to update served_domains after domain ack");
+            }
+        }
+        Ok(None) => {
+            // Ack arrived before registration, or the registry was wiped; the
+            // next register cycle reconciles.
+            warn!(
+                instance_id,
+                "domain ack received for unregistered server — skipping registry update"
+            );
+        }
+        Err(e) => {
+            warn!(instance_id, error = %e, "failed to load instance for ack reconciliation");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Server registration handler
 // ---------------------------------------------------------------------------
 
-/// A rejection an infrastructure core (registration, stats sync) can report,
-/// rendered differently by each transport: the legacy DIDComm route packs it into an `MSG_PROBLEM_REPORT`
-/// message; the trust-task route turns it into a framework `ErrorResponse`.
+/// A rejection an infrastructure core (registration, stats sync) can report;
+/// the trust-task route turns it into a framework `ErrorResponse`.
 pub(crate) struct InfraRejection {
     pub code: &'static str,
     pub comment: String,
@@ -1334,15 +1075,15 @@ impl InfraRejection {
     }
 }
 
-/// Transport-agnostic core of server registration.
+/// Transport-agnostic core of server registration, for the
+/// `.../server/register/0.1` trust task arriving over DIDComm **or** TSP.
 ///
-/// Reads only `(sender, body)` — no `HandlerContext`, no DIDComm `Message` —
-/// so the same logic serves the legacy `MSG_SERVER_REGISTER` DIDComm route and
-/// the `.../server/register/0.1` trust task arriving over DIDComm **or** TSP.
-/// Returns the ack body on success.
+/// `signer` is the registration document's proven issuer — the DID whose key
+/// signed it — so a server is registered, and synced every tenant's DIDs, only
+/// on its own signature. Returns the ack body on success.
 pub(crate) async fn do_server_register(
     state: &AppState,
-    sender: &str,
+    signer: &str,
     body: &Value,
 ) -> Result<Value, InfraRejection> {
     use crate::acl::check_acl;
@@ -1355,11 +1096,11 @@ pub(crate) async fn do_server_register(
     // DID log + witness content to the caller's inbox and add them to the
     // active-server registry so future `notify_servers_did` updates also
     // reach them.
-    let role = match check_acl(&state.acl_ks, sender).await {
+    let role = match check_acl(&state.acl_ks, signer).await {
         Ok(crate::acl::Role::Service) => crate::acl::Role::Service,
         Ok(other) => {
             warn!(
-                did = sender,
+                did = signer,
                 role = %other,
                 "server registration rejected: Service role required"
             );
@@ -1370,7 +1111,7 @@ pub(crate) async fn do_server_register(
         }
         Err(_) => {
             warn!(
-                did = sender,
+                did = signer,
                 "server registration rejected: DID not in ACL (requires pre-approval)"
             );
             return Err(InfraRejection::new(
@@ -1395,7 +1136,7 @@ pub(crate) async fn do_server_register(
         registry::validate_registered_url(public_url, &state.config.registry.url_allowlist)
     {
         warn!(
-            did = sender,
+            did = signer,
             requested = public_url,
             "server registration rejected: URL host not in registry.url_allowlist",
         );
@@ -1453,12 +1194,12 @@ pub(crate) async fn do_server_register(
             match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
                 Ok(Some(_)) => keep.push(name),
                 Ok(None) => warn!(
-                    did = sender,
+                    did = signer,
                     domain = %name,
                     "register: dropping served_domains entry — control plane has no DomainEntry for this name"
                 ),
                 Err(e) => warn!(
-                    did = sender,
+                    did = signer,
                     domain = %name,
                     error = %e,
                     "register: failed to look up DomainEntry during served_domains validation — dropping entry"
@@ -1486,8 +1227,8 @@ pub(crate) async fn do_server_register(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Use the sender DID as a stable instance ID (one registration per DID)
-    let instance_id = sender.replace(':', "_");
+    // Use the signer DID as a stable instance ID (one registration per DID)
+    let instance_id = signer.replace(':', "_");
 
     // `register_instance` overwrites the whole record, so carry the previous
     // badge cache forward rather than blanking it. The refresh below
@@ -1506,7 +1247,7 @@ pub(crate) async fn do_server_register(
         status: ServiceStatus::Active,
         last_health_check: None,
         registered_at: crate::auth::session::now_epoch(),
-        metadata: json!({ "did": sender }),
+        metadata: json!({ "did": signer }),
         enabled_methods,
         served_domains,
         protocol_version,
@@ -1528,7 +1269,7 @@ pub(crate) async fn do_server_register(
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
-        warn!(did = sender, error = %e, "server registration failed");
+        warn!(did = signer, error = %e, "server registration failed");
         return Err(InfraRejection::new(
             "e.p.registration.internal-error",
             e.to_string(),
@@ -1536,7 +1277,7 @@ pub(crate) async fn do_server_register(
     }
 
     info!(
-        did = sender,
+        did = signer,
         instance_id = %instance_id,
         public_url = public_url,
         role = %role,
@@ -1555,7 +1296,7 @@ pub(crate) async fn do_server_register(
     .await
     {
         warn!(
-            did = sender,
+            did = signer,
             error = %e,
             "failed to cache advertised services for registering server"
         );
@@ -1580,7 +1321,7 @@ pub(crate) async fn do_server_register(
                 .collect()
         })
         .unwrap_or_default();
-    server_push::sync_all_dids_to_server(state, sender.to_string(), reported);
+    server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
 
     Ok(json!({
         "instance_id": instance_id,
@@ -1588,41 +1329,6 @@ pub(crate) async fn do_server_register(
     }))
 }
 
-/// Legacy `MSG_SERVER_REGISTER` DIDComm route. Kept alongside the trust-task
-/// path so an older server keeps registering against a newer control plane.
-async fn handle_server_register(
-    ctx: HandlerContext,
-    message: Message,
-    Extension(state): Extension<AppState>,
-) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let sender = require_sender(&ctx)?;
-    info!(
-        sender = sender,
-        "inbound DIDComm: server registration request (legacy MSG_*)"
-    );
-
-    let (typ, body) = match do_server_register(&state, sender, &message.body).await {
-        Ok(ack) => (MSG_SERVER_REGISTER_ACK.to_string(), ack),
-        Err(rej) => (
-            MSG_PROBLEM_REPORT.to_string(),
-            json!({ "code": rej.code, "comment": rej.comment }),
-        ),
-    };
-
-    // A legacy registration arrived over DIDComm by construction. Recorded
-    // after `do_server_register` so the instance exists to write onto.
-    crate::registry::record_inbound_transport(
-        &state.registry_ks,
-        sender,
-        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
-        crate::auth::session::now_epoch(),
-    )
-    .await;
-
-    Ok(Some(
-        DIDCommResponse::new(typ, body).thid(message.id.clone()),
-    ))
-}
 /// Answer a message this router has no arm for with a problem-report, so the
 /// caller fails immediately and *knows which task we refused*.
 ///
@@ -1694,13 +1400,6 @@ fn require_sender(ctx: &HandlerContext) -> Result<&str, DIDCommServiceError> {
         .ok_or_else(|| DIDCommServiceError::Internal("missing sender DID".into()))
 }
 
-fn problem_report(code: &str, comment: &str) -> (String, Value) {
-    (
-        MSG_PROBLEM_REPORT.to_string(),
-        json!({ "code": code, "comment": comment }),
-    )
-}
-
 /// Map an internal `AppError` to its DIDComm protocol error code.
 ///
 /// Thin wrapper around `AppError::didcomm_code()` — kept as a function
@@ -1711,6 +1410,7 @@ fn problem_report(code: &str, comment: &str) -> (String, Value) {
 /// substring sniffing, so a wording change in any
 /// `AppError::Validation("...")` literal can no longer silently
 /// re-route the protocol code.
+#[cfg(test)]
 fn map_app_error_code(err: &AppError) -> &'static str {
     err.didcomm_code()
 }
@@ -1722,14 +1422,15 @@ fn map_app_error_code(err: &AppError) -> &'static str {
 /// DIDComm handler for the Trust Tasks envelope
 /// (`https://trusttasks.org/binding/didcomm/0.1/envelope`).
 ///
-/// The DIDComm service layer has already verified the JWE and
-/// authenticated the sender; `ctx.sender_did` is the producer's DID.
 /// `message.body` is the JSON of the inner `TrustTask<Value>` document
 /// (per the binding's wire shape — see `trust-tasks-didcomm/src/pack.rs`).
+/// `ctx.sender_did` is the messaging layer's report of who sent it: a routing
+/// hint that [`dispatch_trust_task_doc`] requires to agree with the document's
+/// proof, never an authorisation on its own.
 ///
 /// We construct a [`DidcommHandler`] reporting `local = server_did`
 /// and `peer = sender`, then hand the document to the shared
-/// [`dispatch_inbound`] core. The result is repacked as a new DIDComm
+/// [`dispatch_trust_task_doc`] core. The result is repacked as a new DIDComm
 /// message of the same envelope type so the same routing rules
 /// (mediator pickup, attachment, etc.) apply.
 async fn handle_trust_tasks_envelope(
@@ -1751,8 +1452,7 @@ async fn handle_trust_tasks_envelope(
 /// an inbound trust-tasks envelope. Extracted from
 /// `handle_trust_tasks_envelope` so the dispatch + body-parse +
 /// repack logic is testable without an `ATM`-backed
-/// [`HandlerContext`] — matches the pattern used by
-/// `run_authenticate` / `run_webvh_dispatch` above. Returns `None`
+/// [`HandlerContext`]. Returns `None`
 /// for the SPEC.md §8.1 routing exception (identity-mismatch with no
 /// transport sender), which is unreachable on the dispatcher's
 /// `require_sender_did(true)` gate.
@@ -1786,47 +1486,11 @@ pub(crate) async fn run_trust_tasks_envelope(
         .as_deref()
         .ok_or_else(|| DIDCommServiceError::Internal("server_did not configured".into()))?;
 
-    // Replay gate — the same one `run_webvh_dispatch` applies to bare `MSG_*`
-    // messages, on the same `(sender, msg.id)` key.
-    //
-    // It has to be here too, not only there. Freshness (`created_time` ± the
-    // 5-minute window, checked during unpack) does not stop replay: a captured
-    // envelope re-submitted inside that window still verifies. `replay.rs` names
-    // the operations that matters for — delete, change-owner, publish — and
-    // every one of them is reachable through *both* DIDComm framings, since
-    // `bridge_did_management` hands the envelope's document to the same
-    // `dispatch_did_op` table the bare types use. A VTA moving its
-    // DID-management traffic onto the envelope binding would otherwise leave
-    // this protection behind, and leave it behind silently — the kind of
-    // regression that looks like nothing at all until someone replays a delete.
-    //
-    // Ordering differs from `run_webvh_dispatch` deliberately. That one gates
-    // after its ACL check, so a sender the ACL would reject cannot consume cache
-    // slots. Here authorization belongs to the dispatcher and varies by op
-    // (framework §7.2 ops authorize themselves; discovery is intentionally
-    // open), so there is no single ACL verdict to sequence behind. The gate runs
-    // after the body parses as a Trust Task — malformed bodies never reach the
-    // cache — and the router's `require_encrypted(true).require_sender_did(true)`
-    // means every key inserted still belongs to a cryptographically proven
-    // sender, never an anonymous one.
-    //
-    // The rejection is the *same* problem report the bare path emits, wrapped as
-    // a Trust Task document the way `bridge_did_management` wraps every other
-    // `AppError`. Parity is the whole point of this gate, so the error a client
-    // sees must not depend on which framing it used to get here.
-    if let Err(e) = state.replay_cache.check_and_insert(sender, &message.id) {
-        let code = map_app_error_code(&e);
-        warn!(
-            code,
-            did = sender,
-            msg_id = %message.id,
-            type_uri = %doc.type_uri,
-            "trust-tasks envelope: replay rejected"
-        );
-        let body = tt_reply(&doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e))?;
-        return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
-    }
-
+    // Replay protection is not here: a DIDComm message id is chosen per
+    // message by whoever sends it, so a captured document re-wrapped in a new
+    // message would sail past a `(sender, message.id)` check. The unified
+    // dispatcher keys its replay cache on `(proven issuer, document id)`
+    // instead — both covered by the document's own proof.
     let transport =
         trust_tasks_didcomm::DidcommHandler::new(my_vid.to_string(), sender.to_string());
 
@@ -1834,7 +1498,8 @@ pub(crate) async fn run_trust_tasks_envelope(
     // HTTPS use. Every family is reachable here: the typed
     // `did-hosting/*/1.0` protocol, auth, infra, ACL + discovery, and the
     // legacy `MSG_*` bridge.
-    match dispatch_trust_task_doc(state, sender, &transport, doc)
+    let verifier = require_verifier(state)?;
+    match dispatch_trust_task_doc(state, sender, &transport, doc, verifier)
         .await?
         .into_document()
     {
@@ -1871,34 +1536,6 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
         // No ceremony, for the same reason as `parent_thread_id` above: SPEC
         // §7.1 carries the member forward from the request so a reply stays
         // inside its enactment, and here there is no request to carry it from.
-        ceremony: None,
-        type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
-        issuer: None,
-        recipient: None,
-        issued_at: Some(chrono::Utc::now()),
-        expires_at: None,
-        payload,
-        context: None,
-        proof: None,
-        extra: Default::default(),
-    }
-}
-
-/// Trust-task error document for a **replayed** request: the `(sender, id)`
-/// pair was already seen within the freshness window. Mirrors
-/// [`body_parse_error`] so the TSP and HTTPS trust-task transports emit a
-/// consistent routed error (`idConflict`) instead of leaving the re-executed
-/// op unguarded (SEC-4045 W4). The DIDComm envelope path already gates on
-/// `replay_cache`; this closes the sibling transports.
-pub(crate) fn body_replay_error() -> trust_tasks_rs::ErrorResponse {
-    use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
-    // A duplicate document id within the freshness window is exactly an
-    // id-conflict on the wire.
-    let payload: ErrorPayload = RejectReason::IdConflict.into();
-    TrustTask {
-        id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        thread_id: None,
-        parent_thread_id: None,
         ceremony: None,
         type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
         issuer: None,
@@ -1993,10 +1630,11 @@ pub(crate) async fn dispatch_trust_task_doc(
     sender: &str,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
+    verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
 ) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher,
-        dispatch_inbound,
+        dispatch_inbound, verify_sender_bound,
     };
 
     let my_vid = state
@@ -2007,99 +1645,20 @@ pub(crate) async fn dispatch_trust_task_doc(
 
     let type_uri = doc.type_uri.to_string();
 
-    // Typed fit-for-purpose DID-management protocol (`did-hosting/*/1.0`).
-    // Takes precedence for its own URIs; runs the framework §7.2 pipeline
-    // with typed payloads (see `crate::trust_tasks_did`). The legacy
-    // `MSG_*` bridge below stays for back-compat, deprecated over time.
-    if crate::trust_tasks_did::owns(&type_uri) {
-        let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
-            state.config.trust_tasks.enforce_proofs,
-            state.trust_tasks_verifier.as_deref(),
-        ) {
-            (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
-            _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
-        };
-        let outcome = crate::trust_tasks_did::dispatch::<TransportBoundVerifier>(
-            state, transport, policy, doc,
-        )
-        .await;
-        return Ok(match outcome {
-            DispatchOutcome::Handled(resp) => RoutedReply::Document(
-                serde_json::to_value(&resp).expect("response document serialises"),
-            ),
-            DispatchOutcome::Rejected(err) => RoutedReply::Document(
-                serde_json::to_value(&err).expect("error document serialises"),
-            ),
-            DispatchOutcome::Suppressed => RoutedReply::Suppressed,
-        });
-    }
-
-    // Control↔server infrastructure ops (server registration, health pong).
-    // Must be checked *before* the `bridge_did_management` fallthrough below,
-    // which would otherwise hand them to `dispatch_did_op` — a table of DID
-    // operations that has never heard of them — and answer with a bogus
-    // "unknown op" problem report.
-    // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
-    // check below: the shared `build_dispatcher` does not carry this family —
-    // its context is the ACL keyspace — so an auth document would fall through
-    // to `bridge_did_management`, a table of DID operations that has never
-    // heard of it, and come back a bogus "unknown op".
-    if crate::trust_tasks_auth::owns(&type_uri) {
-        let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
-            state.config.trust_tasks.enforce_proofs,
-            state.trust_tasks_verifier.as_deref(),
-        ) {
-            (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
-            _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
-        };
-        return Ok(RoutedReply::Document(
-            crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
-                .await
-                .ok_or(DIDCommServiceError::Internal(
-                    "auth dispatch produced no reply".into(),
-                ))?,
-        ));
-    }
-
-    if crate::trust_tasks_infra::owns(&type_uri) {
-        // The dispatcher stays transport-agnostic; we only tell it which binding
-        // the document came in on so the registry can record what actually moved.
-        let via = did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
-            transport.binding_uri(),
-        );
-        return Ok(
-            match crate::trust_tasks_infra::dispatch(state, sender, via, doc).await {
-                Some(value) => RoutedReply::Document(value),
-                None => RoutedReply::Suppressed,
-            },
-        );
-    }
-
     // An error is terminal: it is somebody's account of a failure, not a request
-    // to act on. Checked before any routing because the routing below has no
-    // arm for it — `build_dispatcher` does not own `trust-task-error`, so it
-    // fell through to `bridge_did_management`, which synthesised a `Message`
-    // from the error's own `type`, handed it to `dispatch_did_op`, and answered
-    // the resulting `e.p.did.validation-error` with a problem report. The peer
-    // did the same with ours. One failure became a permanent exchange between
-    // two services politely answering each other's errors, and it stopped only
-    // when the mediator started rate-limiting.
+    // to act on. Checked before anything else — including the proof gate below,
+    // which would otherwise answer an unsigned error with an error of its own,
+    // and the peer would do the same with ours. One failure became a permanent
+    // exchange between two services politely answering each other's errors
+    // once already, and it stopped only when the mediator started
+    // rate-limiting.
     //
     // The reason is logged, not just the fact: a peer's error is often the only
-    // account of what went wrong anywhere in the exchange, and dropping it is
-    // how the original failure stayed undiagnosable.
+    // account of what went wrong anywhere in the exchange.
     //
-    // The prefix comes from `vta_sdk::inbound`, not a literal here. Which URIs
-    // are terminal errors is a fact about the *document*, so it is the same
-    // fact for whoever reads one — this service, the VTA, any other peer — and
-    // a local copy is a second place for it to drift from. The TSP binding
-    // taught that already (see `tsp_binding`). This was that local copy, kept
-    // only until a release carrying `inbound` existed; 0.43 is it.
-    //
-    // The constant rather than `inbound::classify`: classify takes a `Value`
-    // and this path holds a `TrustTask<Value>`, so calling it would mean
-    // serialising every inbound document to read two fields. The prefix is the
-    // part that can drift; the `starts_with` around it is not.
+    // The prefix comes from `vta_sdk::inbound`, not a literal here: which URIs
+    // are terminal errors is a fact about the *document*, the same for whoever
+    // reads one, and a local copy is a second place for it to drift from.
     if type_uri.starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX) {
         let code = doc
             .payload
@@ -2120,12 +1679,115 @@ pub(crate) async fn dispatch_trust_task_doc(
         return Ok(RoutedReply::Suppressed);
     }
 
+    // ── The proof gate. Every document that asks this control plane to *do*
+    //    something — change state, disclose a record, mint a session — must be
+    //    signed by its issuer, addressed here, and fresh; and the issuer must be
+    //    the DID the transport reported (`verify_sender_bound`). From here on
+    //    `principal` — the proven signer — is the only identity anything below
+    //    authorises on. The transport's `sender` is a routing hint, and a
+    //    document whose proof disagrees with it is refused rather than resolved
+    //    in either's favour.
+    //
+    //    The exemptions are the two documents that authorise nothing and that a
+    //    peer must be able to send before it can sign anything useful:
+    //    capability discovery, and asking for an auth challenge.
+    let principal = if is_proofless(&type_uri) {
+        sender.to_string()
+    } else {
+        match verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await {
+            Ok(principal) => principal,
+            Err(e) => {
+                warn!(sender, %type_uri, error = %e, "trust task refused: not bound to its sender");
+                let reason = e.reject_reason();
+                return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                    doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+                ))));
+            }
+        }
+    };
+
+    // Replay gate, keyed on what the proof covers: the proven issuer and the
+    // document id. A captured document re-submitted inside the freshness window
+    // — on any transport, in any framing — is refused as an id conflict.
+    if !is_proofless(&type_uri)
+        && state
+            .replay_cache
+            .check_and_insert(&principal, &doc.id)
+            .is_err()
+    {
+        warn!(did = %principal, doc_id = %doc.id, %type_uri, "trust task refused: replay");
+        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                trust_tasks_rs::RejectReason::IdConflict,
+            ),
+        ))));
+    }
+
+    // Proofs are verified on every path — there is no configuration under
+    // which a proof-bearing document is accepted unverified.
+    let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
+        trust_tasks_rs::ProofPolicy::Verify(verifier);
+
+    // Typed fit-for-purpose DID-management protocol (`did-hosting/*/1.0`).
+    // Takes precedence for its own URIs; runs the framework §7.2 pipeline
+    // with typed payloads (see `crate::trust_tasks_did`).
+    if crate::trust_tasks_did::owns(&type_uri) {
+        let outcome = crate::trust_tasks_did::dispatch::<TransportBoundVerifier>(
+            state, transport, policy, doc,
+        )
+        .await;
+        return Ok(match outcome {
+            DispatchOutcome::Handled(resp) => RoutedReply::Document(
+                serde_json::to_value(&resp).expect("response document serialises"),
+            ),
+            DispatchOutcome::Rejected(err) => RoutedReply::Document(
+                serde_json::to_value(&err).expect("error document serialises"),
+            ),
+            DispatchOutcome::Suppressed => RoutedReply::Suppressed,
+        });
+    }
+
+    // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
+    // check below: the shared `build_dispatcher` does not carry this family —
+    // its context is the ACL keyspace — so an auth document would fall through
+    // to `bridge_did_management`, a table of DID operations that has never
+    // heard of it, and come back a bogus "unknown op".
+    if crate::trust_tasks_auth::owns(&type_uri) {
+        return Ok(RoutedReply::Document(
+            crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
+                .await
+                .ok_or(DIDCommServiceError::Internal(
+                    "auth dispatch produced no reply".into(),
+                ))?,
+        ));
+    }
+
+    // Control↔server infrastructure ops (server registration, health pong,
+    // stats, sync and domain acks). Must be checked *before* the
+    // `bridge_did_management` fallthrough below, which would otherwise hand
+    // them to `dispatch_did_op` — a table of DID operations that has never
+    // heard of them — and answer with a bogus "unknown op" problem report.
+    if crate::trust_tasks_infra::owns(&type_uri) {
+        // The dispatcher stays transport-agnostic; we only tell it which binding
+        // the document came in on so the registry can record what actually moved.
+        let via = did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
+            transport.binding_uri(),
+        );
+        return Ok(
+            match crate::trust_tasks_infra::dispatch(state, &principal, via, doc).await {
+                Some(value) => RoutedReply::Document(value),
+                None => RoutedReply::Suppressed,
+            },
+        );
+    }
+
     let framework_owns = build_dispatcher()
         .registered_uris()
         .contains(&type_uri.as_str());
 
     if !framework_owns {
-        return bridge_did_management(state, sender, my_vid, &doc)
+        return bridge_did_management(state, &principal, my_vid, &doc)
             .await
             .map(RoutedReply::Document);
     }
@@ -2134,13 +1796,6 @@ pub(crate) async fn dispatch_trust_task_doc(
         acl_ks: &state.acl_ks,
         acl_locks: &state.acl_locks,
         my_vid,
-    };
-    let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => trust_tasks_rs::ProofPolicy::Verify(v),
-        _ => trust_tasks_rs::ProofPolicy::RejectIfPresent,
     };
 
     // The framework path, and the only one whose outcome carries a reject code
@@ -2151,15 +1806,38 @@ pub(crate) async fn dispatch_trust_task_doc(
     )))
 }
 
+/// The only Type URIs [`dispatch_trust_task_doc`] routes without a proof.
+///
+/// Both authorise nothing: discovery lists what this service implements, and a
+/// challenge request only creates the nonce a peer must then sign to
+/// authenticate. Everything else — ACL reads included — is privileged.
+pub(crate) fn is_proofless(type_uri: &str) -> bool {
+    use trust_tasks_rs::Payload;
+    type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
+        || type_uri == trust_tasks_rs::specs::auth::challenge::v0_1::Payload::TYPE_URI
+}
+
+/// The shared proof verifier, or an error when none is configured — without
+/// one no privileged document can be accepted, so dispatch refuses outright.
+pub(crate) fn require_verifier(
+    state: &AppState,
+) -> Result<&did_hosting_common::server::trust_tasks::TransportBoundVerifier, DIDCommServiceError> {
+    state.trust_tasks_verifier.as_deref().ok_or_else(|| {
+        DIDCommServiceError::Internal(
+            "no trust-task proof verifier configured (a DID resolver is required)".into(),
+        )
+    })
+}
+
 /// Bridge a legacy DID-management Trust Task document to the shared
 /// [`dispatch_did_op`] table.
 ///
 /// The DID-management ops (`did_ops::*`) are bound to the control plane's
 /// `AppState`, so they cannot move into the crate-agnostic framework
 /// dispatcher — but `dispatch_did_op` is *already* transport-agnostic (it
-/// reads only `msg.typ` + `msg.body`). We ACL-authenticate the
-/// transport-proven sender (as the DIDComm / HTTP-signed transports do),
-/// synthesise a `Message` from the Trust Task document (`type_uri` →
+/// reads only `msg.typ` + `msg.body`). We ACL-check `sender` — the
+/// document's proven issuer, established by [`dispatch_trust_task_doc`]'s
+/// proof gate before this is reached — synthesise a `Message` from the Trust Task document (`type_uri` →
 /// `typ`, `payload` → `body`), dispatch, and wrap the `(response_type,
 /// body)` back into a Trust Task `#response` document.
 pub(crate) async fn bridge_did_management(
@@ -2919,97 +2597,6 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
     }
 
-    /// Build an `AppState` plus a seeded ACL entry and a real `JwtKeys`,
-    /// so the authenticate pipeline produces decodable tokens. The ACL
-    /// step gates everything downstream — without it, `run_authenticate`
-    /// short-circuits with a problem report.
-    async fn auth_ready_state(
-        sender_did: &str,
-        role: Role,
-    ) -> (AppState, tempfile::TempDir, Arc<crate::auth::jwt::JwtKeys>) {
-        let (mut state, dir) = test_state().await;
-
-        store_acl_entry(
-            &state.acl_ks,
-            &AclEntry {
-                did: sender_did.into(),
-                role,
-                label: None,
-                created_at: 0,
-                max_total_size: None,
-                max_did_count: None,
-
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            },
-        )
-        .await
-        .unwrap();
-
-        let keys = Arc::new(
-            crate::auth::jwt::JwtKeys::from_ed25519_bytes(&[3u8; 32])
-                .expect("test JWT keys construct"),
-        );
-        state.jwt_keys = Some(keys.clone());
-        (state, dir, keys)
-    }
-
-    /// Successful `MSG_AUTHENTICATE` flow: ACL allows, session is created,
-    /// the response is `MSG_AUTH_RESPONSE` with a JWT that decodes back to
-    /// the caller's DID + role. Pins both the wire-level body shape and
-    /// the JWT contents the SDK relies on.
-    #[tokio::test]
-    async fn run_authenticate_authorized_returns_decodable_jwt() {
-        let sender = "did:example:caller-a";
-        let (state, _dir, keys) = auth_ready_state(sender, Role::Owner).await;
-
-        let (typ, body) = run_authenticate(&state, sender)
-            .await
-            .expect("authenticate must not fail when ACL + JWT are configured");
-        assert_eq!(typ, MSG_AUTH_RESPONSE);
-
-        let session_id = body
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .expect("session_id present");
-        assert!(!session_id.is_empty());
-
-        let access = body
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .expect("access_token present");
-        let claims = keys.decode(access).expect("access token decodes");
-        assert_eq!(claims.sub, sender);
-        assert_eq!(claims.aud, "WebVH");
-        assert_eq!(claims.role, "owner");
-        assert_eq!(claims.session_id, session_id);
-        assert!(claims.exp > claims.iat);
-        assert!(!claims.jti.is_empty());
-
-        // Refresh token is opaque; just assert it's present.
-        assert!(
-            body.get("refresh_token").and_then(|v| v.as_str()).is_some(),
-            "refresh_token missing"
-        );
-    }
-
-    /// `MSG_AUTHENTICATE` from a DID that isn't in the ACL must surface as
-    /// a problem-report body with `e.p.did.unauthorized` — never as a
-    /// `MSG_AUTH_RESPONSE`. Pinning this prevents an ACL bypass from
-    /// silently still issuing a JWT.
-    #[tokio::test]
-    async fn run_authenticate_unauthorized_did_returns_problem_report() {
-        let (state, _dir, _keys) = auth_ready_state("did:example:authorized", Role::Owner).await;
-
-        let (typ, body) = run_authenticate(&state, "did:example:stranger")
-            .await
-            .unwrap();
-        assert_eq!(typ, MSG_PROBLEM_REPORT);
-        assert_eq!(
-            body.get("code").and_then(|v| v.as_str()),
-            Some("e.p.did.unauthorized")
-        );
-    }
-
     /// An unrouted type is answered, not dropped. Dropping it is what made the
     /// #144 retirements expensive: the caller learned nothing for 30s and then
     /// reported a bare gateway timeout. The reply must name the type, or the
@@ -3058,6 +2645,11 @@ mod tests {
             "https://trusttasks.org/spec/did-management/agent-name/set/0.1",
             "https://trusttasks.org/spec/did-management/agent-name/enable/0.1",
             "https://trusttasks.org/spec/did-management/agent-name/disable/0.1",
+            // Bare-message forms of ops that now travel only as signed Trust
+            // Task documents inside the envelope.
+            MSG_AUTHENTICATE,
+            MSG_DELETE,
+            MSG_SERVER_REGISTER,
         ] {
             let (typ, body) = run_unsupported_task(retired);
             assert_eq!(typ, MSG_PROBLEM_REPORT, "{retired}");
@@ -3068,87 +2660,6 @@ mod tests {
                 "{retired} must be named in the reply"
             );
         }
-    }
-
-    /// `run_webvh_dispatch` mirrors the `handle_webvh_message` wrapper:
-    /// non-ACL'd senders get a problem report with `e.p.did.unauthorized`
-    /// regardless of the request shape. Pins the auth gate at the
-    /// dispatcher level (defense-in-depth alongside `MessagePolicy`).
-    #[tokio::test]
-    async fn run_webvh_dispatch_unauthorized_sender_problem_report() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-
-        let (typ, body) = run_webvh_dispatch(&state, "did:example:stranger", &msg).await;
-        assert_eq!(typ, MSG_PROBLEM_REPORT);
-        assert_eq!(
-            body.get("code").and_then(|v| v.as_str()),
-            Some("e.p.did.unauthorized")
-        );
-    }
-
-    /// Replay gate: re-submitting the same `(sender, msg.id)` after a
-    /// successful dispatch surfaces as `e.p.did.validation-error` with
-    /// a "replay-detected" comment. Pinning this at the wrapper level
-    /// catches a regression where the replay cache is not consulted
-    /// before dispatch (e.g. a future refactor that moves the cache
-    /// check into a per-arm handler).
-    #[tokio::test]
-    async fn run_webvh_dispatch_replay_rejected() {
-        let sender = "did:example:authorized";
-        let (state, _dir, _keys) = auth_ready_state(sender, Role::Owner).await;
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-
-        // First call goes through.
-        let (typ, _) = run_webvh_dispatch(&state, sender, &msg).await;
-        assert_eq!(typ, MSG_LIST);
-
-        // Same `(sender, msg.id)` — replay.
-        let (typ, body) = run_webvh_dispatch(&state, sender, &msg).await;
-        assert_eq!(typ, MSG_PROBLEM_REPORT);
-        assert_eq!(
-            body.get("code").and_then(|v| v.as_str()),
-            Some("e.p.did.validation-error")
-        );
-        let comment = body.get("comment").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(
-            comment.contains("replay-detected"),
-            "replay rejection should mention 'replay-detected', got: {comment}"
-        );
-    }
-
-    /// ACL'd `MSG_LIST_REQUEST` from a sender with no DIDs returns
-    /// `MSG_LIST` with an empty array — full happy-path through the ACL
-    /// gate + dispatcher.
-    #[tokio::test]
-    async fn run_webvh_dispatch_authorized_list_returns_empty() {
-        let sender = "did:example:authorized";
-        let (state, _dir, _keys) = auth_ready_state(sender, Role::Owner).await;
-
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-        let (typ, body) = run_webvh_dispatch(&state, sender, &msg).await;
-        assert_eq!(typ, MSG_LIST);
-        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
-        assert!(dids.is_empty());
-    }
-
-    /// Validation errors from `dispatch_did_op` get translated into the
-    /// right protocol code by `map_app_error_code`. Covers the wrapper's
-    /// glue path between dispatcher and wire-level error reporting.
-    #[tokio::test]
-    async fn run_webvh_dispatch_validation_error_maps_to_protocol_code() {
-        let sender = "did:example:authorized";
-        let (state, _dir, _keys) = auth_ready_state(sender, Role::Owner).await;
-
-        // Missing `mnemonic` — `dispatch_did_op` returns Validation,
-        // wrapper wraps as MSG_PROBLEM_REPORT with e.p.did.validation-error.
-        let msg = build_msg(MSG_INFO_REQUEST, json!({}));
-        let (typ, body) = run_webvh_dispatch(&state, sender, &msg).await;
-        assert_eq!(typ, MSG_PROBLEM_REPORT);
-        assert_eq!(
-            body.get("code").and_then(|v| v.as_str()),
-            Some("e.p.did.validation-error")
-        );
     }
 
     /// Pin the AppError → DIDComm protocol-code mapping. The handler set is
@@ -3803,44 +3314,24 @@ mod tests {
     // ATM-backed context.
     // -----------------------------------------------------------------
 
-    fn build_list_envelope(issuer_did: &str) -> Message {
-        use trust_tasks_rs::specs::acl::list::v0_1 as list;
-        // `#[non_exhaustive]` from trust-tasks 0.17 on: every field of this
-        // list request is optional and left unset, so the builder takes no
-        // calls at all.
-        let payload: list::Payload = list::Payload::builder()
-            .try_into()
-            .expect("empty list payload is well formed");
-        let mut doc = trust_tasks_rs::TrustTask::for_payload(
-            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-            payload,
-        );
-        doc.issuer = Some(issuer_did.into());
-        doc.recipient = Some("did:webvh:test:control.example.com".into());
-        doc.issued_at = Some(chrono::Utc::now());
+    const CONTROL: &str = "did:webvh:test:control.example.com";
 
-        let body = serde_json::to_value(&doc).expect("envelope serialises");
-        build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, body)
+    /// `test_state` with the production verifier over the local `did:key`
+    /// resolver, so signed envelopes verify without I/O.
+    async fn signing_state() -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = test_state().await;
+        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
+            Arc::new(DidKeyResolver),
+        )));
+        (state, dir)
     }
 
-    /// Happy-path envelope dispatch. Exercises the `acl/list/0.1`
-    /// flow (a RECOMMENDED spec — proofless requests are valid under
-    /// the framework's IS_PROOF_REQUIRED enforcement). REQUIRED specs
-    /// (`acl/grant`, `acl/revoke`, `acl/change-role`) require a real
-    /// Data Integrity proof; the signed end-to-end coverage for that
-    /// enforcement lives in `trust_tasks_envelope_signed_acl_grant_*`
-    /// below, and the signed request→decision round trip of the
-    /// consent family in the `task_consent_signed_round_trip` /
-    /// `task_consent_decision_*` tests.
-    #[tokio::test]
-    async fn trust_tasks_envelope_happy_path_list_returns_handled_response() {
-        let (state, _dir) = test_state().await;
-        // Seed an Admin so list authorises (list rejects non-Admin).
+    async fn seed_role(state: &AppState, did: &str, role: Role) {
         store_acl_entry(
             &state.acl_ks,
             &AclEntry {
-                did: "did:example:admin".into(),
-                role: Role::Admin,
+                did: did.into(),
+                role,
                 label: None,
                 created_at: 1_700_000_000,
                 max_total_size: None,
@@ -3850,24 +3341,99 @@ mod tests {
         )
         .await
         .unwrap();
+    }
 
-        let msg = build_list_envelope("did:example:admin");
+    /// An unsigned request document from `issuer` to the control plane.
+    fn request_doc(type_uri: &str, issuer: Option<&str>, payload: Value) -> Value {
+        let mut doc = json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": type_uri,
+            "recipient": CONTROL,
+            // Whole seconds, `Z`: the form the typed document re-serialises
+            // to, so the signature over this JSON still covers it.
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": payload,
+        });
+        if let Some(issuer) = issuer {
+            doc["issuer"] = json!(issuer);
+        }
+        doc
+    }
+
+    async fn sign(doc: Value, signer: &affinidi_tdk::secrets_resolver::secrets::Secret) -> Value {
+        crate::signing::sign_trust_task_document(doc, signer)
+            .await
+            .expect("sign")
+    }
+
+    fn envelope(body: Value) -> Message {
+        // A fresh DIDComm message id each time: replay protection must not
+        // depend on the transport's id.
+        Message::build(
+            uuid::Uuid::new_v4().to_string(),
+            trust_tasks_didcomm::ENVELOPE_TYPE.to_string(),
+            body,
+        )
+        .finalize()
+    }
+
+    async fn dispatch_envelope(state: &AppState, sender: &str, body: Value) -> Value {
         let (resp_type, resp_body) =
-            super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
+            super::run_trust_tasks_envelope(state, sender, &envelope(body))
                 .await
                 .expect("dispatch returns Ok")
                 .expect("envelope produces a response");
-
         assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
-        let inner_type = resp_body["type"].as_str().unwrap();
+        resp_body
+    }
+
+    fn list_payload() -> Value {
+        json!({})
+    }
+
+    /// Happy path: an ACL read (`acl/list/0.1`) signed by the Admin it names.
+    #[tokio::test]
+    async fn trust_tasks_envelope_happy_path_list_returns_handled_response() {
+        let (state, _dir) = signing_state().await;
+        let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[21u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
+
+        let doc = sign(
+            request_doc(
+                "https://trusttasks.org/spec/acl/list/0.1",
+                Some(&admin),
+                list_payload(),
+            ),
+            &admin_key,
+        )
+        .await;
+        let resp = dispatch_envelope(&state, &admin, doc).await;
+
+        let inner_type = resp["type"].as_str().unwrap();
         assert!(
             inner_type.ends_with("/acl/list/0.1#response"),
             "expected acl/list response type, got {inner_type}"
         );
-        // The single seeded Admin should appear in the response.
-        let entries = resp_body["payload"]["entries"].as_array().unwrap();
+        let entries = resp["payload"]["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["subject"], "did:example:admin");
+        assert_eq!(entries[0]["subject"], admin.as_str());
+    }
+
+    /// An ACL read is privileged: without a proof it is refused even from an
+    /// Admin sender.
+    #[tokio::test]
+    async fn trust_tasks_envelope_unsigned_acl_read_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let (admin, _) = crate::signing::test_util::did_key_signer(&[21u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
+
+        let doc = request_doc(
+            "https://trusttasks.org/spec/acl/list/0.1",
+            Some(&admin),
+            list_payload(),
+        );
+        let resp = dispatch_envelope(&state, &admin, doc).await;
+        assert_eq!(resp["payload"]["code"], "proofRequired", "{resp}");
     }
 
     #[tokio::test]
@@ -3895,137 +3461,256 @@ mod tests {
         assert_eq!(resp_body["payload"]["code"], "malformedRequest");
     }
 
-    /// A DID-management op (`did/check-name`) delivered as a Trust Task
-    /// *envelope* over DIDComm is bridged to `dispatch_did_op` by the unified
-    /// `dispatch_trust_task_doc` router — proving DID-management is now a
-    /// first-class trust task over DIDComm too, not just via legacy `MSG_*`.
+    /// A signed DID-management op (`did/check-name`) in the envelope is bridged
+    /// to `dispatch_did_op` and answered to its signer.
     #[tokio::test]
     async fn trust_tasks_envelope_bridges_did_management() {
-        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+        let (state, _dir) = signing_state().await;
+        let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[22u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
 
-        let (state, _dir) = test_state().await;
-        let sender = "did:example:admin";
-        store_acl_entry(
-            &state.acl_ks,
-            &AclEntry {
-                did: sender.into(),
-                role: Role::Admin,
-                label: None,
-                created_at: 1_700_000_000,
-                max_total_size: None,
-                max_did_count: None,
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            },
+        let doc = sign(
+            request_doc(
+                MSG_DID_REQUEST,
+                Some(&admin),
+                json!({ "path": "bob", "reserve": false }),
+            ),
+            &admin_key,
         )
-        .await
-        .unwrap();
+        .await;
+        let resp = dispatch_envelope(&state, &admin, doc).await;
 
-        // The envelope body IS the DID-management Trust Task document.
-        let msg = build_msg(
-            trust_tasks_didcomm::ENVELOPE_TYPE,
-            json!({
-                "id": "urn:uuid:33333333-3333-3333-3333-333333333333",
-                "type": "https://trusttasks.org/spec/did-management/did/check-name/0.1",
-                "recipient": "did:webvh:test:control.example.com",
-                "issuedAt": "2026-07-06T00:00:00Z",
-                "payload": { "path": "bob", "reserve": false }
-            }),
-        );
-        let (resp_type, resp_body) = super::run_trust_tasks_envelope(&state, sender, &msg)
-            .await
-            .expect("dispatch ok")
-            .expect("a response is emitted");
-
-        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
         assert_eq!(
-            resp_body["type"],
+            resp["type"],
             "https://trusttasks.org/spec/did-management/did/check-name/0.1#response"
         );
-        assert_eq!(resp_body["payload"]["available"], true);
-        assert_eq!(resp_body["issuer"], "did:webvh:test:control.example.com");
-        assert_eq!(resp_body["recipient"], sender);
+        assert_eq!(resp["payload"]["available"], true);
+        assert_eq!(resp["issuer"], CONTROL);
+        assert_eq!(resp["recipient"], admin.as_str());
     }
 
-    /// A replayed envelope is refused, with the *same* `e.p.did.replay-detected`
-    /// problem report the bare `MSG_*` path emits.
-    ///
-    /// This is the gate that made it safe to move DID-management traffic onto
-    /// the envelope binding. `bridge_did_management` hands an envelope's
-    /// document to the same `dispatch_did_op` table the bare types use, so
-    /// without this the two DIDComm framings reached identical state-changing
-    /// operations with non-identical replay protection — and a client switching
-    /// framing would have silently lost it. Uses a destructive op (`did/delete`)
-    /// because that is precisely what `replay.rs` exists to stop being replayed.
+    /// The unsigned form of the same op — what every DIDComm client sent before
+    /// — is refused, and refused *before* the ACL is consulted, so an Admin
+    /// sender name on the envelope buys nothing.
     #[tokio::test]
-    async fn trust_tasks_envelope_replay_is_refused_like_the_bare_path() {
-        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+    async fn trust_tasks_envelope_unsigned_did_management_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let admin = "did:example:admin";
+        seed_role(&state, admin, Role::Admin).await;
+        seed_did(&state, admin, "victim").await;
 
-        let (state, _dir) = test_state().await;
-        let sender = "did:example:admin";
-        store_acl_entry(
-            &state.acl_ks,
-            &AclEntry {
-                did: sender.into(),
-                role: Role::Admin,
-                label: None,
-                created_at: 1_700_000_000,
-                max_total_size: None,
-                max_did_count: None,
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            },
+        let doc = request_doc(MSG_DELETE, Some(admin), json!({ "mnemonic": "victim" }));
+        let resp = dispatch_envelope(&state, admin, doc).await;
+        assert_eq!(resp["payload"]["code"], "proofRequired", "{resp}");
+        assert!(
+            state
+                .dids_ks
+                .get::<did_hosting_common::did_ops::DidRecord>(did_key("victim"))
+                .await
+                .unwrap()
+                .is_some(),
+            "nothing was deleted"
+        );
+    }
+
+    /// A validly-signed document from one DID, delivered under another DID's
+    /// name (an Admin's), is refused: the proof's issuer and the transport's
+    /// reported sender disagree, and the reported sender is never enough.
+    #[tokio::test]
+    async fn trust_tasks_envelope_proof_from_someone_else_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let admin = "did:example:admin";
+        seed_role(&state, admin, Role::Admin).await;
+        seed_did(&state, admin, "victim").await;
+        let (attacker, attacker_key) = crate::signing::test_util::did_key_signer(&[66u8; 32]);
+
+        let doc = sign(
+            request_doc(MSG_DELETE, Some(&attacker), json!({ "mnemonic": "victim" })),
+            &attacker_key,
         )
-        .await
-        .unwrap();
-        seed_did(&state, sender, "replayed").await;
+        .await;
+        let resp = dispatch_envelope(&state, admin, doc).await;
+        assert_eq!(resp["payload"]["code"], "permissionDenied", "{resp}");
+        assert!(
+            state
+                .dids_ks
+                .get::<did_hosting_common::did_ops::DidRecord>(did_key("victim"))
+                .await
+                .unwrap()
+                .is_some(),
+            "nothing was deleted"
+        );
+    }
 
-        // `build_msg` pins a constant `msg.id`, so sending the same envelope
-        // twice IS the replay — exactly the captured-and-resubmitted shape the
-        // freshness window cannot catch on its own.
-        let envelope = || {
-            build_msg(
-                trust_tasks_didcomm::ENVELOPE_TYPE,
-                json!({
-                    "id": "urn:uuid:44444444-4444-4444-4444-444444444444",
-                    "type": "https://trusttasks.org/spec/did-management/did/delete/0.1",
-                    "recipient": "did:webvh:test:control.example.com",
-                    "issuedAt": "2026-07-06T00:00:00Z",
-                    "payload": { "mnemonic": "replayed" }
-                }),
-            )
-        };
+    /// The `acl/grant` shape that would otherwise mint a permanent Admin: a
+    /// valid proof by the attacker, no in-band `issuer`, an Admin's name on the
+    /// envelope. Refused — an issuer-less proof verifies as nobody.
+    #[tokio::test]
+    async fn trust_tasks_envelope_issuerless_grant_under_admin_name_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let admin = "did:example:admin";
+        seed_role(&state, admin, Role::Admin).await;
+        let (attacker, attacker_key) = crate::signing::test_util::did_key_signer(&[66u8; 32]);
 
-        let (_, first) = super::run_trust_tasks_envelope(&state, sender, &envelope())
-            .await
-            .expect("dispatch ok")
-            .expect("a response is emitted");
+        // Sign with an issuer (the signer insists), then strip it: the proof
+        // is still a valid signature by the attacker over the rest.
+        let mut signed = sign(
+            request_doc(
+                "https://trusttasks.org/spec/acl/grant/0.1",
+                Some(&attacker),
+                json!({ "entry": { "subject": attacker, "role": "admin" } }),
+            ),
+            &attacker_key,
+        )
+        .await;
+        signed.as_object_mut().unwrap().remove("issuer");
+        let resp = dispatch_envelope(&state, admin, signed).await;
         assert_ne!(
-            first["type"], MSG_PROBLEM_REPORT,
+            resp["type"].as_str().unwrap_or(""),
+            "https://trusttasks.org/spec/acl/grant/0.1#response",
+            "{resp}"
+        );
+        assert!(
+            did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &attacker)
+                .await
+                .unwrap()
+                .is_none(),
+            "no ACL entry was created for the attacker"
+        );
+    }
+
+    /// Replaying a captured signed document is refused, even wrapped in a fresh
+    /// DIDComm message — the gate keys on the proven issuer and the document
+    /// id, both covered by the proof. Uses a destructive op because that is
+    /// what replay protection exists for.
+    #[tokio::test]
+    async fn trust_tasks_envelope_replay_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[23u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
+        seed_did(&state, &admin, "replayed").await;
+
+        let doc = sign(
+            request_doc(MSG_DELETE, Some(&admin), json!({ "mnemonic": "replayed" })),
+            &admin_key,
+        )
+        .await;
+
+        let first = dispatch_envelope(&state, &admin, doc.clone()).await;
+        assert_eq!(
+            first["type"], MSG_DELETE_CONFIRM,
             "the first delivery must be handled, not rejected: {first}"
         );
 
-        let (resp_type, replayed) = super::run_trust_tasks_envelope(&state, sender, &envelope())
-            .await
-            .expect("dispatch ok")
-            .expect("the replay is answered, not dropped");
+        let replayed = dispatch_envelope(&state, &admin, doc).await;
+        assert_eq!(replayed["payload"]["code"], "idConflict", "{replayed}");
+    }
 
-        // Still a well-formed envelope carrying a Trust Task document — a
-        // rejection the sender can read, not a silent drop.
-        assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
-        assert_eq!(replayed["type"], MSG_PROBLEM_REPORT);
+    fn register_payload() -> Value {
+        json!({
+            "public_url": "https://edge.example",
+            "label": "edge",
+            "trust_task_capable": true,
+        })
+    }
 
-        // Byte-for-byte the code `run_webvh_dispatch_replay_rejected` pins on
-        // the bare path. Untagged `AppError::Validation` maps to the generic
-        // code, so the `replay-detected` marker rides the comment — that is the
-        // observed behaviour on both paths, and identical behaviour is the
-        // property under test. (`replay.rs`'s doc comment still advertises a
-        // dedicated `e.p.did.replay-detected` code; nothing emits it, on either
-        // path, and correcting that claim is out of scope here.)
-        assert_eq!(replayed["payload"]["code"], "e.p.did.validation-error");
-        let comment = replayed["payload"]["comment"].as_str().unwrap_or("");
+    /// A server registers only on its own signature. Unsigned, the document is
+    /// refused even when the reported sender holds the Service role — the
+    /// registration would otherwise enrol the sender as a sync target for every
+    /// tenant's DIDs on a name alone.
+    #[tokio::test]
+    async fn unsigned_server_registration_is_refused() {
+        let (state, _dir) = signing_state().await;
+        let edge = "did:example:edge";
+        seed_role(&state, edge, Role::Service).await;
+
+        let doc = request_doc(MSG_SERVER_REGISTER, Some(edge), register_payload());
+        let resp = dispatch_envelope(&state, edge, doc).await;
+        assert_eq!(resp["payload"]["code"], "proofRequired", "{resp}");
         assert!(
-            comment.contains("replay-detected"),
-            "replay rejection should mention 'replay-detected', got: {comment}"
+            crate::registry::get_instance(&state.registry_ks, &edge.replace(':', "_"))
+                .await
+                .unwrap()
+                .is_none(),
+            "no instance was registered"
         );
+    }
+
+    /// The normal flow: a Service-role edge signs its registration and is
+    /// registered and acknowledged.
+    #[tokio::test]
+    async fn signed_server_registration_is_accepted() {
+        let (state, _dir) = signing_state().await;
+        let (edge, edge_key) = crate::signing::test_util::did_key_signer(&[41u8; 32]);
+        seed_role(&state, &edge, Role::Service).await;
+
+        let doc = sign(
+            request_doc(MSG_SERVER_REGISTER, Some(&edge), register_payload()),
+            &edge_key,
+        )
+        .await;
+        let resp = dispatch_envelope(&state, &edge, doc).await;
+        assert_eq!(resp["type"], MSG_SERVER_REGISTER_ACK, "{resp}");
+        assert!(
+            crate::registry::get_instance(&state.registry_ks, &edge.replace(':', "_"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the signing edge was registered"
+        );
+    }
+
+    /// A signed pong from a DID without the Service role changes nothing: the
+    /// registry's liveness view is not writable by any DID that can sign.
+    #[tokio::test]
+    async fn health_pong_from_a_non_service_signer_is_ignored() {
+        use crate::registry::{ServiceInstance, ServiceStatus, ServiceType};
+
+        let (state, _dir) = signing_state().await;
+        let (edge, edge_key) = crate::signing::test_util::did_key_signer(&[42u8; 32]);
+        seed_role(&state, &edge, Role::Owner).await;
+        let instance_id = edge.replace(':', "_");
+        crate::registry::register_instance(
+            &state.registry_ks,
+            &ServiceInstance {
+                instance_id: instance_id.clone(),
+                service_type: ServiceType::Server,
+                label: None,
+                url: "https://edge.example".into(),
+                status: ServiceStatus::Unreachable,
+                last_health_check: None,
+                registered_at: 0,
+                metadata: json!({ "did": edge }),
+                enabled_methods: vec![],
+                served_domains: vec![],
+                protocol_version: "1.0".into(),
+                advertised_services: None,
+                services_checked_at: None,
+                trust_task_capable: true,
+                sync_batch_capable: false,
+                last_inbound_transport: None,
+                last_inbound_at: None,
+                last_outbound_transport: None,
+                last_outbound_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let doc = sign(
+            request_doc(MSG_HEALTH_PONG, Some(&edge), json!({ "status": "ok" })),
+            &edge_key,
+        )
+        .await;
+        let out = super::run_trust_tasks_envelope(&state, &edge, &envelope(doc))
+            .await
+            .expect("dispatch ok");
+        assert!(out.is_none(), "a pong is terminal");
+        let inst = crate::registry::get_instance(&state.registry_ks, &instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inst.status, ServiceStatus::Unreachable, "status unchanged");
     }
 
     #[tokio::test]
@@ -4053,7 +3738,11 @@ mod tests {
         };
         state.config = Arc::new(cfg);
 
-        let msg = build_list_envelope("did:example:admin");
+        let msg = envelope(request_doc(
+            "https://trusttasks.org/spec/acl/list/0.1",
+            Some("did:example:admin"),
+            list_payload(),
+        ));
         let err = super::run_trust_tasks_envelope(&state, "did:example:admin", &msg)
             .await
             .expect_err("missing server_did should fail");

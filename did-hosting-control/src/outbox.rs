@@ -41,11 +41,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::{KS_OUTBOUND_QUEUE, KeyspaceHandle, Store};
+use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, watch};
@@ -250,85 +251,62 @@ pub async fn record_failure(
     outbox_ks(store)?.insert(key, &next).await
 }
 
-/// Send one entry via the messaging service. Pulled out so tests can
-/// substitute a mock service when the time comes.
+/// The signed Trust Task document an outbox entry is delivered as.
 ///
-/// Prefers **TSP** when the target's DID document advertises a
-/// `TSPTransport` service (peers prefer TSP over DIDComm — see
-/// `didcomm_profile::resolve_transport`), falling back to DIDComm
-/// otherwise. Over TSP the DIDComm `Message` is serialised and sent as the
-/// sealed frame payload; the receiving server's `ServerTspHandler`
-/// deserialises it back and applies it through the same `do_*` cores.
+/// Built — and signed — at delivery time, not at enqueue time, so a retried
+/// entry carries a fresh `issuedAt` and never ages out of the receiver's
+/// freshness window while it waits in the queue. The receiving edge applies it
+/// only if the proof binds it to this control plane (`verify_control_plane`),
+/// so an entry this node cannot sign is not sent at all.
+pub async fn signed_document(
+    control_did: &str,
+    entry: &OutboxEntry,
+    signer: &Secret,
+) -> Result<trust_tasks_rs::TrustTask<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    // Entries queued before the upsert op moved onto a Trust Task Type URI.
+    let type_uri = match entry.msg_type.as_str() {
+        did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT_LEGACY => {
+            did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT
+        }
+        other => other,
+    };
+    build_signed_request(
+        type_uri,
+        control_did,
+        &entry.target_did,
+        entry.body.clone(),
+        signer,
+    )
+    .await
+}
+
+/// Send one entry via the messaging service, as a signed Trust Task document.
+///
+/// The binding follows the target's DID document (`send_trust_task`): a TSP
+/// frame when it advertises `TSPTransport`, else the DIDComm trust-task
+/// envelope, with the same TSP→DIDComm fallback as every other trust-task send.
 async fn deliver(
     didcomm: &DIDCommService,
     control_did: &str,
     entry: &OutboxEntry,
+    signer: &Secret,
     fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let msg = Message::build(
-        uuid::Uuid::new_v4().to_string(),
-        entry.msg_type.clone(),
-        entry.body.clone(),
+    let doc = signed_document(control_did, entry, signer).await?;
+    send_trust_task(
+        didcomm,
+        "control",
+        control_did,
+        &entry.target_did,
+        &doc,
+        fallback,
+        did_resolver,
     )
-    .from(control_did.to_string())
-    .to(entry.target_did.clone())
-    .created_time(now_epoch())
-    .finalize();
-
-    use did_hosting_common::server::didcomm_profile::{PeerTransport, resolve_send_binding};
-
-    match resolve_send_binding(&entry.target_did, fallback, did_resolver).await {
-        Some((PeerTransport::Tsp, _)) => {
-            // `to_vec` borrows `msg`, so it stays owned for the DIDComm
-            // fallback below.
-            let payload = serde_json::to_vec(&msg)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            match didcomm
-                .send_tsp("control", &entry.target_did, &payload)
-                .await
-            {
-                Ok(()) => Ok(()),
-                // Graceful degradation: if the TSP send fails (e.g. this
-                // node has no TSP connection, or the mediator rejects the
-                // frame), fall back to DIDComm. The VTA webvh templates
-                // advertise *both* `TSPTransport` and `DIDCommMessaging`
-                // for any mediator-connected DID, so a DIDComm endpoint is
-                // available for every TSP-advertising target. This keeps
-                // mixed / partially-upgraded fleets from getting stuck on
-                // TSP delivery failures.
-                Err(tsp_err) => {
-                    warn!(
-                        target_did = %entry.target_did,
-                        msg_type = %entry.msg_type,
-                        error = %tsp_err,
-                        "outbox: TSP send failed — falling back to DIDComm"
-                    );
-                    didcomm
-                        .send_message("control", msg, &entry.target_did)
-                        .await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                }
-            }
-        }
-        Some((PeerTransport::Didcomm, _)) => didcomm
-            .send_message("control", msg, &entry.target_did)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-        // No binding: target advertises no transport and control has no
-        // configured mediator to fall back on. This was previously a blind
-        // DIDComm send; it could never route, so it is now a delivery error
-        // the outbox records and retries rather than a silent black hole.
-        None => Err(format!(
-            "no route to {}: target advertises no messaging transport and no mediator is configured",
-            entry.target_did
-        )
-        .into()),
-    }
+    .await
+    .map(|_| ())
 }
 
-/// Outcome of one tick. Exposed so tests + `info!` callsites can
-/// surface concrete counts.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
     pub delivered: u64,
@@ -357,6 +335,16 @@ pub async fn run_tick(state: &AppState) -> TickReport {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "outbox tick: list_targets failed");
+            return TickReport::default();
+        }
+    };
+
+    // Every entry goes out signed; without the key there is nothing an edge
+    // would accept, so leave the queue intact for a later tick.
+    let signer = match crate::signing::control_assertion_secret(state, &control_did) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "outbox tick: cannot sign outbound documents; skipping");
             return TickReport::default();
         }
     };
@@ -408,6 +396,7 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                 &svc,
                 &control_did,
                 &entry,
+                &signer,
                 &fallback,
                 state.did_resolver.as_ref(),
             )
