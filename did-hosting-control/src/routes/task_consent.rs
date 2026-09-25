@@ -38,7 +38,7 @@
 //! request was sent to AND the proof verifies against that same DID.
 //! The *request* leg carries the spec's REQUIRED Data Integrity proof,
 //! signed by the control plane's own DID key (`eddsa-jcs-2022`,
-//! `proofPurpose: assertionMethod`, `issuer` == the DID of
+//! `proofPurpose: authentication`, `issuer` == the DID of
 //! `proof.verificationMethod` == the control DID) — see
 //! [`crate::signing`]. The wallet verifies that proof before rendering
 //! `note`/`effects`; the authcrypt envelope additionally binds the
@@ -164,8 +164,8 @@ fn encode_digest_multibase(digest: &[u8]) -> String {
 /// action) and `consequences` says so; the admin's `action` rides
 /// verbatim in the explicitly-untrusted `note`. The document carries the
 /// spec's REQUIRED Data Integrity proof: `eddsa-jcs-2022`,
-/// `proofPurpose: assertionMethod`, signed by `signing_secret` (the
-/// control DID's assertion key, so `issuer` equals the DID of
+/// `proofPurpose: authentication`, signed by `signing_secret` (the
+/// control DID's operational key, so `issuer` equals the DID of
 /// `proof.verificationMethod`).
 ///
 /// `pub(crate)` (with [`wire_digest`]) so the round-trip tests in
@@ -263,9 +263,9 @@ pub async fn request(
         .get()
         .ok_or_else(|| AppError::Internal("DIDComm service not started".into()))?;
 
-    // The control DID's assertion key — resolved before anything is
+    // The control DID's operational key — resolved before anything is
     // registered, so a missing key fails the request cleanly.
-    let signing_secret = crate::signing::control_assertion_secret(&state, &control_did)?;
+    let signing_secret = crate::signing::control_signing_secret(&state, &control_did)?;
 
     // Fresh 16-byte (128-bit) challenge, hex-encoded — the spec's
     // entropy floor, and the digest salt.
@@ -480,14 +480,15 @@ mod tests {
         .await
         .expect("build + sign");
 
-        // The proof names the assertion key of the issuer DID.
+        // The proof names the operational key of the issuer DID.
         assert_eq!(document["issuer"], control_did);
         let vm = document["proof"]["verificationMethod"]
             .as_str()
             .expect("proof carries a verificationMethod");
         assert_eq!(vm.split('#').next().unwrap(), control_did);
         assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
-        assert_eq!(document["proof"]["proofPurpose"], "assertionMethod");
+        // A request is the service's operational message, not an attestation.
+        assert_eq!(document["proof"]["proofPurpose"], "authentication");
 
         // The proof verifies under the shared verifier (which also
         // enforces the issuer ↔ verificationMethod binding).

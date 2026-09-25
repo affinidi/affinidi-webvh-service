@@ -218,6 +218,11 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   gate.
 - **Replies are signed** (`seal_reply` on both sides) — every non-error
   trust-task response, every transport; only `trust-task-error` stays unsigned.
+  No signing identity → the control plane refuses to start
+  (`signing::require_signing_identity`, called by both `server::run` and the
+  daemon's `build_control`); the dispatch path also refuses at request time.
+- **Only a human approver's decision is `assertionMethod`.** Everything a
+  service signs, approval *requests* included, is `authentication`.
 - **Outbound privileged documents are signed** (`build_signed_request`, signed
   at send time so retries stay fresh). A new control↔edge op needs both halves.
 - **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce

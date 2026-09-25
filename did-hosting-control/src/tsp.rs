@@ -207,7 +207,11 @@ mod tests {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
-            identity: None,
+            identity: Some(
+                did_hosting_common::server::identity::ServiceIdentity::generated_for(SERVICE_DID)
+                    .await
+                    .unwrap(),
+            ),
             trust_tasks_verifier: Some(Arc::new(
                 did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
                     Arc::new(affinidi_data_integrity::DidKeyResolver),

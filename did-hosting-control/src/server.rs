@@ -263,6 +263,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
+    // No unsigned mode: a control plane that cannot sign refuses to start.
+    crate::signing::require_signing_identity(identity.as_deref(), config.server_did.as_deref())?;
     let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
     let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 

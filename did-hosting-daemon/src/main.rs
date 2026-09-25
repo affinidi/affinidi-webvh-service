@@ -1380,6 +1380,12 @@ async fn build_control(
 
     let control_config = config.control_config();
 
+    // No unsigned mode: a control plane that cannot sign refuses to start.
+    did_hosting_control::signing::require_signing_identity(
+        identity.as_deref(),
+        control_config.server_did.as_deref(),
+    )?;
+
     // Opened here rather than threaded in: `keyspace()` is idempotent and
     // cheap, and passing them as arguments pushed this past clippy's
     // too-many-arguments bound for no benefit — the four below were always

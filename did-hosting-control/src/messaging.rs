@@ -1683,8 +1683,35 @@ pub(crate) async fn dispatch_trust_task_doc(
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
 ) -> Result<RoutedReply, DIDCommServiceError> {
+    // Fail closed: a control plane that cannot sign refuses to start (see
+    // `signing::require_signing_identity`), and this is the same rule at
+    // request time — no trust task is acted on that could not then be
+    // answered with a signed reply. There is no unsigned mode.
+    let secret = match state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or_else(|| "server_did not configured".to_string())
+        .and_then(|did| {
+            crate::signing::control_signing_secret(state, did).map_err(|e| e.to_string())
+        }) {
+        Ok(secret) => secret,
+        Err(e) => {
+            tracing::error!(error = %e, "refusing trust task: this control plane cannot sign its replies");
+            return Ok(RoutedReply::Framework(Box::new(
+                did_hosting_common::server::trust_tasks::DispatchOutcome::Rejected(
+                    doc.reject_with(
+                        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                        trust_tasks_rs::RejectReason::InternalError {
+                            reason: "this service cannot sign its replies".into(),
+                        },
+                    ),
+                ),
+            )));
+        }
+    };
     let reply = route_trust_task_doc(state, sender, transport, doc, verifier).await?;
-    Ok(seal_reply(state, sender, reply).await)
+    Ok(seal_reply(state, &secret, sender, reply).await)
 }
 
 /// Sign every non-error reply the control plane emits, on every transport.
@@ -1698,14 +1725,20 @@ pub(crate) async fn dispatch_trust_task_doc(
 /// and signed with the operational key (`proofPurpose: authentication`).
 ///
 /// `trust-task-error` documents stay unsigned, as the framework allows. A
-/// control plane with no loaded identity cannot sign at all; its replies go
-/// out unsigned (and are refused by conforming clients) with an error logged.
-async fn seal_reply(state: &AppState, requester: &str, reply: RoutedReply) -> RoutedReply {
+/// control plane that cannot sign does not start, and
+/// [`dispatch_trust_task_doc`] refuses every request up front should the key
+/// ever be missing at request time.
+async fn seal_reply(
+    state: &AppState,
+    secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
+    requester: &str,
+    reply: RoutedReply,
+) -> RoutedReply {
     use did_hosting_common::server::trust_tasks::DispatchOutcome;
     match reply {
         RoutedReply::Framework(outcome) => match *outcome {
             DispatchOutcome::Handled(doc) => RoutedReply::Framework(Box::new(
-                DispatchOutcome::Handled(sign_reply_doc(state, requester, doc).await),
+                DispatchOutcome::Handled(sign_reply_doc(state, secret, requester, doc).await),
             )),
             other => RoutedReply::Framework(Box::new(other)),
         },
@@ -1719,7 +1752,7 @@ async fn seal_reply(state: &AppState, requester: &str, reply: RoutedReply) -> Ro
             }
             match serde_json::from_value::<trust_tasks_rs::TrustTask<Value>>(value.clone()) {
                 Ok(doc) => RoutedReply::Document(
-                    serde_json::to_value(sign_reply_doc(state, requester, doc).await)
+                    serde_json::to_value(sign_reply_doc(state, secret, requester, doc).await)
                         .expect("signed reply serialises"),
                 ),
                 Err(_) => RoutedReply::Document(value),
@@ -1730,31 +1763,38 @@ async fn seal_reply(state: &AppState, requester: &str, reply: RoutedReply) -> Ro
 }
 
 /// Stamp and sign one reply document. See [`seal_reply`].
+///
+/// A reply that cannot be signed is replaced by an (unsigned) internal-error
+/// document rather than sent unsigned.
 pub(crate) async fn sign_reply_doc(
     state: &AppState,
+    secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
     requester: &str,
     mut doc: trust_tasks_rs::TrustTask<Value>,
 ) -> trust_tasks_rs::TrustTask<Value> {
-    let Some(my_vid) = state.config.server_did.as_deref() else {
-        return doc;
-    };
-    doc.issuer = Some(my_vid.to_string());
+    let my_vid = state.config.server_did.clone().unwrap_or_default();
+    doc.issuer = Some(my_vid);
     if doc.recipient.is_none() {
         doc.recipient = Some(requester.to_string());
     }
     doc.issued_at = Some(chrono::Utc::now());
     doc.proof = None;
-    let signed = match crate::signing::control_assertion_secret(state, my_vid) {
-        Ok(secret) => did_hosting_common::server::trust_tasks::sign_document(&doc, &secret)
-            .await
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
-    match signed {
+    match did_hosting_common::server::trust_tasks::sign_document(&doc, secret).await {
         Ok(signed) => signed,
         Err(e) => {
-            tracing::error!(error = %e, type_uri = %doc.type_uri, "cannot sign trust-task reply; sending it unsigned");
-            doc
+            tracing::error!(error = %e, type_uri = %doc.type_uri, "cannot sign trust-task reply; refusing it");
+            let mut err = doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                trust_tasks_rs::RejectReason::InternalError {
+                    reason: "this service could not sign its reply".into(),
+                },
+            );
+            // Rejecting a *reply* swaps its parties; address it back to the
+            // requester.
+            err.issuer = doc.issuer.clone();
+            err.recipient = Some(requester.to_string());
+            serde_json::from_value(serde_json::to_value(&err).expect("error serialises"))
+                .expect("error re-reads as a TrustTask")
         }
     }
 }
@@ -2234,7 +2274,13 @@ mod tests {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
-            identity: None,
+            identity: Some(
+                did_hosting_common::server::identity::ServiceIdentity::generated_for(
+                    "did:webvh:test:control.example.com",
+                )
+                .await
+                .unwrap(),
+            ),
             trust_tasks_verifier: None,
             jwt_keys: None,
             webauthn: None,
@@ -3937,15 +3983,52 @@ mod tests {
             let mut doc =
                 unsigned_decision(Some(&holder), control_did, "chal", "digest", "approve");
             mutate(&mut doc);
-            let signed = crate::signing::sign_trust_task_document(doc, &key)
-                .await
-                .unwrap();
+            let signed = sign_as_approver(doc, &key).await;
             let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), signed);
             let out = super::run_consent_decision(&state, &holder, &msg)
                 .await
                 .unwrap();
             assert!(out.is_none(), "must be ignored");
         }
+    }
+
+    /// Fail closed: a control plane that cannot sign its replies serves no
+    /// trust task — not even the proofless ones — and acts on nothing.
+    #[tokio::test]
+    async fn a_control_plane_without_a_signing_identity_refuses_every_trust_task() {
+        let (mut state, _dir) = signing_state().await;
+        state.identity = None;
+        let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[95u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
+
+        let signed = sign(
+            request_doc(
+                MSG_DID_REQUEST,
+                Some(&admin),
+                json!({ "path": "bob", "reserve": true }),
+            ),
+            &admin_key,
+        )
+        .await;
+        let challenge = request_doc(
+            "https://trusttasks.org/spec/auth/challenge/0.1",
+            Some(&admin),
+            json!({ "purpose": "login" }),
+        );
+        for doc in [signed, challenge] {
+            let reply = dispatch_envelope(&state, &admin, doc).await;
+            assert_eq!(reply["payload"]["code"], "internalError", "{reply}");
+            assert!(reply.get("proof").is_none());
+        }
+        assert!(
+            state
+                .dids_ks
+                .get::<did_hosting_common::did_ops::DidRecord>(did_key("bob"))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was reserved"
+        );
     }
 
     fn register_payload() -> Value {
@@ -4187,6 +4270,21 @@ mod tests {
         doc
     }
 
+    /// Sign a decision the way an approver's wallet does: the decision is the
+    /// human's own attestation, so `proofPurpose: assertionMethod`.
+    async fn sign_as_approver(unsigned: Value, signer: &Secret) -> Value {
+        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+        sign_trust_task(
+            &unsigned,
+            signer,
+            SignOptions::new()
+                .with_proof_purpose("assertionMethod")
+                .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+        )
+        .await
+        .expect("sign decision")
+    }
+
     /// [`unsigned_decision`], signed with the holder's key via the same
     /// signing entry point the production code uses.
     async fn signed_decision(
@@ -4197,12 +4295,11 @@ mod tests {
         digest: &str,
         decision: &str,
     ) -> Value {
-        crate::signing::sign_trust_task_document(
+        sign_as_approver(
             unsigned_decision(Some(issuer_did), recipient, challenge, digest, decision),
             signer,
         )
         .await
-        .expect("sign decision")
     }
 
     /// Park a pending consent exactly as the REST route does; the

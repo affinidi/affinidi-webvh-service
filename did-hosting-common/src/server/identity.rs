@@ -282,6 +282,15 @@ impl ServiceIdentity {
         self.current().mediator_did
     }
 
+    /// [`Self::from_signing_secret`] with a freshly generated Ed25519 key named
+    /// `{did}#key-1`. For tests that need a service able to sign as `did`
+    /// without anything resolving the key.
+    pub async fn generated_for(did: &str) -> Result<Arc<Self>, AppError> {
+        let mut secret = Secret::generate_ed25519(None, None);
+        secret.id = format!("{did}#key-1");
+        Self::from_signing_secret(did, secret).await
+    }
+
     /// An identity with one generation whose signing key is `secret` (its `id`
     /// is the signing kid). For tests and tools that need a service able to
     /// sign — e.g. a `did:key` service DID — without a published DID log.

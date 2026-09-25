@@ -230,7 +230,7 @@ pub fn build_request(
 /// Every request one of these services sends to another is a privileged
 /// document the receiver will refuse without a proof bound to the sender
 /// (see [`super::bound`]), so this — not the bare [`build_request`] — is what
-/// callers put on the wire. `signer` must be `from`'s current assertion key.
+/// callers put on the wire. `signer` must be `from`'s current operational key.
 pub async fn build_signed_request(
     type_uri: &str,
     from: &str,

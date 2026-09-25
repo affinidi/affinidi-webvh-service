@@ -29,7 +29,14 @@ id)`. See `did_hosting_common::server::trust_tasks::bound`.
   `issuer` = the control plane, `recipient` = the requester, a fresh
   `issuedAt`, and signed with its operational key (`authentication`). Edges
   sign their acks and pongs the same way. `trust-task-error` documents stay
-  unsigned.
+  unsigned. There is no unsigned mode: a control plane (standalone or in the
+  daemon) with no `server_did`, no loaded identity, or no signing key for its
+  current generation **refuses to start**, and should the key ever be missing
+  at request time every trust task is refused with `internalError`.
+- **Approval requests are operational too.** The `task-consent/request` and
+  `auth/step-up/approve-request` documents the control plane sends are signed
+  with `proofPurpose: authentication`. Only the human approver's own decision
+  / approve-response is an `assertionMethod` attestation.
 - **Edges keep a high-water mark per DID and per slot that a delete does not
   clear.** A DID re-created after `sync/delete` must extend everything the edge
   ever served for it, so a delete-then-resync cannot roll a DID back to before a

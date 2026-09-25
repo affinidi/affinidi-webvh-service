@@ -218,7 +218,7 @@ pub async fn sign_document(
 #[error("sign trust task document: {0}")]
 pub struct SignError(pub String);
 
-/// This service's current assertion key as a signing secret, named by the kid
+/// This service's current operational (`authentication`) key as a signing secret, named by the kid
 /// its published DID document lists.
 ///
 /// `expected_did` is the configured service DID; a current identity

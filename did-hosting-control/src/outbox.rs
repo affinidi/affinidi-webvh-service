@@ -413,7 +413,7 @@ pub async fn run_tick(state: &AppState) -> TickReport {
 
     // Every entry goes out signed; without the key there is nothing an edge
     // would accept, so leave the queue intact for a later tick.
-    let signer = match crate::signing::control_assertion_secret(state, &control_did) {
+    let signer = match crate::signing::control_signing_secret(state, &control_did) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "outbox tick: cannot sign outbound documents; skipping");

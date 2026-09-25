@@ -157,6 +157,16 @@ impl TestServer {
             .with_jwt
             .then(|| Arc::new(JwtKeys::from_ed25519_bytes(&[7u8; 32]).expect("jwt keys")));
 
+        // Every trust-task reply is signed, so a node that serves them needs a
+        // signing identity for its own DID.
+        let identity = match config.server_did.as_deref() {
+            Some(did) => Some(
+                did_hosting_common::server::identity::ServiceIdentity::generated_for(did)
+                    .await
+                    .expect("test identity"),
+            ),
+            None => None,
+        };
         let state = AppState {
             store: store.clone(),
             sessions_ks,
@@ -166,7 +176,7 @@ impl TestServer {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
-            identity: None,
+            identity,
             trust_tasks_verifier: None,
             jwt_keys,
             webauthn: None,

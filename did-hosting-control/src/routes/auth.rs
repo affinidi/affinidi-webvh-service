@@ -498,8 +498,8 @@ fn trust_task_malformed(reason: &str) -> Response {
 /// (the relying party), `recipient` = the subject DID (self-approve
 /// path — the wallet holding the subject key is the approver), and the
 /// spec's REQUIRED Data Integrity proof (`eddsa-jcs-2022`,
-/// `proofPurpose: assertionMethod`) signed with the control DID's
-/// assertion key, so the wallet can verify the `reason` it renders is
+/// `proofPurpose: authentication`) signed with the control DID's
+/// operational key, so the wallet can verify the `reason` it renders is
 /// this RP's before surfacing it. The payload carries exactly the
 /// schema's REQUIRED members (`subject`, `sessionId`, `challenge`,
 /// `reason`); the schema is closed (`additionalProperties: false`) and
@@ -552,7 +552,7 @@ pub async fn step_up_vta_start(
     let control_did = state.config.server_did.as_deref().ok_or_else(|| {
         AppError::Config("server_did not configured; cannot sign the step-up request".into())
     })?;
-    let signing_secret = crate::signing::control_assertion_secret(&state, control_did)?;
+    let signing_secret = crate::signing::control_signing_secret(&state, control_did)?;
 
     let challenge = rand::random::<[u8; 32]>()
         .iter()
@@ -1175,13 +1175,14 @@ mod tests {
         assert_eq!(document["payload"]["sessionId"], session_id);
         assert_eq!(document["payload"]["challenge"], challenge);
 
-        // Proof binding: assertion key of the issuer DID, eddsa-jcs-2022.
+        // Proof binding: operational key of the issuer DID, eddsa-jcs-2022.
         let vm = document["proof"]["verificationMethod"]
             .as_str()
             .expect("proof carries a verificationMethod");
         assert_eq!(vm.split('#').next().unwrap(), control_did);
         assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
-        assert_eq!(document["proof"]["proofPurpose"], "assertionMethod");
+        // A request is the service's operational message, not an attestation.
+        assert_eq!(document["proof"]["proofPurpose"], "authentication");
 
         // Verifies under the shared verifier (issuer ↔ vm binding included).
         let doc: TrustTask<Value> =
