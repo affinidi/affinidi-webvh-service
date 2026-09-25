@@ -16,8 +16,12 @@
 //! 4. an in-band `recipient` equal to this service's DID, so a document signed
 //!    for another service cannot be replayed here;
 //! 5. an `issuedAt` inside the freshness window, and no passed `expiresAt`;
-//! 6. a proof whose `verificationMethod` is controlled by the issuer and whose
-//!    signature verifies ([`TransportBoundVerifier`]).
+//! 6. a proof with `proofPurpose: authentication`, whose `verificationMethod`
+//!    is controlled by the issuer and listed under its `authentication`
+//!    relationship, and whose signature verifies
+//!    ([`TransportBoundVerifier::verify_operational`]). These are a service's
+//!    own operational messages, not attestations; `assertionMethod` is
+//!    reserved for credentials and is refused.
 //!
 //! The returned DID is the **proven** signer. Callers authorise on it and key
 //! their replay cache on `(it, doc.id)` — never on the transport's report of
@@ -34,7 +38,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use trust_tasks_rs::{ProofVerifier, RejectReason, TrustTask, VerificationError};
+use trust_tasks_rs::{RejectReason, TrustTask, VerificationError};
 
 use super::verifier::{TransportBoundVerifier, controller_did};
 use crate::server::didcomm_unpack::{FRESHNESS_WINDOW_SECS, FUTURE_SKEW_SECS};
@@ -178,12 +182,14 @@ where
     {
         return Err(BoundError::Expired(expires_at));
     }
-    verifier.verify(doc).await?;
+    verifier.verify_operational(doc).await?;
     Ok(issuer.to_string())
 }
 
 /// Sign an unsigned document (no `proof`) with `signer`, returning it with the
-/// proof attached. `eddsa-jcs-2022`, `proofPurpose: assertionMethod`.
+/// proof attached. `eddsa-jcs-2022`, `proofPurpose: authentication` — the
+/// operational purpose [`verify_sender_bound`] requires. `signer` must be one
+/// of the issuer's `authentication` keys.
 ///
 /// The document's `issuer` must be the DID of `signer`'s verification method;
 /// the signing call refuses otherwise, so a document that could never verify
@@ -199,7 +205,7 @@ pub async fn sign_document(
         &unsigned,
         signer,
         SignOptions::new()
-            .with_proof_purpose("assertionMethod")
+            .with_proof_purpose(super::verifier::OPERATIONAL_PROOF_PURPOSE)
             .with_cryptosuite(CryptoSuite::EddsaJcs2022),
     )
     .await
@@ -374,6 +380,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BoundError::Proof(_)), "{err:?}");
+    }
+
+    /// An attestation-purpose proof is not an operational one: refused even
+    /// though it is validly signed by the right DID.
+    #[tokio::test]
+    async fn an_assertion_method_proof_is_refused() {
+        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+        let (did, secret) = signer(1);
+        let doc = build_request(TYPE, &did, ME, json!({})).unwrap();
+        let signed = sign_trust_task(
+            &serde_json::to_value(&doc).unwrap(),
+            &secret,
+            SignOptions::new()
+                .with_proof_purpose("assertionMethod")
+                .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+        )
+        .await
+        .unwrap();
+        let doc: TrustTask<Value> = serde_json::from_value(signed).unwrap();
+        let err = verify_sender_bound(&doc, Some(&did), Some(&did), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BoundError::Proof(VerificationError::MalformedProof(ref m)) if m.contains("authentication")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn documents_are_signed_for_authentication() {
+        let (_, doc) = signed_by(1, ME).await;
+        assert_eq!(doc.proof.unwrap().proof_purpose, "authentication");
     }
 
     #[test]

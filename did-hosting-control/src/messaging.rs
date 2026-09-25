@@ -1632,6 +1632,91 @@ pub(crate) async fn dispatch_trust_task_doc(
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
 ) -> Result<RoutedReply, DIDCommServiceError> {
+    let reply = route_trust_task_doc(state, sender, transport, doc, verifier).await?;
+    Ok(seal_reply(state, sender, reply).await)
+}
+
+/// Sign every non-error reply the control plane emits, on every transport.
+///
+/// A response is a document from this control plane to the requester, and a
+/// requester must be able to attribute it by signature, not by the channel it
+/// arrived on: `auth/authenticate/0.1` declares a proof REQUIRED and SPEC §7.3
+/// item 8 applies that to its response, and clients refuse unsigned non-error
+/// replies. So each reply is re-stamped `issuer` = this control plane,
+/// `recipient` = the requester (when the request named none), `issuedAt` = now,
+/// and signed with the operational key (`proofPurpose: authentication`).
+///
+/// `trust-task-error` documents stay unsigned, as the framework allows. A
+/// control plane with no loaded identity cannot sign at all; its replies go
+/// out unsigned (and are refused by conforming clients) with an error logged.
+async fn seal_reply(state: &AppState, requester: &str, reply: RoutedReply) -> RoutedReply {
+    use did_hosting_common::server::trust_tasks::DispatchOutcome;
+    match reply {
+        RoutedReply::Framework(outcome) => match *outcome {
+            DispatchOutcome::Handled(doc) => RoutedReply::Framework(Box::new(
+                DispatchOutcome::Handled(sign_reply_doc(state, requester, doc).await),
+            )),
+            other => RoutedReply::Framework(Box::new(other)),
+        },
+        RoutedReply::Document(value) => {
+            let is_error = value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX));
+            if is_error {
+                return RoutedReply::Document(value);
+            }
+            match serde_json::from_value::<trust_tasks_rs::TrustTask<Value>>(value.clone()) {
+                Ok(doc) => RoutedReply::Document(
+                    serde_json::to_value(sign_reply_doc(state, requester, doc).await)
+                        .expect("signed reply serialises"),
+                ),
+                Err(_) => RoutedReply::Document(value),
+            }
+        }
+        RoutedReply::Suppressed => RoutedReply::Suppressed,
+    }
+}
+
+/// Stamp and sign one reply document. See [`seal_reply`].
+pub(crate) async fn sign_reply_doc(
+    state: &AppState,
+    requester: &str,
+    mut doc: trust_tasks_rs::TrustTask<Value>,
+) -> trust_tasks_rs::TrustTask<Value> {
+    let Some(my_vid) = state.config.server_did.as_deref() else {
+        return doc;
+    };
+    doc.issuer = Some(my_vid.to_string());
+    if doc.recipient.is_none() {
+        doc.recipient = Some(requester.to_string());
+    }
+    doc.issued_at = Some(chrono::Utc::now());
+    doc.proof = None;
+    let signed = match crate::signing::control_assertion_secret(state, my_vid) {
+        Ok(secret) => did_hosting_common::server::trust_tasks::sign_document(&doc, &secret)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match signed {
+        Ok(signed) => signed,
+        Err(e) => {
+            tracing::error!(error = %e, type_uri = %doc.type_uri, "cannot sign trust-task reply; sending it unsigned");
+            doc
+        }
+    }
+}
+
+/// The routing half of [`dispatch_trust_task_doc`]; replies are signed by the
+/// caller.
+async fn route_trust_task_doc(
+    state: &AppState,
+    sender: &str,
+    transport: &(impl trust_tasks_rs::TransportHandler + Sync),
+    doc: trust_tasks_rs::TrustTask<Value>,
+    verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher,
         dispatch_inbound, verify_sender_bound,
@@ -3361,9 +3446,7 @@ mod tests {
     }
 
     async fn sign(doc: Value, signer: &affinidi_tdk::secrets_resolver::secrets::Secret) -> Value {
-        crate::signing::sign_trust_task_document(doc, signer)
-            .await
-            .expect("sign")
+        crate::signing::test_util::sign_operational(doc, signer).await
     }
 
     fn envelope(body: Value) -> Message {
@@ -3604,6 +3687,54 @@ mod tests {
 
         let replayed = dispatch_envelope(&state, &admin, doc).await;
         assert_eq!(replayed["payload"]["code"], "idConflict", "{replayed}");
+    }
+
+    /// Over the DIDComm envelope too, a non-error reply is signed by the
+    /// control plane for the requester; error documents are not.
+    #[tokio::test]
+    async fn envelope_replies_are_signed_by_the_control_plane() {
+        use did_hosting_common::server::identity::ServiceIdentity;
+        use did_hosting_common::server::trust_tasks::verify_sender_bound;
+
+        let (mut state, _dir) = signing_state().await;
+        let (control, control_key) = crate::signing::test_util::did_key_signer(&[71u8; 32]);
+        let mut cfg = (*state.config).clone();
+        cfg.server_did = Some(control.clone());
+        state.config = Arc::new(cfg);
+        state.identity = Some(
+            ServiceIdentity::from_signing_secret(&control, control_key)
+                .await
+                .unwrap(),
+        );
+        let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[72u8; 32]);
+        seed_role(&state, &admin, Role::Admin).await;
+
+        let mut doc = request_doc(MSG_DID_REQUEST, Some(&admin), json!({ "path": "bob" }));
+        doc["recipient"] = json!(control);
+        let reply = dispatch_envelope(&state, &admin, sign(doc, &admin_key).await).await;
+        let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(reply).unwrap();
+        assert!(
+            reply
+                .type_uri
+                .to_string()
+                .ends_with("check-name/0.1#response")
+        );
+        verify_sender_bound(
+            &reply,
+            Some(&control),
+            None,
+            &admin,
+            state.trust_tasks_verifier.as_deref().unwrap(),
+        )
+        .await
+        .expect("reply is signed by the control plane for the requester");
+
+        // An error reply (unsigned request) stays unsigned.
+        let mut unsigned = request_doc(MSG_DID_REQUEST, Some(&admin), json!({ "path": "bob" }));
+        unsigned["recipient"] = json!(control);
+        let err = dispatch_envelope(&state, &admin, unsigned).await;
+        assert!(err["type"].as_str().unwrap().contains("/trust-task-error/"));
+        assert!(err.get("proof").is_none());
     }
 
     fn register_payload() -> Value {
@@ -4324,12 +4455,11 @@ mod tests {
         let (state, _dir) = grant_state(&admin_did).await;
 
         let subject = "did:example:grantee";
-        let signed = crate::signing::sign_trust_task_document(
+        let signed = crate::signing::test_util::sign_operational(
             unsigned_grant_doc(&admin_did, subject),
             &admin_signer,
         )
-        .await
-        .expect("sign grant");
+        .await;
         let msg = build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, signed);
 
         let (resp_type, resp_body) = super::run_trust_tasks_envelope(&state, &admin_did, &msg)
@@ -4361,12 +4491,11 @@ mod tests {
         let (admin_did, admin_signer) = did_key_signer(&[42u8; 32]);
         let (state, _dir) = grant_state(&admin_did).await;
 
-        let mut signed = crate::signing::sign_trust_task_document(
+        let mut signed = crate::signing::test_util::sign_operational(
             unsigned_grant_doc(&admin_did, "did:example:grantee"),
             &admin_signer,
         )
-        .await
-        .expect("sign grant");
+        .await;
         signed["payload"]["entry"]["subject"] = json!("did:example:mallory");
         let msg = build_msg(trust_tasks_didcomm::ENVELOPE_TYPE, signed);
 

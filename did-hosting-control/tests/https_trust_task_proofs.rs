@@ -87,7 +87,7 @@ async fn sign_as(doc: Value, key: &Secret) -> Value {
     let proof = affinidi_data_integrity::DataIntegrityProof::sign(
         &canonical,
         key,
-        affinidi_data_integrity::SignOptions::new(),
+        affinidi_data_integrity::SignOptions::new().with_proof_purpose("authentication"),
     )
     .await
     .expect("sign");
@@ -186,4 +186,41 @@ async fn unsigned_privileged_document_is_refused() {
     let (status, body) = post(&h, &tok, &list_doc(Some(admin))).await;
     assert_ne!(status, StatusCode::OK, "{body}");
     assert_eq!(body["payload"]["code"], "proofRequired", "{body}");
+}
+
+/// HTTPS replies are signed by the control plane for the caller, like every
+/// other transport's.
+#[tokio::test]
+async fn https_reply_is_signed_by_the_control_plane() {
+    use did_hosting_common::server::identity::ServiceIdentity;
+    use did_hosting_common::server::trust_tasks::verify_sender_bound;
+    use did_hosting_control::test_support::TestServerOptions;
+
+    let (control, _, control_key) = did_key_signer(80);
+    let mut h = TestServer::start_with(TestServerOptions {
+        server_did: Some(Some(control.clone())),
+        ..TestServerOptions::default()
+    })
+    .await;
+    let verifier = Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
+        DidKeyResolver,
+    )));
+    h.state.trust_tasks_verifier = Some(verifier.clone());
+    h.state.identity = Some(
+        ServiceIdentity::from_signing_secret(&control, control_key)
+            .await
+            .unwrap(),
+    );
+    let (admin, _, key) = did_key_signer(1);
+    h.add_acl(&admin, Role::Admin).await;
+    let tok = token(&h, &admin, None).await;
+
+    let mut doc = list_doc(Some(&admin));
+    doc["recipient"] = json!(control);
+    let (status, body) = post(&h, &tok, &sign_as(doc, &key).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(body).unwrap();
+    verify_sender_bound(&reply, Some(&control), None, &admin, &verifier)
+        .await
+        .expect("HTTPS reply is signed by the control plane for the caller");
 }

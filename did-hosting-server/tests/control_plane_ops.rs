@@ -593,3 +593,44 @@ async fn a_non_control_plane_type_returns_none() {
             .is_none()
     );
 }
+
+/// The edge's acks are signed by the edge for the control plane
+/// (`proofPurpose: authentication`), so the control plane can attribute them.
+#[tokio::test]
+async fn acks_are_signed_by_the_edge() {
+    use did_hosting_common::server::identity::ServiceIdentity;
+    use did_hosting_common::server::trust_tasks::verify_sender_bound;
+
+    let (mut state, _dir) = make_state().await;
+    let (edge, edge_key) = signer(91);
+    let mut cfg = (*state.config).clone();
+    cfg.server_did = Some(edge.clone());
+    state.config = Arc::new(cfg);
+    state.identity = Some(
+        ServiceIdentity::from_signing_secret(&edge, edge_key)
+            .await
+            .unwrap(),
+    );
+
+    let (control_did, control_key) = control();
+    let (did_id, log) = valid_did_log("alice").await;
+    let doc = build_signed_request(
+        MSG_SYNC_UPDATE,
+        &control_did,
+        &edge,
+        update_body("alice", &did_id, &log),
+        &control_key,
+    )
+    .await
+    .unwrap();
+    let reply = apply(&state, doc).await;
+    assert_eq!(reply.type_uri.to_string(), MSG_SYNC_UPDATE_ACK, "{reply:?}");
+
+    let sealed = did_hosting_server::messaging::seal_reply(&state, reply)
+        .await
+        .expect("sealed");
+    let sealed: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(sealed).unwrap();
+    verify_sender_bound(&sealed, Some(&edge), None, &control_did, &verifier())
+        .await
+        .expect("the ack is signed by the edge for the control plane");
+}

@@ -203,7 +203,10 @@ control→edge sync and domain ops, edge→control registration/stats/pongs/acks
 DID management, ACL, auth — is a Trust Task document authorised on its **own
 Data Integrity proof**: `issuer` in-band and exactly the expected peer, the
 proof's `verificationMethod` controlled by that issuer, `recipient` = this
-service, fresh `issuedAt`, replay-keyed on `(issuer, id)`. The one entry point
+service, fresh `issuedAt`, replay-keyed on `(issuer, id)`, and
+`proofPurpose: authentication` with the key under the signer's `authentication`
+relationship — these are operational messages; `assertionMethod` is for
+attestations (credentials) only. The one entry point
 is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
 (the control plane's `dispatch_trust_task_doc` gate; the edge's
 `verify_control_plane`).
@@ -213,11 +216,16 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   Never authorise, ACL-check, or key a replay cache on one. Don't add a bare
   `MSG_*` route that acts on `ctx.sender_did`; add a trust-task arm behind the
   gate.
+- **Replies are signed** (`seal_reply` on both sides) — every non-error
+  trust-task response, every transport; only `trust-task-error` stays unsigned.
 - **Outbound privileged documents are signed** (`build_signed_request`, signed
   at send time so retries stay fresh). A new control↔edge op needs both halves.
 - **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
   an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
   (`with_session_delegate`).
+- **A proof failing against a cached DID document is re-resolved once**
+  (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
+  the cache TTL is `DID_CACHE_TTL_SECS`.
 - **Edges verify what they serve.** A synced webvh log must pass the chain
   check and strictly extend the held log (`verify_log_extends`); a deactivated
   DID takes no further entries.

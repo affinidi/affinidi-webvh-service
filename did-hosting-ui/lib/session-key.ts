@@ -240,7 +240,9 @@ export async function signEnvelope<T extends SignableEnvelope>(
     cryptosuite: "eddsa-jcs-2022",
     verificationMethod: `${sessionDidKey}#${sessionDidKey.slice("did:key:".length)}`,
     created: new Date(Date.now() - CREATED_BACKDATE_MS).toISOString(),
-    proofPurpose: "assertionMethod",
+    // Operational, not an attestation: the control plane accepts only
+    // `authentication` proofs on the envelopes a session signs.
+    proofPurpose: "authentication",
   };
 
   // Hash the proof config and the doc (envelope minus proof).

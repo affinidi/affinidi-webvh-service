@@ -94,4 +94,16 @@ pub(crate) mod test_util {
         signer.id = format!("{did}#{pk_mb}");
         (did, signer)
     }
+
+    /// Sign `unsigned` as an operational (sender-bound) document —
+    /// `proofPurpose: authentication` — the form every privileged inbound
+    /// trust task must carry.
+    pub(crate) async fn sign_operational(unsigned: Value, signer: &Secret) -> Value {
+        let doc: trust_tasks_rs::TrustTask<Value> =
+            serde_json::from_value(unsigned).expect("unsigned document parses");
+        let signed = did_hosting_common::server::trust_tasks::sign_document(&doc, signer)
+            .await
+            .expect("sign");
+        serde_json::to_value(&signed).expect("signed document serialises")
+    }
 }

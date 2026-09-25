@@ -13,6 +13,23 @@ addressed to the receiving service (`recipient`), and its `issuedAt` is inside
 the freshness window. Replay protection is keyed on `(proven issuer, document
 id)`. See `did_hosting_common::server::trust_tasks::bound`.
 
+- **Operational proofs use `authentication`.** These are a service's own
+  messages, not attestations (VTI key roles, VTI-KEY-106/107): the proof must
+  carry `proofPurpose: authentication` and its `verificationMethod` must be
+  listed under the signer's `authentication` relationship. `assertionMethod`
+  proofs are refused on these paths (it stays reserved for credentials), and
+  every sender this repo controls now signs with `authentication`.
+- **Key rotation does not open a rejection window.** A proof that fails against
+  a cached DID document is retried once against a freshly resolved one before
+  it is refused (at most one forced refresh per DID per 30s). The service's
+  DID cache TTL is now explicit: 120s (`DID_CACHE_TTL_SECS`).
+- **Replies are signed too.** Every non-error trust-task reply the control
+  plane emits — on DIDComm, TSP and HTTPS alike, including
+  `auth/challenge#response` and `auth/authenticate#response` — is stamped
+  `issuer` = the control plane, `recipient` = the requester, a fresh
+  `issuedAt`, and signed with its operational key (`authentication`). Edges
+  sign their acks and pongs the same way. `trust-task-error` documents stay
+  unsigned.
 - **`TransportBoundVerifier` requires an in-band `issuer`, always.** A proof
   with no `issuer` used to verify as a bare signature, with the issuer then
   filled from the transport's sender; it is now refused. The one delegated shape
@@ -65,7 +82,8 @@ the VTA's DID-management client over DIDComm/TSP
 each document with the VTA DID as `issuer`; the browser extension's DIDComm
 sign-in (`pnm-browser-plugin` `packages/core/src/rp-login/didcomm.ts`) must use
 the challenge → signed-authenticate trust tasks instead of a bare
-`MSG_AUTHENTICATE`. REST API callers (bearer JWT from the signed REST sign-in)
+`MSG_AUTHENTICATE`, and its `signTrustTask` (used for wallet-signed admin UI
+envelopes) must sign with `proofPurpose: authentication`. REST API callers (bearer JWT from the signed REST sign-in)
 are unaffected.
 
 ### Fixed — stats sync uses TSP when the control plane advertises it
