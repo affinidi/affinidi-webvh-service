@@ -196,6 +196,57 @@ nothing visible to anyone who could not already act on it. Until then, note that
 the unauthenticated `/api/server-info` lives on the **control plane** (not the
 edge), so nothing about the topology leaks today. Keep it that way.
 
+## Privileged messages are authorised on their proof, never on the transport
+
+Every inbound message that changes state or discloses more than public data —
+control→edge sync and domain ops, edge→control registration/stats/pongs/acks,
+DID management, ACL, auth — is a Trust Task document authorised on its **own
+Data Integrity proof**: `issuer` in-band and exactly the expected peer, the
+proof's `verificationMethod` controlled by that issuer, `recipient` = this
+service, fresh `issuedAt`, replay-keyed on `(issuer, id)`, and
+`proofPurpose: authentication` with the key under the signer's `authentication`
+relationship — these are operational messages; `assertionMethod` is for
+attestations (credentials) only. The one entry point
+is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
+(the control plane's `dispatch_trust_task_doc` gate; the edge's
+`verify_control_plane`).
+
+- **A transport's sender is a routing hint.** `ctx.sender_did`, a TSP sender
+  VID, a DIDComm `from` — each is only required to *agree* with the proof.
+  Never authorise, ACL-check, or key a replay cache on one. Don't add a bare
+  `MSG_*` route that acts on `ctx.sender_did`; add a trust-task arm behind the
+  gate.
+- **Replies are signed** (`seal_reply` on both sides) — every non-error
+  trust-task response, every transport; only `trust-task-error` stays unsigned.
+  No signing identity → the control plane refuses to start
+  (`signing::require_signing_identity`, called by both `server::run` and the
+  daemon's `build_control`); the dispatch path also refuses at request time.
+- **Only a human approver's decision is `assertionMethod`.** Everything a
+  service signs, approval *requests* included, is `authentication`. Decisions
+  (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
+  — `assertionMethod` purpose *and* relationship, deactivation check — never
+  the bare `ProofVerifier::verify`.
+- **An edge never answers a document that failed `verify_control_plane`** —
+  no signed refusal (it would settle an op the control plane never sent), no
+  unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
+  reported retryable so the control plane keeps the op queued.
+- **Outbound privileged documents are signed** (`build_signed_request`, signed
+  at send time so retries stay fresh). A new control↔edge op needs both halves.
+- **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
+  an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
+  (`with_session_delegate`).
+- **A proof failing against a cached DID document is re-resolved once**
+  (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
+  the cache TTL is `DID_CACHE_TTL_SECS`.
+- **Edges verify what they serve.** A synced webvh log must pass the chain
+  check and strictly extend the held log and the per-DID high-water mark
+  (`control_register::verify_history`); a deactivated DID takes no further
+  entries. Every path that replaces an edge's log — sync *and* the edge's own
+  REST publish — goes through `verify_history` and `stage_high_water`.
+- **Re-sync compares identity, not just versions** (`server_push::
+  edge_is_current`), and domain assign/unassign/purge are re-sent on each
+  registration until acknowledged (`server_push::resend_domain_intents`).
+
 ## Cross-service networking & integration discipline
 
 This service's primary client is the VTA's `webvh_client`

@@ -3,7 +3,6 @@ pub(crate) mod auth;
 // `pub(crate)` so the DIDComm dispatch table reuses the REST request types
 // and helpers verbatim — the two transports must not grow separate shapes.
 pub(crate) mod did_manage;
-mod didcomm;
 pub(crate) mod domain;
 pub mod health;
 mod identity;
@@ -56,13 +55,10 @@ pub const AUTH_BODY_LIMIT_BYTES: usize = 32 * 1024;
 /// from the middleware. The exempt routes are:
 ///
 /// - `/api/health` — operator monitoring; never authed.
-/// - `/api/didcomm` — terminal DIDComm envelope; the inner message
-///   `typ` is the actual task identifier, validated separately by
-///   the DIDComm dispatcher.
 /// - `/api/proxy/...` — pass-through to a registered service; the
 ///   upstream service runs its own Trust-Task validation.
-/// - `/api/control/stats` — server-to-control stats sync; servers
-///   self-identify by DID, not by Trust-Task header.
+/// - `/api/control/stats` — server-to-control stats sync; the body is a
+///   signed stats-sync document, authenticated by its proof.
 // The deprecated `_0_1` auth consts are wired here intentionally — as
 // the accepted-but-deprecated inbound aliases alongside their `_0_2`
 // primaries — so this compatibility layer opts out of the deprecation
@@ -406,11 +402,8 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(trust_tasks::dispatch_trust_task)
                 .layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
         )
-        // Exempt: DIDComm envelope (inner message type is the real
-        // task identifier).
-        .route_exempt("/didcomm", post(didcomm::handle))
-        // Exempt: server-to-control stats sync (servers self-identify
-        // by DID, not by Trust-Task header).
+        // Exempt from the Trust-Task header: the body is itself a signed
+        // stats-sync Trust Task document, authenticated by its own proof.
         .route_exempt("/control/stats", post(stats_sync::receive_stats))
         // Exempt: proxy pass-through. The upstream service runs its
         // own validation.

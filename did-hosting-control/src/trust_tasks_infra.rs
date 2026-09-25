@@ -35,22 +35,24 @@
 //! and they wrongly model the response as a separate URI instead of a fragment.
 //! They are route-header decorators for the HTTPS surface, nothing more.
 //!
-//! ## Why this bypasses the §7.2 pipeline
+//! ## Authorisation
 //!
-//! Registration and stats sync authenticate via the ACL (`Service` role)
-//! against the transport-proven sender, exactly as their DIDComm routes do. Health pong
-//! carries no authority at all — it only marks an already-registered instance
-//! Active, keyed by sender DID. Neither needs proof verification or audience
-//! binding beyond what the transport already guarantees, and running them
-//! through `dispatch_inbound` would demand typed payload specs that don't exist
-//! upstream. If these ops ever grow authority, move them onto the typed
-//! pipeline like `trust_tasks_did`.
+//! Every document reaching [`dispatch`] has already passed
+//! [`crate::messaging::dispatch_trust_task_doc`]'s proof gate, so `signer` is
+//! the DID whose key signed it — not a transport's report. Registration, stats
+//! sync, health pongs and domain acks then require that DID to hold the
+//! `Service` role in the ACL; sync acks are only logged. These ops don't run
+//! the typed §7.2 pipeline because upstream has no typed payload specs for
+//! them; the proof gate supplies what that pipeline would (issuer binding,
+//! audience, freshness, replay).
 
 use serde_json::Value;
 use tracing::warn;
 
 use did_hosting_common::didcomm_types::{
+    MSG_DOMAIN_ASSIGN_ACK, MSG_DOMAIN_PURGE_ACK, MSG_DOMAIN_UNASSIGN_ACK, MSG_DOMAIN_UPSERT_ACK,
     MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
+    MSG_SYNC_BATCH_ACK, MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE_ACK,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 
@@ -61,15 +63,25 @@ use crate::server::AppState;
 ///
 /// Compared on the full string, fragment included: `register/0.1` is a request
 /// we act on, while `register/0.1#response` is an ack *we* emit and must never
-/// route back into ourselves.
+/// route back into ourselves. The sync and domain `#response` acks are the
+/// other way round — edges emit them, we receive them.
 pub fn owns(type_uri: &str) -> bool {
     matches!(
         type_uri,
-        MSG_SERVER_REGISTER | MSG_HEALTH_PONG | MSG_STATS_SYNC
+        MSG_SERVER_REGISTER
+            | MSG_HEALTH_PONG
+            | MSG_STATS_SYNC
+            | MSG_SYNC_UPDATE_ACK
+            | MSG_SYNC_BATCH_ACK
+            | MSG_SYNC_DELETE_ACK
+            | MSG_DOMAIN_ASSIGN_ACK
+            | MSG_DOMAIN_UNASSIGN_ACK
+            | MSG_DOMAIN_PURGE_ACK
+            | MSG_DOMAIN_UPSERT_ACK
     )
 }
 
-/// Handle an infrastructure trust task from `sender`.
+/// Handle an infrastructure trust task signed by `sender` (the proven issuer).
 ///
 /// Returns the serialised response document, or `None` when the op is terminal
 /// (a health pong is an answer, not a question).
@@ -156,10 +168,57 @@ async fn dispatch_inner(
             crate::messaging::do_health_pong(state, sender, &doc.payload).await;
             None
         }
+        uri @ (MSG_SYNC_UPDATE_ACK | MSG_SYNC_BATCH_ACK | MSG_SYNC_DELETE_ACK) => {
+            crate::messaging::do_sync_ack(sender, uri, &doc.payload);
+            acknowledge_outbox(state, sender, &doc).await;
+            None
+        }
+        uri @ (MSG_DOMAIN_ASSIGN_ACK | MSG_DOMAIN_UNASSIGN_ACK | MSG_DOMAIN_PURGE_ACK) => {
+            crate::messaging::do_domain_ack(state, sender, uri, &doc.payload).await;
+            acknowledge_outbox(state, sender, &doc).await;
+            None
+        }
+        // The upsert ack carries nothing the registry tracks; it only settles
+        // the outbox entry.
+        MSG_DOMAIN_UPSERT_ACK => {
+            acknowledge_outbox(state, sender, &doc).await;
+            None
+        }
         // `owns` gates this; a mismatch means the two drifted.
         other => {
             warn!(type_uri = other, "trust_tasks_infra: unowned type URI");
             None
         }
+    }
+}
+
+/// Settle the outbox entry an acknowledgement answers: the document it threads
+/// to, from the server that signed it. Only a Service-role signer settles
+/// anything — `sender` is the proven issuer.
+pub(crate) async fn acknowledge_outbox(
+    state: &AppState,
+    sender: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+) {
+    let thread = doc.thread_id.as_deref().or_else(|| {
+        doc.payload
+            .get("inResponseTo")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+    });
+    let Some(thread) = thread else {
+        return;
+    };
+    if !matches!(
+        crate::acl::check_acl(&state.acl_ks, sender).await,
+        Ok(crate::acl::Role::Service)
+    ) {
+        warn!(sender, "acknowledgement ignored: Service role required");
+        return;
+    }
+    match crate::outbox::acknowledge(&state.store, sender, thread).await {
+        Ok(true) => state.outbox_notify.notify_one(),
+        Ok(false) => tracing::debug!(sender, thread, "acknowledgement for no awaited entry"),
+        Err(e) => warn!(sender, error = %e, "failed to settle acknowledged outbox entry"),
     }
 }

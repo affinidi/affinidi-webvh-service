@@ -50,30 +50,16 @@ pub struct AppConfig {
 }
 
 /// Trust Tasks framework runtime knobs.
-///
-/// Introduced in v0.7.0 with `enforce_proofs` defaulting to `true`
-/// — the framework's 0.1.1 `IS_PROOF_REQUIRED` enforcement makes
-/// `acl/grant`, `acl/revoke`, and `acl/change-role` unreachable
-/// without a verified proof, and the Web UI ships ephemeral Ed25519
-/// session-key signing in this release so the default produces a
-/// working deployment out-of-the-box.
-///
-/// Setting this to `false` switches the dispatcher to
-/// [`trust_tasks_rs::ProofPolicy::RejectIfPresent`] — a proof-bearing
-/// document is rejected with `malformed_request`. RECOMMENDED specs
-/// (acl/list, acl/show, trust-task-discovery) continue to work
-/// proofless under either policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrustTasksConfig {
-    /// When `true` (default), dispatch passes the configured proof
-    /// verifier (`state.trust_tasks_verifier`) through as
-    /// [`trust_tasks_rs::ProofPolicy::Verify`]. Proof-bearing documents
-    /// are verified; REQUIRED-spec documents without a proof are
-    /// rejected with `proof_required`. When `false`, the dispatcher
-    /// runs in [`trust_tasks_rs::ProofPolicy::RejectIfPresent`] mode:
-    /// proof-bearing documents are rejected with `malformed_request`,
-    /// so a producer that signed in-band is never silently
-    /// downgraded.
+    /// Retained only so an existing config that sets it still parses.
+    ///
+    /// Proofs are now verified on every trust-task path, and every privileged
+    /// document must carry one bound to its sender; there is no mode that
+    /// accepts or ignores proofs. `true` (the default) is a no-op, and
+    /// `false` is refused at startup by [`AppConfig::load`] rather than
+    /// silently disregarded — an operator who turned verification off must
+    /// learn that it is back on.
     #[serde(default = "default_enforce_proofs")]
     pub enforce_proofs: bool,
 }
@@ -182,6 +168,14 @@ impl AppConfig {
             .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
 
         config.config_path = path;
+
+        if !config.trust_tasks.enforce_proofs {
+            return Err(AppError::Config(
+                "trust_tasks.enforce_proofs = false is no longer supported: every privileged \
+                 trust task must carry a proof bound to its sender. Remove the setting."
+                    .into(),
+            ));
+        }
 
         // Apply shared env overrides for common config fields
         did_hosting_common::server::config::apply_env_overrides(

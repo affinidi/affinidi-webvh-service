@@ -82,18 +82,8 @@ pub async fn dispatch_trust_task(
         }
     };
 
-    // ─── 2a. Replay gate (SEC-4045 W4). The DIDComm envelope path guards
-    //         state-changing DID ops (delete/change-owner/publish) with the
-    //         replay cache; the HTTPS transport reached the shared dispatcher
-    //         with no such gate, so a captured request could be re-executed
-    //         within the freshness window. Keyed on the transport-authenticated
-    //         caller DID + the document id, mirroring the DIDComm path.
-    if let Err(e) = state.replay_cache.check_and_insert(&auth.did, &doc.id) {
-        tracing::warn!(did = %auth.did, doc_id = %doc.id, error = %e, "HTTPS trust-task replay rejected");
-        return Ok(into_response(DispatchOutcome::Rejected(
-            crate::messaging::body_replay_error(),
-        )));
-    }
+    // Replay protection runs inside `dispatch_trust_task_doc`, keyed on the
+    // proven issuer and the document id, after the proof has been verified.
 
     // ─── 3. Proof-verificationMethod binding pre-check (SECURITY).
     //
@@ -175,8 +165,28 @@ pub async fn dispatch_trust_task(
     //
     // The comment this replaces claimed "parity with the TSP + DIDComm
     // transports". It had parity with one branch of five.
+    // The verifier for this request. A passkey session signs with its
+    // JWT-bound session key on behalf of the JWT subject, so its verifier
+    // accepts exactly that key for exactly that principal — built here, per
+    // request, from the verified bearer token, never on the shared verifier.
+    // Every other caller signs as itself.
+    let shared = state
+        .trust_tasks_verifier
+        .as_deref()
+        .ok_or_else(|| AppError::Config("no trust-task proof verifier configured".into()))?;
+    let delegated;
+    let verifier = match auth.session_pubkey_b58btc.as_deref() {
+        Some(pk) => {
+            delegated = shared
+                .clone()
+                .with_session_delegate(auth.did.clone(), format!("did:key:{pk}#{pk}"));
+            &delegated
+        }
+        None => shared,
+    };
+
     let transport = HttpsHandler::new(my_vid.to_string(), auth.did.clone());
-    match crate::messaging::dispatch_trust_task_doc(&state, &auth.did, &transport, doc)
+    match crate::messaging::dispatch_trust_task_doc(&state, &auth.did, &transport, doc, verifier)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
     {

@@ -3263,6 +3263,7 @@ dependencies = [
 name = "did-hosting-server"
 version = "0.8.3"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-did-webs",
  "affinidi-messaging-didcomm",
@@ -3321,6 +3322,7 @@ dependencies = [
  "tracing-subscriber",
  "trust-tasks-didcomm",
  "trust-tasks-rs",
+ "url",
  "utoipa",
  "uuid",
  "vta-sdk",

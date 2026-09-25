@@ -31,7 +31,7 @@ use did_hosting_common::server::trust_tasks::TspTransportHandler;
 
 use did_hosting_common::server::tsp_binding;
 
-use crate::messaging::{body_parse_error, body_replay_error, dispatch_trust_task_doc};
+use crate::messaging::{body_parse_error, dispatch_trust_task_doc};
 use crate::server::AppState;
 
 /// messaging-service [`TspHandler`] that dispatches inbound TSP trust-task
@@ -117,18 +117,8 @@ pub(crate) async fn run_tsp_trust_task(
         }
     };
 
-    // Replay gate (SEC-4045 W4). The DIDComm envelope path guards state-changing
-    // DID ops with the replay cache; the TSP routed-relay transport reached the
-    // shared dispatcher with no such gate, so a mediator-positioned attacker
-    // could resubmit a captured sealed frame and re-execute a delete/change-owner/
-    // publish within the freshness window. Keyed on the transport-authenticated
-    // sender + the document id, mirroring the DIDComm and HTTPS paths.
-    if let Err(e) = state.replay_cache.check_and_insert(sender, &doc.id) {
-        warn!(sender, doc_id = %doc.id, error = %e, "TSP trust-task replay rejected");
-        let err_doc = body_replay_error();
-        let body = serde_json::to_vec(&err_doc).expect("trust-task-error serialises");
-        return Ok(Some(body));
-    }
+    // Replay protection runs inside `dispatch_trust_task_doc`, keyed on the
+    // proven issuer and the document id, after the proof has been verified.
 
     let my_vid = state
         .config
@@ -145,7 +135,8 @@ pub(crate) async fn run_tsp_trust_task(
     // No status codes on this transport, so the reply is the document either
     // way — `into_document` is where that flattening belongs, beside the router
     // rather than in each binding.
-    match dispatch_trust_task_doc(state, sender, &transport, doc)
+    let verifier = crate::messaging::require_verifier(state)?;
+    match dispatch_trust_task_doc(state, sender, &transport, doc, verifier)
         .await?
         .into_document()
     {
@@ -216,8 +207,16 @@ mod tests {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
-            identity: None,
-            trust_tasks_verifier: None,
+            identity: Some(
+                did_hosting_common::server::identity::ServiceIdentity::generated_for(SERVICE_DID)
+                    .await
+                    .unwrap(),
+            ),
+            trust_tasks_verifier: Some(Arc::new(
+                did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
+                    Arc::new(affinidi_data_integrity::DidKeyResolver),
+                ),
+            )),
             jwt_keys: None,
             webauthn: None,
             http_client: reqwest::Client::new(),
@@ -329,9 +328,8 @@ mod tests {
             vta_sdk::tsp_binding::open_envelope(&bytes).expect("the reply is a binding envelope");
         let doc: Value = serde_json::from_slice(&document).expect("document is JSON");
         // And the dispatcher saw *our task*, not the envelope. The reply is a
-        // `proofRequired` rejection — the same outcome the bare-document test
-        // above gets, since neither supplies a proof under the default policy —
-        // but what matters is that it answers `acl/grant`. Before the fix the
+        // rejection — the sender has no ACL entry, so it is turned away before
+        // any proof work — but what matters is that it answers `acl/grant`. Before the fix the
         // envelope's own type URI was all the parser ever saw, so no reply
         // could name the task inside it.
         assert_eq!(
@@ -339,8 +337,8 @@ mod tests {
             "the reply answers the task the envelope carried: {doc}"
         );
         assert_eq!(
-            doc["payload"]["code"], "proofRequired",
-            "it reached proof checking, i.e. past parsing: {doc}"
+            doc["payload"]["code"], "permissionDenied",
+            "it reached the authorisation gate, i.e. past parsing: {doc}"
         );
     }
 
@@ -403,11 +401,13 @@ mod tests {
         use did_hosting_common::server::domain::DomainScope;
 
         let (state, _dir) = test_state().await;
-        // check_acl must resolve the sender; seed an admin entry.
+        // The document must be signed by its sender; a did:key signer
+        // verifies without I/O. check_acl must then resolve that signer.
+        let (sender, signer) = crate::signing::test_util::did_key_signer(&[31u8; 32]);
         store_acl_entry(
             &state.acl_ks,
             &AclEntry {
-                did: SENDER_DID.into(),
+                did: sender.clone(),
                 role: Role::Admin,
                 label: None,
                 created_at: 1_700_000_000,
@@ -422,21 +422,23 @@ mod tests {
         let body = json!({
             "id": "urn:uuid:22222222-2222-2222-2222-222222222222",
             "type": "https://trusttasks.org/spec/did-management/did/check-name/0.1",
+            "issuer": sender,
             "recipient": SERVICE_DID,
-            "issuedAt": "2026-07-06T00:00:00Z",
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             // A read-only availability probe: params ride in `payload`,
             // which the bridge maps to the synthesised `Message.body`.
             "payload": { "path": "alice", "reserve": false }
         });
-        let payload = serde_json::to_vec(&body).unwrap();
-        let out = run_tsp_trust_task(&state, SENDER_DID, &payload)
+        let signed = crate::signing::test_util::sign_operational(body, &signer).await;
+        let payload = serde_json::to_vec(&signed).unwrap();
+        let out = run_tsp_trust_task(&state, &sender, &payload)
             .await
             .expect("handler ok")
             .expect("a response is emitted");
         let doc: Value = serde_json::from_slice(&out).expect("response is JSON");
 
         // Bridged to dispatch_did_op → check-name `#response`, addressed back
-        // to the TSP-authenticated sender, threaded to the request.
+        // to the proven signer, threaded to the request.
         assert_eq!(
             doc["type"],
             "https://trusttasks.org/spec/did-management/did/check-name/0.1#response"
@@ -444,11 +446,50 @@ mod tests {
         assert_eq!(doc["payload"]["available"], true);
         assert_eq!(doc["payload"]["reserved"], false);
         assert_eq!(doc["issuer"], SERVICE_DID);
-        assert_eq!(doc["recipient"], SENDER_DID);
+        assert_eq!(doc["recipient"], sender.as_str());
         assert_eq!(
             doc["threadId"], "urn:uuid:22222222-2222-2222-2222-222222222222",
             "response threads to the request id"
         );
+    }
+
+    /// The same probe unsigned — which is how every TSP client sent it before
+    /// — is refused before the ACL is consulted, whatever sender VID TSP
+    /// reported.
+    #[tokio::test]
+    async fn unsigned_did_management_over_tsp_is_refused() {
+        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+        use did_hosting_common::server::domain::DomainScope;
+
+        let (state, _dir) = test_state().await;
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: SENDER_DID.into(),
+                role: Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        let body = json!({
+            "id": "urn:uuid:55555555-5555-5555-5555-555555555555",
+            "type": "https://trusttasks.org/spec/did-management/did/check-name/0.1",
+            "issuer": SENDER_DID,
+            "recipient": SERVICE_DID,
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": { "path": "alice", "reserve": true }
+        });
+        let out = run_tsp_trust_task(&state, SENDER_DID, &serde_json::to_vec(&body).unwrap())
+            .await
+            .expect("handler ok")
+            .expect("a response is emitted");
+        let doc: Value = serde_json::from_slice(&out).expect("response is JSON");
+        assert_eq!(doc["payload"]["code"], "proofRequired", "{doc}");
     }
 
     /// `auth/challenge/0.1` over a messaging binding is held to the same
@@ -577,9 +618,7 @@ mod tests {
                 "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 "payload": { "sessionId": first.session_id, "challenge": challenge }
             });
-            let signed = crate::signing::sign_trust_task_document(unsigned, &signer)
-                .await
-                .unwrap();
+            let signed = crate::signing::test_util::sign_operational(unsigned, &signer).await;
             let out = run_tsp_trust_task(&state, &caller, &serde_json::to_vec(&signed).unwrap())
                 .await
                 .unwrap()
@@ -606,5 +645,104 @@ mod tests {
             "already released: a second release is a no-op"
         );
         assert_eq!(state.pending_challenges.count_for(&caller), 1);
+    }
+
+    /// Every non-error reply is signed by the control plane: `issuer` is the
+    /// control plane, `recipient` the requester, `proofPurpose:
+    /// authentication` — checked here exactly as a client would, with
+    /// `verify_sender_bound` from the requester's side. Covers the two replies
+    /// clients depend on first: the challenge and the session.
+    #[tokio::test]
+    async fn challenge_and_authenticate_replies_are_signed_by_the_control_plane() {
+        use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+        use did_hosting_common::server::domain::DomainScope;
+        use did_hosting_common::server::identity::ServiceIdentity;
+        use did_hosting_common::server::trust_tasks::{
+            TransportBoundVerifier, verify_sender_bound,
+        };
+
+        let (control, control_key) = crate::signing::test_util::did_key_signer(&[61u8; 32]);
+        let (caller, caller_key) = crate::signing::test_util::did_key_signer(&[62u8; 32]);
+        let (mut state, _dir) = test_state().await;
+        let mut cfg = (*state.config).clone();
+        cfg.server_did = Some(control.clone());
+        state.config = Arc::new(cfg);
+        state.identity = Some(
+            ServiceIdentity::from_signing_secret(&control, control_key)
+                .await
+                .unwrap(),
+        );
+        state.jwt_keys = Some(Arc::new(
+            crate::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
+        ));
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: caller.clone(),
+                role: Role::Owner,
+                label: None,
+                created_at: crate::auth::session::now_epoch(),
+                max_total_size: None,
+                max_did_count: None,
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        let client_verifier = TransportBoundVerifier::with_resolver(Arc::new(
+            affinidi_data_integrity::DidKeyResolver,
+        ));
+        let now = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // Challenge — proofless request, signed reply.
+        let request = json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": "https://trusttasks.org/spec/auth/challenge/0.1",
+            "issuer": caller,
+            "recipient": control,
+            "issuedAt": now(),
+            "payload": { "purpose": "login" }
+        });
+        let out = run_tsp_trust_task(&state, &caller, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            reply.type_uri.to_string(),
+            "https://trusttasks.org/spec/auth/challenge/0.1#response"
+        );
+        verify_sender_bound(&reply, Some(&control), None, &caller, &client_verifier)
+            .await
+            .expect("challenge reply is signed by the control plane, for the caller");
+        let session_id = reply.payload["sessionId"].as_str().unwrap().to_string();
+        let challenge = reply.payload["challenge"].as_str().unwrap().to_string();
+
+        // Authenticate — signed request, signed reply.
+        let request = crate::signing::test_util::sign_operational(
+            json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
+                "issuer": caller,
+                "recipient": control,
+                "issuedAt": now(),
+                "payload": { "sessionId": session_id, "challenge": challenge }
+            }),
+            &caller_key,
+        )
+        .await;
+        let out = run_tsp_trust_task(&state, &caller, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            reply.type_uri.to_string(),
+            "https://trusttasks.org/spec/auth/authenticate/0.1#response",
+            "{reply:?}"
+        );
+        verify_sender_bound(&reply, Some(&control), None, &caller, &client_verifier)
+            .await
+            .expect("authenticate reply is signed by the control plane, for the caller");
     }
 }

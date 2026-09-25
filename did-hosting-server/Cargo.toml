@@ -90,6 +90,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 didwebvh-rs = { workspace = true }
+url = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true, optional = true }
 hex = "0.4"
@@ -135,6 +136,10 @@ azure_identity = { version = "1.0", optional = true }
 [dev-dependencies]
 tempfile = "3"
 anyhow.workspace = true
+# `tests/control_plane_ops.rs` signs control-plane documents with `did:key`
+# signers and verifies them with the crate's local `DidKeyResolver`, so the
+# proof checks run without DID-resolution I/O.
+affinidi-data-integrity = { workspace = true }
 # `tests/webs_resolve.rs` re-derives the DID document from the served
 # artifacts with the method crate directly, so the assertion is against
 # an independent implementation rather than against the same code path

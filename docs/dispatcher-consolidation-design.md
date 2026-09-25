@@ -1,5 +1,10 @@
 # Design note — DIDComm dispatcher consolidation
 
+> **Update.** Both transports this document consolidates — the bare DIDComm
+> `MSG_*` routes and `POST /api/didcomm` — have since been removed.
+> `dispatch_did_op` is reached only through `bridge_did_management`, after the
+> unified trust-task dispatcher has verified the document's sender-bound proof.
+
 **Status:** implemented. The single `dispatch_did_op`
 (`did-hosting-control/src/messaging.rs`) is now the one per-message
 dispatch table; both the framework-routed and HTTP-signed transports call

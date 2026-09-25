@@ -263,6 +263,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
+    // No unsigned mode: a control plane that cannot sign refuses to start.
+    crate::signing::require_signing_identity(identity.as_deref(), config.server_did.as_deref())?;
     let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
     let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 
@@ -307,13 +309,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // sharing one Arc, because did_resolver remains `Option<DIDCacheClient>`
     // for callers that prefer the un-Arc'd form.
     let trust_tasks_verifier = did_resolver.clone().map(|client| {
-        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
-            Arc::new(client),
-        ));
         Arc::new(
-            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
-                resolver,
-            ),
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_did_cache(client),
         )
     });
 
@@ -534,6 +531,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let health_control_did = state.config.server_did.clone();
     let health_interval_secs = state.config.registry.health_check_interval.max(10);
     let health_resolver = state.did_resolver.clone();
+    let health_identity = state.identity.clone();
     // Control's own configured mediator, used as the send fallback when a
     // target server's document advertises no transport.
     let health_fallback =
@@ -554,6 +552,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                         health_interval_secs,
                         &health_fallback,
                         health_resolver.as_ref(),
+                        health_identity.as_deref(),
                     ).await {
                         warn!("health check error: {e}");
                     }
@@ -1090,6 +1089,9 @@ pub async fn flush_stats_to_store(
 /// Ping one trust-task-capable instance, letting its DID document choose the
 /// transport. Failures are logged, never fatal — an unreachable server simply
 /// stops ponging and ages into `Unreachable` on the next sweep.
+// One over clippy's 7-arg threshold: the signer joined an already-flat
+// parameter list, and a struct would only move the same values around.
+#[allow(clippy::too_many_arguments)]
 async fn send_health_ping_trust_task(
     svc: &DIDCommService,
     registry_ks: &KeyspaceHandle,
@@ -1098,18 +1100,23 @@ async fn send_health_ping_trust_task(
     inst: &registry::ServiceInstance,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
+    signer: &affinidi_tdk::secrets_resolver::secrets::Secret,
 ) {
-    use did_hosting_common::server::trust_tasks::send::{build_request, send_trust_task};
+    use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
 
-    let doc = match build_request(
+    // Signed: an edge answers only a ping its control plane signed.
+    let doc = match build_signed_request(
         did_hosting_common::didcomm_types::MSG_HEALTH_PING,
         control_did,
         server_did,
         serde_json::json!({}),
-    ) {
+        signer,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "health ping: MSG_HEALTH_PING is not a valid Type URI");
+            warn!(error = %e, "health ping: could not build the signed ping");
             return;
         }
     };
@@ -1153,6 +1160,11 @@ async fn send_health_ping_trust_task(
 
 /// Send health pings to all registered instances and evaluate staleness-based
 /// status from the last received pong timestamp.
+///
+/// `identity` is the control plane's own identity, read on every sweep so a
+/// rotation is picked up; without it no ping can be signed and none is sent —
+/// instances then age into `Unreachable`, which is the honest status for a
+/// control plane that cannot prove who it is.
 pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     didcomm: &std::sync::OnceLock<DIDCommService>,
@@ -1160,69 +1172,46 @@ pub async fn run_health_checks(
     health_interval_secs: u64,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
+    identity: Option<&did_hosting_common::server::identity::ServiceIdentity>,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
     // Send health pings (fire-and-forget — the pong handler updates status).
-    //
-    // Two framings, chosen per instance:
-    //
-    // - `trust_task_capable` servers get a `.../server/health/0.1` trust task,
-    //   and `send_trust_task` picks TSP or DIDComm from the *server's own DID
-    //   document*. This is the only way a TSP-only server is ever pinged.
-    // - Everything else gets the legacy `MSG_HEALTH_PING` DIDComm message. An
-    //   older server has no trust-task dispatcher, so a trust task would go
-    //   unrouted and it would decay to Unreachable on a control-plane-only
-    //   upgrade.
-    if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
+    // Every ping is a signed `.../server/health/0.1` trust task, and
+    // `send_trust_task` picks TSP or DIDComm from the *server's own DID
+    // document*.
+    let signer = match (identity, control_did) {
+        (Some(identity), Some(ctrl_did)) => {
+            match did_hosting_common::server::trust_tasks::identity_signing_secret(
+                identity, ctrl_did,
+            ) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(error = %e, "health pings skipped: cannot sign");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if let (Some(svc), Some(ctrl_did), Some(signer)) = (didcomm.get(), control_did, signer.as_ref())
+    {
         for inst in &instances {
             let Some(server_did) = inst.did() else {
                 continue;
             };
-
-            if inst.trust_task_capable {
-                send_health_ping_trust_task(
-                    svc,
-                    registry_ks,
-                    ctrl_did,
-                    server_did,
-                    inst,
-                    fallback,
-                    did_resolver,
-                )
-                .await;
-                continue;
-            }
-
-            let msg = affinidi_messaging_didcomm::Message::build(
-                uuid::Uuid::new_v4().to_string(),
-                did_hosting_common::didcomm_types::MSG_HEALTH_PING.to_string(),
-                serde_json::json!({}),
+            send_health_ping_trust_task(
+                svc,
+                registry_ks,
+                ctrl_did,
+                server_did,
+                inst,
+                fallback,
+                did_resolver,
+                signer,
             )
-            .from(ctrl_did.to_string())
-            .to(server_did.to_string())
-            .created_time(now)
-            .finalize();
-
-            match svc.send_message("control", msg, server_did).await {
-                Ok(()) => {
-                    // A legacy ping is DIDComm by construction.
-                    registry::record_outbound_transport(
-                        registry_ks,
-                        &inst.instance_id,
-                        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
-                        now,
-                    )
-                    .await;
-                }
-                Err(e) => debug!(
-                    instance_id = %inst.instance_id,
-                    server_did,
-                    error = %e,
-                    "failed to send legacy health ping"
-                ),
-            }
+            .await;
         }
     }
 

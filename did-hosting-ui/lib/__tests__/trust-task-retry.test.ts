@@ -10,14 +10,34 @@
  *     proves the wrapper actually re-issues, bounds its attempts, and
  *     surfaces the original rejection when it gives up.
  *
- * `acl/list` is used for the end-to-end layer deliberately: it is not in
- * `REQUIRED_PROOF_TYPES`, so no Data Integrity proof (and therefore no
- * WebCrypto Ed25519 keypair) is needed to drive a real request through.
+ * `acl/list` drives the end-to-end layer. Like every envelope but discovery it
+ * is signed, so the session-key module is stubbed to attach a placeholder
+ * proof — the fetch stub never verifies it — and a bearer token supplies the
+ * subject DID the envelope's `issuer` is taken from.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, TrustTaskRejection, api, retryDelayMs } from "../api";
+
+vi.mock("../session-key", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../session-key")>()),
+  hasSessionKeypair: () => true,
+  restoreSessionKeypair: async () => {},
+  signEnvelope: async (envelope: Record<string, unknown>) => {
+    envelope.proof = { type: "DataIntegrityProof", proofValue: "zTest" };
+    return envelope;
+  },
+}));
+
+/** An unsigned JWT whose payload names `sub` — all the UI reads from it. */
+function tokenFor(sub: string): string {
+  const b64url = (v: unknown) =>
+    btoa(JSON.stringify(v)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${b64url({ alg: "none" })}.${b64url({ sub })}.`;
+}
+
+const SUBJECT = "did:web:admin.example";
 
 const GRANT = "https://trusttasks.org/spec/acl/grant/0.1";
 const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.1";
@@ -207,17 +227,22 @@ describe("trustTask — re-issue behaviour", () => {
    * Stub `fetch` so `/api/server-info` always succeeds and each
    * `/api/trust-tasks` POST returns the next queued response.
    */
+  /** Every envelope sent, as the server would have received it. */
+  let sent: Record<string, unknown>[];
+
   function stubFetch(responses: unknown[]) {
     trustTaskCalls = 0;
+    sent = [];
     const queue = [...responses];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (path: string) => {
+      vi.fn(async (path: string, init?: RequestInit) => {
         if (path === "/api/server-info") {
           return jsonOk({ server_did: "did:webvh:example:test", version: "0" });
         }
         if (path === "/api/trust-tasks") {
           trustTaskCalls++;
+          sent.push(JSON.parse(String(init?.body ?? "{}")));
           const next = queue.shift();
           if (next === undefined) throw new Error("unexpected extra POST");
           return asResponse(next);
@@ -231,6 +256,22 @@ describe("trustTask — re-issue behaviour", () => {
     // `retryAfter`-less retries pause for TRUST_TASK_DEFAULT_RETRY_DELAY_MS;
     // fake timers keep the suite instant.
     vi.useFakeTimers();
+    const token = tokenFor(SUBJECT);
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => (key === "webvh_token" ? token : null),
+      setItem: () => {},
+      removeItem: () => {},
+    });
+  });
+
+  it("signs an ACL read and names the session subject as its issuer", async () => {
+    stubFetch([listResponse([])]);
+
+    await api.listAcl();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.issuer).toBe(SUBJECT);
+    expect(sent[0]!.proof).toBeDefined();
   });
 
   afterEach(() => {

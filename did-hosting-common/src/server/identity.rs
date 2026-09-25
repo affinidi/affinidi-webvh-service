@@ -48,6 +48,16 @@ use super::error::AppError;
 use super::secret_store::{RetiredKeys, SecretStore, ServerSecrets};
 use super::store::{KS_IDENTITY, KeyspaceHandle, Store};
 
+/// How long a resolved DID document is trusted from the cache, in seconds.
+///
+/// This service's resolver verifies every sender-bound proof, so the TTL bounds
+/// how long a key a peer has *removed* from its document keeps being accepted.
+/// A peer that *added* a key (rotation) is not held to it: a proof that fails
+/// against a cached document is retried once against a fresh resolution (see
+/// `TransportBoundVerifier`). Kept short and explicit rather than inherited
+/// from the SDK default.
+pub const DID_CACHE_TTL_SECS: u32 = 120;
+
 /// Store key holding the current generation's id.
 const KEY_CURRENT: &str = "identity:current";
 
@@ -270,6 +280,52 @@ impl ServiceIdentity {
     /// The mediator the live listener connects to.
     pub fn mediator_did(&self) -> Option<String> {
         self.current().mediator_did
+    }
+
+    /// [`Self::from_signing_secret`] with a freshly generated Ed25519 key named
+    /// `{did}#key-1`. For tests that need a service able to sign as `did`
+    /// without anything resolving the key.
+    pub async fn generated_for(did: &str) -> Result<Arc<Self>, AppError> {
+        let mut secret = Secret::generate_ed25519(None, None);
+        secret.id = format!("{did}#key-1");
+        Self::from_signing_secret(did, secret).await
+    }
+
+    /// An identity with one generation whose signing key is `secret` (its `id`
+    /// is the signing kid). For tests and tools that need a service able to
+    /// sign — e.g. a `did:key` service DID — without a published DID log.
+    /// Carries no key-agreement key, so it cannot back a DIDComm listener.
+    pub async fn from_signing_secret(did: &str, secret: Secret) -> Result<Arc<Self>, AppError> {
+        let did_resolver = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_cache_ttl(DID_CACHE_TTL_SECS)
+                .build(),
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("DID cache: {e}")))?;
+        let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+        let generation = IdentityGeneration {
+            id: 0,
+            did: did.to_string(),
+            signing_kid: secret.id.clone(),
+            ka_kid: String::new(),
+            ka_public_multibase: None,
+            mediator_did: None,
+            protocols: ProtocolSet::default(),
+            created_at: now_epoch(),
+            retired_at: None,
+            expires_at: None,
+        };
+        Ok(Arc::new(Self {
+            did: did.to_string(),
+            did_resolver,
+            secrets_resolver: Arc::new(secrets_resolver),
+            live: RwLock::new(LiveSet {
+                generations: vec![generation],
+                secrets: vec![secret],
+            }),
+            rotation: tokio::sync::Mutex::new(()),
+        }))
     }
 
     /// Build a `ServiceIdentity` directly, for tests in sibling modules.
@@ -651,7 +707,13 @@ pub async fn load_identity(
         }
     };
 
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+    let did_resolver = match DIDCacheClient::new(
+        DIDCacheConfigBuilder::default()
+            .with_cache_ttl(DID_CACHE_TTL_SECS)
+            .build(),
+    )
+    .await
+    {
         Ok(resolver) => resolver,
         Err(e) => {
             warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");

@@ -222,6 +222,7 @@ async fn a_signed_sign_in_must_be_addressed_to_this_server() {
         acl_ks,
         dids_ks: store.keyspace(KS_DIDS).expect("dids ks"),
         config: Arc::new(config),
+        trust_tasks_verifier: did_hosting_server::messaging::build_verifier(Some(&did_resolver)),
         did_resolver: Some(did_resolver),
         secrets_resolver: Some(secrets_resolver),
         identity: None,

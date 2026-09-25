@@ -281,6 +281,33 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
 /// failures and a "proof verification failed: ..." prefix on the
 /// upstream verifier's report.
 pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
+    verify_did_log_chain(content, None).map(|_| ())
+}
+
+/// [`verify_did_log_proofs`] plus the DID's witness proofs.
+///
+/// For a hosting node that serves a log it did not author: when the log
+/// configures witnesses, the published witness proofs must be supplied and must
+/// meet the threshold — a witnessed DID is refused outright without them rather
+/// than served unwitnessed.
+pub fn verify_did_log_and_witness_proofs(
+    content: &str,
+    witness_content: Option<&str>,
+) -> Result<(), String> {
+    let witnessed = verify_did_log_chain(content, witness_content)?;
+    if witnessed && witness_content.is_none_or(|w| w.trim().is_empty()) {
+        return Err(
+            "the DID log configures witnesses but no witness proofs were supplied; refusing to \
+             serve it unwitnessed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Walk and validate the chain; returns whether the (current) parameters
+/// configure witnesses.
+fn verify_did_log_chain(content: &str, witness_content: Option<&str>) -> Result<bool, String> {
     // Re-run the structural parse so callers can use this function
     // as a single gate. Cheap relative to the proof-verification cost.
     validate_did_jsonl(content)?;
@@ -307,6 +334,12 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         });
     }
 
+    if let Some(raw) = witness_content.filter(|w| !w.trim().is_empty()) {
+        let proofs = DIDWebVHState::parse_witness_proofs(raw)
+            .map_err(|e| format!("invalid witness proofs: {e}"))?;
+        state.set_witness_proofs(proofs);
+    }
+
     let report = state
         .validate()
         .map_err(|e| format!("proof verification failed: {e}"))?;
@@ -317,6 +350,66 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         .assert_complete()
         .map_err(|e| format!("proof verification failed (chain incomplete): {e}"))?;
 
+    let witnessed = state.log_entries().last().is_some_and(|e| {
+        e.validated_parameters
+            .witness
+            .as_ref()
+            .and_then(|w| serde_json::to_value(w).ok())
+            .and_then(|v| v.get("threshold").and_then(|t| t.as_u64()))
+            .is_some_and(|t| t > 0)
+    });
+    Ok(witnessed)
+}
+
+/// Check that `next` is an acceptable successor of the `did.jsonl` a host
+/// already holds (`previous`), independent of who sent it.
+///
+/// A webvh log is append-only: every version commits to the one before it, so
+/// the only legitimate way for a hosted log to change is to gain entries at the
+/// end. This refuses:
+///
+/// - **rollback / fork** — a `next` that is not `previous` with zero or more
+///   entries appended (shorter, or diverging anywhere in the shared prefix).
+///   Serving an older log would resurrect keys the controller has rotated out,
+///   or a document it has since changed;
+/// - **resurrection** — any change at all to a log whose history already
+///   contains a deactivation. A deactivated DID stays deactivated.
+///
+/// Resending the identical log is accepted (idempotent sync). This is a
+/// history check only; pair it with [`verify_did_log_proofs`] for the chain's
+/// own validity.
+pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let entries = |log: &str| -> Vec<String> {
+        log.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let old = entries(previous);
+    let new = entries(next);
+    if new.len() < old.len() || new[..old.len()] != old[..] {
+        return Err(format!(
+            "did.jsonl is not an extension of the hosted log ({} entries held, {} received, \
+             or the shared history differs); refusing a rollback or fork",
+            old.len(),
+            new.len()
+        ));
+    }
+    let deactivated = old.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("parameters")?.get("deactivated")?.as_bool())
+            .unwrap_or(false)
+    });
+    if deactivated && new.len() != old.len() {
+        return Err(
+            "the hosted DID is deactivated; refusing entries appended after deactivation".into(),
+        );
+    }
     Ok(())
 }
 
@@ -810,5 +903,53 @@ mod agent_name_tests {
     fn no_also_known_as_is_empty() {
         let log = "{\"versionId\":\"1\",\"state\":{\"id\":\"did:webvh:x:host.example\"}}";
         assert!(extract_agent_names(log, "host.example").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod log_extension_tests {
+    use super::verify_log_extends;
+
+    const V1: &str = r#"{"versionId":"1-a","parameters":{}}"#;
+    const V2: &str = r#"{"versionId":"2-b","parameters":{}}"#;
+    const V2_FORK: &str = r#"{"versionId":"2-x","parameters":{}}"#;
+    const V2_DEACT: &str = r#"{"versionId":"2-b","parameters":{"deactivated":true}}"#;
+    const V3: &str = r#"{"versionId":"3-c","parameters":{}}"#;
+
+    fn log(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn a_first_log_is_accepted() {
+        verify_log_extends(None, &log(&[V1])).unwrap();
+    }
+
+    #[test]
+    fn appending_and_resending_are_accepted() {
+        verify_log_extends(Some(&log(&[V1])), &log(&[V1, V2])).unwrap();
+        verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1, V2])).unwrap();
+    }
+
+    #[test]
+    fn a_shorter_log_is_a_rollback() {
+        let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1])).unwrap_err();
+        assert!(err.contains("rollback"), "{err}");
+    }
+
+    #[test]
+    fn a_diverging_log_is_a_fork() {
+        let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1, V2_FORK, V3])).unwrap_err();
+        assert!(err.contains("fork"), "{err}");
+    }
+
+    #[test]
+    fn a_deactivated_log_cannot_grow_or_be_replaced() {
+        let held = log(&[V1, V2_DEACT]);
+        verify_log_extends(Some(&held), &held).unwrap();
+        let err = verify_log_extends(Some(&held), &log(&[V1, V2_DEACT, V3])).unwrap_err();
+        assert!(err.contains("deactivated"), "{err}");
+        // Replacing the deactivating entry is a fork, and refused as one.
+        assert!(verify_log_extends(Some(&held), &log(&[V1, V2, V3])).is_err());
     }
 }

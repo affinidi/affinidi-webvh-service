@@ -1,8 +1,8 @@
 //! Control plane registration — announces this server to the control plane
 //! via DIDComm through the shared mediator connection.
 //!
-//! On startup, the server sends a `server/register` DIDComm message to the
-//! control plane's DID using the `DIDCommService::send_message()` API.
+//! On startup, the server sends a signed `server/register` trust task to the
+//! control plane's DID over whichever binding its DID document advertises.
 //! The control plane validates the server's DID against its ACL (must be
 //! pre-approved with service role) and adds it to the service registry.
 //!
@@ -11,23 +11,20 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use did_hosting_common::DidSyncUpdate;
 use did_hosting_common::did_ops::{
     AgentNameEntry, DidRecord, agent_name_key, content_log_key, content_witness_key, did_key,
-    extract_agent_names, extract_service_types, owner_key, validate_did_jsonl,
+    extract_agent_names, extract_service_types, owner_key,
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
 use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
-use did_hosting_common::server::didcomm_profile::{
-    PeerTransport, TransportFallback, resolve_transport,
-};
+use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use did_hosting_common::server::mnemonic::validate_agent_name_binding;
 use did_hosting_common::server::trust_tasks::send::{
-    Retry, build_request, send_trust_task_with_retry,
+    Retry, build_signed_request, send_trust_task_with_retry,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -154,7 +151,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
-    // Report the DIDs we already hold (mnemonic → version) so the control
+    // Report the DIDs we already hold (mnemonic → DID + version) so the control
     // plane sends only what we're missing or behind on, instead of re-pushing
     // every DID on every boot. Compact by design — mnemonic + version, not the
     // logs. A store-iteration failure degrades to an empty list, i.e. a full
@@ -164,7 +161,17 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
             .into_iter()
             .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
             .filter(|r| r.version_count > 0)
-            .map(|r| json!({ "mnemonic": r.mnemonic, "version_count": r.version_count }))
+            // `did_id` names *which* DID the slot holds: a DID deleted and
+            // re-created at the same mnemonic has a new identifier, so the
+            // control plane re-pushes on an identity mismatch even when the
+            // version counts happen to agree.
+            .map(|r| {
+                json!({
+                    "mnemonic": r.mnemonic,
+                    "did_id": r.did_id,
+                    "version_count": r.version_count,
+                })
+            })
             .collect(),
         Err(e) => {
             warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
@@ -191,74 +198,64 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         "preloaded_dids": preloaded_dids,
     });
 
-    // Framing follows the transport, and for one hard reason: a **TSP-only**
-    // server has no DIDComm wire on which to send the legacy
-    // `MSG_SERVER_REGISTER` message, so its only way into the registry is a
-    // trust task over TSP. Meanwhile a DIDComm-reachable server keeps sending
-    // the legacy message, because an *older* control plane has no
-    // `trust_tasks_infra` arm and would bounce a register trust task into
-    // `bridge_did_management` — which has never heard of `server/register` —
-    // leaving the server silently unregistered.
-    //
-    // Once every control plane in a fleet understands the trust task, this
-    // branch collapses to `send_trust_task` unconditionally. Discovery
-    // (`trust-task-discovery/0.1`) is the principled way to detect that; it is
-    // deliberately not attempted here.
-    let control_speaks_tsp = matches!(
-        resolve_transport(&control_did, state.did_resolver.as_ref()).await,
-        Some((PeerTransport::Tsp, _))
-    );
-
-    // This node's configured mediator, used as the send fallback when the
-    // peer's document advertises no transport (see `resolve_send_binding`).
+    // Always a signed trust task. Registration makes this server a sync target
+    // for every tenant's DIDs, so the control plane admits it only on a
+    // document this server's DID signed (see `do_server_register`); the
+    // bare-message form it replaced carried no proof and is no longer routed.
+    // The binding — TSP or the DIDComm envelope — follows the control plane's
+    // DID document.
     let fallback = TransportFallback::from_config(
         state.config.mediator_did.as_deref(),
         state.config.features.tsp,
     );
-
-    let outcome = if control_speaks_tsp {
-        match build_request(MSG_SERVER_REGISTER, &server_did, &control_did, body) {
-            Ok(doc) => send_trust_task_with_retry(
-                didcomm_svc,
-                "server",
+    let signer = match state.identity.as_deref() {
+        Some(identity) => {
+            match did_hosting_common::server::trust_tasks::identity_signing_secret(
+                identity,
                 &server_did,
-                &control_did,
-                &doc,
-                &fallback,
-                state.did_resolver.as_ref(),
-                Retry {
-                    attempts: 10,
-                    delay: std::time::Duration::from_secs(5),
-                },
-            )
-            .await
-            .map(|transport| {
-                info!(?transport, "server registration sent as trust task");
-            }),
-            Err(e) => Err(e),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "cannot register: no signing key for this server's DID");
+                    return;
+                }
+            }
         }
-    } else {
-        let msg = Message::build(
-            uuid::Uuid::new_v4().to_string(),
-            MSG_SERVER_REGISTER.to_string(),
-            body,
-        )
-        .from(server_did.clone())
-        .to(control_did.clone())
-        .created_time(crate::auth::session::now_epoch())
-        .finalize();
+        None => {
+            warn!(
+                "cannot register: service identity not loaded, so the registration cannot be signed"
+            );
+            return;
+        }
+    };
 
-        // Send with built-in retry (waits for reconnection between attempts)
-        didcomm_svc
-            .send_message_with_retry(
-                "server",
-                msg,
-                &control_did,
-                10,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    let outcome = match build_signed_request(
+        MSG_SERVER_REGISTER,
+        &server_did,
+        &control_did,
+        body,
+        &signer,
+    )
+    .await
+    {
+        Ok(doc) => send_trust_task_with_retry(
+            didcomm_svc,
+            "server",
+            &server_did,
+            &control_did,
+            &doc,
+            &fallback,
+            state.did_resolver.as_ref(),
+            Retry {
+                attempts: 10,
+                delay: std::time::Duration::from_secs(5),
+            },
+        )
+        .await
+        .map(|transport| {
+            info!(?transport, "server registration sent as trust task");
+        }),
+        Err(e) => Err(e),
     };
 
     match outcome {
@@ -285,9 +282,10 @@ pub async fn apply_did_updates(
     store: &Store,
     updates: &[DidSyncUpdate],
     did_cache: &crate::cache::ContentCache,
+    public_url: Option<&str>,
 ) {
     for update in updates {
-        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache).await {
+        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache, public_url).await {
             warn!(
                 mnemonic = %update.mnemonic,
                 error = %e,
@@ -297,12 +295,311 @@ pub async fn apply_did_updates(
     }
 }
 
+/// What [`verify_update`] established about an update.
+struct VerifiedUpdate {
+    /// The DID's stable identity: the SCID for webvh, the identifier for webs.
+    identity: String,
+    #[cfg(feature = "method-webs")]
+    webs_document: Option<serde_json::Value>,
+}
+
+/// The last DID a slot served. Kept after a delete (see `apply_single_update`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlotHighWater {
+    identity: String,
+    did_id: String,
+    method: String,
+}
+
+/// The high-water log key for a DID identity (SCID / webs identifier).
+fn high_water_identity_key(identity: &str) -> String {
+    format!("hw:id:{identity}")
+}
+
+/// The high-water record key for a slot.
+fn high_water_slot_key(mnemonic: &str) -> String {
+    format!("hw:slot:{mnemonic}")
+}
+
+/// Verify a sync update before it replaces anything:
+///
+/// 1. **Binding** — the identifier the push names is the one the log
+///    establishes, and it resolves at exactly this slot on a host this server
+///    serves (its public URL or an assigned domain). A valid log cannot be
+///    filed under another slot or served for another host.
+/// 2. **Chain** — webvh: every entry's hash, proof against the authorised
+///    `updateKeys`, pre-rotation and parameter transition, and the witness
+///    proofs when witnesses are configured; webs: the full key event log.
+/// 3. **History** — the log must strictly extend every history this edge has
+///    ever served for the same DID: the log it holds now, and the high-water
+///    log it kept for that DID's identity, which a delete does not clear. A
+///    rollback, a fork, a resurrected deactivation or a re-created DID that
+///    starts over are all refused. A slot that held a different DID may be
+///    re-used by a new one (a new DID is a new identity with its own history);
+///    a slot never changes method.
+async fn verify_update(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+    update: &DidSyncUpdate,
+    synced_method: &str,
+    public_url: Option<&str>,
+) -> Result<VerifiedUpdate, crate::error::AppError> {
+    use crate::error::AppError;
+
+    verify_binding(store, update, synced_method, public_url).await?;
+
+    match synced_method {
+        "webvh" => did_hosting_common::did_ops::verify_did_log_and_witness_proofs(
+            &update.log_content,
+            update.witness_content.as_deref(),
+        )
+        .map_err(AppError::Validation)?,
+        #[cfg(feature = "method-webs")]
+        _ => {}
+        #[cfg(not(feature = "method-webs"))]
+        _ => {
+            return Err(AppError::Validation(format!(
+                "this server cannot verify {synced_method} logs"
+            )));
+        }
+    }
+
+    #[cfg(feature = "method-webs")]
+    let webs_document = if synced_method == "webs" {
+        let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
+            &update.did_id,
+            update.log_content.as_bytes(),
+            None,
+        )
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&derived)
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let identity = verify_history(
+        dids_ks,
+        &update.mnemonic,
+        &update.did_id,
+        &update.log_content,
+        synced_method,
+    )
+    .await?;
+
+    Ok(VerifiedUpdate {
+        identity,
+        #[cfg(feature = "method-webs")]
+        webs_document,
+    })
+}
+
+/// Step 3 of [`verify_update`], shared with every other path that replaces a
+/// hosted log (the edge's own `PUT /api/dids/{mnemonic}`): the log must
+/// strictly extend every history this edge has served for the same DID — the
+/// log it holds now, and the high-water log kept for the DID's identity, which
+/// a delete does not clear — and a slot never changes method. Returns the DID's
+/// identity (SCID for webvh, the identifier for webs), to be recorded with
+/// [`stage_high_water`] in the same batch that stores the log.
+///
+/// The log itself must already have been verified (chain, proofs).
+pub(crate) async fn verify_history(
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    did_id: &str,
+    log_content: &str,
+    method: &str,
+) -> Result<String, crate::error::AppError> {
+    use crate::error::AppError;
+    use did_hosting_common::did_ops::verify_log_extends;
+
+    let held = dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let held_record: Option<DidRecord> = dids_ks.get(did_key(mnemonic)).await?;
+    let slot_mark: Option<SlotHighWater> = dids_ks.get(high_water_slot_key(mnemonic)).await?;
+    for held_method in held_record
+        .as_ref()
+        .map(|r| r.method.as_str())
+        .into_iter()
+        .chain(slot_mark.as_ref().map(|m| m.method.as_str()))
+    {
+        if held_method != method {
+            return Err(AppError::Validation(format!(
+                "slot {mnemonic} holds a {held_method} DID; refusing to replace it with a {method} log"
+            )));
+        }
+    }
+
+    let identity = match method {
+        "webvh" => webvh_scid(did_id).ok_or_else(|| {
+            AppError::Validation(format!("{did_id} is not a did:webvh identifier"))
+        })?,
+        _ => did_id.to_string(),
+    };
+
+    // Every history of this same DID the edge has served.
+    let high_water = dids_ks
+        .get_raw(high_water_identity_key(&identity))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let held_identity =
+        held_record
+            .as_ref()
+            .and_then(|r| r.did_id.as_deref())
+            .map(|id| match method {
+                "webvh" => webvh_scid(id).unwrap_or_default(),
+                _ => id.to_string(),
+            });
+    let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
+    for previous in [same_did_held, high_water].into_iter().flatten() {
+        match method {
+            "webvh" => {
+                verify_log_extends(Some(&previous), log_content).map_err(AppError::Validation)?
+            }
+            #[cfg(feature = "method-webs")]
+            _ => did_hosting_common::method::webs::Webs::verify_continuation(
+                did_id,
+                previous.as_bytes(),
+                log_content.as_bytes(),
+            )
+            .map_err(|e| AppError::Validation(e.to_string()))?,
+            #[cfg(not(feature = "method-webs"))]
+            _ => {
+                return Err(AppError::Validation(format!(
+                    "this server cannot verify {method} logs"
+                )));
+            }
+        }
+    }
+    Ok(identity)
+}
+
+/// Record, in `batch`, the high-water marks for a log that passed
+/// [`verify_history`]: the furthest history served for the DID's `identity`,
+/// and which DID (and method) the slot last held. Never removed — not by
+/// `sync/delete`, not by a domain purge, not by a local delete — so a delete
+/// followed by a re-publish cannot roll either back.
+pub(crate) fn stage_high_water(
+    batch: &mut crate::store::WriteBatch,
+    dids_ks: &KeyspaceHandle,
+    identity: &str,
+    mnemonic: &str,
+    did_id: &str,
+    method: &str,
+    log_content: &str,
+) -> Result<(), crate::error::AppError> {
+    batch.insert_raw(
+        dids_ks,
+        high_water_identity_key(identity),
+        log_content.as_bytes().to_vec(),
+    );
+    batch.insert(
+        dids_ks,
+        high_water_slot_key(mnemonic),
+        &SlotHighWater {
+            identity: identity.to_string(),
+            did_id: did_id.to_string(),
+            method: method.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+/// The SCID of a `did:webvh:{scid}:…` identifier.
+fn webvh_scid(did_id: &str) -> Option<String> {
+    did_id
+        .strip_prefix("did:webvh:")?
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Step 1 of [`verify_update`]: the identifier is the log's, and it resolves
+/// at this slot on a host this server serves.
+async fn verify_binding(
+    store: &Store,
+    update: &DidSyncUpdate,
+    synced_method: &str,
+    public_url: Option<&str>,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+
+    if synced_method == "webvh" {
+        match did_hosting_common::did_ops::extract_did_id(&update.log_content) {
+            Some(id) if id == update.did_id => {}
+            other => {
+                return Err(AppError::Validation(format!(
+                    "sync update names {} but its log establishes {}",
+                    update.did_id,
+                    other.as_deref().unwrap_or("no DID")
+                )));
+            }
+        }
+    }
+
+    // The hosts this server serves: its public URL and each assigned domain.
+    let mut bases: Vec<String> = public_url.map(str::to_string).into_iter().collect();
+    for entry in did_hosting_common::server::assignment::list(store).await? {
+        let host = entry.domain.split('/').next().unwrap_or(&entry.domain);
+        bases.push(format!("https://{host}"));
+        bases.push(format!("https://{}", entry.domain));
+    }
+    if bases.is_empty() {
+        return Err(AppError::Validation(
+            "this server has no public URL or assigned domain to bind synced DIDs to".into(),
+        ));
+    }
+
+    let bound = match synced_method {
+        "webvh" => bases.iter().any(|base| {
+            did_hosting_common::did_ops::validate_did_id_matches_request(
+                &update.did_id,
+                &update.mnemonic,
+                base,
+            )
+            .is_ok()
+        }),
+        // did:webs:{host}:{path…}:{aid} — the slot is the path including the
+        // AID, so the identifier must end in exactly that.
+        _ => {
+            let host = extract_did_host(&update.did_id).unwrap_or_default();
+            let suffix = format!(":{}", update.mnemonic.replace('/', ":"));
+            update.did_id.ends_with(&suffix)
+                && bases.iter().any(|base| {
+                    url::Url::parse(base).ok().is_some_and(|u| {
+                        let authority = match u.port() {
+                            Some(p) => format!("{}:{p}", u.host_str().unwrap_or_default()),
+                            None => u.host_str().unwrap_or_default().to_string(),
+                        };
+                        authority == host
+                    })
+                })
+        }
+    };
+    if !bound {
+        return Err(AppError::Validation(format!(
+            "{} does not resolve at slot {} on a host this server serves",
+            update.did_id, update.mnemonic
+        )));
+    }
+    Ok(())
+}
+
 /// Apply a single DID sync update atomically.
+///
+/// `public_url` is this server's configured public URL, one of the bases a
+/// synced DID's identifier may be hosted under (with each assigned domain).
 pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     update: &DidSyncUpdate,
     did_cache: &crate::cache::ContentCache,
+    public_url: Option<&str>,
 ) -> Result<(), crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
@@ -323,34 +620,14 @@ pub async fn apply_single_update(
     let synced_method =
         did_hosting_common::method::detect_method(update.log_content.as_bytes()).unwrap_or("webvh");
 
-    // Per-method verification. The webvh path is unchanged — structural
-    // only, because the control plane has already walked the proof chain
-    // and an edge re-running it would reject logs an older didwebvh-rs
-    // accepted. did:webs gets the full key-event-log verification instead
-    // of a lighter check, and that asymmetry is deliberate: it is what
-    // keeps an edge from serving a stream a compromised or buggy control
-    // plane pushed, exactly as deriving agent names from the signed
-    // document (rather than from the push) does below.
+    // The edge verifies what it is asked to serve itself, rather than trusting
+    // the control plane to have done so: a compromised or buggy control plane
+    // must not be able to make an edge serve a log the DID's own keys never
+    // authorised, an old version of one, or one filed under another slot.
+    // See `verify_update` for the full list.
+    let verified = verify_update(dids_ks, store, update, synced_method, public_url).await?;
     #[cfg(feature = "method-webs")]
-    let webs_document = if synced_method == "webs" {
-        let derived = did_hosting_common::method::webs::Webs::verify_artifacts(
-            &update.did_id,
-            update.log_content.as_bytes(),
-            None,
-        )
-        .map_err(|e| crate::error::AppError::Validation(e.to_string()))?;
-        Some(
-            serde_json::from_slice::<serde_json::Value>(&derived)
-                .map_err(|e| crate::error::AppError::Internal(e.to_string()))?,
-        )
-    } else {
-        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
-        None
-    };
-    #[cfg(not(feature = "method-webs"))]
-    {
-        validate_did_jsonl(&update.log_content).map_err(crate::error::AppError::Validation)?;
-    }
+    let webs_document = verified.webs_document;
 
     // Services and agent names both come from the current DID document,
     // wherever this method keeps it — the last log entry's `state` for
@@ -469,6 +746,17 @@ pub async fn apply_single_update(
             witness.as_bytes().to_vec(),
         );
     }
+    // High-water marks: the furthest history this edge has served for this DID
+    // and for this slot (see `stage_high_water`).
+    stage_high_water(
+        &mut batch,
+        dids_ks,
+        &verified.identity,
+        &update.mnemonic,
+        &update.did_id,
+        synced_method,
+        &update.log_content,
+    )?;
     batch.commit().await?;
 
     did_cache.invalidate(&content_log_key(&update.mnemonic));

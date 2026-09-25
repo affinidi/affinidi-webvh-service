@@ -8,7 +8,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tracing::{info, warn};
-use trust_tasks_rs::{ProofVerifier, TrustTask};
+use trust_tasks_rs::TrustTask;
 
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
@@ -498,8 +498,8 @@ fn trust_task_malformed(reason: &str) -> Response {
 /// (the relying party), `recipient` = the subject DID (self-approve
 /// path — the wallet holding the subject key is the approver), and the
 /// spec's REQUIRED Data Integrity proof (`eddsa-jcs-2022`,
-/// `proofPurpose: assertionMethod`) signed with the control DID's
-/// assertion key, so the wallet can verify the `reason` it renders is
+/// `proofPurpose: authentication`) signed with the control DID's
+/// operational key, so the wallet can verify the `reason` it renders is
 /// this RP's before surfacing it. The payload carries exactly the
 /// schema's REQUIRED members (`subject`, `sessionId`, `challenge`,
 /// `reason`); the schema is closed (`additionalProperties: false`) and
@@ -552,7 +552,7 @@ pub async fn step_up_vta_start(
     let control_did = state.config.server_did.as_deref().ok_or_else(|| {
         AppError::Config("server_did not configured; cannot sign the step-up request".into())
     })?;
-    let signing_secret = crate::signing::control_assertion_secret(&state, control_did)?;
+    let signing_secret = crate::signing::control_signing_secret(&state, control_did)?;
 
     let challenge = rand::random::<[u8; 32]>()
         .iter()
@@ -697,7 +697,10 @@ pub async fn step_up_vta_finish(
         .trust_tasks_verifier
         .as_deref()
         .ok_or_else(|| AppError::Config("trust-tasks proof verifier not configured".into()))?;
-    verifier.verify(&doc).await.map_err(|e| {
+    //        An approval is the holder's attestation: `assertionMethod` purpose,
+    //        a key listed under `assertionMethod`, and — for `did:webvh` — a
+    //        signer that has not deactivated its DID.
+    verifier.verify_approval(&doc).await.map_err(|e| {
         warn!(error = %e, "step-up rejected: approve-response proof failed verification");
         AppError::Authentication("approve-response proof failed verification".into())
     })?;
@@ -1149,6 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn signed_step_up_request_verifies_and_binds_issuer() {
         use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
+        use trust_tasks_rs::ProofVerifier;
 
         let (control_did, signer) = crate::signing::test_util::did_key_signer(&[13u8; 32]);
 
@@ -1175,13 +1179,14 @@ mod tests {
         assert_eq!(document["payload"]["sessionId"], session_id);
         assert_eq!(document["payload"]["challenge"], challenge);
 
-        // Proof binding: assertion key of the issuer DID, eddsa-jcs-2022.
+        // Proof binding: operational key of the issuer DID, eddsa-jcs-2022.
         let vm = document["proof"]["verificationMethod"]
             .as_str()
             .expect("proof carries a verificationMethod");
         assert_eq!(vm.split('#').next().unwrap(), control_did);
         assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
-        assert_eq!(document["proof"]["proofPurpose"], "assertionMethod");
+        // A request is the service's operational message, not an attestation.
+        assert_eq!(document["proof"]["proofPurpose"], "authentication");
 
         // Verifies under the shared verifier (issuer ↔ vm binding included).
         let doc: TrustTask<Value> =

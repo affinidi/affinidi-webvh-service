@@ -10,9 +10,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 
-use did_hosting_common::StatsSyncPayload;
 use did_hosting_common::server::acl;
-use did_hosting_common::server::auth::ServiceAuth;
 use tracing::{debug, warn};
 
 use crate::server::AppState;
@@ -41,91 +39,68 @@ pub fn accept_seq(server_did: &str, seq: u64) -> bool {
     true
 }
 
-/// POST /api/control/stats — receive per-DID deltas from a server instance.
+/// `POST /api/control/stats` — a server's signed stats-sync document.
 ///
-/// Requires the Service-role JWT issued to the registered server, and rejects
-/// payloads whose `server_did` does not match the authenticated caller. The
-/// Service role is a separate role from Admin/Owner; only servers that have
-/// completed registration receive a Service JWT.
-///
-/// Validates ACL, checks sequence for idempotency, then records deltas into
-/// the in-memory collector. Zero I/O — everything is flushed to store by
-/// the periodic flush cycle in the storage thread.
+/// The body is a `.../server/stats-sync/0.1` Trust Task document. It is
+/// applied only when signed by its issuer (an `authentication` key), addressed
+/// to this control plane and fresh (`verify_sender_bound`), not a replay, and
+/// the issuer holds the `Service` role — the same checks, and the same core
+/// (`do_stats_sync`), as the messaging path. There is no bearer token: the
+/// document's own proof is the authentication.
 pub async fn receive_stats(
-    auth: ServiceAuth,
     State(state): State<AppState>,
-    Json(payload): Json<StatsSyncPayload>,
-) -> StatusCode {
-    // Bind the payload to the JWT-authenticated server. Without this check,
-    // any holder of a Service-role JWT could falsify counters for any server.
-    if auth.0.did != payload.server_did {
-        warn!(
-            authenticated = %auth.0.did,
-            claimed = %payload.server_did,
-            "stats sync rejected: payload server_did does not match authenticated DID",
-        );
-        return StatusCode::FORBIDDEN;
-    }
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use did_hosting_common::didcomm_types::MSG_STATS_SYNC;
+    use did_hosting_common::server::trust_tasks::verify_sender_bound;
+    use serde_json::json;
 
-    // Belt-and-braces: re-check ACL membership at request time so a yanked
-    // ACL entry takes effect immediately even if the JWT hasn't expired.
-    match acl::get_acl_entry(&state.acl_ks, &payload.server_did).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            warn!(server_did = %payload.server_did, "stats sync rejected: DID not in ACL");
-            return StatusCode::FORBIDDEN;
-        }
+    let refuse = |status: StatusCode, reason: &str| (status, Json(json!({ "error": reason })));
+    let doc: trust_tasks_rs::TrustTask<serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(_) => return refuse(StatusCode::BAD_REQUEST, "body is not a Trust Task document"),
+    };
+    if doc.type_uri.to_string() != MSG_STATS_SYNC {
+        return refuse(StatusCode::BAD_REQUEST, "expected a stats-sync document");
+    }
+    let (Some(my_vid), Some(verifier)) = (
+        state.config.server_did.as_deref(),
+        state.trust_tasks_verifier.as_deref(),
+    ) else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control plane cannot verify documents",
+        );
+    };
+    // Cheap pre-filter before any signature work.
+    let Some(issuer) = doc.issuer.clone() else {
+        return refuse(StatusCode::BAD_REQUEST, "document names no issuer");
+    };
+    if !matches!(
+        acl::get_acl_entry(&state.acl_ks, &issuer).await,
+        Ok(Some(_))
+    ) {
+        warn!(%issuer, "stats sync rejected: DID not in ACL");
+        return refuse(StatusCode::FORBIDDEN, "not permitted");
+    }
+    let signer = match verify_sender_bound(&doc, None, None, my_vid, verifier).await {
+        Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "stats sync: ACL lookup failed");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            warn!(%issuer, error = %e, "stats sync rejected: document not bound to its signer");
+            return refuse(StatusCode::FORBIDDEN, "document proof invalid");
         }
+    };
+    if state.replay_cache.check(&signer, &doc.id).is_err() {
+        return refuse(StatusCode::CONFLICT, "replayed document");
     }
-
-    // Idempotency: reject replayed payloads
-    if !accept_seq(&payload.server_did, payload.seq) {
-        debug!(
-            server_did = %payload.server_did,
-            seq = payload.seq,
-            "stats sync: stale sequence (skipped)"
-        );
-        return StatusCode::NO_CONTENT;
+    match crate::messaging::do_stats_sync(&state, &signer, &doc.payload).await {
+        Ok(ack) => {
+            debug!(%signer, "stats sync accepted (HTTPS)");
+            (StatusCode::OK, Json(ack))
+        }
+        Err(rej) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "code": rej.code, "comment": rej.comment })),
+        ),
     }
-
-    // Bound the per-payload delta count. The in-memory stats collector is keyed
-    // by mnemonic with no cardinality limit, so a Service-role edge (or a leaked
-    // service token that already passed the checks above) must not be able to
-    // inflate it without bound in a single request. A real edge only ever syncs
-    // the slots it hosts, which its own quota bounds well below this.
-    const MAX_DELTAS_PER_SYNC: usize = 10_000;
-    if payload.did_deltas.len() > MAX_DELTAS_PER_SYNC {
-        warn!(
-            server_did = %payload.server_did,
-            count = payload.did_deltas.len(),
-            "stats sync rejected: too many deltas in one payload"
-        );
-        return StatusCode::PAYLOAD_TOO_LARGE;
-    }
-
-    // Record deltas into in-memory collector (no I/O)
-    for delta in &payload.did_deltas {
-        state.stats_collector.record_deltas(
-            &delta.mnemonic,
-            delta.resolve_delta,
-            delta.update_delta,
-            delta.last_resolved_at,
-            delta.last_updated_at,
-        );
-    }
-
-    #[cfg(feature = "metrics")]
-    did_hosting_common::server::metrics::inc_stats_sync();
-
-    debug!(
-        server_did = %payload.server_did,
-        seq = payload.seq,
-        delta_count = payload.did_deltas.len(),
-        "stats sync accepted"
-    );
-
-    StatusCode::NO_CONTENT
 }

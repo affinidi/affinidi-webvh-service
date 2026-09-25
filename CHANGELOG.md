@@ -2,6 +2,149 @@
 
 ## Unreleased
 
+### Changed (breaking) — privileged messages must carry a proof bound to their sender
+
+Every message that changes state or discloses more than public data is now
+authorised on a Data Integrity proof carried in the document itself, never on
+the messaging transport's report of who sent it. A document is acted on only
+when it carries a `proof` whose `verificationMethod` is controlled by its
+in-band `issuer`, the `issuer` is the expected peer (exact match), it is
+addressed to the receiving service (`recipient`), and its `issuedAt` is inside
+the freshness window. Replay protection is keyed on `(proven issuer, document
+id)`. See `did_hosting_common::server::trust_tasks::bound`.
+
+- **Operational proofs use `authentication`.** These are a service's own
+  messages, not attestations (VTI key roles, VTI-KEY-106/107): the proof must
+  carry `proofPurpose: authentication` and its `verificationMethod` must be
+  listed under the signer's `authentication` relationship. `assertionMethod`
+  proofs are refused on these paths (it stays reserved for credentials), and
+  every sender this repo controls now signs with `authentication`.
+- **Key rotation does not open a rejection window.** A proof that fails against
+  a cached DID document is retried once against a freshly resolved one before
+  it is refused (at most one forced refresh per DID per 30s). The service's
+  DID cache TTL is now explicit: 120s (`DID_CACHE_TTL_SECS`).
+- **Replies are signed too.** Every non-error trust-task reply the control
+  plane emits — on DIDComm, TSP and HTTPS alike, including
+  `auth/challenge#response` and `auth/authenticate#response` — is stamped
+  `issuer` = the control plane, `recipient` = the requester, a fresh
+  `issuedAt`, and signed with its operational key (`authentication`). Edges
+  sign their acks and pongs the same way. `trust-task-error` documents stay
+  unsigned. There is no unsigned mode: a control plane (standalone or in the
+  daemon) with no `server_did`, no loaded identity, or no signing key for its
+  current generation **refuses to start**, and should the key ever be missing
+  at request time every trust task is refused with `internalError`.
+- **Approval requests are operational too.** The `task-consent/request` and
+  `auth/step-up/approve-request` documents the control plane sends are signed
+  with `proofPurpose: authentication`. Only the human approver's own decision
+  / approve-response is an `assertionMethod` attestation.
+- **Approver decisions must be attestations.** A `task-consent/decision` and an
+  `auth/step-up/approve-response` must carry `proofPurpose: assertionMethod`
+  with the key listed under the signer's `assertionMethod` relationship, and a
+  deactivated `did:webvh` signer is refused (`verify_approval`). The consent
+  decision's `#response` is now a signed trust-task document in the trust-task
+  envelope.
+- **Edges do not answer documents that fail verification.** A control-plane op
+  or health ping that is not signed by the configured control plane gets no
+  reply at all — neither a signed refusal nor an unsigned one.
+- **Transient failures are retryable.** A signer whose DID cannot be resolved
+  (or whose deactivation status cannot be read) is refused as `unavailable`
+  with an error that names the unreachable DID; an edge's storage or I/O
+  failure applying an op is `internalError`. Both are retryable, so the control
+  plane keeps the op queued rather than settling it. A `sync/batch` with an
+  entry that failed transiently is retried whole.
+- **Registration re-sends what an edge missed.** The delta re-sync compares the
+  DID identity (`did_id`, reported by the edge in `preloaded_dids`) as well as
+  the version count, so a DID deleted and re-created at the same slot reaches
+  an edge that missed the delete. Domain `assign` / `unassign` / `purge` ops are
+  recorded per server and re-sent on each registration until acknowledged
+  (an assignment is kept as the desired state).
+- **The edge's own REST publish (`PUT /api/dids/{mnemonic}`) is held to the
+  sync history rule**: it must extend the held log and the per-DID high-water
+  mark, and records the high-water mark itself.
+- **Deactivation verdicts follow the DID cache.** An edge builds its proof
+  verifier once (it used to build one per message, so nothing was remembered);
+  a verdict is reused while the DID cache serves the same document, and the
+  verdict map is bounded.
+- **Edges keep a high-water mark per DID and per slot that a delete does not
+  clear.** A DID re-created after `sync/delete` must extend everything the edge
+  ever served for it, so a delete-then-resync cannot roll a DID back to before a
+  rotation or bring back a deactivated one. A slot never changes method; a new
+  DID (new SCID) may reuse a deleted slot.
+- **Edges bind each synced DID to its slot and host** (the log's identifier must
+  resolve at that mnemonic on the edge's public URL or an assigned domain),
+  verify `did:webs` updates as continuations of the held and high-water logs,
+  and verify witness proofs — a witnessed DID without its proofs is refused.
+- **The outbox removes an entry only on the target's signed acknowledgement**
+  of the exact document sent (or its signed, non-retryable refusal), re-signing
+  on every retry and re-sending after 60s without an ack; one op in flight per
+  server. Edges re-register at startup, on every mediator reconnect and every
+  10 minutes; each registration re-syncs the delta, queues deletes the edge
+  missed, and replicates every domain record.
+- **Pre-authorisation filtering.** A privileged document from a sender with no
+  ACL entry is refused before any signature or DID-resolution work and never
+  reaches the replay cache. The replay cache refuses (retryable `unavailable`)
+  instead of evicting at its bounds, caps each signer, and expires in O(1).
+- **Other hardening.** The task-consent decision requires `recipient`, a fresh
+  `issuedAt` and is replay-checked; REST DIDComm-JWS sign-in and refresh require
+  a key listed under `authentication`; `POST /api/control/stats` takes a signed
+  stats-sync document instead of a bearer token; proofs from a deactivated
+  `did:webvh` signer are refused.
+- **`TransportBoundVerifier` requires an in-band `issuer`, always.** A proof
+  with no `issuer` used to verify as a bare signature, with the issuer then
+  filled from the transport's sender; it is now refused. The one delegated shape
+  kept is the passkey session key, accepted only on `POST /api/trust-tasks`, and
+  only as the exact JWT-bound key acting for the JWT subject
+  (`with_session_delegate`).
+- **Control plane → edge (sync, domain ops, health ping).** The outbox and the
+  health loop send signed Trust Task documents (TSP frame or DIDComm
+  trust-task envelope, chosen from the edge's DID document). Edges apply
+  `sync/update`, `sync/batch`, `sync/delete` and `domain/{assign,unassign,
+  purge,upsert}` only when signed by the configured `control_did` and addressed
+  to their own DID. The bare `MSG_SYNC_*` / `MSG_DOMAIN_*` / `MSG_HEALTH_PING`
+  DIDComm routes and the serialised-`Message`-over-TSP form are removed.
+  `domain/upsert` moves to `https://trusttasks.org/spec/did-management/domain/upsert/0.1`
+  (queued entries under the old URI are delivered under the new one).
+- **Edges verify the DID logs they are asked to serve.** A `sync/update` is
+  applied only if the log's proof chain verifies (entry hashes, update-key
+  authorisation, pre-rotation), it establishes the DID the push names, and it
+  strictly extends the log already held: a shorter or diverging log is refused
+  as a rollback or fork, and a deactivated DID accepts no further entries.
+- **Edge → control plane (registration, stats, health pong, sync and domain
+  acks).** Sent as signed trust tasks; the bare `MSG_SERVER_REGISTER`,
+  `MSG_STATS_SYNC`, `MSG_HEALTH_PONG` and ack routes are removed. Registration,
+  stats, pongs and domain acks additionally require the signer to hold the
+  `Service` role (pongs previously had no ACL check).
+- **DID management, ACL and auth trust tasks (DIDComm envelope, TSP, HTTPS).**
+  Every trust task except `trust-task-discovery` and `auth/challenge` must be
+  signed by its issuer, and the issuer must be the transport's sender. This
+  includes the typed `did-hosting/*/1.0` ops and the ACL reads (`acl/list`,
+  `acl/show`), which previously went through unsigned.
+- **Removed the non-Trust-Task DID-management transports.** The bare DIDComm
+  `MSG_DID_*`, `MSG_AGENT_NAME_*`, `MSG_ME_DOMAINS` routes and the HTTP-signed
+  `POST /api/didcomm` endpoint are gone; the same operations are reachable as
+  signed documents in the trust-task envelope, over TSP, or on
+  `POST /api/trust-tasks`. A peer still sending a bare type gets a
+  problem report naming it.
+- **`MSG_AUTHENTICATE` over DIDComm requires a signed challenge.** The bare
+  route that issued a session to the reported sender is removed; sign-in over
+  DIDComm/TSP is the `auth/challenge/0.1` → `auth/authenticate/0.1` trust-task
+  pair, whose authenticate document must be signed by the authenticating DID.
+- **`trust_tasks.enforce_proofs = false` is refused at startup.** There is no
+  longer a mode in which proofs are ignored.
+- **Web UI.** Every trust-task envelope except discovery is signed and names
+  the session's subject DID as `issuer`.
+
+**Upgrade the whole fleet together.** A control plane and its edges on either
+side of this change cannot talk to each other. Clients that must change:
+the VTA's DID-management client over DIDComm/TSP
+(`verifiable-trust-infrastructure` `vta-service/src/webvh_didcomm.rs`) must sign
+each document with the VTA DID as `issuer`; the browser extension's DIDComm
+sign-in (`pnm-browser-plugin` `packages/core/src/rp-login/didcomm.ts`) must use
+the challenge → signed-authenticate trust tasks instead of a bare
+`MSG_AUTHENTICATE`, and its `signTrustTask` (used for wallet-signed admin UI
+envelopes) must sign with `proofPurpose: authentication`. REST API callers (bearer JWT from the signed REST sign-in)
+are unaffected.
+
 ### Fixed — stats sync uses TSP when the control plane advertises it
 
 - **Stats sync was the last control↔server exchange hard-coded to DIDComm.**
