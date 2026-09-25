@@ -145,6 +145,26 @@ the challenge → signed-authenticate trust tasks instead of a bare
 envelopes) must sign with `proofPurpose: authentication`. REST API callers (bearer JWT from the signed REST sign-in)
 are unaffected.
 
+### Changed — the 0.27 messaging line, with the authcrypt sender bound to its key
+
+- **Moved to the 0.27 messaging line.** `affinidi-tdk` 0.16 → **0.17**,
+  `affinidi-messaging-sdk` 0.26.27 → **0.27.2**,
+  `affinidi-messaging-didcomm-service` 0.11 → **0.12.1**,
+  `affinidi-messaging-didcomm` → **0.15.9** (floor), `vta-sdk` 0.50 → **0.52**
+  with `vti-common` 0.23.1 → **0.25** (all four declarations), `trust-tasks-*`
+  0.21 → **0.22**; dev-graph `affinidi-messaging-test-mediator` 0.9 →
+  **0.10.2** (mediator 0.29.5). One copy of each of `affinidi-messaging-sdk`,
+  `affinidi-tdk`, `trust-tasks-rs`, `vta-sdk` and `vti-common`.
+- **The authcrypt sender is the key that encrypted the message.** In didcomm
+  0.15.9 / SDK 0.27.2 / didcomm-service 0.12.1 the sender is resolved only from
+  the `skid` the envelope names, and an envelope whose `apu` disagrees with it
+  is refused; `HandlerContext::sender_did` is the verified signer or authcrypt
+  sender, never the plaintext `from`.
+- **Signed sign-in verifies the JWS against the resolved key *as* the key of
+  its `kid`.** `didcomm_unpack::unpack_signed` calls `unpack_bound` with a
+  `SignerKey`, so the reported `signer_kid` is the key id the signature was
+  checked against (the key-only `unpack` is deprecated in didcomm 0.15.9).
+
 ### Fixed — stats sync uses TSP when the control plane advertises it
 
 - **Stats sync was the last control↔server exchange hard-coded to DIDComm.**
