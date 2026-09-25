@@ -57,10 +57,26 @@
 //! under the signer's `authentication` relationship. `assertionMethod` is
 //! reserved for attestation artefacts (credentials) and is refused here.
 //!
+//! ## Approver decisions
+//!
+//! [`TransportBoundVerifier::verify_approval`] is the counterpart for a human
+//! approver's decision (a consent decision, a step-up approval): the one
+//! document that is an attestation, so it must carry `proofPurpose:
+//! assertionMethod` with the key listed under the signer's `assertionMethod`.
+//!
 //! ## Deactivated signers
 //!
 //! A `did:webvh` signer whose DID is deactivated is refused on the operational
-//! path, whatever its last document lists (see `DeactivationCache`).
+//! and approval paths, whatever its last document lists (see
+//! `DeactivationCache`). The verdict is remembered for the DID cache TTL, in a
+//! bounded map, and is re-read whenever the DID cache re-resolves the document.
+//!
+//! ## Unreachable signers
+//!
+//! A signer whose DID cannot be resolved (its log is unreachable, or its status
+//! cannot be read) is refused with an error that says so
+//! ([`is_unreachable`]); callers report it as retryable, since the same
+//! document may verify once the DID is reachable again.
 //!
 //! ## Key rotation and the DID cache
 //!
@@ -87,6 +103,38 @@ use trust_tasks_rs::{ProofVerifier, TrustTask, VerificationError};
 
 /// The only `proofPurpose` an operational (sender-bound) proof may carry.
 pub const OPERATIONAL_PROOF_PURPOSE: &str = "authentication";
+
+/// The only `proofPurpose` a human approver's decision may carry.
+pub const APPROVAL_PROOF_PURPOSE: &str = "assertionMethod";
+
+/// Marks a verification failure caused by a signer's DID being unreachable
+/// (not by anything wrong with the proof). See [`is_unreachable`].
+const UNREACHABLE: &str = "signer DID unreachable";
+
+/// Most DIDs whose deactivation verdict is remembered at once.
+const DEACTIVATION_CACHE_CAPACITY: usize = 4096;
+
+/// Whether a verification failure was caused by the signer's DID being
+/// unreachable — a condition that may clear, unlike a bad proof.
+pub fn is_unreachable(err: &VerificationError) -> bool {
+    matches!(err, VerificationError::Other(m) if m.contains(UNREACHABLE))
+}
+
+/// Which verification relationship a proof's key must be listed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyRelationship {
+    Authentication,
+    AssertionMethod,
+}
+
+impl KeyRelationship {
+    fn name(self) -> &'static str {
+        match self {
+            KeyRelationship::Authentication => "authentication",
+            KeyRelationship::AssertionMethod => "assertionMethod",
+        }
+    }
+}
 
 /// Minimum spacing between forced re-resolutions of one DID.
 pub const FORCED_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -155,12 +203,21 @@ impl StaleKeyRefresh for CacheRefresher {
 /// So deactivation is read from the DID's own log (`didwebvh-rs` resolution
 /// metadata). A DID whose deactivation cannot be established is refused: an
 /// unreadable log proves nothing about the key.
+///
+/// The verdict follows the DID cache: it is reused while the cache serves the
+/// same document and younger than the cache TTL, and re-read when the cache
+/// resolved the document afresh (or the verdict aged out). The map is bounded
+/// ([`DEACTIVATION_CACHE_CAPACITY`]); expired verdicts are dropped first.
 #[derive(Default)]
 struct DeactivationCache {
     verdicts: Mutex<HashMap<String, (Instant, bool)>>,
 }
 
 impl DeactivationCache {
+    fn ttl() -> Duration {
+        Duration::from_secs(u64::from(crate::server::identity::DID_CACHE_TTL_SECS))
+    }
+
     fn forget(&self, did: &str) {
         self.verdicts
             .lock()
@@ -168,16 +225,44 @@ impl DeactivationCache {
             .remove(did);
     }
 
-    async fn is_deactivated(&self, did: &str) -> Result<bool, DataIntegrityError> {
-        let ttl = Duration::from_secs(u64::from(crate::server::identity::DID_CACHE_TTL_SECS));
-        if let Some((at, verdict)) = self
-            .verdicts
+    /// The remembered verdict, when one is fresh and the DID cache served the
+    /// document it was read alongside.
+    fn cached(&self, did: &str, document_cached: bool) -> Option<bool> {
+        if !document_cached {
+            return None;
+        }
+        self.verdicts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(did)
-            && at.elapsed() < ttl
-        {
-            return Ok(*verdict);
+            .filter(|(at, _)| at.elapsed() < Self::ttl())
+            .map(|(_, v)| *v)
+    }
+
+    fn remember(&self, did: &str, deactivated: bool) {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        if verdicts.len() >= DEACTIVATION_CACHE_CAPACITY && !verdicts.contains_key(did) {
+            let ttl = Self::ttl();
+            verdicts.retain(|_, (at, _)| at.elapsed() < ttl);
+            if verdicts.len() >= DEACTIVATION_CACHE_CAPACITY
+                && let Some(oldest) = verdicts
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone())
+            {
+                verdicts.remove(&oldest);
+            }
+        }
+        verdicts.insert(did.to_string(), (Instant::now(), deactivated));
+    }
+
+    async fn is_deactivated(
+        &self,
+        did: &str,
+        document_cached: bool,
+    ) -> Result<bool, DataIntegrityError> {
+        if let Some(verdict) = self.cached(did, document_cached) {
+            return Ok(verdict);
         }
         let mut state = didwebvh_rs::DIDWebVHState::default();
         let deactivated = state
@@ -185,38 +270,44 @@ impl DeactivationCache {
             .await
             .map(|(_, meta)| meta.deactivated)
             .map_err(|e| {
-                DataIntegrityError::Resolver(format!("cannot establish status of {did}: {e}"))
+                DataIntegrityError::Resolver(format!(
+                    "{UNREACHABLE}: cannot read the DID log of {did} to establish whether it is \
+                     deactivated ({e})"
+                ))
             })?;
-        self.verdicts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(did.to_string(), (Instant::now(), deactivated));
+        self.remember(did, deactivated);
         Ok(deactivated)
     }
 }
 
-/// Resolves a verification method only if the DID document lists it under
-/// `authentication`, then decodes it with the shared resolver.
-struct AuthenticationKeyResolver {
+/// Resolves a verification method only if the DID document lists it under the
+/// required relationship, then decodes it with the shared resolver.
+struct RelationshipKeyResolver {
     client: DIDCacheClient,
     decode: trust_tasks_proof::affinidi::CachedDidResolver,
     /// `None` only in tests that resolve from documents placed in the cache.
     deactivation: Option<Arc<DeactivationCache>>,
+    relationship: KeyRelationship,
 }
 
 #[async_trait]
-impl VerificationMethodResolver for AuthenticationKeyResolver {
+impl VerificationMethodResolver for RelationshipKeyResolver {
     async fn resolve_vm(&self, vm: &str) -> Result<ResolvedKey, DataIntegrityError> {
         let did = controller_did(vm);
-        let doc = self
-            .client
-            .resolve(did)
-            .await
-            .map_err(|e| DataIntegrityError::Resolver(format!("resolve {did}: {e}")))?
-            .doc;
+        let resolved = self.client.resolve(did).await.map_err(|e| {
+            DataIntegrityError::Resolver(format!(
+                "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable from \
+                 this service?): {e}"
+            ))
+        })?;
+        let doc = resolved.doc;
         let fragment = vm.find('#').map(|i| &vm[i..]);
         let refers = |id: &str| id == vm || fragment.is_some_and(|f| id == f);
-        let listed = doc.authentication.iter().any(|r| match r {
+        let relationship = match self.relationship {
+            KeyRelationship::Authentication => &doc.authentication,
+            KeyRelationship::AssertionMethod => &doc.assertion_method,
+        };
+        let listed = relationship.iter().any(|r| match r {
             VerificationRelationship::Reference(id) => refers(id),
             VerificationRelationship::VerificationMethod(m) => refers(m.id.as_str()),
             // A relationship shape this build cannot read authorises nothing.
@@ -224,13 +315,14 @@ impl VerificationMethodResolver for AuthenticationKeyResolver {
         });
         if !listed {
             return Err(DataIntegrityError::Resolver(format!(
-                "verificationMethod {vm} is not an authentication key of {did}"
+                "verificationMethod {vm} is not an {} key of {did}",
+                self.relationship.name()
             )));
         }
         // A deactivated DID's keys sign nothing.
         if did.starts_with("did:webvh:")
             && let Some(deactivation) = &self.deactivation
-            && deactivation.is_deactivated(did).await?
+            && deactivation.is_deactivated(did, resolved.cache_hit).await?
         {
             return Err(DataIntegrityError::Resolver(format!(
                 "{did} is deactivated; its keys are no longer valid"
@@ -246,6 +338,7 @@ impl VerificationMethodResolver for AuthenticationKeyResolver {
 pub struct TransportBoundVerifier {
     resolver: Arc<dyn VerificationMethodResolver>,
     authentication_resolver: Arc<dyn VerificationMethodResolver>,
+    assertion_resolver: Arc<dyn VerificationMethodResolver>,
     refresher: Option<Arc<dyn StaleKeyRefresh>>,
     options: VerifyOptions,
     delegate: Option<SessionDelegate>,
@@ -260,6 +353,7 @@ impl TransportBoundVerifier {
     pub fn with_resolver(resolver: Arc<dyn VerificationMethodResolver>) -> Self {
         Self {
             authentication_resolver: resolver.clone(),
+            assertion_resolver: resolver.clone(),
             resolver,
             refresher: None,
             options: VerifyOptions::default(),
@@ -275,10 +369,17 @@ impl TransportBoundVerifier {
         let deactivation = Arc::new(DeactivationCache::default());
         Self {
             resolver: Arc::new(decode.clone()),
-            authentication_resolver: Arc::new(AuthenticationKeyResolver {
+            authentication_resolver: Arc::new(RelationshipKeyResolver {
+                client: client.clone(),
+                decode: decode.clone(),
+                deactivation: Some(deactivation.clone()),
+                relationship: KeyRelationship::Authentication,
+            }),
+            assertion_resolver: Arc::new(RelationshipKeyResolver {
                 client: client.clone(),
                 decode,
                 deactivation: Some(deactivation.clone()),
+                relationship: KeyRelationship::AssertionMethod,
             }),
             refresher: Some(Arc::new(CacheRefresher {
                 client,
@@ -331,6 +432,26 @@ impl TransportBoundVerifier {
             )));
         }
         self.verify_with(doc, &*self.authentication_resolver).await
+    }
+
+    /// Verify a human approver's decision (consent decision, step-up
+    /// approval): everything [`ProofVerifier::verify`] checks, plus
+    /// `proofPurpose: assertionMethod`, a `verificationMethod` listed under the
+    /// signer's `assertionMethod` relationship, and — for `did:webvh` — a signer
+    /// that has not deactivated its DID.
+    pub async fn verify_approval<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        if let Some(proof) = &doc.proof
+            && proof.proof_purpose != APPROVAL_PROOF_PURPOSE
+        {
+            return Err(VerificationError::MalformedProof(format!(
+                "proofPurpose must be `{APPROVAL_PROOF_PURPOSE}` for an approver's decision, not `{}`",
+                proof.proof_purpose
+            )));
+        }
+        self.verify_with(doc, &*self.assertion_resolver).await
     }
 
     async fn verify_with<P>(
@@ -831,10 +952,11 @@ mod tests {
             .unwrap();
             client.add_did_document(did, doc).await;
         }
-        let resolver = AuthenticationKeyResolver {
+        let resolver = RelationshipKeyResolver {
             client: client.clone(),
-            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client.clone())),
             deactivation: None,
+            relationship: KeyRelationship::Authentication,
         };
         resolver
             .resolve_vm("did:web:auth.example#key-1")
@@ -848,6 +970,102 @@ mod tests {
             err.to_string().contains("not an authentication key"),
             "{err}"
         );
+
+        // An approver's decision is the mirror image: its key must be listed
+        // under `assertionMethod`, and an authentication-only key is refused.
+        let approvals = RelationshipKeyResolver {
+            client: client.clone(),
+            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+            deactivation: None,
+            relationship: KeyRelationship::AssertionMethod,
+        };
+        approvals
+            .resolve_vm("did:web:assert.example#key-1")
+            .await
+            .expect("assertionMethod key resolves for an approval");
+        let err = approvals
+            .resolve_vm("did:web:auth.example#key-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an assertionMethod key"),
+            "{err}"
+        );
+    }
+
+    /// An approver's decision must carry `proofPurpose: assertionMethod`; an
+    /// operational (`authentication`) proof is not a decision.
+    #[tokio::test]
+    async fn approval_verification_requires_assertion_method_purpose() {
+        let doc = self_issued_doc().await;
+        verifier()
+            .verify_approval(&doc)
+            .await
+            .expect("an assertionMethod-purpose decision verifies");
+
+        let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+        let pk_mb = secret.get_public_keymultibase().unwrap();
+        let did = format!("did:key:{pk_mb}");
+        let mut signer = secret;
+        signer.id = format!("{did}#{pk_mb}");
+        let mut body = base_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("issuer".to_string(), json!(did));
+        let unsigned: TrustTask<Value> = serde_json::from_value(body).unwrap();
+        let signed = super::super::bound::sign_document(&unsigned, &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            signed.proof.as_ref().unwrap().proof_purpose,
+            "authentication"
+        );
+        let err = verifier().verify_approval(&signed).await.unwrap_err();
+        assert!(
+            matches!(err, VerificationError::MalformedProof(ref m) if m.contains("assertionMethod")),
+            "{err:?}"
+        );
+    }
+
+    /// A resolution failure is reported as the signer being unreachable — the
+    /// retryable case — and nothing else is.
+    #[test]
+    fn unreachable_signers_are_distinguished_from_bad_proofs() {
+        let unreachable = map_error(DataIntegrityError::Resolver(format!(
+            "{UNREACHABLE}: cannot resolve did:webvh:QmX:gone.example"
+        )));
+        assert!(is_unreachable(&unreachable), "{unreachable:?}");
+        assert!(unreachable.to_string().contains("gone.example"));
+        let not_listed = map_error(DataIntegrityError::Resolver(
+            "verificationMethod x is not an authentication key of y".into(),
+        ));
+        assert!(!is_unreachable(&not_listed));
+        assert!(!is_unreachable(&VerificationError::SignatureInvalid));
+    }
+
+    /// The deactivation verdict follows the DID cache: reused while the cache
+    /// serves the same document, re-read when the cache resolved afresh.
+    #[test]
+    fn a_deactivation_verdict_is_reused_only_for_a_cached_document() {
+        let cache = DeactivationCache::default();
+        cache.remember("did:webvh:QmA:a.example", false);
+        assert_eq!(cache.cached("did:webvh:QmA:a.example", true), Some(false));
+        assert_eq!(cache.cached("did:webvh:QmA:a.example", false), None);
+        assert_eq!(cache.cached("did:webvh:QmB:b.example", true), None);
+    }
+
+    /// The verdict map is bounded.
+    #[test]
+    fn the_deactivation_cache_is_bounded() {
+        let cache = DeactivationCache::default();
+        for i in 0..DEACTIVATION_CACHE_CAPACITY + 10 {
+            cache.remember(&format!("did:webvh:Qm{i}:x.example"), false);
+        }
+        let len = cache.verdicts.lock().unwrap().len();
+        assert!(len <= DEACTIVATION_CACHE_CAPACITY, "{len}");
+        // The newest verdict survives eviction.
+        let newest = format!("did:webvh:Qm{}:x.example", DEACTIVATION_CACHE_CAPACITY + 9);
+        assert_eq!(cache.cached(&newest, true), Some(false));
     }
 
     /// A deactivated `did:webvh` signer is refused even though its last
@@ -883,10 +1101,11 @@ mod tests {
             v.insert(live.into(), (Instant::now(), false));
             v.insert(dead.into(), (Instant::now(), true));
         }
-        let resolver = AuthenticationKeyResolver {
+        let resolver = RelationshipKeyResolver {
             client: client.clone(),
             decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
             deactivation: Some(deactivation),
+            relationship: KeyRelationship::Authentication,
         };
         resolver
             .resolve_vm(&format!("{live}#key-1"))
@@ -923,6 +1142,12 @@ mod tests {
             .verify(&approved)
             .await
             .expect("wallet-signed approved response verifies");
+        // …and passes the approval check `/auth/step-up/vta/finish` applies
+        // (`assertionMethod` purpose and relationship).
+        verifier()
+            .verify_approval(&approved)
+            .await
+            .expect("wallet-signed approval passes the approval check");
 
         let denied: TrustTask<Value> =
             serde_json::from_value(fixture["denied"].clone()).expect("denied doc parses");

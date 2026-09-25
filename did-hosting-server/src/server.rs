@@ -44,6 +44,12 @@ pub struct AppState {
     pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
+    /// The proof verifier for control-plane documents, built once over
+    /// `did_resolver` so its DID-status verdicts and forced-refresh rate limit
+    /// persist across messages. `None` when no resolver is configured, in which
+    /// case no control-plane document can be accepted.
+    pub trust_tasks_verifier:
+        Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     /// The service's own DID identity: every generation of key material still
     /// honoured, and the kids each one answers to. `did_resolver` and
@@ -214,6 +220,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         acl_ks,
         dids_ks,
         config: Arc::new(config),
+        trust_tasks_verifier: crate::messaging::build_verifier(did_resolver.as_ref()),
         did_resolver,
         secrets_resolver,
         identity,

@@ -69,8 +69,19 @@ pub enum BoundError {
 }
 
 impl BoundError {
-    /// The framework rejection this failure is reported as on the wire.
+    /// Whether the failure may clear on its own — the signer's DID could not be
+    /// resolved, or its status read — so the same document is worth re-sending.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, BoundError::Proof(e) if super::verifier::is_unreachable(e))
+    }
+
+    /// The framework rejection this failure is reported as on the wire. A
+    /// transient failure ([`Self::is_transient`]) is `unavailable` (retryable);
+    /// every other one is final.
     pub fn reject_reason(&self) -> RejectReason {
+        if self.is_transient() {
+            return RejectReason::Unavailable { retry_after: None };
+        }
         match self {
             BoundError::MissingProof => RejectReason::ProofRequired,
             BoundError::MissingIssuer
@@ -412,6 +423,42 @@ mod tests {
     async fn documents_are_signed_for_authentication() {
         let (_, doc) = signed_by(1, ME).await;
         assert_eq!(doc.proof.unwrap().proof_purpose, "authentication");
+    }
+
+    /// A signer that cannot be resolved is a retryable condition, not a bad
+    /// proof: a DID with no reachable log fails with an error that says so.
+    #[tokio::test]
+    async fn an_unresolvable_signer_is_reported_as_retryable() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        // `.invalid` never resolves (RFC 6761), and the default host policy
+        // refuses it before any request is made.
+        let did = "did:web:control.invalid";
+        let (_, secret) = signer(3);
+        let mut doc = build_request(TYPE, did, ME, json!({})).unwrap();
+        doc.issuer = Some(secret.id.split('#').next().unwrap().to_string());
+        let mut signed = sign_document(&doc, &secret).await.unwrap();
+        signed.issuer = Some(did.to_string());
+        let mut proof = signed.proof.take().unwrap();
+        proof.verification_method = format!("{did}#key-1");
+        signed.proof = Some(proof);
+        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let err = verify_sender_bound(
+            &signed,
+            Some(did),
+            None,
+            ME,
+            &TransportBoundVerifier::with_did_cache(client),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(err.to_string().contains("control.invalid"), "{err}");
+        assert!(matches!(
+            err.reject_reason(),
+            RejectReason::Unavailable { .. }
+        ));
     }
 
     #[test]

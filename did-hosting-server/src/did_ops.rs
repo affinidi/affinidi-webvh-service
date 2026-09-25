@@ -340,6 +340,22 @@ pub async fn publish_did(
 
     let did_id = extract_did_id(did_log);
 
+    // History (the same rule a control-plane sync is held to): the log must
+    // strictly extend everything this edge has served for the same DID — the
+    // log it holds now and the high-water log a delete does not clear — so an
+    // authorised caller cannot roll a DID back, fork it, resurrect a
+    // deactivated one, or re-create it from scratch after a delete.
+    let identity = crate::control_register::verify_history(
+        &state.dids_ks,
+        mnemonic,
+        did_id
+            .as_deref()
+            .ok_or_else(|| AppError::Validation("did.jsonl establishes no DID".into()))?,
+        did_log,
+        "webvh",
+    )
+    .await?;
+
     let version_id = did_log
         .lines()
         .last()
@@ -365,6 +381,15 @@ pub async fn publish_did(
         did_log.as_bytes().to_vec(),
     );
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    crate::control_register::stage_high_water(
+        &mut batch,
+        &state.dids_ks,
+        &identity,
+        mnemonic,
+        did_id.as_deref().unwrap_or_default(),
+        "webvh",
+        did_log,
+    )?;
     batch.commit().await?;
 
     // Update quota index for size change

@@ -21,14 +21,64 @@ use tracing::{info, warn};
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
 
-/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
-/// already have at the current version.
+/// What a registering server reports holding in one slot (an entry of the
+/// `preloaded_dids` in its register payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedDid {
+    /// The DID the slot holds. `None` from a server that did not say — which
+    /// never counts as current.
+    pub did_id: Option<String>,
+    pub version_count: u64,
+}
+
+/// Whether a server that reports `reported` for a slot already holds the
+/// control plane's `record` for it, so nothing need be pushed.
 ///
-/// `reported` maps mnemonic → the `version_count` the registering server says
-/// it already holds (from the `preloaded_dids` in its register payload). Any
-/// DID at or above that version is skipped. An **empty** map means a full push
-/// — the back-compat path for a client that sends no `preloaded_dids`, and the
-/// correct behaviour for a server with an empty store.
+/// Both the **identity** and the version must match: a DID deleted and
+/// re-created at the same mnemonic has a new identifier but may well have the
+/// same number of versions, and an edge that missed the delete (offline past
+/// its outbox budget, say) would otherwise keep serving the old DID. On a
+/// mismatch the new log is pushed; the edge's own per-identity high-water mark
+/// still refuses anything that would roll a DID back.
+pub fn edge_is_current(record: &DidRecord, reported: Option<&ReportedDid>) -> bool {
+    reported.is_some_and(|have| {
+        have.did_id.is_some()
+            && have.did_id == record.did_id
+            && have.version_count >= record.version_count
+    })
+}
+
+/// Parse the `preloaded_dids` of a register payload into mnemonic →
+/// [`ReportedDid`]. Absent or malformed → empty, i.e. a full push.
+pub fn parse_reported(body: &serde_json::Value) -> std::collections::HashMap<String, ReportedDid> {
+    body.get("preloaded_dids")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let mnemonic = e.get("mnemonic")?.as_str()?.to_string();
+                    let version_count = e.get("version_count")?.as_u64()?;
+                    let did_id = e.get("did_id").and_then(|v| v.as_str()).map(String::from);
+                    Some((
+                        mnemonic,
+                        ReportedDid {
+                            did_id,
+                            version_count,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
+/// already hold, as the same DID at the current version ([`edge_is_current`]).
+///
+/// `reported` maps mnemonic → what the registering server says it holds (from
+/// the `preloaded_dids` in its register payload). An **empty** map means a full
+/// push — the correct behaviour for a server with an empty store.
 ///
 /// Each DID is one outbox row; the worker drains them in enqueue order so the
 /// server applies them deterministically, and a control restart mid-bulk
@@ -38,7 +88,7 @@ use crate::server::AppState;
 pub fn sync_all_dids_to_server(
     state: &AppState,
     server_did: String,
-    reported: std::collections::HashMap<String, u64>,
+    reported: std::collections::HashMap<String, ReportedDid>,
 ) {
     let dids_ks = state.dids_ks.clone();
     let registry_ks = state.registry_ks.clone();
@@ -86,12 +136,9 @@ pub fn sync_all_dids_to_server(
             }
             published.insert(record.mnemonic.clone());
 
-            // Delta: the registering server already has this DID at this
+            // Delta: the registering server already has this same DID at this
             // version or newer — nothing to push.
-            if reported
-                .get(&record.mnemonic)
-                .is_some_and(|&have| have >= record.version_count)
-            {
+            if edge_is_current(&record, reported.get(&record.mnemonic)) {
                 continue;
             }
 
@@ -388,6 +435,124 @@ async fn get_active_servers(
 // idempotent (assign/unassign/purge/upsert all no-op on repeat).
 // ---------------------------------------------------------------------------
 
+/// A domain operation the control plane has sent a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainOp {
+    Assign,
+    Unassign,
+    Purge,
+}
+
+/// The latest domain operation sent to one server for one domain — what that
+/// server's assignment of the domain should be. Kept so a server that missed
+/// the op (offline past its outbox budget) is brought back in line when it
+/// next registers ([`resend_domain_intents`]); an unassign or purge is settled
+/// once the server acknowledges it, an assign is kept (it is the desired
+/// state, and re-sending it is a no-op).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DomainIntent {
+    pub domain: String,
+    pub op: DomainOp,
+    pub at: u64,
+}
+
+/// `|` cannot occur in a DID, so one server's prefix never matches another's.
+fn domain_intent_prefix(server_did: &str) -> String {
+    format!("domain-intent:{server_did}|")
+}
+
+fn domain_intent_key(server_did: &str, domain: &str) -> String {
+    format!("{}{domain}", domain_intent_prefix(server_did))
+}
+
+/// Record `op` as the latest domain operation for `server_did`.
+async fn record_domain_intent(
+    state: &AppState,
+    server_did: &str,
+    domain: &str,
+    op: DomainOp,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    state
+        .registry_ks
+        .insert(
+            domain_intent_key(server_did, domain),
+            &DomainIntent {
+                domain: domain.to_string(),
+                op,
+                at: crate::auth::session::now_epoch(),
+            },
+        )
+        .await
+}
+
+/// Every recorded domain intent for one server.
+pub async fn domain_intents(
+    state: &AppState,
+    server_did: &str,
+) -> Result<Vec<DomainIntent>, did_hosting_common::server::error::AppError> {
+    Ok(state
+        .registry_ks
+        .prefix_iter_raw(domain_intent_prefix(server_did))
+        .await?
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
+        .collect())
+}
+
+/// A server acknowledged `op` for `domain`: an unassign or purge is settled —
+/// but only when it is still the latest op, so the ack of an older unassign
+/// cannot erase a newer assign.
+pub async fn settle_domain_intent(state: &AppState, server_did: &str, domain: &str, op: DomainOp) {
+    if op == DomainOp::Assign {
+        return;
+    }
+    let key = domain_intent_key(server_did, domain);
+    match state.registry_ks.get::<DomainIntent>(key.clone()).await {
+        Ok(Some(intent)) if intent.op == op => {
+            if let Err(e) = state.registry_ks.remove(key).await {
+                warn!(server_did, domain, error = %e, "failed to settle domain intent");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(server_did, domain, error = %e, "failed to read domain intent"),
+    }
+}
+
+/// Re-send every unsettled domain operation to a (re-)registering server: its
+/// assignments, and any unassign or purge it has not acknowledged. Idempotent
+/// on the server. A purge is preceded by its unassign, so a server that missed
+/// both ends up unassigned and purged.
+pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
+    let intents = match domain_intents(state, server_did).await {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(server_did, error = %e, "domain resync: failed to list domain intents");
+            return;
+        }
+    };
+    for intent in intents {
+        let ops: &[&str] = match intent.op {
+            DomainOp::Assign => &[MSG_DOMAIN_ASSIGN],
+            DomainOp::Unassign => &[MSG_DOMAIN_UNASSIGN],
+            DomainOp::Purge => &[MSG_DOMAIN_UNASSIGN, MSG_DOMAIN_PURGE],
+        };
+        for op in ops {
+            if let Err(e) = crate::outbox::enqueue(
+                &state.store,
+                server_did,
+                op,
+                json!({ "domain": intent.domain }),
+            )
+            .await
+            {
+                warn!(server_did, domain = %intent.domain, op, error = %e, "domain resync: enqueue failed");
+            }
+        }
+    }
+    state.outbox_notify.notify_one();
+}
+
 /// Enqueue `MSG_DOMAIN_ASSIGN { domain }` for one server. Returns once
 /// the outbox row is durable; the worker handles actual delivery and
 /// retry.
@@ -396,6 +561,7 @@ pub async fn send_domain_assign(
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Assign).await?;
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
@@ -414,6 +580,7 @@ pub async fn send_domain_purge(
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Purge).await?;
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
@@ -431,6 +598,7 @@ pub async fn send_domain_unassign(
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Unassign).await?;
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
@@ -461,25 +629,31 @@ pub async fn send_domain_upsert(
     Ok(())
 }
 
-/// Replicate every control-side `DomainEntry` to one server — run on each
-/// (re-)registration so a server that missed upserts while unreachable
-/// converges on the control plane's domain records and statuses.
+/// Replicate every control-side `DomainEntry` to one server, then re-send its
+/// unsettled domain assign/unassign/purge ops ([`resend_domain_intents`]) — run
+/// on each (re-)registration so a server that missed any of them while
+/// unreachable converges on the control plane's domain records, statuses and
+/// assignments.
 pub fn sync_all_domains_to_server(state: &AppState, server_did: String) {
     let state = state.clone();
     tokio::spawn(async move {
-        let domains = match did_hosting_common::server::domain::list_domains(&state.store).await {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(server_did = %server_did, error = %e, "domain resync: list failed");
-                return;
-            }
-        };
-        for entry in &domains {
-            if let Err(e) = send_domain_upsert(&state, &server_did, entry).await {
-                warn!(server_did = %server_did, domain = %entry.name, error = %e, "domain resync: enqueue failed");
+        sync_all_domains_now(&state, &server_did).await;
+    });
+}
+
+/// The body of [`sync_all_domains_to_server`], awaited (for tests).
+pub async fn sync_all_domains_now(state: &AppState, server_did: &str) {
+    match did_hosting_common::server::domain::list_domains(&state.store).await {
+        Ok(domains) => {
+            for entry in &domains {
+                if let Err(e) = send_domain_upsert(state, server_did, entry).await {
+                    warn!(server_did, domain = %entry.name, error = %e, "domain resync: enqueue failed");
+                }
             }
         }
-    });
+        Err(e) => warn!(server_did, error = %e, "domain resync: list failed"),
+    }
+    resend_domain_intents(state, server_did).await;
 }
 
 /// Fan an upsert out to every registered server. Used after every

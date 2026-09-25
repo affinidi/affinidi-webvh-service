@@ -81,6 +81,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         dids_ks,
         config: Arc::new(config),
         did_resolver: None,
+        trust_tasks_verifier: None,
         secrets_resolver: None,
         identity: None,
         didcomm_service: Arc::new(std::sync::OnceLock::new()),

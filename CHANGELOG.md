@@ -37,6 +37,34 @@ id)`. See `did_hosting_common::server::trust_tasks::bound`.
   `auth/step-up/approve-request` documents the control plane sends are signed
   with `proofPurpose: authentication`. Only the human approver's own decision
   / approve-response is an `assertionMethod` attestation.
+- **Approver decisions must be attestations.** A `task-consent/decision` and an
+  `auth/step-up/approve-response` must carry `proofPurpose: assertionMethod`
+  with the key listed under the signer's `assertionMethod` relationship, and a
+  deactivated `did:webvh` signer is refused (`verify_approval`). The consent
+  decision's `#response` is now a signed trust-task document in the trust-task
+  envelope.
+- **Edges do not answer documents that fail verification.** A control-plane op
+  or health ping that is not signed by the configured control plane gets no
+  reply at all — neither a signed refusal nor an unsigned one.
+- **Transient failures are retryable.** A signer whose DID cannot be resolved
+  (or whose deactivation status cannot be read) is refused as `unavailable`
+  with an error that names the unreachable DID; an edge's storage or I/O
+  failure applying an op is `internalError`. Both are retryable, so the control
+  plane keeps the op queued rather than settling it. A `sync/batch` with an
+  entry that failed transiently is retried whole.
+- **Registration re-sends what an edge missed.** The delta re-sync compares the
+  DID identity (`did_id`, reported by the edge in `preloaded_dids`) as well as
+  the version count, so a DID deleted and re-created at the same slot reaches
+  an edge that missed the delete. Domain `assign` / `unassign` / `purge` ops are
+  recorded per server and re-sent on each registration until acknowledged
+  (an assignment is kept as the desired state).
+- **The edge's own REST publish (`PUT /api/dids/{mnemonic}`) is held to the
+  sync history rule**: it must extend the held log and the per-DID high-water
+  mark, and records the high-water mark itself.
+- **Deactivation verdicts follow the DID cache.** An edge builds its proof
+  verifier once (it used to build one per message, so nothing was remembered);
+  a verdict is reused while the DID cache serves the same document, and the
+  verdict map is bounded.
 - **Edges keep a high-water mark per DID and per slot that a delete does not
   clear.** A DID re-created after `sync/delete` must extend everything the edge
   ever served for it, so a delete-then-resync cannot roll a DID back to before a

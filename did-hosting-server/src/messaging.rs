@@ -69,14 +69,23 @@ pub struct VerifiedControlPlane {
     pub issued_at: u64,
 }
 
-/// The proof verifier this server checks control-plane documents with, built
-/// over its DID resolver. `None` when no resolver is configured, in which case
-/// no control-plane document can be accepted.
-pub fn state_verifier(state: &AppState) -> Option<TransportBoundVerifier> {
-    state
-        .did_resolver
-        .clone()
-        .map(TransportBoundVerifier::with_did_cache)
+/// Build the proof verifier this server checks control-plane documents with,
+/// over its DID resolver. Built once, at startup, and kept in
+/// [`AppState::trust_tasks_verifier`]: the verifier remembers DID-status
+/// verdicts for the DID cache TTL and rate-limits forced re-resolutions, and a
+/// verifier built per message would remember nothing and limit nothing.
+pub fn build_verifier(
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) -> Option<std::sync::Arc<TransportBoundVerifier>> {
+    did_resolver
+        .cloned()
+        .map(|client| std::sync::Arc::new(TransportBoundVerifier::with_did_cache(client)))
+}
+
+/// The shared proof verifier (see [`build_verifier`]). `None` when no resolver
+/// is configured, in which case no control-plane document can be accepted.
+pub fn state_verifier(state: &AppState) -> Option<std::sync::Arc<TransportBoundVerifier>> {
+    state.trust_tasks_verifier.clone()
 }
 
 /// Establish that `doc` comes from the configured control plane. See the module
@@ -113,12 +122,22 @@ where
     let did = verify_sender_bound(doc, Some(control_did), transport_sender, my_did, verifier)
         .await
         .map_err(|e| {
-            warn!(
-                sender = transport_sender.unwrap_or("unknown"),
-                type_uri = %doc.type_uri,
-                error = %e,
-                "control-plane document rejected: not signed by the configured control plane"
-            );
+            if e.is_transient() {
+                warn!(
+                    control_did,
+                    type_uri = %doc.type_uri,
+                    error = %e,
+                    "control-plane document not verified: the control plane's DID could not be \
+                     resolved from this server (is its did.jsonl reachable?); it will be re-sent"
+                );
+            } else {
+                warn!(
+                    sender = transport_sender.unwrap_or("unknown"),
+                    type_uri = %doc.type_uri,
+                    error = %e,
+                    "control-plane document rejected: not signed by the configured control plane"
+                );
+            }
             e.reject_reason()
         })?;
     match REPLAY_CACHE.check(&did, &doc.id) {
@@ -139,8 +158,82 @@ where
     Ok(VerifiedControlPlane { did, issued_at })
 }
 
-/// Apply one control-plane operation document and return the (unsigned) reply
-/// document: the op's `#response` on success, a `trust-task-error` otherwise.
+/// What [`dispatch_control_plane_op`] produced.
+#[derive(Debug)]
+pub enum ControlPlaneReply {
+    /// The document came from the control plane; this reply — the op's
+    /// `#response`, or a `trust-task-error` for an op that failed — is signed
+    /// and sent back.
+    Reply(trust_tasks_rs::TrustTask<Value>),
+    /// The document failed [`verify_control_plane`]. Nothing is sent back: a
+    /// signed refusal would settle an op that did not come from the control
+    /// plane, or answer a stranger. The error document is kept for logs and
+    /// tests only.
+    Unverified(trust_tasks_rs::TrustTask<Value>),
+}
+
+impl ControlPlaneReply {
+    /// The reply document, whichever kind it is.
+    pub fn into_document(self) -> trust_tasks_rs::TrustTask<Value> {
+        match self {
+            ControlPlaneReply::Reply(d) | ControlPlaneReply::Unverified(d) => d,
+        }
+    }
+}
+
+/// Why a control-plane operation failed after the document was verified.
+#[derive(Debug)]
+pub(crate) enum OpError {
+    /// The op is wrong and always will be (malformed, refused by policy, a log
+    /// that does not verify): reported non-retryable, so the control plane
+    /// stops re-sending it.
+    Refused(String),
+    /// This server could not apply it just now (storage, I/O): reported
+    /// retryable, so the control plane keeps it queued.
+    Transient(String),
+}
+
+impl From<&str> for OpError {
+    fn from(e: &str) -> Self {
+        OpError::Refused(e.to_string())
+    }
+}
+
+impl From<String> for OpError {
+    fn from(e: String) -> Self {
+        OpError::Refused(e)
+    }
+}
+
+impl From<crate::error::AppError> for OpError {
+    fn from(e: crate::error::AppError) -> Self {
+        use crate::error::AppError;
+        match e {
+            AppError::Io(_)
+            | AppError::Store(_)
+            | AppError::SecretStore(_)
+            | AppError::Internal(_) => OpError::Transient(e.to_string()),
+            other => OpError::Refused(other.to_string()),
+        }
+    }
+}
+
+impl OpError {
+    fn reject_reason(self) -> trust_tasks_rs::RejectReason {
+        match self {
+            OpError::Refused(reason) => trust_tasks_rs::RejectReason::TaskFailed {
+                reason,
+                details: None,
+            },
+            OpError::Transient(reason) => {
+                warn!(%reason, "control-plane op not applied (transient); the control plane will re-send it");
+                trust_tasks_rs::RejectReason::InternalError { reason }
+            }
+        }
+    }
+}
+
+/// Apply one control-plane operation document and return the (unsigned) reply.
 ///
 /// Shared by the DIDComm envelope route and the TSP handler. Returns `None`
 /// for a type that is not a control-plane operation.
@@ -149,7 +242,7 @@ pub async fn dispatch_control_plane_op(
     transport_sender: Option<&str>,
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &TransportBoundVerifier,
-) -> Option<trust_tasks_rs::TrustTask<Value>> {
+) -> Option<ControlPlaneReply> {
     let type_uri = doc.type_uri.to_string();
     if !CONTROL_PLANE_OPS.contains(&type_uri.as_str()) {
         return None;
@@ -157,7 +250,11 @@ pub async fn dispatch_control_plane_op(
     let reply_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let control = match verify_control_plane(state, transport_sender, &doc, verifier).await {
         Ok(c) => c,
-        Err(reason) => return Some(error_value(doc.reject_with(reply_id, reason))),
+        Err(reason) => {
+            return Some(ControlPlaneReply::Unverified(error_value(
+                doc.reject_with(reply_id, reason),
+            )));
+        }
     };
 
     let result = match type_uri.as_str() {
@@ -170,7 +267,7 @@ pub async fn dispatch_control_plane_op(
         MSG_DOMAIN_UPSERT => do_domain_upsert(&control, state, &doc.payload).await,
         _ => unreachable!("CONTROL_PLANE_OPS gates this match"),
     };
-    Some(match result {
+    Some(ControlPlaneReply::Reply(match result {
         Ok((ack_type, body)) if ack_type != MSG_PROBLEM_REPORT => {
             let reply = doc.respond_with(reply_id, body);
             debug_assert_eq!(reply.type_uri.to_string(), ack_type);
@@ -189,14 +286,8 @@ pub async fn dispatch_control_plane_op(
                 },
             ),
         ),
-        Err(e) => error_value(doc.reject_with(
-            reply_id,
-            trust_tasks_rs::RejectReason::TaskFailed {
-                reason: e,
-                details: None,
-            },
-        )),
-    })
+        Err(e) => error_value(doc.reject_with(reply_id, e.reject_reason())),
+    }))
 }
 
 /// An error document as the untyped reply shape the transports carry.
@@ -208,9 +299,11 @@ fn error_value(err: trust_tasks_rs::ErrorResponse) -> trust_tasks_rs::TrustTask<
 /// Sign a reply document with this server's identity so the control plane can
 /// attribute it, returning it ready for the wire.
 ///
-/// Error documents are signed too: a signed, non-retryable refusal is what lets
-/// the control plane stop re-sending an op this server will never apply (an
-/// unsigned one settles nothing there). A reply this server cannot sign is
+/// Error documents for ops that came from the control plane are signed too: a
+/// signed, non-retryable refusal is what lets the control plane stop re-sending
+/// an op this server will never apply (an unsigned one settles nothing there).
+/// A document that did not verify as the control plane's gets no reply at all
+/// ([`ControlPlaneReply::Unverified`]). A reply this server cannot sign is
 /// dropped — the control plane refuses unsigned acks.
 pub async fn seal_reply(
     state: &AppState,
@@ -345,8 +438,10 @@ pub async fn dispatch_inbound_document(
             warn!(%type_uri, "control-plane document refused: no DID resolver configured to verify it");
             return None;
         };
-        let reply = dispatch_control_plane_op(state, sender, doc, &verifier).await?;
-        return seal_reply(state, reply).await;
+        return match dispatch_control_plane_op(state, sender, doc, &verifier).await? {
+            ControlPlaneReply::Reply(reply) => seal_reply(state, reply).await,
+            ControlPlaneReply::Unverified(_) => None,
+        };
     }
     if crate::trust_tasks_infra::owns(&type_uri) {
         let reply = crate::trust_tasks_infra::dispatch(state, sender, doc).await?;
@@ -384,7 +479,7 @@ async fn do_sync_update(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     let mnemonic = apply_sync_update_body(state, body).await?;
     debug!(did = %control.did, %mnemonic, "applied sync update");
     Ok((
@@ -404,7 +499,7 @@ async fn do_sync_batch(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     let updates = body
         .get("updates")
         .and_then(|v| v.as_array())
@@ -412,14 +507,29 @@ async fn do_sync_batch(
 
     let mut applied = 0usize;
     let mut failed = 0usize;
+    let mut transient: Option<String> = None;
     for update in updates {
         match apply_sync_update_body(state, update).await {
             Ok(_) => applied += 1,
-            Err(e) => {
+            Err(OpError::Refused(e)) => {
                 failed += 1;
                 warn!(error = %e, "sync-batch: skipping an update that failed to apply");
             }
+            Err(OpError::Transient(e)) => {
+                failed += 1;
+                warn!(error = %e, "sync-batch: an update could not be applied just now");
+                transient.get_or_insert(e);
+            }
         }
+    }
+    // An entry this server could not apply *just now* makes the whole batch
+    // retryable: re-applying the entries that did land is a no-op, and
+    // acknowledging the batch would settle it with that entry missing.
+    if let Some(e) = transient {
+        return Err(OpError::Transient(format!(
+            "{failed} of {} sync-batch updates not applied: {e}",
+            updates.len()
+        )));
     }
     debug!(
         did = %control.did,
@@ -438,7 +548,7 @@ async fn do_sync_batch(
 /// element of a `MSG_SYNC_BATCH`. Returns the mnemonic on success. Runs the
 /// own-DID rotation check, so a batched update to the server's own DID is
 /// treated exactly like a single one.
-async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String, String> {
+async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String, OpError> {
     use crate::control_register::apply_single_update;
     use did_hosting_common::DidSyncUpdate;
 
@@ -479,7 +589,7 @@ async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String
         state.config.public_url.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(OpError::from)?;
 
     // Duplicate of the canonical info line in
     // `control_register::apply_single_update`; keep it at debug so each synced
@@ -501,7 +611,7 @@ async fn do_sync_delete(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     use crate::did_ops;
 
     let mnemonic = body
@@ -513,7 +623,7 @@ async fn do_sync_delete(
         .dids_ks
         .get(did_ops::did_key(mnemonic))
         .await
-        .unwrap_or(None);
+        .map_err(OpError::from)?;
 
     if let Some(record) = record {
         let mut batch = state.store.batch();
@@ -522,7 +632,7 @@ async fn do_sync_delete(
         batch.remove(&state.dids_ks, did_ops::content_witness_key(mnemonic));
         batch.remove(&state.dids_ks, did_ops::owner_key(&record.owner, mnemonic));
         batch.remove(&state.dids_ks, did_ops::watcher_sync_key(mnemonic));
-        batch.commit().await.map_err(|e| e.to_string())?;
+        batch.commit().await.map_err(OpError::from)?;
 
         info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
     } else {
@@ -549,7 +659,7 @@ async fn do_domain_assign(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::assignment::{AssignOutcome, assign};
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, CancelOutcome};
@@ -558,12 +668,12 @@ async fn do_domain_assign(
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/assign")?;
-    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
 
     let now = crate::auth::session::now_epoch();
     let outcome = assign(&state.store, &domain, &control.did, now)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(OpError::from)?;
 
     let (status, log_msg) = match &outcome {
         AssignOutcome::Created(_) => ("assigned", "domain assigned"),
@@ -575,7 +685,7 @@ async fn do_domain_assign(
     // "did my data survive the unassign / re-assign round trip?".
     let cancelled = pending_purge::cancel(&state.store, &domain)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(OpError::from)?;
     if let CancelOutcome::Removed(prev) = cancelled {
         info!(
             did = %control.did,
@@ -603,7 +713,7 @@ async fn do_domain_unassign(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::pending_purge::{self, parse_grace_string};
@@ -612,11 +722,11 @@ async fn do_domain_unassign(
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/unassign")?;
-    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
 
     let outcome = unassign(&state.store, &domain)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(OpError::from)?;
 
     let (status, log_msg) = match &outcome {
         UnassignOutcome::Removed(_) => ("unassigned", "domain unassigned"),
@@ -695,7 +805,7 @@ async fn do_domain_purge(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::assignment;
     use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::domain_purge::purge_domain_dids;
@@ -705,7 +815,7 @@ async fn do_domain_purge(
         .get("domain")
         .and_then(|v| v.as_str())
         .ok_or("missing 'domain' in domain/purge")?;
-    let domain = normalize_domain_name(domain_raw).map_err(|e| e.to_string())?;
+    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
 
     // Freshness check — defends against the replay-after-reassign-
     // within-grace scenario:
@@ -722,7 +832,10 @@ async fn do_domain_purge(
     // purge. `issuedAt` is covered by the control plane's proof, so unlike
     // the DIDComm `created_time` this used to read it is always present and
     // cannot be restamped in transit.
-    if let Ok(Some(current)) = assignment::get(&state.store, &domain).await
+    // A lookup failure must not skip the check: it is retried, not assumed away.
+    if let Some(current) = assignment::get(&state.store, &domain)
+        .await
+        .map_err(OpError::from)?
         && control.issued_at < current.assigned_at
     {
         warn!(
@@ -740,7 +853,7 @@ async fn do_domain_purge(
 
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(OpError::from)?;
 
     // Clear any pending purge — the synchronous purge supersedes it.
     let _ = pending_purge::cancel(&state.store, &domain).await;
@@ -785,7 +898,7 @@ async fn do_domain_upsert(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
-) -> Result<(String, Value), String> {
+) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::domain::{
         DISABLE_PURGE_REASON, DomainEntry, DomainStatus, create_domain, get_domain,
         normalize_domain_name, update_domain,
@@ -794,26 +907,27 @@ async fn do_domain_upsert(
 
     let entry: DomainEntry = serde_json::from_value(body.clone())
         .map_err(|e| format!("malformed 'entry' in domain/upsert (expected a DomainEntry): {e}"))?;
-    let canonical = normalize_domain_name(&entry.name).map_err(|e| e.to_string())?;
+    let canonical = normalize_domain_name(&entry.name).map_err(OpError::from)?;
     if canonical != entry.name {
         return Err(format!(
             "domain/upsert sender sent non-canonical name '{}' (expected '{canonical}')",
             entry.name
-        ));
+        )
+        .into());
     }
 
     let existed = get_domain(&state.store, &canonical)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(OpError::from)?
         .is_some();
     if existed {
         update_domain(&state.store, &canonical, &entry)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(OpError::from)?;
     } else {
         create_domain(&state.store, &entry)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(OpError::from)?;
     }
 
     // Status-driven side effects.
@@ -880,4 +994,48 @@ fn problem_report(code: &str, comment: &str) -> (String, Value) {
         MSG_PROBLEM_REPORT.to_string(),
         json!({ "code": code, "comment": comment }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::AppError;
+
+    fn payload_of(err: OpError) -> Value {
+        let doc: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(json!({
+            "id": "urn:uuid:00000000-0000-0000-0000-000000000001",
+            "type": MSG_SYNC_UPDATE,
+            "payload": {},
+        }))
+        .unwrap();
+        serde_json::to_value(doc.reject_with("urn:uuid:x", err.reject_reason())).unwrap()["payload"]
+            .clone()
+    }
+
+    /// A storage or I/O failure is this server's momentary problem: reported
+    /// retryable, so the control plane keeps the op queued instead of settling it.
+    #[test]
+    fn storage_failures_are_retryable() {
+        for e in [
+            AppError::Store("disk full".into()),
+            AppError::Internal("lock poisoned".into()),
+            AppError::Io(std::io::Error::other("eio")),
+        ] {
+            let err = OpError::from(e);
+            assert!(matches!(err, OpError::Transient(_)), "{err:?}");
+            assert_eq!(payload_of(err)["retryable"], true);
+        }
+    }
+
+    /// A refusal is final: reported non-retryable, so the control plane stops.
+    #[test]
+    fn refusals_are_final() {
+        for err in [
+            OpError::from(AppError::Validation("not an extension".into())),
+            OpError::from("missing 'mnemonic'"),
+        ] {
+            assert!(matches!(err, OpError::Refused(_)), "{err:?}");
+            assert_eq!(payload_of(err)["retryable"], false);
+        }
+    }
 }

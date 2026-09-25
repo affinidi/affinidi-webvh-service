@@ -8,7 +8,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tracing::{info, warn};
-use trust_tasks_rs::{ProofVerifier, TrustTask};
+use trust_tasks_rs::TrustTask;
 
 use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
@@ -697,7 +697,10 @@ pub async fn step_up_vta_finish(
         .trust_tasks_verifier
         .as_deref()
         .ok_or_else(|| AppError::Config("trust-tasks proof verifier not configured".into()))?;
-    verifier.verify(&doc).await.map_err(|e| {
+    //        An approval is the holder's attestation: `assertionMethod` purpose,
+    //        a key listed under `assertionMethod`, and — for `did:webvh` — a
+    //        signer that has not deactivated its DID.
+    verifier.verify_approval(&doc).await.map_err(|e| {
         warn!(error = %e, "step-up rejected: approve-response proof failed verification");
         AppError::Authentication("approve-response proof failed verification".into())
     })?;
@@ -1149,6 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn signed_step_up_request_verifies_and_binds_issuer() {
         use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
+        use trust_tasks_rs::ProofVerifier;
 
         let (control_did, signer) = crate::signing::test_util::did_key_signer(&[13u8; 32]);
 

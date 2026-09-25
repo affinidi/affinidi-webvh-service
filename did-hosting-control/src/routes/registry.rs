@@ -452,12 +452,18 @@ async fn compute_did_sync_updates(
             continue;
         }
 
-        let needs_update = match reported.get(record.mnemonic.as_str()) {
-            // Server doesn't have this DID → send it
-            None => true,
-            // Server has it but with fewer versions → send update
-            Some(entry) => entry.version_count < record.version_count,
-        };
+        // Send unless the server holds this same DID (identity, not just the
+        // slot) at this version or newer — see `server_push::edge_is_current`.
+        let needs_update = !crate::server_push::edge_is_current(
+            &record,
+            reported
+                .get(record.mnemonic.as_str())
+                .map(|e| crate::server_push::ReportedDid {
+                    did_id: e.did_id.clone(),
+                    version_count: e.version_count,
+                })
+                .as_ref(),
+        );
 
         if !needs_update {
             continue;

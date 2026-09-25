@@ -165,7 +165,6 @@ async fn run_consent_decision(
     use did_hosting_common::did_hosting_tasks::{
         TASK_CONSENT_DECISION_0_1, TASK_CONSENT_DECISION_RESPONSE_0_1,
     };
-    use trust_tasks_rs::ProofVerifier;
 
     // ── 1. The body must be a Trust Task document of the decision type.
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
@@ -271,7 +270,10 @@ async fn run_consent_decision(
         warn!("trust-tasks proof verifier not configured — cannot accept consent decisions");
         return Ok(None);
     };
-    if let Err(e) = verifier.verify(&doc).await {
+    // A decision is the approver's own attestation: `assertionMethod` purpose,
+    // a key listed under `assertionMethod`, and a signer that has not
+    // deactivated its DID.
+    if let Err(e) = verifier.verify_approval(&doc).await {
         warn!(
             sender = sender,
             error = %e,
@@ -342,15 +344,39 @@ async fn run_consent_decision(
     let _ = pending.tx.send(approved);
 
     // Spec `#response` acknowledgement: minApprovals is 1, so an approve
-    // is immediately `granted` and a deny is `denied`.
+    // is immediately `granted` and a deny is `denied`. It is a trust-task
+    // document in the trust-task envelope, signed like every other non-error
+    // reply, so the approver can attribute it to this control plane.
     let ack = json!({
         "status": if approved { "granted" } else { "denied" },
         "payloadDigest": digest,
         "approvals": if approved { 1 } else { 0 },
     });
+    let reply = doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), ack);
+    debug_assert_eq!(
+        reply.type_uri.to_string(),
+        TASK_CONSENT_DECISION_RESPONSE_0_1.as_str()
+    );
+    let secret = match state
+        .config
+        .server_did
+        .as_deref()
+        .ok_or_else(|| "server_did not configured".to_string())
+        .and_then(|did| {
+            crate::signing::control_signing_secret(state, did).map_err(|e| e.to_string())
+        }) {
+        Ok(secret) => secret,
+        Err(e) => {
+            // The decision is already delivered; only the acknowledgement is
+            // withheld, because an unsigned one could not be attributed.
+            tracing::error!(error = %e, "cannot sign the task-consent acknowledgement; not sending it");
+            return Ok(None);
+        }
+    };
+    let signed = sign_reply_doc(state, &secret, sender, reply).await;
     Ok(Some((
-        TASK_CONSENT_DECISION_RESPONSE_0_1.as_str().to_string(),
-        ack,
+        trust_tasks_didcomm::ENVELOPE_TYPE.to_string(),
+        serde_json::to_value(&signed).expect("signed reply serialises"),
     )))
 }
 
@@ -1067,6 +1093,15 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
             return;
         }
     }
+    // An acknowledged unassign or purge no longer needs re-sending on the next
+    // registration (see `server_push::resend_domain_intents`).
+    let settled = match op {
+        "assign" => crate::server_push::DomainOp::Assign,
+        "unassign" => crate::server_push::DomainOp::Unassign,
+        _ => crate::server_push::DomainOp::Purge,
+    };
+    crate::server_push::settle_domain_intent(state, signer, domain, settled).await;
+
     let instance_id = signer.replace(':', "_");
     match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
         Ok(Some(mut instance)) => {
@@ -1354,23 +1389,10 @@ pub(crate) async fn do_server_register(
 
     // Sync DIDs to the newly registered server — only the ones it doesn't
     // already have. The server reports what it holds in `preloaded_dids`
-    // (mnemonic → version_count); anything absent or stale is pushed. A client
-    // that sends no `preloaded_dids` (older server, or an empty store) gets a
-    // full push. This is what stops a reboot from re-syncing every DID.
-    let reported: std::collections::HashMap<String, u64> = body
-        .get("preloaded_dids")
-        .and_then(|v| v.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|e| {
-                    let mnemonic = e.get("mnemonic")?.as_str()?.to_string();
-                    let version = e.get("version_count")?.as_u64()?;
-                    Some((mnemonic, version))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // (mnemonic → DID + version_count); anything absent, stale, or a different
+    // DID at that slot is pushed. A server with an empty store sends none and
+    // gets a full push. This is what stops a reboot from re-syncing every DID.
+    let reported = server_push::parse_reported(body);
     server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
     server_push::sync_all_domains_to_server(state, signer.to_string());
 
@@ -4204,6 +4226,38 @@ mod tests {
     /// production DI verifier over `did:key` wired in — the decision
     /// handler refuses everything without a verifier, and its audience
     /// check compares the decision's `recipient` against `server_did`.
+    /// Give `state` a signing identity for `control_did`, so replies can be
+    /// signed.
+    async fn with_control_identity(state: &mut AppState, control_did: &str, key: &Secret) {
+        state.identity = Some(
+            did_hosting_common::server::identity::ServiceIdentity::from_signing_secret(
+                control_did,
+                key.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    /// The consent acknowledgement is a signed trust-task document, verifiable
+    /// by the approver as coming from this control plane.
+    fn assert_signed_ack(envelope_type: &str, ack: &Value, control_did: &str, holder_did: &str) {
+        assert_eq!(envelope_type, trust_tasks_didcomm::ENVELOPE_TYPE);
+        assert_eq!(ack["type"], TASK_CONSENT_DECISION_RESPONSE_0_1.as_str());
+        assert_eq!(ack["issuer"], control_did);
+        assert_eq!(ack["recipient"], holder_did);
+        assert_eq!(ack["proof"]["proofPurpose"], "authentication");
+        assert_eq!(
+            ack["proof"]["verificationMethod"]
+                .as_str()
+                .unwrap()
+                .split('#')
+                .next()
+                .unwrap(),
+            control_did
+        );
+    }
+
     async fn consent_state(control_did: &str) -> (AppState, tempfile::TempDir) {
         let (mut state, dir) = test_state().await;
         let mut config = (*state.config).clone();
@@ -4366,7 +4420,8 @@ mod tests {
 
         let (control_did, control_signer) = did_key_signer(&[21u8; 32]);
         let (holder_did, holder_signer) = did_key_signer(&[22u8; 32]);
-        let (state, _dir) = consent_state(&control_did).await;
+        let (mut state, _dir) = consent_state(&control_did).await;
+        with_control_identity(&mut state, &control_did, &control_signer).await;
 
         // ── Request leg, signed by the control DID.
         let (request, challenge, digest) =
@@ -4411,7 +4466,14 @@ mod tests {
             .expect("handler ok")
             .expect("an acknowledgement is returned");
 
-        assert_eq!(resp_type, TASK_CONSENT_DECISION_RESPONSE_0_1.as_str());
+        assert_signed_ack(&resp_type, &ack, &control_did, &holder_did);
+        let parsed_ack: trust_tasks_rs::TrustTask<Value> =
+            serde_json::from_value(ack.clone()).unwrap();
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+            .verify_operational(&parsed_ack)
+            .await
+            .expect("the approver can verify the acknowledgement");
+        let ack = &ack["payload"];
         assert_eq!(ack["status"], "granted");
         assert_eq!(ack["approvals"], 1);
         assert_eq!(ack["payloadDigest"], digest.as_str());
@@ -4428,7 +4490,8 @@ mod tests {
     async fn task_consent_signed_round_trip_deny() {
         let (control_did, control_signer) = did_key_signer(&[23u8; 32]);
         let (holder_did, holder_signer) = did_key_signer(&[24u8; 32]);
-        let (state, _dir) = consent_state(&control_did).await;
+        let (mut state, _dir) = consent_state(&control_did).await;
+        with_control_identity(&mut state, &control_did, &control_signer).await;
         let (_request, challenge, digest) =
             minted_request(&control_did, &control_signer, &holder_did).await;
         let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
@@ -4443,14 +4506,56 @@ mod tests {
         )
         .await;
         let msg = build_msg(TASK_CONSENT_DECISION_0_1.as_str(), decision);
-        let (_, ack) = super::run_consent_decision(&state, &holder_did, &msg)
+        let (resp_type, ack) = super::run_consent_decision(&state, &holder_did, &msg)
             .await
             .expect("handler ok")
             .expect("an acknowledgement is returned");
 
+        assert_signed_ack(&resp_type, &ack, &control_did, &holder_did);
+        let ack = &ack["payload"];
         assert_eq!(ack["status"], "denied");
         assert_eq!(ack["approvals"], 0);
         assert!(!rx.try_recv().expect("decision delivered"), "denied");
+    }
+
+    /// A decision is the approver's attestation: one signed for
+    /// `authentication` (an operational proof) is not a decision, however
+    /// valid its signature.
+    #[tokio::test]
+    async fn task_consent_decision_with_an_authentication_proof_is_refused() {
+        let (control_did, control_signer) = did_key_signer(&[27u8; 32]);
+        let (holder_did, holder_signer) = did_key_signer(&[28u8; 32]);
+        let (mut state, _dir) = consent_state(&control_did).await;
+        with_control_identity(&mut state, &control_did, &control_signer).await;
+        let (_request, challenge, digest) =
+            minted_request(&control_did, &control_signer, &holder_did).await;
+        let mut rx = park_pending(&state, &challenge, &holder_did, &digest).await;
+
+        let unsigned: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(unsigned_decision(
+            Some(&holder_did),
+            &control_did,
+            &challenge,
+            &digest,
+            "approve",
+        ))
+        .unwrap();
+        let signed =
+            did_hosting_common::server::trust_tasks::sign_document(&unsigned, &holder_signer)
+                .await
+                .unwrap();
+        assert_eq!(
+            signed.proof.as_ref().unwrap().proof_purpose,
+            "authentication"
+        );
+        assert_decision_refused(
+            &state,
+            &holder_did,
+            serde_json::to_value(&signed).unwrap(),
+            &mut rx,
+            &challenge,
+            "an authentication-purpose decision",
+        )
+        .await;
     }
 
     /// An unsigned decision is refused outright — the proof, not the
@@ -4862,6 +4967,259 @@ mod tests {
                 .expect("acl read")
                 .is_none(),
             "nothing must be granted"
+        );
+    }
+
+    // ── Delta re-sync compares identity, not just version ──────────────
+
+    fn record_at(mnemonic: &str, did_id: &str, version_count: u64) -> DidRecord {
+        DidRecord {
+            services: None,
+            owner: "did:example:owner".into(),
+            mnemonic: mnemonic.into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count,
+            did_id: Some(did_id.into()),
+            content_size: 1,
+            disabled: false,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: String::new(),
+            agent_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_edge_is_current_only_for_the_same_did_at_the_same_version() {
+        use crate::server_push::{ReportedDid, edge_is_current};
+        let record = record_at("alice", "did:webvh:QmNew:host:alice", 2);
+        let have = |did_id: Option<&str>, version_count| ReportedDid {
+            did_id: did_id.map(String::from),
+            version_count,
+        };
+        assert!(edge_is_current(
+            &record,
+            Some(&have(Some("did:webvh:QmNew:host:alice"), 2))
+        ));
+        assert!(!edge_is_current(&record, None), "absent → push");
+        assert!(
+            !edge_is_current(&record, Some(&have(Some("did:webvh:QmNew:host:alice"), 1))),
+            "behind → push"
+        );
+        // Deleted and re-created at the same slot with the same version count:
+        // the edge that missed the delete still holds the old DID.
+        assert!(
+            !edge_is_current(&record, Some(&have(Some("did:webvh:QmOld:host:alice"), 2))),
+            "a different DID at the slot → push"
+        );
+        assert!(
+            !edge_is_current(&record, Some(&have(None, 5))),
+            "an edge that does not say which DID it holds → push"
+        );
+    }
+
+    #[test]
+    fn preloaded_dids_carry_the_did_identity() {
+        let reported = crate::server_push::parse_reported(&json!({
+            "preloaded_dids": [
+                { "mnemonic": "alice", "did_id": "did:webvh:QmA:h:alice", "version_count": 3 },
+                { "mnemonic": "bob", "version_count": 1 },
+            ]
+        }));
+        assert_eq!(
+            reported["alice"].did_id.as_deref(),
+            Some("did:webvh:QmA:h:alice")
+        );
+        assert_eq!(reported["alice"].version_count, 3);
+        assert_eq!(reported["bob"].did_id, None);
+    }
+
+    /// End to end: an edge reporting the old DID at a re-created slot, at the
+    /// same version count, is sent the new log.
+    #[tokio::test]
+    async fn resync_pushes_a_re_created_did_at_the_same_version() {
+        let (state, _dir) = test_state().await;
+        let record = record_at("alice", "did:webvh:QmNew:host:alice", 1);
+        state
+            .dids_ks
+            .insert(did_key("alice"), &record)
+            .await
+            .unwrap();
+        state
+            .dids_ks
+            .insert_raw(
+                did_hosting_common::did_ops::content_log_key("alice"),
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap();
+        let edge = "did:example:edge-resync";
+        let reported = crate::server_push::parse_reported(&json!({
+            "preloaded_dids": [
+                { "mnemonic": "alice", "did_id": "did:webvh:QmOld:host:alice", "version_count": 1 },
+            ]
+        }));
+        crate::server_push::sync_all_dids_to_server(&state, edge.to_string(), reported);
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = crate::outbox::list_pending_for_target(&state.store, edge)
+                .await
+                .unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(rows.len(), 1, "the new DID is pushed");
+        assert_eq!(rows[0].1.msg_type, MSG_SYNC_UPDATE);
+        assert_eq!(rows[0].1.body["did_id"], "did:webvh:QmNew:host:alice");
+    }
+
+    // ── Domain ops are re-sent on registration until settled ───────────
+
+    async fn seed_service(state: &AppState, did: &str) {
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: did.into(),
+                role: Role::Service,
+                label: None,
+                created_at: 1,
+                max_total_size: None,
+                max_did_count: None,
+                domains: did_hosting_common::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn pending_ops(state: &AppState, edge: &str) -> Vec<(String, String)> {
+        crate::outbox::list_pending_for_target(&state.store, edge)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| {
+                (
+                    e.msg_type,
+                    e.body["domain"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    async fn clear_outbox(state: &AppState, edge: &str) {
+        for (k, _) in crate::outbox::list_pending_for_target(&state.store, edge)
+            .await
+            .unwrap()
+        {
+            crate::outbox::remove(&state.store, k).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsettled_domain_ops_are_re_sent_on_registration() {
+        use crate::server_push::{
+            DomainOp, domain_intents, resend_domain_intents, send_domain_assign, send_domain_purge,
+            send_domain_unassign,
+        };
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-domains";
+        seed_service(&state, edge).await;
+
+        send_domain_assign(&state, edge, "kept.example")
+            .await
+            .unwrap();
+        send_domain_unassign(&state, edge, "gone.example")
+            .await
+            .unwrap();
+        send_domain_purge(&state, edge, "wiped.example")
+            .await
+            .unwrap();
+        // The edge was offline long enough for the outbox to give up.
+        clear_outbox(&state, edge).await;
+
+        resend_domain_intents(&state, edge).await;
+        let mut ops = pending_ops(&state, edge).await;
+        ops.sort();
+        let mut want = vec![
+            (MSG_DOMAIN_ASSIGN.to_string(), "kept.example".to_string()),
+            (MSG_DOMAIN_UNASSIGN.to_string(), "gone.example".to_string()),
+            (MSG_DOMAIN_UNASSIGN.to_string(), "wiped.example".to_string()),
+            (MSG_DOMAIN_PURGE.to_string(), "wiped.example".to_string()),
+        ];
+        want.sort();
+        assert_eq!(ops, want);
+
+        // Acknowledged unassign / purge are settled; the assign stays (it is the
+        // desired state).
+        do_domain_ack(
+            &state,
+            edge,
+            MSG_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "gone.example", "status": "unassigned" }),
+        )
+        .await;
+        do_domain_ack(
+            &state,
+            edge,
+            MSG_DOMAIN_PURGE_ACK,
+            &json!({ "domain": "wiped.example", "deleted": 0 }),
+        )
+        .await;
+        do_domain_ack(
+            &state,
+            edge,
+            MSG_DOMAIN_ASSIGN_ACK,
+            &json!({ "domain": "kept.example", "status": "assigned" }),
+        )
+        .await;
+        let intents = domain_intents(&state, edge).await.unwrap();
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(intents[0].domain, "kept.example");
+        assert_eq!(intents[0].op, DomainOp::Assign);
+    }
+
+    /// The ack of an older unassign cannot erase a newer assign, and a stranger
+    /// cannot settle anything.
+    #[tokio::test]
+    async fn a_stale_or_foreign_ack_does_not_settle_a_domain_op() {
+        use crate::server_push::{
+            DomainOp, domain_intents, send_domain_assign, send_domain_unassign,
+        };
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-stale";
+        seed_service(&state, edge).await;
+
+        send_domain_unassign(&state, edge, "a.example")
+            .await
+            .unwrap();
+        send_domain_assign(&state, edge, "a.example").await.unwrap();
+        do_domain_ack(
+            &state,
+            edge,
+            MSG_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "a.example", "status": "unassigned" }),
+        )
+        .await;
+        let intents = domain_intents(&state, edge).await.unwrap();
+        assert_eq!(intents[0].op, DomainOp::Assign, "the newer assign stands");
+
+        send_domain_unassign(&state, edge, "a.example")
+            .await
+            .unwrap();
+        do_domain_ack(
+            &state,
+            "did:example:not-a-service",
+            MSG_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "a.example", "status": "unassigned" }),
+        )
+        .await;
+        assert_eq!(
+            domain_intents(&state, edge).await.unwrap()[0].op,
+            DomainOp::Unassign,
+            "another DID's ack settles nothing"
         );
     }
 }

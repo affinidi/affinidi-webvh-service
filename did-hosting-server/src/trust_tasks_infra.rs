@@ -36,9 +36,10 @@ pub fn owns(type_uri: &str) -> bool {
 /// or `None` when the op is terminal (an ack is an answer, not a question).
 ///
 /// A health ping is answered only when the control plane signed it (see
-/// [`crate::messaging::verify_control_plane`]): the pong discloses the DID
-/// count, and answering an unauthenticated ping would make this server a
-/// reflector for anyone who can reach its mediator. The two acks are advisory
+/// [`crate::messaging::verify_control_plane`]); any other ping gets no reply
+/// at all. The pong discloses the DID count, and answering an unauthenticated
+/// ping — even with a refusal — would make this server a reflector for anyone
+/// who can reach its mediator. The two acks are advisory
 /// — logged and nothing else — so they need no authority.
 pub async fn dispatch(
     state: &AppState,
@@ -48,19 +49,12 @@ pub async fn dispatch(
     match doc.type_uri.to_string().as_str() {
         MSG_HEALTH_PING => {
             let verifier = crate::messaging::state_verifier(state)?;
-            if let Err(reason) =
-                crate::messaging::verify_control_plane(state, sender, &doc, &verifier).await
-            {
-                return Some(
-                    serde_json::from_value(
-                        serde_json::to_value(
-                            doc.reject_with(uuid::Uuid::new_v4().to_string(), reason),
-                        )
-                        .expect("error document serialises"),
-                    )
-                    .expect("error document re-reads as a TrustTask"),
-                );
-            }
+            // A ping that is not the control plane's gets no answer — not even
+            // a (signed) refusal, which would make this server answer
+            // strangers. `verify_control_plane` has logged why.
+            crate::messaging::verify_control_plane(state, sender, &doc, &verifier)
+                .await
+                .ok()?;
             let pong = do_health_ping(state).await;
             debug!(sender, "health ping answered (trust task)");
             Some(doc.respond_with(uuid::Uuid::new_v4().to_string(), pong))

@@ -56,7 +56,7 @@ pub mod verifier;
 
 pub use bound::{BoundError, identity_signing_secret, sign_document, verify_sender_bound};
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
-pub use verifier::TransportBoundVerifier;
+pub use verifier::{TransportBoundVerifier, is_unreachable};
 
 use chrono::Utc;
 use serde::Serialize;

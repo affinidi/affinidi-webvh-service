@@ -151,7 +151,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
-    // Report the DIDs we already hold (mnemonic → version) so the control
+    // Report the DIDs we already hold (mnemonic → DID + version) so the control
     // plane sends only what we're missing or behind on, instead of re-pushing
     // every DID on every boot. Compact by design — mnemonic + version, not the
     // logs. A store-iteration failure degrades to an empty list, i.e. a full
@@ -161,7 +161,17 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
             .into_iter()
             .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
             .filter(|r| r.version_count > 0)
-            .map(|r| json!({ "mnemonic": r.mnemonic, "version_count": r.version_count }))
+            // `did_id` names *which* DID the slot holds: a DID deleted and
+            // re-created at the same mnemonic has a new identifier, so the
+            // control plane re-pushes on an identity mismatch even when the
+            // version counts happen to agree.
+            .map(|r| {
+                json!({
+                    "mnemonic": r.mnemonic,
+                    "did_id": r.did_id,
+                    "version_count": r.version_count,
+                })
+            })
             .collect(),
         Err(e) => {
             warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
@@ -335,44 +345,24 @@ async fn verify_update(
     public_url: Option<&str>,
 ) -> Result<VerifiedUpdate, crate::error::AppError> {
     use crate::error::AppError;
-    use did_hosting_common::did_ops::verify_log_extends;
 
     verify_binding(store, update, synced_method, public_url).await?;
 
-    let held = dids_ks
-        .get_raw(content_log_key(&update.mnemonic))
-        .await?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    let held_record: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await?;
-    let slot_mark: Option<SlotHighWater> =
-        dids_ks.get(high_water_slot_key(&update.mnemonic)).await?;
-    for method in held_record
-        .as_ref()
-        .map(|r| r.method.as_str())
-        .into_iter()
-        .chain(slot_mark.as_ref().map(|m| m.method.as_str()))
-    {
-        if method != synced_method {
+    match synced_method {
+        "webvh" => did_hosting_common::did_ops::verify_did_log_and_witness_proofs(
+            &update.log_content,
+            update.witness_content.as_deref(),
+        )
+        .map_err(AppError::Validation)?,
+        #[cfg(feature = "method-webs")]
+        _ => {}
+        #[cfg(not(feature = "method-webs"))]
+        _ => {
             return Err(AppError::Validation(format!(
-                "slot {} holds a {method} DID; refusing to replace it with a {synced_method} log",
-                update.mnemonic
+                "this server cannot verify {synced_method} logs"
             )));
         }
     }
-
-    let identity = match synced_method {
-        "webvh" => {
-            did_hosting_common::did_ops::verify_did_log_and_witness_proofs(
-                &update.log_content,
-                update.witness_content.as_deref(),
-            )
-            .map_err(AppError::Validation)?;
-            webvh_scid(&update.did_id).ok_or_else(|| {
-                AppError::Validation(format!("{} is not a did:webvh identifier", update.did_id))
-            })?
-        }
-        _ => update.did_id.clone(),
-    };
 
     #[cfg(feature = "method-webs")]
     let webs_document = if synced_method == "webs" {
@@ -389,47 +379,134 @@ async fn verify_update(
     } else {
         None
     };
-    #[cfg(not(feature = "method-webs"))]
-    if synced_method != "webvh" {
-        return Err(AppError::Validation(format!(
-            "this server cannot verify {synced_method} logs"
-        )));
-    }
 
-    // Every history of this same DID the edge has served.
-    let high_water = dids_ks
-        .get_raw(high_water_identity_key(&identity))
-        .await?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    let held_identity = held_record
-        .as_ref()
-        .and_then(|r| r.did_id.as_deref())
-        .map(|id| match synced_method {
-            "webvh" => webvh_scid(id).unwrap_or_default(),
-            _ => id.to_string(),
-        });
-    let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
-    for previous in [same_did_held, high_water].into_iter().flatten() {
-        match synced_method {
-            "webvh" => verify_log_extends(Some(&previous), &update.log_content)
-                .map_err(AppError::Validation)?,
-            #[cfg(feature = "method-webs")]
-            _ => did_hosting_common::method::webs::Webs::verify_continuation(
-                &update.did_id,
-                previous.as_bytes(),
-                update.log_content.as_bytes(),
-            )
-            .map_err(|e| AppError::Validation(e.to_string()))?,
-            #[cfg(not(feature = "method-webs"))]
-            _ => unreachable!("refused above"),
-        }
-    }
+    let identity = verify_history(
+        dids_ks,
+        &update.mnemonic,
+        &update.did_id,
+        &update.log_content,
+        synced_method,
+    )
+    .await?;
 
     Ok(VerifiedUpdate {
         identity,
         #[cfg(feature = "method-webs")]
         webs_document,
     })
+}
+
+/// Step 3 of [`verify_update`], shared with every other path that replaces a
+/// hosted log (the edge's own `PUT /api/dids/{mnemonic}`): the log must
+/// strictly extend every history this edge has served for the same DID — the
+/// log it holds now, and the high-water log kept for the DID's identity, which
+/// a delete does not clear — and a slot never changes method. Returns the DID's
+/// identity (SCID for webvh, the identifier for webs), to be recorded with
+/// [`stage_high_water`] in the same batch that stores the log.
+///
+/// The log itself must already have been verified (chain, proofs).
+pub(crate) async fn verify_history(
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    did_id: &str,
+    log_content: &str,
+    method: &str,
+) -> Result<String, crate::error::AppError> {
+    use crate::error::AppError;
+    use did_hosting_common::did_ops::verify_log_extends;
+
+    let held = dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let held_record: Option<DidRecord> = dids_ks.get(did_key(mnemonic)).await?;
+    let slot_mark: Option<SlotHighWater> = dids_ks.get(high_water_slot_key(mnemonic)).await?;
+    for held_method in held_record
+        .as_ref()
+        .map(|r| r.method.as_str())
+        .into_iter()
+        .chain(slot_mark.as_ref().map(|m| m.method.as_str()))
+    {
+        if held_method != method {
+            return Err(AppError::Validation(format!(
+                "slot {mnemonic} holds a {held_method} DID; refusing to replace it with a {method} log"
+            )));
+        }
+    }
+
+    let identity = match method {
+        "webvh" => webvh_scid(did_id).ok_or_else(|| {
+            AppError::Validation(format!("{did_id} is not a did:webvh identifier"))
+        })?,
+        _ => did_id.to_string(),
+    };
+
+    // Every history of this same DID the edge has served.
+    let high_water = dids_ks
+        .get_raw(high_water_identity_key(&identity))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let held_identity =
+        held_record
+            .as_ref()
+            .and_then(|r| r.did_id.as_deref())
+            .map(|id| match method {
+                "webvh" => webvh_scid(id).unwrap_or_default(),
+                _ => id.to_string(),
+            });
+    let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
+    for previous in [same_did_held, high_water].into_iter().flatten() {
+        match method {
+            "webvh" => {
+                verify_log_extends(Some(&previous), log_content).map_err(AppError::Validation)?
+            }
+            #[cfg(feature = "method-webs")]
+            _ => did_hosting_common::method::webs::Webs::verify_continuation(
+                did_id,
+                previous.as_bytes(),
+                log_content.as_bytes(),
+            )
+            .map_err(|e| AppError::Validation(e.to_string()))?,
+            #[cfg(not(feature = "method-webs"))]
+            _ => {
+                return Err(AppError::Validation(format!(
+                    "this server cannot verify {method} logs"
+                )));
+            }
+        }
+    }
+    Ok(identity)
+}
+
+/// Record, in `batch`, the high-water marks for a log that passed
+/// [`verify_history`]: the furthest history served for the DID's `identity`,
+/// and which DID (and method) the slot last held. Never removed — not by
+/// `sync/delete`, not by a domain purge, not by a local delete — so a delete
+/// followed by a re-publish cannot roll either back.
+pub(crate) fn stage_high_water(
+    batch: &mut crate::store::WriteBatch,
+    dids_ks: &KeyspaceHandle,
+    identity: &str,
+    mnemonic: &str,
+    did_id: &str,
+    method: &str,
+    log_content: &str,
+) -> Result<(), crate::error::AppError> {
+    batch.insert_raw(
+        dids_ks,
+        high_water_identity_key(identity),
+        log_content.as_bytes().to_vec(),
+    );
+    batch.insert(
+        dids_ks,
+        high_water_slot_key(mnemonic),
+        &SlotHighWater {
+            identity: identity.to_string(),
+            did_id: did_id.to_string(),
+            method: method.to_string(),
+        },
+    )?;
+    Ok(())
 }
 
 /// The SCID of a `did:webvh:{scid}:…` identifier.
@@ -670,21 +747,15 @@ pub async fn apply_single_update(
         );
     }
     // High-water marks: the furthest history this edge has served for this DID
-    // and for this slot. Never removed — not by `sync/delete`, not by a domain
-    // purge — so a delete followed by a re-sync cannot roll either back.
-    batch.insert_raw(
+    // and for this slot (see `stage_high_water`).
+    stage_high_water(
+        &mut batch,
         dids_ks,
-        high_water_identity_key(&verified.identity),
-        update.log_content.as_bytes().to_vec(),
-    );
-    batch.insert(
-        dids_ks,
-        high_water_slot_key(&update.mnemonic),
-        &SlotHighWater {
-            identity: verified.identity.clone(),
-            did_id: update.did_id.clone(),
-            method: synced_method.to_string(),
-        },
+        &verified.identity,
+        &update.mnemonic,
+        &update.did_id,
+        synced_method,
+        &update.log_content,
     )?;
     batch.commit().await?;
 

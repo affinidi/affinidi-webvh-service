@@ -222,7 +222,14 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   (`signing::require_signing_identity`, called by both `server::run` and the
   daemon's `build_control`); the dispatch path also refuses at request time.
 - **Only a human approver's decision is `assertionMethod`.** Everything a
-  service signs, approval *requests* included, is `authentication`.
+  service signs, approval *requests* included, is `authentication`. Decisions
+  (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
+  — `assertionMethod` purpose *and* relationship, deactivation check — never
+  the bare `ProofVerifier::verify`.
+- **An edge never answers a document that failed `verify_control_plane`** —
+  no signed refusal (it would settle an op the control plane never sent), no
+  unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
+  reported retryable so the control plane keeps the op queued.
 - **Outbound privileged documents are signed** (`build_signed_request`, signed
   at send time so retries stay fresh). A new control↔edge op needs both halves.
 - **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
@@ -232,8 +239,13 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
   the cache TTL is `DID_CACHE_TTL_SECS`.
 - **Edges verify what they serve.** A synced webvh log must pass the chain
-  check and strictly extend the held log (`verify_log_extends`); a deactivated
-  DID takes no further entries.
+  check and strictly extend the held log and the per-DID high-water mark
+  (`control_register::verify_history`); a deactivated DID takes no further
+  entries. Every path that replaces an edge's log — sync *and* the edge's own
+  REST publish — goes through `verify_history` and `stage_high_water`.
+- **Re-sync compares identity, not just versions** (`server_push::
+  edge_is_current`), and domain assign/unassign/purge are re-sent on each
+  registration until acknowledged (`server_push::resend_domain_intents`).
 
 ## Cross-service networking & integration discipline
 

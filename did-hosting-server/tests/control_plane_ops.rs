@@ -26,7 +26,7 @@ use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_common::server::trust_tasks::send::{build_request, build_signed_request};
 use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
-use did_hosting_server::messaging::dispatch_control_plane_op;
+use did_hosting_server::messaging::{ControlPlaneReply, dispatch_control_plane_op};
 use did_hosting_server::server::AppState;
 use serde_json::{Value, json};
 
@@ -90,6 +90,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         dids_ks: store.keyspace(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
+        trust_tasks_verifier: None,
         secrets_resolver: None,
         identity: None,
         didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -199,6 +200,7 @@ async fn apply(
     dispatch_control_plane_op(state, sender.as_deref(), doc, &verifier())
         .await
         .expect("a control-plane op produces a reply")
+        .into_document()
 }
 
 fn is_error(reply: &trust_tasks_rs::TrustTask<Value>) -> bool {
@@ -354,6 +356,9 @@ async fn an_unsigned_sync_update_is_refused() {
     let reply = dispatch_control_plane_op(&state, Some(&control_did), doc, &verifier())
         .await
         .unwrap();
+    let ControlPlaneReply::Unverified(reply) = reply else {
+        panic!("an unsigned document must not verify: {reply:?}");
+    };
     assert!(is_error(&reply));
     assert_eq!(reply.payload["code"], "proofRequired");
     assert!(stored(&state, "mallory").await.is_none(), "nothing applied");
@@ -377,6 +382,9 @@ async fn a_document_signed_by_another_peer_is_refused_whatever_the_transport_rep
     let reply = dispatch_control_plane_op(&state, Some(&control_did), doc, &verifier())
         .await
         .unwrap();
+    let ControlPlaneReply::Unverified(reply) = reply else {
+        panic!("another peer's document must not verify: {reply:?}");
+    };
     assert!(is_error(&reply), "{reply:?}");
     assert!(stored(&state, "mallory").await.is_none(), "nothing applied");
 }
@@ -800,4 +808,156 @@ async fn a_new_did_may_reuse_a_deleted_slot() {
     )
     .await;
     assert!(!is_error(&r), "{r:?}");
+}
+
+/// A document that did not verify as the control plane's gets no reply at all
+/// — not a signed refusal (which would settle an op the control plane never
+/// sent) and not an unsigned one.
+#[tokio::test]
+async fn an_unverified_document_gets_no_reply() {
+    use did_hosting_common::server::identity::ServiceIdentity;
+
+    let (mut state, _dir) = make_state().await;
+    let (edge, edge_key) = signer(92);
+    let mut cfg = (*state.config).clone();
+    cfg.server_did = Some(edge.clone());
+    state.config = Arc::new(cfg);
+    state.identity = Some(
+        ServiceIdentity::from_signing_secret(&edge, edge_key)
+            .await
+            .unwrap(),
+    );
+    state.trust_tasks_verifier = Some(Arc::new(verifier()));
+    let (control_did, control_key) = control();
+    let attacker = signer(66);
+    let (did_id, log) = valid_did_log("mallory").await;
+
+    // Signed by another peer, reported as the control plane.
+    let forged = build_signed_request(
+        MSG_SYNC_UPDATE,
+        &attacker.0,
+        &edge,
+        update_body("mallory", &did_id, &log),
+        &attacker.1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        did_hosting_server::messaging::dispatch_inbound_document(
+            &state,
+            Some(&control_did),
+            forged
+        )
+        .await
+        .is_none(),
+        "a forged op is dropped silently"
+    );
+    // A ping from a stranger is not answered either.
+    let ping = build_signed_request(
+        did_hosting_common::didcomm_types::MSG_HEALTH_PING,
+        &attacker.0,
+        &edge,
+        json!({}),
+        &attacker.1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        did_hosting_server::messaging::dispatch_inbound_document(&state, Some(&attacker.0), ping)
+            .await
+            .is_none(),
+        "a stranger's ping is not answered"
+    );
+
+    // The genuine control plane's op still gets its signed ack.
+    let genuine = build_signed_request(
+        MSG_SYNC_UPDATE,
+        &control_did,
+        &edge,
+        update_body("mallory", &did_id, &log),
+        &control_key,
+    )
+    .await
+    .unwrap();
+    let reply = did_hosting_server::messaging::dispatch_inbound_document(
+        &state,
+        Some(&control_did),
+        genuine,
+    )
+    .await
+    .expect("the control plane's op is answered");
+    assert_eq!(reply["type"], MSG_SYNC_UPDATE_ACK);
+    assert!(reply.get("proof").is_some(), "{reply}");
+}
+
+fn admin() -> did_hosting_server::auth::AuthClaims {
+    did_hosting_server::auth::AuthClaims {
+        did: "did:key:admin".into(),
+        role: did_hosting_server::acl::Role::Admin,
+        session_id: String::new(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".into()],
+        acr: "aal1".into(),
+    }
+}
+
+/// The edge's own `PUT /api/dids/{mnemonic}` is held to the same history rule
+/// as a sync: it cannot roll a DID back, and after a delete it cannot bring
+/// back a history older than the one the edge last served.
+#[tokio::test]
+async fn a_rest_publish_cannot_roll_back_the_served_history() {
+    use did_hosting_server::did_ops::{create_did, publish_did};
+
+    let (state, _dir) = make_state().await;
+    let (mut webvh, key) = new_log("alice").await;
+    let v1 = jsonl(&webvh);
+    let id = did_id(&v1);
+    append(&mut webvh, &key, 1).await;
+    let v2 = jsonl(&webvh);
+    append(&mut webvh, &key, 0).await;
+    let v3 = jsonl(&webvh);
+
+    let synced = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    assert!(!is_error(&synced), "{synced:?}");
+
+    // Rollback over the held log.
+    let err = publish_did(&admin(), &state, "alice", &v1)
+        .await
+        .err()
+        .expect("a rollback is refused");
+    assert!(err.to_string().contains("not an extension"), "{err}");
+
+    // Delete, re-create the slot, and try the older history again.
+    let del = apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({"mnemonic": "alice"})).await,
+    )
+    .await;
+    assert!(!is_error(&del), "{del:?}");
+    create_did(&admin(), &state, Some("alice"))
+        .await
+        .expect("slot re-created");
+    let err = publish_did(&admin(), &state, "alice", &v1)
+        .await
+        .err()
+        .expect("the high-water mark survives the delete");
+    assert!(err.to_string().contains("not an extension"), "{err}");
+
+    // A strict extension is fine, and becomes the new high-water mark.
+    publish_did(&admin(), &state, "alice", &v3)
+        .await
+        .expect("an extension is published");
+    let back = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    assert!(
+        is_error(&back),
+        "a sync cannot undo the REST publish: {back:?}"
+    );
 }

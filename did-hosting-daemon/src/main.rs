@@ -1283,6 +1283,7 @@ async fn build_server(
         acl_ks,
         dids_ks,
         config: Arc::new(server_config),
+        trust_tasks_verifier: did_hosting_server::messaging::build_verifier(did_resolver.as_ref()),
         did_resolver,
         secrets_resolver,
         identity,
