@@ -70,16 +70,13 @@ pub struct VerifiedControlPlane {
 }
 
 /// Build the proof verifier this server checks control-plane documents with,
-/// over its DID resolver. Built once, at startup, and kept in
-/// [`AppState::trust_tasks_verifier`]: the verifier remembers DID-status
-/// verdicts for the DID cache TTL and rate-limits forced re-resolutions, and a
-/// verifier built per message would remember nothing and limit nothing.
+/// over its DID resolver: the workspace's one construction,
+/// [`did_hosting_common::server::trust_tasks::build_verifier`]. Built once, at
+/// startup, and kept in [`AppState::trust_tasks_verifier`].
 pub fn build_verifier(
     did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
 ) -> Option<std::sync::Arc<TransportBoundVerifier>> {
-    did_resolver
-        .cloned()
-        .map(|client| std::sync::Arc::new(TransportBoundVerifier::with_did_cache(client)))
+    did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
 /// The shared proof verifier (see [`build_verifier`]). `None` when no resolver

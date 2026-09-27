@@ -71,6 +71,9 @@ vault-secrets = ["server-core", "dep:vaultrs"]
 k8s-secrets = ["server-core", "dep:kube", "dep:k8s-openapi"]
 setup-wizard = ["server-core", "dep:dialoguer"]
 passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
+# Test-only seams (e.g. seeding a verifier's deactivation verdicts). Enabled
+# only from dev-dependencies; never compiled into a release.
+test-support = ["server-core"]
 
 [dependencies]
 affinidi-tdk = { workspace = true }

@@ -3234,6 +3234,7 @@ dependencies = [
 name = "did-hosting-daemon"
 version = "0.8.3"
 dependencies = [
+ "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm-service",
  "affinidi-tdk",
  "axum",
@@ -3253,7 +3254,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "trust-tasks-proof",
+ "trust-tasks-rs",
  "vta-sdk",
  "webvh-watcher",
  "webvh-witness",

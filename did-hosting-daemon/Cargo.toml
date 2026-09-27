@@ -119,11 +119,9 @@ did-hosting-server = { version = "0.8", path = "../did-hosting-server", default-
 webvh-witness = { version = "0.8", path = "../webvh-witness", default-features = false }
 webvh-watcher = { version = "0.8", path = "../webvh-watcher", default-features = false }
 did-hosting-control = { version = "0.8", path = "../did-hosting-control", default-features = false }
-# Trust Tasks proof verifier — daemon's `build_control` constructs
-# `AppState.trust_tasks_verifier` directly, so it needs the type to
-# be visible. Kept aligned with the workspace pin in case did-hosting-control
-# ever drops the dep.
-trust-tasks-proof = { workspace = true }
+# Names the DID cache client handed to the shared Trust Tasks verifier
+# constructor (`did_hosting_common::server::trust_tasks::build_verifier`).
+affinidi-did-resolver-cache-sdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk = { workspace = true }
 axum = "0.8"
@@ -143,3 +141,7 @@ vta-sdk = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-support` seeds the verifier's deactivation verdicts in the daemon's
+# verifier tests; dev-only, so never part of a release build.
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
+trust-tasks-rs = { workspace = true }
