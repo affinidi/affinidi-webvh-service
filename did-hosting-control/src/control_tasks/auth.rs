@@ -578,69 +578,51 @@ pub(crate) async fn invite_list(
     typed(json!({ "invites": invites }), "invite list response")
 }
 
-/// The request type for `auth/passkey/enroll/invite/update/0.1`.
-///
-/// The generated payload for this task cannot carry a role change: the
-/// schema's `oneOf` (a role alone, or `expiresAt`, or `extendBy`) narrows the
-/// role branch to an empty enum, so no role update would ever parse. This is
-/// the same members under the same Type URI, closed the same way; the `oneOf`
-/// is checked in the handler, and the response is still the generated type.
-pub(crate) mod invite_update_v0_1 {
-    use trust_tasks_rs::specs::auth::passkey::enroll::invite::update::v0_1 as generated;
-
-    pub(crate) use generated::ERROR_CODES;
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    #[serde(deny_unknown_fields, rename_all = "camelCase")]
-    pub(crate) struct Payload {
-        pub invite_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub role: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub extend_by: Option<std::num::NonZeroU64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub ext: Option<serde_json::Map<String, serde_json::Value>>,
-    }
-
-    impl trust_tasks_rs::Payload for Payload {
-        const TYPE_URI: &'static str = <generated::Payload as trust_tasks_rs::Payload>::TYPE_URI;
-        const IS_PROOF_REQUIRED: bool = true;
-        const IS_ISSUED_AT_REQUIRED: bool = true;
-        const IS_RECIPIENT_REQUIRED: bool = true;
-        const PAYLOAD_SCHEMA: Option<&'static str> =
-            <generated::Payload as trust_tasks_rs::Payload>::PAYLOAD_SCHEMA;
-    }
-
-    impl trust_tasks_rs::RequestPayload for Payload {
-        type Response = generated::Response;
-    }
-}
-
 /// `auth/passkey/enroll/invite/update/0.1`: change an outstanding invite's
 /// role or expiry, by `inviteId`. Admin.
+///
+/// The generated `Payload` (trust-tasks 0.24+) is a permissive struct — every
+/// member but `inviteId` is `Option` — because the schema's `oneOf` (a role
+/// alone with no expiry change, or `expiresAt` XOR `extendBy`, each with an
+/// optional role alongside it) has no Rust type shape that enforces it the
+/// way `deny_unknown_fields` enforces `additionalProperties: false`. Struct
+/// shape alone would accept `{inviteId}` alone (a silent no-op) or
+/// `{inviteId, expiresAt, extendBy}` together (two conflicting expiry
+/// changes). So this handler re-validates the raw payload against the
+/// spec's schema before acting, and refuses with the framework's
+/// `malformedRequest` — the same code `Dispatcher::dispatch_or_reject` would
+/// have produced for a shape violation, had the schema been representable
+/// as one — when it does not conform.
 pub(crate) async fn invite_update(
     cx: &Cx<'_>,
-    p: invite_update_v0_1::Payload,
+    p: invite_update::v0_1::Payload,
 ) -> Result<invite_update::v0_1::Response, TaskError> {
     use invite_update::v0_1::error_codes;
+    use trust_tasks_rs::validate::ValidatedPayload;
 
     let auth = cx.admin().await?;
-    let changes = [
-        p.role.is_some(),
-        p.expires_at.is_some(),
-        p.extend_by.is_some(),
-    ]
-    .iter()
-    .filter(|c| **c)
-    .count();
-    if changes != 1 || p.invite_id.is_empty() || p.invite_id.chars().count() > 128 {
+
+    // Re-serialize the typed (already `deny_unknown_fields`-checked) payload
+    // and validate it against `PAYLOAD_SCHEMA`. This recovers exactly the
+    // `oneOf` the codegen's Rust type cannot express: at least one of
+    // `role`/`expiresAt`/`extendBy` present, and `expiresAt`/`extendBy`
+    // mutually exclusive.
+    let raw = serde_json::to_value(&p).map_err(|e| {
+        TaskError::Standard(
+            trust_tasks_rs::StandardCode::InternalError,
+            format!("invite update payload did not re-serialize: {e}"),
+        )
+    })?;
+    if let Err(e) = invite_update::v0_1::Payload::validate_value(&raw) {
         return Err(TaskError::Standard(
             trust_tasks_rs::StandardCode::MalformedRequest,
-            "an update changes exactly one of role, expiresAt or extendBy".into(),
+            format!(
+                "an update changes at least one of role, expiresAt or extendBy, \
+                 and expiresAt/extendBy are mutually exclusive: {e}"
+            ),
         ));
     }
+
     let existing = passkey_store::find_enrollment_by_invite_id(&cx.state.sessions_ks, &p.invite_id)
         .await?
         .ok_or_else(|| TaskError::Declared(error_codes::NOT_FOUND, "no such invite".into()))?;
@@ -661,7 +643,7 @@ pub(crate) async fn invite_update(
     let item = passkey_routes::update_invite_by_id(
         &cx.state.sessions_ks,
         &p.invite_id,
-        p.role.clone(),
+        p.role.as_deref().cloned(),
         p.expires_at.map(|t| t.timestamp().max(0) as u64),
         p.extend_by.map(|s| s.get()),
     )
@@ -670,7 +652,7 @@ pub(crate) async fn invite_update(
         AppError::NotFound(m) => TaskError::Declared(error_codes::NOT_FOUND, m),
         other => other.into(),
     })?;
-    info!(caller = %auth.did, invite_id = %p.invite_id, "invite updated");
+    info!(caller = %auth.did, invite_id = %p.invite_id.as_str(), "invite updated");
     typed(
         json!({ "invite": summary(&item) }),
         "invite update response",

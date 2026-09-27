@@ -159,7 +159,7 @@ control_tasks! {
     tt_login::finish::v0_2 => SessionKey, auth::login_finish;
     // Enrolment invites, addressed by inviteId.
     tt_invite::list::v0_1 => Authentication, auth::invite_list;
-    auth::invite_update_v0_1 => Authentication, auth::invite_update;
+    tt_invite::update::v0_1 => Authentication, auth::invite_update;
     tt_invite::revoke::v0_1 => Authentication, auth::invite_revoke;
 }
 
