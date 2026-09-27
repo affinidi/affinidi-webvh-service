@@ -302,17 +302,12 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    // Trust Tasks verifier — share the configured DIDCacheClient so
-    // `did:web` / `did:webvh` verificationMethod lookups hit the same
-    // cache the DIDComm path already populates. We clone the client
-    // (DIDCacheClient is cheap to clone — internal Arcs) rather than
-    // sharing one Arc, because did_resolver remains `Option<DIDCacheClient>`
-    // for callers that prefer the un-Arc'd form.
-    let trust_tasks_verifier = did_resolver.clone().map(|client| {
-        Arc::new(
-            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_did_cache(client),
-        )
-    });
+    // Trust Tasks verifier — over the configured DID cache, so `did:web` /
+    // `did:webvh` verificationMethod lookups hit the same cache the DIDComm
+    // path already populates. Built by the one shared constructor (the daemon
+    // builds its control-plane verifier with it too).
+    let trust_tasks_verifier =
+        did_hosting_common::server::trust_tasks::build_verifier(did_resolver.as_ref());
 
     let pending_challenges =
         crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);

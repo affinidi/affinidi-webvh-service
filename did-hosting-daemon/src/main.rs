@@ -1369,6 +1369,18 @@ async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     Ok(router)
 }
 
+/// The control plane's Trust Task proof verifier, built exactly as the
+/// standalone control plane builds it (the shared
+/// [`did_hosting_common::server::trust_tasks::build_verifier`]): a deactivated
+/// `did:webvh` signer is refused, an unreachable signer is retryable, and a
+/// proof failing against a cached DID document is retried once, rate-limited,
+/// against a fresh one.
+fn control_verifier(
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) -> Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>> {
+    did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
+}
+
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -1416,20 +1428,9 @@ async fn build_control(
         }
     });
 
-    // Trust Tasks verifier — share the configured DID cache so
-    // `did:web` / `did:webvh` proof verifications hit the same cache
-    // the DIDComm path populates. Mirrors `did_hosting_control::server::build`
-    // for daemon-mode parity (see CLAUDE.md §What the daemon mirrors).
-    let trust_tasks_verifier = did_resolver.clone().map(|client| {
-        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
-            Arc::new(client),
-        ));
-        Arc::new(
-            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
-                resolver,
-            ),
-        )
-    });
+    // Trust Tasks verifier — the control plane's, built by the same shared
+    // constructor (see CLAUDE.md §What the daemon mirrors).
+    let trust_tasks_verifier = control_verifier(did_resolver.as_ref());
 
     let pending_challenges =
         did_hosting_control::pending_challenges::PendingChallengeTracker::for_auth_config(
@@ -2424,4 +2425,215 @@ async fn run_identity_rotate_keys(
     eprintln!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod verifier_tests {
+    //! The daemon's control-plane verifier behaves like the standalone control
+    //! plane's: status, rotation and reachability of the signer's DID.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use affinidi_did_resolver_cache_sdk::{
+        AsyncResolver, DIDCacheClient, MethodName, Resolution, ResolverError,
+        config::DIDCacheConfigBuilder,
+    };
+    use affinidi_tdk::did_common::{DID, Document};
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use did_hosting_common::server::trust_tasks::{
+        BoundError, TransportBoundVerifier, send::build_request, sign_document, verify_sender_bound,
+    };
+    use serde_json::{Value, json};
+    use trust_tasks_rs::{RejectReason, TrustTask};
+
+    use super::control_verifier;
+
+    const TYPE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
+    const ME: &str = "did:example:daemon";
+
+    async fn cache() -> DIDCacheClient {
+        DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap()
+    }
+
+    fn verifier(client: &DIDCacheClient) -> Arc<TransportBoundVerifier> {
+        control_verifier(Some(client)).expect("a resolver is configured")
+    }
+
+    fn key(seed: u8, did: &str) -> Secret {
+        let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+        secret.id = format!("{did}#key-1");
+        secret
+    }
+
+    fn document(did: &str, signer: &Secret) -> Document {
+        serde_json::from_value(json!({
+            "id": did,
+            "verificationMethod": [{
+                "id": format!("{did}#key-1"),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": signer.get_public_keymultibase().unwrap(),
+            }],
+            "authentication": [format!("{did}#key-1")],
+        }))
+        .unwrap()
+    }
+
+    async fn signed(did: &str, signer: &Secret) -> TrustTask<Value> {
+        let doc = build_request(TYPE, did, ME, json!({ "mnemonic": "alice" })).unwrap();
+        sign_document(&doc, signer).await.unwrap()
+    }
+
+    async fn check(
+        doc: &TrustTask<Value>,
+        did: &str,
+        verifier: &TransportBoundVerifier,
+    ) -> Result<String, BoundError> {
+        verify_sender_bound(doc, Some(did), Some(did), ME, verifier).await
+    }
+
+    /// A deactivated `did:webvh` signer is refused even though its last
+    /// document, still served from cache, lists the key; the same document
+    /// from a live DID verifies. The refusal is final: it spends no forced
+    /// re-resolution (which would evict the recorded verdict and the cached
+    /// document, and fail here as unreachable).
+    #[tokio::test]
+    async fn a_deactivated_webvh_signer_is_refused() {
+        let mut client = cache().await;
+        let live = "did:webvh:QmLive:live.example";
+        let dead = "did:webvh:QmDead:dead.example";
+        let (live_key, dead_key) = (key(1, live), key(2, dead));
+        client
+            .add_did_document(live, document(live, &live_key))
+            .await;
+        client
+            .add_did_document(dead, document(dead, &dead_key))
+            .await;
+        let v = verifier(&client);
+        v.record_deactivation_verdict(live, false);
+        v.record_deactivation_verdict(dead, true);
+
+        check(&signed(live, &live_key).await, live, &v)
+            .await
+            .expect("a live signer verifies");
+        let err = check(&signed(dead, &dead_key).await, dead, &v)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deactivated"), "{err}");
+        assert!(!err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::ProofInvalid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Serves `did:web` documents listing whichever key `keys` holds, and
+    /// counts resolutions.
+    struct RotatingResolver {
+        keys: Arc<std::sync::Mutex<Secret>>,
+        resolutions: Arc<AtomicUsize>,
+    }
+
+    impl AsyncResolver for RotatingResolver {
+        fn name(&self) -> &str {
+            "RotatingResolver"
+        }
+
+        fn resolve<'a>(
+            &'a self,
+            did: &'a DID,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resolution> + Send + 'a>> {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            let current = self.keys.lock().unwrap().clone();
+            let did = did.to_string();
+            Box::pin(async move { Some(Ok(document(&did, &current))) })
+        }
+    }
+
+    /// A signer that rotated its key after its document was cached verifies
+    /// after exactly one fresh resolution.
+    #[tokio::test]
+    async fn a_rotated_key_verifies_after_one_refresh() {
+        let did = "did:web:rotated.example";
+        let (old_key, new_key) = (key(3, did), key(4, did));
+        let keys = Arc::new(std::sync::Mutex::new(old_key));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let mut client = cache().await;
+        client.set_resolver(
+            MethodName::Web,
+            Box::new(RotatingResolver {
+                keys: keys.clone(),
+                resolutions: resolutions.clone(),
+            }),
+        );
+        // The pre-rotation document is cached.
+        client.resolve(did).await.unwrap();
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        let v = verifier(&client);
+
+        *keys.lock().unwrap() = new_key.clone();
+        let proven = check(&signed(did, &new_key).await, did, &v)
+            .await
+            .expect("verifies after one refresh");
+        assert_eq!(proven, did);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2, "exactly one refresh");
+    }
+
+    /// A signer whose DID cannot be resolved is `unavailable` — retryable —
+    /// not a bad proof.
+    #[tokio::test]
+    async fn an_unreachable_signer_is_unavailable() {
+        struct Unreachable;
+        impl AsyncResolver for Unreachable {
+            fn name(&self) -> &str {
+                "Unreachable"
+            }
+            fn resolve<'a>(
+                &'a self,
+                _did: &'a DID,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resolution> + Send + 'a>>
+            {
+                Box::pin(async {
+                    Some(Err(ResolverError::ResolutionFailed(
+                        "connection refused".to_string(),
+                    )))
+                })
+            }
+        }
+
+        let did = "did:web:unreachable.example";
+        let signer = key(5, did);
+        let mut client = cache().await;
+        client.set_resolver(MethodName::Web, Box::new(Unreachable));
+        let err = check(&signed(did, &signer).await, did, &verifier(&client))
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The `did:webvh` flavour: a document served from cache whose DID log
+    /// cannot be read leaves deactivation unestablished, which is retryable.
+    #[tokio::test]
+    async fn a_webvh_signer_with_an_unreadable_log_is_unavailable() {
+        // `.invalid` never resolves (RFC 6761).
+        let did = "did:webvh:QmGone:gone.invalid";
+        let signer = key(6, did);
+        let mut client = cache().await;
+        client.add_did_document(did, document(did, &signer)).await;
+        let err = check(&signed(did, &signer).await, did, &verifier(&client))
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
+            "{err:?}"
+        );
+    }
 }

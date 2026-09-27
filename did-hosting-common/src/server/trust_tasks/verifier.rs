@@ -111,6 +111,10 @@ pub const APPROVAL_PROOF_PURPOSE: &str = "assertionMethod";
 /// (not by anything wrong with the proof). See [`is_unreachable`].
 const UNREACHABLE: &str = "signer DID unreachable";
 
+/// Marks a refusal because the signer deactivated its DID. Final: a
+/// `did:webvh` deactivation cannot be undone, so no fresh resolution is tried.
+const DEACTIVATED: &str = "is deactivated; its keys are no longer valid";
+
 /// Most DIDs whose deactivation verdict is remembered at once.
 const DEACTIVATION_CACHE_CAPACITY: usize = 4096;
 
@@ -297,9 +301,7 @@ impl ProofPurposeResolver for SignerKeyResolver {
             && let Some(deactivation) = &self.deactivation
             && deactivation.is_deactivated(did, resolved.cache_hit).await?
         {
-            return Err(DataIntegrityError::Resolver(format!(
-                "{did} is deactivated; its keys are no longer valid"
-            )));
+            return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
         }
         Ok(key)
     }
@@ -317,6 +319,32 @@ pub struct TransportBoundVerifier {
     refresher: Option<Arc<dyn StaleKeyRefresh>>,
     options: VerifyOptions,
     delegate: Option<SessionDelegate>,
+    /// The deactivation verdicts `signer_resolver` consults; `None` for a
+    /// caller-supplied resolver. Reachable only through the `test-support`
+    /// seam [`Self::record_deactivation_verdict`].
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    deactivation: Option<Arc<DeactivationCache>>,
+}
+
+/// Build the proof verifier a service checks inbound Trust Task documents with,
+/// over its configured DID cache: [`TransportBoundVerifier::with_did_cache`],
+/// so a deactivated `did:webvh` signer is refused, an unreachable signer is
+/// reported as retryable ([`is_unreachable`]), and a proof failing against a
+/// cached document is retried once against a fresh one (at most one forced
+/// re-resolution per DID per [`FORCED_REFRESH_INTERVAL`]).
+///
+/// Every service (control plane, server, and each half of the daemon) builds
+/// its verifier here, so they cannot drift apart. Build it once, at startup,
+/// and keep it: the verifier remembers DID-status verdicts for the DID cache
+/// TTL and rate-limits forced re-resolutions, and a verifier built per message
+/// would remember nothing and limit nothing. `None` when no resolver is
+/// configured, in which case no signed document can be accepted.
+pub fn build_verifier(
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<Arc<TransportBoundVerifier>> {
+    did_resolver
+        .cloned()
+        .map(|client| Arc::new(TransportBoundVerifier::with_did_cache(client)))
 }
 
 impl TransportBoundVerifier {
@@ -332,6 +360,7 @@ impl TransportBoundVerifier {
             refresher: None,
             options: VerifyOptions::default(),
             delegate: None,
+            deactivation: None,
         }
     }
 
@@ -351,10 +380,24 @@ impl TransportBoundVerifier {
             refresher: Some(Arc::new(CacheRefresher {
                 client,
                 limiter: RefreshLimiter::default(),
-                deactivation,
+                deactivation: deactivation.clone(),
             })),
             options: VerifyOptions::default(),
             delegate: None,
+            deactivation: Some(deactivation),
+        }
+    }
+
+    /// Record whether `did` is deactivated, as if its DID log had just been
+    /// read, so a test can exercise the deactivation refusal of a
+    /// [`Self::with_did_cache`] verifier without serving a `did:webvh` log.
+    /// The verdict is used only while the DID cache serves its document from
+    /// cache, exactly like one read from the log. A no-op on a verifier over a
+    /// caller-supplied resolver.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_deactivation_verdict(&self, did: &str, deactivated: bool) {
+        if let Some(deactivation) = &self.deactivation {
+            deactivation.remember(did, deactivated);
         }
     }
 
@@ -445,10 +488,12 @@ impl TransportBoundVerifier {
         };
         // Only a failure that a different document could cure is worth a fresh
         // resolution: the key was not found, or the key found did not match.
-        let retryable = matches!(
-            err,
-            DataIntegrityError::Resolver(_) | DataIntegrityError::InvalidSignature { .. }
-        );
+        // A deactivated signer is final — deactivation cannot be undone.
+        let retryable = match &err {
+            DataIntegrityError::Resolver(m) => !m.contains(DEACTIVATED),
+            DataIntegrityError::InvalidSignature { .. } => true,
+            _ => false,
+        };
         let vm = doc
             .proof
             .as_ref()

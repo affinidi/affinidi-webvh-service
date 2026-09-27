@@ -145,6 +145,24 @@ the challenge → signed-authenticate trust tasks instead of a bare
 envelopes) must sign with `proofPurpose: authentication`. REST API callers (bearer JWT from the signed REST sign-in)
 are unaffected.
 
+### Fixed — the daemon's control plane checks signer status like the standalone one
+
+The daemon's embedded control plane built its Trust Task proof verifier over the
+bare DID cache resolver, so — unlike the standalone control plane — it did not
+refuse a proof from a deactivated `did:webvh` signer, did not retry once against
+a fresh DID document after the signer rotated its key, and reported an
+unreachable signer as a bad proof rather than as retryable (`unavailable`). The
+relationship check (`authentication` / `assertionMethod`) already ran.
+
+Every service now builds its verifier with one shared constructor,
+`did_hosting_common::server::trust_tasks::build_verifier`: the standalone
+control plane, the standalone server, and both halves of the daemon. A
+deactivated signer's refusal is now final everywhere: it no longer spends the
+signer's forced re-resolution, since a `did:webvh` deactivation cannot be
+undone. The
+`did-hosting-common` `test-support` feature (dev-only) exposes
+`TransportBoundVerifier::record_deactivation_verdict` for tests.
+
 ### Changed — the 0.27 messaging line, with the authcrypt sender bound to its key
 
 - **Moved to the 0.27 messaging line.** `affinidi-tdk` 0.16 → **0.17**,
