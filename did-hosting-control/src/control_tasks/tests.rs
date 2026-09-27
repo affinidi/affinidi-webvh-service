@@ -1230,13 +1230,40 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
         "admin"
     );
 
-    // Two changes at once is not one update.
+    // A role change may ride alongside an expiry change — the spec's `oneOf`
+    // only pits `expiresAt` against `extendBy`, not either against `role`.
     let reply = call(
         &state,
         Via::Tsp,
         &admin,
         &t("auth/passkey/enroll/invite/update/0.1"),
-        json!({ "inviteId": created.invite_id, "role": "owner", "extendBy": 60 }),
+        json!({ "inviteId": created.invite_id, "role": "owner", "expiresAt": "2099-01-01T00:00:00Z" }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(
+        ok(&reply, &t("auth/passkey/enroll/invite/update/0.1"))["invite"]["role"],
+        "owner"
+    );
+
+    // Nothing to change is not an update.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/update/0.1"),
+        json!({ "inviteId": created.invite_id }),
+    )
+    .await;
+    assert_eq!(code(&reply), "malformedRequest", "{reply}");
+
+    // `expiresAt` and `extendBy` are mutually exclusive.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/update/0.1"),
+        json!({ "inviteId": created.invite_id, "expiresAt": "2099-01-01T00:00:00Z", "extendBy": 60 }),
     )
     .await;
     assert_eq!(code(&reply), "malformedRequest", "{reply}");

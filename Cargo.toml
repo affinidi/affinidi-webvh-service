@@ -71,7 +71,7 @@ affinidi-tdk = "0.18"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
 # to the `TspHandler`. Without it the handler is stored but never invoked
 # (the crate compiles TSP support out).
-affinidi-messaging-didcomm-service = { version = "0.13", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.14", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15.9"
 affinidi-secrets-resolver = "0.5"
@@ -296,11 +296,60 @@ vta-sdk = { version = "0.54", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Trust Tasks (DTGWG, ToIP). On crates.io at 0.23.x. The whole family
+# Trust Tasks (DTGWG, ToIP). On crates.io at 0.24.x. The whole family
 # moves as one workspace event — `trust-tasks-rs`'s core types cross the
 # public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
 # mixing majors does not type-check. Bump all five together, and in
 # lockstep with verifiable-trust-infrastructure.
+#
+# What 0.23 → 0.24 changed for us: 0.24 fixes the codegen defect behind
+# `auth/passkey/enroll/invite/update/0.1`'s local workaround type (issue
+# #218) — the schema's `oneOf` (role alone, or `expiresAt` XOR `extendBy`)
+# used to narrow the generated `Payload`'s role branch to an empty enum, so
+# the handler carried its own hand-rolled copy of the payload shape instead.
+# 0.24's generated `Payload` is now permissive (every member but `inviteId`
+# is `Option`) rather than encoding the `oneOf` at all, so
+# `did-hosting-control::control_tasks::auth::invite_update` now uses the
+# generated type directly and re-validates the raw payload against
+# `PAYLOAD_SCHEMA` at runtime (`trust_tasks_rs::validate::ValidatedPayload`)
+# before acting — see the `validate` feature note on `did-hosting-control`'s
+# own `trust-tasks-rs` declaration. That also corrected a bug the workaround
+# had: the old hand-written check demanded *exactly* one of
+# role/expiresAt/extendBy, so a `role` + `expiresAt` update was wrongly
+# refused; the real schema allows a role change alongside either expiry
+# change, only `expiresAt` and `extendBy` are mutually exclusive.
+#
+# `-https` / `-didcomm` / `-proof` / `-tsp` 0.24.0 are each byte-identical in
+# `src/` to their 0.23.6 — the move re-pins them onto `trust-tasks-rs
+# "^0.24"` and nothing else, so `trust-task-error/0.5` is unchanged and no
+# other source here moved.
+#
+# Of the four transitive carriers the paragraph below tracks,
+# `affinidi-messaging-didcomm-service` needed a bump to keep one copy of
+# `trust-tasks-rs`: 0.13 pinned `trust-tasks-rs "0.23"`; 0.14 moved to
+# `"0.24"`, and pulled `affinidi-messaging-sdk` 0.29 with it — bumped our own
+# direct pin (0.28.1 → 0.29.0, below) to match rather than carry a second
+# copy of that too. `vta-sdk` 0.54.0 and `vti-common` 0.27.0 are unchanged
+# (already the newest release of each) and still pin `trust-tasks-tsp` /
+# `trust-tasks-capability-client` at their old 0.23.x majors — neither has
+# republished for 0.24 yet, so `cargo tree -d -e normal,build,dev` still
+# lists a second, older copy of `trust-tasks-rs` (and of
+# `trust-tasks-tsp`/`trust-tasks-capability-client` themselves) pulled in
+# behind them, via `affinidi-tdk`'s still-0.28.1 `affinidi-messaging-sdk`.
+# Tolerated, the same way past dev-graph splits were: neither vta-sdk's nor
+# vti-common's use of those crates is `pub`, so it never reaches a type we
+# consume. Re-run `cargo tree -d -e normal,build,dev` after the next
+# vta-sdk/vti-common bump to check whether it has closed.
+#
+# The dev-graph half needed test-mediator `0.11` → `0.12` (mediator 0.31,
+# affinidi-messaging-sdk 0.29, affinidi-tdk 0.19) to keep pace with the
+# affinidi-messaging-sdk bump above; test-mediator itself still pins
+# `trust-tasks-rs`/`trust-tasks-proof` at 0.23 (its own subgraph, never
+# crossed — it is a fixture we only spawn).
+#
+# The compiler-invisible check was run again and still passes: the
+# framework emits `trust-task-error/0.5`, unchanged since 0.9, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
 #
 # **"All five" undersells it.** `trust-tasks-rs` also arrives transitively
 # through four crates we pin by caret, and every one of them has to reach a
@@ -472,25 +521,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 #
 # The acl/* typed payloads we consume directly are still v0_1 in 0.4.x.
 #
-# `validate` feature: deliberately NOT enabled. The codegen-emitted
-# `Payload` structs use `#[serde(deny_unknown_fields)]` plus newtype
-# wrappers that reject `minLength: 1` / regex constraints at
-# deserialise time, so we get framework-shape + payload-shape
-# validation as a side-effect of typed dispatch. The `validate`
-# feature would add JSON-Schema-driven validation against the
-# embedded schema string per request — redundant for our consumers
-# and a compile-time tax we don't pay. Re-enable if a future spec
-# carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.23.5", default-features = false }
-trust-tasks-https = { version = "0.23.5", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.23.5", default-features = false }
-trust-tasks-proof = { version = "0.23.5", default-features = false, features = ["affinidi"] }
+# `validate` feature: NOT enabled here (default workspace dependency stays
+# off it). The codegen-emitted `Payload` structs use
+# `#[serde(deny_unknown_fields)]` plus newtype wrappers that reject
+# `minLength: 1` / regex constraints at deserialise time, so we get
+# framework-shape + payload-shape validation as a side-effect of typed
+# dispatch for almost every spec — the `validate` feature's JSON-Schema-driven
+# validation against the embedded schema string would be redundant for those
+# and a compile-time tax we don't pay.
+#
+# `did-hosting-control` overrides this to `features = ["validate"]` on its own
+# `trust-tasks-rs` declaration (Cargo unifies the feature across the graph,
+# so every crate is built with it once one turns it on): its
+# `auth/passkey/enroll/invite/update/0.1` handler needs runtime schema
+# validation for a `oneOf` (role alone, or `expiresAt` XOR `extendBy`) that
+# 0.24's now-permissive generated `Payload` — every member `Option` — cannot
+# express as a Rust type shape. That is a per-handler decision, not the
+# framework-wide `PayloadPolicy` this workspace still runs
+# `AcceptUnvalidated` (see `run_pipeline` in did-hosting-common): re-enable
+# more broadly only if a future spec's constraints are similarly
+# unrepresentable and need the same treatment.
+trust-tasks-rs = { version = "0.24.0", default-features = false }
+trust-tasks-https = { version = "0.24.0", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.24.0", default-features = false }
+trust-tasks-proof = { version = "0.24.0", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.23.5", default-features = false }
+trust-tasks-tsp = { version = "0.24.0", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
@@ -503,7 +563,7 @@ affinidi-tsp = { version = "0.2", features = ["messaging-core"] }
 # already resolves (transitively via vta-sdk / -didcomm-service), pinned here so
 # a crate can name it. Moves with that family; `tsp` feature exposes the store
 # surface.
-affinidi-messaging-sdk = { version = "0.28.1", features = ["tsp"] }
+affinidi-messaging-sdk = { version = "0.29.0", features = ["tsp"] }
 # Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
 # resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
 # Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the

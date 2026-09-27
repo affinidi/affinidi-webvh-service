@@ -96,7 +96,17 @@ vti-common = { version = "0.27", default-features = false }
 async-trait = "0.1"
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
-trust-tasks-rs = { workspace = true }
+#
+# `validate`: the workspace-wide framework validation policy is still
+# `AcceptUnvalidated` (see the note beside `run_pipeline` in
+# did-hosting-common) — this is not that. `auth/passkey/enroll/invite/update`
+# is the one payload whose spec `oneOf` (role alone, or `expiresAt` XOR
+# `extendBy`) has no Rust type shape, so its handler re-validates the raw
+# payload against the embedded schema directly via
+# `trust_tasks_rs::validate::ValidatedPayload`. That call needs this feature
+# compiled in; every other handler still relies on `deny_unknown_fields` +
+# newtypes alone.
+trust-tasks-rs = { workspace = true, features = ["validate"] }
 trust-tasks-https = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 trust-tasks-proof = { workspace = true }
@@ -174,9 +184,10 @@ tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
-# `validate` so the table's tests can check every reply against the schema its
-# type names (`trust_tasks_rs::validate`). Test-only: the shipped build relies
-# on the generated types' `deny_unknown_fields` and newtypes instead.
+# `validate` is also on in `[dependencies]` above now (the invite/update
+# handler uses it at runtime); kept explicit here too so the table's tests
+# can check any reply against the schema its type names
+# (`trust_tasks_rs::validate`) without depending on that staying true.
 trust-tasks-rs = { workspace = true, features = ["validate"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -188,7 +199,7 @@ base64 = { workspace = true }
 # with the trust-tasks family in the root manifest — `^0.2` against a shipped
 # graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
 # dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
-affinidi-messaging-test-mediator = "0.11.1"
+affinidi-messaging-test-mediator = "0.12.0"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.
