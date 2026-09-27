@@ -317,6 +317,25 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
         super::schema::ServiceKind::Daemon
     ) {
         crate::did::add_webvh_hosting_service(&mut doc, public_url);
+        // The daemon's embedded control plane always serves Trust Tasks at
+        // `<origin>/api/trust-tasks`, regardless of the DID's own path — the
+        // control plane merges at the daemon's origin root, unprefixed by the
+        // DID's `did_path`, so the base is the bare origin, not `public_url`
+        // (which carries the path here). A VTA-provisioned DID gets
+        // `TrustTaskHTTPS` for free from the vta-sdk template; this
+        // self-managed DID is built locally, so it needs the explicit sibling
+        // of the VTI-18 fix above (the endpoint is the Trust-Task *base*, not
+        // the request URL — see `add_trust_task_https_service`).
+        let (origin, _) = split_origin_and_did_path(public_url);
+        let trust_task_base = format!("{origin}/api");
+        if crate::did::is_https_or_loopback(&trust_task_base) {
+            crate::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+        } else {
+            eprintln!(
+                "  [setup-recipe] public_url is not HTTPS (and not loopback) — skipping \
+                 the TrustTaskHTTPS service"
+            );
+        }
     }
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
         .await

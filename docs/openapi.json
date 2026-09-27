@@ -217,10 +217,17 @@
         "tags": [
           "system"
         ],
+        "summary": "Unauthenticated liveness probe; degraded while the service's own DID is\nnot being served.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "Service is up; returns status + version",
+            "description": "Service is up and its own DID (if configured) resolves locally; returns status + version",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "Service is up but its own DID isn't being served locally",
             "content": {
               "application/json": {}
             }
