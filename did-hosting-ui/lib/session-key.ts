@@ -6,9 +6,9 @@
  * Lifecycle:
  *  1. `generateSessionKeypair()` on login — fresh Ed25519 keypair per
  *     login via WebCrypto. Public key is encoded as an Ed25519
- *     multikey (`z6Mk…`) and sent to the server during
- *     `/api/auth/passkey/login/finish`; the server stores it on the
- *     session record. The keypair is mirrored to IndexedDB so it
+ *     multikey (`z6Mk…`); the key signs the `auth/passkey/login/finish`
+ *     document as its own `did:key`, and the server binds the new
+ *     session to it. The keypair is mirrored to IndexedDB so it
  *     survives full page reloads while the JWT is still valid.
  *  2. `signEnvelope()` on every REQUIRED-spec request — implements the
  *     `eddsa-jcs-2022` cryptosuite (W3C VC Data Integrity ed25519):

@@ -35,7 +35,7 @@ export default function Dashboard() {
   const [aclEntries, setAclEntries] = useState<AclEntry[] | null>(null);
   // Per-domain stats are derived from the DID list. We only fetch it
   // when a specific domain is pinned — "All domains" reads the cheap
-  // server-wide aggregate from /api/stats instead.
+  // server-wide aggregate from `stats/get` instead.
   const [dids, setDids] = useState<DidRecord[] | null>(null);
 
   const isDaemon = config?.deploymentMode === "daemon";
@@ -83,9 +83,8 @@ export default function Dashboard() {
   }, [api]);
 
   useEffect(() => {
-    // `/api/config` and the server-wide aggregate are both admin-only on the
-    // backend now (config carries operator topology; parity with
-    // `/api/services/overview`). Skip them for non-admins — `config` only drives
+    // `server/config` and the server-wide `stats/get` are both admin-only on
+    // the backend (config carries operator topology). Skip them for non-admins — `config` only drives
     // the daemon/standalone label, and the usage chart / aggregate section is
     // hidden whenever `serverStats` is null.
     if (!isAuthenticated || !isAdmin) return;
@@ -109,7 +108,7 @@ export default function Dashboard() {
 
   // When a domain is pinned, pull the DID list so we can derive
   // per-domain stat cards. "All domains" doesn't need this — the
-  // server-wide aggregate from /api/stats is shown instead.
+  // server-wide aggregate from `stats/get` is shown instead.
   useEffect(() => {
     if (!isAuthenticated || currentDomain === null) {
       setDids(null);
@@ -238,7 +237,7 @@ export default function Dashboard() {
           modes: a daemon still has its own DID document advertising
           DIDComm / TSP, and the operator needs to see that here. The
           panel itself decides how much registry detail to show.
-          Admin-only — `GET /api/services/overview` is behind AdminAuth,
+          Admin-only — `server/config` and `registry/list` need an admin,
           so rendering this for anyone else just yields a 403 error box. */}
       {isAdmin && (
         <View style={styles.section}>

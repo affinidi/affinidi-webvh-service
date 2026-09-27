@@ -99,7 +99,7 @@ export default function SettingsPage() {
   const { isAuthenticated, role } = useAuth();
   // Settings shows control-plane topology (mediator/VTA DIDs, listen address,
   // registry, TTLs) — the same operator data the backend now gates behind
-  // AdminAuth (`GET /api/config`, `/api/identity/generations`). Non-admins get
+  // an admin (`server/config`, `identity/list`). Non-admins get
   // an explanatory panel instead of a blank page or a 403 error box.
   const isAdmin = role === "admin";
 
@@ -297,11 +297,11 @@ export default function SettingsPage() {
                 )}
               </View>
 
-              <Row label="Key agreement" value={g.key_agreement_kid} />
-              {g.expires_at !== null && (
+              <Row label="Key agreement" value={g.keyAgreementKid} />
+              {g.expiresAt !== null && (
                 <Row
                   label="Honoured for"
-                  value={remainingLabel(g.expires_at, now)}
+                  value={remainingLabel(g.expiresAt, now)}
                 />
               )}
             </View>
@@ -319,10 +319,11 @@ export default function SettingsPage() {
           spells out the consequences when they do. */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
-        <Row label="Listen Address" value={config.listenAddress} />
+        {config.listenAddress && (
+          <Row label="Listen Address" value={config.listenAddress} />
+        )}
         <StatusRow label="DIDComm" enabled={config.didcommEnabled} />
         <StatusRow label="TSP" enabled={config.tspEnabled} />
-        <StatusRow label="REST API" enabled={config.restApiEnabled} />
         <View style={styles.row}>
           <Text style={styles.label}>Advertised services</Text>
           {config.advertisedServices ? (
@@ -332,7 +333,7 @@ export default function SettingsPage() {
             />
           ) : (
             <Text style={styles.advertisedUnknown}>
-              {config.controlDid ? "DID not resolved" : "no control DID"}
+              DID not resolved
             </Text>
           )}
         </View>
@@ -353,47 +354,52 @@ export default function SettingsPage() {
         </View>
       )}
 
-      {/* Service Registry */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Service Registry</Text>
-        <Row
-          label="Health Check Interval"
-          value={formatDuration(config.healthCheckIntervalSecs)}
-        />
-        <Row
-          label="Configured Instances"
-          value={config.configuredInstances.toString()}
-        />
-      </View>
+      {/* The sections below are optional in `server/config`: each renders
+          only when the control plane states it. */}
+      {config.registry && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Service Registry</Text>
+          <Row
+            label="Health Check Interval"
+            value={formatDuration(config.registry.healthCheckIntervalSecs)}
+          />
+          <Row
+            label="Configured Instances"
+            value={config.registry.configuredInstances.toString()}
+          />
+        </View>
+      )}
 
-      {/* Authentication */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Authentication</Text>
-        <Row
-          label="Sign Out After Inactivity"
-          value={formatDuration(config.adminIdleTimeout)}
-        />
-        <Row
-          label="Access Token Expiry"
-          value={formatDuration(config.accessTokenExpiry)}
-        />
-        <Row
-          label="Refresh Token Expiry"
-          value={formatDuration(config.refreshTokenExpiry)}
-        />
-        <Row
-          label="Passkey Enrollment TTL"
-          value={formatDuration(config.passkeyEnrollmentTtl)}
-        />
-      </View>
+      {config.sessions && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Authentication</Text>
+          <Row
+            label="Sign Out After Inactivity"
+            value={formatDuration(config.sessions.adminIdleTimeout)}
+          />
+          <Row
+            label="Access Token Expiry"
+            value={formatDuration(config.sessions.accessTokenExpiry)}
+          />
+          <Row
+            label="Refresh Token Expiry"
+            value={formatDuration(config.sessions.refreshTokenExpiry)}
+          />
+          <Row
+            label="Passkey Enrollment TTL"
+            value={formatDuration(config.sessions.passkeyEnrollmentTtl)}
+          />
+        </View>
+      )}
 
-      {/* Storage & Logging */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Storage & Logging</Text>
-        <Row label="Data Directory" value={config.dataDir} />
-        <Row label="Log Level" value={config.logLevel} />
-        <Row label="Log Format" value={config.logFormat} />
-      </View>
+      {(config.dataDir || config.logLevel || config.logFormat) && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Storage & Logging</Text>
+          {config.dataDir && <Row label="Data Directory" value={config.dataDir} />}
+          {config.logLevel && <Row label="Log Level" value={config.logLevel} />}
+          {config.logFormat && <Row label="Log Format" value={config.logFormat} />}
+        </View>
+      )}
     </ScrollView>
   );
 }

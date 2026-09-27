@@ -18,7 +18,7 @@
  * asynchronous and will reflect on a refresh.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -40,19 +40,6 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
 import { useAgentNames } from "../../lib/use-agent-names";
 
-/**
- * The DID an instance actually recorded, or `null`.
- *
- * Deliberately not the `instanceId`-derived fallback the card displays: that
- * is a reconstruction for the eye, not an identifier the control plane could
- * resolve, so sending it to the name lookup would be asking about a DID that
- * does not exist.
- */
-function instanceDid(instance: ServiceInstance): string | null {
-  return typeof instance.metadata?.did === "string"
-    ? instance.metadata.did
-    : null;
-}
 import type { ServiceInstance } from "../../lib/api";
 
 export default function ServersScreen() {
@@ -68,7 +55,7 @@ export default function ServersScreen() {
 
   // One lookup for every instance on the page, refreshed when the set of
   // recorded DIDs changes rather than on every render.
-  const agentNames = useAgentNames(instances.map(instanceDid));
+  const agentNames = useAgentNames(instances.map((i) => i.did));
 
   const refresh = useCallback(async () => {
     if (!isAuthenticated) {
@@ -228,7 +215,7 @@ export default function ServersScreen() {
           renderItem={({ item }) => (
             <ServerCard
               instance={item}
-              agentNames={agentNames[instanceDid(item) ?? ""] ?? []}
+              agentNames={agentNames[item.did] ?? []}
               busyKey={busy}
               onAssign={() => setPickerFor(item)}
               onUnassign={(d) => handleUnassign(item, d)}
@@ -268,10 +255,7 @@ function ServerCard({
   onUnassign: (domain: string) => void;
   onPurge: (domain: string) => void;
 }) {
-  const did = useMemo(
-    () => instanceDid(instance) ?? instance.instanceId.replace(/_/g, ":"),
-    [instance],
-  );
+  const did = instance.did;
 
   const healthColor =
     instance.status === "active"
@@ -328,9 +312,7 @@ function ServerCard({
               />
             ) : (
               <Text style={styles.servicesUnknown}>
-                {instance.metadata?.did
-                  ? "DID not resolved yet"
-                  : "no DID recorded"}
+                DID not resolved yet
               </Text>
             )}
           </View>
@@ -339,7 +321,6 @@ function ServerCard({
             lastInboundAt={instance.lastInboundAt}
             lastOutboundTransport={instance.lastOutboundTransport}
             lastOutboundAt={instance.lastOutboundAt}
-            trustTaskCapable={instance.trustTaskCapable}
           />
           <View style={styles.metaRow}>
             {instance.enabledMethods.map((m) => (
@@ -347,9 +328,6 @@ function ServerCard({
                 <Text style={styles.methodBadgeText}>did:{m}</Text>
               </View>
             ))}
-            <Text style={styles.metaText}>
-              proto {instance.protocolVersion}
-            </Text>
           </View>
         </View>
         <Pressable
@@ -589,11 +567,6 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
     marginTop: spacing.sm,
     flexWrap: "wrap",
-  },
-  metaText: {
-    fontFamily: fonts.regular,
-    fontSize: 11,
-    color: colors.textTertiary,
   },
   methodBadge: {
     backgroundColor: colors.tealMuted,
