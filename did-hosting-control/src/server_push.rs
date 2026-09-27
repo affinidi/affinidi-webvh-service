@@ -161,13 +161,9 @@ pub fn sync_all_dids_to_server(
                 _ => None,
             };
 
-            let body = json!({
-                "mnemonic": record.mnemonic,
-                "did_id": record.did_id.unwrap_or_default(),
-                "log_content": log_content,
-                "witness_content": witness_content,
-                "version_count": record.version_count,
-            });
+            let Some(body) = sync_update_body(&record, log_content, witness_content) else {
+                continue;
+            };
 
             if !batch {
                 if let Err(e) =
@@ -250,6 +246,40 @@ pub fn sync_all_dids_to_server(
     });
 }
 
+/// The `webvh/sync/update/0.2` payload for a stored slot — the same shape each
+/// entry of a `webvh/sync/batch/0.1` carries — or `None` when the slot has no
+/// published DID to replicate.
+///
+/// The slot's `disabled` state travels with its content, so disabling a DID
+/// reaches every replica through the same channel as publishing one. The body
+/// is read back through the generated type before it is queued: it leaves
+/// only in the shape its schema allows.
+pub(crate) fn sync_update_body(
+    record: &DidRecord,
+    log_content: String,
+    witness_content: Option<String>,
+) -> Option<serde_json::Value> {
+    use trust_tasks_rs::specs::webvh::sync::update::v0_2 as update;
+
+    let did_id = record.did_id.clone().filter(|d| !d.is_empty())?;
+    let body = serde_json::to_value(did_hosting_common::DidSyncUpdate {
+        mnemonic: record.mnemonic.clone(),
+        did_id,
+        log_content,
+        witness_content: witness_content.filter(|w| !w.is_empty()),
+        version_count: record.version_count,
+        disabled: record.disabled,
+    })
+    .ok()?;
+    match serde_json::from_value::<update::Payload>(body.clone()) {
+        Ok(_) => Some(body),
+        Err(e) => {
+            warn!(mnemonic = %record.mnemonic, error = %e, "DID sync: slot does not fit sync/update/0.2; not sending it");
+            None
+        }
+    }
+}
+
 /// Max DIDs per `MSG_SYNC_BATCH`, and max serialized bytes. Bounds message size
 /// (each DID carries a full `did.jsonl`) while collapsing the resync burst.
 const SYNC_BATCH_MAX_COUNT: usize = 50;
@@ -308,13 +338,9 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             _ => None,
         };
 
-        let body = json!({
-            "mnemonic": mnemonic,
-            "did_id": record.did_id.unwrap_or_default(),
-            "log_content": log_content,
-            "witness_content": witness_content,
-            "version_count": record.version_count,
-        });
+        let Some(body) = sync_update_body(&record, log_content, witness_content) else {
+            return;
+        };
 
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,

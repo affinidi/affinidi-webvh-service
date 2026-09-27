@@ -132,10 +132,14 @@ pub const MSG_HEALTH_PONG: &str =
 // Sync (control plane ↔ server)
 // ---------------------------------------------------------------------------
 
-pub const MSG_SYNC_UPDATE: &str = "https://trusttasks.org/spec/webvh/sync/update/0.1";
-pub const MSG_SYNC_UPDATE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/update/0.1#response";
-pub const MSG_SYNC_DELETE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
-pub const MSG_SYNC_DELETE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1#response";
+/// `webvh/sync/update/0.2`: camelCase exactly as schema'd, proof REQUIRED, and
+/// the slot's `disabled` state travels with its content. 0.1 is not sent or
+/// accepted: its implementations put snake_case members on the wire that its
+/// own schema never allowed.
+pub const MSG_SYNC_UPDATE: &str = "https://trusttasks.org/spec/webvh/sync/update/0.2";
+pub const MSG_SYNC_UPDATE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/update/0.2#response";
+pub const MSG_SYNC_DELETE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.2";
+pub const MSG_SYNC_DELETE_ACK: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.2#response";
 
 /// A batch of DID sync updates in a single message — `body.updates` is an array
 /// of the same shape [`MSG_SYNC_UPDATE`] carries. Collapses a bulk resync into

@@ -1585,6 +1585,87 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
     Ok(entries)
 }
 
+/// One page of the slots a caller may see, with each slot's lifetime resolve
+/// count, and the size of the whole (unpaged) set.
+///
+/// The scoping rule is [`list_dids`]'s: an admin sees every slot, or one
+/// owner's when `requested_owner` names one; anyone else sees their own.
+/// Refusing a non-admin who names another owner is the caller's job — this
+/// never widens a non-admin's view, whatever it is passed. `domain` (already
+/// canonical) keeps only slots hosted under it. Ordered by mnemonic so paging
+/// is stable.
+pub async fn list_dids_page(
+    auth: &AuthClaims,
+    state: &AppState,
+    requested_owner: Option<&str>,
+    domain: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<(Vec<(DidRecord, u64)>, u64), AppError> {
+    use crate::acl::Role;
+
+    const MAX_LIST_LIMIT: usize = 1000;
+
+    let mut records: Vec<DidRecord> = if auth.role == Role::Admin && requested_owner.is_none() {
+        let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+        raw.into_iter()
+            .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
+            .collect()
+    } else {
+        let target_owner = if auth.role == Role::Admin {
+            requested_owner.unwrap_or(&auth.did)
+        } else {
+            &auth.did
+        };
+        let raw = state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{target_owner}:"))
+            .await?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (_key, value) in raw {
+            let mnemonic = String::from_utf8(value)
+                .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+            // The owner index is a string prefix, and DIDs contain colons, so a
+            // DID that prefixes another shares rows with it: re-check the owner.
+            if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await?
+                && record.owner == target_owner
+            {
+                out.push(record);
+            }
+        }
+        out
+    };
+    if let Some(domain) = domain {
+        records.retain(|r| {
+            let host = if r.domain.is_empty() {
+                r.did_id
+                    .as_deref()
+                    .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+                    .unwrap_or_default()
+            } else {
+                r.domain.clone()
+            };
+            host.eq_ignore_ascii_case(domain)
+        });
+    }
+    records.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
+
+    let total = records.len() as u64;
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let mut page = Vec::with_capacity(limit.min(records.len()));
+    for record in records.into_iter().skip(offset).take(limit) {
+        let stats: did_hosting_common::DidStats = state
+            .stats_ks
+            .get(format!("stats:{}", record.mnemonic))
+            .await?
+            .unwrap_or_default();
+        page.push((record, stats.total_resolves));
+    }
+    info!(did = %auth.did, total, returned = page.len(), "DID page listed on control plane");
+    Ok((page, total))
+}
+
 /// Cross-check a caller's explicit domain against the slot's own domain.
 ///
 /// A DID's host IS its domain, so a caller naming a different one is either
@@ -1593,7 +1674,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
 /// `record.domain`; falls back to the DID's embedded host for legacy slots
 /// that never had a domain resolved, and passes when neither is known (an
 /// un-domained install has nothing to compare against).
-fn ensure_slot_domain_matches(
+pub(crate) fn ensure_slot_domain_matches(
     record: &DidRecord,
     request_domain: Option<&str>,
 ) -> Result<(), AppError> {

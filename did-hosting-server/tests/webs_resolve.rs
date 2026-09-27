@@ -344,6 +344,7 @@ async fn a_webs_did_syncs_from_the_control_plane_and_then_serves() {
         log_content: String::from_utf8(KERI.to_vec()).unwrap(),
         witness_content: None,
         version_count: 1,
+        disabled: false,
     };
     did_hosting_server::control_register::apply_single_update(
         &state.dids_ks,
@@ -399,6 +400,7 @@ async fn an_edge_refuses_a_tampered_webs_log_from_the_control_plane() {
         log_content: String::from_utf8(tampered).unwrap(),
         witness_content: None,
         version_count: 1,
+        disabled: false,
     };
     did_hosting_server::control_register::apply_single_update(
         &state.dids_ks,
@@ -422,6 +424,7 @@ async fn an_edge_refuses_to_rewind_a_webs_log_even_after_a_delete() {
         log_content: String::from_utf8(log.to_vec()).unwrap(),
         witness_content: None,
         version_count: 1,
+        disabled: false,
     };
     let apply = |u: did_hosting_common::DidSyncUpdate| {
         let state = state.clone();

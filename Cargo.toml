@@ -481,16 +481,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # embedded schema string per request — redundant for our consumers
 # and a compile-time tax we don't pay. Re-enable if a future spec
 # carries constraints not captured by the codegen newtypes.
-trust-tasks-rs = { version = "0.23.3", default-features = false }
-trust-tasks-https = { version = "0.23.3", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.23.3", default-features = false }
-trust-tasks-proof = { version = "0.23.3", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.23.5", default-features = false }
+trust-tasks-https = { version = "0.23.5", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.23.5", default-features = false }
+trust-tasks-proof = { version = "0.23.5", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.23.3", default-features = false }
+trust-tasks-tsp = { version = "0.23.5", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the

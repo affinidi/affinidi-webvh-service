@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Changed (breaking) — DID management answers in its specifications' shapes
+
+The control plane's DID-management Trust Tasks are served from one table keyed
+on the generated `trust-tasks` 0.23.5 Type URIs (`control_tasks`), with the
+generated request and response types end to end. The hand-built `MSG_*` JSON
+bridge (`bridge_did_management` / `dispatch_did_op`) is gone.
+
+- **Every reply matches its schema.** `did/list` answers `{records, total}`
+  (paged by `limit`/`offset`, filtered by `domain`), `did/register`,
+  `did/delete`, `did/change-owner` and the `agent-name/*` verbs answer
+  `{record}` in the shared `DidRecord` shape, `me/domains` answers the shared
+  `DomainEntry` shape. Host-specific members the closed schemas do not define
+  (a record's agent names; a domain's scheme, branding, witnesses, watchers,
+  quota) travel under the `vnd.affinidi.webvh` extension namespace.
+- **Errors are `trust-task-error` documents** with the code the task's
+  specification declares (`did-management/did/info:notFound`,
+  `…/change-owner:notOwner`, `did-management:unknownDomain`, …), not
+  `did/problem-report` replies, which that specification reserves for the
+  host's asynchronous reports.
+- **Requests are held to their schemas.** An unknown payload member —
+  including the snake_case aliases (`new_owner`, `did_log`) — is refused with
+  `malformedRequest`. A non-admin naming another `owner` on `did/list` is
+  refused (`did-management/did/list:forbidden`) rather than silently shown
+  their own slots; `domain` on `did/info`, `did/change-owner` and
+  `did/register` is now checked against the slot instead of dropped.
+- **Sync moves to `webvh/sync/update/0.2` and `webvh/sync/delete/0.2`.** The
+  control plane sends camelCase exactly as schema'd (0.1's implementations
+  sent snake_case its schema never allowed), and the slot's `disabled` state
+  travels with its content: a disabled DID stops resolving on every edge, and
+  resumes on an update carrying `false`. Edges read the generated types, answer
+  `applied` or `unchanged`, drop held witness proofs when an update carries
+  none, refuse under the declared `invalidLog` / `historyRewrite` /
+  `deactivated` codes, report per-entry outcomes for `webvh/sync/batch/0.1`,
+  answer `sync/delete` with `deleted` or `absent`, and remove a deleted slot's
+  agent-name index. Control planes and edges must be upgraded together.
+- **A proof that is present is verified**, on every task, including those that
+  do not require one.
+
 ### Changed (breaking) — privileged messages must carry a proof bound to their sender
 
 Every message that changes state or discloses more than public data is now

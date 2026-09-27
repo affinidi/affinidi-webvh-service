@@ -14,16 +14,13 @@ use affinidi_messaging_didcomm_service::{
     MessagePolicy, MiddlewareResult, Next, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
     middleware_fn, trust_ping_handler,
 };
-use did_hosting_common::did_ops::did_key;
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
+use did_hosting_common::server::trust_tasks::ProofRule;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::acl::check_acl;
-use crate::auth::AuthClaims;
-use crate::did_ops;
-use crate::error::AppError;
 use crate::server::AppState;
 use crate::server_push;
 
@@ -426,456 +423,20 @@ pub(crate) fn spec_did_record_json(
     // Emitted only when non-empty, matching `domain`/`didId` above: a DID with
     // no names produces a byte-identical response to before, which keeps this
     // additive for the `did-management/did/*` family that shares this shape.
+    //
+    // The shared `DidRecord` schema is closed, so the names travel under this
+    // host's extension namespace rather than as a member it does not define.
     if !record.agent_names.is_empty() {
-        rec.insert("agentNames".into(), json!(record.agent_names));
+        rec.insert(
+            "ext".into(),
+            json!({
+                did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY: {
+                    "agentNames": record.agent_names,
+                }
+            }),
+        );
     }
     Value::Object(rec)
-}
-
-/// Transport-agnostic dispatch table for the DID-management `MSG_*` Type URIs.
-///
-/// Reached only through [`bridge_did_management`], after
-/// [`dispatch_trust_task_doc`] has verified the document's proof and ACL'd its
-/// signer into `auth`. It reads only `msg.typ` and `msg.body`, so it has no view
-/// of — and places no trust in — any transport.
-pub async fn dispatch_did_op(
-    auth: &AuthClaims,
-    state: &AppState,
-    msg: &Message,
-) -> Result<(String, Value), AppError> {
-    // Phase 3 end-state: did-hosting accepts canonical Trust-Task
-    // spec URIs only. The MSG_* constants in `didcomm_types` hold the
-    // canonical spec URI values, so the dispatcher matches `msg.typ`
-    // directly without the historical `to_legacy` translation step.
-    // Unrecognised types fall through to the default arm (which emits
-    // a protocol error code).
-    match msg.typ.as_str() {
-        MSG_DID_REQUEST => {
-            // `did-management/did/check-name/0.1`. Two modes share this
-            // task (see the spec): an availability *probe* (`reserve`
-            // false/absent) that never mutates state, and a *reserve*
-            // (`reserve: true`) that atomically claims a slot. Reserve
-            // additionally supports *auto-assign*: when `path` is
-            // omitted the host generates a fresh server-side mnemonic.
-            let path = msg.body.get("path").and_then(|v| v.as_str());
-            let reserve = msg
-                .body
-                .get("reserve")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let force = msg
-                .body
-                .get("force")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            // Probe mode is read-only and MUST name a path — a path-less
-            // request is only meaningful as an auto-assign reservation.
-            if !reserve {
-                let path = path.ok_or_else(|| {
-                    AppError::Validation(
-                        "check-name without `reserve: true` requires a `path` to probe".into(),
-                    )
-                })?;
-                let probe = did_ops::check_name(state, path).await?;
-                return Ok((
-                    MSG_DID_OFFER.to_string(),
-                    json!({ "available": probe.available, "reserved": false }),
-                ));
-            }
-
-            // T34 domain resolution mirrors the REST `request_uri` handler.
-            // Same chain: explicit on the wire → caller's ACL default →
-            // system default. When resolution fails (no domains
-            // configured / no default / `Allowed([])` caller with no
-            // explicit), we proceed with `None`; publish-time backfill
-            // from `did_id` host will tag the record. This keeps the
-            // legacy behaviour of un-domained installs and pre-T18
-            // tests, while still surfacing the domain on the new record
-            // for the common case where a default exists.
-            let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
-            let acl_scope =
-                match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did)
-                    .await?
-                {
-                    Some(e) => e.domains,
-                    None => did_hosting_common::server::domain::DomainScope::All,
-                };
-            let system_default =
-                did_hosting_common::server::domain::get_default_domain(&state.store)
-                    .await
-                    .ok()
-                    .flatten();
-            let resolved_domain = did_hosting_common::server::domain::resolve_request_domain(
-                request_domain,
-                &acl_scope,
-                system_default.as_deref(),
-            )
-            .ok();
-
-            // Reserve. `path == None` → auto-assign. An explicitly-named
-            // path that is already taken (without `force`) is not an
-            // error here: the spec says return `available: false,
-            // reserved: false` and DO NOT mutate. `create_did` signals
-            // that case with `Conflict`, which we translate rather than
-            // surface as a problem report.
-            // No fan-out on force-replace: see `routes/did_manage::request_uri`.
-            match did_ops::create_did(auth, state, path, force, resolved_domain.as_deref()).await {
-                Ok(result) => {
-                    // Read the committed record back for the canonical
-                    // response fields (timestamps, owner, version).
-                    let record: did_hosting_common::did_ops::DidRecord = state
-                        .dids_ks
-                        .get(did_key(&result.mnemonic))
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::Internal("record missing after reservation".into())
-                        })?;
-                    Ok((
-                        MSG_DID_OFFER.to_string(),
-                        json!({
-                            "available": true,
-                            "reserved": true,
-                            "record": spec_did_record_json(&record, &result.did_url),
-                        }),
-                    ))
-                }
-                Err(AppError::Conflict(_)) => Ok((
-                    MSG_DID_OFFER.to_string(),
-                    json!({ "available": false, "reserved": false }),
-                )),
-                Err(e) => Err(e),
-            }
-        }
-        MSG_DID_REGISTER => {
-            // Atomic claim-and-publish — see did_ops::register_did_atomic.
-            // Body shape mirrors `DidRegisterRequest` from did-hosting-common,
-            // including T26's `did_data` + `method` extension.
-            let req: did_hosting_common::DidRegisterRequest =
-                serde_json::from_value(msg.body.clone())
-                    .map_err(|e| AppError::Validation(format!("invalid DidRegister body: {e}")))?;
-            if req.path.is_empty() {
-                return Err(AppError::Validation("missing 'path' in body".into()));
-            }
-            let (method, payload) = req.resolve().map_err(AppError::Validation)?;
-            if method != "webvh" {
-                return Err(AppError::Validation(format!(
-                    "DIDComm register is currently webvh-only; received method = '{method}'.",
-                )));
-            }
-            let did_log = std::str::from_utf8(&payload).map_err(|e| {
-                AppError::Validation(format!("webvh did_data is not valid UTF-8: {e}"))
-            })?;
-
-            let result =
-                did_ops::register_did_atomic(auth, state, &req.path, did_log, req.force, None)
-                    .await?;
-            server_push::notify_servers_did(state, result.mnemonic.clone());
-
-            let server_did = state.config.server_did.as_deref().unwrap_or_default();
-            Ok((
-                MSG_DID_REGISTER_CONFIRM.to_string(),
-                json!({
-                    "mnemonic": result.mnemonic,
-                    "did_url": result.did_url,
-                    "server_did": server_did,
-                }),
-            ))
-        }
-        MSG_WITNESS_PUBLISH => {
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            let witness = msg
-                .body
-                .get("witness")
-                .ok_or_else(|| AppError::Validation("missing 'witness' in body".into()))?;
-            let witness_str = serde_json::to_string(witness)?;
-            if witness_str.is_empty() || witness_str == "null" {
-                return Err(AppError::Validation(
-                    "witness content cannot be empty".into(),
-                ));
-            }
-
-            did_ops::upload_witness(auth, state, mnemonic, &witness_str).await?;
-
-            let base_url = state
-                .config
-                .did_hosting_url
-                .as_deref()
-                .or(state.config.public_url.as_deref())
-                .unwrap_or("http://localhost");
-            let witness_url = format!("{base_url}/{mnemonic}/did-witness.json");
-
-            server_push::notify_servers_did(state, mnemonic.to_string());
-            Ok((
-                MSG_WITNESS_CONFIRM.to_string(),
-                json!({
-                    "mnemonic": mnemonic,
-                    "witness_url": witness_url,
-                }),
-            ))
-        }
-        MSG_INFO_REQUEST => {
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            let (record, log_metadata) = did_ops::get_did_info(auth, state, mnemonic).await?;
-
-            // Get stats for this DID
-            let stats_key = format!("stats:{mnemonic}");
-            let did_stats: did_hosting_common::DidStats =
-                state.stats_ks.get(stats_key).await?.unwrap_or_default();
-
-            let log_metadata_json = log_metadata
-                .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null);
-
-            let base_url = state
-                .config
-                .did_hosting_url
-                .as_deref()
-                .or(state.config.public_url.as_deref())
-                .unwrap_or("http://localhost");
-            let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
-            Ok((
-                MSG_INFO.to_string(),
-                json!({
-                    "mnemonic": record.mnemonic,
-                    "did_id": record.did_id,
-                    "did_url": did_url,
-                    "owner": record.owner,
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                    "version_count": record.version_count,
-                    "content_size": record.content_size,
-                    "stats": {
-                        "total_resolves": did_stats.total_resolves,
-                        "total_updates": did_stats.total_updates,
-                        "last_resolved_at": did_stats.last_resolved_at,
-                        "last_updated_at": did_stats.last_updated_at,
-                    },
-                    "log_metadata": log_metadata_json,
-                }),
-            ))
-        }
-        MSG_LIST_REQUEST => {
-            let requested_owner = msg.body.get("owner").and_then(|v| v.as_str());
-            let entries = did_ops::list_dids(auth, state, requested_owner, None, None).await?;
-            let entries_json: Vec<Value> = entries
-                .into_iter()
-                .map(|e| {
-                    json!({
-                        "mnemonic": e.mnemonic,
-                        "did_id": e.did_id,
-                        "created_at": e.created_at,
-                        "updated_at": e.updated_at,
-                        "version_count": e.version_count,
-                        "total_resolves": e.total_resolves,
-                    })
-                })
-                .collect();
-            Ok((MSG_LIST.to_string(), json!({ "dids": entries_json })))
-        }
-        MSG_DELETE => {
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            let did_id = did_ops::delete_did(auth, state, mnemonic, None).await?;
-
-            server_push::notify_servers_delete(state, mnemonic.to_string());
-            Ok((
-                MSG_DELETE_CONFIRM.to_string(),
-                json!({
-                    "mnemonic": mnemonic,
-                    "did_id": did_id,
-                }),
-            ))
-        }
-        MSG_DID_CHANGE_OWNER => {
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            // Canonical wire field is `newOwner` (camelCase, per
-            // did-management/did/change-owner/0.1); `new_owner` is the
-            // legacy snake_case alias.
-            let new_owner = msg
-                .body
-                .get("newOwner")
-                .or_else(|| msg.body.get("new_owner"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'newOwner' in body".into()))?;
-            let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
-            Ok((
-                MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
-                json!({
-                    "mnemonic": record.mnemonic,
-                    "owner": record.owner,
-                    "updated_at": record.updated_at,
-                }),
-            ))
-        }
-        MSG_ME_DOMAINS => {
-            // Net-new DIDComm route: caller-scoped view of hosting
-            // domains. Shares its compute with the REST handler
-            // `GET /api/me/domains` via `fetch_me_domains_for_caller`
-            // so both transports return byte-identical payloads.
-            let resp = crate::routes::domain::fetch_me_domains_for_caller(auth, state).await?;
-            Ok((
-                did_hosting_common::did_hosting_tasks::TASK_ME_DOMAINS_RESPONSE_0_1
-                    .as_str()
-                    .to_string(),
-                serde_json::to_value(resp)?,
-            ))
-        }
-        MSG_AGENT_NAME_UPDATE | MSG_AGENT_NAME_REMOVE => {
-            // The two mutating verbs share one `{record}` response. `update`
-            // carries the declarative `state: active | parked` field
-            // (did-management/agent-name/update/0.1); `remove` stays a
-            // separate destructive task (agent-name/remove/0.1). Both carry
-            // the caller's new signed `did.jsonl` (`didData`), whose
-            // `alsoKnownAs` direction the `did_ops` engine verifies against
-            // the requested state.
-            let (response_type, record) = if msg.typ.as_str() == MSG_AGENT_NAME_REMOVE {
-                let req: crate::routes::did_manage::AgentNameRequest =
-                    serde_json::from_value(msg.body.clone()).map_err(|e| {
-                        AppError::Validation(format!("invalid agent-name request body: {e}"))
-                    })?;
-                let record = did_ops::remove_agent_name(
-                    auth,
-                    state,
-                    &req.mnemonic,
-                    &req.name,
-                    &req.did_log,
-                    req.domain.as_deref(),
-                )
-                .await?;
-                server_push::notify_servers_did(state, req.mnemonic.clone());
-                info!(
-                    did = %auth.did,
-                    mnemonic = %req.mnemonic,
-                    name = %req.name,
-                    msg_type = %msg.typ,
-                    "agent name removed via DIDComm"
-                );
-                (MSG_AGENT_NAME_REMOVE_RESPONSE, record)
-            } else {
-                let req: crate::routes::did_manage::AgentNameUpdateRequest =
-                    serde_json::from_value(msg.body.clone()).map_err(|e| {
-                        AppError::Validation(format!("invalid agent-name update body: {e}"))
-                    })?;
-                let record = did_ops::update_agent_name(
-                    auth,
-                    state,
-                    &req.mnemonic,
-                    &req.name,
-                    &req.did_data,
-                    req.domain.as_deref(),
-                    req.state,
-                )
-                .await?;
-                // Every update publishes a new DID version, so hosting
-                // servers need the fan-out the REST handler sends — without
-                // it a name bound over DIDComm would not resolve until the
-                // next full resync.
-                server_push::notify_servers_did(state, req.mnemonic.clone());
-                info!(
-                    did = %auth.did,
-                    mnemonic = %req.mnemonic,
-                    name = %req.name,
-                    state = ?req.state,
-                    "agent name updated via DIDComm"
-                );
-                (MSG_AGENT_NAME_UPDATE_RESPONSE, record)
-            };
-
-            Ok((
-                response_type.to_string(),
-                crate::routes::did_manage::agent_name_record_response(state, &record),
-            ))
-        }
-        MSG_AGENT_NAME_LIST => {
-            // Read-only. The registry — not the DID document — is the only
-            // place a *parked* name is visible, so this is what a client needs
-            // to offer "resume" for a name it disabled earlier.
-            let mnemonic = msg
-                .body
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
-            let request_domain = msg.body.get("domain").and_then(|v| v.as_str());
-            let (domain, names) =
-                did_ops::list_agent_names(auth, state, mnemonic, request_domain).await?;
-
-            let mut body = serde_json::Map::new();
-            body.insert("mnemonic".into(), json!(mnemonic));
-            // Omitted rather than empty-stringed for an un-domained legacy
-            // slot, matching how `spec_did_record_json` treats `domain`.
-            if !domain.is_empty() {
-                body.insert("domain".into(), json!(domain));
-            }
-            // Always present, unlike the record projection's conditional
-            // `agentNames`: this verb's whole answer is the list, and a client
-            // shouldn't have to distinguish "no names" from "field missing".
-            //
-            // Projected per did-management/agent-name/list/0.1: `createdAt`
-            // is an RFC3339 timestamp on the wire (the store keeps epoch
-            // seconds), matching how `spec_did_record_json` projects the
-            // record's own audit fields.
-            let rfc3339 = |secs: u64| {
-                chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
-                    .unwrap_or_default()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-            };
-            let entries: Vec<Value> = names
-                .iter()
-                .map(|e| {
-                    json!({
-                        "name": e.name,
-                        "enabled": e.enabled,
-                        "createdAt": rfc3339(e.created_at),
-                    })
-                })
-                .collect();
-            body.insert("agentNames".into(), json!(entries));
-            Ok((
-                MSG_AGENT_NAME_LIST_RESPONSE.to_string(),
-                Value::Object(body),
-            ))
-        }
-        MSG_AGENT_NAME_CHECK => {
-            // Read-only probe. Domain scoping is resolved by the same helper
-            // the REST handler uses (explicit → caller's ACL default → system
-            // default), because "is @alice free?" has no answer until the
-            // domain is pinned down.
-            let req: crate::routes::did_manage::AgentNameCheckRequest =
-                serde_json::from_value(msg.body.clone()).map_err(|e| {
-                    AppError::Validation(format!("invalid agent-name check body: {e}"))
-                })?;
-            let domain = crate::routes::did_manage::resolve_agent_name_domain(
-                auth,
-                state,
-                req.domain.as_deref(),
-            )
-            .await?;
-            let result = did_ops::check_agent_name(state, &domain, &req.name).await?;
-            Ok((
-                MSG_AGENT_NAME_CHECK_RESPONSE.to_string(),
-                serde_json::to_value(result)?,
-            ))
-        }
-        other => Err(AppError::Validation(format!(
-            "unknown message type: {other}"
-        ))),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,21 +1034,6 @@ fn require_sender(ctx: &HandlerContext) -> Result<&str, DIDCommServiceError> {
         .ok_or_else(|| DIDCommServiceError::Internal("missing sender DID".into()))
 }
 
-/// Map an internal `AppError` to its DIDComm protocol error code.
-///
-/// Thin wrapper around `AppError::didcomm_code()` — kept as a function
-/// alias so the existing call sites (and the
-/// `map_app_error_code_pinned_table` test) don't need to chase the
-/// rename. The shared implementation in `did-hosting-common::server::error`
-/// is backed by `ValidationKind` / `QuotaKind` tags rather than
-/// substring sniffing, so a wording change in any
-/// `AppError::Validation("...")` literal can no longer silently
-/// re-route the protocol code.
-#[cfg(test)]
-fn map_app_error_code(err: &AppError) -> &'static str {
-    err.didcomm_code()
-}
-
 // ---------------------------------------------------------------------------
 // Trust Tasks envelope handler (v0.7.0+)
 // ---------------------------------------------------------------------------
@@ -1831,8 +1377,8 @@ async fn route_trust_task_doc(
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
 ) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
-        DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher,
-        dispatch_inbound, verify_sender_bound,
+        DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
+        verify_sender_bound,
     };
 
     let my_vid = state
@@ -1916,7 +1462,12 @@ async fn route_trust_task_doc(
     //    of a key lookup, and never reaches the resolver or the replay cache.
     //    This is a cheap pre-filter, not the authorisation; the proof still has
     //    to bind the document to that same DID below.
-    if !is_proofless(&type_uri)
+    //
+    //    A document that carries a proof it was not required to carry is held
+    //    to the same rule: a proof that is present is verified, never ignored.
+    let rule = proof_rule(&type_uri);
+    let signed = rule != ProofRule::Optional || doc.proof.is_some();
+    if rule != ProofRule::Optional
         && !matches!(
             did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
             Ok(Some(_))
@@ -1932,9 +1483,7 @@ async fn route_trust_task_doc(
             ),
         ))));
     }
-    let principal = if is_proofless(&type_uri) {
-        sender.to_string()
-    } else {
+    let principal = if signed {
         match verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await {
             Ok(principal) => principal,
             Err(e) => {
@@ -1945,15 +1494,15 @@ async fn route_trust_task_doc(
                 ))));
             }
         }
+    } else {
+        sender.to_string()
     };
 
     // Replay gate, keyed on what the proof covers: the proven issuer and the
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
     // At its bounds the cache refuses (retryable) rather than forgetting.
-    if !is_proofless(&type_uri)
-        && let Err(e) = state.replay_cache.check(&principal, &doc.id)
-    {
+    if signed && let Err(e) = state.replay_cache.check(&principal, &doc.id) {
         warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
         let reason = match e {
             did_hosting_common::server::replay::ReplayError::Duplicate => {
@@ -2026,16 +1575,28 @@ async fn route_trust_task_doc(
         );
     }
 
-    let framework_owns = build_dispatcher()
-        .registered_uris()
-        .contains(&type_uri.as_str());
+    // The control plane's own table: DID management, agent names, domains.
+    // Every row is typed against its generated request and response.
+    //
+    // The gate above has verified every proof this document carries, on the
+    // document as it arrived. Narrowing it into a generated type can
+    // materialise a schema default the signer never wrote (`reserve: false`),
+    // which a second verification over the re-serialised document would read
+    // as tampering; so the rows do not verify again.
+    let doc = match crate::control_tasks::route(
+        state,
+        transport,
+        trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
+        doc,
+    )
+    .await
+    {
+        Ok(outcome) => return Ok(RoutedReply::Framework(Box::new(outcome))),
+        Err(unclaimed) => *unclaimed,
+    };
 
-    if !framework_owns {
-        return bridge_did_management(state, &principal, my_vid, &doc)
-            .await
-            .map(RoutedReply::Document);
-    }
-
+    // What is left is the shared framework family (ACL, discovery); a Type URI
+    // nobody serves is refused there as `unsupportedType`.
     let ctx = TrustTaskContext {
         acl_ks: &state.acl_ks,
         acl_locks: &state.acl_locks,
@@ -2050,15 +1611,24 @@ async fn route_trust_task_doc(
     )))
 }
 
-/// The only Type URIs [`dispatch_trust_task_doc`] routes without a proof.
+/// What [`dispatch_trust_task_doc`] requires of `type_uri`'s proof.
 ///
-/// Both authorise nothing: discovery lists what this service implements, and a
-/// challenge request only creates the nonce a peer must then sign to
-/// authenticate. Everything else — ACL reads included — is privileged.
-pub(crate) fn is_proofless(type_uri: &str) -> bool {
+/// The control plane's table says for its own rows. Of the rest, only
+/// discovery and asking for an auth challenge authorise nothing and must be
+/// sendable before a peer can sign anything useful; every other task — ACL
+/// reads included — is privileged, including a Type URI nobody serves, which
+/// is then refused as unsupported only once it has been proven.
+pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     use trust_tasks_rs::Payload;
-    type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
+    if let Some(rule) = crate::control_tasks::proof_rule(type_uri) {
+        return rule;
+    }
+    if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
         || type_uri == trust_tasks_rs::specs::auth::challenge::v0_1::Payload::TYPE_URI
+    {
+        return ProofRule::Optional;
+    }
+    ProofRule::Authentication
 }
 
 /// The shared proof verifier, or an error when none is configured — without
@@ -2071,116 +1641,6 @@ pub(crate) fn require_verifier(
             "no trust-task proof verifier configured (a DID resolver is required)".into(),
         )
     })
-}
-
-/// Bridge a legacy DID-management Trust Task document to the shared
-/// [`dispatch_did_op`] table.
-///
-/// The DID-management ops (`did_ops::*`) are bound to the control plane's
-/// `AppState`, so they cannot move into the crate-agnostic framework
-/// dispatcher — but `dispatch_did_op` is *already* transport-agnostic (it
-/// reads only `msg.typ` + `msg.body`). We ACL-check `sender` — the
-/// document's proven issuer, established by [`dispatch_trust_task_doc`]'s
-/// proof gate before this is reached — synthesise a `Message` from the Trust Task document (`type_uri` →
-/// `typ`, `payload` → `body`), dispatch, and wrap the `(response_type,
-/// body)` back into a Trust Task `#response` document.
-pub(crate) async fn bridge_did_management(
-    state: &AppState,
-    sender: &str,
-    my_vid: &str,
-    doc: &trust_tasks_rs::TrustTask<Value>,
-) -> Result<Value, DIDCommServiceError> {
-    let role = match check_acl(&state.acl_ks, sender).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                sender,
-                code = e.didcomm_code(),
-                "trust-task DID-management: ACL denied"
-            );
-            return tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e));
-        }
-    };
-    let auth = AuthClaims {
-        did: sender.to_string(),
-        role,
-        session_id: String::new(),
-        session_pubkey_b58btc: None,
-        amr: vec!["did".to_string()],
-        acr: "aal1".to_string(),
-    };
-
-    // `dispatch_did_op` reads only `typ` and `body`; `id`/`from` are set for
-    // completeness / logging.
-    let msg = Message::build(
-        doc.id.clone(),
-        doc.type_uri.to_string(),
-        doc.payload.clone(),
-    )
-    .from(sender.to_string())
-    .finalize();
-
-    match dispatch_did_op(&auth, state, &msg).await {
-        Ok((resp_type, resp_body)) => tt_reply(doc, my_vid, sender, &resp_type, resp_body),
-        Err(e) => {
-            // `error = %e` is the point: `code` alone is a taxonomy bucket —
-            // `e.p.did.validation-error` is every `AppError::Validation` whose
-            // kind is `Other` — so without the message an operator reading this
-            // line learns only that *something* did not validate. That is
-            // exactly how a live mint failure stayed unexplained.
-            warn!(
-                sender,
-                code = e.didcomm_code(),
-                error = %e,
-                msg_type = %msg.typ,
-                "trust-task DID-management: protocol error"
-            );
-            tt_reply(doc, my_vid, sender, MSG_PROBLEM_REPORT, problem_body(&e))
-        }
-    }
-}
-
-/// The `{code, comment}` problem-report body the DID-management protocol
-/// uses for errors, shared across transports.
-fn problem_body(e: &AppError) -> Value {
-    json!({ "code": e.didcomm_code(), "comment": e.user_message() })
-}
-
-/// Wrap a `(type_uri, payload)` DID-management response as a Trust Task
-/// document addressed back to `sender`, threaded to the request.
-fn tt_reply(
-    request: &trust_tasks_rs::TrustTask<Value>,
-    my_vid: &str,
-    sender: &str,
-    type_uri: &str,
-    payload: Value,
-) -> Result<Value, DIDCommServiceError> {
-    let type_uri = type_uri.parse().map_err(|_| {
-        DIDCommServiceError::Internal(format!("response Type URI does not parse: {type_uri}"))
-    })?;
-    let doc = trust_tasks_rs::TrustTask {
-        id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        thread_id: Some(request.id.clone()),
-        // SPEC §4.9.2 — the whole exchange shares one parent, so a response
-        // stays inside whatever enclosing exchange the request named.
-        parent_thread_id: request.parent_thread_id.clone(),
-        // And the ceremony for the same reason (SPEC §7.1): a response stays
-        // inside the enactment its request belonged to. `respond_with` carries
-        // this for callers that use it — this builder does not, because it
-        // needs a caller-chosen `type_uri`, so it has to carry it by hand.
-        // `None` here would silently drop the response out of its ceremony.
-        ceremony: request.ceremony.clone(),
-        type_uri,
-        issuer: Some(my_vid.to_string()),
-        recipient: Some(sender.to_string()),
-        issued_at: Some(chrono::Utc::now()),
-        expires_at: None,
-        payload,
-        context: None,
-        proof: None,
-        extra: Default::default(),
-    };
-    Ok(serde_json::to_value(&doc).expect("Trust Task response serialises"))
 }
 
 #[cfg(test)]
@@ -2201,7 +1661,6 @@ mod tests {
     use did_hosting_common::server::store::Store;
     use serde_json::json;
 
-    use crate::auth::AuthClaims;
     use crate::config::{AppConfig, RegistryConfig};
     use crate::server::AppState;
 
@@ -2324,28 +1783,6 @@ mod tests {
         (state, dir)
     }
 
-    fn owner_auth(did: &str) -> AuthClaims {
-        AuthClaims {
-            did: did.to_string(),
-            role: Role::Owner,
-            session_pubkey_b58btc: None,
-            session_id: String::new(),
-            amr: vec!["did".to_string()],
-            acr: "aal1".to_string(),
-        }
-    }
-
-    fn admin_auth(did: &str) -> AuthClaims {
-        AuthClaims {
-            did: did.to_string(),
-            role: Role::Admin,
-            session_pubkey_b58btc: None,
-            session_id: String::new(),
-            amr: vec!["did".to_string()],
-            acr: "aal1".to_string(),
-        }
-    }
-
     fn build_msg(typ: &str, body: serde_json::Value) -> Message {
         Message::build("msg-id".to_string(), typ.to_string(), body).finalize()
     }
@@ -2382,435 +1819,6 @@ mod tests {
             .expect("seed owner index");
     }
 
-    /// Unknown DIDComm message types must surface as `Validation` so the
-    /// protocol-error mapper sends `e.p.did.validation-error`. Pinning this
-    /// keeps the wire-level contract stable when handlers are added or
-    /// renamed.
-    #[tokio::test]
-    async fn dispatch_did_op_unknown_type_returns_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg("https://affinidi.com/webvh/1.0/not-a-real-type", json!({}));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg)
-            .await
-            .expect_err("unknown type must error");
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("unknown message type")));
-        assert_eq!(map_app_error_code(&err), "e.p.did.validation-error");
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_witness_missing_mnemonic_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_WITNESS_PUBLISH, json!({ "witness": {} }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_witness_missing_witness_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_WITNESS_PUBLISH, json!({ "mnemonic": "alpha-beta" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("witness")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_witness_null_body_rejected() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_WITNESS_PUBLISH,
-            json!({ "mnemonic": "alpha-beta", "witness": null }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("witness")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_info_missing_mnemonic_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_INFO_REQUEST, json!({}));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_did_op_delete_missing_mnemonic_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DELETE, json!({}));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    /// Owners with no DIDs see an empty list — verifies the success-path
-    /// shape (`MSG_LIST` + `{ dids: [] }`) end-to-end with a real keyspace
-    /// scan.
-    #[tokio::test]
-    async fn dispatch_did_op_list_request_empty_returns_empty_array() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-        let auth = owner_auth("did:example:caller");
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_LIST);
-        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
-        assert!(dids.is_empty(), "expected empty list, got {dids:?}");
-    }
-
-    /// Listing returns DIDs the caller owns, with the wire-level keys the
-    /// VTA SDK consumes (`mnemonic`, `did_id`, `version_count`,
-    /// `total_resolves`, etc.). Pinning the shape avoids silent drift if
-    /// `DidListEntry` ever sprouts new fields.
-    #[tokio::test]
-    async fn dispatch_did_op_list_request_returns_owner_dids() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did(&state, owner, "alpha-beta").await;
-        seed_did(&state, owner, "gamma-delta").await;
-        // A different owner's DID must not leak into the response.
-        seed_did(&state, "did:example:other", "eta-theta").await;
-
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_LIST);
-
-        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
-        assert_eq!(dids.len(), 2, "owner sees only their own DIDs: {dids:?}");
-        let mnemonics: std::collections::HashSet<&str> = dids
-            .iter()
-            .filter_map(|d| d.get("mnemonic").and_then(|v| v.as_str()))
-            .collect();
-        assert!(mnemonics.contains("alpha-beta"));
-        assert!(mnemonics.contains("gamma-delta"));
-        assert!(!mnemonics.contains("eta-theta"));
-
-        // Spot-check one entry's wire shape.
-        let entry = dids
-            .iter()
-            .find(|d| d.get("mnemonic").and_then(|v| v.as_str()) == Some("alpha-beta"))
-            .unwrap();
-        assert!(entry.get("did_id").is_some());
-        assert_eq!(entry.get("version_count").and_then(|v| v.as_u64()), Some(1));
-        assert!(entry.get("total_resolves").is_some());
-    }
-
-    /// IDOR regression: an owner whose DID is a string-prefix of another
-    /// owner's DID must NOT see the longer-DID owner's mnemonics. Owner-
-    /// index keys are `owner:{did}:{mnemonic}` and DIDs naturally contain
-    /// colons, so the prefix iteration is ambiguous between
-    /// `did:web:tenant` and `did:web:tenant:server`. `list_dids` must
-    /// re-check `record.owner == target_owner` after the iteration.
-    #[tokio::test]
-    async fn dispatch_did_op_list_request_filters_did_prefix_collision() {
-        let (state, _dir) = test_state().await;
-        let short = "did:example:tenant";
-        let long = "did:example:tenant:server";
-        seed_did(&state, short, "short-mn").await;
-        seed_did(&state, long, "long-mn").await;
-
-        // Caller is the SHORT-DID owner. Without the fix, the iterator
-        // returns both `owner:did:example:tenant:short-mn` and
-        // `owner:did:example:tenant:server:long-mn`.
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-        let auth = owner_auth(short);
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_LIST);
-        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
-        assert_eq!(
-            dids.len(),
-            1,
-            "prefix collision must not leak the longer-DID owner's records: {dids:?}"
-        );
-        assert_eq!(
-            dids[0].get("mnemonic").and_then(|v| v.as_str()),
-            Some("short-mn")
-        );
-    }
-
-    /// Admin role with no `owner` filter sees every DID across owners —
-    /// pins the admin-listing branch in `did_ops::list_dids`.
-    #[tokio::test]
-    async fn dispatch_did_op_list_request_admin_sees_all_owners() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
-        seed_did(&state, "did:example:owner-b", "gamma-delta").await;
-
-        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
-        let auth = admin_auth("did:example:admin");
-
-        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        let dids = body.get("dids").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(dids.len(), 2, "admin must see DIDs from every owner");
-    }
-
-    /// Deleting a non-existent mnemonic surfaces as `NotFound`, which the
-    /// protocol mapper turns into `e.p.did.mnemonic-not-found`.
-    #[tokio::test]
-    async fn dispatch_did_op_delete_unknown_mnemonic_not_found() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DELETE, json!({ "mnemonic": "ghost-token" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(
-            matches!(err, AppError::NotFound(_)),
-            "expected NotFound, got {err:?}"
-        );
-        assert_eq!(map_app_error_code(&err), "e.p.did.mnemonic-not-found");
-    }
-
-    /// `MSG_INFO_REQUEST` against a non-existent mnemonic is `NotFound` —
-    /// covers the read-side counterpart to the delete case above and
-    /// guards the wire-level "mnemonic-not-found" code.
-    #[tokio::test]
-    async fn dispatch_did_op_info_unknown_mnemonic_not_found() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_INFO_REQUEST, json!({ "mnemonic": "ghost-token" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::NotFound(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.mnemonic-not-found");
-    }
-
-    /// Cross-owner access is forbidden — Owner role can only see their own
-    /// DIDs. Admins bypass this; regression-locks both branches of the
-    /// `get_authorized_record` check.
-    #[tokio::test]
-    async fn dispatch_did_op_info_cross_owner_forbidden() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
-
-        let msg = build_msg(MSG_INFO_REQUEST, json!({ "mnemonic": "alpha-beta" }));
-        let attacker = owner_auth("did:example:attacker");
-
-        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
-
-        // Admin sees through.
-        let admin = admin_auth("did:example:admin");
-        let (typ, body) = dispatch_did_op(&admin, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_INFO);
-        assert_eq!(
-            body.get("mnemonic").and_then(|v| v.as_str()),
-            Some("alpha-beta")
-        );
-    }
-
-    /// Auto-assign: a `check-name` with `reserve: true` and no `path`
-    /// generates a fresh mnemonic, persists a `DidRecord` owned by the
-    /// caller, and replies with `available: true, reserved: true` and a
-    /// `record` carrying the assigned `mnemonic` + `didUrl`.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_auto_assign_reserves_record() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        let msg = build_msg(MSG_DID_REQUEST, json!({ "reserve": true }));
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_DID_OFFER);
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
-
-        let record_json = body.get("record").expect("reserved offer carries record");
-        let mnemonic = record_json
-            .get("mnemonic")
-            .and_then(|v| v.as_str())
-            .expect("record has mnemonic")
-            .to_string();
-        let did_url = record_json
-            .get("didUrl")
-            .and_then(|v| v.as_str())
-            .expect("record has didUrl");
-        assert!(
-            did_url.ends_with(&format!("/{mnemonic}/did.jsonl")),
-            "didUrl shape: {did_url}"
-        );
-        assert_eq!(
-            record_json.get("versionCount").and_then(|v| v.as_u64()),
-            Some(0)
-        );
-
-        // Verify the record landed in the dids keyspace, owned by the caller.
-        let record: DidRecord = state
-            .dids_ks
-            .get(did_key(&mnemonic))
-            .await
-            .unwrap()
-            .expect("record persisted");
-        assert_eq!(record.owner, owner);
-        assert_eq!(record.version_count, 0);
-    }
-
-    /// Auto-assign is collision-free: two successive `reserve: true`
-    /// requests with no `path` yield two *different* mnemonics, each
-    /// persisted. Mirrors the VTA-side regression at
-    /// `vta-service/src/webvh_didcomm.rs` ("auto-assign (path == None)").
-    #[tokio::test]
-    async fn dispatch_did_op_auto_assign_yields_distinct_mnemonics() {
-        let (state, _dir) = test_state().await;
-        let auth = owner_auth("did:example:owner-a");
-        let body = json!({ "reserve": true });
-
-        let extract = |v: &Value| {
-            v.get("record")
-                .and_then(|r| r.get("mnemonic"))
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-                .expect("reserved record has mnemonic")
-        };
-        let (_t1, b1) = dispatch_did_op(&auth, &state, &build_msg(MSG_DID_REQUEST, body.clone()))
-            .await
-            .unwrap();
-        let (_t2, b2) = dispatch_did_op(&auth, &state, &build_msg(MSG_DID_REQUEST, body))
-            .await
-            .unwrap();
-        let m1 = extract(&b1);
-        let m2 = extract(&b2);
-        assert_ne!(m1, m2, "auto-assign must not collide");
-        assert!(
-            state
-                .dids_ks
-                .get::<DidRecord>(did_key(&m1))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            state
-                .dids_ks
-                .get::<DidRecord>(did_key(&m2))
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// Pure availability probe (`reserve` absent) is read-only: it reports
-    /// `available` for the named path and persists nothing.
-    #[tokio::test]
-    async fn dispatch_did_op_check_name_probe_is_read_only() {
-        let (state, _dir) = test_state().await;
-        let auth = owner_auth("did:example:owner-a");
-
-        // Free path → available, not reserved, no record written.
-        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": "free-path" }));
-        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
-        assert!(body.get("record").is_none());
-        assert!(
-            state
-                .dids_ks
-                .get::<DidRecord>(did_key("free-path"))
-                .await
-                .unwrap()
-                .is_none(),
-            "probe must not reserve the path"
-        );
-
-        // Taken path → not available.
-        seed_did(&state, "did:example:owner-b", "taken-path").await;
-        let msg = build_msg(MSG_DID_REQUEST, json!({ "path": "taken-path" }));
-        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
-    }
-
-    /// A path-less request without `reserve: true` has no subject to
-    /// probe and is rejected (spec §Conformance consumer rule 1).
-    #[tokio::test]
-    async fn dispatch_did_op_check_name_pathless_probe_rejected() {
-        let (state, _dir) = test_state().await;
-        let auth = owner_auth("did:example:owner-a");
-        let msg = build_msg(MSG_DID_REQUEST, json!({}));
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
-    }
-
-    /// A request bearing the canonical spec URI
-    /// (`spec/did-management/did/check-name/0.1`) routes to the same
-    /// `create_did` handler as the legacy `MSG_DID_REQUEST`, and the
-    /// response carries the spec `#response` URI rather than the legacy
-    /// `MSG_DID_OFFER` — proving inbound + outbound dialect symmetry
-    /// for spec-URI callers like the VTA's `webvh_didcomm` client.
-    #[tokio::test]
-    async fn dispatch_did_op_spec_check_name_returns_spec_response() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:spec-owner";
-        let spec_check_name = "https://trusttasks.org/spec/did-management/did/check-name/0.1";
-        let spec_response =
-            "https://trusttasks.org/spec/did-management/did/check-name/0.1#response";
-        let msg = build_msg(spec_check_name, json!({ "reserve": true }));
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, spec_response);
-        let mnemonic = body
-            .get("record")
-            .and_then(|r| r.get("mnemonic"))
-            .and_then(|v| v.as_str())
-            .expect("response carries record.mnemonic");
-        // Record persisted under caller's ownership, same as the legacy path.
-        let record: DidRecord = state
-            .dids_ks
-            .get(did_key(mnemonic))
-            .await
-            .unwrap()
-            .expect("record persisted");
-        assert_eq!(record.owner, owner);
-    }
-
-    /// Reserving an explicit custom path that's already taken (without
-    /// `force`) is NOT an error under check-name: the spec mandates
-    /// `available: false, reserved: false` with no mutation.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_taken_path_not_available() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "shared-path").await;
-
-        let msg = build_msg(
-            MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "reserve": true }),
-        );
-        let auth = owner_auth("did:example:owner-b");
-
-        let (_typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
-        assert!(body.get("record").is_none());
-    }
-
-    /// `.well-known` is admin-only; a non-admin reserving it gets
-    /// `Forbidden` → `e.p.did.unauthorized`.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_well_known_forbidden_for_owner() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_DID_REQUEST,
-            json!({ "path": ".well-known", "reserve": true }),
-        );
-        let auth = owner_auth("did:example:owner-a");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
-    }
-
     /// ACL gate covers DIDComm authentication and DID ops alike. This pins
     /// the integration: a DID added to the ACL with role `Owner` resolves
     /// through `check_acl` to that role — the input `handle_authenticate`
@@ -2844,7 +1852,7 @@ mod tests {
         let err = check_acl(&state.acl_ks, "did:example:stranger")
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(matches!(err, crate::error::AppError::Forbidden(_)));
     }
 
     /// An unrouted type is answered, not dropped. Dropping it is what made the
@@ -2910,648 +1918,6 @@ mod tests {
                 "{retired} must be named in the reply"
             );
         }
-    }
-
-    /// Pin the AppError → DIDComm protocol-code mapping. The handler set is
-    /// the wire-level contract for every external VTA, and the substring
-    /// matches inside this function are easy to break with a wording change
-    /// in any `AppError::*` literal elsewhere.
-    #[test]
-    fn map_app_error_code_pinned_table() {
-        let cases: &[(AppError, &str)] = &[
-            (
-                AppError::Unauthorized("nope".into()),
-                "e.p.did.unauthorized",
-            ),
-            (AppError::Forbidden("nope".into()), "e.p.did.unauthorized"),
-            (
-                AppError::QuotaExceeded("upload size cap exceeded".into()),
-                "e.p.did.size-exceeded",
-            ),
-            (
-                AppError::QuotaExceeded("monthly quota reached".into()),
-                "e.p.did.quota-exceeded",
-            ),
-            (
-                AppError::Conflict("path already in use".into()),
-                "e.p.did.path-unavailable",
-            ),
-            (
-                AppError::NotFound("did not found".into()),
-                "e.p.did.mnemonic-not-found",
-            ),
-            // Tagged validations route via `ValidationKind`, not by
-            // sniffing the message text — pinning these via the
-            // `AppError::validation()` constructor ensures the tag is
-            // the load-bearing input.
-            (
-                AppError::validation(
-                    did_hosting_common::server::error::ValidationKind::InvalidLog,
-                    "invalid log entry on line 3",
-                ),
-                "e.p.did.invalid-log",
-            ),
-            (
-                AppError::validation(
-                    did_hosting_common::server::error::ValidationKind::InvalidLog,
-                    "malformed JSONL body",
-                ),
-                "e.p.did.invalid-log",
-            ),
-            (
-                AppError::validation(
-                    did_hosting_common::server::error::ValidationKind::InvalidPath,
-                    "path component reserved",
-                ),
-                "e.p.did.path-invalid",
-            ),
-            (
-                AppError::validation(
-                    did_hosting_common::server::error::ValidationKind::InvalidWitness,
-                    "witness signature failed",
-                ),
-                "e.p.did.witness-invalid",
-            ),
-            (
-                AppError::validation(
-                    did_hosting_common::server::error::ValidationKind::Other,
-                    "something else broke",
-                ),
-                "e.p.did.validation-error",
-            ),
-            // An untagged Validation (no `[tag]` prefix) falls through to
-            // the generic code rather than re-routing based on wording.
-            (
-                AppError::Validation("missing 'mnemonic' in body".into()),
-                "e.p.did.validation-error",
-            ),
-            (AppError::Internal("oops".into()), "e.p.did.internal-error"),
-        ];
-        for (err, expected) in cases {
-            let got = map_app_error_code(err);
-            assert_eq!(
-                got, *expected,
-                "map_app_error_code({err:?}) = {got}, expected {expected}",
-            );
-        }
-    }
-
-    /// `MSG_DID_CHANGE_OWNER` with no `mnemonic` body field is a validation
-    /// error — wire-level contract for malformed clients.
-    #[tokio::test]
-    async fn dispatch_did_op_change_owner_missing_mnemonic_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_DID_CHANGE_OWNER,
-            json!({ "new_owner": "did:example:new" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    /// `MSG_DID_CHANGE_OWNER` with no new-owner body field is a validation
-    /// error surfacing the canonical camelCase field name. (The success
-    /// path below still exercises the legacy snake_case `new_owner` alias.)
-    #[tokio::test]
-    async fn dispatch_did_op_change_owner_missing_new_owner_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_DID_CHANGE_OWNER, json!({ "mnemonic": "alpha-beta" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("newOwner")));
-    }
-
-    /// Owner can transfer their own DID to another ACL'd DID. Confirms the
-    /// success path and the wire-level confirm body shape.
-    #[tokio::test]
-    async fn dispatch_did_op_change_owner_success() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        let new_owner = "did:example:owner-b";
-        seed_did(&state, owner, "alpha-beta").await;
-
-        // Both old and new owners must be in the ACL for change-owner to
-        // succeed — defense-in-depth.
-        store_acl_entry(
-            &state.acl_ks,
-            &AclEntry {
-                did: new_owner.into(),
-                role: Role::Owner,
-                label: None,
-                created_at: 0,
-                max_total_size: None,
-                max_did_count: None,
-
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            },
-        )
-        .await
-        .unwrap();
-
-        let msg = build_msg(
-            MSG_DID_CHANGE_OWNER,
-            json!({ "mnemonic": "alpha-beta", "new_owner": new_owner }),
-        );
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_DID_CHANGE_OWNER_CONFIRM);
-        assert_eq!(body.get("owner").and_then(|v| v.as_str()), Some(new_owner));
-
-        // Owner index swapped: old owner has none, new owner has one.
-        let old_idx = state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{owner}:"))
-            .await
-            .unwrap();
-        assert!(old_idx.is_empty(), "old owner index should be cleared");
-        let new_idx = state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{new_owner}:"))
-            .await
-            .unwrap();
-        assert_eq!(new_idx.len(), 1, "new owner should have one entry");
-    }
-
-    /// Cross-owner change-owner is forbidden — only the current owner or an
-    /// admin may transfer.
-    #[tokio::test]
-    async fn dispatch_did_op_change_owner_cross_owner_forbidden() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
-        store_acl_entry(
-            &state.acl_ks,
-            &AclEntry {
-                did: "did:example:target".into(),
-                role: Role::Owner,
-                label: None,
-                created_at: 0,
-                max_total_size: None,
-                max_did_count: None,
-
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            },
-        )
-        .await
-        .unwrap();
-
-        let msg = build_msg(
-            MSG_DID_CHANGE_OWNER,
-            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:target" }),
-        );
-        let attacker = owner_auth("did:example:attacker");
-
-        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
-    }
-
-    /// New owner must be in the ACL — prevents transferring a DID to an
-    /// identity that can never authenticate to claim it.
-    #[tokio::test]
-    async fn dispatch_did_op_change_owner_unknown_new_owner_validation() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did(&state, owner, "alpha-beta").await;
-
-        let msg = build_msg(
-            MSG_DID_CHANGE_OWNER,
-            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:not-in-acl" }),
-        );
-        let auth = owner_auth(owner);
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("not in the ACL")));
-    }
-
-    // -----------------------------------------------------------------------
-    // agent-name/* dispatch
-    // -----------------------------------------------------------------------
-    //
-    // The signed-log happy paths are covered by the `did_ops` unit tests; what
-    // these pin is the wiring the REST tests can't see — that each verb is
-    // reachable on the DIDComm dispatch table, parses the same body the REST
-    // handler does, and lands in the same `did_ops` function with the caller's
-    // authorization intact.
-
-    /// Seed a DID whose registry already holds names, so the read verbs have
-    /// something to project. `domain` is set explicitly rather than derived
-    /// from `did_id` so the expected response is unambiguous.
-    async fn seed_did_with_names(
-        state: &AppState,
-        owner_did: &str,
-        mnemonic: &str,
-        domain: &str,
-        names: &[(&str, bool)],
-    ) {
-        seed_did(state, owner_did, mnemonic).await;
-        let mut record: DidRecord = state
-            .dids_ks
-            .get(did_key(mnemonic))
-            .await
-            .unwrap()
-            .expect("seeded record");
-        record.domain = domain.to_string();
-        record.agent_names = names
-            .iter()
-            .map(
-                |(name, enabled)| did_hosting_common::did_ops::AgentNameEntry {
-                    name: (*name).to_string(),
-                    enabled: *enabled,
-                    created_at: 7,
-                },
-            )
-            .collect();
-        state
-            .dids_ks
-            .insert(did_key(mnemonic), &record)
-            .await
-            .expect("update seeded record");
-    }
-
-    /// A body missing a required field is a client error, not a 500 — the
-    /// update verb deserialises the REST `AgentNameUpdateRequest` verbatim.
-    #[tokio::test]
-    async fn dispatch_agent_name_update_missing_name_is_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_AGENT_NAME_UPDATE,
-            json!({ "mnemonic": "alpha-beta", "state": "active", "didData": "{}" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("agent-name")));
-    }
-
-    /// A `state` outside the spec enum is a client error — the declarative
-    /// field only accepts `active` / `parked` (release is `remove`'s job).
-    #[tokio::test]
-    async fn dispatch_agent_name_update_invalid_state_is_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_AGENT_NAME_UPDATE,
-            json!({ "mnemonic": "alpha-beta", "name": "alice", "state": "released", "didData": "{}" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("agent-name")));
-    }
-
-    /// `update {state: active}` reaches `did_ops::update_agent_name` for the
-    /// slot's owner: a malformed `didData` is rejected there as an invalid
-    /// log, proving delegation rather than a dispatch-table dead end. The
-    /// pre-cutover `didLog` spelling is accepted as an alias.
-    #[tokio::test]
-    async fn dispatch_agent_name_update_reaches_did_ops() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did(&state, owner, "alpha-beta").await;
-
-        for field in ["didData", "didLog"] {
-            let msg = build_msg(
-                MSG_AGENT_NAME_UPDATE,
-                json!({ "mnemonic": "alpha-beta", "name": "alice", "state": "active", field: "not-a-valid-log" }),
-            );
-            let auth = owner_auth(owner);
-
-            let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-            assert_eq!(map_app_error_code(&err), "e.p.did.invalid-log");
-        }
-    }
-
-    /// A reserved name is refused before any storage read, and surfaces as the
-    /// dedicated reserved-name code rather than a generic validation error.
-    #[tokio::test]
-    async fn dispatch_agent_name_update_reserved_name_rejected() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did(&state, owner, "alpha-beta").await;
-
-        let msg = build_msg(
-            MSG_AGENT_NAME_UPDATE,
-            json!({ "mnemonic": "alpha-beta", "name": "admin", "state": "active", "didData": "irrelevant" }),
-        );
-        let auth = owner_auth(owner);
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AppError::AgentName(did_hosting_common::server::error::AgentNameError::Reserved)
-            ),
-            "expected a reserved-name error, got {err:?}"
-        );
-    }
-
-    /// The owner check in `did_ops` is not weakened by the DIDComm path — a
-    /// non-owner calling the destructive verb is forbidden.
-    #[tokio::test]
-    async fn dispatch_agent_name_remove_cross_owner_forbidden() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
-
-        let msg = build_msg(
-            MSG_AGENT_NAME_REMOVE,
-            json!({ "mnemonic": "alpha-beta", "name": "alice", "didLog": "x" }),
-        );
-        let attacker = owner_auth("did:example:attacker");
-
-        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
-    }
-
-    /// `list` projects the registry, parked entries included — the whole point
-    /// of the verb, since a parked name is absent from the DID document.
-    #[tokio::test]
-    async fn dispatch_agent_name_list_returns_registry() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did_with_names(
-            &state,
-            owner,
-            "alpha-beta",
-            "example.com",
-            &[("alice", true), ("parked", false)],
-        )
-        .await;
-
-        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_AGENT_NAME_LIST_RESPONSE);
-        assert_eq!(
-            body.get("domain").and_then(|v| v.as_str()),
-            Some("example.com")
-        );
-        let names = body
-            .get("agentNames")
-            .and_then(|v| v.as_array())
-            .expect("agentNames array");
-        assert_eq!(names.len(), 2);
-        assert_eq!(names[0].get("name").and_then(|v| v.as_str()), Some("alice"));
-        assert_eq!(
-            names[0].get("enabled").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            names[0].get("createdAt").and_then(|v| v.as_str()),
-            Some("1970-01-01T00:00:07Z"),
-            "createdAt is projected to RFC3339 per agent-name/list/0.1"
-        );
-        assert_eq!(
-            names[1].get("enabled").and_then(|v| v.as_bool()),
-            Some(false),
-            "a parked name must still be listed"
-        );
-    }
-
-    /// A DID with no names answers with an empty array, not a missing field —
-    /// the caller asked for a list and should not have to tell "none" from
-    /// "the host forgot to say".
-    #[tokio::test]
-    async fn dispatch_agent_name_list_empty_registry_is_empty_array() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did_with_names(&state, owner, "alpha-beta", "example.com", &[]).await;
-
-        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
-        let (_, body) = dispatch_did_op(&owner_auth(owner), &state, &msg)
-            .await
-            .unwrap();
-        assert_eq!(
-            body.get("agentNames").and_then(|v| v.as_array()),
-            Some(&vec![])
-        );
-    }
-
-    /// `list` without a `mnemonic` is a validation error, matching the other
-    /// mnemonic-scoped arms.
-    #[tokio::test]
-    async fn dispatch_agent_name_list_missing_mnemonic_is_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({}));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
-    }
-
-    /// An explicit `domain` that doesn't match the slot's is the same
-    /// cross-tenant rejection publish and delete give.
-    #[tokio::test]
-    async fn dispatch_agent_name_list_domain_mismatch_rejected() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did_with_names(
-            &state,
-            owner,
-            "alpha-beta",
-            "example.com",
-            &[("alice", true)],
-        )
-        .await;
-
-        let msg = build_msg(
-            MSG_AGENT_NAME_LIST,
-            json!({ "mnemonic": "alpha-beta", "domain": "other.example" }),
-        );
-        let err = dispatch_did_op(&owner_auth(owner), &state, &msg)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("unknown_domain")));
-    }
-
-    /// `list` is owner-scoped: another caller cannot enumerate a DID's names.
-    #[tokio::test]
-    async fn dispatch_agent_name_list_cross_owner_forbidden() {
-        let (state, _dir) = test_state().await;
-        seed_did_with_names(
-            &state,
-            "did:example:owner-a",
-            "alpha-beta",
-            "example.com",
-            &[("alice", true)],
-        )
-        .await;
-
-        let msg = build_msg(MSG_AGENT_NAME_LIST, json!({ "mnemonic": "alpha-beta" }));
-        let err = dispatch_did_op(&owner_auth("did:example:attacker"), &state, &msg)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-    }
-
-    /// `check` answers on the explicitly-named domain and reports a free name.
-    #[tokio::test]
-    async fn dispatch_agent_name_check_available() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_AGENT_NAME_CHECK,
-            json!({ "name": "alice", "domain": "example.com" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_AGENT_NAME_CHECK_RESPONSE);
-        assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("alice"));
-        assert_eq!(
-            body.get("domain").and_then(|v| v.as_str()),
-            Some("example.com")
-        );
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
-    }
-
-    /// A reserved name reports `available: false, reserved: true` rather than
-    /// erroring — the UI needs to explain *why* it can't be claimed.
-    #[tokio::test]
-    async fn dispatch_agent_name_check_reserved() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(
-            MSG_AGENT_NAME_CHECK,
-            json!({ "name": "admin", "domain": "example.com" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let (_, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
-    }
-
-    /// A name already bound on the domain is unavailable — the arm reads the
-    /// same `name:{domain}:{name}` index the resolver does.
-    #[tokio::test]
-    async fn dispatch_agent_name_check_taken() {
-        let (state, _dir) = test_state().await;
-        state
-            .dids_ks
-            .insert_raw(
-                did_hosting_common::did_ops::agent_name_key("example.com", "alice"),
-                b"alpha-beta".to_vec(),
-            )
-            .await
-            .unwrap();
-
-        let msg = build_msg(
-            MSG_AGENT_NAME_CHECK,
-            json!({ "name": "alice", "domain": "example.com" }),
-        );
-        let auth = owner_auth("did:example:caller");
-
-        let (_, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(body.get("available").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(false));
-    }
-
-    /// With no domain on the wire and no system default configured, `check`
-    /// refuses rather than guessing: "is @alice free?" answered against the
-    /// wrong domain is a wrong answer, not a lenient one.
-    #[tokio::test]
-    async fn dispatch_agent_name_check_unresolvable_domain_is_validation() {
-        let (state, _dir) = test_state().await;
-        let msg = build_msg(MSG_AGENT_NAME_CHECK, json!({ "name": "alice" }));
-        let auth = owner_auth("did:example:caller");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-    }
-
-    /// Force-replace via `MSG_DID_REQUEST` with `force: true` succeeds when
-    /// the requester is the current owner, replacing the existing slot.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_force_replaces_when_owner() {
-        let (state, _dir) = test_state().await;
-        let owner = "did:example:owner-a";
-        seed_did(&state, owner, "shared-path").await;
-        // Seed log content so we can verify it gets cleared.
-        state
-            .dids_ks
-            .insert_raw(
-                did_hosting_common::did_ops::content_log_key("shared-path"),
-                b"old log".to_vec(),
-            )
-            .await
-            .unwrap();
-
-        let msg = build_msg(
-            MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "reserve": true, "force": true }),
-        );
-        let auth = owner_auth(owner);
-
-        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_DID_OFFER);
-        assert_eq!(body.get("reserved").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            body.get("record")
-                .and_then(|r| r.get("mnemonic"))
-                .and_then(|v| v.as_str()),
-            Some("shared-path")
-        );
-
-        // Old log content has been wiped; new record has version_count 0.
-        let log = state
-            .dids_ks
-            .get_raw(did_hosting_common::did_ops::content_log_key("shared-path"))
-            .await
-            .unwrap();
-        assert!(log.is_none(), "old log content should be wiped");
-        let record: DidRecord = state
-            .dids_ks
-            .get(did_key("shared-path"))
-            .await
-            .unwrap()
-            .expect("record present");
-        assert_eq!(record.version_count, 0);
-        assert_eq!(record.owner, owner);
-    }
-
-    /// Force-replace by a different owner is forbidden — `force` only works
-    /// for admin or current owner of the existing path.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_force_forbidden_for_other_owner() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "shared-path").await;
-
-        let msg = build_msg(
-            MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "reserve": true, "force": true }),
-        );
-        let auth = owner_auth("did:example:owner-b");
-
-        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
-    }
-
-    /// Admins can force-replace any DID — the caller becomes the new owner.
-    #[tokio::test]
-    async fn dispatch_did_op_did_request_force_admin_takes_ownership() {
-        let (state, _dir) = test_state().await;
-        seed_did(&state, "did:example:owner-a", "shared-path").await;
-
-        let admin = admin_auth("did:example:admin");
-        let msg = build_msg(
-            MSG_DID_REQUEST,
-            json!({ "path": "shared-path", "reserve": true, "force": true }),
-        );
-
-        let (typ, _body) = dispatch_did_op(&admin, &state, &msg).await.unwrap();
-        assert_eq!(typ, MSG_DID_OFFER);
-
-        let record: DidRecord = state
-            .dids_ks
-            .get(did_key("shared-path"))
-            .await
-            .unwrap()
-            .expect("record present");
-        assert_eq!(record.owner, "did:example:admin");
     }
 
     // -----------------------------------------------------------------
@@ -5073,7 +3439,8 @@ mod tests {
         }
         assert_eq!(rows.len(), 1, "the new DID is pushed");
         assert_eq!(rows[0].1.msg_type, MSG_SYNC_UPDATE);
-        assert_eq!(rows[0].1.body["did_id"], "did:webvh:QmNew:host:alice");
+        assert_eq!(rows[0].1.body["didId"], "did:webvh:QmNew:host:alice");
+        assert_eq!(rows[0].1.body["disabled"], false);
     }
 
     // ── Domain ops are re-sent on registration until settled ───────────

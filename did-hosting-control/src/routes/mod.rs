@@ -12,7 +12,7 @@ mod registry;
 pub mod server_info;
 pub(crate) mod stats_sync;
 pub mod task_consent;
-mod trust_tasks;
+pub(crate) mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;

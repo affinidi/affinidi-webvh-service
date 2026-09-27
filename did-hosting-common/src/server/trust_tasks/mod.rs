@@ -110,6 +110,23 @@ pub fn build_dispatcher() -> Dispatcher<TypedInbound> {
         .on::<discovery::v0_1::Payload, _>(TypedInbound::Discovery)
 }
 
+/// What a served Trust Task requires of its proof before its handler runs.
+///
+/// One value per row of a service's dispatch table, so the gate that reads it
+/// and the table that serves the task cannot disagree about a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofRule {
+    /// A request that authorises nothing and that a peer with no key yet must
+    /// be able to send: accepted unsigned. A proof that is present is still
+    /// verified, and one that does not verify is refused.
+    Optional,
+    /// An operational request: signed by its issuer, with the key listed under
+    /// the issuer's `authentication` relationship (`proofPurpose:
+    /// authentication`), bound to the transport's sender, addressed here,
+    /// fresh, and not a replay. See [`verify_sender_bound`].
+    Authentication,
+}
+
 /// Result of [`dispatch_inbound`]. The calling transport (HTTPS or
 /// DIDComm) decides how to emit each variant.
 #[derive(Debug)]
