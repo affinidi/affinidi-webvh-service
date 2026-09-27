@@ -511,7 +511,8 @@ mod force_reprovision_tests {
     use did_hosting_common::did_ops::{DidRecord, did_key};
     use did_hosting_common::server::setup_recipe::{
         AdminSection, DaemonSection, DeploymentSection, IdentitySection, OutputSection,
-        ReprovisionSection, SecretsSection, ServerSection, VtaSection, WatcherSection,
+        ReprovisionSection, SecretsBackend, SecretsSection, ServerSection, VtaSection,
+        WatcherSection,
     };
 
     /// A minimal, valid self-managed daemon recipe — the only `vta_mode`
@@ -532,7 +533,13 @@ mod force_reprovision_tests {
                 ..Default::default()
             },
             vta: VtaSection::default(),
-            secrets: SecretsSection::default(),
+            // Plaintext + confirm: CI's Linux runners have no Secret Service,
+            // so the default keyring backend cannot open there.
+            secrets: SecretsSection {
+                backend: Some(SecretsBackend::Plaintext),
+                confirm_plaintext: true,
+                ..Default::default()
+            },
             admin: AdminSection::default(),
             reprovision: ReprovisionSection::default(),
             watcher: WatcherSection::default(),
