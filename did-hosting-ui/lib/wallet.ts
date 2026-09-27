@@ -121,9 +121,6 @@ interface VtaWalletProvider {
     target?: { kind: string; [k: string]: unknown };
     ttlSecondsHint?: number;
   }): Promise<ProxyLoginWireResult>;
-  /** Which persona this site knows the user as, resolving or binding one.
-   *  Mints nothing and issues no session. Present from the wallet build that
-   *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
   /** Raise an existing session to `aal2`. The wallet sends
    *  `auth/step-up/start/0.1` to `{baseUrl}/trust-tasks`, verifies the signed
    *  reply and the approve-request inside it (issuer `rpDid`, this session),
@@ -136,6 +133,9 @@ interface VtaWalletProvider {
     refreshToken: string;
     sessionId: string;
   }): Promise<VtaWalletLoginResult>;
+  /** Which persona this site knows the user as, resolving or binding one.
+   *  Mints nothing and issues no session. Present from the wallet build that
+   *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
   walletProfile?(params: {
     target?: { kind: string; [k: string]: unknown };
   }): Promise<{ did: string; entryId: string; bound: boolean }>;

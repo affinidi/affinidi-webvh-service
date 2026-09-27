@@ -1079,9 +1079,14 @@ export const api = {
     inviteId: string,
     updates: { role?: Role; expiresAt?: string; extendBy?: number },
   ): Promise<InviteListItem> => {
+    // Only the members actually given: a document carrying an `undefined`
+    // member cannot be canonicalised for its proof, and the spec reads an
+    // absent member as "unchanged".
     const r = await trustTask<InviteUpdate.Payload, InviteUpdate.Response>(T.inviteUpdate, {
       inviteId,
-      ...updates,
+      ...(updates.role !== undefined ? { role: updates.role } : {}),
+      ...(updates.expiresAt !== undefined ? { expiresAt: updates.expiresAt } : {}),
+      ...(updates.extendBy !== undefined ? { extendBy: updates.extendBy } : {}),
     });
     return inviteFromWire(r.invite);
   },

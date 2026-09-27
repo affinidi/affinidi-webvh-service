@@ -132,10 +132,10 @@ describe("checkReply", () => {
 
   it("is a 502, so it reads as the upstream's fault", () => {
     const reply = { ...good(), proof: undefined };
+    expect(() => checkReply(sent, reply as never, SERVICE_DID)).toThrow(ApiError);
     try {
       checkReply(sent, reply as never, SERVICE_DID);
     } catch (e) {
-      expect(e).toBeInstanceOf(ApiError);
       expect((e as ApiError).status).toBe(502);
     }
   });
@@ -322,6 +322,22 @@ describe("management calls (passkey session)", () => {
         expired: false,
       },
     ]);
+  });
+
+  it("updates an invite with only the members given", async () => {
+    const invite = {
+      inviteId: "inv-1",
+      subject: "did:web:new.example",
+      purpose: "session",
+      role: "owner",
+      createdAt: "2026-01-01T00:00:00Z",
+      expiresAt: "2026-01-02T00:00:00Z",
+      expired: false,
+    };
+    const sent = installControlPlane((req) => seal(req, { invite }));
+    await api.updateInvite("inv-1", { role: undefined, extendBy: 60 });
+    const [task] = tasks(sent);
+    expect(task!.doc.payload).toEqual({ inviteId: "inv-1", extendBy: 60 });
   });
 
   it("a passkey session purges a domain without stepping up", async () => {

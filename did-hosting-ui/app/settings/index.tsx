@@ -319,9 +319,9 @@ export default function SettingsPage() {
           spells out the consequences when they do. */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
-        {config.listenAddress && (
+        {config.listenAddress ? (
           <Row label="Listen Address" value={config.listenAddress} />
-        )}
+        ) : null}
         <StatusRow label="DIDComm" enabled={config.didcommEnabled} />
         <StatusRow label="TSP" enabled={config.tspEnabled} />
         <View style={styles.row}>
@@ -392,14 +392,14 @@ export default function SettingsPage() {
         </View>
       )}
 
-      {(config.dataDir || config.logLevel || config.logFormat) && (
+      {config.dataDir || config.logLevel || config.logFormat ? (
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Storage & Logging</Text>
-          {config.dataDir && <Row label="Data Directory" value={config.dataDir} />}
-          {config.logLevel && <Row label="Log Level" value={config.logLevel} />}
-          {config.logFormat && <Row label="Log Format" value={config.logFormat} />}
+          {config.dataDir ? <Row label="Data Directory" value={config.dataDir} /> : null}
+          {config.logLevel ? <Row label="Log Level" value={config.logLevel} /> : null}
+          {config.logFormat ? <Row label="Log Format" value={config.logFormat} /> : null}
         </View>
-      )}
+      ) : null}
     </ScrollView>
   );
 }
