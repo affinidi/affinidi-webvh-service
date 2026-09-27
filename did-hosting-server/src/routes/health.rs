@@ -10,17 +10,8 @@ pub struct HealthResponse {
     version: &'static str,
 }
 
-/// Unauthenticated liveness + one local-resolution check. Deliberately
-/// generic — no configuration or DID detail — but it must not claim
-/// healthy while the service's own DID isn't being served locally (Keyring
-/// VTI-17): see [`did_hosting_common::server::health::own_did_served_locally`].
-///
-/// Takes `AppState` directly rather than axum's `State` extractor: the
-/// route is registered *after* `Router::with_state` (deliberately outside
-/// the CORS/security-header layers — see `run_rest_thread`), so by the time
-/// it's added the router's state type is already `()` and an extractor-based
-/// handler would no longer type-check. The caller closes over a cloned
-/// `AppState` instead.
+/// Unauthenticated liveness probe; degraded while the service's own DID is
+/// not being served.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/api/health",
@@ -30,6 +21,17 @@ pub struct HealthResponse {
         (status = 503, description = "Service is up but its own DID isn't being served locally", content_type = "application/json"),
     ),
 ))]
+// Deliberately generic — no configuration or DID detail — but it must not
+// claim healthy while the service's own DID isn't being served locally
+// (Keyring VTI-17): see
+// `did_hosting_common::server::health::own_did_served_locally`.
+//
+// Takes `AppState` directly rather than axum's `State` extractor: the
+// route is registered *after* `Router::with_state` (deliberately outside
+// the CORS/security-header layers — see `run_rest_thread`), so by the time
+// it's added the router's state type is already `()` and an extractor-based
+// handler would no longer type-check. The caller closes over a cloned
+// `AppState` instead.
 pub async fn health(state: AppState) -> (StatusCode, Json<HealthResponse>) {
     let ok = did_hosting_common::server::health::own_did_served_locally(
         &state.dids_ks,
