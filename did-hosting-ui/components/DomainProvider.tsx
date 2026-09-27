@@ -3,8 +3,8 @@
  * mount + tracks the active "current domain" selection.
  *
  * Design (v0.7):
- * - Admins call `GET /api/domains` and see every configured domain.
- * - Non-admins call `GET /api/me/domains` and see only the subset
+ * - Admins send `domain/list` and see every configured domain.
+ * - Non-admins send `me/domains` and see only the subset
  *   their ACL `DomainScope` allows.
  * - The response carries a `default` field. We seed `currentDomain`
  *   from localStorage if the user previously picked one, else

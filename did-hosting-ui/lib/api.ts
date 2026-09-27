@@ -1,19 +1,103 @@
-/** Typed API client for the did-hosting-control REST API. */
+/**
+ * The console's client for its control plane.
+ *
+ * Every management call is a signed Trust Task through `POST /api/trust-tasks`
+ * (see `trust-task.ts` for the binding and how replies are checked). The
+ * request and response shapes are the generated types in
+ * `@openvtc/trust-tasks`; `wire.ts` projects each reply into the view models
+ * below, which are what the screens render.
+ *
+ * Three things stay plain HTTP: the unauthenticated `/api/health` liveness
+ * probe, passkey *enrolment* (its Trust Tasks are not served yet), and the
+ * REST token refresh in `session.ts`.
+ */
 
+import type * as DidList from "@openvtc/trust-tasks/did-management/did/list/0.1/payload";
+import type * as DidInfo from "@openvtc/trust-tasks/did-management/did/info/0.1/payload";
+import type * as DidLog from "@openvtc/trust-tasks/did-management/did/log/0.1/payload";
+import type * as DidCheckName from "@openvtc/trust-tasks/did-management/did/check-name/0.1/payload";
+import type * as DidRegister from "@openvtc/trust-tasks/did-management/did/register/0.1/payload";
+import type * as DidDelete from "@openvtc/trust-tasks/did-management/did/delete/0.1/payload";
+import type * as DidChangeOwner from "@openvtc/trust-tasks/did-management/did/change-owner/0.1/payload";
+import type * as DidRollback from "@openvtc/trust-tasks/did-management/did/rollback/0.1/payload";
+import type * as WitnessPublish from "@openvtc/trust-tasks/webvh/witness/publish/0.1/payload";
+import type * as AgentNameCheck from "@openvtc/trust-tasks/did-management/agent-name/check/0.1/payload";
+import type * as AgentNameResolve from "@openvtc/trust-tasks/did-management/agent-name/resolve/0.1/payload";
+import type * as DomainList from "@openvtc/trust-tasks/did-management/domain/list/0.1/payload";
+import type * as MeDomains from "@openvtc/trust-tasks/did-management/me/domains/0.1/payload";
+import type * as DomainCreate from "@openvtc/trust-tasks/did-management/domain/create/0.1/payload";
+import type * as DomainSetState from "@openvtc/trust-tasks/did-management/domain/set-state/0.1/payload";
+import type * as DomainSetDefault from "@openvtc/trust-tasks/did-management/domain/set-default/0.1/payload";
+import type * as DomainPurge from "@openvtc/trust-tasks/did-management/domain/purge/0.1/payload";
+import type * as DomainAssign from "@openvtc/trust-tasks/did-management/domain/assign/0.1/payload";
+import type * as DomainUnassign from "@openvtc/trust-tasks/did-management/domain/unassign/0.1/payload";
+import type * as RegistryList from "@openvtc/trust-tasks/did-management/registry/list/0.1/payload";
+import type * as RegistryPurgeDomain from "@openvtc/trust-tasks/did-management/registry/purge-domain/0.1/payload";
+import type * as StatsGet from "@openvtc/trust-tasks/did-management/stats/get/0.1/payload";
+import type * as StatsTimeseries from "@openvtc/trust-tasks/did-management/stats/timeseries/0.1/payload";
+import type * as ServerConfig from "@openvtc/trust-tasks/did-management/server/config/0.1/payload";
+import type * as IdentityList from "@openvtc/trust-tasks/did-management/identity/list/0.1/payload";
+import type * as IdentityRetire from "@openvtc/trust-tasks/did-management/identity/retire/0.1/payload";
+import type * as LoginStart from "@openvtc/trust-tasks/auth/passkey/login/start/0.2/payload";
+import type * as LoginFinish from "@openvtc/trust-tasks/auth/passkey/login/finish/0.2/payload";
+import type * as InviteList from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
+import type * as InviteUpdate from "@openvtc/trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
+import type * as InviteRevoke from "@openvtc/trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
+import type * as AclList from "@openvtc/trust-tasks/acl/list/0.1/payload";
+import type * as AclShow from "@openvtc/trust-tasks/acl/show/0.1/payload";
+import type * as AclGrant from "@openvtc/trust-tasks/acl/grant/0.1/payload";
+import type * as AclRevoke from "@openvtc/trust-tasks/acl/revoke/0.1/payload";
+import type * as AclChangeRole from "@openvtc/trust-tasks/acl/change-role/0.1/payload";
+import type { Response as ServerInfo } from "@openvtc/trust-tasks/did-management/server/info/0.1/payload";
+
+import { ApiError, request } from "./http";
 import {
-  clearSessionKeypair,
-  generateSessionKeypair,
-  hasSessionKeypair,
-  restoreSessionKeypair,
-  signEnvelope,
-} from "./session-key";
+  getAuthMethod,
+  getRefreshToken,
+  getSessionId,
+  getToken,
+  setRefreshToken,
+  setToken,
+} from "./session";
+import { getServiceInfo, isRejection, trustTask } from "./trust-task";
+import { getApiBase } from "./api-base";
+import {
+  aclEntryFromWire,
+  configFromWire,
+  didRecordFromWire,
+  domainFromWire,
+  identityFromWire,
+  inviteFromWire,
+  logEntriesFromWire,
+  logMetadataFromEntries,
+  serviceInstanceFromWire,
+  statsFromWire,
+  timeRangeToWire,
+  timeseriesFromWire,
+  WEBVH_EXT,
+} from "./wire";
+
+export { ApiError } from "./http";
+export * from "./session";
+export {
+  TrustTaskRejection,
+  checkReply,
+  isRejection,
+  resetServiceInfo,
+  retryDelayMs,
+} from "./trust-task";
+export type { ServerInfo };
+
+// ---------------------------------------------------------------------------
+// View models
+// ---------------------------------------------------------------------------
 
 export interface HealthResponse {
   status: string;
   version: string;
 }
 
-/** DID hosting method tag carried on every DidRecord (v0.7+). */
+/** DID hosting method tag carried on every DidRecord. */
 export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
 
 export interface DidRecord {
@@ -23,27 +107,18 @@ export interface DidRecord {
   updatedAt: number;
   versionCount: number;
   didId: string | null;
+  /** Where the slot's log is served. */
+  didUrl: string | null;
   totalResolves: number;
-  /** Resolution method ("webvh" / "web"). Filled by M-01 on legacy records. */
+  /** Suspended with `did/set-state`: resolves nowhere until resumed. */
+  disabled: boolean;
   method?: DidMethod;
-  /** Hosting domain. Filled by M-01 on legacy records. */
   domain?: string;
-  /** `service[].type` values cached off the DID document, in document
-   *  order. Absent for slots with no document yet and for legacy records
-   *  M-02 hasn't swept — render no badges in both cases. An empty array
-   *  is meaningful: the document was read and advertises nothing. */
-  services?: string[];
-  /** The slot's agent names from the authoritative registry — the same shape
-   *  `DidDetailResponse.agentNames` carries, so the list can render a handle
-   *  without fetching each DID. Includes parked entries; filter with
-   *  `servedNames` before showing them as resolvable. Absent when the DID has
-   *  none. */
+  /** The slot's agent names from the authoritative registry, including parked
+   *  ones — filter with `servedNames` before showing them as resolvable.
+   *  Absent when the DID has none. */
   agentNames?: AgentNameEntry[];
 }
-
-// ---------------------------------------------------------------------------
-// Multi-domain types (v0.7)
-// ---------------------------------------------------------------------------
 
 export type DomainStatus = "active" | "disabled";
 export type DomainUrlScheme = "https" | "http";
@@ -59,10 +134,6 @@ export interface DomainQuota {
   maxBytes?: number | null;
 }
 
-/** Server-side `DomainEntry` (`KS_DOMAINS`). The wire is snake_case (the
- *  Rust struct has no `rename_all`); this interface is camelCase and the
- *  raw response is run through `normalizeDomain()` at the API boundary
- *  before reaching the UI. */
 export interface DomainEntry {
   name: string;
   label: string | null;
@@ -75,108 +146,55 @@ export interface DomainEntry {
   watchers: string[] | null;
   quota: DomainQuota | null;
   wellKnownEnabled: boolean;
-  /** Unix seconds when disable was called. Null while Active. The
-   *  domain + every hosted DID is permanently removed at `purgeAt`
-   *  unless the operator re-enables before then. */
+  /** Unix seconds when disable was called. Null while Active. The domain and
+   *  every hosted DID is permanently removed at `purgeAt` unless the operator
+   *  re-enables before then. */
   disabledAt: number | null;
-  /** Unix seconds at which the disabled domain becomes eligible for
-   *  the background purge sweep. Null while Active. */
+  /** Unix seconds at which the disabled domain becomes eligible for the
+   *  background purge sweep. Null while Active. */
   purgeAt: number | null;
 }
 
 export interface DomainListResponse {
   domains: DomainEntry[];
-  /** Currently-elected system default; may be null on a fresh install. */
+  /** Currently-elected default; may be null on a fresh install. */
   default: string | null;
 }
 
-// snake_case → camelCase normalization at the wire boundary. The server's
-// Rust DomainEntry has no #[serde(rename_all = "camelCase")] attribute and
-// adding it would invalidate already-stored fjall records, so we hydrate
-// here instead. Accepts either case (forward-compat if the server ever
-// flips).
-function normalizeBranding(b: any): DomainBranding | null {
-  if (!b) return null;
-  return {
-    logoUrl: b.logoUrl ?? b.logo_url ?? null,
-    primaryColor: b.primaryColor ?? b.primary_color ?? null,
-    displayName: b.displayName ?? b.display_name ?? null,
-  };
-}
-function normalizeQuota(q: any): DomainQuota | null {
-  if (!q) return null;
-  return {
-    maxDids: q.maxDids ?? q.max_dids ?? null,
-    maxBytes: q.maxBytes ?? q.max_bytes ?? null,
-  };
-}
-function normalizeDomain(raw: any): DomainEntry {
-  return {
-    name: raw.name,
-    label: raw.label ?? null,
-    scheme: raw.scheme,
-    status: raw.status,
-    createdAt: raw.createdAt ?? raw.created_at,
-    defaultDomain: raw.defaultDomain ?? raw.default_domain ?? false,
-    branding: normalizeBranding(raw.branding),
-    witnesses: raw.witnesses ?? null,
-    watchers: raw.watchers ?? null,
-    quota: normalizeQuota(raw.quota),
-    wellKnownEnabled: raw.wellKnownEnabled ?? raw.well_known_enabled ?? false,
-    disabledAt: raw.disabledAt ?? raw.disabled_at ?? null,
-    purgeAt: raw.purgeAt ?? raw.purge_at ?? null,
-  };
-}
-function normalizeDomainList(raw: any): DomainListResponse {
-  return {
-    domains: (raw.domains ?? []).map(normalizeDomain),
-    default: raw.default ?? null,
-  };
-}
-
-/** Per-ACL `DomainScope`. Tagged with `kind` per spec §3 wire shape. */
+/** Per-ACL `DomainScope`. Tagged with `kind`. */
 export type DomainScope =
   | { kind: "all" }
   | { kind: "allowed"; domains: string[] }
   | { kind: "allowed_with_default"; domains: string[]; default: string };
 
+/** A transport observed carrying real traffic. */
+export type ObservedTransport = "tsp" | "didcomm" | "https";
+
+/** One registered service instance (`registry/list`). */
 export interface ServiceInstance {
   instanceId: string;
+  did: string;
   serviceType: "server" | "witness" | "watcher";
   label: string | null;
-  url: string;
+  url: string | null;
   status: "active" | "degraded" | "unreachable";
   lastHealthCheck: number | null;
   registeredAt: number;
-  metadata: any;
-  /** v0.7+ capability declaration. */
   enabledMethods: string[];
   servedDomains: string[];
-  protocolVersion: string;
   /** `service[].type` values resolved from this instance's DID document.
-   *  Distinct from `enabledMethods`, which is what its binary supports.
-   *  Absent when the instance has no recorded DID (REST/config
-   *  registration) or the DID has never resolved. */
+   *  Distinct from `enabledMethods`, which is what its binary supports. */
   advertisedServices?: string[];
   /** Epoch seconds of the last successful resolve of `advertisedServices`. */
   servicesCheckedAt?: number;
-  /** Whether this instance understands infrastructure trust tasks, so the
-   *  control plane may ping it over whichever transport its DID document
-   *  advertises. Older servers omit the flag and keep receiving legacy
-   *  DIDComm pings. */
-  trustTaskCapable?: boolean;
   /** The transport that **actually carried** the last message in each
    *  direction. Distinct from `advertisedServices`, which is only what the
-   *  peer says it can speak: a TSP-advertising server still reads `didcomm`
-   *  here if a TSP send fell back, or if it registered over DIDComm. */
+   *  peer says it can speak. */
   lastInboundTransport?: ObservedTransport;
   lastInboundAt?: number;
   lastOutboundTransport?: ObservedTransport;
   lastOutboundAt?: number;
 }
-
-/** A transport observed carrying real traffic. See `ServiceInstance`. */
-export type ObservedTransport = "tsp" | "didcomm" | "https";
 
 export interface LogMetadata {
   logEntryCount: number;
@@ -195,35 +213,9 @@ export interface LogMetadata {
   ttl: number | null;
 }
 
-export interface ServicesResponse {
-  watcherUrls: string[];
-}
-
-export interface WatcherSyncStatus {
-  watcherUrl: string;
-  lastSyncedVersionId: string | null;
-  lastSyncedAt: number | null;
-  lastError: string | null;
-  ok: boolean;
-}
-
-export interface DidDetailResponse {
-  mnemonic: string;
-  createdAt: number;
-  updatedAt: number;
-  versionCount: number;
-  didId: string | null;
-  owner: string;
+/** A slot with its log summarised. */
+export interface DidDetailResponse extends DidRecord {
   log: LogMetadata | null;
-  watcherSync: WatcherSyncStatus[] | null;
-  /** v0.7: hosting method (`webvh` / `web`). Omitted on legacy records. */
-  method?: string;
-  /** v0.7: hosting domain. Omitted on legacy records pre-M-01. */
-  domain?: string;
-  /** The DID's agent names from the authoritative registry, each with its
-   *  `enabled` flag. Absent/empty when the DID has none. Parked names appear
-   *  here only — they are deliberately not in the document. */
-  agentNames?: AgentNameEntry[];
 }
 
 export interface LogEntryInfo {
@@ -235,18 +227,11 @@ export interface LogEntryInfo {
 
 export interface CreateDidResponse {
   mnemonic: string;
-  didUrl: string;
-}
-
-export interface ChangeOwnerResponse {
-  mnemonic: string;
-  owner: string;
-  updatedAt: number;
+  didUrl: string | null;
 }
 
 export interface CheckNameResponse {
   available: boolean;
-  path: string;
 }
 
 /** One agent name in a DID's authoritative registry. A parked name
@@ -271,7 +256,7 @@ export interface AgentNameAvailability {
   /** Free to claim: neither reserved nor already bound on this domain. */
   available: boolean;
   /** On the host's reserved list (`@admin`, `@support`, …) — unavailable but
-   *  a well-formed name, distinct from a grammar error (a 400). */
+   *  a well-formed name. */
   reserved: boolean;
 }
 
@@ -282,8 +267,6 @@ export interface AclEntry {
   created_at: number;
   max_total_size: number | null;
   max_did_count: number | null;
-  /** Per-ACL `DomainScope` (v0.7). Optional for forward-compat — a
-   * v0.6 store with no scope field deserialises as `{ kind: "all" }`. */
   domains?: DomainScope;
 }
 
@@ -298,12 +281,8 @@ export interface DidStats {
   lastUpdatedAt: number | null;
 }
 
-export interface ServerStats {
+export interface ServerStats extends DidStats {
   totalDids: number;
-  totalResolves: number;
-  totalUpdates: number;
-  lastResolvedAt: number | null;
-  lastUpdatedAt: number | null;
 }
 
 export interface TimeSeriesPoint {
@@ -314,7 +293,9 @@ export interface TimeSeriesPoint {
 
 export type TimeRange = "1h" | "24h" | "7d" | "30d";
 
-// Service overview types
+/** The dashboard's view of the deployment: the control plane itself, the
+ *  registered fleet, and the totals. Composed from `server/config`,
+ *  `registry/list` and `stats/get`. */
 export interface ServiceOverview {
   control: ControlInfo;
   services: ServiceInfo[];
@@ -325,54 +306,20 @@ export interface ControlInfo {
   version: string;
   serverDid: string | null;
   publicUrl: string | null;
-  /** Transport turned on in config (`features.didcomm`). */
+  /** Transport turned on in config. */
   didcommEnabled: boolean;
-  /** Transport turned on in config (`features.tsp`). */
+  /** Transport turned on in config. */
   tspEnabled: boolean;
-  /** What the control plane's own DID document advertises to peers.
-   *  May disagree with the `*Enabled` flags above — enabled-but-not-
-   *  advertised means peers can't reach us on that transport, and
-   *  advertised-but-not-enabled means they'll try and fail. Absent when
-   *  no control DID is configured or it wouldn't resolve, in which case
-   *  the comparison can't be made and the UI says so. */
+  /** What the control plane's own DID document advertises to peers. May
+   *  disagree with the `*Enabled` flags above. Absent when the DID would not
+   *  resolve, in which case the comparison can't be made. */
   advertisedServices?: string[];
-  totalLocalDids: number;
-  /** DID methods compiled into this control-plane binary (from
-   *  `did_hosting_common::method::enabled_methods`). Empty when the
-   *  operator built with `--no-default-features` and no `method-*`
-   *  feature — every DID op then fails; the dashboard renders a loud
-   *  warning when this list is empty so the misconfiguration is
-   *  obvious before any user hits a failure. */
+  /** DID methods compiled into this control-plane binary. Empty means every
+   *  DID op fails; the dashboard warns loudly. */
   enabledMethods: string[];
 }
 
-export interface ServiceInfo {
-  instanceId: string;
-  serviceType: string;
-  label: string | null;
-  url: string;
-  status: string;
-  lastHealthCheck: number | null;
-  registeredAt: number;
-  did: string | null;
-  stats: ServiceStats | null;
-  /** See `ServiceInstance.advertisedServices`. */
-  advertisedServices?: string[];
-  servicesCheckedAt?: number;
-  /** See `ServiceInstance` — observed, not inferred. */
-  lastInboundTransport?: ObservedTransport;
-  lastInboundAt?: number;
-  lastOutboundTransport?: ObservedTransport;
-  lastOutboundAt?: number;
-}
-
-export interface ServiceStats {
-  totalDids: number;
-  totalResolves: number;
-  totalUpdates: number;
-  lastResolvedAt: number | null;
-  lastUpdatedAt: number | null;
-}
+export type ServiceInfo = ServiceInstance;
 
 export interface AggregateStats {
   totalServices: number;
@@ -384,6 +331,7 @@ export interface AggregateStats {
   totalUpdates: number;
 }
 
+/** The tokens passkey enrolment (still REST) answers with. */
 export interface TokenResponse {
   session_id: string;
   access_token: string;
@@ -398,8 +346,15 @@ export interface EnrollStartResponse {
 }
 
 export interface LoginStartResponse {
-  auth_id: string;
-  options: any;
+  authId: string;
+  /** WebAuthn request options, in the shape `navigator.credentials.get` takes
+   *  under `publicKey` (base64url members still encoded). */
+  options: LoginStart.Response["options"];
+}
+
+export interface LoginTokens {
+  accessToken: string;
+  refreshToken: string | null;
 }
 
 export interface CreateInviteResponse {
@@ -409,15 +364,15 @@ export interface CreateInviteResponse {
   expires_at: number;
 }
 
-// A pending invite as an administrator sees it later: addressed by
-// `invite_id`. The token is shown once, when the invite is created, and is
-// never sent back.
+/** A pending invite as an administrator sees it later: addressed by
+ *  `inviteId`. The token is shown once, when the invite is created, and is
+ *  never sent back. */
 export interface InviteListItem {
-  invite_id: string;
+  inviteId: string;
   did: string;
   role: "admin" | "owner" | "service";
-  created_at: number;
-  expires_at: number;
+  createdAt: number;
+  expiresAt: number;
   expired: boolean;
 }
 
@@ -425,364 +380,33 @@ export interface InviteListResponse {
   invites: InviteListItem[];
 }
 
+/** `server/config`: what an operator needs to see. No secrets, by rule. */
 export interface ControlPlaneConfig {
-  controlDid: string | null;
-  mediatorDid: string | null;
+  controlDid: string;
+  softwareVersion: string;
+  deploymentMode: string;
   publicUrl: string | null;
   didHostingUrl: string | null;
+  mediatorDid: string | null;
   didcommEnabled: boolean;
   tspEnabled: boolean;
-  /** `service[].type` from the control plane's own DID document. See
-   *  `ControlInfo.advertisedServices` for the enabled-vs-advertised split. */
+  /** `service[].type` from the control plane's own DID document. */
   advertisedServices?: string[];
-  restApiEnabled: boolean;
-  listenAddress: string;
+  enabledMethods: string[];
+  agentNames: boolean;
+  listenAddress: string | null;
   vtaUrl: string | null;
   vtaDid: string | null;
-  deploymentMode: string;
-  healthCheckIntervalSecs: number;
-  configuredInstances: number;
-  accessTokenExpiry: number;
-  adminIdleTimeout: number;
-  refreshTokenExpiry: number;
-  passkeyEnrollmentTtl: number;
-  dataDir: string;
-  logLevel: string;
-  logFormat: string;
-}
-
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    /**
-     * The raw response body, when there was one.
-     *
-     * Kept because a Trust-Task rejection arrives *as a document* at a non-2xx
-     * status (`status_for_code` maps `permissionDenied` → 403, `taskFailed` →
-     * 422, …). Throwing on the status alone discards that document, and with it
-     * the `code` / `retryable` / `retryAfter` members the §8.4 retry policy is
-     * written against — leaving the caller to match on message text, which is
-     * the thing that policy exists to avoid.
-     */
-    public body?: string,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-const TOKEN_KEY = "webvh_token";
-const REFRESH_TOKEN_KEY = "webvh_refresh_token";
-
-/** Which auth path produced the current session. Trust-task signing
- *  branches on this: `"wallet"` calls `window.vtaWallet.signTrustTask` (the
- *  holder did:peer is the signing identity); anything else uses the
- *  ephemeral session keypair the passkey-login flow generates. */
-export type AuthMethod = "passkey" | "wallet";
-const AUTH_METHOD_KEY = "webvh_auth_method";
-
-export function getToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setToken(token: string): void {
-  try {
-    localStorage.setItem(TOKEN_KEY, token);
-  } catch {
-    // ignore in non-browser contexts
-  }
-}
-
-/// The refresh token, which login used to hand us and we used to discard.
-///
-/// Without it the console could not renew: the access token is a fixed
-/// 15-minute JWT, nothing extended it, and the first sign of expiry was a
-/// request failing. It lives beside the access token in `localStorage` —
-/// no worse a place, since a reader of one already has the other.
-export function getRefreshToken(): string | null {
-  try {
-    return localStorage.getItem(REFRESH_TOKEN_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setRefreshToken(token: string | null): void {
-  try {
-    if (token === null) localStorage.removeItem(REFRESH_TOKEN_KEY);
-    else localStorage.setItem(REFRESH_TOKEN_KEY, token);
-  } catch {
-    // ignore in non-browser contexts
-  }
-}
-
-const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.1";
-
-/** Seconds since the epoch at which `token` expires, or null if unreadable. */
-function tokenExpiry(token: string): number | null {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) return null;
-    const exp = JSON.parse(atob(payload)).exp;
-    return typeof exp === "number" ? exp : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Renew when the access token has this long or less to live. */
-const RENEW_WITHIN_SECS = 60;
-/** Floor between renewal attempts, so a failing one cannot spin. */
-const MIN_RETRY_GAP_MS = 5_000;
-
-let renewInFlight: Promise<void> | null = null;
-let lastRenewAttemptMs = 0;
-
-/**
- * Renew the session if the access token is nearly out.
- *
- * Single-flight, and that matters more than ordinary dedupe: refresh
- * **rotates** the token and the daemon claims the old one atomically, so a
- * second simultaneous renewal would present a token the first had already
- * consumed and be rejected.
- *
- * The daemon refuses a renewal once the session has been idle past
- * `auth.admin_idle_timeout`, which is what stops this timer from keeping a
- * tab signed in forever. Never throws: a failed renewal leaves the session
- * alone and the caller's own request reports the failure.
- */
-export async function renewIfNeeded(): Promise<void> {
-  const access = getToken();
-  const refresh = getRefreshToken();
-  if (!access || !refresh) return;
-
-  const exp = tokenExpiry(access);
-  if (exp === null) return;
-  const now = Math.floor(Date.now() / 1000);
-  if (now < exp - RENEW_WITHIN_SECS) return;
-
-  if (renewInFlight) return renewInFlight;
-  if (Date.now() - lastRenewAttemptMs < MIN_RETRY_GAP_MS) return;
-  lastRenewAttemptMs = Date.now();
-
-  renewInFlight = (async () => {
-    try {
-      // Signed with the session keypair, not sent bare. The daemon binds a
-      // REST refresh to the key this browser registered at login, so a
-      // stolen refresh token alone will not rotate the session — which is
-      // what makes this dialect no weaker than the DIDComm one it sits
-      // beside. A session with no bound key (wallet, machine-to-machine)
-      // has nothing to sign with and the daemon does not ask.
-      let envelope: Record<string, unknown> = {
-        type: REFRESH_TASK_URI,
-        id: crypto.randomUUID(),
-        payload: { refreshToken: refresh },
-      };
-      if (hasSessionKeypair()) {
-        envelope = await signEnvelope(envelope);
-      }
-      const res = await fetch("/api/auth/refresh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(envelope),
-      });
-      if (!res.ok) return;
-      const body = await res.json();
-      const nextAccess = body?.access_token ?? body?.tokens?.accessToken;
-      const nextRefresh = body?.refresh_token ?? body?.tokens?.refreshToken;
-      if (typeof nextAccess === "string") setToken(nextAccess);
-      if (typeof nextRefresh === "string") setRefreshToken(nextRefresh);
-    } catch {
-      // Swallowed by design — see the doc comment.
-    } finally {
-      renewInFlight = null;
-    }
-  })();
-  return renewInFlight;
-}
-
-export function getAuthMethod(): AuthMethod | null {
-  try {
-    const v = localStorage.getItem(AUTH_METHOD_KEY);
-    return v === "passkey" || v === "wallet" ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-export function setAuthMethod(method: AuthMethod): void {
-  try {
-    localStorage.setItem(AUTH_METHOD_KEY, method);
-  } catch {
-    // ignore
-  }
-}
-
-/** DID the wallet-authenticated session is bound to. Set by the
- *  proxy-login flow to the vault entry's `principalDid`; the wallet's
- *  holder-login flow leaves this unset.
- *
- *  Trust-task signing reads this: when set, the wallet's
- *  `signTrustTask({ asDid })` extension routes via
- *  `vault/sign-trust-task/0.1` so the proof's `verificationMethod`
- *  matches the session's authenticated DID at the server. Without it,
- *  the wallet falls back to holder-signing and the server rejects with
- *  `proof_invalid: proof verificationMethod DID does not match the
- *  authenticated caller` (which is how this discriminator got
- *  motivated). */
-const SESSION_PRINCIPAL_DID_KEY = "webvh_session_principal_did";
-
-export function getSessionPrincipalDid(): string | null {
-  try {
-    return localStorage.getItem(SESSION_PRINCIPAL_DID_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setSessionPrincipalDid(did: string): void {
-  try {
-    localStorage.setItem(SESSION_PRINCIPAL_DID_KEY, did);
-  } catch {
-    // ignore
-  }
-}
-
-export function clearSessionPrincipalDid(): void {
-  try {
-    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
-  } catch {
-    // ignore
-  }
-}
-
-export function clearToken(): void {
-  try {
-    localStorage.removeItem(TOKEN_KEY);
-    // Clear the renewal credential too: a refresh token outliving a logout
-    // would leave the browser able to mint fresh access tokens.
-    localStorage.removeItem(REFRESH_TOKEN_KEY);
-    localStorage.removeItem(AUTH_METHOD_KEY);
-    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
-  } catch {
-    // ignore
-  }
-  // Drop the session keypair from both memory and IndexedDB.
-  // Fire-and-forget; logout shouldn't block on storage.
-  clearSessionKeypair();
-}
-
-async function request<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
-  // Renew ahead of expiry, so an operator who is using the console is not
-  // signed out mid-task. Skipped for the renewal call itself, which would
-  // otherwise recurse.
-  if (path !== "/api/auth/refresh") {
-    await renewIfNeeded();
-  }
-  const token = getToken();
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string>),
-  };
-
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(path, { ...options, headers });
-
-  if (!res.ok) {
-    if (res.status === 401) {
-      clearToken();
-      window.dispatchEvent(new Event("webvh:unauthorized"));
-    }
-    const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text, text);
-  }
-
-  if (res.status === 204) {
-    return undefined as T;
-  }
-
-  // Guard against HTML fallback responses (e.g., SPA catch-all returning index.html)
-  const contentType = res.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    throw new ApiError(
-      res.status,
-      `Expected JSON response but got ${contentType || "unknown content type"} — is the API endpoint available?`,
-    );
-  }
-
-  return res.json() as Promise<T>;
-}
-
-async function requestText(
-  path: string,
-  options: RequestInit = {},
-): Promise<string> {
-  const token = getToken();
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string>),
-  };
-
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(path, { ...options, headers });
-
-  if (!res.ok) {
-    if (res.status === 401) {
-      clearToken();
-      window.dispatchEvent(new Event("webvh:unauthorized"));
-    }
-    const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
-  }
-
-  return res.text();
-}
-
-/** Response shape of `GET /api/server-info`. */
-export interface ServerInfoResponse {
-  /** The server's DID — used as the `recipient` / audience-binding value on
-   *  signed trust-task envelopes (SPEC §4.8.2). `null` when the operator
-   *  hasn't configured one (signed trust tasks will then be refused by the
-   *  server). */
-  server_did: string | null;
-  /** Soft-delete grace period applied when a domain is disabled, in
-   *  seconds. The Domains screen reads this to render the deletion
-   *  countdown copy. `null` if config is missing/unparseable — UI
-   *  falls back to a generic warning without a specific duration. */
-  disable_purge_grace_seconds: number | null;
-  /** Whether this deployment serves agent names (`/@alice` -> 302). Read it
-   *  before offering the Agent Names UI: with the feature off the redirect
-   *  404s, deliberately indistinguishable from "no such name", so there is no
-   *  way to detect it by probing. Optional — a deployment older than this
-   *  field omits it, and `undefined` should be read as "unknown", not "off". */
-  agent_names?: boolean;
-  /** Agent names the server's own DID serves, as bare local parts — the input
-   *  `AgentNameChips` takes. A community name (`{domain}/@`) arrives as an
-   *  empty string, which is its real local part and renders correctly without
-   *  special-casing. Optional: a deployment older than this field omits it. */
-  server_names?: string[];
-}
-
-// Cache the server-info response for the lifetime of the tab. The server's
-// DID is stable per-deployment + already published in the server's did.jsonl,
-// so we never need to re-fetch unless we hit a config error somewhere.
-let cachedServerInfo: ServerInfoResponse | null = null;
-async function getServerInfo(): Promise<ServerInfoResponse> {
-  if (cachedServerInfo) return cachedServerInfo;
-  cachedServerInfo = await request<ServerInfoResponse>("/api/server-info");
-  return cachedServerInfo;
+  registry: { healthCheckIntervalSecs: number; configuredInstances: number } | null;
+  sessions: {
+    accessTokenExpiry: number;
+    refreshTokenExpiry: number;
+    adminIdleTimeout: number;
+    passkeyEnrollmentTtl: number;
+  } | null;
+  dataDir: string | null;
+  logLevel: string | null;
+  logFormat: string | null;
 }
 
 /**
@@ -797,268 +421,425 @@ export interface IdentityGeneration {
   did: string;
   /** The generation the DID document currently advertises. Cannot be retired. */
   current: boolean;
-  signing_kid: string;
-  key_agreement_kid: string;
-  mediator_did: string | null;
+  signingKid: string;
+  keyAgreementKid: string;
+  mediatorDid: string | null;
   didcomm: boolean;
   tsp: boolean;
-  created_at: number;
+  createdAt: number;
   /** When it stopped being current. `null` on the current generation. */
-  retired_at: number | null;
+  retiredAt: number | null;
   /** When it stops being honoured. `null` on the current generation. */
-  expires_at: number | null;
+  expiresAt: number | null;
 }
 
 export interface IdentityGenerationsResponse {
   generations: IdentityGeneration[];
   /** How long a generation retired from now would keep being honoured. */
-  rotation_grace_secs: number;
+  rotationGraceSecs: number;
 }
 
-export const api = {
-  health: () => request<HealthResponse>("/api/health"),
-  serverInfo: getServerInfo,
+// ---------------------------------------------------------------------------
+// Task type URIs
+//
+// Each is typed as its generated `TYPE_URI`, so a typo or a version the
+// package does not know fails the typecheck. Only the types are imported —
+// the generated modules carry their schemas as values, which the bundle does
+// not need.
+// ---------------------------------------------------------------------------
 
-  /** This service's own identity generations. */
-  listIdentityGenerations: () =>
-    request<IdentityGenerationsResponse>("/api/identity/generations"),
+const TT = "https://trusttasks.org/spec/";
+const DM = `${TT}did-management/` as const;
+
+const T = {
+  didList: `${DM}did/list/0.1` as const satisfies typeof DidList.TYPE_URI,
+  didInfo: `${DM}did/info/0.1` as const satisfies typeof DidInfo.TYPE_URI,
+  didLog: `${DM}did/log/0.1` as const satisfies typeof DidLog.TYPE_URI,
+  didCheckName: `${DM}did/check-name/0.1` as const satisfies typeof DidCheckName.TYPE_URI,
+  didRegister: `${DM}did/register/0.1` as const satisfies typeof DidRegister.TYPE_URI,
+  didDelete: `${DM}did/delete/0.1` as const satisfies typeof DidDelete.TYPE_URI,
+  didChangeOwner: `${DM}did/change-owner/0.1` as const satisfies typeof DidChangeOwner.TYPE_URI,
+  didRollback: `${DM}did/rollback/0.1` as const satisfies typeof DidRollback.TYPE_URI,
+  witnessPublish: `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
+  agentNameCheck: `${DM}agent-name/check/0.1` as const satisfies typeof AgentNameCheck.TYPE_URI,
+  agentNameResolve: `${DM}agent-name/resolve/0.1` as const satisfies typeof AgentNameResolve.TYPE_URI,
+  domainList: `${DM}domain/list/0.1` as const satisfies typeof DomainList.TYPE_URI,
+  meDomains: `${DM}me/domains/0.1` as const satisfies typeof MeDomains.TYPE_URI,
+  domainCreate: `${DM}domain/create/0.1` as const satisfies typeof DomainCreate.TYPE_URI,
+  domainSetState: `${DM}domain/set-state/0.1` as const satisfies typeof DomainSetState.TYPE_URI,
+  domainSetDefault: `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
+  domainPurge: `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
+  domainAssign: `${DM}domain/assign/0.1` as const satisfies typeof DomainAssign.TYPE_URI,
+  domainUnassign: `${DM}domain/unassign/0.1` as const satisfies typeof DomainUnassign.TYPE_URI,
+  registryList: `${DM}registry/list/0.1` as const satisfies typeof RegistryList.TYPE_URI,
+  registryPurgeDomain: `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
+  statsGet: `${DM}stats/get/0.1` as const satisfies typeof StatsGet.TYPE_URI,
+  statsTimeseries: `${DM}stats/timeseries/0.1` as const satisfies typeof StatsTimeseries.TYPE_URI,
+  serverConfig: `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
+  identityList: `${DM}identity/list/0.1` as const satisfies typeof IdentityList.TYPE_URI,
+  identityRetire: `${DM}identity/retire/0.1` as const satisfies typeof IdentityRetire.TYPE_URI,
+  loginStart: `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
+  loginFinish: `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
+  inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
+  inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
+  inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
+  aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
+  aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
+  aclGrant: `${TT}acl/grant/0.1` as const satisfies typeof AclGrant.TYPE_URI,
+  aclRevoke: `${TT}acl/revoke/0.1` as const satisfies typeof AclRevoke.TYPE_URI,
+  aclChangeRole: `${TT}acl/change-role/0.1` as const satisfies typeof AclChangeRole.TYPE_URI,
+} as const;
+
+/** Largest page `did/list` answers. */
+const DID_LIST_PAGE = 1000;
+
+/** The control plane's `did/log` for `mnemonic`. */
+function didLog(mnemonic: string, raw: boolean): Promise<DidLog.Response> {
+  return trustTask<DidLog.Payload, DidLog.Response>(T.didLog, {
+    mnemonic,
+    ...(raw ? { raw: true } : {}),
+  });
+}
+
+/** The webvh extension object an ACL grant carries. */
+function webvhAclExt(
+  domains: DomainScope,
+  maxTotalSize: number | null | undefined,
+  maxDidCount: number | null | undefined,
+): Record<string, unknown> {
+  const ext: Record<string, unknown> = { domains };
+  const quota: Record<string, number> = {};
+  if (typeof maxTotalSize === "number") quota.maxTotalSize = maxTotalSize;
+  if (typeof maxDidCount === "number") quota.maxDidCount = maxDidCount;
+  if (Object.keys(quota).length > 0) ext.quota = quota;
+  return { [WEBVH_EXT]: ext };
+}
+
+type Role = "admin" | "owner" | "service";
+
+export const api = {
+  /** Unauthenticated liveness probe. Plain HTTP by design. */
+  health: () => request<HealthResponse>("/api/health", { anonymous: true }),
+
+  /** `server/info`: the service DID and the public facts shown before login. */
+  serverInfo: (): Promise<ServerInfo> => getServiceInfo(),
+
+  // ---- The service's own identity ----
+
+  listIdentityGenerations: async (): Promise<IdentityGenerationsResponse> =>
+    identityFromWire(
+      await trustTask<IdentityList.Payload, IdentityList.Response>(T.identityList, {}),
+    ),
 
   /**
    * Stop honouring a superseded generation immediately — the kill switch.
-   *
-   * Runs in-process on the control plane, so the key is dropped from the live
-   * secrets resolver before this returns. Messages still addressed to that
-   * generation's key-agreement key will no longer decrypt.
+   * The key is dropped from the live secrets resolver before this returns.
    */
-  retireIdentityGeneration: (id: number) =>
-    request<void>(`/api/identity/generations/${id}/retire`, {
-      method: "POST",
-    }),
-
-  listDids: (owner?: string) => {
-    const params = owner ? `?owner=${encodeURIComponent(owner)}` : "";
-    return request<DidRecord[]>(`/api/dids${params}`);
+  retireIdentityGeneration: async (id: number): Promise<void> => {
+    await trustTask<IdentityRetire.Payload, IdentityRetire.Response>(T.identityRetire, {
+      generationId: id,
+    });
   },
 
-  getDid: (mnemonic: string) =>
-    request<DidDetailResponse>(`/api/dids/${mnemonic}`),
+  // ---- DIDs ----
 
-  getDidLog: (mnemonic: string) =>
-    request<LogEntryInfo[]>(`/api/log/${mnemonic}`),
+  /** Every slot the caller may see (an admin may name another `owner`),
+   *  following `did/list`'s pages to the end. */
+  listDids: async (owner?: string): Promise<DidRecord[]> => {
+    const out: DidRecord[] = [];
+    for (let offset = 0; ; ) {
+      const page = await trustTask<DidList.Payload, DidList.Response>(T.didList, {
+        ...(owner ? { owner } : {}),
+        limit: DID_LIST_PAGE,
+        ...(offset > 0 ? { offset } : {}),
+      });
+      out.push(...page.records.map(didRecordFromWire));
+      offset += page.records.length;
+      if (page.records.length === 0 || offset >= page.total) return out;
+    }
+  },
 
-  createDid: (
-    path?: string,
-    force?: boolean,
-    /** Optional explicit domain. Omitted → daemon's T34 resolver picks
-     * the caller's ACL default → system default → 400. */
-    domain?: string,
-  ) =>
-    request<CreateDidResponse>("/api/dids", {
-      method: "POST",
-      ...(path || force || domain
-        ? {
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path, force: force ?? false, domain }),
-          }
-        : {}),
-    }),
+  /** A slot with its log summarised: `did/info` for the record, `did/log` for
+   *  the summary (webvh parameters are read from the log itself). */
+  getDid: async (mnemonic: string): Promise<DidDetailResponse> => {
+    const [info, log] = await Promise.all([
+      trustTask<DidInfo.Payload, DidInfo.Response>(T.didInfo, { mnemonic }),
+      didLog(mnemonic, false).catch((e) => {
+        // A slot with no published content has no log; that is not a failure.
+        if (isRejection(e, "notFound")) return null;
+        throw e;
+      }),
+    ]);
+    return {
+      ...didRecordFromWire(info.record),
+      log: log ? logMetadataFromEntries(logEntriesFromWire(log)) : null,
+    };
+  },
 
-  changeOwner: (mnemonic: string, newOwner: string) =>
-    request<ChangeOwnerResponse>(`/api/owner/${mnemonic}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ new_owner: newOwner }),
-    }),
+  getDidLog: async (mnemonic: string): Promise<LogEntryInfo[]> =>
+    logEntriesFromWire(await didLog(mnemonic, false)),
 
-  checkName: (path: string, domain?: string) =>
-    request<CheckNameResponse>("/api/dids/check", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, domain }),
-    }),
+  /** The stored `did.jsonl`, verbatim. */
+  getRawLog: async (mnemonic: string): Promise<string> =>
+    (await didLog(mnemonic, true)).logContent ?? "",
+
+  /** Claim a slot (`did/check-name` with `reserve: true`) — at `path`, or an
+   *  auto-assigned one. Without `domain` the control plane uses the caller's
+   *  default, then the system default. */
+  createDid: async (path?: string, domain?: string): Promise<CreateDidResponse> => {
+    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(T.didCheckName, {
+      reserve: true,
+      ...(path ? { path } : {}),
+      ...(domain ? { domain } : {}),
+    });
+    if (!resp.reserved || !resp.record) {
+      throw new ApiError(409, path ? `"${path}" is already taken` : "no slot could be reserved");
+    }
+    return { mnemonic: resp.record.mnemonic, didUrl: resp.record.didUrl ?? null };
+  },
+
+  changeOwner: async (mnemonic: string, newOwner: string): Promise<DidRecord> =>
+    didRecordFromWire(
+      (
+        await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(T.didChangeOwner, {
+          mnemonic,
+          newOwner,
+        })
+      ).record,
+    ),
+
+  /** Is `path` free? A read-only probe. */
+  checkName: async (path: string, domain?: string): Promise<CheckNameResponse> => {
+    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(T.didCheckName, {
+      path,
+      ...(domain ? { domain } : {}),
+    });
+    return { available: resp.available };
+  },
 
   /** Is an agent name (`/@name`) free to claim on `domain`? Binding itself is
-   *  a signed did.jsonl publish through the user's agent (edit `alsoKnownAs`),
-   *  not a call here — this is only the availability probe. */
-  checkAgentName: (name: string, domain?: string) =>
-    request<AgentNameAvailability>("/api/agent-names/check", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, domain }),
-    }),
-
-  /** DID -> its served agent names, the reverse of the `/@name` redirect.
-   *
-   *  Batched: display surfaces hold several DIDs at once, and a per-DID
-   *  round-trip would make showing a handle cost more than the identifier it
-   *  replaces. DIDs with no served names are absent from the map, so read a
-   *  miss and an empty list the same way. Only names this service actually
-   *  serves come back — a DID hosted elsewhere resolves to nothing here rather
-   *  than being chased over the network. */
-  resolveAgentNames: (dids: string[]) =>
-    request<AgentNameResolveResponse>("/api/agent-names/resolve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dids }),
-    }),
-
-  uploadDid: (mnemonic: string, body: string) =>
-    request<void>(`/api/dids/${mnemonic}`, {
-      method: "PUT",
-      headers: { "Content-Type": "text/plain" },
-      body,
-    }),
-
-  uploadWitness: (mnemonic: string, body: string) =>
-    request<void>(`/api/witness/${mnemonic}`, {
-      method: "PUT",
-      headers: { "Content-Type": "text/plain" },
-      body,
-    }),
-
-  deleteDid: (mnemonic: string) =>
-    request<void>(`/api/dids/${mnemonic}`, { method: "DELETE" }),
-
-  rollbackDid: (mnemonic: string) =>
-    request<DidDetailResponse>(`/api/rollback/${mnemonic}`, { method: "POST" }),
-
-  getRawLog: (mnemonic: string) => requestText(`/api/raw/${mnemonic}`),
-
-  getServices: () => request<ServicesResponse>("/api/services"),
-
-  getStats: (mnemonic: string) =>
-    request<DidStats>(`/api/stats/${mnemonic}`),
-
-  getServerStats: () => request<ServerStats>("/api/stats"),
-
-  getServicesOverview: () => request<ServiceOverview>("/api/services/overview"),
-
-  getServerTimeseries: (range: TimeRange = "24h", domain?: string) => {
-    const q = new URLSearchParams({ range });
-    if (domain) q.set("domain", domain);
-    return request<TimeSeriesPoint[]>(`/api/timeseries?${q.toString()}`);
+   *  a signed did.jsonl publish through the user's agent. */
+  checkAgentName: async (name: string, domain?: string): Promise<AgentNameAvailability> => {
+    const r = await trustTask<AgentNameCheck.Payload, AgentNameCheck.Response>(
+      T.agentNameCheck,
+      { name, ...(domain ? { domain } : {}) },
+    );
+    return { name: r.name, domain: r.domain, available: r.available, reserved: r.reserved };
   },
 
-  getDidTimeseries: (mnemonic: string, range: TimeRange = "24h") =>
-    request<TimeSeriesPoint[]>(`/api/timeseries/${mnemonic}?range=${range}`),
+  /** DID -> its served agent names, batched. Only DIDs the caller may read
+   *  and this service serves come back; read a miss and an empty list alike. */
+  resolveAgentNames: async (dids: string[]): Promise<AgentNameResolveResponse> => {
+    if (dids.length === 0) return { names: {} };
+    const r = await trustTask<AgentNameResolve.Payload, AgentNameResolve.Response>(
+      T.agentNameResolve,
+      { dids: dids as [string, ...string[]] },
+    );
+    const names: Record<string, string[]> = {};
+    for (const e of r.entries) names[e.did] = e.names;
+    return { names };
+  },
 
-  // ---- ACL via Trust Tasks (v0.7.0+) ----
+  /** Publish a signed `did.jsonl` to an existing slot (`did/register`). */
+  uploadDid: async (mnemonic: string, log: string): Promise<void> => {
+    await trustTask<DidRegister.Payload, DidRegister.Response>(T.didRegister, {
+      path: mnemonic,
+      method: "webvh",
+      didData: log,
+    });
+  },
+
+  /** Publish witness proofs (`did-witness.json`) for a slot. */
+  uploadWitness: async (mnemonic: string, witnessJson: string): Promise<void> => {
+    let witness: object;
+    try {
+      witness = JSON.parse(witnessJson);
+    } catch (e) {
+      throw new ApiError(400, `witness proofs are not valid JSON: ${(e as Error).message}`);
+    }
+    await trustTask<WitnessPublish.Payload, WitnessPublish.Response>(T.witnessPublish, {
+      mnemonic,
+      witness,
+    });
+  },
+
+  deleteDid: async (mnemonic: string): Promise<void> => {
+    await trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, { mnemonic });
+  },
+
+  /** Discard the last log entry: roll back to `versionCount - 1`. */
+  rollbackDid: async (mnemonic: string, versionCount: number): Promise<DidRecord> => {
+    if (versionCount < 2) {
+      throw new ApiError(400, "the first log entry cannot be rolled back");
+    }
+    const r = await trustTask<DidRollback.Payload, DidRollback.Response>(T.didRollback, {
+      mnemonic,
+      targetVersion: versionCount - 1,
+    });
+    return didRecordFromWire(r.record);
+  },
+
+  // ---- Stats ----
+
+  getStats: async (mnemonic: string): Promise<DidStats> =>
+    statsFromWire(
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }),
+    ),
+
+  getServerStats: async (): Promise<ServerStats> =>
+    statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {})),
+
+  getServerTimeseries: async (
+    range: TimeRange = "24h",
+    domain?: string,
+  ): Promise<TimeSeriesPoint[]> =>
+    timeseriesFromWire(
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
+        range: timeRangeToWire(range),
+        ...(domain ? { domain } : {}),
+      }),
+    ),
+
+  getDidTimeseries: async (
+    mnemonic: string,
+    range: TimeRange = "24h",
+  ): Promise<TimeSeriesPoint[]> =>
+    timeseriesFromWire(
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
+        range: timeRangeToWire(range),
+        mnemonic,
+      }),
+    ),
+
+  // ---- The deployment ----
+
+  getConfig: async (): Promise<ControlPlaneConfig> =>
+    configFromWire(
+      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}),
+    ),
+
+  /** Control plane + fleet + totals, for the dashboard. Admin. */
+  getServicesOverview: async (): Promise<ServiceOverview> => {
+    const [config, services, stats] = await Promise.all([
+      api.getConfig(),
+      api.listRegistry(),
+      api.getServerStats(),
+    ]);
+    const count = (s: ServiceInstance["status"]) =>
+      services.filter((i) => i.status === s).length;
+    return {
+      control: {
+        version: config.softwareVersion,
+        serverDid: config.controlDid,
+        publicUrl: config.publicUrl,
+        didcommEnabled: config.didcommEnabled,
+        tspEnabled: config.tspEnabled,
+        ...(config.advertisedServices ? { advertisedServices: config.advertisedServices } : {}),
+        enabledMethods: config.enabledMethods,
+      },
+      services,
+      aggregate: {
+        totalServices: services.length,
+        activeServices: count("active"),
+        degradedServices: count("degraded"),
+        unreachableServices: count("unreachable"),
+        totalDids: stats.totalDids,
+        totalResolves: stats.totalResolves,
+        totalUpdates: stats.totalUpdates,
+      },
+    };
+  },
+
+  listRegistry: async (): Promise<ServiceInstance[]> =>
+    (
+      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {})
+    ).instances.map(serviceInstanceFromWire),
+
+  /** Assign a hosting domain to a server instance; the control plane queues
+   *  the directive to the edge. */
+  assignDomainToServer: async (instanceId: string, domain: string): Promise<void> => {
+    await trustTask<DomainAssign.Payload, DomainAssign.Response>(T.domainAssign, {
+      instanceId,
+      domain,
+    });
+  },
+
+  /** Unassign; the edge schedules its purge after its grace period. */
+  unassignDomainFromServer: async (instanceId: string, domain: string): Promise<void> => {
+    await trustTask<DomainUnassign.Payload, DomainUnassign.Response>(T.domainUnassign, {
+      instanceId,
+      domain,
+    });
+  },
+
+  /** Admin "Purge now" on one edge. Refused while the domain is still
+   *  assigned to that edge (`stillAssigned`). */
+  purgeDomainOnServer: async (instanceId: string, domain: string): Promise<void> => {
+    await trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(
+      T.registryPurgeDomain,
+      { instanceId, domain },
+    );
+  },
+
+  // ---- ACL ----
   //
-  // The four methods below post to `/api/trust-tasks` carrying typed
-  // `acl/*` envelopes. The wire shape comes from the registry at
-  // https://trusttasks.org/spec/acl/; webvh-specific fields land
-  // inside `payload.entry.ext.vnd.affinidi.webvh.*`.
-  //
-  // The methods preserve the same TypeScript surface the UI screens
-  // already use (in, out, error semantics) so the ACL admin page
-  // didn't have to change shape — the wire format swap is invisible
-  // to the caller. The legacy `/api/acl/*` REST routes still exist
-  // on the server (deprecation-tagged); we no longer hit them from
-  // the UI. They are removed in v0.8.0.
-  //
-  // **Proofs**: v0.7.0 emits *unsigned* envelopes — the browser has
-  // no Data Integrity signing infrastructure today. The server's
-  // bearer JWT auth establishes the caller's identity end-to-end on
-  // the §4.8.1 transport channel. Operators with backend-only
-  // callers can flip `trust_tasks.enforce_proofs = true` server-side
-  // to require signed envelopes; v0.8.0 ships the session-key
-  // protocol that lets the UI sign too.
+  // The webvh-specific members travel under `ext["vnd.affinidi.webvh"]`.
 
   listAcl: async (): Promise<AclListResponse> => {
-    const resp = await trustTask<AclListEnvelopePayload, AclListResponsePayload>(
-      "https://trusttasks.org/spec/acl/list/0.1",
-      { /* no filters; defaults to everything paged */ },
-    );
-    return {
-      entries: (resp.entries ?? []).map(specEntryToLocal),
-    };
+    const resp = await trustTask<AclList.Payload, AclList.Response>(T.aclList, {});
+    return { entries: (resp.entries ?? []).map(aclEntryFromWire) };
   },
 
   createAcl: async (
     did: string,
-    role: "admin" | "owner" | "service",
+    role: Role,
     opts?: {
       label?: string;
       maxTotalSize?: number;
       maxDidCount?: number;
-      /** Optional DomainScope. Omit to inherit the daemon default
-       * (Owner → AllowedWithDefault on system default; Admin/Service → All). */
+      /** Omit to let the control plane pick the role's default scope. */
       domains?: DomainScope;
     },
   ): Promise<AclEntry> => {
-    // The webvh `vnd.affinidi.webvh` ext namespace requires `domains`
-    // because the auth path uses it on every request. Build a default
-    // when the caller didn't supply one; the server reshapes `All`
-    // appropriately for Admin/Service roles.
-    const webvhExt: Record<string, any> = {
-      domains: opts?.domains ?? { kind: "all" },
-    };
-    const quota: Record<string, number> = {};
-    if (typeof opts?.maxTotalSize === "number") {
-      quota.maxTotalSize = opts.maxTotalSize;
-    }
-    if (typeof opts?.maxDidCount === "number") {
-      quota.maxDidCount = opts.maxDidCount;
-    }
-    if (Object.keys(quota).length > 0) {
-      webvhExt.quota = quota;
-    }
-
-    const resp = await trustTask<AclGrantPayload, AclEntryResponsePayload>(
-      "https://trusttasks.org/spec/acl/grant/0.1",
-      {
-        entry: {
-          subject: did,
-          role,
-          ...(opts?.label !== undefined ? { label: opts.label } : {}),
-          ext: { "vnd.affinidi.webvh": webvhExt },
-        },
+    const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+      entry: {
+        subject: did,
+        role,
+        ...(opts?.label !== undefined ? { label: opts.label } : {}),
+        ext: webvhAclExt(opts?.domains ?? { kind: "all" }, opts?.maxTotalSize, opts?.maxDidCount),
       },
-    );
-    return specEntryToLocal(resp.entry);
+    });
+    return aclEntryFromWire(resp.entry);
   },
 
+  /**
+   * Change an entry. A role change is `acl/change-role` (state-checked
+   * against the current role); anything else re-emits `acl/grant` with the
+   * new metadata, which the maintainer treats as an idempotent update. A
+   * combined update sends both, role first.
+   */
   updateAcl: async (
     did: string,
     updates: {
-      role?: "admin" | "owner" | "service";
+      role?: Role;
       label?: string | null;
       maxTotalSize?: number | null;
       maxDidCount?: number | null;
       domains?: DomainScope;
     },
   ): Promise<AclEntry> => {
-    // v0.7's `updateAcl` was a kitchen-sink PUT that could change
-    // role + label + quotas + domains in one call. The acl/* spec
-    // family splits these:
-    //
-    //   - role change   → acl/change-role/0.1 (state-checked)
-    //   - other fields  → re-emit acl/grant/0.1 with the new entry
-    //     shape (the maintainer treats same-role grants as
-    //     idempotent updates of the metadata fields)
-    //
-    // We surface the same single `updateAcl(did, updates)` call by
-    // sequencing the two tasks as needed. A change-role-only update
-    // hits exactly one trust-task; a metadata-only update hits one;
-    // a combined update hits two with the role transition first.
     let entry: AclEntry | null = null;
+    const notFound = () => new ApiError(404, `subject ${did} not found in ACL`);
 
     if (updates.role !== undefined) {
-      // Need the existing role for the state-checked transition.
       const current = await api.aclShow(did);
-      if (!current) {
-        throw new ApiError(404, `subject ${did} not found in ACL`);
-      }
+      if (!current) throw notFound();
       if (current.role !== updates.role) {
-        const resp = await trustTask<AclChangeRolePayload, AclEntryResponsePayload>(
-          "https://trusttasks.org/spec/acl/change-role/0.1",
-          {
-            subject: did,
-            fromRole: current.role,
-            toRole: updates.role,
-          },
+        const resp = await trustTask<AclChangeRole.Payload, AclChangeRole.Response>(
+          T.aclChangeRole,
+          { subject: did, fromRole: current.role, toRole: updates.role },
         );
-        entry = specEntryToLocal(resp.entry);
+        entry = aclEntryFromWire(resp.entry);
       } else {
         entry = current;
       }
@@ -1072,217 +853,199 @@ export const api = {
 
     if (wantsMetadataUpdate) {
       const base = entry ?? (await api.aclShow(did));
-      if (!base) {
-        throw new ApiError(404, `subject ${did} not found in ACL`);
-      }
-      const webvhExt: Record<string, any> = {
-        domains: updates.domains ?? base.domains ?? { kind: "all" },
-      };
-      const quota: Record<string, number> = {};
-      const finalMaxTotalSize =
-        updates.maxTotalSize === undefined
-          ? base.max_total_size
-          : updates.maxTotalSize;
-      const finalMaxDidCount =
-        updates.maxDidCount === undefined
-          ? base.max_did_count
-          : updates.maxDidCount;
-      if (typeof finalMaxTotalSize === "number") {
-        quota.maxTotalSize = finalMaxTotalSize;
-      }
-      if (typeof finalMaxDidCount === "number") {
-        quota.maxDidCount = finalMaxDidCount;
-      }
-      if (Object.keys(quota).length > 0) {
-        webvhExt.quota = quota;
-      }
-
-      const finalLabel =
-        updates.label === undefined ? base.label : updates.label;
-
-      const resp = await trustTask<AclGrantPayload, AclEntryResponsePayload>(
-        "https://trusttasks.org/spec/acl/grant/0.1",
-        {
-          entry: {
-            subject: did,
-            role: base.role,
-            ...(finalLabel !== null && finalLabel !== undefined
-              ? { label: finalLabel }
-              : {}),
-            ext: { "vnd.affinidi.webvh": webvhExt },
-          },
+      if (!base) throw notFound();
+      const label = updates.label === undefined ? base.label : updates.label;
+      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+        entry: {
+          subject: did,
+          role: base.role,
+          ...(label !== null && label !== undefined ? { label } : {}),
+          ext: webvhAclExt(
+            updates.domains ?? base.domains ?? { kind: "all" },
+            updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize,
+            updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount,
+          ),
         },
-      );
-      entry = specEntryToLocal(resp.entry);
+      });
+      entry = aclEntryFromWire(resp.entry);
     }
 
     if (!entry) {
-      // Shouldn't happen: caller invoked update with no changes.
       const refreshed = await api.aclShow(did);
-      if (!refreshed) {
-        throw new ApiError(404, `subject ${did} not found in ACL`);
-      }
+      if (!refreshed) throw notFound();
       entry = refreshed;
     }
     return entry;
   },
 
-  /** Single-entry lookup (v0.7.0). Returns `null` when the subject
-   * is not in the ACL — distinct from a server error. */
+  /** Single-entry lookup. `null` when the subject is not in the ACL. */
   aclShow: async (did: string): Promise<AclEntry | null> => {
-    const resp = await trustTask<AclShowPayload, AclShowResponsePayload>(
-      "https://trusttasks.org/spec/acl/show/0.1",
-      { subject: did },
-    );
-    return resp.entry ? specEntryToLocal(resp.entry) : null;
+    const resp = await trustTask<AclShow.Payload, AclShow.Response>(T.aclShow, { subject: did });
+    return resp.entry ? aclEntryFromWire(resp.entry) : null;
   },
 
   deleteAcl: async (did: string): Promise<void> => {
-    await trustTask<AclRevokePayload, AclRevokeResponsePayload>(
-      "https://trusttasks.org/spec/acl/revoke/0.1",
-      { subject: did },
-    );
+    await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, { subject: did });
   },
 
-  // ---- Multi-domain (v0.7) ----
+  // ---- Hosting domains ----
 
-  /** GET /api/domains — Admin only. */
-  listDomains: () =>
-    request<any>("/api/domains").then(normalizeDomainList),
+  /** Every domain. Admin. */
+  listDomains: async (): Promise<DomainListResponse> => {
+    const r = await trustTask<DomainList.Payload, DomainList.Response>(T.domainList, {});
+    return {
+      domains: r.domains.map((d) => domainFromWire(d)),
+      default: r.default ?? null,
+    };
+  },
 
-  /** GET /api/me/domains — caller-scoped subset; returns the caller's
-   * default in the `default` field (falls back to the system default
-   * when the caller's scope is `All` / `Allowed` without a default). */
-  listMyDomains: () =>
-    request<any>("/api/me/domains").then(normalizeDomainList),
+  /** The caller's domains, with the caller's default. */
+  listMyDomains: async (): Promise<DomainListResponse> => {
+    const r = await trustTask<MeDomains.Payload, MeDomains.Response>(T.meDomains, {});
+    return {
+      domains: r.domains.map((d) => domainFromWire(d)),
+      default: r.default ?? null,
+    };
+  },
 
-  /** POST /api/domains — Admin creates a new domain. `setAsDefault`
-   * promotes it to the system default in the same call. */
-  createDomain: (input: {
+  /** Create a domain; `setAsDefault` promotes it in the same call. Admin. */
+  createDomain: async (input: {
     name: string;
     label?: string;
-    scheme?: DomainUrlScheme;
-    branding?: DomainBranding;
-    witnesses?: string[];
-    watchers?: string[];
-    quota?: DomainQuota;
-    wellKnownEnabled?: boolean;
     setAsDefault?: boolean;
-  }) =>
-    request<any>("/api/domains", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: input.name,
-        label: input.label,
-        scheme: input.scheme,
-        branding: input.branding,
-        witnesses: input.witnesses,
-        watchers: input.watchers,
-        quota: input.quota,
-        well_known_enabled: input.wellKnownEnabled,
-        set_as_default: input.setAsDefault,
-      }),
-    }).then(normalizeDomain),
-
-  /** PUT /api/domains/{name} — Admin updates metadata. Status,
-   * default-flag, and created_at are preserved. */
-  updateDomain: (
-    name: string,
-    updates: Partial<{
-      label: string;
-      scheme: DomainUrlScheme;
-      branding: DomainBranding;
-      witnesses: string[];
-      watchers: string[];
-      quota: DomainQuota;
-      wellKnownEnabled: boolean;
-    }>,
-  ) =>
-    request<any>(`/api/domains/${encodeURIComponent(name)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        label: updates.label,
-        scheme: updates.scheme,
-        branding: updates.branding,
-        witnesses: updates.witnesses,
-        watchers: updates.watchers,
-        quota: updates.quota,
-        well_known_enabled: updates.wellKnownEnabled,
-      }),
-    }).then(normalizeDomain),
-
-  disableDomain: (name: string) =>
-    request<any>(`/api/domains/${encodeURIComponent(name)}/disable`, {
-      method: "POST",
-    }).then(normalizeDomain),
-
-  enableDomain: (name: string) =>
-    request<any>(`/api/domains/${encodeURIComponent(name)}/enable`, {
-      method: "POST",
-    }).then(normalizeDomain),
-
-  setDefaultDomain: (name: string) =>
-    request<any>(
-      `/api/domains/${encodeURIComponent(name)}/set-default`,
-      { method: "POST" },
-    ).then(normalizeDomain),
-
-  /** DELETE /api/domains/{name} — admin force-delete of a disabled
-   *  domain. Bypasses the `hosting.disable_purge_grace` cooling-off
-   *  window. Server refuses when the domain is Active or the current
-   *  default. Returns void (204 No Content).
-   *
-   *  `purgeServers: true` adds the T30 `domain.purge/1.0` DIDComm
-   *  fan-out: every server instance whose `served_domains` includes
-   *  this domain gets a purge message before the control record is
-   *  removed. Fire-and-forget on the DIDComm side — the local delete
-   *  proceeds without waiting for acks. */
-  /** DELETE /api/domains/{name}. Requires an aal2 (stepped-up) session
-   *  per the security review — the caller MUST have already passed
-   *  the step-up flow before this resolves. Sends `confirm=<name>` as
-   *  a typo guard the server checks against the path segment. */
-  deleteDomain: (name: string, opts?: { purgeServers?: boolean }) => {
-    const params = new URLSearchParams({ confirm: name });
-    if (opts?.purgeServers) params.set("purge_servers", "true");
-    return request<void>(
-      `/api/domains/${encodeURIComponent(name)}?${params.toString()}`,
-      { method: "DELETE" },
-    );
+  }): Promise<DomainEntry> => {
+    const r = await trustTask<DomainCreate.Payload, DomainCreate.Response>(T.domainCreate, {
+      name: input.name,
+      ...(input.label ? { label: input.label } : {}),
+      ...(input.setAsDefault ? { setAsDefault: true } : {}),
+    });
+    return domainFromWire(r.entry);
   },
 
-  // ---- Registry + per-(server, domain) ops (admin) ----
-
-  listRegistry: () => request<ServiceInstance[]>("/api/control/registry"),
-
-  /** POST /api/control/registry/{id}/domains/{domain}/assign — pushes
-   * the assign Trust Task to the named server instance. */
-  assignDomainToServer: (instanceId: string, domain: string) =>
-    request<void>(
-      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/assign`,
-      { method: "POST" },
+  disableDomain: async (name: string): Promise<DomainEntry> =>
+    domainFromWire(
+      (
+        await trustTask<DomainSetState.Payload, DomainSetState.Response>(T.domainSetState, {
+          name,
+          state: "disabled",
+        })
+      ).entry,
     ),
 
-  /** Same shape — schedules a pending purge on the server side with
-   * `unassigned_purge_grace` window. */
-  unassignDomainFromServer: (instanceId: string, domain: string) =>
-    request<void>(
-      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/unassign`,
-      { method: "POST" },
+  enableDomain: async (name: string): Promise<DomainEntry> =>
+    domainFromWire(
+      (
+        await trustTask<DomainSetState.Payload, DomainSetState.Response>(T.domainSetState, {
+          name,
+          state: "active",
+        })
+      ).entry,
     ),
 
-  /** Admin "Purge now" — bypasses the grace and deletes every DID on
-   * the named domain on the target server immediately. */
-  purgeDomainOnServer: (instanceId: string, domain: string) =>
-    request<void>(
-      `/api/control/registry/${encodeURIComponent(instanceId)}/domains/${encodeURIComponent(domain)}/purge`,
-      { method: "POST" },
+  setDefaultDomain: async (name: string): Promise<DomainEntry> =>
+    domainFromWire(
+      (
+        await trustTask<DomainSetDefault.Payload, DomainSetDefault.Response>(
+          T.domainSetDefault,
+          { name },
+        )
+      ).entry,
     ),
 
-  getConfig: () => request<ControlPlaneConfig>("/api/config"),
+  /**
+   * Force-delete a disabled domain now, ahead of its grace window. Refused
+   * while the domain is active or the default.
+   *
+   * Needs a stepped-up (`aal2`) session. A passkey login already is one; a
+   * wallet session is stepped up through the wallet when the control plane
+   * asks for it, and the purge is then sent once more.
+   *
+   * `purgeServers` also sends the purge to every edge serving the domain.
+   */
+  deleteDomain: async (name: string, opts?: { purgeServers?: boolean }): Promise<void> => {
+    const purge = () =>
+      trustTask<DomainPurge.Payload, DomainPurge.Response>(T.domainPurge, {
+        name,
+        ...(opts?.purgeServers ? { purgeServers: true } : {}),
+      });
+    try {
+      await purge();
+    } catch (e) {
+      if (!isRejection(e, "stepUpRequired")) throw e;
+      await api.stepUp();
+      await purge();
+    }
+  },
 
-  // Passkey auth
+  /**
+   * Raise this session to `aal2` through the wallet: the wallet sends
+   * `auth/step-up/start`, verifies the signed approve-request it gets back,
+   * asks the user, answers with a signed `approve-response`, and renews the
+   * session with `auth/refresh`. The new tokens replace the old ones here.
+   *
+   * Only a wallet session can do this; a passkey session is `aal2` from login.
+   */
+  stepUp: async (): Promise<void> => {
+    const wallet = typeof window !== "undefined" ? window.vtaWallet : undefined;
+    const accessToken = getToken();
+    const refreshToken = getRefreshToken();
+    const sessionId = getSessionId();
+    if (getAuthMethod() !== "wallet" || !wallet?.stepUpVta) {
+      throw new ApiError(
+        403,
+        "This action needs a stepped-up session. Sign in again with a passkey, or with a wallet that supports step-up.",
+      );
+    }
+    if (!accessToken || !refreshToken || !sessionId) {
+      throw new ApiError(401, "No session to step up — sign in again.");
+    }
+    const { serviceDid } = await getServiceInfo();
+    const result = await wallet.stepUpVta({
+      baseUrl: getApiBase(),
+      rpDid: serviceDid,
+      accessToken,
+      refreshToken,
+      sessionId,
+    });
+    setToken(result.accessToken);
+    setRefreshToken(result.refreshToken);
+  },
+
+  // ---- Passkey login (Trust Tasks) ----
+
+  /** Open a login ceremony. Sent anonymously: opening one authorises nothing. */
+  passkeyLoginStart: async (): Promise<LoginStartResponse> => {
+    const r = await trustTask<LoginStart.Payload, LoginStart.Response>(
+      T.loginStart,
+      { purpose: "login" },
+      { signer: "none", anonymous: true },
+    );
+    return { authId: r.authId, options: r.options };
+  },
+
+  /**
+   * Finish the ceremony. The document is signed by a fresh session key as its
+   * own `did:key`; the control plane binds the new session to exactly that
+   * key, so every later request in the session must be signed by it. The
+   * private key never leaves this browser.
+   */
+  passkeyLoginFinish: async (
+    authId: string,
+    credential: LoginFinish.Payload["credential"],
+  ): Promise<LoginTokens> => {
+    const r = await trustTask<LoginFinish.Payload, LoginFinish.Response>(
+      T.loginFinish,
+      { authId, credential },
+      { signer: "fresh-session-key", anonymous: true },
+    );
+    if (r.purpose !== "login" || !r.tokens) {
+      throw new ApiError(502, "the control plane finished a login without issuing a session");
+    }
+    return { accessToken: r.tokens.accessToken, refreshToken: r.tokens.refreshToken ?? null };
+  },
+
+  // ---- Passkey enrolment (REST until its Trust Tasks are served) ----
+
   passkeyEnrollStart: (token: string) =>
     request<EnrollStartResponse>("/api/auth/passkey/enroll/start", {
       method: "POST",
@@ -1297,631 +1060,38 @@ export const api = {
       body: JSON.stringify({ registration_id: registrationId, credential }),
     }),
 
-  passkeyLoginStart: () =>
-    request<LoginStartResponse>("/api/auth/passkey/login/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    }),
-
-  passkeyLoginFinish: async (authId: string, credential: any) => {
-    // Generate a fresh ephemeral Ed25519 keypair for this browser
-    // session and send the public multikey to the server. The server
-    // binds it to the JWT session so REQUIRED-spec trust-task
-    // requests (acl/grant, acl/revoke, acl/change-role) can carry
-    // `eddsa-jcs-2022` Data Integrity proofs signed with the matching
-    // private key. The private key stays in the CryptoKey wrapper
-    // and never leaves this tab.
-    const { pubkeyMultikey } = await generateSessionKeypair();
-    return request<TokenResponse>("/api/auth/passkey/login/finish", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        auth_id: authId,
-        credential,
-        session_pubkey_b58btc: pubkeyMultikey,
-      }),
-    });
-  },
-
-  createInvite: (did: string, role: "admin" | "owner" | "service") =>
+  createInvite: (did: string, role: Role) =>
     request<CreateInviteResponse>("/api/auth/passkey/invite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ did, role }),
     }),
 
-  listInvites: () =>
-    request<InviteListResponse>("/api/auth/passkey/invites"),
+  // ---- Enrolment invites (Trust Tasks) ----
 
-  updateInvite: (
+  listInvites: async (): Promise<InviteListResponse> => {
+    const r = await trustTask<InviteList.Payload, InviteList.Response>(T.inviteList, {});
+    return { invites: r.invites.map(inviteFromWire) };
+  },
+
+  /** Change a pending invite's role, or push its expiry out. */
+  updateInvite: async (
     inviteId: string,
-    updates: {
-      role?: "admin" | "owner" | "service";
-      expires_at?: number;
-      extend_ttl?: number;
-    },
-  ) =>
-    request<InviteListItem>(
-      `/api/auth/passkey/invite/${encodeURIComponent(inviteId)}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updates),
-      },
-    ),
+    updates: { role?: Role; expiresAt?: string; extendBy?: number },
+  ): Promise<InviteListItem> => {
+    // Only the members actually given: a document carrying an `undefined`
+    // member cannot be canonicalised for its proof, and the spec reads an
+    // absent member as "unchanged".
+    const r = await trustTask<InviteUpdate.Payload, InviteUpdate.Response>(T.inviteUpdate, {
+      inviteId,
+      ...(updates.role !== undefined ? { role: updates.role } : {}),
+      ...(updates.expiresAt !== undefined ? { expiresAt: updates.expiresAt } : {}),
+      ...(updates.extendBy !== undefined ? { extendBy: updates.extendBy } : {}),
+    });
+    return inviteFromWire(r.invite);
+  },
 
-  revokeInvite: (inviteId: string) =>
-    request<void>(`/api/auth/passkey/invite/${encodeURIComponent(inviteId)}`, {
-      method: "DELETE",
-    }),
+  revokeInvite: async (inviteId: string): Promise<void> => {
+    await trustTask<InviteRevoke.Payload, InviteRevoke.Response>(T.inviteRevoke, { inviteId });
+  },
 };
-
-// ---------------------------------------------------------------------------
-// Trust Tasks transport (v0.7.0+)
-// ---------------------------------------------------------------------------
-
-/** Trust Tasks framework Type URI prefix. */
-const TT_RESPONSE_FRAGMENT = "#response";
-
-/**
- * Is this reply document a framework error document, at any `0.x` minor?
- *
- * Matched by slug rather than pinned to a version. This was `=== ".../0.1"`,
- * and `trust-tasks-rs` has emitted `trust-task-error/0.3` since its 0.3 release
- * (it carries the §8.2 `inResponseTo` member, which `0.2`'s
- * `additionalProperties: false` payload schema cannot admit) — so the control
- * plane this UI talks to, on 0.4.1, has not sent a document this recognised in
- * some time. SPEC.md §5.2's forward-minor rule says a consumer SHOULD accept a
- * later minor; matching the slug means the next one cannot break it again.
- * `1.x` is excluded on purpose: a major bump is where the payload shape may
- * change, and `TrustTaskErrorPayload` is read directly off it.
- */
-function isTrustTaskErrorType(type: string | undefined): boolean {
-  if (typeof type !== "string") return false;
-  return /^https:\/\/trusttasks\.org\/spec\/trust-task-error\/0\.\d+$/.test(type);
-}
-
-/** Outer envelope shape produced by every `trustTask()` call. */
-interface TrustTaskEnvelope<P> {
-  id: string;
-  type: string;
-  issuer?: string;
-  recipient?: string;
-  issuedAt?: string;
-  payload: P;
-}
-
-/** `trust-task-error/0.1` payload shape. Mirrors `trust_tasks_rs::ErrorPayload`. */
-interface TrustTaskErrorPayload {
-  code: string;
-  message?: string;
-  retryable: boolean;
-  retryAfter?: string;
-  details?: any;
-}
-
-/**
- * An `ApiError` that keeps the `trust-task-error/0.1` payload, so the
- * retry policy in `trustTask()` can read `code` / `retryable` /
- * `retryAfter` instead of matching on a message string. Callers that only
- * want the message keep working — this is an `ApiError` with the same
- * `status` and `message` as before.
- */
-/**
- * Recover a {@link TrustTaskRejection} from an {@link ApiError} whose body is a
- * framework error document, or `null` when it is anything else.
- *
- * Deliberately strict about what counts: the type must be a framework error
- * document and the payload must carry a `code`. A body that merely happens to
- * be JSON — an HTML error page is not, but a reverse proxy's `{"error": …}` is
- * — must not be dressed up as a Trust-Task rejection, or the retry policy would
- * be reading fields off a shape nobody promised.
- */
-function trustTaskRejectionFrom(err: ApiError): TrustTaskRejection | null {
-  if (!err.body) return null;
-  let doc: { type?: unknown; payload?: unknown };
-  try {
-    doc = JSON.parse(err.body);
-  } catch {
-    return null;
-  }
-  if (!isTrustTaskErrorType(typeof doc?.type === "string" ? doc.type : undefined)) {
-    return null;
-  }
-  const payload = doc.payload as TrustTaskErrorPayload | undefined;
-  if (!payload || typeof payload.code !== "string") return null;
-  return new TrustTaskRejection(
-    payload.message ?? payload.code ?? "trust task rejected",
-    payload,
-    err.status,
-  );
-}
-
-export class TrustTaskRejection extends ApiError {
-  constructor(
-    message: string,
-    public payload: TrustTaskErrorPayload,
-    // The status the rejection actually arrived at. `status_for_code` maps the
-    // framework code onto it (permissionDenied → 403, notFound → 404,
-    // taskFailed → 422), so reporting a flat 422 for all of them told anything
-    // reading `.status` — an error banner, a redirect on 401/403 — the wrong
-    // thing. Defaults to 422 for the 2xx-bodied path, which carries no status
-    // of its own.
-    status = 422,
-  ) {
-    super(status, message);
-    this.name = "TrustTaskRejection";
-  }
-}
-
-/**
- * The code that is safe to auto-retry on *any* task.
- *
- * `unavailable` is the spec's unambiguous "temporarily unable to process"
- * (SPEC §8.3) — the task did **not** run, so re-issuing cannot double-apply
- * a mutation.
- */
-const ALWAYS_RETRY_CODES = new Set<string>(["unavailable"]);
-
-/**
- * Task types where re-issuing is safe even when the error is *ambiguous*
- * about whether the first attempt took effect (`internalError`) — either
- * because the task has no side effects, or because applying it twice is
- * a no-op.
- *
- * This is the distinction that makes honoring the flag useful against
- * this control plane at all: it emits `internalError` (retryable by
- * default in `trust_tasks_rs`) but never `unavailable`, so a code-only
- * policy would be inert. Safety comes from what the *task* does, not from
- * the code.
- *
- * Membership is a claim about the maintainer's semantics, so each entry
- * cites the rule that makes it true:
- *
- * * `acl/list`, `acl/show` — reads. Nothing to duplicate.
- * * `acl/grant` — idempotent by SPEC §3, "re-emitting an identical grant
- *   produces no state change". The handler's equal-role arm merges the
- *   producer's metadata and persists only when a field actually changed
- *   (`handlers/grant.rs`), so a re-issue after a first attempt that
- *   silently succeeded is a no-op.
- *
- * Deliberately excluded — and *not* because they would corrupt state;
- * both fail cleanly on re-issue — but because the failure would be
- * misleading, reporting an error for an operation that succeeded:
- *
- * * `acl/revoke` — a re-issue after a successful full removal is
- *   rejected `acl/revoke:subject_not_present`.
- * * `acl/change-role` — state-checked against `fromRole`, so a re-issue
- *   after success is rejected `acl/change-role:state_mismatch`.
- *
- * Enumerated rather than derived as "not a mutation", so a future
- * proofless *write* cannot silently inherit auto-retry. Adding an entry
- * means answering: if the first attempt already took effect, is a second
- * one a no-op?
- */
-const REISSUE_SAFE_TASK_TYPES = new Set<string>([
-  "https://trusttasks.org/spec/acl/list/0.1",
-  "https://trusttasks.org/spec/acl/show/0.1",
-  "https://trusttasks.org/spec/acl/grant/0.1",
-]);
-
-/** Codes that are retryable per the framework but ambiguous about whether
- *  the task ran — honored only on a `REISSUE_SAFE_TASK_TYPES` task. */
-const AMBIGUOUS_RETRY_CODES = new Set<string>(["internalError"]);
-
-/** Extra attempts after the first. One is enough to ride out a restart or
- *  a brief mediator hiccup; more would just delay showing the user a real
- *  failure. */
-const TRUST_TASK_MAX_RETRIES = 1;
-
-/** Cap on an honored `retryAfter`, so a server can't park the UI on a
- *  spinner. Past this we surface the error and let the user retry. */
-const TRUST_TASK_MAX_RETRY_DELAY_MS = 5_000;
-
-/** Fallback pause when the server marks an error retryable but gives no
- *  `retryAfter`. */
-const TRUST_TASK_DEFAULT_RETRY_DELAY_MS = 500;
-
-/**
- * Apply SPEC §8.4 retry semantics to a rejection, returning how long to
- * wait before re-issuing, or `null` to give up and surface the error.
- *
- * Mirrors `trust_tasks_rs::ErrorPayload::should_retry_at`: retry only when
- * `retryable` is set and any `retryAfter` has elapsed. We additionally
- * *wait out* a near-future `retryAfter` rather than failing on it, which
- * is what makes the hint useful in an interactive UI.
- *
- * Exported for `lib/__tests__/trust-task-retry.test.ts`; not part of the
- * client surface.
- */
-export function retryDelayMs(
-  typeUri: string,
-  payload: TrustTaskErrorPayload,
-  now: number,
-): number | null {
-  // The server's flag is necessary but not sufficient: it says "retrying
-  // is allowed", not "re-issuing this particular task is safe".
-  if (!payload.retryable) return null;
-  const safe =
-    ALWAYS_RETRY_CODES.has(payload.code) ||
-    (AMBIGUOUS_RETRY_CODES.has(payload.code) &&
-      REISSUE_SAFE_TASK_TYPES.has(typeUri));
-  if (!safe) return null;
-
-  if (payload.retryAfter === undefined) {
-    return TRUST_TASK_DEFAULT_RETRY_DELAY_MS;
-  }
-  const at = Date.parse(payload.retryAfter);
-  // An unparseable hint is not a reason to hammer the server.
-  if (Number.isNaN(at)) return null;
-  const wait = at - now;
-  if (wait <= 0) return 0;
-  return wait <= TRUST_TASK_MAX_RETRY_DELAY_MS ? wait : null;
-}
-
-/** Per-spec request-payload shapes used by the ACL surface. */
-interface AclGrantPayload {
-  entry: SpecAclEntry;
-  reason?: string;
-  ext?: Record<string, any>;
-}
-interface AclRevokePayload {
-  subject: string;
-  scopes?: string[];
-  reason?: string;
-  ext?: Record<string, any>;
-}
-interface AclChangeRolePayload {
-  subject: string;
-  fromRole: string;
-  toRole: string;
-  reason?: string;
-  ext?: Record<string, any>;
-}
-interface AclShowPayload {
-  subject: string;
-  ext?: Record<string, any>;
-}
-interface AclListEnvelopePayload {
-  role?: string;
-  scope?: string;
-  subjectPrefix?: string;
-  pageSize?: number;
-  cursor?: string;
-  ext?: Record<string, any>;
-}
-
-/** Per-spec response-payload shapes. */
-interface AclEntryResponsePayload {
-  entry: SpecAclEntry;
-  ext?: Record<string, any>;
-}
-interface AclShowResponsePayload {
-  entry: SpecAclEntry | null;
-  redactedFields?: string[];
-  ext?: Record<string, any>;
-}
-interface AclRevokeResponsePayload {
-  entry: SpecAclEntry | null;
-  ext?: Record<string, any>;
-}
-interface AclListResponsePayload {
-  entries: SpecAclEntry[];
-  truncated: boolean;
-  cursor?: string;
-  redactedFields?: string[];
-  ext?: Record<string, any>;
-}
-
-/** Wire-form AclEntry per the spec's _shared/0.1/acl-entry.schema.json. */
-interface SpecAclEntry {
-  subject: string;
-  role: string;
-  scopes?: string[];
-  label?: string;
-  createdAt?: string;
-  createdBy?: string;
-  updatedAt?: string;
-  updatedBy?: string;
-  expiresAt?: string;
-  ext?: Record<string, any>;
-}
-
-/**
- * The only trust task the admin UI may send without a Data Integrity proof.
- *
- * The control plane refuses every privileged document that is not signed and
- * bound to its sender — ACL reads (`acl/list`, `acl/show`) included, not just
- * the mutations — so every envelope is signed except capability discovery,
- * which authorises nothing.
- */
-const PROOFLESS_TYPES = new Set<string>([
-  "https://trusttasks.org/spec/trust-task-discovery/0.1",
-]);
-
-/**
- * The DID the current bearer session authenticated — the access token's
- * `sub`. Read, not verified: the server verified it when it issued the token
- * and verifies it again on every request. The UI needs it because every signed
- * envelope must name its `issuer` in-band.
- */
-export function getSessionSubjectDid(): string | null {
-  const token = getToken();
-  const payload = token?.split(".")[1];
-  if (!payload) return null;
-  try {
-    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    const claims = JSON.parse(atob(padded)) as { sub?: unknown };
-    return typeof claims.sub === "string" ? claims.sub : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * POST `/api/trust-tasks` with a typed envelope; throw an `ApiError`
- * for `trust-task-error/0.1` responses, return the typed response
- * payload otherwise.
- *
- * Every envelope except discovery carries an `eddsa-jcs-2022` Data Integrity
- * proof: from the wallet on a wallet login, or from the ephemeral session
- * keypair generated at a passkey login. For the session key, the proof's
- * `verificationMethod` is the `did:key` of the session pubkey, and the server
- * accepts it only as that exact key acting for the JWT subject.
- *
- * `issuer` is always set in-band, to the session's subject DID. The server
- * refuses a proof that names no issuer — an issuer-less proof would only show
- * that *someone* signed, not who the document is from. `recipient`, too, is set on
- * *every* envelope: under the Trust Tasks 0.2 framework every spec the UI
- * sends is recipient-REQUIRED (`IS_RECIPIENT_REQUIRED = true`), proofless
- * reads (acl/list, acl/show, trust-task-discovery) included. SPEC §7.2 item
- * 5b rejects a recipient-less document with `malformedRequest` *before* the
- * proof is even examined, and §4.8.1 transport-fill does NOT satisfy it —
- * the recipient must be carried in-band. For signed specs (acl/grant,
- * acl/revoke, acl/change-role) the same field doubles as §4.8.2 audience
- * binding so the signature is bound to *this* server and can't be replayed
- * against another verifier. The proof's `verificationMethod` ties the
- * signature to the session keypair, not the JWT subject's published DID.
- */
-async function sendTrustTaskOnce<Req, Resp>(
-  typeUri: string,
-  payload: Req,
-): Promise<Resp> {
-  const id = `urn:uuid:${cryptoRandomUuid()}`;
-  const envelope: TrustTaskEnvelope<Req> = {
-    id,
-    type: typeUri,
-    issuedAt: new Date().toISOString(),
-    payload,
-  };
-
-  // REQUIRED-spec envelopes need a Data Integrity proof. The
-  // resolution order:
-  //   1. In-memory keypair from this tab (login or earlier restore).
-  //   2. IndexedDB restore — survives page reloads while the JWT is
-  //      still cached in localStorage, so the user doesn't have to
-  //      re-login every time they refresh the admin page.
-  //   3. Fall through to generate a fresh keypair (will fail server-
-  //      side with `proof_invalid` because the new pubkey isn't bound
-  //      to the JWT) — the failure prompts the user to log in again.
-  // §7.2 item 5b / §4.8.2 audience binding: every spec the admin UI sends is
-  // recipient-REQUIRED under Trust Tasks 0.2, so bind the audience on *every*
-  // envelope — proofless reads (acl/list, acl/show, trust-task-discovery)
-  // included. Omitting it is rejected with `malformedRequest` ("specification
-  // declares recipient REQUIRED but the document carries no in-band
-  // recipient") before the proof is ever checked.
-  const info = await getServerInfo();
-  if (!info.server_did) {
-    throw new ApiError(
-      500,
-      "server_did is not configured — trust tasks cannot be sent",
-    );
-  }
-  envelope.recipient = info.server_did;
-
-  // Every signed envelope names its issuer: the DID this session authenticated.
-  const subject = getSessionSubjectDid();
-  if (!subject) {
-    throw new ApiError(401, "Not signed in — trust tasks need an authenticated session to sign as.");
-  }
-
-  if (!PROOFLESS_TYPES.has(typeUri)) {
-    envelope.issuer = subject;
-    // Two signing paths, picked by which login flow produced the JWT:
-    //
-    // (1) Wallet login → the VTI browser extension's holder did:peer is the
-    //     signing authority. The wallet adds the eddsa-jcs-2022 proof
-    //     server-side from the page's perspective (it runs in the
-    //     extension's offscreen doc with the private key). The server
-    //     resolves the did:peer to verify; the dispatch_trust_task pre-check
-    //     enforces that the proof's DID == JWT.sub.
-    //
-    // (2) Passkey login → ephemeral session keypair (generated at login,
-    //     pubkey bound to the JWT by the server). dispatch_trust_task
-    //     enforces that the proof's verificationMethod is exactly the
-    //     JWT-bound `did:key:{pk}#{pk}`.
-    const method = getAuthMethod();
-    if (method === "wallet") {
-      const wallet = (
-        typeof window !== "undefined"
-          ? (window as unknown as {
-              vtaWallet?: {
-                signTrustTask: (p: {
-                  envelope: Record<string, unknown>;
-                  asDid?: string;
-                }) => Promise<{ signedEnvelope: Record<string, unknown> }>;
-              };
-            }).vtaWallet
-          : undefined
-      );
-      if (!wallet?.signTrustTask) {
-        throw new ApiError(
-          401,
-          "Wallet-authenticated session but the VTA Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
-        );
-      }
-      // Wallet-authenticated sessions split into two cases:
-      //   - Holder login: session is bound to the wallet's holder DID,
-      //     proof.verificationMethod = that holder, matches. Pass no asDid;
-      //     wallet signs with its own holder key.
-      //   - Proxy login: session is bound to a vault entry's principalDid
-      //     (the SIOP id_token's iss/sub). Long-term key lives at the VTA,
-      //     so the wallet has to ask the VTA to sign as that DID via
-      //     vault/sign-trust-task/0.1. Without `asDid` the wallet would
-      //     sign with the holder, the server's check
-      //     `proof.verificationMethod == authenticated caller` would fail,
-      //     and we'd get `proof_invalid`.
-      const sessionPrincipalDid = getSessionPrincipalDid();
-      const signed = await wallet.signTrustTask({
-        envelope: envelope as unknown as Record<string, unknown>,
-        ...(sessionPrincipalDid ? { asDid: sessionPrincipalDid } : {}),
-      });
-      // Replace our envelope with the signed one (the wallet may have
-      // copied + added `proof`; the rest of the fields must be byte-
-      // identical so the server's JCS hash matches).
-      Object.assign(envelope as unknown as Record<string, unknown>, signed.signedEnvelope);
-    } else {
-      if (!hasSessionKeypair()) {
-        await restoreSessionKeypair();
-      }
-      if (!hasSessionKeypair()) {
-        await generateSessionKeypair();
-      }
-      await signEnvelope(envelope as unknown as Record<string, unknown>);
-    }
-  }
-
-  let respDoc: TrustTaskEnvelope<Resp | TrustTaskErrorPayload>;
-  try {
-    respDoc = await request<TrustTaskEnvelope<Resp | TrustTaskErrorPayload>>(
-      "/api/trust-tasks",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(envelope),
-      },
-    );
-  } catch (e) {
-    // A rejection is a *document*, and it arrives at a non-2xx status:
-    // `into_response` maps the framework code through `status_for_code`
-    // (permissionDenied → 403, taskFailed → 422, …). `request()` throws on the
-    // status, so without this the document never reached the branch below —
-    // every rejection surfaced as a bare `ApiError` carrying the serialised
-    // JSON as its message, and the §8.4 retry policy, which reads `code` and
-    // `retryable` off the payload, could never run at all.
-    //
-    // Read the body before deciding what the failure was (the same rule the
-    // sibling wallet learned as guide R3.7). Anything that is not a
-    // trust-task error document — a proxy error page, an auth failure, a
-    // network-level fault — is re-thrown untouched.
-    const rejection = e instanceof ApiError ? trustTaskRejectionFrom(e) : null;
-    if (rejection) throw rejection;
-    throw e;
-  }
-
-  // Successful response carries `type: <request-type>#response`. An error
-  // response carries a framework `trust-task-error/0.x` type. We discriminate
-  // on the response envelope's `type` to surface the right shape to the caller.
-  // Reachable when a peer answers a rejection at a 2xx status; the non-2xx
-  // path is handled above.
-  if (isTrustTaskErrorType(respDoc.type)) {
-    const err = respDoc.payload as TrustTaskErrorPayload;
-    throw new TrustTaskRejection(
-      err.message ?? err.code ?? "trust task rejected",
-      err,
-    );
-  }
-  if (!respDoc.type.endsWith(TT_RESPONSE_FRAGMENT)) {
-    throw new ApiError(
-      500,
-      `unexpected trust-task response type: ${respDoc.type}`,
-    );
-  }
-  return respDoc.payload as Resp;
-}
-
-/**
- * Send a trust task, honoring the server's `retryable` / `retryAfter`
- * hints (SPEC §8.4) instead of discarding them.
- *
- * Every attempt goes through `sendTrustTaskOnce`, which builds a **fresh**
- * envelope: new `id`, new `issuedAt`, and — for signed specs — a new proof
- * with a new `created`. That is deliberate. §8.4's "retry" is the strict
- * bit-for-bit resend, which is useless for a signed envelope: the same
- * `created` that was just rejected would be rejected again. Re-issuing
- * under a fresh `id` is always permitted by the spec and is the only form
- * of retry that can actually succeed here.
- *
- * Which is exactly why the policy is narrow. A re-issued document is a
- * *new* task, so if the first one had already taken effect the server
- * would apply it again. Auto-retry is therefore limited to the code that
- * guarantees the task did not run (`unavailable`), plus `internalError`
- * on tasks where a second application is a no-op. See
- * `REISSUE_SAFE_TASK_TYPES` before widening either.
- */
-async function trustTask<Req, Resp>(
-  typeUri: string,
-  payload: Req,
-): Promise<Resp> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await sendTrustTaskOnce<Req, Resp>(typeUri, payload);
-    } catch (e) {
-      if (!(e instanceof TrustTaskRejection) || attempt >= TRUST_TASK_MAX_RETRIES) {
-        throw e;
-      }
-      const delay = retryDelayMs(typeUri, e.payload, Date.now());
-      if (delay === null) throw e;
-      // eslint-disable-next-line no-console
-      console.debug(
-        `trust task ${typeUri} rejected as ${e.payload.code} (retryable); re-issuing in ${delay}ms`,
-      );
-      if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-  }
-}
-
-/** Browser-safe UUIDv4. Falls back to a polyfill where crypto.randomUUID
- * isn't available (e.g. iOS Safari < 15.4). */
-function cryptoRandomUuid(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  // RFC 4122 v4 polyfill via getRandomValues.
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
-    .slice(6, 8)
-    .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
-}
-
-/** Project a spec-wire `SpecAclEntry` into the existing `AclEntry`
- * shape the UI screens already render. The wire form carries webvh
- * fields under `ext.vnd.affinidi.webvh.*`; the UI reads them off
- * the top-level `AclEntry` for backwards-compat with v0.7 code. */
-function specEntryToLocal(spec: SpecAclEntry): AclEntry {
-  const role = spec.role as "admin" | "owner" | "service";
-  const webvh: any = spec.ext?.["vnd.affinidi.webvh"] ?? {};
-  const quota: any = webvh.quota ?? {};
-  const createdAt = spec.createdAt
-    ? Math.floor(new Date(spec.createdAt).getTime() / 1000)
-    : 0;
-  return {
-    did: spec.subject,
-    role,
-    label: spec.label ?? null,
-    created_at: createdAt,
-    max_total_size:
-      typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
-    max_did_count:
-      typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
-    domains: (webvh.domains as DomainScope | undefined) ?? { kind: "all" },
-  };
-}

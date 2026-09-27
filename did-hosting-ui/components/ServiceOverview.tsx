@@ -134,17 +134,6 @@ function mismatchWarning(
   return null;
 }
 
-function StatValue({ label, value }: { label: string; value: string | number }) {
-  return (
-    <View style={styles.statItem}>
-      <Text style={styles.statLabel}>{label}</Text>
-      <Text style={styles.statValue}>
-        {typeof value === "number" ? value.toLocaleString() : value}
-      </Text>
-    </View>
-  );
-}
-
 function ServiceCard({
   service,
   agentNames,
@@ -205,20 +194,6 @@ function ServiceCard({
           Health check {timeAgo(service.lastHealthCheck)}
         </Text>
       </View>
-
-      {service.stats && (
-        <View style={styles.serviceStatsRow}>
-          <StatValue label="DIDs" value={service.stats.totalDids} />
-          <StatValue label="Resolves" value={service.stats.totalResolves} />
-          <StatValue label="Updates" value={service.stats.totalUpdates} />
-          <StatValue
-            label="Last Active"
-            value={timeAgo(
-              service.stats.lastResolvedAt ?? service.stats.lastUpdatedAt,
-            )}
-          />
-        </View>
-      )}
     </View>
   );
 }
@@ -821,29 +796,9 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: colors.textTertiary,
   },
-  serviceStatsRow: {
-    flexDirection: "row",
-    gap: spacing.md,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    paddingTop: spacing.sm,
-  },
   statItem: {
     flex: 1,
     alignItems: "center",
-  },
-  statLabel: {
-    fontSize: 10,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    marginBottom: 2,
-  },
-  statValue: {
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-    color: colors.textPrimary,
   },
 
   // Status indicators

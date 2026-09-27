@@ -1,5 +1,5 @@
 /**
- * Tests for the trust-task retry policy in `lib/api.ts`.
+ * Tests for the trust-task retry policy in `lib/trust-task.ts`.
  *
  * Two layers:
  *
@@ -18,7 +18,23 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, TrustTaskRejection, api, retryDelayMs } from "../api";
+import {
+  ApiError,
+  TrustTaskRejection,
+  api,
+  resetServiceInfo,
+  retryDelayMs,
+} from "../api";
+import {
+  SERVER_INFO,
+  installControlPlane,
+  tokenFor,
+  jsonResponse,
+  rejection,
+  seal,
+  type Doc,
+  type StubResponse,
+} from "./fake-control-plane";
 
 vi.mock("../session-key", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../session-key")>()),
@@ -30,12 +46,6 @@ vi.mock("../session-key", async (importOriginal) => ({
   },
 }));
 
-/** An unsigned JWT whose payload names `sub` — all the UI reads from it. */
-function tokenFor(sub: string): string {
-  const b64url = (v: unknown) =>
-    btoa(JSON.stringify(v)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `${b64url({ alg: "none" })}.${b64url({ sub })}.`;
-}
 
 const SUBJECT = "did:web:admin.example";
 
@@ -44,11 +54,6 @@ const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.1";
 const CHANGE_ROLE = "https://trusttasks.org/spec/acl/change-role/0.1";
 const LIST = "https://trusttasks.org/spec/acl/list/0.1";
 const SHOW = "https://trusttasks.org/spec/acl/show/0.1";
-// The version the control plane actually emits. `trust-tasks-rs` has emitted
-// `trust-task-error/0.3` since its 0.3 release and the workspace is on 0.4.1.
-// This file used to say `0.1`, which nothing has sent for some time — one half
-// of why the rejection path could be broken in production and green here.
-const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.3";
 
 const NOW = Date.parse("2026-07-28T12:00:00Z");
 const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
@@ -140,122 +145,41 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
 // End-to-end through trustTask, with fetch stubbed.
 // ---------------------------------------------------------------------------
 
-/** Build a `trust-task-error/0.1` response envelope. */
-function errorResponse(code: string, retryable: boolean) {
-  return {
-    id: "urn:uuid:00000000-0000-4000-8000-000000000000",
-    type: TT_ERROR,
-    payload: { code, message: `${code} from test`, retryable },
-  };
-}
+/** A `trust-task-error` document. */
+const errorResponse = (code: string, retryable: boolean) => rejection(code, retryable);
 
-/** Build a successful `acl/list` response envelope. */
-function listResponse(entries: unknown[]) {
-  return {
-    id: "urn:uuid:00000000-0000-4000-8000-000000000001",
-    type: `${LIST}#response`,
-    payload: { entries },
-  };
-}
-
-/** The part of `Response` that `request()` actually touches. Named so the
- *  stand-ins below can be annotated — without a declared return type, `text`
- *  referring to a value the same object literal computes is circular (TS7023). */
-interface StubResponse {
-  ok: boolean;
-  status: number;
-  statusText?: string;
-  headers: Headers;
-  json: () => Promise<unknown>;
-  text: () => Promise<string>;
-}
-
-/** Minimal `Response` stand-in. `request()` inspects `headers` to reject
- *  HTML fallbacks from the SPA catch-all, so the content type matters. */
-const jsonOk = (body: unknown): StubResponse => ({
-  ok: true,
-  status: 200,
-  headers: new Headers({ "content-type": "application/json" }),
-  json: async () => body,
-  text: async () => JSON.stringify(body),
-});
-
-/**
- * A rejection as the control plane actually returns one: the error document at
- * the status `status_for_code` maps its framework code to — never 200.
- *
- * Serving these at 200 (which this file did) is the other half of why the
- * rejection path was green here and dead in production: `request()` throws on
- * the status before the document is ever looked at, so the branch that builds a
- * `TrustTaskRejection` — and therefore the whole §8.4 retry policy below — was
- * unreachable against a real server while every test passed.
- */
-const STATUS_FOR_CODE: Record<string, number> = {
-  permissionDenied: 403,
-  notFound: 404,
-  malformedRequest: 400,
-  taskFailed: 422,
-  unavailable: 503,
-  internalError: 500,
-};
-
-const jsonError = (body: { type: string; payload: { code: string } }): StubResponse => {
-  const serialised = JSON.stringify(body);
-  return {
-    ok: false,
-    status: STATUS_FOR_CODE[body.payload.code] ?? 500,
-    statusText: "Error",
-    headers: new Headers({ "content-type": "application/json" }),
-    json: async () => body,
-    text: async () => serialised,
-  };
-};
-
-/** Serve success documents at 200 and error documents at their mapped status,
- *  the way the server does. */
-const asResponse = (doc: unknown): StubResponse => {
-  const type = (doc as { type?: unknown })?.type;
-  return typeof type === "string" && type.includes("/trust-task-error/")
-    ? jsonError(doc as { type: string; payload: { code: string } })
-    : jsonOk(doc);
-};
+/** A successful `acl/list` reply to whichever request it answers. */
+const listResponse =
+  (entries: unknown[]) =>
+  (req: Doc): Doc =>
+    seal(req, { entries, truncated: false });
 
 describe("trustTask — re-issue behaviour", () => {
   let trustTaskCalls: number;
 
-  /**
-   * Stub `fetch` so `/api/server-info` always succeeds and each
-   * `/api/trust-tasks` POST returns the next queued response.
-   */
-  /** Every envelope sent, as the server would have received it. */
-  let sent: Record<string, unknown>[];
+  /** Every ACL document sent, as the server would have received it. */
+  let sent: Doc[];
 
-  function stubFetch(responses: unknown[]) {
+  /** Answer `server/info` as the control plane does, and each other POST with
+   *  the next queued reply (a document, or a function of the request). */
+  function stubFetch(responses: (Doc | ((req: Doc) => Doc))[]) {
     trustTaskCalls = 0;
     sent = [];
     const queue = [...responses];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (path: string, init?: RequestInit) => {
-        if (path === "/api/server-info") {
-          return jsonOk({ server_did: "did:webvh:example:test", version: "0" });
-        }
-        if (path === "/api/trust-tasks") {
-          trustTaskCalls++;
-          sent.push(JSON.parse(String(init?.body ?? "{}")));
-          const next = queue.shift();
-          if (next === undefined) throw new Error("unexpected extra POST");
-          return asResponse(next);
-        }
-        throw new Error(`unexpected fetch: ${path}`);
-      }),
-    );
+    installControlPlane((req) => {
+      trustTaskCalls++;
+      sent.push(req);
+      const next = queue.shift();
+      if (next === undefined) throw new Error("unexpected extra POST");
+      return typeof next === "function" ? next(req) : next;
+    });
   }
 
   beforeEach(() => {
     // `retryAfter`-less retries pause for TRUST_TASK_DEFAULT_RETRY_DELAY_MS;
     // fake timers keep the suite instant.
     vi.useFakeTimers();
+    resetServiceInfo();
     const token = tokenFor(SUBJECT);
     vi.stubGlobal("localStorage", {
       getItem: (key: string) => (key === "webvh_token" ? token : null),
@@ -362,9 +286,21 @@ describe("trustTask — re-issue behaviour", () => {
     // rejection would hand the retry policy fields nobody promised.
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (path: string): Promise<StubResponse> => {
-        if (path === "/api/server-info") {
-          return jsonOk({ server_did: "did:webvh:example:test", version: "0" });
+      vi.fn(async (_path: string, init?: RequestInit): Promise<StubResponse> => {
+        const doc = JSON.parse(String(init?.body ?? "{}")) as Doc;
+        if (doc.type === SERVER_INFO) {
+          return jsonResponse(
+            seal(doc, { serviceDid: "did:webvh:example:test", agentNames: false, serviceNames: [] }, {
+              issuer: "did:webvh:example:test",
+              proof: {
+                type: "DataIntegrityProof",
+                cryptosuite: "eddsa-jcs-2022",
+                verificationMethod: "did:webvh:example:test#key-0",
+                proofPurpose: "authentication",
+                proofValue: "zSig",
+              },
+            }),
+          );
         }
         return {
           ok: false,

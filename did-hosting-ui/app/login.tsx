@@ -71,12 +71,10 @@ export default function Login() {
   // Fetch the server's own DID so the operator can see it on the
   // login page — they need it when granting wallet access (the DID
   // is what the wallet pins a did-self-issued vault entry to). The
-  // /api/server-info endpoint is unauthenticated and cached at the
-  // api-client layer; mounting the login page is cheap. `null` is
-  // a legitimate response when the operator hasn't configured a
-  // server_did yet; we skip rendering the row in that case rather
-  // than showing "(unset)" — operators who haven't configured it
-  // don't need a Copy button.
+  // `server/info` Trust Task is the one public read, and is cached at the
+  // api-client layer; mounting the login page is cheap. The row stays
+  // hidden until the read succeeds (a control plane with no DID cannot
+  // answer it).
   const [serverDid, setServerDid] = useState<string | null>(null);
   // The server's own agent names, if it serves any. Same request as the DID —
   // no extra round-trip — and rendered beneath it, because a name is an alias
@@ -89,8 +87,8 @@ export default function Login() {
       try {
         const info = await api.serverInfo();
         if (!cancelled) {
-          setServerDid(info.server_did);
-          setServerNames(info.server_names ?? []);
+          setServerDid(info.serviceDid);
+          setServerNames(info.serviceNames);
         }
       } catch {
         // Best-effort. The login page works without the DID row.
@@ -112,15 +110,15 @@ export default function Login() {
     setPasskeyLoading(true);
     setPasskeyError(null);
     try {
-      const { auth_id, options } = await api.passkeyLoginStart();
-      const credential = await getPasskeyCredential(options);
-      const result = await api.passkeyLoginFinish(auth_id, credential);
+      const { authId, options } = await api.passkeyLoginStart();
+      const credential = await getPasskeyCredential({ publicKey: options });
+      const result = await api.passkeyLoginFinish(authId, credential);
       setAuthMethod("passkey");
       // Keep the renewal credential. Every login path hands one back and
       // all three used to drop it, which is why a session could not be
       // renewed and died on a fixed timer.
-      setRefreshToken(result.refresh_token ?? null);
-      login(result.access_token);
+      setRefreshToken(result.refreshToken);
+      login(result.accessToken);
       router.replace("/");
     } catch (err: any) {
       setPasskeyError(

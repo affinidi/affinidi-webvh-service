@@ -29,11 +29,11 @@ import {
   type RequestTaskOutcome,
 } from "../../lib/wallet";
 import { orphanHint, ownerMismatchWarning } from "../../lib/delegation-guard";
+import { useDomains } from "../../components/DomainProvider";
 import type {
   DidStats,
   DidDetailResponse,
   LogEntryInfo,
-  WatcherSyncStatus,
 } from "../../lib/api";
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,6 @@ export default function DidDetail() {
   const [paramAlsoKnownAs, setParamAlsoKnownAs] = useState<string[]>([]);
   const [paramPortable, setParamPortable] = useState(false);
   const [paramTtl, setParamTtl] = useState<string>("");
-  const [knownWatcherUrls, setKnownWatcherUrls] = useState<string[]>([]);
   // Agent names (`/@alice`)
   const [nameInput, setNameInput] = useState("");
   const [nameStatus, setNameStatus] = useState<
@@ -171,10 +170,6 @@ export default function DidDetail() {
         setLogEntries(entries);
         setSelectedVersion(entries.length - 1);
       })
-      .catch(() => {});
-    api
-      .getServices()
-      .then((s) => setKnownWatcherUrls(s.watcherUrls))
       .catch(() => {});
   }, [api, mnemonic, isAuthenticated]);
 
@@ -215,6 +210,12 @@ export default function DidDetail() {
 
   // The hosting domain this DID's names are scoped to.
   const agentDomain = agentDomainOf(didDetail);
+
+  // Watcher URLs to suggest in the parameter editor: the ones this DID's
+  // hosting domain is configured with.
+  const { domains } = useDomains();
+  const knownWatcherUrls =
+    domains.find((d) => d.name === agentDomain)?.watchers ?? [];
 
   // The names currently claimed by the live document, parsed from its
   // `alsoKnownAs`. Source of truth is the signed log — the edge serves exactly
@@ -339,8 +340,8 @@ export default function DidDetail() {
       async () => {
         setRollingBack(true);
         try {
-          const updated = await api.rollbackDid(mnemonic);
-          setDidDetail(updated);
+          if (!didDetail) return;
+          await api.rollbackDid(mnemonic, didDetail.versionCount);
           loadData();
           showAlert("Success", "Last log entry has been rolled back");
         } catch (e: unknown) {
@@ -1045,42 +1046,6 @@ export default function DidDetail() {
                 <Text style={styles.statLabel}>Deactivated</Text>
               </View>
             </View>
-          </View>
-        )}
-
-        {/* Watcher Sync */}
-        {didDetail?.watcherSync && didDetail.watcherSync.length > 0 && (
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Watcher Sync</Text>
-            {didDetail.watcherSync.map((ws: WatcherSyncStatus, idx: number) => {
-              const synced =
-                ws.ok &&
-                ws.lastSyncedVersionId != null &&
-                ws.lastSyncedVersionId === didDetail.log?.latestVersionId;
-              return (
-                <View key={idx} style={styles.watcherRow}>
-                  <View
-                    style={[
-                      styles.watcherDot,
-                      { backgroundColor: synced ? colors.success : colors.error },
-                    ]}
-                  />
-                  <View style={styles.watcherInfo}>
-                    <Text style={styles.watcherUrl} numberOfLines={1}>
-                      {ws.watcherUrl}
-                    </Text>
-                    {ws.lastSyncedVersionId && (
-                      <Text style={styles.watcherMeta}>
-                        Synced: {ws.lastSyncedVersionId}
-                      </Text>
-                    )}
-                    {ws.lastError && (
-                      <Text style={styles.watcherError}>{ws.lastError}</Text>
-                    )}
-                  </View>
-                </View>
-              );
-            })}
           </View>
         )}
 
@@ -1963,38 +1928,6 @@ const styles = StyleSheet.create({
   },
   selectWrapper: {
     flex: 1,
-  },
-  watcherRow: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: spacing.sm,
-    marginBottom: spacing.md,
-  },
-  watcherDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    marginTop: 4,
-  },
-  watcherInfo: {
-    flex: 1,
-  },
-  watcherUrl: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.textPrimary,
-  },
-  watcherMeta: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
-    marginTop: 2,
-  },
-  watcherError: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    marginTop: 2,
   },
   paramField: {
     marginBottom: spacing.md,

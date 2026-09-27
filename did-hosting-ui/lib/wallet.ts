@@ -16,7 +16,8 @@
 
 import { Platform } from "react-native";
 
-import { api } from "./api";
+import { getApiBase } from "./api-base";
+import { getServiceInfo } from "./trust-task";
 
 /** A subset of the wallet provider's interface — just the SIOPv2 login.
  *  Declaring it inline keeps did-hosting-ui from depending on the extension
@@ -120,6 +121,18 @@ interface VtaWalletProvider {
     target?: { kind: string; [k: string]: unknown };
     ttlSecondsHint?: number;
   }): Promise<ProxyLoginWireResult>;
+  /** Raise an existing session to `aal2`. The wallet sends
+   *  `auth/step-up/start/0.1` to `{baseUrl}/trust-tasks`, verifies the signed
+   *  reply and the approve-request inside it (issuer `rpDid`, this session),
+   *  asks the user, answers with a signed `approve-response/0.5`, and renews
+   *  the session with `auth/refresh/0.1`. Resolves with the renewed tokens. */
+  stepUpVta?(params: {
+    baseUrl: string;
+    rpDid: string;
+    accessToken: string;
+    refreshToken: string;
+    sessionId: string;
+  }): Promise<VtaWalletLoginResult>;
   /** Which persona this site knows the user as, resolving or binding one.
    *  Mints nothing and issues no session. Present from the wallet build that
    *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
@@ -147,11 +160,11 @@ export function isWalletAvailable(): boolean {
 /** The RP DID the wallet signs the SIOPv2 `id_token` for.
  *
  *  Sourced at runtime from THIS control plane's own DID via
- *  `GET /api/server-info` (`server_did`). That is the exact value the
+ *  the signed `server/info` Trust Task (`serviceDid`). That is the exact value the
  *  server compares the id_token `aud` against in `auth.rs`, so the wallet
  *  and the verifier can never disagree — and a single prebuilt UI bundle
  *  works against any deployment without baking a DID in at build time.
- *  `api.serverInfo()` caches per-tab, so this is one network round-trip.
+ *  `getServiceInfo()` caches per-tab, so this is one network round-trip.
  *
  *  `EXPO_PUBLIC_RP_DID` remains an explicit override for the unusual case
  *  where the wallet must target a DID other than this deployment's
@@ -159,26 +172,10 @@ export function isWalletAvailable(): boolean {
 export async function getRpDid(): Promise<string> {
   const override = process.env.EXPO_PUBLIC_RP_DID;
   if (override) return override;
-  const info = await api.serverInfo();
-  if (!info.server_did) {
-    throw new Error(
-      "This deployment has no server_did configured (GET /api/server-info returned null), " +
-        "so the wallet can't determine the RP DID for SIOP login. Set `server_did` in the " +
-        "control-plane config (or the CONTROL_SERVER_DID env var).",
-    );
-  }
-  return info.server_did;
+  return (await getServiceInfo()).serviceDid;
 }
 
-/** API base for the wallet's SIOPv2 round-trip. The UI is served same-origin
- *  with the did-hosting-control API at `/api`, so the default resolves the
- *  wallet's `${baseUrl}/auth/challenge` to the right endpoint without
- *  configuration. Override with `EXPO_PUBLIC_API_BASE` if the API is on a
- *  separate origin. */
-export function getApiBase(): string {
-  if (process.env.EXPO_PUBLIC_API_BASE) return process.env.EXPO_PUBLIC_API_BASE;
-  return (typeof window !== "undefined" ? window.location.origin : "") + "/api";
-}
+export { getApiBase };
 
 /** Trigger the wallet's SIOPv2 login. Resolves to the result containing the
  *  server-issued access token (suitable for `AuthProvider.login`); rejects

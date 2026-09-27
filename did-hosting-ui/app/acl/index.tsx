@@ -603,7 +603,7 @@ export default function AclManagement() {
 
   const startEditInviteRole = useCallback(
     (item: InviteListItem) =>
-      setEditingInvite({ inviteId: item.invite_id, role: item.role }),
+      setEditingInvite({ inviteId: item.inviteId, role: item.role }),
     [],
   );
 
@@ -930,10 +930,10 @@ export default function AclManagement() {
             Pending Invites ({pendingInvites.length})
           </Text>
           {pendingInvites.map((inv) => {
-            const isEditing = editingInvite?.inviteId === inv.invite_id;
-            const busy = invitesBusyId === inv.invite_id;
+            const isEditing = editingInvite?.inviteId === inv.inviteId;
+            const busy = invitesBusyId === inv.inviteId;
             return (
-              <View key={inv.invite_id} style={styles.pendingInviteRow}>
+              <View key={inv.inviteId} style={styles.pendingInviteRow}>
                 <View style={styles.pendingInviteInfo}>
                   <Text style={styles.entryDid} numberOfLines={1}>
                     {inv.did}
@@ -951,7 +951,7 @@ export default function AclManagement() {
                     <Text style={styles.entryDate}>
                       {inv.expired
                         ? "expired"
-                        : `expires in ${formatExpiry(inv.expires_at)}`}
+                        : `expires in ${formatExpiry(inv.expiresAt)}`}
                     </Text>
                   </View>
                   {isEditing && (
@@ -966,7 +966,7 @@ export default function AclManagement() {
                             ]}
                             onPress={() =>
                               setEditingInvite({
-                                inviteId: inv.invite_id,
+                                inviteId: inv.inviteId,
                                 role: r,
                               })
                             }
@@ -1013,7 +1013,7 @@ export default function AclManagement() {
                     </Pressable>
                     <Pressable
                       style={[styles.deleteButton, busy && styles.disabled]}
-                      onPress={() => handleRevokeInvite(inv.invite_id)}
+                      onPress={() => handleRevokeInvite(inv.inviteId)}
                       disabled={busy}
                     >
                       <Text style={styles.deleteText}>Revoke</Text>
