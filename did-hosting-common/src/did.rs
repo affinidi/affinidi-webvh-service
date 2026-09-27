@@ -152,14 +152,28 @@ pub fn add_trust_task_https_service(doc: &mut serde_json::Value, base_uri: &str)
 /// `https://` always qualifies. Plain `http://` qualifies only for loopback
 /// (`localhost`, `127.0.0.1`, `[::1]`) — acceptable for a local dev daemon,
 /// never for a real deployment a VTA might actually route Trust Tasks to.
+///
+/// The URL is parsed and its host compared exactly, never by text prefix:
+/// `http://localhost.evil.example` and `http://127.0.0.1.evil.example` are
+/// not loopback, and neither is a URL carrying userinfo. `127.0.0.0/8`
+/// counts, as every address in it is loopback.
 pub fn is_https_or_loopback(uri: &str) -> bool {
-    let lower = uri.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return true;
+    let Ok(url) = url::Url::parse(uri) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
     }
-    lower.starts_with("http://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://[::1]")
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// Build a standard DID document with `{SCID}` placeholders.
@@ -518,6 +532,16 @@ mod tests {
     fn plaintext_http_to_a_real_host_does_not_qualify() {
         assert!(!is_https_or_loopback("http://example.com/api"));
         assert!(!is_https_or_loopback("http://webvh.example.com/api"));
+        // Lookalikes that only start with a loopback name are not loopback.
+        assert!(!is_https_or_loopback("http://localhost.evil.example/api"));
+        assert!(!is_https_or_loopback("http://127.0.0.1.evil.example/api"));
+        assert!(!is_https_or_loopback("http://localhostevil.example/api"));
+        assert!(!is_https_or_loopback("http://user@localhost/api"));
+        assert!(!is_https_or_loopback("http://evil.example@127.0.0.1/api"));
+        assert!(!is_https_or_loopback("ftp://localhost/api"));
+        assert!(!is_https_or_loopback("not a url"));
+        assert!(is_https_or_loopback("http://127.0.0.2:8534/api"));
+        assert!(is_https_or_loopback("HTTP://LOCALHOST:8534/api"));
     }
 
     #[test]
