@@ -72,7 +72,7 @@ pub struct ServerInfoResponse {
 /// the single global `.well-known` slot — so without confirming the slot holds
 /// this exact DID, a deployment whose configured `server_did` was minted
 /// elsewhere would advertise whichever root DID happens to be hosted here.
-async fn server_agent_names(state: &AppState) -> Vec<String> {
+pub(crate) async fn server_agent_names(state: &AppState) -> Vec<String> {
     if !state.config.features.agent_names {
         return Vec::new();
     }

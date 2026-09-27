@@ -1844,6 +1844,20 @@ pub async fn rollback_did(
     state: &AppState,
     mnemonic: &str,
 ) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
+    let (record, metadata, _) = rollback_did_to(auth, state, mnemonic, None).await?;
+    Ok((record, metadata))
+}
+
+/// Discard every log entry after `target_version` (1-based), or — with no
+/// target — the newest entry alone. Returns the updated record, the log's
+/// metadata and how many entries were removed. A target outside
+/// `1..=versionCount` is refused; the current version removes nothing.
+pub async fn rollback_did_to(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    target_version: Option<u64>,
+) -> Result<(DidRecord, Option<LogMetadata>, u64), AppError> {
     use crate::auth::session::now_epoch;
 
     validate_mnemonic(mnemonic)?;
@@ -1864,13 +1878,32 @@ pub async fn rollback_did(
         .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() < 2 {
-        return Err(AppError::Validation(
-            "cannot rollback: DID log must have at least 2 entries".into(),
-        ));
+    let keep = match target_version {
+        None => {
+            if lines.len() < 2 {
+                return Err(AppError::Validation(
+                    "cannot rollback: DID log must have at least 2 entries".into(),
+                ));
+            }
+            lines.len() - 1
+        }
+        Some(target) => {
+            if target < 1 || target as usize > lines.len() {
+                return Err(AppError::Validation(format!(
+                    "invalid target version {target}: the log holds {} entries",
+                    lines.len()
+                )));
+            }
+            target as usize
+        }
+    };
+    let removed = (lines.len() - keep) as u64;
+    if removed == 0 {
+        let metadata = Some(extract_log_metadata(&content));
+        return Ok((record, metadata, 0));
     }
 
-    let truncated_lines = &lines[..lines.len() - 1];
+    let truncated_lines = &lines[..keep];
     let truncated = truncated_lines.join("\n");
 
     let new_did_id = extract_did_id(&truncated);
@@ -1900,10 +1933,11 @@ pub async fn rollback_did(
         did = %auth.did,
         mnemonic = %mnemonic,
         remaining = truncated_lines.len(),
-        "DID log entry rolled back on control plane"
+        removed,
+        "DID log rolled back on control plane"
     );
 
-    Ok((record, log_metadata))
+    Ok((record, log_metadata, removed))
 }
 
 /// Check if a custom path is available.
@@ -2151,8 +2185,14 @@ pub async fn resolve_agent_name_to_did(
 /// DID the caller already holds. It is authenticated regardless — it answers
 /// questions about arbitrary DIDs, and an unauthenticated batch endpoint is an
 /// enumeration surface even when each individual answer is public.
+///
+/// Answers only for DIDs `reader` may read — its own, or any for an
+/// administrator — so a DID not hosted here, one the reader may not read and
+/// one serving no name are indistinguishable, and the call cannot be used to
+/// test whether a DID is hosted.
 pub async fn resolve_agent_names(
     state: &AppState,
+    reader: &AuthClaims,
     dids: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
     use std::collections::HashMap;
@@ -2194,6 +2234,9 @@ pub async fn resolve_agent_names(
             || record.disabled
             || record.deleted_at.is_some()
         {
+            continue;
+        }
+        if reader.role != crate::acl::Role::Admin && record.owner != reader.did {
             continue;
         }
         let names: Vec<String> = record

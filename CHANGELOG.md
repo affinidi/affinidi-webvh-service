@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Added — the control plane is served as Trust Tasks on every transport
+
+Every control-plane task that only REST served, and every new specification
+from trustoverip/dtgwg-trust-tasks-tf#661 the control plane owns, is a row of
+the one table, reachable over TSP, DIDComm and HTTPS `POST /api/trust-tasks`:
+`did/{set-state,rollback,log}`, `agent-name/resolve`,
+`domain/{list,create,update,set-state,set-default,purge,assign,unassign}`,
+`registry/{list,get,check,admin-register,deregister,purge-domain}`,
+`stats/{get,timeseries}`, `server/{info,config,metrics}`,
+`identity/{list,retire}`, `auth/step-up/start/0.1`,
+`auth/step-up/approve-response/0.5`, `auth/passkey/login/{start,finish}/0.2`
+and `auth/passkey/enroll/invite/{list,update,revoke}`. The REST routes stay
+until their callers move.
+
+- **Each task's proof is checked against the key relationship it names.**
+  `server/info` and `auth/passkey/login/start` accept a request with no proof
+  (a proof that is present is still verified). Operational requests need
+  `proofPurpose: authentication`; an approver's `approve-response` needs
+  `assertionMethod`, and each is refused under the other. A passkey login is
+  signed by the `did:key` its session is then bound to.
+- **`POST /api/trust-tasks` no longer requires a bearer session.** The
+  document's proof is the authorisation, as on the other transports; a bearer
+  session, when presented, must match the proof and contributes its assurance
+  level (a domain purge needs `aal2`).
+- **Step-up moves to `approve-request/0.3` / `approve-response/0.5`.**
+  `auth/step-up/start` binds a challenge to the caller's own session and
+  answers a signed `approve-request/0.3`; the subject's `approve-response`
+  elevates the session; `auth/refresh` then mints tokens at the session's
+  current level.
+- **Invites are addressed by `inviteId` and never disclose their token after
+  issue** — on REST too: `GET /api/auth/passkey/invites` no longer returns
+  tokens or enrollment URLs, and `PUT`/`DELETE /api/auth/passkey/invite/{id}`
+  take the invite id. The UI follows.
+- **`agent-name/resolve` answers only for DIDs the caller may read**, on REST
+  too, so it cannot be used to test whether a DID is hosted.
+- **`did/rollback`** takes a `targetVersion`.
+
 ### Changed (breaking) — DID management answers in its specifications' shapes
 
 The control plane's DID-management Trust Tasks are served from one table keyed

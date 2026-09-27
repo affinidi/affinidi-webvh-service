@@ -3,7 +3,9 @@
 use serde_json::json;
 use tracing::info;
 use trust_tasks_rs::specs::{
-    did_management::did::{change_owner, check_name, delete, info, list, register},
+    did_management::did::{
+        change_owner, check_name, delete, info, list, log, register, rollback, set_state,
+    },
     webvh::witness::publish as witness_publish,
 };
 
@@ -307,4 +309,136 @@ async fn stored(
         .get(did_key(mnemonic))
         .await?
         .ok_or_else(|| AppError::Internal(format!("record `{mnemonic}` missing after write")))?)
+}
+
+/// `did/set-state/0.1`: `suspended` stops the slot resolving on every edge,
+/// `active` resumes it. The state travels to edges with the slot's content.
+pub(crate) async fn set_state(
+    cx: &Cx<'_>,
+    p: set_state::v0_1::Payload,
+) -> Result<set_state::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
+    let disabled = match p.state {
+        set_state::v0_1::PayloadState::Active => false,
+        set_state::v0_1::PayloadState::Suspended => true,
+        _ => return Err(AppError::Validation("unsupported DID state".into()).into()),
+    };
+    did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
+    server_push::notify_servers_did(state, p.mnemonic.to_string());
+    let record = stored(cx, &p.mnemonic).await?;
+    typed(
+        json!({ "record": spec_record::<set_state::v0_1::DidRecord>(state, &record)? }),
+        "set-state response",
+    )
+}
+
+/// `did/rollback/0.1`: discard every entry after `targetVersion`.
+pub(crate) async fn rollback(
+    cx: &Cx<'_>,
+    p: rollback::v0_1::Payload,
+) -> Result<rollback::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
+    let (record, _, removed) =
+        did_ops::rollback_did_to(&auth, state, &p.mnemonic, Some(p.target_version.get()))
+            .await
+            .map_err(|e| match e {
+                AppError::Validation(message) if message.starts_with("invalid target version") => {
+                    TaskError::Declared(
+                        rollback::v0_1::error_codes::INVALID_TARGET_VERSION,
+                        message,
+                    )
+                }
+                other => other.into(),
+            })?;
+    if removed > 0 {
+        server_push::notify_servers_did(state, p.mnemonic.to_string());
+    }
+    typed(
+        json!({
+            "record": spec_record::<rollback::v0_1::DidRecord>(state, &record)?,
+            "removedVersions": removed,
+        }),
+        "rollback response",
+    )
+}
+
+/// `did/log/0.1`: the slot's history, oldest first — and, with `raw`, the
+/// stored artifacts verbatim. A slot that does not exist, one the caller may
+/// not read, and one with no published content are answered alike.
+pub(crate) async fn log(
+    cx: &Cx<'_>,
+    p: log::v0_1::Payload,
+) -> Result<log::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let not_found = || {
+        TaskError::Declared(
+            log::v0_1::error_codes::NOT_FOUND,
+            "no such slot with published content".into(),
+        )
+    };
+    let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) | AppError::Forbidden(_) => not_found(),
+            other => other.into(),
+        })?;
+    did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
+    let content = match did_ops::get_raw_log(&auth, state, &p.mnemonic).await {
+        Ok(content) => content,
+        Err(AppError::NotFound(_)) => return Err(not_found()),
+        Err(e) => return Err(e.into()),
+    };
+    let entries: Vec<serde_json::Value> = did_hosting_common::did_ops::parse_log_entries(&content)
+        .into_iter()
+        .map(|e| {
+            let mut entry = serde_json::Map::new();
+            if let Some(id) = e.version_id {
+                entry.insert("versionId".into(), json!(id));
+            }
+            if let Some(time) = e.version_time {
+                entry.insert("versionTime".into(), json!(time));
+            }
+            entry.insert(
+                "state".into(),
+                e.state
+                    .filter(|s| s.is_object())
+                    .unwrap_or_else(|| json!({})),
+            );
+            if let Some(parameters) = e.parameters.filter(|p| p.is_object()) {
+                entry.insert("parameters".into(), parameters);
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    let method = if record.method.is_empty() {
+        "webvh".to_string()
+    } else {
+        record.method.clone()
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("mnemonic".into(), json!(p.mnemonic.as_str()));
+    body.insert("method".into(), json!(method));
+    body.insert("entries".into(), json!(entries));
+    if p.raw.unwrap_or(false) {
+        body.insert("logContent".into(), json!(content));
+        if let Some(witness) = state
+            .dids_ks
+            .get_raw(did_hosting_common::did_ops::content_witness_key(
+                &p.mnemonic,
+            ))
+            .await?
+            .and_then(|w| String::from_utf8(w).ok())
+            .filter(|w| !w.is_empty())
+        {
+            body.insert("witnessContent".into(), json!(witness));
+        }
+    }
+    typed(serde_json::Value::Object(body), "log response")
 }

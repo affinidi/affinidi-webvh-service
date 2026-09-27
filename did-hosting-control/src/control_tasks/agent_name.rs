@@ -2,7 +2,7 @@
 
 use serde_json::json;
 use tracing::info;
-use trust_tasks_rs::specs::did_management::agent_name::{check, list, remove, update};
+use trust_tasks_rs::specs::did_management::agent_name::{check, list, remove, resolve, update};
 
 use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
@@ -146,4 +146,26 @@ impl std::fmt::Display for AppErrorMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0.user_message())
     }
+}
+
+/// `agent-name/resolve/0.1`: the names each requested DID serves, in request
+/// order, for the DIDs the caller may read. Every other DID is simply absent.
+pub(crate) async fn resolve(
+    cx: &Cx<'_>,
+    p: resolve::v0_1::Payload,
+) -> Result<resolve::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let dids: Vec<String> = p.dids.iter().map(|d| d.to_string()).collect();
+    let names = did_ops::resolve_agent_names(cx.state, &auth, &dids).await?;
+    let mut seen = std::collections::HashSet::new();
+    let entries: Vec<_> = dids
+        .iter()
+        .filter(|did| seen.insert(did.as_str()))
+        .filter_map(|did| {
+            names
+                .get(did)
+                .map(|names| json!({ "did": did, "names": names }))
+        })
+        .collect();
+    typed(json!({ "entries": entries }), "agent-name resolve response")
 }

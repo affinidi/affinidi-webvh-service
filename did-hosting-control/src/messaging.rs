@@ -1118,7 +1118,7 @@ pub(crate) async fn run_trust_tasks_envelope(
     // `did-hosting/*/1.0` protocol, auth, infra, ACL + discovery, and the
     // legacy `MSG_*` bridge.
     let verifier = require_verifier(state)?;
-    match dispatch_trust_task_doc(state, sender, &transport, doc, verifier)
+    match dispatch_trust_task_doc(state, sender, None, &transport, doc, verifier)
         .await?
         .into_document()
     {
@@ -1244,9 +1244,15 @@ impl RoutedReply {
 ///
 /// The order of the checks below is load bearing and each one carries the
 /// reason it sits where it does; they are not interchangeable.
+///
+/// `sender` is the transport's report of who sent the document (empty for an
+/// anonymous HTTPS request that names no issuer); `bearer` is the session an
+/// HTTPS request presented, when it presented one. Neither authorises anything
+/// on its own.
 pub(crate) async fn dispatch_trust_task_doc(
     state: &AppState,
     sender: &str,
+    bearer: Option<&crate::auth::AuthClaims>,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
@@ -1278,7 +1284,7 @@ pub(crate) async fn dispatch_trust_task_doc(
             )));
         }
     };
-    let reply = route_trust_task_doc(state, sender, transport, doc, verifier).await?;
+    let reply = route_trust_task_doc(state, sender, bearer, transport, doc, verifier).await?;
     Ok(seal_reply(state, &secret, sender, reply).await)
 }
 
@@ -1342,7 +1348,9 @@ pub(crate) async fn sign_reply_doc(
 ) -> trust_tasks_rs::TrustTask<Value> {
     let my_vid = state.config.server_did.clone().unwrap_or_default();
     doc.issuer = Some(my_vid);
-    if doc.recipient.is_none() {
+    // An anonymous request (a public read that named no issuer) is answered
+    // with no `recipient`.
+    if doc.recipient.is_none() && !requester.is_empty() {
         doc.recipient = Some(requester.to_string());
     }
     doc.issued_at = Some(chrono::Utc::now());
@@ -1372,13 +1380,14 @@ pub(crate) async fn sign_reply_doc(
 async fn route_trust_task_doc(
     state: &AppState,
     sender: &str,
+    bearer: Option<&crate::auth::AuthClaims>,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
 ) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
-        verify_sender_bound,
+        verify_sender_bound, verify_sender_bound_approval,
     };
 
     let my_vid = state
@@ -1452,9 +1461,18 @@ async fn route_trust_task_doc(
     //    document whose proof disagrees with it is refused rather than resolved
     //    in either's favour.
     //
-    //    The exemptions are the two documents that authorise nothing and that a
-    //    peer must be able to send before it can sign anything useful:
-    //    capability discovery, and asking for an auth challenge.
+    //    Each task's `ProofRule` says what its proof must be:
+    //    - `Optional`: the documents that authorise nothing and that a peer
+    //      must be able to send before it can sign anything useful — capability
+    //      discovery, an auth challenge, the public `server/info`, and opening a
+    //      passkey login;
+    //    - `Authentication`: an operational request, `proofPurpose:
+    //      authentication` under the signer's `authentication` relationship;
+    //    - `AssertionMethod`: a human approver's decision, an attestation under
+    //      the approver's `assertionMethod` relationship;
+    //    - `SessionKey`: a ceremony that mints a session for a key the caller
+    //      has just generated, signed by that `did:key` — which has no ACL entry
+    //      of its own; the ceremony names the subject.
     //
     //    Before any signature work — which can mean resolving a DID over the
     //    network — the reported sender must at least *have* an ACL entry: every
@@ -1467,7 +1485,29 @@ async fn route_trust_task_doc(
     //    to the same rule: a proof that is present is verified, never ignored.
     let rule = proof_rule(&type_uri);
     let signed = rule != ProofRule::Optional || doc.proof.is_some();
-    if rule != ProofRule::Optional
+    let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod);
+    // A session ceremony is signed by a `did:key` the caller holds: as the
+    // issuer itself, or — for a session that already exists — as that
+    // session's delegate key.
+    if rule == ProofRule::SessionKey
+        && doc
+            .proof
+            .as_ref()
+            .is_some_and(|p| !p.verification_method.starts_with("did:key:"))
+    {
+        warn!(sender, %type_uri, "trust task refused: a session ceremony must be signed by a did:key");
+        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                trust_tasks_rs::RejectReason::PermissionDenied {
+                    reason:
+                        "this ceremony must be signed by the did:key its session will be bound to"
+                            .into(),
+                },
+            ),
+        ))));
+    }
+    if needs_acl
         && !matches!(
             did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
             Ok(Some(_))
@@ -1484,7 +1524,13 @@ async fn route_trust_task_doc(
         ))));
     }
     let principal = if signed {
-        match verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await {
+        let bound = match rule {
+            ProofRule::AssertionMethod => {
+                verify_sender_bound_approval(&doc, Some(sender), my_vid, verifier).await
+            }
+            _ => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
+        };
+        match bound {
             Ok(principal) => principal,
             Err(e) => {
                 warn!(sender, %type_uri, error = %e, "trust task refused: not bound to its sender");
@@ -1585,6 +1631,7 @@ async fn route_trust_task_doc(
     // as tampering; so the rows do not verify again.
     let doc = match crate::control_tasks::route(
         state,
+        bearer,
         transport,
         trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
         doc,

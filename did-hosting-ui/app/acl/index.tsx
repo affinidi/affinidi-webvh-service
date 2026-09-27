@@ -532,10 +532,9 @@ export default function AclManagement() {
   // Pending invites (from server)
   const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
   const [editingInvite, setEditingInvite] = useState<
-    { token: string; role: "admin" | "owner" | "service" } | null
+    { inviteId: string; role: "admin" | "owner" | "service" } | null
   >(null);
-  const [invitesBusyToken, setInvitesBusyToken] = useState<string | null>(null);
-  const [inviteCopiedToken, setInviteCopiedToken] = useState<string | null>(null);
+  const [invitesBusyId, setInvitesBusyId] = useState<string | null>(null);
 
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
@@ -584,31 +583,18 @@ export default function AclManagement() {
     }
   };
 
-  const handleCopyPendingInvite = useCallback(
-    async (item: InviteListItem) => {
-      await Clipboard.setStringAsync(item.enrollment_url);
-      setInviteCopiedToken(item.token);
-      setTimeout(
-        () =>
-          setInviteCopiedToken((prev) => (prev === item.token ? null : prev)),
-        2000,
-      );
-    },
-    [],
-  );
-
   const handleRevokeInvite = useCallback(
-    (token: string) => {
+    (inviteId: string) => {
       showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
-        setInvitesBusyToken(token);
+        setInvitesBusyId(inviteId);
         try {
-          await api.revokeInvite(token);
+          await api.revokeInvite(inviteId);
           refresh();
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Failed to revoke";
           showAlert("Error", msg);
         } finally {
-          setInvitesBusyToken((prev) => (prev === token ? null : prev));
+          setInvitesBusyId((prev) => (prev === inviteId ? null : prev));
         }
       });
     },
@@ -617,7 +603,7 @@ export default function AclManagement() {
 
   const startEditInviteRole = useCallback(
     (item: InviteListItem) =>
-      setEditingInvite({ token: item.token, role: item.role }),
+      setEditingInvite({ inviteId: item.invite_id, role: item.role }),
     [],
   );
 
@@ -625,17 +611,19 @@ export default function AclManagement() {
 
   const handleSaveInviteRole = useCallback(async () => {
     if (!editingInvite) return;
-    setInvitesBusyToken(editingInvite.token);
+    setInvitesBusyId(editingInvite.inviteId);
     try {
-      await api.updateInvite(editingInvite.token, { role: editingInvite.role });
+      await api.updateInvite(editingInvite.inviteId, {
+        role: editingInvite.role,
+      });
       setEditingInvite(null);
       refresh();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to update invite";
       showAlert("Error", msg);
     } finally {
-      setInvitesBusyToken((prev) =>
-        prev === editingInvite.token ? null : prev,
+      setInvitesBusyId((prev) =>
+        prev === editingInvite.inviteId ? null : prev,
       );
     }
   }, [api, editingInvite, refresh]);
@@ -942,10 +930,10 @@ export default function AclManagement() {
             Pending Invites ({pendingInvites.length})
           </Text>
           {pendingInvites.map((inv) => {
-            const isEditing = editingInvite?.token === inv.token;
-            const busy = invitesBusyToken === inv.token;
+            const isEditing = editingInvite?.inviteId === inv.invite_id;
+            const busy = invitesBusyId === inv.invite_id;
             return (
-              <View key={inv.token} style={styles.pendingInviteRow}>
+              <View key={inv.invite_id} style={styles.pendingInviteRow}>
                 <View style={styles.pendingInviteInfo}>
                   <Text style={styles.entryDid} numberOfLines={1}>
                     {inv.did}
@@ -978,7 +966,7 @@ export default function AclManagement() {
                             ]}
                             onPress={() =>
                               setEditingInvite({
-                                token: inv.token,
+                                inviteId: inv.invite_id,
                                 role: r,
                               })
                             }
@@ -1019,21 +1007,13 @@ export default function AclManagement() {
                   <View style={styles.entryActions}>
                     <Pressable
                       style={styles.editButton}
-                      onPress={() => handleCopyPendingInvite(inv)}
-                    >
-                      <Text style={styles.editText}>
-                        {inviteCopiedToken === inv.token ? "Copied" : "Copy"}
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={styles.editButton}
                       onPress={() => startEditInviteRole(inv)}
                     >
                       <Text style={styles.editText}>Role</Text>
                     </Pressable>
                     <Pressable
                       style={[styles.deleteButton, busy && styles.disabled]}
-                      onPress={() => handleRevokeInvite(inv.token)}
+                      onPress={() => handleRevokeInvite(inv.invite_id)}
                       disabled={busy}
                     >
                       <Text style={styles.deleteText}>Revoke</Text>

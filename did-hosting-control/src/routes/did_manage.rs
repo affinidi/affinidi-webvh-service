@@ -199,11 +199,11 @@ pub async fn remove_agent_name(
 /// information, and the surfaces that need it are visible to every logged-in
 /// operator.
 pub async fn resolve_agent_names(
-    _auth: AuthClaims,
+    auth: AuthClaims,
     State(state): State<AppState>,
     Json(req): Json<AgentNameResolveRequest>,
 ) -> Result<Json<AgentNameResolveResponse>, AppError> {
-    let names = did_ops::resolve_agent_names(&state, &req.dids).await?;
+    let names = did_ops::resolve_agent_names(&state, &auth, &req.dids).await?;
     Ok(Json(AgentNameResolveResponse { names }))
 }
 
@@ -830,7 +830,7 @@ pub async fn get_did_timeseries(
 /// `stats_ks` in v0.7); the rows have shape
 /// `ts:{mnemonic}:{bucket_epoch} -> {r,u}`. The literal `mnemonic`
 /// `_all` is the server-wide aggregate.
-async fn query_timeseries(
+pub(crate) async fn query_timeseries(
     timeseries_ks: &did_hosting_common::server::store::KeyspaceHandle,
     mnemonic: &str,
     range: &str,
@@ -913,7 +913,7 @@ async fn query_timeseries(
 /// buckets, and sums them at the same step granularity as
 /// `query_timeseries`. Cost is O(N_dids_in_domain × buckets_in_range);
 /// the dashboard chart is not the hot path.
-async fn query_timeseries_by_domain(
+pub(crate) async fn query_timeseries_by_domain(
     state: &AppState,
     domain: &str,
     range: &str,
@@ -1075,7 +1075,7 @@ pub struct ConfigResponse {
 /// page load into an outbound fetch, once per request. With a resolver
 /// configured, the shared client's cache makes everything after the first call
 /// cheap.
-async fn control_advertised_services(state: &AppState) -> Option<Vec<String>> {
+pub(crate) async fn control_advertised_services(state: &AppState) -> Option<Vec<String>> {
     let did = state.config.server_did.as_deref()?;
     let resolver = state.did_resolver.as_ref()?;
     did_hosting_common::server::didcomm_profile::resolve_service_types(did, Some(resolver)).await

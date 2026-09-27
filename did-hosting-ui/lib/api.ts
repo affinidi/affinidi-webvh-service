@@ -403,18 +403,21 @@ export interface LoginStartResponse {
 }
 
 export interface CreateInviteResponse {
+  invite_id: string;
   token: string;
   enrollment_url: string;
   expires_at: number;
 }
 
+// A pending invite as an administrator sees it later: addressed by
+// `invite_id`. The token is shown once, when the invite is created, and is
+// never sent back.
 export interface InviteListItem {
-  token: string;
+  invite_id: string;
   did: string;
   role: "admin" | "owner" | "service";
   created_at: number;
   expires_at: number;
-  enrollment_url: string;
   expired: boolean;
 }
 
@@ -1332,7 +1335,7 @@ export const api = {
     request<InviteListResponse>("/api/auth/passkey/invites"),
 
   updateInvite: (
-    token: string,
+    inviteId: string,
     updates: {
       role?: "admin" | "owner" | "service";
       expires_at?: number;
@@ -1340,7 +1343,7 @@ export const api = {
     },
   ) =>
     request<InviteListItem>(
-      `/api/auth/passkey/invite/${encodeURIComponent(token)}`,
+      `/api/auth/passkey/invite/${encodeURIComponent(inviteId)}`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1348,8 +1351,8 @@ export const api = {
       },
     ),
 
-  revokeInvite: (token: string) =>
-    request<void>(`/api/auth/passkey/invite/${encodeURIComponent(token)}`, {
+  revokeInvite: (inviteId: string) =>
+    request<void>(`/api/auth/passkey/invite/${encodeURIComponent(inviteId)}`, {
       method: "DELETE",
     }),
 };

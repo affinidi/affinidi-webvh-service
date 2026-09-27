@@ -90,7 +90,9 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         jwt_keys: Some(Arc::new(
             crate::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
         )),
-        webauthn: None,
+        webauthn: Some(Arc::new(
+            did_hosting_common::server::passkey::build_webauthn("http://control.test").unwrap(),
+        )),
         http_client: reqwest::Client::new(),
         didcomm_service: Arc::new(OnceLock::new()),
         stats_collector: Arc::new(StatsCollector::new()),
@@ -209,32 +211,31 @@ pub(crate) async fn send(state: &AppState, via: Via, sender: &Caller, doc: Value
             assert_eq!(typ, trust_tasks_didcomm::ENVELOPE_TYPE);
             body
         }
-        Via::Https => {
-            use axum::response::IntoResponse;
-            use http_body_util::BodyExt;
-
-            let bearer = AuthClaims {
-                did: sender.did.clone(),
-                role: sender.role.clone(),
-                session_id: String::new(),
-                session_pubkey_b58btc: None,
-                amr: vec!["did".into()],
-                acr: "aal1".into(),
-            };
-            let response = crate::routes::trust_tasks::dispatch_trust_task(
-                bearer,
-                axum::extract::State(state.clone()),
-                axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
-            )
-            .await
-            .into_response();
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            serde_json::from_slice(&bytes).expect("HTTPS reply is JSON")
-        }
+        // No bearer session: the document's own proof is the authorisation,
+        // as on the other two transports.
+        Via::Https => https(state, None, doc).await,
     }
 }
 
-/// Sign `payload` as a `type_uri` request from `caller` and deliver it.
+/// Deliver `doc` to `POST /api/trust-tasks`, with `bearer` as the session the
+/// request presents, and return the reply document.
+pub(crate) async fn https(state: &AppState, bearer: Option<AuthClaims>, doc: Value) -> Value {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let response = crate::routes::trust_tasks::dispatch_trust_task(
+        bearer,
+        axum::extract::State(state.clone()),
+        axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+    )
+    .await
+    .into_response();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).expect("HTTPS reply is JSON")
+}
+
+/// Sign `payload` as a `type_uri` request from `caller` — with the proof
+/// purpose the task's rule asks for — and deliver it.
 pub(crate) async fn call(
     state: &AppState,
     via: Via,
@@ -242,7 +243,14 @@ pub(crate) async fn call(
     type_uri: &str,
     payload: Value,
 ) -> Value {
-    let doc = signed(request(type_uri, &caller.did, payload), &caller.key).await;
+    let doc = request(type_uri, &caller.did, payload);
+    let doc = if super::proof_rule(type_uri)
+        == Some(did_hosting_common::server::trust_tasks::ProofRule::AssertionMethod)
+    {
+        signed_as_assertion(doc, &caller.key).await
+    } else {
+        signed(doc, &caller.key).await
+    };
     send(state, via, caller, doc).await
 }
 

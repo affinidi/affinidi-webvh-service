@@ -136,7 +136,7 @@ pub(crate) async fn run_tsp_trust_task(
     // way — `into_document` is where that flattening belongs, beside the router
     // rather than in each binding.
     let verifier = crate::messaging::require_verifier(state)?;
-    match dispatch_trust_task_doc(state, sender, &transport, doc, verifier)
+    match dispatch_trust_task_doc(state, sender, None, &transport, doc, verifier)
         .await?
         .into_document()
     {
