@@ -1257,16 +1257,31 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
     .await;
     assert_eq!(code(&reply), "malformedRequest", "{reply}");
 
-    // `expiresAt` and `extendBy` are mutually exclusive.
+    // `expiresAt` and `extendBy` are mutually exclusive — and a refused
+    // update changes nothing, not even the role riding along with it.
     let reply = call(
         &state,
         Via::Tsp,
         &admin,
         &t("auth/passkey/enroll/invite/update/0.1"),
-        json!({ "inviteId": created.invite_id, "expiresAt": "2099-01-01T00:00:00Z", "extendBy": 60 }),
+        json!({ "inviteId": created.invite_id, "role": "admin", "expiresAt": "2099-01-01T00:00:00Z", "extendBy": 60 }),
     )
     .await;
     assert_eq!(code(&reply), "malformedRequest", "{reply}");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/list/0.1"),
+        json!({}),
+    )
+    .await;
+    let body = ok(&reply, &t("auth/passkey/enroll/invite/list/0.1"));
+    assert_eq!(body["invites"][0]["role"], "owner", "{reply}");
+    assert_eq!(
+        body["invites"][0]["expiresAt"], "2099-01-01T00:00:00Z",
+        "{reply}"
+    );
 
     let reply = call(
         &state,
