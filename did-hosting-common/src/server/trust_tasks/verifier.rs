@@ -92,13 +92,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use affinidi_data_integrity::{
-    DataIntegrityError, ResolvedKey, SignatureFailure, VerificationMethodResolver, VerifyOptions,
-};
+use affinidi_data_integrity::{DataIntegrityError, ResolvedKey, SignatureFailure, VerifyOptions};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_tdk::did_common::verification_method::VerificationRelationship;
 use async_trait::async_trait;
 use serde::Serialize;
+use trust_tasks_proof::affinidi::{
+    CachedDidResolver, ProofPurpose, ProofPurposeResolver, PurposeBound,
+};
 use trust_tasks_rs::{ProofVerifier, TrustTask, VerificationError};
 
 /// The only `proofPurpose` an operational (sender-bound) proof may carry.
@@ -118,22 +118,6 @@ const DEACTIVATION_CACHE_CAPACITY: usize = 4096;
 /// unreachable — a condition that may clear, unlike a bad proof.
 pub fn is_unreachable(err: &VerificationError) -> bool {
     matches!(err, VerificationError::Other(m) if m.contains(UNREACHABLE))
-}
-
-/// Which verification relationship a proof's key must be listed under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyRelationship {
-    Authentication,
-    AssertionMethod,
-}
-
-impl KeyRelationship {
-    fn name(self) -> &'static str {
-        match self {
-            KeyRelationship::Authentication => "authentication",
-            KeyRelationship::AssertionMethod => "assertionMethod",
-        }
-    }
 }
 
 /// Minimum spacing between forced re-resolutions of one DID.
@@ -280,19 +264,25 @@ impl DeactivationCache {
     }
 }
 
-/// Resolves a verification method only if the DID document lists it under the
-/// required relationship, then decodes it with the shared resolver.
-struct RelationshipKeyResolver {
+/// Resolves a verification method for a proof purpose through the library's
+/// relationship check ([`CachedDidResolver`]: the key must be listed under the
+/// relationship the purpose names, and controlled by the DID naming it), after
+/// telling an unreachable signer apart from a bad proof, and refusing a
+/// deactivated `did:webvh` signer.
+struct SignerKeyResolver {
     client: DIDCacheClient,
-    decode: trust_tasks_proof::affinidi::CachedDidResolver,
+    decode: CachedDidResolver,
     /// `None` only in tests that resolve from documents placed in the cache.
     deactivation: Option<Arc<DeactivationCache>>,
-    relationship: KeyRelationship,
 }
 
 #[async_trait]
-impl VerificationMethodResolver for RelationshipKeyResolver {
-    async fn resolve_vm(&self, vm: &str) -> Result<ResolvedKey, DataIntegrityError> {
+impl ProofPurposeResolver for SignerKeyResolver {
+    async fn resolve_vm_for_purpose(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, DataIntegrityError> {
         let did = controller_did(vm);
         let resolved = self.client.resolve(did).await.map_err(|e| {
             DataIntegrityError::Resolver(format!(
@@ -300,25 +290,8 @@ impl VerificationMethodResolver for RelationshipKeyResolver {
                  this service?): {e}"
             ))
         })?;
-        let doc = resolved.doc;
-        let fragment = vm.find('#').map(|i| &vm[i..]);
-        let refers = |id: &str| id == vm || fragment.is_some_and(|f| id == f);
-        let relationship = match self.relationship {
-            KeyRelationship::Authentication => &doc.authentication,
-            KeyRelationship::AssertionMethod => &doc.assertion_method,
-        };
-        let listed = relationship.iter().any(|r| match r {
-            VerificationRelationship::Reference(id) => refers(id),
-            VerificationRelationship::VerificationMethod(m) => refers(m.id.as_str()),
-            // A relationship shape this build cannot read authorises nothing.
-            _ => false,
-        });
-        if !listed {
-            return Err(DataIntegrityError::Resolver(format!(
-                "verificationMethod {vm} is not an {} key of {did}",
-                self.relationship.name()
-            )));
-        }
+        // The relationship check (and key decoding) is the library's.
+        let key = self.decode.resolve_vm_for_purpose(vm, purpose).await?;
         // A deactivated DID's keys sign nothing.
         if did.starts_with("did:webvh:")
             && let Some(deactivation) = &self.deactivation
@@ -328,7 +301,7 @@ impl VerificationMethodResolver for RelationshipKeyResolver {
                 "{did} is deactivated; its keys are no longer valid"
             )));
         }
-        self.decode.resolve_vm(vm).await
+        Ok(key)
     }
 }
 
@@ -336,9 +309,11 @@ impl VerificationMethodResolver for RelationshipKeyResolver {
 /// `verificationMethod` to it. See the module docs for the security rationale.
 #[derive(Clone)]
 pub struct TransportBoundVerifier {
-    resolver: Arc<dyn VerificationMethodResolver>,
-    authentication_resolver: Arc<dyn VerificationMethodResolver>,
-    assertion_resolver: Arc<dyn VerificationMethodResolver>,
+    /// Resolves keys for [`ProofVerifier::verify`].
+    resolver: Arc<dyn ProofPurposeResolver>,
+    /// Resolves keys for the operational and approval checks, which also
+    /// refuse a deactivated signer.
+    signer_resolver: Arc<dyn ProofPurposeResolver>,
     refresher: Option<Arc<dyn StaleKeyRefresh>>,
     options: VerifyOptions,
     delegate: Option<SessionDelegate>,
@@ -350,10 +325,9 @@ impl TransportBoundVerifier {
     /// separate relationships (the local `did:key` resolver, where the one key
     /// is by construction an authentication key). Production code uses
     /// [`Self::with_did_cache`].
-    pub fn with_resolver(resolver: Arc<dyn VerificationMethodResolver>) -> Self {
+    pub fn with_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
         Self {
-            authentication_resolver: resolver.clone(),
-            assertion_resolver: resolver.clone(),
+            signer_resolver: resolver.clone(),
             resolver,
             refresher: None,
             options: VerifyOptions::default(),
@@ -365,21 +339,14 @@ impl TransportBoundVerifier {
     /// proofs must use an `authentication` key, and a proof failing against a
     /// cached document is retried once against a fresh one.
     pub fn with_did_cache(client: DIDCacheClient) -> Self {
-        let decode = trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client.clone()));
+        let decode = CachedDidResolver::new(Arc::new(client.clone()));
         let deactivation = Arc::new(DeactivationCache::default());
         Self {
             resolver: Arc::new(decode.clone()),
-            authentication_resolver: Arc::new(RelationshipKeyResolver {
-                client: client.clone(),
-                decode: decode.clone(),
-                deactivation: Some(deactivation.clone()),
-                relationship: KeyRelationship::Authentication,
-            }),
-            assertion_resolver: Arc::new(RelationshipKeyResolver {
+            signer_resolver: Arc::new(SignerKeyResolver {
                 client: client.clone(),
                 decode,
                 deactivation: Some(deactivation.clone()),
-                relationship: KeyRelationship::AssertionMethod,
             }),
             refresher: Some(Arc::new(CacheRefresher {
                 client,
@@ -431,7 +398,8 @@ impl TransportBoundVerifier {
                 proof.proof_purpose
             )));
         }
-        self.verify_with(doc, &*self.authentication_resolver).await
+        self.verify_with(doc, &*self.signer_resolver, ProofPurpose::Authentication)
+            .await
     }
 
     /// Verify a human approver's decision (consent decision, step-up
@@ -451,20 +419,25 @@ impl TransportBoundVerifier {
                 proof.proof_purpose
             )));
         }
-        self.verify_with(doc, &*self.assertion_resolver).await
+        self.verify_with(doc, &*self.signer_resolver, ProofPurpose::AssertionMethod)
+            .await
     }
 
+    /// Verify `doc` with its key resolved for `purpose`: the key must be listed
+    /// under the relationship `purpose` names in the signer's DID document.
     async fn verify_with<P>(
         &self,
         doc: &TrustTask<P>,
-        resolver: &dyn VerificationMethodResolver,
+        resolver: &dyn ProofPurposeResolver,
+        purpose: ProofPurpose,
     ) -> Result<(), VerificationError>
     where
         P: Serialize + Send + Sync,
     {
         let (parsed_proof, doc_value) = self.prepare(doc)?;
+        let resolver = PurposeBound::new(resolver, purpose);
         let attempt = parsed_proof
-            .verify(&doc_value, resolver, self.options.clone())
+            .verify(&doc_value, &resolver, self.options.clone())
             .await;
         let err = match attempt {
             Ok(_) => return Ok(()),
@@ -487,7 +460,7 @@ impl TransportBoundVerifier {
         {
             tracing::debug!(vm, error = %err, "proof failed against cached DID document; retrying fresh");
             return parsed_proof
-                .verify(&doc_value, resolver, self.options.clone())
+                .verify(&doc_value, &resolver, self.options.clone())
                 .await
                 .map(|_| ())
                 .map_err(map_error);
@@ -570,7 +543,15 @@ impl ProofVerifier for TransportBoundVerifier {
     where
         P: Serialize + Send + Sync,
     {
-        self.verify_with(doc, &*self.resolver).await
+        // The key must be authorised for the purpose the proof declares.
+        let purpose = doc
+            .proof
+            .as_ref()
+            .map(|p| ProofPurpose::parse(&p.proof_purpose))
+            .transpose()
+            .map_err(map_error)?
+            .unwrap_or(ProofPurpose::Authentication);
+        self.verify_with(doc, &*self.resolver, purpose).await
     }
 }
 
@@ -611,7 +592,9 @@ fn map_error(err: DataIntegrityError) -> VerificationError {
 mod tests {
     use super::*;
 
-    use affinidi_data_integrity::{DataIntegrityProof, DidKeyResolver, SignOptions};
+    use affinidi_data_integrity::{
+        DataIntegrityProof, DidKeyResolver, SignOptions, VerificationMethodResolver,
+    };
     use affinidi_secrets_resolver::secrets::Secret;
     use serde_json::{Value, json};
     use trust_tasks_rs::TrustTask;
@@ -814,10 +797,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl VerificationMethodResolver for RotatedResolver {
-        async fn resolve_vm(&self, vm: &str) -> Result<ResolvedKey, DataIntegrityError> {
+    impl ProofPurposeResolver for RotatedResolver {
+        async fn resolve_vm_for_purpose(
+            &self,
+            vm: &str,
+            purpose: ProofPurpose,
+        ) -> Result<ResolvedKey, DataIntegrityError> {
             if self.refreshed.load(std::sync::atomic::Ordering::SeqCst) {
-                DidKeyResolver.resolve_vm(vm).await
+                DidKeyResolver.resolve_vm_for_purpose(vm, purpose).await
             } else {
                 Err(DataIntegrityError::Resolver(format!(
                     "{vm} not in cached document"
@@ -952,12 +939,12 @@ mod tests {
             .unwrap();
             client.add_did_document(did, doc).await;
         }
-        let resolver = RelationshipKeyResolver {
+        let signers = SignerKeyResolver {
             client: client.clone(),
-            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client.clone())),
+            decode: CachedDidResolver::new(Arc::new(client)),
             deactivation: None,
-            relationship: KeyRelationship::Authentication,
         };
+        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
         resolver
             .resolve_vm("did:web:auth.example#key-1")
             .await
@@ -967,18 +954,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("not an authentication key"),
+            err.to_string().contains("not listed under authentication"),
             "{err}"
         );
 
         // An approver's decision is the mirror image: its key must be listed
         // under `assertionMethod`, and an authentication-only key is refused.
-        let approvals = RelationshipKeyResolver {
-            client: client.clone(),
-            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
-            deactivation: None,
-            relationship: KeyRelationship::AssertionMethod,
-        };
+        let approvals = PurposeBound::new(&signers, ProofPurpose::AssertionMethod);
         approvals
             .resolve_vm("did:web:assert.example#key-1")
             .await
@@ -988,7 +970,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("not an assertionMethod key"),
+            err.to_string().contains("not listed under assertionMethod"),
             "{err}"
         );
     }
@@ -1037,7 +1019,7 @@ mod tests {
         assert!(is_unreachable(&unreachable), "{unreachable:?}");
         assert!(unreachable.to_string().contains("gone.example"));
         let not_listed = map_error(DataIntegrityError::Resolver(
-            "verificationMethod x is not an authentication key of y".into(),
+            "verificationMethod is not listed under authentication in its DID document".into(),
         ));
         assert!(!is_unreachable(&not_listed));
         assert!(!is_unreachable(&VerificationError::SignatureInvalid));
@@ -1101,12 +1083,12 @@ mod tests {
             v.insert(live.into(), (Instant::now(), false));
             v.insert(dead.into(), (Instant::now(), true));
         }
-        let resolver = RelationshipKeyResolver {
+        let signers = SignerKeyResolver {
             client: client.clone(),
-            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
+            decode: CachedDidResolver::new(Arc::new(client)),
             deactivation: Some(deactivation),
-            relationship: KeyRelationship::Authentication,
         };
+        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
         resolver
             .resolve_vm(&format!("{live}#key-1"))
             .await
