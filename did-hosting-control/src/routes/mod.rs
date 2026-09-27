@@ -249,7 +249,7 @@ pub fn router_without_fallback() -> Router<AppState> {
             (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )
         .route_with_task_permissive(
-            "/auth/passkey/invite/{token}",
+            "/auth/passkey/invite/{invite_id}",
             put(passkey::update_invite::<AppState>).delete(passkey::revoke_invite::<AppState>),
             (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )

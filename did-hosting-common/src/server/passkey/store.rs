@@ -12,7 +12,13 @@ use crate::server::store::KeyspaceHandle;
 /// One-time enrollment invitation created by the CLI `invite` subcommand.
 #[derive(Serialize, Deserialize)]
 pub struct Enrollment {
+    /// The bearer secret the invitee redeems. Disclosed once, when the invite
+    /// is issued, and never again: every later read or change addresses the
+    /// invite by [`Self::invite_id`].
     pub token: String,
+    /// The invite's handle for administrators — list, update, revoke. Carries
+    /// no authority.
+    pub invite_id: String,
     pub did: String,
     pub role: String,
     pub created_at: u64,
@@ -46,6 +52,7 @@ impl std::fmt::Debug for Enrollment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Enrollment")
             .field("token", &"<redacted>")
+            .field("invite_id", &self.invite_id)
             .field("did", &self.did)
             .field("role", &self.role)
             .field("created_at", &self.created_at)
@@ -155,6 +162,17 @@ pub async fn list_enrollments(ks: &KeyspaceHandle) -> Result<Vec<Enrollment>, Ap
         }
     }
     Ok(out)
+}
+
+/// The enrollment an administrator addresses by `invite_id`.
+pub async fn find_enrollment_by_invite_id(
+    ks: &KeyspaceHandle,
+    invite_id: &str,
+) -> Result<Option<Enrollment>, AppError> {
+    Ok(list_enrollments(ks)
+        .await?
+        .into_iter()
+        .find(|e| e.invite_id == invite_id))
 }
 
 // ---------------------------------------------------------------------------

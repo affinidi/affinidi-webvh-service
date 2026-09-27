@@ -139,6 +139,34 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
     }
 }
 
+/// An optional bearer session: `None` when the request carries no
+/// `Authorization` header at all, the authenticated claims when it carries a
+/// valid one — and a refusal, exactly as [`AuthClaims`] refuses, when it
+/// carries one that does not authenticate. A bad credential is never quietly
+/// treated as none.
+///
+/// For the one route that authorises on something other than a bearer
+/// session — `POST /api/trust-tasks`, where a signed document is the
+/// authorisation and a bearer session only adds the session's context.
+impl<S: AuthState> axum::extract::OptionalFromRequestParts<S> for AuthClaims {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            return Ok(None);
+        }
+        <AuthClaims as FromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+            .map(Some)
+    }
+}
+
 /// Extractor that requires the caller to have Service role.
 ///
 /// Use on endpoints that only service accounts should access (e.g. register-service):

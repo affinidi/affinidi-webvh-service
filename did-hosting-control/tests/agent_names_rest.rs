@@ -428,7 +428,7 @@ async fn server_info_reports_no_names_when_the_feature_is_off() {
 /// Seed a hosted DID at `mnemonic` whose identifier is `did_id`.
 async fn seed_named_did(h: &TestServer, mnemonic: &str, did_id: &str, names: &[(&str, bool)]) {
     let record = did_hosting_common::did_ops::DidRecord {
-        owner: "did:example:operator".into(),
+        owner: "did:example:owner".into(),
         mnemonic: mnemonic.into(),
         created_at: 0,
         updated_at: 0,
@@ -528,6 +528,26 @@ async fn resolve_does_not_answer_for_a_foreign_root_did() {
         json!({}),
         "a foreign root DID must not inherit the local root DID's names"
     );
+}
+
+/// Only DIDs the caller may read are answered: another owner's DID is simply
+/// absent, exactly as one this service does not host — so the call cannot be
+/// used to test whether a DID is hosted here.
+#[tokio::test]
+async fn resolve_does_not_answer_for_another_owners_did() {
+    let h = make_harness().await;
+    let token = h.mint_token("did:example:someone-else", Role::Owner).await;
+    seed_named_did(
+        &h,
+        "alice",
+        "did:webvh:abc:control.example.com:alice",
+        &[("alice", true)],
+    )
+    .await;
+    let (status, body) =
+        resolve_names(&h, &token, &["did:webvh:abc:control.example.com:alice"]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["names"], json!({}));
 }
 
 /// Parked names are registry-private: they resolve to nothing, so returning

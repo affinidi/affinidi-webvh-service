@@ -140,6 +140,42 @@ where
     .await
 }
 
+/// [`verify_sender_bound`] for a human approver's decision: every binding
+/// check is the same, but the proof must carry `proofPurpose: assertionMethod`
+/// with its key listed under the approver's `assertionMethod` relationship,
+/// and the signer must not have deactivated its DID
+/// ([`TransportBoundVerifier::verify_approval`]). A decision is an
+/// attestation, not an operational message, and an `authentication` proof is
+/// refused for one exactly as an `assertionMethod` proof is refused for an
+/// operational request.
+pub async fn verify_sender_bound_approval<P>(
+    doc: &TrustTask<P>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    verify_bound(
+        doc,
+        None,
+        transport_sender,
+        my_vid,
+        verifier,
+        Utc::now(),
+        Relationship::AssertionMethod,
+    )
+    .await
+}
+
+/// Which verification relationship a sender-bound proof must use.
+#[derive(Clone, Copy)]
+enum Relationship {
+    Authentication,
+    AssertionMethod,
+}
+
 /// [`verify_sender_bound`] against an explicit clock, for tests.
 pub async fn verify_sender_bound_at<P>(
     doc: &TrustTask<P>,
@@ -148,6 +184,30 @@ pub async fn verify_sender_bound_at<P>(
     my_vid: &str,
     verifier: &TransportBoundVerifier,
     now: DateTime<Utc>,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    verify_bound(
+        doc,
+        expected_issuer,
+        transport_sender,
+        my_vid,
+        verifier,
+        now,
+        Relationship::Authentication,
+    )
+    .await
+}
+
+async fn verify_bound<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+    now: DateTime<Utc>,
+    relationship: Relationship,
 ) -> Result<String, BoundError>
 where
     P: Serialize + Send + Sync,
@@ -193,7 +253,10 @@ where
     {
         return Err(BoundError::Expired(expires_at));
     }
-    verifier.verify_operational(doc).await?;
+    match relationship {
+        Relationship::Authentication => verifier.verify_operational(doc).await?,
+        Relationship::AssertionMethod => verifier.verify_approval(doc).await?,
+    }
     Ok(issuer.to_string())
 }
 

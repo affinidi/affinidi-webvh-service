@@ -3,17 +3,8 @@
 //! relationship, and answers in the shape its schema allows.
 
 use serde_json::{Value, json};
-use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::{
-    did_management::{
-        agent_name::{check, list as names_list, remove, update},
-        did::{change_owner, check_name, delete, info, list, register},
-        me::domains as me_domains,
-    },
-    webvh::witness::publish as witness_publish,
-};
 
-use did_hosting_common::did_ops::{AgentNameEntry, DidRecord, did_key};
+use did_hosting_common::did_ops::{AgentNameEntry, DidRecord, content_log_key, did_key};
 use did_hosting_common::server::acl::Role;
 use did_hosting_common::server::trust_tasks::ProofRule;
 
@@ -21,60 +12,169 @@ use super::TASKS;
 use super::harness::*;
 use crate::server::AppState;
 
-/// The URI of a generated request type.
-fn uri<P: Payload>() -> &'static str {
-    P::TYPE_URI
-}
-
 /// A task code is the task's own — declared by its specification or its
 /// category — rather than one the framework raises before a handler runs.
 fn is_task_code(code: &str) -> bool {
     code.contains(':')
 }
 
-/// A request for every row that reaches its handler: either the handler
-/// answers, or it refuses under a code the task's specification declares.
-/// `n` keeps each transport's run on its own slots.
+/// Whether `reply` came from the row's handler rather than from the gate or
+/// the narrowing in front of it: a response, or an error that is not one of
+/// the refusals the gate and the framework raise before a handler runs.
+fn is_served(reply: &Value) -> bool {
+    let reply_type = reply["type"].as_str().unwrap_or_default();
+    if reply_type.ends_with("#response") {
+        return true;
+    }
+    let code = reply["payload"]["code"].as_str().unwrap_or_default();
+    let message = reply["payload"]["message"].as_str().unwrap_or_default();
+    !matches!(
+        code,
+        "proofRequired" | "proofInvalid" | "unsupportedType" | "idConflict" | "wrongRecipient"
+    ) && !(code == "permissionDenied" && message.contains("not present in the maintainer's ACL"))
+        && !(code == "malformedRequest" && message.contains("payload"))
+}
+
+/// A seeded, published slot with a two-entry log.
+async fn seed_published(state: &AppState, owner: &str, mnemonic: &str) {
+    let mut record = seed_did(state, owner, mnemonic).await;
+    record.version_count = 2;
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .unwrap();
+    state
+        .dids_ks
+        .insert_raw(
+            content_log_key(mnemonic),
+            b"{\"versionId\":\"1-a\",\"state\":{},\"parameters\":{}}\n{\"versionId\":\"2-b\",\"state\":{},\"parameters\":{}}".to_vec(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A WebAuthn assertion in the shape the schema requires — it will not
+/// verify, which is not what these tests are about.
+fn assertion() -> Value {
+    json!({
+        "id": "AAAA",
+        "rawId": "AAAA",
+        "type": "public-key",
+        "response": {
+            "authenticatorData": "AAAA",
+            "clientDataJSON": "AAAA",
+            "signature": "AAAA",
+        },
+    })
+}
+
+/// A request for every row that reaches its handler. `n` keeps each
+/// transport's run on its own slots.
 async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> Value {
     let slot = format!("slot-{n}");
-    let seed = |m: String| {
-        let admin = admin.did.clone();
-        async move { seed_did(state, &admin, &m).await }
-    };
-    if type_uri == uri::<check_name::v0_1::Payload>() {
-        json!({ "path": format!("free-{n}"), "reserve": false })
-    } else if type_uri == uri::<register::v0_1::Payload>() {
-        json!({ "path": format!("reg-{n}"), "method": "webvh", "didData": "not a log", "force": false })
-    } else if type_uri == uri::<info::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot })
-    } else if type_uri == uri::<list::v0_1::Payload>() {
-        json!({})
-    } else if type_uri == uri::<delete::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot })
-    } else if type_uri == uri::<change_owner::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        let heir = member(state, 100 + (n % 150) as u8, Role::Owner).await;
-        json!({ "mnemonic": slot, "newOwner": heir.did })
-    } else if type_uri == uri::<witness_publish::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot, "witness": {} })
-    } else if type_uri == uri::<me_domains::v0_1::Payload>() {
-        json!({})
-    } else if type_uri == uri::<update::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot, "name": "alice", "state": "active", "didData": "not a log" })
-    } else if type_uri == uri::<remove::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot, "name": "alice", "didData": "not a log" })
-    } else if type_uri == uri::<names_list::v0_1::Payload>() {
-        seed(slot.clone()).await;
-        json!({ "mnemonic": slot })
-    } else if type_uri == uri::<check::v0_1::Payload>() {
-        json!({ "name": "alice", "domain": "example.com" })
-    } else {
-        panic!("no sample for {type_uri}: add one when adding a row");
+    let slug = type_uri.trim_start_matches("https://trusttasks.org/spec/");
+    match slug {
+        "did-management/did/check-name/0.1" => {
+            json!({ "path": format!("free-{n}"), "reserve": false })
+        }
+        "did-management/did/register/0.1" => {
+            json!({ "path": format!("reg-{n}"), "method": "webvh", "didData": "not a log", "force": false })
+        }
+        "did-management/did/info/0.1"
+        | "did-management/did/delete/0.1"
+        | "did-management/agent-name/list/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot })
+        }
+        "did-management/did/list/0.1"
+        | "did-management/me/domains/0.1"
+        | "did-management/domain/list/0.1"
+        | "did-management/registry/list/0.1"
+        | "did-management/server/info/0.1"
+        | "did-management/server/config/0.1"
+        | "did-management/server/metrics/0.1"
+        | "did-management/stats/get/0.1"
+        | "did-management/identity/list/0.1"
+        | "auth/passkey/login/start/0.2"
+        | "auth/passkey/enroll/invite/list/0.1" => json!({}),
+        "did-management/did/change-owner/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            let heir = member(state, 100 + (n % 150) as u8, Role::Owner).await;
+            json!({ "mnemonic": slot, "newOwner": heir.did })
+        }
+        "did-management/did/set-state/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "state": "suspended" })
+        }
+        "did-management/did/rollback/0.1" => {
+            seed_published(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "targetVersion": 1 })
+        }
+        "did-management/did/log/0.1" => {
+            seed_published(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "raw": true })
+        }
+        "webvh/witness/publish/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "witness": {} })
+        }
+        "did-management/agent-name/update/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "name": "alice", "state": "active", "didData": "not a log" })
+        }
+        "did-management/agent-name/remove/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "name": "alice", "didData": "not a log" })
+        }
+        "did-management/agent-name/check/0.1" => {
+            json!({ "name": "alice", "domain": "example.com" })
+        }
+        "did-management/agent-name/resolve/0.1" => {
+            json!({ "dids": [format!("did:webvh:abc:control.test:{slot}")] })
+        }
+        "did-management/domain/create/0.1" => {
+            json!({ "name": format!("d{n}.example.com"), "setAsDefault": false })
+        }
+        "did-management/domain/update/0.1" | "did-management/domain/set-default/0.1" => {
+            json!({ "name": "nowhere.example.com" })
+        }
+        "did-management/domain/set-state/0.1" => {
+            json!({ "name": "nowhere.example.com", "state": "disabled" })
+        }
+        "did-management/domain/purge/0.1" => {
+            json!({ "name": "nowhere.example.com", "purgeServers": false })
+        }
+        "did-management/domain/assign/0.1"
+        | "did-management/domain/unassign/0.1"
+        | "did-management/registry/purge-domain/0.1" => {
+            json!({ "domain": "nowhere.example.com", "instanceId": "nobody" })
+        }
+        "did-management/registry/get/0.1"
+        | "did-management/registry/check/0.1"
+        | "did-management/registry/deregister/0.1" => json!({ "instanceId": "nobody" }),
+        "did-management/registry/admin-register/0.1" => json!({
+            "instanceId": format!("edge-{n}"),
+            "did": format!("did:example:edge-{n}"),
+            "publicUrl": format!("https://edge-{n}.example.com"),
+        }),
+        "did-management/stats/timeseries/0.1" => json!({ "range": "lastHour" }),
+        "did-management/identity/retire/0.1" => json!({ "generationId": 999 }),
+        "auth/step-up/start/0.1" => json!({ "sessionId": "no-such-session" }),
+        "auth/step-up/approve-response/0.5" => json!({
+            "challenge": "0123456789abcdef0123456789abcdef",
+            "decision": "approved",
+            "subject": admin.did,
+            "sessionId": "no-such-session",
+        }),
+        "auth/passkey/login/finish/0.2" => {
+            json!({ "authId": "no-such-ceremony", "credential": assertion() })
+        }
+        "auth/passkey/enroll/invite/update/0.1" => {
+            json!({ "inviteId": "no-such-invite", "role": "owner" })
+        }
+        "auth/passkey/enroll/invite/revoke/0.1" => json!({ "inviteId": "no-such-invite" }),
+        other => panic!("no sample for {other}: add one when adding a row"),
     }
 }
 
@@ -88,19 +188,16 @@ async fn every_row_is_served_on_every_transport() {
             n += 1;
             let payload = sample(&state, &admin, n, type_uri).await;
             let reply = call(&state, via, &admin, type_uri, payload).await;
-            let reply_type = reply["type"].as_str().unwrap_or_default();
-            if reply_type == format!("{type_uri}#response") {
+            assert!(
+                is_served(&reply),
+                "{via:?} {type_uri} was not served: {reply}"
+            );
+            if reply["type"] == format!("{type_uri}#response") {
                 conforms(&reply);
                 assert_eq!(reply["issuer"], CONTROL, "{via:?} {type_uri}: {reply}");
                 assert!(
                     reply["proof"].is_object(),
                     "{via:?} {type_uri}: reply is signed"
-                );
-            } else {
-                let code = code(&reply);
-                assert!(
-                    is_task_code(&code),
-                    "{via:?} {type_uri} was not served: {reply}"
                 );
             }
         }
@@ -108,7 +205,7 @@ async fn every_row_is_served_on_every_transport() {
 }
 
 #[tokio::test]
-async fn an_unsigned_request_is_refused_on_every_transport() {
+async fn an_unsigned_request_is_refused_where_a_proof_is_required() {
     let (state, _dir) = state().await;
     let admin = member(&state, 2, Role::Admin).await;
     let mut n = 1000;
@@ -125,19 +222,26 @@ async fn an_unsigned_request_is_refused_on_every_transport() {
     }
 }
 
+/// An operational request (and a session ceremony) signed as an attestation,
+/// and an approver's decision signed as an operational message, are each
+/// refused: the proof purpose must match the key relationship the task names.
 #[tokio::test]
-async fn a_proof_under_the_wrong_key_relationship_is_refused_on_every_transport() {
+async fn a_proof_under_the_wrong_key_relationship_is_refused() {
     let (state, _dir) = state().await;
     let admin = member(&state, 3, Role::Admin).await;
     let mut n = 2000;
     for (type_uri, rule) in TASKS {
-        if *rule != ProofRule::Authentication {
+        if *rule == ProofRule::Optional {
             continue;
         }
         for via in VIAS {
             n += 1;
             let payload = sample(&state, &admin, n, type_uri).await;
-            let doc = signed_as_assertion(request(type_uri, &admin.did, payload), &admin.key).await;
+            let doc = request(type_uri, &admin.did, payload);
+            let doc = match rule {
+                ProofRule::AssertionMethod => signed(doc, &admin.key).await,
+                _ => signed_as_assertion(doc, &admin.key).await,
+            };
             let reply = send(&state, via, &admin, doc).await;
             assert_eq!(code(&reply), "proofInvalid", "{via:?} {type_uri}: {reply}");
         }
@@ -151,7 +255,7 @@ async fn a_signer_outside_the_acl_is_refused_on_every_transport() {
     let outsider = stranger(5);
     let mut n = 3000;
     for (type_uri, rule) in TASKS {
-        if *rule == ProofRule::Optional {
+        if matches!(rule, ProofRule::Optional | ProofRule::SessionKey) {
             continue;
         }
         for via in VIAS {
@@ -161,6 +265,28 @@ async fn a_signer_outside_the_acl_is_refused_on_every_transport() {
             assert_eq!(
                 code(&reply),
                 "permissionDenied",
+                "{via:?} {type_uri}: {reply}"
+            );
+        }
+    }
+}
+
+/// A proof that is present is verified even where none is required.
+#[tokio::test]
+async fn an_optional_proof_that_does_not_verify_is_refused() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 6, Role::Admin).await;
+    for (type_uri, rule) in TASKS {
+        if *rule != ProofRule::Optional {
+            continue;
+        }
+        for via in VIAS {
+            // Signed, then altered: the proof no longer covers the document.
+            let mut doc = signed(request(type_uri, &admin.did, json!({})), &admin.key).await;
+            doc["id"] = json!(format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+            let reply = send(&state, via, &admin, doc).await;
+            assert!(
+                matches!(code(&reply).as_str(), "proofInvalid" | "permissionDenied"),
                 "{via:?} {type_uri}: {reply}"
             );
         }
@@ -863,4 +989,716 @@ async fn me_domains_answers_in_the_shared_domain_entry_shape() {
         body["domains"][0]["ext"]["vnd.affinidi.webvh"]["scheme"],
         "https"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the control plane: slots, domains, fleet, service, auth
+// ---------------------------------------------------------------------------
+
+const SPEC: &str = "https://trusttasks.org/spec/";
+
+fn t(slug: &str) -> String {
+    format!("{SPEC}{slug}")
+}
+
+/// A live session for `caller`, as a login would leave it.
+async fn session_for(
+    state: &AppState,
+    caller: &Caller,
+) -> did_hosting_common::server::auth::session::TokenResponse {
+    did_hosting_common::server::auth::session::create_authenticated_session(
+        &state.sessions_ks,
+        state.jwt_keys.as_deref().unwrap(),
+        &caller.did,
+        &caller.role,
+        900,
+        3600,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// Step-up end to end: start answers a signed approve-request 0.3 bound to the
+/// session; the subject's assertionMethod-signed approve-response elevates the
+/// session; auth/refresh then mints tokens at the session's new level.
+#[tokio::test]
+async fn step_up_elevates_the_session_and_refresh_reads_the_new_level() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 40, Role::Owner).await;
+    let tokens = session_for(&state, &owner).await;
+
+    let reply = call(
+        &state,
+        Via::Didcomm,
+        &owner,
+        &t("auth/step-up/start/0.1"),
+        json!({ "sessionId": tokens.session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t("auth/step-up/start/0.1"))["approveRequest"].clone();
+    assert_eq!(request["type"], t("auth/step-up/approve-request/0.3"));
+    assert_eq!(request["issuer"], CONTROL);
+    assert_eq!(request["recipient"], owner.did.as_str());
+    assert_eq!(request["payload"]["sessionId"], tokens.session_id.as_str());
+    assert_eq!(request["proof"]["proofPurpose"], "authentication");
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // An operational (authentication) proof is not a decision.
+    let decision = json!({
+        "challenge": challenge,
+        "decision": "approved",
+        "subject": owner.did,
+        "sessionId": tokens.session_id,
+    });
+    let wrong = signed(
+        request_doc(
+            &t("auth/step-up/approve-response/0.5"),
+            &owner.did,
+            decision.clone(),
+        ),
+        &owner.key,
+    )
+    .await;
+    assert_eq!(
+        code(&send(&state, Via::Https, &owner, wrong).await),
+        "proofInvalid"
+    );
+
+    let reply = call(
+        &state,
+        Via::Https,
+        &owner,
+        &t("auth/step-up/approve-response/0.5"),
+        decision.clone(),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t("auth/step-up/approve-response/0.5"));
+    assert_eq!(body["status"], "elevated");
+    assert_eq!(body["session"]["acr"], "aal2");
+
+    // The challenge is single use.
+    let reply = call(
+        &state,
+        Via::Https,
+        &owner,
+        &t("auth/step-up/approve-response/0.5"),
+        decision,
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:challengeUnknown",
+        "{reply}"
+    );
+
+    // Refresh re-reads the session's level.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &t("auth/refresh/0.1"),
+        json!({ "refreshToken": tokens.refresh_token }),
+    )
+    .await;
+    let body = ok(&reply, &t("auth/refresh/0.1"));
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+    let access = body["tokens"]["accessToken"].as_str().unwrap();
+    let claims = state.jwt_keys.as_deref().unwrap().decode(access).unwrap();
+    assert_eq!(claims.acr, "aal2");
+
+    // An elevated session needs no further step-up.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &t("auth/step-up/start/0.1"),
+        json!({ "sessionId": tokens.session_id }),
+    )
+    .await;
+    assert_eq!(code(&reply), "auth/step-up/start:notNeeded", "{reply}");
+}
+
+/// Nobody can open a step-up against a session that is not theirs.
+#[tokio::test]
+async fn step_up_start_answers_someone_elses_session_as_unknown() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 41, Role::Owner).await;
+    let other = member(&state, 42, Role::Owner).await;
+    let tokens = session_for(&state, &owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &other,
+        &t("auth/step-up/start/0.1"),
+        json!({ "sessionId": tokens.session_id }),
+    )
+    .await;
+    assert_eq!(code(&reply), "auth/step-up/start:sessionUnknown", "{reply}");
+}
+
+/// An unsigned request document from `issuer`, for tests that sign it
+/// themselves.
+fn request_doc(type_uri: &str, issuer: &str, payload: Value) -> Value {
+    request(type_uri, issuer, payload)
+}
+
+/// `server/info` is the public read: sent with no proof and no issuer, over
+/// HTTPS with no session, it is answered — signed by the DID it names, with no
+/// recipient.
+#[tokio::test]
+async fn server_info_answers_an_anonymous_request_signed_by_the_service() {
+    let (state, _dir) = state().await;
+    let uri = t("did-management/server/info/0.1");
+    let mut doc = request(&uri, "unused", json!({}));
+    doc.as_object_mut().unwrap().remove("issuer");
+    let reply = https(&state, None, doc).await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert_eq!(body["serviceDid"], CONTROL);
+    assert_eq!(reply["issuer"], CONTROL);
+    assert!(reply.get("recipient").is_none(), "{reply}");
+    assert!(reply["proof"].is_object());
+}
+
+/// Passkey login opens unsigned; with no passkeys registered it says so.
+#[tokio::test]
+async fn passkey_login_start_is_open_to_an_unsigned_request() {
+    let (state, _dir) = state().await;
+    let uri = t("auth/passkey/login/start/0.2");
+    let mut doc = request(&uri, "unused", json!({}));
+    doc.as_object_mut().unwrap().remove("issuer");
+    let reply = https(&state, None, doc).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/start:noCredentials",
+        "{reply}"
+    );
+}
+
+/// Invites are addressed by inviteId, and no read sends a token back.
+#[tokio::test]
+async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 43, Role::Admin).await;
+    let created = did_hosting_common::server::passkey::routes::create_enrollment_invite(
+        &state.sessions_ks,
+        "http://control.test",
+        3600,
+        "did:example:invitee",
+        "owner",
+    )
+    .await
+    .unwrap();
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/list/0.1"),
+        json!({}),
+    )
+    .await;
+    conforms(&reply);
+    let text = reply.to_string();
+    assert!(
+        !text.contains(&created.token),
+        "a list must not carry the token"
+    );
+    let body = ok(&reply, &t("auth/passkey/enroll/invite/list/0.1"));
+    assert_eq!(body["invites"][0]["inviteId"], created.invite_id.as_str());
+    assert_eq!(body["invites"][0]["subject"], "did:example:invitee");
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/update/0.1"),
+        json!({ "inviteId": created.invite_id, "role": "admin" }),
+    )
+    .await;
+    conforms(&reply);
+    assert!(!reply.to_string().contains(&created.token));
+    assert_eq!(
+        ok(&reply, &t("auth/passkey/enroll/invite/update/0.1"))["invite"]["role"],
+        "admin"
+    );
+
+    // Two changes at once is not one update.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/update/0.1"),
+        json!({ "inviteId": created.invite_id, "role": "owner", "extendBy": 60 }),
+    )
+    .await;
+    assert_eq!(code(&reply), "malformedRequest", "{reply}");
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/revoke/0.1"),
+        json!({ "inviteId": created.invite_id }),
+    )
+    .await;
+    conforms(&reply);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/revoke/0.1"),
+        json!({ "inviteId": created.invite_id }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite/revoke:notFound",
+        "{reply}"
+    );
+
+    // Administrators only.
+    let owner = member(&state, 44, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &t("auth/passkey/enroll/invite/list/0.1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite/list:notAdministrator",
+        "{reply}"
+    );
+}
+
+/// A suspended slot's state is what the edges are sent.
+#[tokio::test]
+async fn set_state_suspends_a_slot_and_queues_the_state_to_edges() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 45, Role::Owner).await;
+    seed_did(&state, &owner.did, "alpha").await;
+    let uri = t("did-management/did/set-state/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &uri,
+        json!({ "mnemonic": "alpha", "state": "suspended" }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, &uri)["record"]["disabled"], true);
+    let record: DidRecord = state.dids_ks.get(did_key("alpha")).await.unwrap().unwrap();
+    assert!(record.disabled);
+    let body = crate::server_push::sync_update_body(&record, "{}".into(), None).unwrap();
+    assert_eq!(body["disabled"], true);
+}
+
+#[tokio::test]
+async fn rollback_and_log_follow_the_slots_history() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 46, Role::Owner).await;
+    seed_published(&state, &owner.did, "alpha").await;
+
+    let log = t("did-management/did/log/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &log,
+        json!({ "mnemonic": "alpha", "raw": true }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &log);
+    assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+    assert!(body["logContent"].as_str().unwrap().contains("2-b"));
+
+    let rollback = t("did-management/did/rollback/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &rollback,
+        json!({ "mnemonic": "alpha", "targetVersion": 5 }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/did/rollback:invalidTargetVersion",
+        "{reply}"
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &rollback,
+        json!({ "mnemonic": "alpha", "targetVersion": 1 }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &rollback);
+    assert_eq!(body["removedVersions"], 1);
+    assert_eq!(body["record"]["versionCount"], 1);
+
+    // Someone else's slot is answered exactly as a missing one.
+    let other = member(&state, 47, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &other,
+        &log,
+        json!({ "mnemonic": "alpha" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "did-management/did/log:notFound");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &other,
+        &log,
+        json!({ "mnemonic": "nothing" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "did-management/did/log:notFound");
+}
+
+/// Resolve answers only for DIDs the caller may read.
+#[tokio::test]
+async fn agent_name_resolve_does_not_disclose_other_owners_dids() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 48, Role::Owner).await;
+    let other = member(&state, 49, Role::Owner).await;
+    let mut record = seed_did(&state, &owner.did, "alpha").await;
+    record.agent_names = vec![AgentNameEntry {
+        name: "alice".into(),
+        enabled: true,
+        created_at: 1,
+    }];
+    state
+        .dids_ks
+        .insert(did_key("alpha"), &record)
+        .await
+        .unwrap();
+    let did = record.did_id.clone().unwrap();
+    let uri = t("did-management/agent-name/resolve/0.1");
+
+    let body = ok(
+        &call(&state, Via::Tsp, &owner, &uri, json!({ "dids": [did] })).await,
+        &uri,
+    );
+    assert_eq!(body["entries"][0]["names"], json!(["alice"]));
+    let body = ok(
+        &call(&state, Via::Tsp, &other, &uri, json!({ "dids": [did] })).await,
+        &uri,
+    );
+    assert_eq!(body["entries"], json!([]));
+}
+
+/// Domains, end to end; purging needs a stepped-up session.
+#[tokio::test]
+async fn domains_are_administered_over_trust_tasks() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 50, Role::Admin).await;
+    let create = t("did-management/domain/create/0.1");
+    for name in ["a.example.com", "b.example.com"] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &create,
+            json!({ "name": name, "setAsDefault": name == "a.example.com", "label": "A" }),
+        )
+        .await;
+        conforms(&reply);
+    }
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &create,
+        json!({ "name": "a.example.com", "setAsDefault": false }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/domain/create:domainExists",
+        "{reply}"
+    );
+
+    let list = t("did-management/domain/list/0.1");
+    let reply = call(&state, Via::Tsp, &admin, &list, json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &list);
+    assert_eq!(body["default"], "a.example.com");
+    assert_eq!(body["domains"].as_array().unwrap().len(), 2);
+
+    let set_state = t("did-management/domain/set-state/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &set_state,
+        json!({ "name": "a.example.com", "state": "disabled" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/domain/set-state:isDefault",
+        "{reply}"
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &set_state,
+        json!({ "name": "b.example.com", "state": "disabled" }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, &set_state)["entry"]["status"], "disabled");
+
+    let set_default = t("did-management/domain/set-default/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &set_default,
+        json!({ "name": "b.example.com" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/domain/set-default:domainDisabled",
+        "{reply}"
+    );
+
+    let purge = t("did-management/domain/purge/0.1");
+    let payload = json!({ "name": "b.example.com", "purgeServers": false });
+    let reply = call(&state, Via::Tsp, &admin, &purge, payload.clone()).await;
+    assert_eq!(
+        code(&reply),
+        "permissionDenied",
+        "a base session cannot purge: {reply}"
+    );
+
+    let bearer = crate::auth::AuthClaims {
+        did: admin.did.clone(),
+        role: Role::Admin,
+        session_id: "s".into(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".into()],
+        acr: "aal2".into(),
+    };
+    let doc = signed(request(&purge, &admin.did, payload), &admin.key).await;
+    let reply = https(&state, Some(bearer), doc).await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, &purge)["name"], "b.example.com");
+
+    // Owners do not administer domains.
+    let owner = member(&state, 51, Role::Owner).await;
+    let reply = call(&state, Via::Tsp, &owner, &list, json!({})).await;
+    assert_eq!(code(&reply), "permissionDenied");
+}
+
+#[tokio::test]
+async fn the_fleet_is_administered_over_trust_tasks() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 52, Role::Admin).await;
+    did_hosting_common::server::domain::create_domain(
+        &state.store,
+        &did_hosting_common::server::domain::DomainEntry {
+            name: "example.com".into(),
+            label: None,
+            scheme: did_hosting_common::server::domain::DomainUrlScheme::Https,
+            status: did_hosting_common::server::domain::DomainStatus::Active,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let register = t("did-management/registry/admin-register/0.1");
+    let payload = json!({
+        "instanceId": "edge-1",
+        "did": "did:example:edge-1",
+        "publicUrl": "https://edge-1.example.com",
+        "servedDomains": ["example.com"],
+    });
+    let reply = call(&state, Via::Tsp, &admin, &register, payload.clone()).await;
+    conforms(&reply);
+    let reply = call(&state, Via::Tsp, &admin, &register, payload).await;
+    assert_eq!(
+        code(&reply),
+        "did-management/registry/admin-register:instanceExists"
+    );
+
+    for slug in ["registry/get/0.1", "registry/check/0.1"] {
+        let uri = t(&format!("did-management/{slug}"));
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &uri,
+            json!({ "instanceId": "edge-1" }),
+        )
+        .await;
+        conforms(&reply);
+        assert_eq!(ok(&reply, &uri)["instance"]["did"], "did:example:edge-1");
+    }
+    let list = t("did-management/registry/list/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &list,
+        json!({ "serviceType": "server" }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, &list)["instances"].as_array().unwrap().len(), 1);
+
+    // A purge never races an assignment.
+    let purge = t("did-management/registry/purge-domain/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &purge,
+        json!({ "instanceId": "edge-1", "domain": "example.com" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/registry/purge-domain:stillAssigned",
+        "{reply}"
+    );
+
+    let deregister = t("did-management/registry/deregister/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &deregister,
+        json!({ "instanceId": "edge-1" }),
+    )
+    .await;
+    conforms(&reply);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &deregister,
+        json!({ "instanceId": "edge-1" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "did-management/registry/deregister:notFound");
+}
+
+#[tokio::test]
+async fn the_service_describes_itself_to_administrators_only() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 53, Role::Admin).await;
+    let owner = member(&state, 54, Role::Owner).await;
+    for slug in [
+        "server/config/0.1",
+        "server/metrics/0.1",
+        "identity/list/0.1",
+        "stats/get/0.1",
+    ] {
+        let uri = t(&format!("did-management/{slug}"));
+        let reply = call(&state, Via::Tsp, &admin, &uri, json!({})).await;
+        conforms(&reply);
+        let reply = call(&state, Via::Tsp, &owner, &uri, json!({})).await;
+        assert_eq!(code(&reply), "permissionDenied", "{slug}: {reply}");
+    }
+    // The harness identity is signing-only, so it lists no rotating
+    // generation; its one generation is still the current one.
+    let current = state.identity.as_ref().unwrap().generations()[0].id;
+    let uri = t("did-management/identity/retire/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &uri,
+        json!({ "generationId": current }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/identity/retire:current",
+        "{reply}"
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &uri,
+        json!({ "generationId": current + 100 }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/identity/retire:notFound",
+        "{reply}"
+    );
+
+    // An owner reads their own slot's counters, not the aggregate.
+    seed_did(&state, &owner.did, "mine").await;
+    let uri = t("did-management/stats/get/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &uri,
+        json!({ "mnemonic": "mine" }),
+    )
+    .await;
+    conforms(&reply);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &uri,
+        json!({ "mnemonic": "ghost" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "did-management/stats/get:notFound");
+    let uri = t("did-management/stats/timeseries/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &uri,
+        json!({ "range": "lastDay", "mnemonic": "mine" }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, &uri)["bucketSeconds"], 900);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &uri,
+        json!({ "range": "lastDay" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "permissionDenied");
 }

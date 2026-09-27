@@ -115,3 +115,34 @@ pub fn render() -> String {
         .unwrap_or_default();
     String::from_utf8(buffer).unwrap_or_default()
 }
+
+/// Every counter this service keeps, as `(name, value)`, read at once.
+///
+/// For the authenticated `did-management/server/metrics` Trust Task. The
+/// names are the ones the Prometheus text exposition carried, so a dashboard
+/// re-points with a name mapping only.
+pub fn counters() -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = [
+        &*RESOLVES,
+        &*UPDATES,
+        &*AUTH_CHALLENGES,
+        &*AUTH_SUCCESSES,
+        &*AUTH_FAILURES,
+        &*CACHE_HITS,
+        &*CACHE_MISSES,
+        &*STATS_SYNCS,
+    ]
+    .into_iter()
+    .map(|c| {
+        use prometheus::core::Collector;
+        let name = c
+            .desc()
+            .first()
+            .map(|d| d.fq_name.clone())
+            .unwrap_or_default();
+        (name, c.get() as f64)
+    })
+    .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}

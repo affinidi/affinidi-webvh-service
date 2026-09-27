@@ -38,16 +38,24 @@ use crate::error::AppError;
 use crate::server::AppState;
 
 pub(crate) mod agent_name;
+pub(crate) mod auth;
 pub(crate) mod did;
 pub(crate) mod domain;
 #[cfg(test)]
 pub(crate) mod harness;
+pub(crate) mod registry;
+pub(crate) mod server;
 #[cfg(test)]
 mod tests;
 
 use trust_tasks_rs::specs::{
+    auth::{
+        passkey::{enroll::invite as tt_invite, login as tt_login},
+        step_up as tt_step_up,
+    },
     did_management::{
-        agent_name as tt_agent_name, did as tt_did, domain as tt_domain, me as tt_me,
+        agent_name as tt_agent_name, did as tt_did, domain as tt_domain, identity as tt_identity,
+        me as tt_me, registry as tt_registry, server as tt_server, stats as tt_stats,
     },
     webvh::witness as tt_witness,
 };
@@ -68,6 +76,7 @@ macro_rules! control_tasks {
         /// Run `doc` through its row, or hand it back when no row claims it.
         pub(crate) async fn route<V>(
             state: &AppState,
+            bearer: Option<&AuthClaims>,
             transport: &(impl TransportHandler + Sync),
             policy: ProofPolicy<'_, V>,
             doc: TrustTask<Value>,
@@ -81,6 +90,7 @@ macro_rules! control_tasks {
                     return Ok(
                         serve::<$($seg)::+::Payload, _>(
                             state,
+                            bearer,
                             transport,
                             policy,
                             doc,
@@ -97,24 +107,61 @@ macro_rules! control_tasks {
 }
 
 control_tasks! {
+    // DID slots.
     tt_did::check_name::v0_1 => Authentication, did::check_name;
     tt_did::register::v0_1 => Authentication, did::register;
     tt_did::info::v0_1 => Authentication, did::info;
     tt_did::list::v0_1 => Authentication, did::list;
     tt_did::delete::v0_1 => Authentication, did::delete;
     tt_did::change_owner::v0_1 => Authentication, did::change_owner;
+    tt_did::set_state::v0_1 => Authentication, did::set_state;
+    tt_did::rollback::v0_1 => Authentication, did::rollback;
+    tt_did::log::v0_1 => Authentication, did::log;
     tt_witness::publish::v0_1 => Authentication, did::witness_publish;
-    tt_me::domains::v0_1 => Authentication, domain::me_domains;
+    // Agent names.
     tt_agent_name::update::v0_1 => Authentication, agent_name::update;
     tt_agent_name::remove::v0_1 => Authentication, agent_name::remove;
     tt_agent_name::list::v0_1 => Authentication, agent_name::list;
     tt_agent_name::check::v0_1 => Authentication, agent_name::check;
+    tt_agent_name::resolve::v0_1 => Authentication, agent_name::resolve;
+    // Hosting domains.
+    tt_me::domains::v0_1 => Authentication, domain::me_domains;
+    tt_domain::list::v0_1 => Authentication, domain::list;
+    tt_domain::create::v0_1 => Authentication, domain::create;
+    tt_domain::update::v0_1 => Authentication, domain::update;
+    tt_domain::set_state::v0_1 => Authentication, domain::set_state;
+    tt_domain::set_default::v0_1 => Authentication, domain::set_default;
+    tt_domain::purge::v0_1 => Authentication, domain::purge;
+    tt_domain::assign::v0_1 => Authentication, domain::assign;
+    tt_domain::unassign::v0_1 => Authentication, domain::unassign;
+    // The fleet.
+    tt_registry::list::v0_1 => Authentication, registry::list;
+    tt_registry::get::v0_1 => Authentication, registry::get;
+    tt_registry::check::v0_1 => Authentication, registry::check;
+    tt_registry::admin_register::v0_1 => Authentication, registry::admin_register;
+    tt_registry::deregister::v0_1 => Authentication, registry::deregister;
+    tt_registry::purge_domain::v0_1 => Authentication, registry::purge_domain;
+    // The service itself.
+    tt_server::info::v0_1 => Optional, server::info;
+    tt_server::config::v0_1 => Authentication, server::config;
+    tt_server::metrics::v0_1 => Authentication, server::metrics;
+    tt_stats::get::v0_1 => Authentication, server::stats_get;
+    tt_stats::timeseries::v0_1 => Authentication, server::timeseries;
+    tt_identity::list::v0_1 => Authentication, server::identity_list;
+    tt_identity::retire::v0_1 => Authentication, server::identity_retire;
+    // Step-up: the start is the session subject's operational request; the
+    // decision is the approver's attestation.
+    tt_step_up::start::v0_1 => Authentication, auth::step_up_start;
+    tt_step_up::approve_response::v0_5 => AssertionMethod, auth::approve_response;
+    // Passkey login: opening a ceremony authorises nothing; finishing one
+    // mints a session for the did:key that signs it.
+    tt_login::start::v0_2 => Optional, auth::login_start;
+    tt_login::finish::v0_2 => SessionKey, auth::login_finish;
+    // Enrolment invites, addressed by inviteId.
+    tt_invite::list::v0_1 => Authentication, auth::invite_list;
+    auth::invite_update_v0_1 => Authentication, auth::invite_update;
+    tt_invite::revoke::v0_1 => Authentication, auth::invite_revoke;
 }
-
-// `tt_domain` is imported for the rows the next stage adds; keep the import
-// honest until then.
-#[allow(unused_imports)]
-use tt_domain as _;
 
 /// The proof rule for `type_uri`, when this table serves it.
 pub(crate) fn proof_rule(type_uri: &str) -> Option<ProofRule> {
@@ -128,6 +175,7 @@ pub(crate) fn proof_rule(type_uri: &str) -> Option<ProofRule> {
 /// payload to `handler`.
 async fn serve<P, V>(
     state: &AppState,
+    bearer: Option<&AuthClaims>,
     transport: &(impl TransportHandler + Sync),
     policy: ProofPolicy<'_, V>,
     doc: TrustTask<Value>,
@@ -167,6 +215,12 @@ where
             let cx = Cx {
                 state,
                 caller: parties.issuer.clone(),
+                bearer,
+                proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
+                proof_created: doc.proof.as_ref().map(|p| p.created),
+                via: did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
+                    transport.binding_uri(),
+                ),
             };
             match handler(&cx, doc.payload.clone()).await {
                 Ok(resp) => Ok(doc.respond_with(new_id(), resp)),
@@ -184,6 +238,17 @@ pub(crate) struct Cx<'a> {
     /// this is the proven signer: the gate has refused anything else before a
     /// row runs.
     caller: Option<String>,
+    /// The bearer session an HTTPS request presented, if any. Its assurance
+    /// level applies only when its subject is the proven caller.
+    bearer: Option<&'a AuthClaims>,
+    /// The request proof's `verificationMethod`, when it carried a proof.
+    pub proof_vm: Option<String>,
+    /// The request proof's `created`, when it carried a proof.
+    #[allow(dead_code)]
+    pub proof_created: Option<chrono::DateTime<chrono::Utc>>,
+    /// The transport the request arrived on, when it is one this service knows.
+    #[allow(dead_code)]
+    pub via: Option<did_hosting_common::server::didcomm_profile::ObservedTransport>,
 }
 
 impl Cx<'_> {
@@ -198,9 +263,29 @@ impl Cx<'_> {
         })
     }
 
+    /// The bearer session the request presented, when it presented one.
+    pub fn bearer_session(&self) -> Option<&AuthClaims> {
+        self.bearer
+    }
+
+    /// [`Cx::auth`], refused with `permissionDenied` unless the caller is an
+    /// administrator.
+    pub async fn admin(&self) -> Result<AuthClaims, TaskError> {
+        let auth = self.auth().await?;
+        if auth.role != crate::acl::Role::Admin {
+            return Err(TaskError::Standard(
+                StandardCode::PermissionDenied,
+                "this task requires administrator standing".into(),
+            ));
+        }
+        Ok(auth)
+    }
+
     /// The caller's authority: the proven issuer and the role its ACL entry
     /// grants now. A document is a single signed request, not a session, so
-    /// its assurance level is the base one.
+    /// its assurance level is the base one — unless it arrived with a bearer
+    /// session whose subject is that same caller, whose level (and session)
+    /// it then carries.
     pub async fn auth(&self) -> Result<AuthClaims, TaskError> {
         let did = self.caller.as_deref().ok_or_else(|| {
             TaskError::Standard(
@@ -214,6 +299,12 @@ impl Cx<'_> {
                 "caller is not present in the maintainer's ACL".into(),
             )
         })?;
+        if let Some(bearer) = self.bearer.filter(|b| b.did == did) {
+            return Ok(AuthClaims {
+                role,
+                ..bearer.clone()
+            });
+        }
         Ok(AuthClaims {
             did: did.to_string(),
             role,

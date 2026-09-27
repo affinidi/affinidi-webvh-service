@@ -1,13 +1,10 @@
 //! `POST /api/trust-tasks` — the Trust Tasks transport endpoint
 //! introduced in v0.7.0.
 //!
-//! Receives a JSON-encoded `TrustTask<serde_json::Value>` envelope,
-//! authenticates the caller via the existing JWT-bearer flow, and
-//! hands the document to [`did_hosting_common::server::trust_tasks::dispatch_inbound`].
-//! The dispatch layer narrows the untyped document to one of the six
-//! typed handlers (five `acl/*` + `trust-task-discovery`), runs
-//! SPEC.md §7.2 items 4–8 against it, and produces a typed response
-//! or routed error.
+//! Receives a JSON-encoded `TrustTask<serde_json::Value>` document and hands
+//! it to `messaging::dispatch_trust_task_doc` — the same dispatch TSP and
+//! DIDComm use. The document's proof is the authorisation; a bearer session
+//! is optional context.
 //!
 //! ## Body-parse failures are spec-conformant
 //!
@@ -45,18 +42,23 @@ use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::server::AppState;
 
-/// `POST /api/trust-tasks` handler.
+/// `POST /api/trust-tasks` handler — the HTTPS binding of the same dispatch
+/// TSP and DIDComm use.
 ///
-/// Bearer-auth'd via [`AuthClaims`]; the caller's DID becomes the
-/// transport-authenticated peer for SPEC.md §4.8.1 precedence inside
-/// each typed handler.
+/// The document's own proof is the authorisation, exactly as on the other two
+/// transports; a bearer session is optional. Without one the document's
+/// in-band `issuer` stands where a messaging transport's reported sender
+/// would — a routing hint the proof must agree with — and a task whose
+/// `ProofRule` is `Optional` (`server/info`, opening a passkey login) may be
+/// sent with neither. With one, the session is the peer, a proof must be bound
+/// to it (below), and the session's assurance level travels with the request.
 ///
 /// Body is accepted as raw bytes so a parse failure surfaces as a
 /// `trust-task-error` document with `code: malformed_request`
 /// rather than axum's text/plain default. The route mount caps body
 /// size separately (see [`crate::routes::TRUST_TASKS_BODY_LIMIT`]).
 pub async fn dispatch_trust_task(
-    auth: AuthClaims,
+    auth: Option<AuthClaims>,
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
@@ -85,32 +87,21 @@ pub async fn dispatch_trust_task(
     // Replay protection runs inside `dispatch_trust_task_doc`, keyed on the
     // proven issuer and the document id, after the proof has been verified.
 
-    // ─── 3. Proof-verificationMethod binding pre-check (SECURITY).
+    // ─── 3. With a bearer session, the proof must be bound to it (SECURITY).
     //
-    // Two cases, depending on how the JWT was issued:
+    // (a) The session carries an ephemeral session key (passkey Web UI flow):
+    //     the proof's `verificationMethod` MUST be that `did:key:{pk}#{pk}`.
+    //     Otherwise a key the server never bound to this session could sign as
+    //     its subject.
     //
-    // (a) JWT carries an ephemeral session pubkey (passkey Web UI flow).
-    //     The proof's `verificationMethod` MUST be the matching
-    //     `did:key:{pk}#{pk}` URL. Otherwise the proof was signed by a key
-    //     the server hasn't bound to this JWT — even if the signature
-    //     verifies, accepting it would let any key holder forge requests
-    //     as the JWT subject.
+    // (b) It carries none (wallet or machine sessions): the proof's
+    //     `verificationMethod` MUST belong to the session's subject, or any
+    //     resolvable DID's key could be attributed to it.
     //
-    // (b) JWT carries no session pubkey (wallet SIOPv2 flow, machine-to-
-    //     machine auth). The proof's `verificationMethod` MUST resolve to
-    //     a DID that matches `auth.did` (the JWT `sub`). Without this
-    //     check, the framework's verifier would happily accept a proof
-    //     from ANY resolvable DID — letting a wallet user with one
-    //     authenticated session sign trust-tasks attributed to a totally
-    //     different DID, as long as that other DID's key can be resolved.
-    //
-    // The framework's verifier handles signature verification + DID
-    // resolution; this pre-check enforces caller binding *before*
-    // verification so a forged-attribution attempt is rejected with the
-    // explicit reason rather than a generic "proof_invalid".
-    if let Some(proof) = doc.proof.as_ref() {
+    // Enforced before verification, so a forged attribution is refused with
+    // its reason rather than a generic `proofInvalid`.
+    if let (Some(auth), Some(proof)) = (auth.as_ref(), doc.proof.as_ref()) {
         if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
-            // Case (a): session-key flow.
             let expected_vm = format!("did:key:{pk}#{pk}");
             if proof.verification_method != expected_vm {
                 tracing::warn!(
@@ -126,8 +117,6 @@ pub async fn dispatch_trust_task(
                 return Ok(into_response(DispatchOutcome::Rejected(routed)));
             }
         } else {
-            // Case (b): no session-key bound; verify the proof's DID matches
-            // the authenticated caller (JWT.sub).
             let proof_did = proof
                 .verification_method
                 .split_once('#')
@@ -150,33 +139,23 @@ pub async fn dispatch_trust_task(
         }
     }
 
-    // ─── Route.
+    // ─── Route, through `messaging::dispatch_trust_task_doc`: the same entry
+    // DIDComm and TSP use, so what a document means is decided in one place.
     //
-    // Through `messaging::dispatch_trust_task_doc`, the same entry DIDComm and
-    // TSP use. This route used to re-implement the routing — an `acl`-dispatcher
-    // membership check, then a fallthrough to the legacy bridge — and the
-    // duplicate had drifted: the typed `did-hosting/*/1.0` family, the auth
-    // family and the infra family are all checked *before* that fallthrough in
-    // the real router and were checked nowhere here. So an agent-name update
-    // over HTTPS reached `dispatch_did_op`, a table of legacy `MSG_*` ops that
-    // has never heard of it, and came back "unknown op" — the exact failure the
-    // router's own comments warn about, reached by the one transport that did
-    // not go through it.
-    //
-    // The comment this replaces claimed "parity with the TSP + DIDComm
-    // transports". It had parity with one branch of five.
-    // The verifier for this request. A passkey session signs with its
-    // JWT-bound session key on behalf of the JWT subject, so its verifier
-    // accepts exactly that key for exactly that principal — built here, per
-    // request, from the verified bearer token, never on the shared verifier.
-    // Every other caller signs as itself.
+    // A passkey session signs with its session key on behalf of the session's
+    // subject, so its verifier accepts exactly that key for exactly that
+    // principal — built per request from the verified bearer token, never on
+    // the shared verifier. Every other caller signs as itself.
     let shared = state
         .trust_tasks_verifier
         .as_deref()
         .ok_or_else(|| AppError::Config("no trust-task proof verifier configured".into()))?;
     let delegated;
-    let verifier = match auth.session_pubkey_b58btc.as_deref() {
-        Some(pk) => {
+    let verifier = match auth
+        .as_ref()
+        .and_then(|a| a.session_pubkey_b58btc.as_deref().map(|pk| (a, pk)))
+    {
+        Some((auth, pk)) => {
             delegated = shared
                 .clone()
                 .with_session_delegate(auth.did.clone(), format!("did:key:{pk}#{pk}"));
@@ -185,30 +164,35 @@ pub async fn dispatch_trust_task(
         None => shared,
     };
 
-    let transport = HttpsHandler::new(my_vid.to_string(), auth.did.clone());
-    match crate::messaging::dispatch_trust_task_doc(&state, &auth.did, &transport, doc, verifier)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
+    // The peer: the bearer session's subject, or — with no session — the
+    // document's own issuer, which the proof must then bind (empty when an
+    // anonymous public read names none).
+    let peer = match auth.as_ref() {
+        Some(auth) => auth.did.clone(),
+        None => doc.issuer.clone().unwrap_or_default(),
+    };
+    let transport = HttpsHandler::new(my_vid.to_string(), (!peer.is_empty()).then(|| peer.clone()));
+    match crate::messaging::dispatch_trust_task_doc(
+        &state,
+        &peer,
+        auth.as_ref(),
+        &transport,
+        doc,
+        verifier,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
     {
         // The framework outcome keeps its reject code, which is the whole reason
         // the router hands it back whole: SPEC's status table is HTTPS's alone.
         crate::messaging::RoutedReply::Framework(outcome) => Ok(into_response(*outcome)),
-        // A typed or bridged reply. No framework reject code to map, and the
-        // problem-report shape carries any error — 200 with the document, as
-        // this route already answered for bridged ops.
         crate::messaging::RoutedReply::Document(value) => Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             serde_json::to_vec(&value).expect("Trust Task response serialises"),
         )
             .into_response()),
-        crate::messaging::RoutedReply::Suppressed => {
-            tracing::error!(
-                should_not_happen = true,
-                "trust-tasks dispatch returned Suppressed on HTTPS — bearer auth always resolves a peer"
-            );
-            Ok(StatusCode::NO_CONTENT.into_response())
-        }
+        crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
 
@@ -283,7 +267,7 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             // an `error!` log on the off-chance the invariant breaks.
             tracing::error!(
                 should_not_happen = true,
-                "trust-tasks dispatch returned Suppressed on HTTPS — bearer auth always resolves a peer"
+                "trust-tasks dispatch suppressed its reply on HTTPS"
             );
             StatusCode::NO_CONTENT.into_response()
         }

@@ -54,7 +54,10 @@ pub mod send;
 pub mod transport;
 pub mod verifier;
 
-pub use bound::{BoundError, identity_signing_secret, sign_document, verify_sender_bound};
+pub use bound::{
+    BoundError, identity_signing_secret, sign_document, verify_sender_bound,
+    verify_sender_bound_approval,
+};
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
 pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
 
@@ -125,6 +128,17 @@ pub enum ProofRule {
     /// authentication`), bound to the transport's sender, addressed here,
     /// fresh, and not a replay. See [`verify_sender_bound`].
     Authentication,
+    /// A human approver's decision: bound exactly as [`Self::Authentication`],
+    /// but the proof is an attestation — `proofPurpose: assertionMethod`, the
+    /// key under the approver's `assertionMethod` relationship. See
+    /// [`verify_sender_bound_approval`].
+    AssertionMethod,
+    /// A ceremony that mints a session for a key the caller has just
+    /// generated (passkey login, invite redemption): signed and bound as
+    /// [`Self::Authentication`], by a `did:key` the caller holds, which needs
+    /// no ACL entry of its own — the ceremony names the subject, and the
+    /// session it mints is bound to that key.
+    SessionKey,
 }
 
 /// Result of [`dispatch_inbound`]. The calling transport (HTTPS or
