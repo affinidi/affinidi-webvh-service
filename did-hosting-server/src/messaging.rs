@@ -185,6 +185,8 @@ pub(crate) enum OpError {
     /// that does not verify): reported non-retryable, so the control plane
     /// stops re-sending it.
     Refused(String),
+    /// Refused, under a code the op's specification declares.
+    Declared(trust_tasks_rs::DeclaredErrorCode, String),
     /// This server could not apply it just now (storage, I/O): reported
     /// retryable, so the control plane keeps it queued.
     Transient(String),
@@ -216,15 +218,19 @@ impl From<crate::error::AppError> for OpError {
 }
 
 impl OpError {
-    fn reject_reason(self) -> trust_tasks_rs::RejectReason {
+    fn reject_reason(self) -> trust_tasks_rs::ErrorPayload {
         match self {
             OpError::Refused(reason) => trust_tasks_rs::RejectReason::TaskFailed {
                 reason,
                 details: None,
-            },
+            }
+            .into(),
+            OpError::Declared(code, message) => {
+                trust_tasks_rs::ErrorPayload::from(code).with_message(message)
+            }
             OpError::Transient(reason) => {
                 warn!(%reason, "control-plane op not applied (transient); the control plane will re-send it");
-                trust_tasks_rs::RejectReason::InternalError { reason }
+                trust_tasks_rs::RejectReason::InternalError { reason }.into()
             }
         }
     }
@@ -472,138 +478,207 @@ async fn handle_fallback(
 // Sync message handling
 // ---------------------------------------------------------------------------
 
+use trust_tasks_rs::specs::webvh::sync::{
+    batch::v0_1 as sync_batch, delete::v0_2 as sync_delete, update::v0_2 as sync_update,
+};
+
+/// Read a control-plane payload into its generated type. The schemas are
+/// closed, so a member they do not define — 0.1's snake_case among them — is
+/// refused rather than ignored.
+fn payload<P: serde::de::DeserializeOwned>(body: &Value, what: &str) -> Result<P, OpError> {
+    serde_json::from_value(body.clone())
+        .map_err(|e| OpError::Refused(format!("{what} payload does not fit its schema: {e}")))
+}
+
+/// A reply body through its generated type, so it leaves only in the shape its
+/// schema allows.
+fn reply<R: serde::Serialize + serde::de::DeserializeOwned>(
+    body: Value,
+    what: &str,
+) -> Result<Value, OpError> {
+    let typed: R = serde_json::from_value(body)
+        .map_err(|e| OpError::Transient(format!("{what} reply does not fit its schema: {e}")))?;
+    serde_json::to_value(typed).map_err(|e| OpError::Transient(e.to_string()))
+}
+
+/// `webvh/sync/update/0.2`.
 async fn do_sync_update(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    let mnemonic = apply_sync_update_body(state, body).await?;
-    debug!(did = %control.did, %mnemonic, "applied sync update");
+    let update: sync_update::Payload = payload(body, "sync/update")?;
+    let entry = sync_entry(
+        update.mnemonic.to_string(),
+        update.did_id.to_string(),
+        update.log_content.to_string(),
+        update.witness_content.map(|w| w.to_string()),
+        update.version_count.get(),
+        update.disabled,
+    );
+    let status = apply_sync_entry(state, &entry).await?;
+    debug!(did = %control.did, mnemonic = %entry.mnemonic, ?status, "applied sync update");
     Ok((
         MSG_SYNC_UPDATE_ACK.to_string(),
-        json!({ "mnemonic": mnemonic, "status": "applied" }),
+        reply::<sync_update::Response>(
+            json!({ "mnemonic": entry.mnemonic, "status": status_str(status) }),
+            "sync/update",
+        )?,
     ))
 }
 
-/// A batch of sync updates in one message (`body.updates[]`, each the shape
-/// [`do_sync_update`] applies).
-///
-/// Best-effort per entry: a single bad update is logged and skipped, matching
-/// the per-DID path — whose failures are fire-and-forget over TSP — so one
-/// malformed entry can't strand the rest of the batch. Anything skipped is
-/// re-sent on the next delta sync.
+/// `webvh/sync/batch/0.1`: one outcome per entry. A refused entry is reported
+/// with its code and the rest still apply; an entry this server could not
+/// apply *just now* makes the whole batch retryable, because re-applying the
+/// entries that did land is a no-op and acknowledging the batch would settle it
+/// with that entry missing.
 async fn do_sync_batch(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    let updates = body
-        .get("updates")
-        .and_then(|v| v.as_array())
-        .ok_or("missing 'updates' array in sync-batch")?;
-
-    let mut applied = 0usize;
-    let mut failed = 0usize;
+    let batch: sync_batch::Payload = payload(body, "sync/batch")?;
+    let count = batch.updates.len();
+    let mut results = Vec::with_capacity(count);
     let mut transient: Option<String> = None;
-    for update in updates {
-        match apply_sync_update_body(state, update).await {
-            Ok(_) => applied += 1,
+    for update in batch.updates {
+        let entry = sync_entry(
+            update.mnemonic.to_string(),
+            update.did_id.to_string(),
+            update.log_content.to_string(),
+            update.witness_content.map(|w| w.to_string()),
+            update.version_count.get(),
+            update.disabled,
+        );
+        match apply_sync_entry(state, &entry).await {
+            Ok(status) => {
+                results.push(json!({ "mnemonic": entry.mnemonic, "status": status_str(status) }))
+            }
+            Err(OpError::Declared(code, e)) => {
+                warn!(mnemonic = %entry.mnemonic, error = %e, "sync-batch: entry refused");
+                results.push(
+                    json!({ "mnemonic": entry.mnemonic, "status": "refused", "code": code.code }),
+                );
+            }
             Err(OpError::Refused(e)) => {
-                failed += 1;
-                warn!(error = %e, "sync-batch: skipping an update that failed to apply");
+                warn!(mnemonic = %entry.mnemonic, error = %e, "sync-batch: entry refused");
+                results.push(json!({
+                    "mnemonic": entry.mnemonic,
+                    "status": "refused",
+                    "code": sync_update::error_codes::INVALID_LOG.code,
+                }));
             }
             Err(OpError::Transient(e)) => {
-                failed += 1;
-                warn!(error = %e, "sync-batch: an update could not be applied just now");
+                warn!(mnemonic = %entry.mnemonic, error = %e, "sync-batch: entry could not be applied just now");
                 transient.get_or_insert(e);
             }
         }
     }
-    // An entry this server could not apply *just now* makes the whole batch
-    // retryable: re-applying the entries that did land is a no-op, and
-    // acknowledging the batch would settle it with that entry missing.
     if let Some(e) = transient {
         return Err(OpError::Transient(format!(
-            "{failed} of {} sync-batch updates not applied: {e}",
-            updates.len()
+            "a sync-batch entry could not be applied just now: {e}"
         )));
     }
-    debug!(
-        did = %control.did,
-        applied,
-        failed,
-        count = updates.len(),
-        "applied DID sync batch from control plane"
-    );
+    debug!(did = %control.did, count, "applied DID sync batch from control plane");
     Ok((
         MSG_SYNC_BATCH_ACK.to_string(),
-        json!({ "applied": applied, "failed": failed }),
+        reply::<sync_batch::Response>(json!({ "results": results }), "sync/batch")?,
     ))
 }
 
-/// Apply one sync-update body — the shape `MSG_SYNC_UPDATE` carries and each
-/// element of a `MSG_SYNC_BATCH`. Returns the mnemonic on success. Runs the
-/// own-DID rotation check, so a batched update to the server's own DID is
-/// treated exactly like a single one.
-async fn apply_sync_update_body(state: &AppState, body: &Value) -> Result<String, OpError> {
-    use crate::control_register::apply_single_update;
-    use did_hosting_common::DidSyncUpdate;
-
-    let mnemonic = body
-        .get("mnemonic")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'mnemonic' in sync-update")?;
-    let did_id = body
-        .get("did_id")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'did_id' in sync-update")?;
-    let log_content = body
-        .get("log_content")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'log_content' in sync-update")?;
-    let witness_content = body
-        .get("witness_content")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let version_count = body
-        .get("version_count")
-        .and_then(|v| v.as_u64())
-        .ok_or("missing 'version_count' in sync-update")?;
-
-    let update = DidSyncUpdate {
-        mnemonic: mnemonic.to_string(),
-        did_id: did_id.to_string(),
-        log_content: log_content.to_string(),
+fn sync_entry(
+    mnemonic: String,
+    did_id: String,
+    log_content: String,
+    witness_content: Option<String>,
+    version_count: u64,
+    disabled: bool,
+) -> did_hosting_common::DidSyncUpdate {
+    did_hosting_common::DidSyncUpdate {
+        mnemonic,
+        did_id,
+        log_content,
         witness_content,
         version_count,
-    };
+        disabled,
+    }
+}
 
-    apply_single_update(
+fn status_str(status: crate::control_register::SyncApplied) -> &'static str {
+    match status {
+        crate::control_register::SyncApplied::Applied => "applied",
+        crate::control_register::SyncApplied::Unchanged => "unchanged",
+    }
+}
+
+/// Apply one sync entry — a `sync/update` payload, or one element of a
+/// `sync/batch`. Runs the own-DID rotation check, so a batched update to the
+/// server's own DID is treated exactly like a single one.
+async fn apply_sync_entry(
+    state: &AppState,
+    update: &did_hosting_common::DidSyncUpdate,
+) -> Result<crate::control_register::SyncApplied, OpError> {
+    use crate::control_register::{SyncApplied, apply_single_update};
+
+    // The log must hold exactly the entries the source counted.
+    let entries = update
+        .log_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count() as u64;
+    if entries != update.version_count {
+        return Err(OpError::Declared(
+            sync_update::error_codes::INVALID_LOG,
+            format!(
+                "versionCount is {} but logContent holds {entries} entries",
+                update.version_count
+            ),
+        ));
+    }
+
+    let status = apply_single_update(
         &state.dids_ks,
         &state.store,
-        &update,
+        update,
         &state.did_cache,
         state.config.public_url.as_deref(),
     )
     .await
-    .map_err(OpError::from)?;
+    .map_err(sync_refusal)?;
 
-    // Duplicate of the canonical info line in
-    // `control_register::apply_single_update`; keep it at debug so each synced
-    // DID logs once at info, not twice.
-    debug!(
-        mnemonic = %mnemonic,
-        version_count,
-        "applied DID sync update from control plane via mediator"
-    );
-
-    // The second way this server's own DID can change: a control plane pushed a
-    // new log entry for it. Same rotation check as the direct publish path.
-    crate::identity_rotation::on_did_published(state, mnemonic).await;
-
-    Ok(mnemonic.to_string())
+    if status == SyncApplied::Applied {
+        // The second way this server's own DID can change: a control plane
+        // pushed a new log entry for it. Same rotation check as a direct publish.
+        crate::identity_rotation::on_did_published(state, &update.mnemonic).await;
+    }
+    Ok(status)
 }
 
+/// Classify a failed sync apply under the codes `sync/update/0.2` declares.
+fn sync_refusal(e: crate::error::AppError) -> OpError {
+    use crate::error::AppError;
+    match e {
+        AppError::Validation(message) => {
+            let code = if message.contains("deactivated") {
+                sync_update::error_codes::DEACTIVATED
+            } else if message.contains("not an extension")
+                || message.contains("rollback")
+                || message.contains("high-water")
+                || message.contains("refusing to replace")
+            {
+                sync_update::error_codes::HISTORY_REWRITE
+            } else {
+                sync_update::error_codes::INVALID_LOG
+            };
+            OpError::Declared(code, message)
+        }
+        other => OpError::from(other),
+    }
+}
+
+/// `webvh/sync/delete/0.2`: stop serving the slot and drop its log, witness
+/// proofs and derived agent-name index in one change. The high-water marks
+/// stay, so a re-publish cannot roll the DID back.
 async fn do_sync_delete(
     control: &VerifiedControlPlane,
     state: &AppState,
@@ -611,10 +686,8 @@ async fn do_sync_delete(
 ) -> Result<(String, Value), OpError> {
     use crate::did_ops;
 
-    let mnemonic = body
-        .get("mnemonic")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'mnemonic' in sync-delete")?;
+    let delete: sync_delete::Payload = payload(body, "sync/delete")?;
+    let mnemonic = delete.mnemonic.as_str();
 
     let record: Option<did_ops::DidRecord> = state
         .dids_ks
@@ -622,23 +695,41 @@ async fn do_sync_delete(
         .await
         .map_err(OpError::from)?;
 
-    if let Some(record) = record {
+    let status = if let Some(record) = record {
+        let host = record
+            .did_id
+            .as_deref()
+            .and_then(|d| did_hosting_common::server::domain::safety::extract_did_host(d).ok())
+            .unwrap_or_default();
         let mut batch = state.store.batch();
         batch.remove(&state.dids_ks, did_ops::did_key(mnemonic));
         batch.remove(&state.dids_ks, did_ops::content_log_key(mnemonic));
         batch.remove(&state.dids_ks, did_ops::content_witness_key(mnemonic));
         batch.remove(&state.dids_ks, did_ops::owner_key(&record.owner, mnemonic));
         batch.remove(&state.dids_ks, did_ops::watcher_sync_key(mnemonic));
+        for name in &record.agent_names {
+            batch.remove(
+                &state.dids_ks,
+                did_hosting_common::did_ops::agent_name_key(&host, &name.name),
+            );
+        }
         batch.commit().await.map_err(OpError::from)?;
-
+        state
+            .did_cache
+            .invalidate(&did_ops::content_log_key(mnemonic));
         info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
+        "deleted"
     } else {
-        info!(mnemonic = %mnemonic, "sync delete: DID not found locally");
-    }
+        info!(mnemonic = %mnemonic, "sync delete: DID not held here");
+        "absent"
+    };
 
     Ok((
         MSG_SYNC_DELETE_ACK.to_string(),
-        json!({ "mnemonic": mnemonic, "status": "deleted" }),
+        reply::<sync_delete::Response>(
+            json!({ "mnemonic": mnemonic, "status": status }),
+            "sync/delete",
+        )?,
     ))
 }
 

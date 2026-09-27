@@ -12,6 +12,7 @@
 pub mod acl;
 pub mod auth;
 pub mod config;
+pub(crate) mod control_tasks;
 pub mod did_ops;
 pub mod error;
 #[cfg(feature = "ui")]

@@ -229,62 +229,6 @@ pub struct WitnessPublishResponse {
 // (the set / enable / disable verb trio is retired). Both share one
 // `{record}` response.
 
-/// `did-management/agent-name/update/0.1` — declarative binding state:
-/// `active` binds a free name, refreshes an existing binding, or resumes a
-/// parked one (the document MUST claim the name); `parked` stops it
-/// resolving while keeping the reservation (the document MUST NOT claim
-/// it). Replaces the retired set / enable / disable verb trio.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateAgentNameRequest {
-    pub mnemonic: String,
-    /// The name's local part, without the leading `@` (the `alice` in `/@alice`).
-    pub name: String,
-    /// Desired binding state, per the spec's `state` enum.
-    pub state: crate::did_ops::AgentNameState,
-    /// The new signed `did.jsonl` (the spec's `didData`). The pre-cutover
-    /// `didLog` spelling is accepted as an inbound alias.
-    #[serde(alias = "didLog")]
-    pub did_data: String,
-    /// Optional explicit hosting domain; cross-checked against the DID's host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-}
-impl trust_tasks_rs::Payload for UpdateAgentNameRequest {
-    const TYPE_URI: &'static str =
-        "https://trusttasks.org/spec/did-management/agent-name/update/0.1";
-}
-
-/// `did-management/agent-name/remove/0.1` — release a name (destructive).
-/// The submitted document must no longer claim the name. Deliberately NOT a
-/// state of `agent-name/update`: the destructive release stays separately
-/// auditable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoveAgentNameRequest {
-    pub mnemonic: String,
-    pub name: String,
-    /// The new signed `did.jsonl` (the spec's `didData`); `didLog` accepted
-    /// as an inbound alias.
-    #[serde(alias = "didLog")]
-    pub did_data: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-}
-impl trust_tasks_rs::Payload for RemoveAgentNameRequest {
-    const TYPE_URI: &'static str =
-        "https://trusttasks.org/spec/did-management/agent-name/remove/0.1";
-}
-
-/// The shared `#response` for every agent-name verb: the updated DID record
-/// (spec `DidRecord` shape). The response Type URI is derived from the
-/// request's by the framework, so this struct needs no `Payload` impl.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentNameResponse {
-    pub record: Value,
-}
-
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -300,8 +244,6 @@ enum DidHostingInbound {
     Register(TrustTask<RegisterRequest>),
     ChangeOwner(TrustTask<ChangeOwnerRequest>),
     WitnessPublish(TrustTask<WitnessPublishRequest>),
-    UpdateAgentName(TrustTask<UpdateAgentNameRequest>),
-    RemoveAgentName(TrustTask<RemoveAgentNameRequest>),
 }
 
 fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
@@ -313,8 +255,6 @@ fn build_dispatcher() -> Dispatcher<DidHostingInbound> {
         .on::<RegisterRequest, _>(DidHostingInbound::Register)
         .on::<ChangeOwnerRequest, _>(DidHostingInbound::ChangeOwner)
         .on::<WitnessPublishRequest, _>(DidHostingInbound::WitnessPublish)
-        .on::<UpdateAgentNameRequest, _>(DidHostingInbound::UpdateAgentName)
-        .on::<RemoveAgentNameRequest, _>(DidHostingInbound::RemoveAgentName)
 }
 
 /// Does the typed `did-hosting/*/1.0` protocol own this Type URI? The
@@ -348,12 +288,6 @@ where
         }
         Ok(DidHostingInbound::WitnessPublish(d)) => {
             handle_witness_publish(state, transport, policy, d).await
-        }
-        Ok(DidHostingInbound::UpdateAgentName(d)) => {
-            handle_update_agent_name(state, transport, policy, d).await
-        }
-        Ok(DidHostingInbound::RemoveAgentName(d)) => {
-            handle_remove_agent_name(state, transport, policy, d).await
         }
         Err(err) => DispatchOutcome::Rejected(err),
     }
@@ -788,114 +722,6 @@ where
     .await
 }
 
-/// Build the shared `{record}` agent-name response from an updated record.
-fn agent_name_response(state: &AppState, record: &DidRecord) -> AgentNameResponse {
-    let base_url = state
-        .config
-        .did_hosting_url
-        .as_deref()
-        .or(state.config.public_url.as_deref())
-        .unwrap_or("http://localhost");
-    let did_url = format!(
-        "{}/{}/did.jsonl",
-        base_url.trim_end_matches('/'),
-        record.mnemonic
-    );
-    AgentNameResponse {
-        record: spec_did_record_json(record, &did_url),
-    }
-}
-
-/// The two agent-name ops share one handler shape — authorize, call the
-/// matching `did_ops` op with `{mnemonic, name, didData, domain}`, fan the
-/// new version out to edges, and reply with the updated record. (Step-up on
-/// remove / parking is a consumer-policy gate enforced on the REST surface
-/// via `StepUpAuth`; the Trust-Task path carries no assurance level, so —
-/// like `handle_delete` — it relies on the proof-authenticated owner check
-/// in `did_ops`.)
-async fn handle_update_agent_name<V>(
-    state: &AppState,
-    transport: &(impl TransportHandler + Sync),
-    policy: ProofPolicy<'_, V>,
-    doc: TrustTask<UpdateAgentNameRequest>,
-) -> DispatchOutcome
-where
-    V: ProofVerifier + ?Sized,
-{
-    let (my_vid, state) = match resolve_state(state, &doc) {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    run_pipeline(
-        transport,
-        policy,
-        doc,
-        &my_vid,
-        move |doc, parties| async move {
-            let auth = authorize(&state, &doc, &parties).await?;
-            let mnemonic = doc.payload.mnemonic.clone();
-            let record = did_ops::update_agent_name(
-                &auth,
-                &state,
-                &mnemonic,
-                &doc.payload.name,
-                &doc.payload.did_data,
-                doc.payload.domain.as_deref(),
-                doc.payload.state,
-            )
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-            crate::server_push::notify_servers_did(&state, mnemonic.clone());
-            let resp = agent_name_response(&state, &record);
-            Ok(doc.respond_with(new_id(), resp))
-        },
-    )
-    .await
-}
-
-async fn handle_remove_agent_name<V>(
-    state: &AppState,
-    transport: &(impl TransportHandler + Sync),
-    policy: ProofPolicy<'_, V>,
-    doc: TrustTask<RemoveAgentNameRequest>,
-) -> DispatchOutcome
-where
-    V: ProofVerifier + ?Sized,
-{
-    let (my_vid, state) = match resolve_state(state, &doc) {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    run_pipeline(
-        transport,
-        policy,
-        doc,
-        &my_vid,
-        move |doc, parties| async move {
-            let auth = authorize(&state, &doc, &parties).await?;
-            let mnemonic = doc.payload.mnemonic.clone();
-            let record = did_ops::remove_agent_name(
-                &auth,
-                &state,
-                &mnemonic,
-                &doc.payload.name,
-                &doc.payload.did_data,
-                doc.payload.domain.as_deref(),
-            )
-            .await
-            .map_err(|e| reject_apperror(&doc, e))?;
-            crate::server_push::notify_servers_did(&state, mnemonic.clone());
-            let resp = agent_name_response(&state, &record);
-            Ok(doc.respond_with(new_id(), resp))
-        },
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Resolve the service DID (for the pipeline's recipient anchor) and clone
 /// the `AppState` for capture into the `run_pipeline` handler closure.
 /// Returns the failure `DispatchOutcome` when no service DID is configured.
@@ -1313,8 +1139,6 @@ mod tests {
             RegisterRequest::TYPE_URI,
             ChangeOwnerRequest::TYPE_URI,
             WitnessPublishRequest::TYPE_URI,
-            UpdateAgentNameRequest::TYPE_URI,
-            RemoveAgentNameRequest::TYPE_URI,
         ] {
             assert!(owns(uri), "dispatcher should own {uri}");
         }
@@ -1389,94 +1213,6 @@ mod tests {
         assert_eq!(
             err.payload.code,
             trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
-        );
-    }
-
-    // --- Agent names -------------------------------------------------------
-
-    /// A reserved name (`@admin`) routes to `did_ops::update_agent_name`, is
-    /// refused there, and — crucially — surfaces as a routed `task_failed`,
-    /// **not** a masked `internal_error`. This exercises the `reject_apperror`
-    /// arm added for `AppError::AgentName`.
-    #[tokio::test]
-    async fn update_agent_name_reserved_maps_to_task_failed() {
-        let (state, _dir) = test_state().await;
-        seed_admin(&state).await;
-        let mnemonic = reserve_did(&state, "aliceslot").await;
-
-        let outcome = dispatch::<TransportBoundVerifier>(
-            &state,
-            &transport(),
-            ProofPolicy::AcceptUnverified,
-            op_doc(
-                UpdateAgentNameRequest::TYPE_URI,
-                json!({ "mnemonic": mnemonic, "name": "admin", "state": "active", "didData": "irrelevant" }),
-            ),
-        )
-        .await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected (reserved name), got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::TaskFailed),
-            "a reserved agent name must map to task_failed, not internal_error"
-        );
-    }
-
-    /// Update routes through the pipeline to `did_ops::update_agent_name`; a
-    /// malformed `didData` is rejected in the shared publish path (a valid
-    /// signed log + `alsoKnownAs` happy path is covered by the `did_ops`
-    /// tests). Proves delegation for the whole agent-name family, and pins
-    /// the pre-cutover `didLog` alias.
-    #[tokio::test]
-    async fn update_agent_name_malformed_log_rejected_over_typed() {
-        let (state, _dir) = test_state().await;
-        seed_admin(&state).await;
-        let mnemonic = reserve_did(&state, "nameslot").await;
-
-        for field in ["didData", "didLog"] {
-            let outcome = dispatch::<TransportBoundVerifier>(
-                &state,
-                &transport(),
-                ProofPolicy::AcceptUnverified,
-                op_doc(
-                    UpdateAgentNameRequest::TYPE_URI,
-                    json!({ "mnemonic": mnemonic, "name": "alice", "state": "active", field: "not-a-valid-jsonl-log" }),
-                ),
-            )
-            .await;
-            assert!(
-                matches!(outcome, DispatchOutcome::Rejected(_)),
-                "a malformed {field} is rejected in did_ops"
-            );
-        }
-    }
-
-    /// A caller absent from the ACL cannot invoke a destructive agent-name
-    /// verb — the auth gate runs before any `did_ops` work.
-    #[tokio::test]
-    async fn remove_agent_name_unknown_caller_denied() {
-        let (state, _dir) = test_state().await;
-        // No admin seeded → the caller is not in the ACL.
-        let outcome = dispatch::<TransportBoundVerifier>(
-            &state,
-            &transport(),
-            ProofPolicy::AcceptUnverified,
-            op_doc(
-                RemoveAgentNameRequest::TYPE_URI,
-                json!({ "mnemonic": "whatever", "name": "alice", "didLog": "x" }),
-            ),
-        )
-        .await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected (unknown caller), got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
         );
     }
 }

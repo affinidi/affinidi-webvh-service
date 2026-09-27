@@ -500,6 +500,7 @@ async fn compute_did_sync_updates(
             log_content,
             witness_content,
             version_count: record.version_count,
+            disabled: record.disabled,
         });
     }
 

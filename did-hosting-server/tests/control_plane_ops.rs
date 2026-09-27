@@ -174,9 +174,10 @@ async fn valid_did_log(mnemonic: &str) -> (String, String) {
 fn update_body(mnemonic: &str, did_id: &str, log_content: &str) -> Value {
     json!({
         "mnemonic": mnemonic,
-        "did_id": did_id,
-        "log_content": log_content,
-        "version_count": log_content.lines().filter(|l| !l.trim().is_empty()).count(),
+        "didId": did_id,
+        "logContent": log_content,
+        "versionCount": log_content.lines().filter(|l| !l.trim().is_empty()).count(),
+        "disabled": false,
     })
 }
 
@@ -239,30 +240,103 @@ async fn signed_sync_update_from_control_plane_is_applied() {
     );
 }
 
-/// A batch applies every entry; a malformed entry is skipped without
-/// stranding the rest.
+/// A batch applies every entry and reports each one; an entry that fails
+/// verification is refused under its code without stranding the rest.
 #[tokio::test]
-async fn signed_sync_batch_applies_good_entries_and_skips_bad_ones() {
+async fn signed_sync_batch_applies_good_entries_and_refuses_bad_ones() {
     let (state, _dir) = make_state().await;
     let (alice_id, alice_log) = valid_did_log("alice").await;
     let (bob_id, bob_log) = valid_did_log("bob").await;
     let payload = json!({ "updates": [
         update_body("alice", &alice_id, &alice_log),
         update_body("bob", &bob_id, &bob_log),
-        // Missing `mnemonic` — `apply_sync_update_body` rejects it.
-        { "did_id": "did:webvh:x:server.example.com:ghost", "log_content": "{}", "version_count": 1 },
+        // Bob's log filed under another slot: its identifier does not resolve there.
+        update_body("ghost", &bob_id, &bob_log),
     ]});
 
     let reply = apply(&state, signed_op(MSG_SYNC_BATCH, &control(), payload).await).await;
-    assert_eq!(reply.type_uri.to_string(), MSG_SYNC_BATCH_ACK);
-    assert_eq!(reply.payload["applied"], 2);
-    assert_eq!(reply.payload["failed"], 1);
+    assert_eq!(reply.type_uri.to_string(), MSG_SYNC_BATCH_ACK, "{reply:?}");
+    let results = reply.payload["results"].as_array().unwrap();
+    assert_eq!(results[0]["status"], "applied");
+    assert_eq!(results[1]["status"], "applied");
+    assert_eq!(results[2]["status"], "refused");
+    assert_eq!(results[2]["code"], "webvh/sync/update:invalidLog");
     for m in ["alice", "bob"] {
         assert!(
             stored(&state, m).await.is_some(),
             "batched DID {m} landed in the store"
         );
     }
+    assert!(stored(&state, "ghost").await.is_none());
+}
+
+/// 0.1's snake_case members are not read: the payload is refused whole.
+#[tokio::test]
+async fn a_snake_case_sync_update_is_refused() {
+    let (state, _dir) = make_state().await;
+    let (did_id, log) = valid_did_log("alice").await;
+    let reply = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            json!({ "mnemonic": "alice", "did_id": did_id, "log_content": log, "version_count": 1 }),
+        )
+        .await,
+    )
+    .await;
+    assert!(is_error(&reply), "{reply:?}");
+    assert!(stored(&state, "alice").await.is_none());
+}
+
+/// A slot's disabled state travels with its content: it is applied, and an
+/// identical re-send changes nothing.
+#[tokio::test]
+async fn disabled_state_is_applied_and_a_repeat_is_unchanged() {
+    let (state, _dir) = make_state().await;
+    let (did_id, log) = valid_did_log("alice").await;
+    let reply = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &did_id, &log),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(reply.payload["status"], "applied");
+    assert!(!stored(&state, "alice").await.unwrap().disabled);
+
+    let mut disabled = update_body("alice", &did_id, &log);
+    disabled["disabled"] = json!(true);
+    let reply = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), disabled.clone()).await,
+    )
+    .await;
+    assert_eq!(reply.payload["status"], "applied", "{reply:?}");
+    assert!(stored(&state, "alice").await.unwrap().disabled);
+
+    let reply = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), disabled).await,
+    )
+    .await;
+    assert_eq!(reply.payload["status"], "unchanged", "{reply:?}");
+
+    let reply = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &did_id, &log),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(reply.payload["status"], "applied");
+    assert!(!stored(&state, "alice").await.unwrap().disabled);
 }
 
 /// A log that strictly extends the held one (a new version) is applied.
@@ -310,7 +384,15 @@ async fn signed_sync_delete_removes_the_did() {
     )
     .await;
     assert!(!is_error(&reply), "{reply:?}");
+    assert_eq!(reply.payload["status"], "deleted");
     assert!(stored(&state, "alice").await.is_none());
+
+    let reply = apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({ "mnemonic": "alice" })).await,
+    )
+    .await;
+    assert_eq!(reply.payload["status"], "absent", "{reply:?}");
 }
 
 #[tokio::test]

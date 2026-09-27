@@ -600,7 +600,7 @@ pub async fn apply_single_update(
     update: &DidSyncUpdate,
     did_cache: &crate::cache::ContentCache,
     public_url: Option<&str>,
-) -> Result<(), crate::error::AppError> {
+) -> Result<SyncApplied, crate::error::AppError> {
     use crate::auth::session::now_epoch;
 
     let now = now_epoch();
@@ -628,6 +628,25 @@ pub async fn apply_single_update(
     let verified = verify_update(dids_ks, store, update, synced_method, public_url).await?;
     #[cfg(feature = "method-webs")]
     let webs_document = verified.webs_document;
+
+    // Nothing to write when this edge already holds exactly this state: the
+    // same log, the same witness proofs and the same disabled flag.
+    let previous: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await.ok().flatten();
+    if let Some(prev) = previous.as_ref()
+        && prev.did_id.as_deref() == Some(update.did_id.as_str())
+        && prev.disabled == update.disabled
+        && dids_ks
+            .get_raw(content_log_key(&update.mnemonic))
+            .await?
+            .is_some_and(|held| held == update.log_content.as_bytes())
+        && dids_ks
+            .get_raw(content_witness_key(&update.mnemonic))
+            .await?
+            .map(|w| String::from_utf8_lossy(&w).into_owned())
+            == update.witness_content
+    {
+        return Ok(SyncApplied::Unchanged);
+    }
 
     // Services and agent names both come from the current DID document,
     // wherever this method keeps it — the last log entry's `state` for
@@ -657,7 +676,9 @@ pub async fn apply_single_update(
         version_count: update.version_count,
         did_id: Some(update.did_id.clone()),
         content_size: update.log_content.len() as u64,
-        disabled: false,
+        // The source's disabled state travels with the content: a disabled
+        // slot stops resolving here until an update carries `false`.
+        disabled: update.disabled,
         deleted_at: None,
 
         // Tagged from the content, not from the push. T13's migration
@@ -705,12 +726,11 @@ pub async fn apply_single_update(
             .collect(),
     };
 
-    // Read the record we are replacing so stale name-index entries can be
-    // retired in the same batch. Without this, a name removed from
-    // `alsoKnownAs` would keep resolving from a leftover index entry — the
-    // document would stop claiming it while the edge kept serving it, which is
-    // precisely the state Layer-1 exists to prevent.
-    let previous: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await.ok().flatten();
+    // `previous` (read above) is the record being replaced, so stale
+    // name-index entries can be retired in the same batch. Without this, a name
+    // removed from `alsoKnownAs` would keep resolving from a leftover index
+    // entry — the document would stop claiming it while the edge kept serving
+    // it, which is precisely the state Layer-1 exists to prevent.
 
     let mut batch = store.batch();
     batch.insert(dids_ks, did_key(&update.mnemonic), &record)?;
@@ -739,12 +759,15 @@ pub async fn apply_single_update(
         owner_key("system", &update.mnemonic),
         update.mnemonic.as_bytes().to_vec(),
     );
-    if let Some(ref witness) = update.witness_content {
-        batch.insert_raw(
+    // An absent `witnessContent` means the slot holds no witness proofs — never
+    // "unchanged" — so any held proofs go.
+    match update.witness_content {
+        Some(ref witness) => batch.insert_raw(
             dids_ks,
             content_witness_key(&update.mnemonic),
             witness.as_bytes().to_vec(),
-        );
+        ),
+        None => batch.remove(dids_ks, content_witness_key(&update.mnemonic)),
     }
     // High-water marks: the furthest history this edge has served for this DID
     // and for this slot (see `stage_high_water`).
@@ -764,8 +787,18 @@ pub async fn apply_single_update(
     info!(
         mnemonic = %update.mnemonic,
         did = %update.did_id,
+        disabled = update.disabled,
         "applied DID sync update from control plane"
     );
 
-    Ok(())
+    Ok(SyncApplied::Applied)
+}
+
+/// What [`apply_single_update`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncApplied {
+    /// The edge now holds and serves exactly the submitted state.
+    Applied,
+    /// It already held that state; nothing was written.
+    Unchanged,
 }

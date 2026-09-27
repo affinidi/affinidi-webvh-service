@@ -31,8 +31,13 @@ pub struct DidSyncUpdate {
     pub mnemonic: String,
     pub did_id: String,
     pub log_content: String,
+    /// Absent means the slot holds no witness proofs, never "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness_content: Option<String>,
     pub version_count: u64,
+    /// Whether the source has disabled the slot. A replica stops serving a
+    /// disabled slot and resumes only on an update carrying `false`.
+    pub disabled: bool,
 }
 
 /// Request body for `POST /api/control/register-service`.
