@@ -313,7 +313,9 @@ pub async fn apply_recipe(
         let did_path = derive_did_path(&public_url);
         let store = Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
-        use did_hosting_server::bootstrap::{OwnDidImport, import_own_did, stale_own_did_message};
+        use did_hosting_server::bootstrap::{
+            OwnDidImport, import_own_did, replace_own_did, stale_own_did_message,
+        };
         // A DID that cannot be served is a failed setup, not a warning. This
         // used to print one and carry on, so a daemon moved to a new host
         // reported success and health while serving its old identity
@@ -329,6 +331,23 @@ pub async fn apply_recipe(
             OwnDidImport::AlreadyPresent { did_id } => {
                 eprintln!("  [setup-recipe] daemon DID already present at '{did_path}'");
                 did_id
+            }
+            // `--force-reprovision` is the operator explicitly opting into
+            // rotation, so a stale DID at this path is exactly what it's
+            // for: re-mint and replace rather than refuse. Without that
+            // flag this is unexpected — refuse loudly instead (below).
+            OwnDidImport::HeldByAnother { existing, minted } if force_reprovision => {
+                eprintln!(
+                    "  [setup-recipe] replacing stale daemon DID at '{did_path}' \
+                     ({} -> {minted}) — --force-reprovision was set",
+                    existing.as_deref().unwrap_or("an unidentified DID")
+                );
+                let result = replace_own_did(&store, &dids_ks, &did_path, log_entry).await?;
+                eprintln!(
+                    "  [setup-recipe] daemon DID re-minted at '{did_path}' (scid={})",
+                    result.scid
+                );
+                result.did_id
             }
             OwnDidImport::HeldByAnother { existing, minted } => {
                 return Err(AppError::Config(stale_own_did_message(
@@ -479,5 +498,169 @@ pub fn map_exit_code(err: &AppError) -> i32 {
         EXIT_RECIPE_INVALID
     } else {
         1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyring VTI-17: --force-reprovision onto a new public_url
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod force_reprovision_tests {
+    use super::*;
+    use did_hosting_common::did_ops::{DidRecord, did_key};
+    use did_hosting_common::server::setup_recipe::{
+        AdminSection, DaemonSection, DeploymentSection, IdentitySection, OutputSection,
+        ReprovisionSection, SecretsSection, ServerSection, VtaSection, WatcherSection,
+    };
+
+    /// A minimal, valid self-managed daemon recipe — the only `vta_mode`
+    /// that never touches a network, so the test is hermetic.
+    fn recipe(config_path: PathBuf, data_dir: PathBuf, public_url: &str) -> SetupRecipe {
+        SetupRecipe {
+            deployment: DeploymentSection {
+                service: ServiceKind::Daemon,
+                vta_mode: VtaMode::SelfManaged,
+            },
+            output: OutputSection { config_path },
+            server: ServerSection {
+                data_dir: Some(data_dir),
+                ..Default::default()
+            },
+            identity: IdentitySection {
+                public_url: Some(public_url.to_string()),
+                ..Default::default()
+            },
+            vta: VtaSection::default(),
+            secrets: SecretsSection::default(),
+            admin: AdminSection::default(),
+            reprovision: ReprovisionSection::default(),
+            watcher: WatcherSection::default(),
+            daemon: DaemonSection::default(),
+        }
+    }
+
+    /// `--force-reprovision` onto a new `public_url` re-mints the daemon
+    /// DID and replaces the stale one at `.well-known`, rather than
+    /// leaving both the failed setup AND the old identity behind (Keyring
+    /// VTI-17). The store ends up with exactly the new DID, servable, and
+    /// the local-resolution health check agrees.
+    #[tokio::test]
+    async fn reprovision_to_a_new_url_replaces_the_stale_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let data_dir = dir.path().join("data");
+
+        apply_recipe(
+            recipe(
+                config_path.clone(),
+                data_dir.clone(),
+                "https://old-host.example",
+            ),
+            None,
+            false,
+        )
+        .await
+        .expect("first setup succeeds");
+        let old_did = DaemonConfig::load(Some(config_path.clone()))
+            .unwrap()
+            .server_did
+            .expect("server_did set after first setup");
+
+        apply_recipe(
+            recipe(
+                config_path.clone(),
+                data_dir.clone(),
+                "https://new-host.example",
+            ),
+            None,
+            true,
+        )
+        .await
+        .expect("force-reprovision to a new host succeeds");
+        let new_config = DaemonConfig::load(Some(config_path.clone())).unwrap();
+        let new_did = new_config
+            .server_did
+            .clone()
+            .expect("server_did set after reprovision");
+        assert_ne!(old_did, new_did, "a new host re-mints the DID");
+
+        let store = Store::open(&new_config.store).await.unwrap();
+        let dids_ks = store.keyspace(KS_DIDS).unwrap();
+        let record: DidRecord = dids_ks
+            .get(did_key(".well-known"))
+            .await
+            .unwrap()
+            .expect("own DID present at .well-known");
+        assert_eq!(
+            record.did_id.as_deref(),
+            Some(new_did.as_str()),
+            "the new DID replaced the stale one rather than being refused"
+        );
+        // Keyring VTI-18 + the TrustTaskHTTPS sibling: a self-managed daemon
+        // with no mediator still advertises both, so a VTA can register it
+        // and route Trust Tasks to it (`services_overview` shape).
+        assert_eq!(
+            record.services,
+            Some(vec![
+                "WebVHHosting".to_string(),
+                "TrustTaskHTTPS".to_string()
+            ]),
+            "a no-mediator self-managed daemon must advertise hosting + trust tasks"
+        );
+        assert!(
+            did_hosting_common::server::health::own_did_served_locally(
+                &dids_ks,
+                Some(new_did.as_str())
+            )
+            .await,
+            "health must see the new DID as served"
+        );
+    }
+
+    /// The same `public_url` reprovisioned still succeeds (a credential
+    /// rotation with no host change) — `.well-known` ends up matching
+    /// whatever `server_did` the reprovision recorded, and health agrees.
+    #[tokio::test]
+    async fn reprovision_to_the_same_url_still_succeeds_and_stays_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let data_dir = dir.path().join("data");
+
+        apply_recipe(
+            recipe(
+                config_path.clone(),
+                data_dir.clone(),
+                "https://host.example",
+            ),
+            None,
+            false,
+        )
+        .await
+        .expect("first setup succeeds");
+
+        apply_recipe(
+            recipe(
+                config_path.clone(),
+                data_dir.clone(),
+                "https://host.example",
+            ),
+            None,
+            true,
+        )
+        .await
+        .expect("force-reprovision to the same host succeeds");
+
+        let config = DaemonConfig::load(Some(config_path.clone())).unwrap();
+        let did = config.server_did.clone().expect("server_did set");
+        let store = Store::open(&config.store).await.unwrap();
+        let dids_ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(
+            did_hosting_common::server::health::own_did_served_locally(
+                &dids_ks,
+                Some(did.as_str())
+            )
+            .await
+        );
     }
 }

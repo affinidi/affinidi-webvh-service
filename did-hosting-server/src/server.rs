@@ -745,6 +745,12 @@ fn run_rest_thread(
             routes::router_public_only().fallback(routes::did_public::serve_public)
         };
 
+        // Cloned before `with_state` consumes `state`: the health route is
+        // added below the router's state type has already collapsed to
+        // `()` (deliberately, so it sits outside the CORS/security-header
+        // layers), so it closes over its own `AppState` rather than using
+        // axum's `State` extractor.
+        let health_state = state.clone();
         let app = base_router
             .with_state(state)
             .layer(
@@ -762,7 +768,13 @@ fn run_rest_thread(
             // Allow browser-based resolvers to fetch public DID documents
             // cross-origin. Read-only, unauthenticated, wildcard origin.
             .layer(did_hosting_common::server::public_resolution_cors())
-            .route("/api/health", get(routes::health::health));
+            .route(
+                "/api/health",
+                get(move || {
+                    let health_state = health_state.clone();
+                    async move { routes::health::health(health_state).await }
+                }),
+            );
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());

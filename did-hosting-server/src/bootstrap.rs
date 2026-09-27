@@ -251,6 +251,37 @@ pub async fn import_own_did(
         .map(OwnDidImport::Imported)
 }
 
+/// Replace the service's own DID at `mnemonic`: hard-delete whatever is
+/// stored there and import the freshly minted `jsonl` in its place.
+///
+/// Only meant to be called after [`import_own_did`] reports
+/// [`OwnDidImport::HeldByAnother`], **and** the caller has independently
+/// confirmed the operator opted into rotation (`--force-reprovision`).
+/// Without that confirmation, [`stale_own_did_message`] is the right
+/// response — refuse loudly rather than guess.
+///
+/// Keyring VTI-17: reprovisioning onto a new `public_url` mints a DID for the
+/// new host while the store still holds the previous one at the same path —
+/// bound to a hostname that may no longer serve it. These are test
+/// deployments (no migration path), so the stale DID is simply removed
+/// rather than left to 404 while the daemon reports healthy.
+pub async fn replace_own_did(
+    store: &Store,
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    jsonl: &str,
+) -> Result<BootstrapResult, AppError> {
+    if let Some(existing) = dids_ks.get::<DidRecord>(did_key(mnemonic)).await? {
+        let mut batch = store.batch();
+        batch.remove(dids_ks, did_key(mnemonic));
+        batch.remove(dids_ks, content_log_key(mnemonic));
+        batch.remove(dids_ks, content_witness_key(mnemonic));
+        batch.remove(dids_ks, owner_key(&existing.owner, mnemonic));
+        batch.commit().await?;
+    }
+    import_did_at_path(store, dids_ks, mnemonic, jsonl, None).await
+}
+
 /// The operator-facing refusal for [`OwnDidImport::HeldByAnother`], shared
 /// by the interactive wizard and the recipe so both say the same thing.
 ///
@@ -459,6 +490,58 @@ mod own_did_import_tests {
             extract_did_id(&old),
             "the old DID was not overwritten"
         );
+    }
+
+    /// Keyring VTI-17: `--force-reprovision` onto a new host replaces the
+    /// stale DID rather than leaving it in the store to 404 forever.
+    #[tokio::test]
+    async fn replace_own_did_swaps_the_stale_did_for_the_new_one() {
+        let (_dir, store, ks) = store().await;
+        let old = minted_for("http://old-host.example").await;
+        let new = minted_for("http://new-host.example").await;
+        import_own_did(&store, &ks, ".well-known", &old)
+            .await
+            .unwrap();
+
+        let result = replace_own_did(&store, &ks, ".well-known", &new)
+            .await
+            .expect("replace succeeds");
+        assert_eq!(Some(result.did_id.clone()), extract_did_id(&new));
+
+        let kept = ks
+            .get::<DidRecord>(did_key(".well-known"))
+            .await
+            .unwrap()
+            .expect("record still there");
+        assert_eq!(
+            kept.did_id,
+            extract_did_id(&new),
+            "the new DID replaced the stale one"
+        );
+
+        // The re-run case (`AlreadyPresent`) now sees the new DID.
+        match import_own_did(&store, &ks, ".well-known", &new)
+            .await
+            .unwrap()
+        {
+            OwnDidImport::AlreadyPresent { did_id } => {
+                assert_eq!(Some(did_id), extract_did_id(&new));
+            }
+            other => panic!("expected AlreadyPresent, got {other:?}"),
+        }
+    }
+
+    /// A free path is also a valid target — reprovisioning after an
+    /// uninstall (or a first-ever setup that happens to route through the
+    /// replace path) must not require something to already be there.
+    #[tokio::test]
+    async fn replace_own_did_on_a_free_path_just_imports() {
+        let (_dir, store, ks) = store().await;
+        let jsonl = minted_for("http://host.example").await;
+        let result = replace_own_did(&store, &ks, ".well-known", &jsonl)
+            .await
+            .expect("replace on a free path succeeds");
+        assert_eq!(Some(result.did_id), extract_did_id(&jsonl));
     }
 
     /// The refusal names the targeted fix, and says why the blunt one is worse:

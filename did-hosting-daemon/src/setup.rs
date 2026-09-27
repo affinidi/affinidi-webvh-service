@@ -1012,6 +1012,21 @@ async fn run_self_managed_setup(
     // with no services, which no VTA could register (Keyring VTI-18).
     let mut doc = doc;
     did_hosting_common::did::add_webvh_hosting_service(&mut doc, &public_url);
+    // The daemon's embedded control plane always serves Trust Tasks at
+    // `<public_url>/api/trust-tasks` too. A VTA-provisioned DID gets a
+    // `TrustTaskHTTPS` entry for free from the vta-sdk template; this
+    // self-managed DID is built locally, so it needs the explicit sibling of
+    // the VTI-18 fix above (the endpoint is the Trust-Task *base*, not the
+    // request URL — see `add_trust_task_https_service`).
+    let trust_task_base = format!("{public_url}/api");
+    if did_hosting_common::did::is_https_or_loopback(&trust_task_base) {
+        did_hosting_common::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+    } else {
+        eprintln!(
+            "  Public URL is not HTTPS (and not loopback) — skipping the TrustTaskHTTPS \
+             service; a VTA must not be told to POST Trust Tasks over plaintext HTTP."
+        );
+    }
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
         .await
         .map_err(|e| format!("failed to create DID log entry: {e}"))?;
