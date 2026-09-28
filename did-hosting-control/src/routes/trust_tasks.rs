@@ -119,7 +119,8 @@ fn is_redeem_start(body: &[u8]) -> bool {
 /// Body is accepted as raw bytes so a parse failure surfaces as a
 /// `trust-task-error` document with `code: malformed_request`
 /// rather than axum's text/plain default. The route mount caps body
-/// size separately (see [`crate::routes::TRUST_TASKS_BODY_LIMIT`]).
+/// size separately (see [`crate::routes::trust_tasks_body_limit_bytes`]);
+/// the per-type narrowing below is what actually decides most requests.
 pub async fn dispatch_trust_task(
     auth: Option<AuthClaims>,
     State(state): State<AppState>,
@@ -134,6 +135,19 @@ pub async fn dispatch_trust_task(
         .server_did
         .as_deref()
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+
+    // ─── 1b. Per-type document size, decided from the body alone —
+    //         before it is parsed into `TrustTask<Value>` — on every
+    //         transport (`size`). The route mount already caps the raw
+    //         body at the largest limit any served type declares
+    //         (`crate::routes::trust_tasks_body_limit_bytes`); this
+    //         narrows further for a type whose own limit is smaller.
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check(
+        &body,
+        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+    ) {
+        return Ok(into_response(DispatchOutcome::Rejected(err)));
+    }
 
     // ─── 2. Parse the body to `TrustTask<Value>`. A parse failure
     //        emits a routed `trust-task-error` document with
