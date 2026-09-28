@@ -52,6 +52,17 @@ mediator connection) and `POST /api/trust-tasks`, through one dispatch.
 - In the daemon, the embedded witness is reached at
   `POST /witness/api/trust-tasks`.
 
+### Fixed — an already-deleted message no longer logs a deletion-handler warning
+
+Takes affinidi-messaging-sdk 0.30.1 (and, through the lock, mediator-common
+0.17.1 / mediator 0.33.1). A mediator on its Fjall or in-memory store answers
+the redundant delete of a redelivered message with `NOT_FOUND: message_hash
+(…)`, which SDK 0.30.0 did not recognise as "already gone", so each one logged
+`WARN deletion_handler: the mediator refused some ids … deleted=0 failed=1`. In
+a hosting service they recur every 30 seconds, in step with the messaging
+service's offline-sync status request.
+0.30.1 recognises it; mediator 0.33.1 also stops sending it.
+
 ### Added — offline commands to list, reset and delete TSP relationships
 
 `did-hosting-daemon`, `did-hosting-control` and `did-hosting-server` gain
