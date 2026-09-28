@@ -729,3 +729,130 @@ async fn the_signed_proof_satisfies_the_log() {
     )
     .expect("the witnessed log verifies");
 }
+
+// ---------------------------------------------------------------------------
+// witness/sign never witnesses two histories of one DID
+// ---------------------------------------------------------------------------
+
+/// A three-entry did:webvh log that names `witness` throughout, as each of
+/// its prefixes: `[1 entry, 2 entries, 3 entries]`.
+async fn witnessed_chain(witness: &str) -> Vec<String> {
+    use didwebvh_rs::witness::{Witness, Witnesses};
+    let secret = Secret::generate_ed25519(None, Some(&[9u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "server.example.com",
+        "bob",
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        witness: Some(Arc::new(Witnesses::Value {
+            threshold: 1,
+            witnesses: vec![Witness {
+                id: witness.to_string().into(),
+            }],
+        })),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    let base = chrono::Utc::now() - chrono::Duration::hours(1);
+    let mut prefixes = Vec::new();
+    for i in 0..3i64 {
+        let current = match state.log_entries().last() {
+            Some(e) => e.get_state().clone(),
+            None => doc.clone(),
+        };
+        let p = if i == 0 {
+            params.clone()
+        } else {
+            didwebvh_rs::parameters::Parameters::default()
+        };
+        state
+            .create_log_entry(
+                Some((base + chrono::Duration::minutes(i)).fixed_offset()),
+                &current,
+                &p,
+                &signing,
+            )
+            .await
+            .expect("create webvh log entry");
+        prefixes.push(
+            state
+                .log_entries()
+                .iter()
+                .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    prefixes
+}
+
+async fn sign_ok(state: &AppState, witness_id: &str, log: &str) {
+    let a = admin();
+    let reply = deliver(
+        state,
+        Via::Https,
+        &a.0,
+        signed(sign::Payload::TYPE_URI, &a, sign_payload(witness_id, log)).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, sign::Payload::TYPE_URI);
+}
+
+#[tokio::test]
+async fn sign_refuses_a_fork_or_a_rollback_of_what_it_witnessed() {
+    let (state, _dir) = witness_state().await;
+    let record = witness_ops::create_witness(&state.witnesses_ks, None)
+        .await
+        .unwrap();
+    let chain = witnessed_chain(&record.witness_id).await;
+
+    // Extending what it witnessed — and re-witnessing the same entry — is fine.
+    sign_ok(&state, &record.witness_id, &chain[1]).await;
+    sign_ok(&state, &record.witness_id, &chain[1]).await;
+    sign_ok(&state, &record.witness_id, &chain[2]).await;
+
+    // An entry older than one already witnessed is refused.
+    assert_eq!(
+        sign_refusal(&state, sign_payload(&record.witness_id, &chain[1])).await,
+        sign::error_codes::INVALID_LOG.code
+    );
+
+    // A log that diverges from the witnessed history is refused.
+    let scid = did_hosting_common::did_ops::verify_log_for_witnessing(
+        &chain[2],
+        &last_version_id(&chain[2]),
+        &record.did,
+    )
+    .unwrap()
+    .scid;
+    witness_ops::set_witnessed_mark(
+        &state.witnesses_ks,
+        &record.witness_id,
+        &scid,
+        &witness_ops::WitnessedMark {
+            version_number: 2,
+            version_id: "2-QmAnotherHistory".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sign_refusal(&state, sign_payload(&record.witness_id, &chain[2])).await,
+        sign::error_codes::INVALID_LOG.code
+    );
+    assert_eq!(
+        witness_ops::get_witness(&state.witnesses_ks, &record.witness_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .proofs_signed,
+        3
+    );
+}

@@ -55,6 +55,10 @@ pub struct AppState {
     pub acl_locks: PathLocks,
     /// Requests already acted on, keyed on `(proven issuer, document id)`.
     pub replay_cache: Arc<ReplayCache>,
+    /// Serialises `witness/sign`: the check that an entry extends what the
+    /// witness has already witnessed, the signature, and the record of it are
+    /// one step, so two forks of the same DID cannot both be witnessed.
+    pub sign_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -81,6 +85,7 @@ impl AppState {
             signer,
             acl_locks: PathLocks::new(),
             replay_cache: Arc::new(ReplayCache::new()),
+            sign_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }

@@ -116,6 +116,13 @@ pub async fn delete_witness(
 ) -> Result<(), AppError> {
     let key = format!("witness:{witness_id}");
     witnesses_ks.remove(key).await?;
+    // The identity's key is gone, so what it witnessed can never be extended.
+    for (key, _) in witnesses_ks
+        .prefix_iter_raw(format!("witnessed:{witness_id}:"))
+        .await?
+    {
+        witnesses_ks.remove(key).await?;
+    }
     Ok(())
 }
 
@@ -145,6 +152,40 @@ pub async fn sign_witness_proof(
     store_witness(witnesses_ks, &updated).await?;
 
     Ok((version_id.to_string(), proof))
+}
+
+/// The furthest entry a witness identity has witnessed for one DID: what a
+/// later request must extend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessedMark {
+    pub version_number: u64,
+    pub version_id: String,
+}
+
+fn witnessed_key(witness_id: &str, scid: &str) -> String {
+    format!("witnessed:{witness_id}:{scid}")
+}
+
+/// The furthest entry `witness_id` has witnessed for the DID `scid`.
+pub async fn get_witnessed_mark(
+    witnesses_ks: &KeyspaceHandle,
+    witness_id: &str,
+    scid: &str,
+) -> Result<Option<WitnessedMark>, AppError> {
+    witnesses_ks.get(witnessed_key(witness_id, scid)).await
+}
+
+/// Record that `witness_id` has witnessed `mark` for the DID `scid`.
+pub async fn set_witnessed_mark(
+    witnesses_ks: &KeyspaceHandle,
+    witness_id: &str,
+    scid: &str,
+    mark: &WitnessedMark,
+) -> Result<(), AppError> {
+    witnesses_ks
+        .insert(witnessed_key(witness_id, scid), mark)
+        .await
 }
 
 /// Validate that a version_id matches the expected format: `<number>-<hash>`.
