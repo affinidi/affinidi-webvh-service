@@ -203,6 +203,7 @@ async fn a_signed_sign_in_must_be_addressed_to_this_witness_server() {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config,
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),

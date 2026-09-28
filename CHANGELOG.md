@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added — optional Fjall memory settings
+
+Three optional settings — `STORAGE_FJALL_BLOCK_CACHE`,
+`STORAGE_FJALL_WRITE_BUFFER`, `STORAGE_FJALL_MAX_JOURNAL` (env vars, or a
+`[fjall]` config-file table) — cap the embedded fjall store's block
+cache, buffered writes, and startup journal replay so they stay inside a
+pod's Kubernetes memory `limit`. Same three names across every binary
+(did-hosting-server, did-hosting-control, webvh-witness, webvh-watcher,
+did-hosting-daemon); an env var overrides the file. All optional and
+unset leaves fjall's own defaults unchanged. Only the `store-fjall`
+backend reads them. See `docs/bootstrap_startup.md` for the full table
+and pod-sizing guidance.
+
 ### Added — the control plane is served as Trust Tasks on every transport
 
 Every control-plane task that only REST served, and every new specification

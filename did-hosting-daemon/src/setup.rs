@@ -212,6 +212,7 @@ pub async fn run_wizard(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig {
@@ -1058,6 +1059,7 @@ async fn run_self_managed_setup(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig::default(),
@@ -1425,6 +1427,7 @@ pub async fn run_setup_offline_complete(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig {

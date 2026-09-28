@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
-    StoreConfig, TransportSelection, VtaConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -21,6 +21,13 @@ pub struct AppConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
     #[serde(default)]
     pub auth: AuthConfig,
     /// Multi-domain hosting (bootstrap_domains + unassigned_purge_grace).
@@ -175,6 +182,10 @@ impl AppConfig {
             &mut config.auth,
             &mut config.secrets,
         )?;
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         // Server identity (did-hosting-server specific env vars)
         macro_rules! env_opt {
