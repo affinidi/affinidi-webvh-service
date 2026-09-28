@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Added — wallet logins bind a session key (`auth/authenticate/0.2`)
+
+The control plane serves `auth/authenticate/0.2` (trustoverip/dtgwg-trust-tasks-tf#675)
+in place of 0.1. An authenticate document may name a `sessionKey`, a `did:key`
+the subject's own proof covers, and the control plane binds it to the new
+session, as a passkey login binds its browser key.
+
+- **What it can do.** The HTTPS binding accepts that key's `authentication`
+  proofs as the subject, only alongside that session's own bearer token. The
+  key stops working when the session expires, is revoked or logs out. Its
+  `acr` is the login's, so anything that needs a step-up still does.
+- **What it can't do.** It never approves a step-up. Approvals must be signed
+  by the subject's own key, on the Trust Task and REST paths, and the verifier
+  refuses a delegated `assertionMethod` proof outright. This also closes a gap
+  where a passkey session's key could approve its own step-up, because a
+  `did:key` document lists its key under `assertionMethod`. It also never
+  signs `auth/authenticate` or `auth/refresh`, so it cannot mint or extend a
+  session.
+- **Key types.** A key that is not Ed25519 is refused with
+  `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent.
+- **Subject's own key.** A session with a bound key still accepts the
+  subject's own proofs, so a wallet can still sign its step-up approval and
+  its refresh.
+- **Logout.** New `auth/revoke-session/0.2` ends one of the caller's own
+  sessions. The console's sign-out now calls it, signed with the session key,
+  so logout ends the session server-side, not only in the browser.
+- **Console.** A wallet login generates a non-extractable session key and
+  passes it as `sessionKey`. Later calls are signed with it instead of
+  prompting the wallet. Step-up still goes through the wallet.
+
 ### Added — optional Fjall memory settings
 
 Three optional settings — `STORAGE_FJALL_BLOCK_CACHE`,

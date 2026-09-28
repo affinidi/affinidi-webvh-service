@@ -10,11 +10,13 @@ use trust_tasks_rs::specs::auth::{
         enroll::invite::{list as invite_list, revoke as invite_revoke, update as invite_update},
         login::{finish as login_finish, start as login_start},
     },
+    revoke_session,
     step_up::{approve_response, start as step_up_start},
 };
 
 use did_hosting_common::server::auth::session::{
-    Session, SessionState, create_authenticated_session, get_session, now_epoch, store_session,
+    Session, SessionState, create_authenticated_session, delete_session, get_session, now_epoch,
+    store_session,
 };
 use did_hosting_common::server::passkey::{routes as passkey_routes, store as passkey_store};
 
@@ -65,6 +67,58 @@ struct PendingStepUp {
 
 fn step_up_key(session_id: &str) -> String {
     format!("stepup-task:{session_id}")
+}
+
+/// `auth/revoke-session/0.2`: end one of the caller's own sessions. This is
+/// the console's logout.
+///
+/// The session row goes, and with it its refresh token and any session key
+/// bound at login. The bearer extractor reads that row on every request, so
+/// the access token and the key stop working at once, not at expiry
+/// (`auth/authenticate/0.2`: the binding ends on revoke or logout).
+///
+/// A session key may sign this, since revoking only reduces authority. A
+/// session that does not exist, or belongs to someone else, answers
+/// `sessionNotFound` the same way, so the answer discloses nothing. `all` and
+/// `subject` are not offered: the console only ever ends the session it holds.
+pub(crate) async fn revoke_session(
+    cx: &Cx<'_>,
+    p: revoke_session::v0_2::Payload,
+) -> Result<revoke_session::v0_2::Response, TaskError> {
+    use revoke_session::v0_2::error_codes;
+
+    let caller = cx.caller()?.to_string();
+    if p.all.is_some() || p.subject.is_some() {
+        return Err(AppError::Validation(
+            "this relying party revokes one session, named by sessionId".into(),
+        )
+        .into());
+    }
+    let session_id = p
+        .session_id
+        .as_ref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::Validation("sessionId is required".into()))?;
+    let not_found = || {
+        TaskError::Declared(
+            error_codes::SESSION_NOT_FOUND,
+            "no session of yours has that id".into(),
+        )
+    };
+    let session = get_session(&cx.state.sessions_ks, &session_id)
+        .await?
+        .ok_or_else(not_found)?;
+    if session.did != caller {
+        return Err(not_found());
+    }
+    delete_session(&cx.state.sessions_ks, &session_id).await?;
+    info!(
+        did = %caller,
+        session_id = %session_id,
+        reason = p.reason.as_deref().map(String::as_str).unwrap_or(""),
+        "session revoked",
+    );
+    typed(json!({ "revokedCount": 1 }), "revoke-session response")
 }
 
 /// `auth/step-up/start/0.1`: bind a fresh challenge to the caller's own

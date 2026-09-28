@@ -130,9 +130,9 @@ export default function Login() {
   };
 
   // The wallet's `login()` returns the SAME server-issued JWT shape the
-  // passkey path produces (both come out of did-hosting-control's
-  // `/api/auth/`), so we route into `useAuth().login(...)` identically.
-  // Passkey login stays as-is — this is additive.
+  // passkey path produces, so we route into `useAuth().login(...)`
+  // identically. Like the passkey path, it binds this browser's session key,
+  // which signs the session's calls from here on (`wallet-login.ts`).
   const handleWalletLogin = async () => {
     setWalletLoading(true);
     setWalletError(null);

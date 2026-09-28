@@ -387,8 +387,9 @@ async function fetchServiceInfo(): Promise<ServerInfoResponse> {
 
 /** Who signs a document, and as whom. */
 export type Signer =
-  /** The session's subject: the wallet on a wallet login, the session key on a
-   *  passkey login. The default. */
+  /** The session's subject. The session key signs when the login bound one
+   *  (every passkey login, and a wallet holder login); otherwise the wallet
+   *  signs. The default. */
   | "session"
   /** The session key itself, as its own `did:key` issuer — a passkey login's
    *  finish, which binds the new session to the key that signs it. A fresh
@@ -435,11 +436,24 @@ async function sign(
   doc.issuer = subject;
 
   if (getAuthMethod() === "wallet") {
-    // Wallet login. A holder login's session is the wallet's own DID, so it
-    // signs as itself; a proxy login's session is a vault entry's principal,
-    // whose key lives at the VTA, so the wallet asks the VTA to sign as that
-    // DID (`asDid`). Without it the proof would name the holder and the
-    // control plane would refuse it as not the authenticated caller.
+    // A wallet holder login bound this browser's session key
+    // (`auth/authenticate/0.2`), so the key signs, with no wallet prompt.
+    // The control plane accepts it as the subject for this session only.
+    // A step-up is not signed here: it goes to the wallet (`stepUpVta`).
+    if (!hasSessionKeypair()) {
+      await restoreSessionKeypair();
+    }
+    if (hasSessionKeypair()) {
+      await signEnvelope(doc as unknown as Record<string, unknown>);
+      return doc;
+    }
+    // No bound key: a proxy login, which binds none, or a key this browser
+    // no longer holds. The wallet signs. A holder login's session is the
+    // wallet's own DID, so it signs as itself; a proxy login's session is a
+    // vault entry's principal, whose key lives at the VTA, so the wallet asks
+    // the VTA to sign as that DID (`asDid`). Without it the proof would name
+    // the holder and the control plane would refuse it as not the
+    // authenticated caller.
     const wallet =
       typeof window !== "undefined"
         ? (window as unknown as { vtaWallet?: WalletSigner }).vtaWallet

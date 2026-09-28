@@ -677,10 +677,14 @@ mod tests {
                 let doc_noproof: TrustTask<serde_json::Value> =
                     serde_json::from_value(body).expect("parse");
                 let signing_value = serde_json::to_value(&doc_noproof).unwrap();
-                let di_proof =
-                    DataIntegrityProof::sign(&signing_value, &signer, SignOptions::new())
-                        .await
-                        .expect("sign");
+                // A session key signs ordinary requests: `authentication`.
+                let di_proof = DataIntegrityProof::sign(
+                    &signing_value,
+                    &signer,
+                    SignOptions::new().with_proof_purpose("authentication"),
+                )
+                .await
+                .expect("sign");
                 let mut full = signing_value;
                 full.as_object_mut().unwrap().insert(
                     "proof".to_string(),

@@ -441,8 +441,13 @@ impl TransportBoundVerifier {
                 proof.proof_purpose
             )));
         }
-        self.verify_with(doc, &*self.signer_resolver, ProofPurpose::Authentication)
-            .await
+        self.verify_with(
+            doc,
+            &*self.signer_resolver,
+            ProofPurpose::Authentication,
+            Delegation::Allowed,
+        )
+        .await
     }
 
     /// Verify a human approver's decision (consent decision, step-up
@@ -450,6 +455,13 @@ impl TransportBoundVerifier {
     /// `proofPurpose: assertionMethod`, a `verificationMethod` listed under the
     /// signer's `assertionMethod` relationship, and — for `did:webvh` — a signer
     /// that has not deactivated its DID.
+    ///
+    /// **Never by a session delegate.** A session key stands in for its
+    /// subject on ordinary requests only (`auth/authenticate/0.2` Conformance
+    /// item 11). An approval must be signed by a key under the approver's *own*
+    /// `assertionMethod` relationship. A `did:key` document lists its one key
+    /// under every relationship, so without this refusal a session key could
+    /// approve its own session's step-up.
     pub async fn verify_approval<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
     where
         P: Serialize + Send + Sync,
@@ -462,8 +474,13 @@ impl TransportBoundVerifier {
                 proof.proof_purpose
             )));
         }
-        self.verify_with(doc, &*self.signer_resolver, ProofPurpose::AssertionMethod)
-            .await
+        self.verify_with(
+            doc,
+            &*self.signer_resolver,
+            ProofPurpose::AssertionMethod,
+            Delegation::Refused,
+        )
+        .await
     }
 
     /// Verify `doc` with its key resolved for `purpose`: the key must be listed
@@ -473,11 +490,12 @@ impl TransportBoundVerifier {
         doc: &TrustTask<P>,
         resolver: &dyn ProofPurposeResolver,
         purpose: ProofPurpose,
+        delegation: Delegation,
     ) -> Result<(), VerificationError>
     where
         P: Serialize + Send + Sync,
     {
-        let (parsed_proof, doc_value) = self.prepare(doc)?;
+        let (parsed_proof, doc_value) = self.prepare(doc, delegation)?;
         let resolver = PurposeBound::new(resolver, purpose);
         let attempt = parsed_proof
             .verify(&doc_value, &resolver, self.options.clone())
@@ -518,6 +536,7 @@ impl TransportBoundVerifier {
     fn prepare<P>(
         &self,
         doc: &TrustTask<P>,
+        delegation: Delegation,
     ) -> Result<
         (
             affinidi_data_integrity::DataIntegrityProof,
@@ -560,10 +579,11 @@ impl TransportBoundVerifier {
         };
         let vm = proof.verification_method.as_str();
         let self_signed = controller_did(vm) == issuer;
-        let delegated = self
-            .delegate
-            .as_ref()
-            .is_some_and(|d| d.verification_method == vm && d.principal == issuer);
+        let delegated = delegation == Delegation::Allowed
+            && self
+                .delegate
+                .as_ref()
+                .is_some_and(|d| d.verification_method == vm && d.principal == issuer);
         if !self_signed && !delegated {
             return Err(VerificationError::IssuerMismatch(format!(
                 "verificationMethod is controlled by {}, not the document issuer {issuer}",
@@ -596,8 +616,26 @@ impl ProofVerifier for TransportBoundVerifier {
             .transpose()
             .map_err(map_error)?
             .unwrap_or(ProofPurpose::Authentication);
-        self.verify_with(doc, &*self.resolver, purpose).await
+        // An `assertionMethod` proof is an attestation, and a session delegate
+        // never makes one. See `verify_approval`.
+        let delegation = if matches!(purpose, ProofPurpose::AssertionMethod) {
+            Delegation::Refused
+        } else {
+            Delegation::Allowed
+        };
+        self.verify_with(doc, &*self.resolver, purpose, delegation)
+            .await
     }
+}
+
+/// Whether a check may accept the per-request session delegate
+/// ([`TransportBoundVerifier::with_session_delegate`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delegation {
+    /// An ordinary request: the delegate may stand in for its principal.
+    Allowed,
+    /// An attestation: only the signer's own key counts.
+    Refused,
 }
 
 /// Map [`DataIntegrityError`] into the framework's [`VerificationError`]
@@ -667,6 +705,11 @@ mod tests {
     /// document's canonical `TrustTask` serialisation minus `proof` —
     /// exactly what [`TransportBoundVerifier::verify`] reconstructs.
     async fn sign(body: Value) -> (TrustTask<Value>, String) {
+        sign_with(body, SignOptions::new()).await
+    }
+
+    /// [`sign`] with explicit options (for a proof purpose).
+    async fn sign_with(body: Value, options: SignOptions) -> (TrustTask<Value>, String) {
         // Deterministic seed → reproducible key; any 32 bytes work.
         let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
         let pk_mb = secret.get_public_keymultibase().expect("multibase pubkey");
@@ -679,7 +722,7 @@ mod tests {
             serde_json::from_value(body).expect("body parses as TrustTask");
         let signing_value = serde_json::to_value(&doc_noproof).expect("serialise doc");
 
-        let di_proof = DataIntegrityProof::sign(&signing_value, &signer, SignOptions::new())
+        let di_proof = DataIntegrityProof::sign(&signing_value, &signer, options)
             .await
             .expect("sign");
 
@@ -714,7 +757,12 @@ mod tests {
         body.as_object_mut()
             .unwrap()
             .insert("issuer".to_string(), json!("did:web:alice.example"));
-        let (doc, signer_did) = sign(body).await;
+        // A session key signs ordinary requests, so `authentication`.
+        let (doc, signer_did) = sign_with(
+            body,
+            SignOptions::new().with_proof_purpose(OPERATIONAL_PROOF_PURPOSE),
+        )
+        .await;
         let vm = doc.proof.as_ref().unwrap().verification_method.clone();
         assert!(vm.starts_with(&signer_did));
         verifier()
@@ -740,6 +788,52 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, VerificationError::IssuerMismatch(_)));
+    }
+
+    /// GUARD (`auth/authenticate/0.2` Conformance item 11): a session key never
+    /// signs an approval, even for its own principal.
+    ///
+    /// The first assertion shows why the refusal has to be explicit. A
+    /// `did:key` document lists its key under `assertionMethod`, so the same
+    /// key signing as *itself* is a valid approval. Only the delegation is
+    /// refused: acting for the principal, it is not the principal's own
+    /// `assertionMethod` key.
+    #[tokio::test]
+    async fn session_delegate_never_signs_an_approval() {
+        let approval = SignOptions::new().with_proof_purpose(APPROVAL_PROOF_PURPOSE);
+
+        let (as_itself, signer_did) = sign_with(base_body(), approval.clone()).await;
+        let mut as_itself_body = serde_json::to_value(&as_itself).unwrap();
+        as_itself_body["issuer"] = json!(signer_did);
+        as_itself_body.as_object_mut().unwrap().remove("proof");
+        let (as_itself, _) = sign_with(as_itself_body, approval.clone()).await;
+        verifier()
+            .verify_approval(&as_itself)
+            .await
+            .expect("a did:key's own assertionMethod proof verifies");
+
+        let mut body = base_body();
+        body["issuer"] = json!("did:web:alice.example");
+        let (doc, _) = sign_with(body, approval).await;
+        let vm = doc.proof.as_ref().unwrap().verification_method.clone();
+        let delegated = verifier().with_session_delegate("did:web:alice.example", vm);
+
+        let err = delegated
+            .verify_approval(&doc)
+            .await
+            .expect_err("a delegate must not approve");
+        assert!(
+            matches!(err, VerificationError::IssuerMismatch(_)),
+            "{err:?}"
+        );
+        let err = delegated
+            .verify(&doc)
+            .await
+            .expect_err("nor pass an assertionMethod proof through the generic check");
+        assert!(
+            matches!(err, VerificationError::IssuerMismatch(_)),
+            "{err:?}"
+        );
     }
 
     /// GUARD: a delegate is scoped to one key — a different key acting for the
