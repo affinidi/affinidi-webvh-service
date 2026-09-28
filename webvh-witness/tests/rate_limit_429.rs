@@ -71,6 +71,7 @@ async fn pending_challenge_cap_answers_429_with_the_contract() {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config,
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),

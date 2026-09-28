@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, HostingConfig, IdentityConfig, IdentityMode, LogConfig,
-    SecretsConfig, ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, IdentityConfig, IdentityMode,
+    LogConfig, SecretsConfig, ServerConfig, StoreConfig,
 };
 use did_hosting_common::server::error::AppError;
 
@@ -31,6 +31,14 @@ pub struct DaemonConfig {
     pub store: StoreConfig,
     #[serde(default = "default_witness_store")]
     pub witness_store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep both stores' memory use
+    /// inside the pod's Kubernetes limit. Shared by `store` and
+    /// `witness_store` — this is a pod-level setting, not a per-store one.
+    /// Every field defaults to `None` (fjall's own defaults, unchanged).
+    /// See [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
 
     // Server-specific
     #[serde(default)]
@@ -178,6 +186,11 @@ impl DaemonConfig {
             config.log.level = v;
         }
 
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+
         // Normalize
         if let Some(ref mut url) = config.public_url {
             *url = url.trim_end_matches('/').to_string();
@@ -199,6 +212,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
+            fjall: self.fjall,
             auth: self.auth.clone(),
             hosting: self.hosting.clone(),
             secrets: self.secrets.clone(),
@@ -223,6 +237,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.witness_store.clone(),
+            fjall: self.fjall,
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
@@ -240,6 +255,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
+            fjall: self.fjall,
             sync: self.watcher_sync.clone(),
             config_path: self.config_path.clone(),
         }
@@ -256,6 +272,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
+            fjall: self.fjall,
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),

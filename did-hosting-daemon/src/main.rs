@@ -596,12 +596,14 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // ── Open stores ───────────────────────────────────────────────────
     // fjall locks the directory, so server/watcher/control share one handle.
-    let main_store = Store::open(&config.store).await.unwrap_or_else(|e| {
-        error!("failed to open main store: {e}");
-        std::process::exit(1);
-    });
+    let main_store = Store::open_with(&config.store, &config.fjall)
+        .await
+        .unwrap_or_else(|e| {
+            error!("failed to open main store: {e}");
+            std::process::exit(1);
+        });
 
-    let witness_store = Store::open(&config.witness_store)
+    let witness_store = Store::open_with(&config.witness_store, &config.fjall)
         .await
         .unwrap_or_else(|e| {
             error!("failed to open witness store: {e}");

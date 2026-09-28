@@ -207,6 +207,7 @@ pub async fn apply_recipe(
             data_dir,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: secrets_config.clone(),
         vta: VtaConfig {

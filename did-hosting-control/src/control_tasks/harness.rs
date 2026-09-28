@@ -61,6 +61,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config,
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),
