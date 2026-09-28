@@ -17,10 +17,11 @@ import {
 const TOKEN_KEY = "webvh_token";
 const REFRESH_TOKEN_KEY = "webvh_refresh_token";
 
-/** Which auth path produced the current session. Both passkey and wallet
- *  holder logins bind the browser's session keypair, which then signs
- *  trust tasks. A `"wallet"` session with no bound key (a proxy login) falls
- *  back to `window.vtaWallet.signTrustTask`. */
+/** Which auth path produced the current session. Passkey, wallet holder and
+ *  wallet proxy logins all bind the browser's session keypair, which then
+ *  signs trust tasks; a session whose key this browser no longer holds ends.
+ *  Only step-up branches on this: a wallet session steps up through the
+ *  wallet. */
 export type AuthMethod = "passkey" | "wallet";
 const AUTH_METHOD_KEY = "webvh_auth_method";
 
@@ -119,7 +120,7 @@ export async function renewIfNeeded(): Promise<void> {
       // stolen refresh token alone will not rotate the session. The refresh
       // token is still what authorises it: the key proves this is the
       // browser that logged in, and cannot refresh anything on its own. A
-      // session with no bound key (a proxy login, machine-to-machine) has
+      // session with no bound key (machine-to-machine) has
       // nothing to sign with and the daemon does not ask.
       let envelope: Record<string, unknown> = {
         type: REFRESH_TASK_URI,
@@ -171,44 +172,6 @@ export function setAuthMethod(method: AuthMethod): void {
   }
 }
 
-/** DID the wallet-authenticated session is bound to. Set by the
- *  proxy-login flow to the vault entry's `principalDid`; the wallet's
- *  holder-login flow leaves this unset.
- *
- *  Trust-task signing reads this: when set, the wallet's
- *  `signTrustTask({ asDid })` extension routes via
- *  `vault/sign-trust-task/0.1` so the proof's `verificationMethod`
- *  matches the session's authenticated DID at the server. Without it,
- *  the wallet falls back to holder-signing and the server rejects with
- *  `proof_invalid: proof verificationMethod DID does not match the
- *  authenticated caller` (which is how this discriminator got
- *  motivated). */
-const SESSION_PRINCIPAL_DID_KEY = "webvh_session_principal_did";
-
-export function getSessionPrincipalDid(): string | null {
-  try {
-    return localStorage.getItem(SESSION_PRINCIPAL_DID_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setSessionPrincipalDid(did: string): void {
-  try {
-    localStorage.setItem(SESSION_PRINCIPAL_DID_KEY, did);
-  } catch {
-    // ignore
-  }
-}
-
-export function clearSessionPrincipalDid(): void {
-  try {
-    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
-  } catch {
-    // ignore
-  }
-}
-
 export function clearToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY);
@@ -216,7 +179,6 @@ export function clearToken(): void {
     // would leave the browser able to mint fresh access tokens.
     localStorage.removeItem(REFRESH_TOKEN_KEY);
     localStorage.removeItem(AUTH_METHOD_KEY);
-    localStorage.removeItem(SESSION_PRINCIPAL_DID_KEY);
   } catch {
     // ignore
   }

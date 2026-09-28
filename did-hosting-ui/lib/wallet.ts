@@ -21,6 +21,7 @@ import { getApiBase } from "./api-base";
 import { clearSessionKeypair } from "./session-key";
 import { getServiceInfo } from "./trust-task";
 import {
+  authenticateIdTokenBindingSessionKey,
   loginBindingSessionKey,
   type VtaWalletLoginParams,
   type VtaWalletLoginResult,
@@ -402,9 +403,9 @@ export async function loginWithWalletProxy(
       "Chosen entry has no principalDid — only did-self-issued entries are supported for SIOP proxy login.",
     );
   }
-  // This login binds no session key, so none may be left over from an earlier
-  // sign-in: `trust-task.ts` would sign with it, and the control plane would
-  // refuse a key this session never bound.
+  // Drop any session key left from an earlier sign-in before anything can
+  // fail: `trust-task.ts` signs with whatever key is held, and the control
+  // plane refuses one this session never bound. Step 3 binds a fresh one.
   clearSessionKeypair();
   const rpDid = await getRpDid();
   const apiBase = getApiBase().replace(/\/+$/, "");
@@ -487,55 +488,25 @@ export async function loginWithWalletProxy(
 
   // ─── Step 3: post the id_token to /auth/. The server verifies the
   //            signature against the entry's DID + checks nonce + aud
-  //            + iat/exp window, then issues access tokens.
+  //            + iat/exp window, then issues access tokens — for a session
+  //            bound to a fresh key this browser holds, so the session's
+  //            calls are signed without a wallet prompt each.
+  //
+  // `challenge` answers camelCase (`sessionId`); `AuthenticatePayload` wants
+  // snake_case (`session_id`). The response is the canonical
+  // AuthenticateResponse, `{ session, tokens }`, fully camelCase.
   const tAuth = performance.now();
-  const authEnv = {
-    type: AUTH_AUTHENTICATE_TYPE_URI,
-    payload: {
-      id_token: idTokenCompact,
-      // Server expects snake_case here (no rename_all on
-      // AuthenticatePayload). Read from camelCase sessionId on
-      // chJson — that's the wire shape the challenge endpoint
-      // emits.
-      session_id: chJson.sessionId,
+  const { response: tokenResp, sent: authEnv } = await authenticateIdTokenBindingSessionKey(
+    apiBase,
+    {
+      idToken: idTokenCompact,
+      sessionId: chJson.sessionId,
+      typeUri: AUTH_AUTHENTICATE_TYPE_URI,
     },
-  };
-  const authRes = await fetch(`${apiBase}/auth/`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(authEnv),
-  });
-  if (!authRes.ok) {
-    const text = await authRes.text();
-    throw new Error(`/auth/ failed (${authRes.status}): ${text}`);
-  }
-  // /auth/ returns the canonical AuthenticateResponse: `{ session,
-  // tokens }`. Both nested structs (Session, TokenBundle) have
-  // `#[serde(rename_all = "camelCase")]` upstream in did-hosting-
-  // common's types.rs, so the wire shape is fully camelCase. The
-  // earlier draft of this file parsed the response with a flat
-  // snake_case shape (`{ access_token, refresh_token, session_id }`)
-  // — every field came out `undefined`, the wallet stored
-  // `undefined` as the token, and the home page bounced back to
-  // login. Mirror the canonical shape here.
-  const tokenResp = (await authRes.json()) as {
-    session: { id: string; subject: string; issuedAt: string; expiresAt: string };
-    tokens: {
-      accessToken: string;
-      refreshToken?: string;
-      tokenType: string;
-      expiresIn: number;
-      refreshExpiresIn?: number;
-    };
-  };
-  if (!tokenResp.tokens?.accessToken) {
-    throw new Error(
-      `/auth/: missing tokens.accessToken in response — got ${JSON.stringify(tokenResp).slice(0, 200)}`,
-    );
-  }
+  );
   steps.push({
     label: "3. Server verifies + issues bearer",
-    description: `Server resolves the entry's DID, verifies the id_token signature, checks the nonce matches the challenge it issued in step 1, and issues a bearer access token bound to the principal DID.`,
+    description: `Server resolves the entry's DID, verifies the id_token signature, checks the nonce matches the challenge it issued in step 1, and issues a bearer access token bound to the principal DID — and to the session key this browser generated, which signs the session's calls from here on.`,
     durationMs: Math.round(performance.now() - tAuth),
     detail: {
       url: `${apiBase}/auth/`,

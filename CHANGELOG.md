@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed — a wallet proxy login no longer raises an approval popup per request
+
+The console signs every Trust Task it sends. A proxy login (the VTA mints the
+persona's `id_token`) bound no session key, so each call was signed through
+the wallet's `signTrustTask` — which asks the human every time, by design —
+and a page load fired several at once: an endless stack of approval windows.
+The proxy login now binds a fresh session key the way a holder login does,
+sending it as `session_pubkey_b58btc` beside the `id_token` on `POST
+/api/auth/`, and the console signs with it: one approval, at sign-in. The
+route already bound a key it was given; a test now pins that it does.
+
+- **That route now decodes the key.** It accepted anything starting `z6Mk`,
+  so a value that only looked like an Ed25519 multikey was stored and every
+  proof it later signed refused. It now applies the same decode as
+  `auth/authenticate/0.2`'s `sessionKey`, before the challenge is spent.
+- **A lost session key ends the session.** A wallet session whose key this
+  browser no longer holds used to fall back to the wallet's `signTrustTask`
+  silently — changing what each request rested on without saying so, and
+  bringing back the popup per request. Every login now binds a key, so the
+  console treats a wallet session like a passkey one: sign in again. The
+  `asDid` principal hint that fallback read is gone with it.
+
 ### Added — wallet logins bind a session key (`auth/authenticate/0.2`)
 
 The control plane serves `auth/authenticate/0.2` (trustoverip/dtgwg-trust-tasks-tf#675)

@@ -395,6 +395,9 @@ describe("step-up (wallet session)", () => {
       webvh_refresh_token: "refresh-1",
       webvh_auth_method: "wallet",
     });
+    // The session key the wallet login bound signs the purge; only the
+    // step-up goes to the wallet.
+    await generateSessionKeypair();
     const elevated = tokenFor(SUBJECT, { session_id: "sess-1", acr: "aal2" });
     const stepUpVta = stubWallet(
       vi.fn().mockResolvedValue({
@@ -429,6 +432,7 @@ describe("step-up (wallet session)", () => {
 
   it("says so when the session cannot step up", async () => {
     stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "r", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
     vi.stubGlobal("window", {
       location: { origin: "https://console.example.com" },
       dispatchEvent: vi.fn(),
@@ -532,18 +536,22 @@ describe("management calls (wallet session)", () => {
     expect(store.get("webvh_token")).toBe("newer-token");
   });
 
-  it("signs through the wallet when the session bound no key", async () => {
-    stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+  it("ends the session, and never asks the wallet, when the session key is gone", async () => {
+    // Falling back to the wallet's `signTrustTask` would prompt for every
+    // call — one approval window per request — and switch what each request
+    // rests on without saying so. Signing in again is the honest signal.
+    const store = stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
     const sessionKey = await import("../session-key");
     sessionKey.clearSessionKeypair();
     vi.spyOn(sessionKey, "restoreSessionKeypair").mockResolvedValue();
     const signTrustTask = stubWallet();
-    const sent = installControlPlane((req) => seal(req, { entries: [], truncated: false }));
+    const sent = installControlPlane(() => undefined);
 
-    await api.listAcl();
+    await expect(api.listAcl()).rejects.toThrow(/sign in again/);
 
-    expect(signTrustTask).toHaveBeenCalledOnce();
-    expect(tasks(sent)[0]!.doc.proof).toMatchObject({ verificationMethod: `${SUBJECT}#key-1` });
+    expect(signTrustTask).not.toHaveBeenCalled();
+    expect(tasks(sent)).toHaveLength(0);
+    expect(store.get("webvh_token")).toBeUndefined();
   });
 });
 
