@@ -31,6 +31,16 @@ pub const KS_ACL: &str = "acl";
 /// refresh-token index. Holds the JWT challenge-response flow's state.
 pub const KS_SESSIONS: &str = "sessions";
 
+/// `pk_user:<uuid>`, `pk_did:<did>`, `pk_cred:<cred_id_hex>` — **step-up-only**
+/// passkeys (`auth/passkey/enroll/invite/0.2` `purpose: stepUp`), in the same
+/// layout [`KS_SESSIONS`] holds login passkeys in.
+///
+/// A separate keyspace so the separation holds by construction: the passkey
+/// login ceremony reads [`KS_SESSIONS`] and nothing else, so a step-up
+/// credential can never be offered at, or accepted by, a login — and a login
+/// credential is never found where a step-up credential is looked for.
+pub const KS_PASSKEY_STEP_UP: &str = "passkey_step_up";
+
 /// `stats:<mnemonic>` — per-DID resolve/update counters and totals.
 pub const KS_STATS: &str = "stats";
 

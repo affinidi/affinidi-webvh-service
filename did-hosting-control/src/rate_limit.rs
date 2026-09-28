@@ -135,6 +135,63 @@ impl IpRateLimiter {
     }
 }
 
+/// Redemption attempts one source may make per [`WINDOW_SECS`]: an invite's
+/// claim code is Argon2-hashed on every attempt, so this bounds both guessing
+/// across invites and the hashing a single source can make the service do.
+pub const REDEEM_MAX_PER_WINDOW: u64 = 10;
+
+/// The `limiter` a refused redemption names.
+pub const REDEEM_LIMITER_NAME: &str = "passkey-redeem-per-source";
+
+/// Per-source limiter for `auth/passkey/enroll/redeem/start`
+/// (Conformance item 2: "Rate-limit this task per source as well").
+///
+/// A source is what the transport can vouch for: the client IP on HTTPS
+/// (`ip:…`), the authenticated sender on TSP and DIDComm (`vid:…`). The
+/// per-invite wrong-code limit is the real guard on a claim code; this one
+/// keeps a single source from spraying invites or burning CPU.
+#[derive(Debug, Default)]
+pub struct SourceRateLimiter {
+    buckets: Mutex<HashMap<String, Bucket>>,
+}
+
+impl SourceRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one attempt for `source`, or refuse once it has made
+    /// [`REDEEM_MAX_PER_WINDOW`] in the current window.
+    pub fn try_consume(&self, source: &str, now: u64) -> Result<(), AppError> {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buckets.len() >= MAX_TRACKED_IPS {
+            buckets.clear();
+        }
+        let entry = buckets.entry(source.to_string()).or_insert(Bucket {
+            count: 0,
+            window_start: now,
+        });
+        if now.saturating_sub(entry.window_start) >= WINDOW_SECS {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        if entry.count >= REDEEM_MAX_PER_WINDOW {
+            return Err(AppError::RateLimited {
+                limiter: REDEEM_LIMITER_NAME,
+                message: format!(
+                    "too many invite redemptions ({REDEEM_MAX_PER_WINDOW} per {WINDOW_SECS}s); try again later"
+                ),
+                retry_after_secs: (entry.window_start + WINDOW_SECS).saturating_sub(now),
+            });
+        }
+        entry.count += 1;
+        Ok(())
+    }
+}
+
 /// Resolve the client IP from a TCP peer + `X-Forwarded-For` header.
 ///
 /// Behaviour:

@@ -217,12 +217,19 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   rows of `did-hosting-control/src/control_tasks` (`control_tasks!`), keyed on
   the generated `Payload::TYPE_URI`, typed with the generated request and
   response, each with a `ProofRule` the gate enforces: `Optional` (only
-  `server/info` and `auth/passkey/login/start`, plus discovery and
-  `auth/challenge`), `Authentication` (operational), `AssertionMethod` (an
+  `server/info`, `auth/passkey/login/start` and
+  `auth/passkey/enroll/redeem/{start,finish}` — whose authorisation is the
+  invite's token and claim code — plus discovery and `auth/challenge`),
+  `Authentication` (operational), `AssertionMethod` (an
   approver's decision), `SessionKey` (a passkey login, signed by the `did:key`
   its session is bound to). A new task is a new row; never a hand-built reply.
   `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
   document's proof authorises, a bearer session is optional context.
+- **Two passkey stores.** Login (`purpose: session`) passkeys live in
+  `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
+  ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment
+  invites are stored hashed (`passkey::invite`); never store or log a token
+  or claim code.
 - **A transport's sender is a routing hint.** `ctx.sender_did`, a TSP sender
   VID, a DIDComm `from` — each is only required to *agree* with the proof.
   Never authorise, ACL-check, or key a replay cache on one. Don't add a bare

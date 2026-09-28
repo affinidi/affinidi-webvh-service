@@ -42,6 +42,69 @@ use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::server::AppState;
 
+/// The mounted `POST /api/trust-tasks` route: [`dispatch_trust_task`], after
+/// the per-source limit on invite redemption.
+///
+/// `auth/passkey/enroll/redeem/start` is the one task a stranger may send that
+/// makes the service hash a guess (the claim code, with Argon2). Over HTTPS
+/// the only source a stranger cannot choose is the client IP, so it is counted
+/// here, before the document is parsed any further; the messaging transports
+/// count their authenticated sender in the task itself.
+pub async fn trust_tasks_endpoint(
+    auth: Option<AuthClaims>,
+    State(state): State<AppState>,
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, AppError> {
+    if let Some(axum::Extension(axum::extract::ConnectInfo(addr))) = connect
+        && is_redeem_start(&body)
+    {
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        let ip = crate::rate_limit::resolve_client_ip(
+            addr.ip(),
+            xff,
+            &state.config.server.trusted_proxies,
+        );
+        let limited = state.redeem_rate_limiter.try_consume(
+            &format!("ip:{ip}"),
+            did_hosting_common::server::auth::session::now_epoch(),
+        );
+        if let Err(AppError::RateLimited {
+            retry_after_secs, ..
+        }) = limited
+        {
+            tracing::warn!(%ip, "invite redemption rate limited");
+            // Refused as the task would be — a routed `unavailable` document
+            // with its retry time — not as a bare REST 429.
+            if let Ok(doc) = serde_json::from_slice::<TrustTask<Value>>(&body) {
+                let reject = RejectReason::Unavailable {
+                    retry_after: Some(
+                        chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
+                    ),
+                };
+                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+                return Ok(into_response(DispatchOutcome::Rejected(routed)));
+            }
+        }
+    }
+    dispatch_trust_task(auth, State(state), body).await
+}
+
+/// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
+///
+/// Read exactly as [`dispatch_trust_task`] and the task table read it — the
+/// whole body as a `TrustTask`, its parsed `type` compared as the router
+/// compares it — so no body the router serves as a redemption (duplicate
+/// members, escapes, any other quirk of a lighter parse) slips past the limit.
+fn is_redeem_start(body: &[u8]) -> bool {
+    use trust_tasks_rs::Payload;
+    serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
+        doc.type_uri.to_string()
+            == trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
+    })
+}
+
 /// `POST /api/trust-tasks` handler — the HTTPS binding of the same dispatch
 /// TSP and DIDComm use.
 ///

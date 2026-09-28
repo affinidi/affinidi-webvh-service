@@ -1,27 +1,13 @@
+//! Passkeys (WebAuthn): credentials, enrolment invites and ceremony state.
+
+pub mod invite;
 pub mod routes;
 pub mod store;
-
-use std::sync::Arc;
 
 use url::Url;
 use webauthn_rs::prelude::*;
 
-use crate::server::auth::extractor::AuthState;
 use crate::server::error::AppError;
-use crate::server::store::KeyspaceHandle;
-
-/// Trait that application states must implement to support passkey extractors.
-///
-/// Extends `AuthState` (which provides JWT keys + sessions keyspace) with
-/// WebAuthn and ACL access needed by passkey enrollment and login routes.
-pub trait PasskeyState: AuthState {
-    fn webauthn(&self) -> Option<&Arc<Webauthn>>;
-    fn acl_ks(&self) -> &KeyspaceHandle;
-    fn access_token_expiry(&self) -> u64;
-    fn refresh_token_expiry(&self) -> u64;
-    fn public_url(&self) -> Option<&str>;
-    fn enrollment_ttl(&self) -> u64;
-}
 
 /// Build a `Webauthn` instance from the server's `public_url` configuration.
 ///
@@ -45,4 +31,67 @@ pub fn build_webauthn(public_url: &str) -> Result<Webauthn, AppError> {
         .map_err(|e| AppError::Config(format!("failed to build Webauthn: {e}")))?;
 
     Ok(webauthn)
+}
+
+/// The operator's `invite` subcommand: issue a login (`session`) invite from
+/// the command line, with store access standing in for an administrator's
+/// signed `auth/passkey/enroll/invite` — the bootstrap for the first admin.
+///
+/// Prints the invite URL and the claim code separately, for delivery over
+/// two different channels. Neither is stored or logged.
+pub async fn run_cli_invite(
+    sessions_ks: &crate::server::store::KeyspaceHandle,
+    public_url: &str,
+    ttl_secs: u64,
+    did: &str,
+    role: &str,
+) -> Result<(), AppError> {
+    let did = crate::server::acl::validate_did_format(did)?;
+    role.parse::<crate::server::acl::Role>()?;
+    if store::get_passkey_user_by_did(sessions_ks, &did)
+        .await?
+        .is_some_and(|u| !u.credentials.is_empty())
+    {
+        return Err(AppError::Conflict(format!(
+            "{did} already has a login passkey; it adds another from its own session"
+        )));
+    }
+    let issued = invite::issue(
+        sessions_ks,
+        invite::InviteRequest {
+            subject: did.clone(),
+            purpose: invite::Purpose::Session,
+            role: Some(role.to_string()),
+            device_label: None,
+            issued_by: "operator (CLI)".into(),
+            ttl_secs,
+        },
+    )
+    .await?;
+    let url = format!(
+        "{}/enroll?token={}",
+        public_url.trim_end_matches('/'),
+        issued.token
+    );
+    eprintln!();
+    eprintln!("  Enrollment invite created.");
+    eprintln!();
+    eprintln!("  DID:     {did}");
+    eprintln!("  Role:    {role}");
+    eprintln!(
+        "  Expires: in {}m (epoch {})",
+        ttl_secs.div_ceil(60),
+        issued.invite.expires_at
+    );
+    eprintln!();
+    eprintln!("  Send these two over DIFFERENT channels (e.g. the link by email,");
+    eprintln!("  the code by chat or phone). Either one alone redeems nothing.");
+    eprintln!();
+    eprintln!("  Enrollment URL:");
+    eprintln!("  {url}");
+    eprintln!();
+    eprintln!("  Claim code:");
+    eprintln!("  {}", issued.claim_code);
+    eprintln!();
+    Ok(())
 }
