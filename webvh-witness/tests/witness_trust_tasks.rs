@@ -282,6 +282,25 @@ async fn witnessed_log(witness: &str, deactivate: bool) -> String {
         .join("\n")
 }
 
+/// `witnessed_log(witness, true)`, with one more entry appended after the
+/// deactivating one. didwebvh-rs itself refuses to *write* such a log (a
+/// deactivated DID accepts no further entry, full stop — `create_log_entry`
+/// returns `DeactivatedError` regardless of `updateKeys`), so this hand-crafts
+/// the successor line by cloning the real deactivating entry's JSON and
+/// changing only its `versionId`/`versionTime`. That line is never
+/// cryptographically verified: `verify_log_for_witnessing` refuses on sight
+/// of the earlier deactivating entry, before reaching this one (see its doc
+/// comment), so an unsigned-in-truth successor is exactly what the witness's
+/// refusal must not depend on inspecting.
+async fn witnessed_log_after_deactivation(witness: &str) -> String {
+    let deactivated = witnessed_log(witness, true).await;
+    let mut after: Value = serde_json::from_str(deactivated.lines().last().unwrap()).unwrap();
+    after["versionId"] = json!("3-QmAfterDeactivation");
+    after["versionTime"] =
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    format!("{deactivated}\n{}", serde_json::to_string(&after).unwrap())
+}
+
 fn last_version_id(log: &str) -> String {
     let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     last["versionId"].as_str().unwrap().to_string()
@@ -677,10 +696,10 @@ async fn sign_verifies_the_log_before_signing() {
         sign::error_codes::NOT_LISTED.code
     );
 
-    // A deactivated DID.
-    let deactivated = witnessed_log(&record.witness_id, true).await;
+    // An entry *after* the DID's deactivating entry.
+    let past_deactivation = witnessed_log_after_deactivation(&record.witness_id).await;
     assert_eq!(
-        sign_refusal(&state, sign_payload(&record.witness_id, &deactivated)).await,
+        sign_refusal(&state, sign_payload(&record.witness_id, &past_deactivation)).await,
         sign::error_codes::DEACTIVATED.code
     );
 
@@ -698,6 +717,46 @@ async fn sign_verifies_the_log_before_signing() {
             .unwrap()
             .proofs_signed,
         0
+    );
+}
+
+/// did:webvh does not exempt a DID's deactivating entry from witnessing (see
+/// `verify_log_for_witnessing`'s doc comment): a witness signs it exactly as
+/// it signs any other entry that is the log's last, is authorised by the
+/// DID's update keys, and names this witness identity. Only an entry *after*
+/// it is refused (covered by `sign_verifies_the_log_before_signing` above).
+#[tokio::test]
+async fn sign_witnesses_the_deactivating_entry() {
+    let (state, _dir) = witness_state().await;
+    let record = witness_ops::create_witness(&state.witnesses_ks, None)
+        .await
+        .unwrap();
+    let deactivated = witnessed_log(&record.witness_id, true).await;
+
+    let a = admin();
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            sign::Payload::TYPE_URI,
+            &a,
+            sign_payload(&record.witness_id, &deactivated),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    let body = answered(&reply, sign::Payload::TYPE_URI);
+    assert_eq!(body["versionId"], last_version_id(&deactivated));
+    assert_eq!(body["proof"]["type"], "DataIntegrityProof");
+    assert_eq!(
+        witness_ops::get_witness(&state.witnesses_ks, &record.witness_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .proofs_signed,
+        1
     );
 }
 

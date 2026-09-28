@@ -346,10 +346,11 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
 }
 
 /// `webvh/witness/sign/0.1`: the witness signs only an entry it has verified —
-/// the log's chain up to the entry, that the entry is the last, that the DID
-/// is not deactivated, that the entry's witness parameter names this witness
-/// identity, and that the log extends the furthest entry this identity has
-/// already witnessed for the DID.
+/// the log's chain up to the entry, that the entry is the last, that no
+/// entry before it already deactivated the DID (the deactivating entry
+/// itself is signed like any other), that the entry's witness parameter
+/// names this witness identity, and that the log extends the furthest entry
+/// this identity has already witnessed for the DID.
 async fn sign_task(
     state: &AppState,
     requester: &str,
@@ -384,8 +385,10 @@ async fn sign_task(
                     ))
                 }
                 WitnessLogRefusal::Deactivated => {
-                    ErrorPayload::from(sign::error_codes::DEACTIVATED)
-                        .with_message("the log deactivates the DID")
+                    ErrorPayload::from(sign::error_codes::DEACTIVATED).with_message(
+                        "versionId is after the DID's deactivating entry; nothing is witnessed \
+                         once a DID is deactivated",
+                    )
                 }
                 WitnessLogRefusal::NotListed => ErrorPayload::from(sign::error_codes::NOT_LISTED)
                     .with_message(format!(

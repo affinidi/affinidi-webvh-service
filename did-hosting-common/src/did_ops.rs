@@ -5,7 +5,7 @@
 //! are independent of any particular server's `AppState` or business logic.
 
 use didwebvh_rs::DIDWebVHState;
-use didwebvh_rs::log_entry::LogEntry;
+use didwebvh_rs::log_entry::{LogEntry, LogEntryMethods};
 use didwebvh_rs::log_entry_state::{LogEntryState, LogEntryValidationStatus};
 use didwebvh_rs::parameters::Parameters;
 use serde::{Deserialize, Serialize};
@@ -369,7 +369,10 @@ pub enum WitnessLogRefusal {
     InvalidLog(String),
     /// The versionId asked for is not the log's last entry (`versionNotLast`).
     VersionNotLast { last: String },
-    /// The log deactivates the DID at or before the entry (`deactivated`).
+    /// An entry *before* the one asked for already deactivated the DID
+    /// (`deactivated`). The entry that itself first deactivates the DID is
+    /// not refused by this rule — did:webvh witnessing applies to it like
+    /// any other entry; only an entry after it is.
     Deactivated,
     /// The witness parameter in force for the entry does not name this
     /// witness (`notListed`).
@@ -390,9 +393,21 @@ pub struct WitnessedLog {
 /// Verify a did:webvh log a witness has been asked to witness, *before* it
 /// signs anything: the chain up to and including the entry (every entry's
 /// proof against its authorised `updateKeys`, the hash chain, pre-rotation and
-/// the parameter transitions), that `version_id` is the last entry, that the
-/// DID is not deactivated, and that the witness parameter in force for that
-/// entry names `witness_did`.
+/// the parameter transitions), that `version_id` is the last entry, that no
+/// entry *before* it already deactivated the DID, and that the witness
+/// parameter in force for that entry names `witness_did`.
+///
+/// A DID's deactivating entry — the first to set `parameters.deactivated:
+/// true` — is not refused by the deactivation check: did:webvh does not
+/// exempt it from witnessing. While a witness set is active, a threshold of
+/// it MUST provide valid proofs for every log entry, with no carve-out for
+/// the entry that happens to deactivate the DID (did:webvh "DID Witnesses" >
+/// "Witness Lists": "while there are active witnesses, a threshold of the
+/// active witnesses must provide valid proofs associated with each DID log
+/// entry before the DID log entry can be published"). A witness that refused
+/// to sign a deactivating entry *as such* would make a DID that ever had
+/// witnesses undeactivatable. Only an entry *after* the deactivating one is
+/// refused, since nothing is witnessed once a DID is deactivated.
 ///
 /// The entry's own witness proofs are not checked — they are what is being
 /// produced. Every other rule of [`verify_did_log_proofs`] applies.
@@ -428,8 +443,29 @@ pub fn verify_log_for_witnessing(
         });
     }
 
-    let mut deactivated = false;
-    for idx in 0..entries.len() {
+    // did:webvh deactivation is itself a log entry, and did:webvh does not
+    // exempt it from witnessing (see this function's doc comment) — so the
+    // entry that *first* sets `deactivated: true` is witnessed like any
+    // other, and only an entry *after* it is refused.
+    //
+    // didwebvh-rs's own per-entry parameter validation already refuses (as a
+    // generic, structural error) any entry whose predecessor deactivated the
+    // DID — deactivation is terminal for it, not merely un-witnessable. A raw
+    // (unverified) look at each entry's own declared `parameters.deactivated`
+    // finds that entry *before* full verification reaches — and reports on —
+    // it, so the more specific `deactivated` refusal is used instead of the
+    // less specific `invalidLog`. This is safe to read unverified: the
+    // outcome below is refusal either way, never a signature, and entries up
+    // to and including the deactivating one are still fully verified.
+    let deactivating_index = entries
+        .iter()
+        .position(|e| e.log_entry.get_parameters().deactivated == Some(true));
+    let last_index = entries.len().checked_sub(1);
+    let past_deactivation =
+        matches!((deactivating_index, last_index), (Some(d), Some(last)) if d < last);
+    let verify_through = deactivating_index.map_or(entries.len(), |d| d + 1);
+
+    for idx in 0..verify_through {
         let (before, rest) = entries.split_at_mut(idx);
         let entry = &mut rest[0];
         entry.verify_log_entry(before.last()).map_err(|e| {
@@ -438,11 +474,10 @@ pub fn verify_log_for_witnessing(
                 entry.get_version_id()
             ))
         })?;
-        if entry.validated_parameters.deactivated == Some(true) {
-            deactivated = true;
-        }
     }
 
+    // `get_version_id` reads the raw entry, so this check does not need
+    // `last` to have been in the verified range above.
     let last = entries
         .last()
         .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log has no entries".into()))?;
@@ -451,7 +486,7 @@ pub fn verify_log_for_witnessing(
             last: last.get_version_id().to_string(),
         });
     }
-    if deactivated {
+    if past_deactivation {
         return Err(WitnessLogRefusal::Deactivated);
     }
     let listed = last
