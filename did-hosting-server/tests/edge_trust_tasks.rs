@@ -822,3 +822,92 @@ async fn metrics_report_replication_freshness_to_the_control_plane_only() {
         assert_eq!(refused(&reply), "permissionDenied", "{via:?}");
     }
 }
+
+/// The other ways a directive fails to verify — addressed to another server,
+/// stale, a replay of one already applied — get no reply on any transport,
+/// and a reply that is sent is threaded to the directive it answers.
+#[tokio::test]
+async fn misaddressed_stale_and_replayed_directives_are_not_answered() {
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let cp = control();
+        let payload = json!({ "domain": "kept.example" });
+
+        let mut misaddressed = build_request(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp.0,
+            &signer(67).0,
+            payload.clone(),
+        )
+        .unwrap();
+        misaddressed.issued_at = Some(chrono::Utc::now());
+        let misaddressed =
+            did_hosting_common::server::trust_tasks::sign_document(&misaddressed, &cp.1)
+                .await
+                .unwrap();
+        assert!(
+            deliver(
+                &state,
+                via,
+                &cp.0,
+                serde_json::to_value(misaddressed).unwrap()
+            )
+            .await
+            .is_none(),
+            "{via:?}: a directive addressed to another server is not answered"
+        );
+
+        let stale = document(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            payload.clone(),
+            chrono::Duration::days(1),
+            true,
+        )
+        .await;
+        assert!(
+            deliver(&state, via, &cp.0, stale).await.is_none(),
+            "{via:?}: a stale directive is not answered"
+        );
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "kept.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: neither was applied"
+        );
+
+        let fresh = signed(MSG_REPLICA_DOMAIN_ASSIGN, &cp, payload.clone()).await;
+        let reply = deliver(&state, via, &cp.0, fresh.clone())
+            .await
+            .expect("answered");
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+        assert_eq!(reply["threadId"], fresh["id"], "{via:?}: threaded");
+        assert_eq!(reply["recipient"], cp.0, "{via:?}");
+        assert!(
+            deliver(&state, via, &cp.0, fresh).await.is_none(),
+            "{via:?}: a replay is not answered"
+        );
+    }
+}
+
+/// A health ping is answered to the control plane only: a stranger's gets no
+/// reply at all, not even a refusal.
+#[tokio::test]
+async fn a_strangers_health_ping_is_not_answered() {
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let stranger = signer(68);
+        let ping = signed(MSG_HEALTH_PING, &stranger, json!({})).await;
+        assert!(
+            deliver(&state, via, &stranger.0, ping).await.is_none(),
+            "{via:?}"
+        );
+        let ping = signed(MSG_HEALTH_PING, &control(), json!({})).await;
+        let reply = deliver(&state, via, &control().0, ping.clone())
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: the control plane's ping is answered"));
+        signed_by_the_edge(&reply);
+        assert_eq!(reply["threadId"], ping["id"], "{via:?}");
+    }
+}
