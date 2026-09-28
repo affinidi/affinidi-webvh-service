@@ -35,7 +35,7 @@ use did_hosting_common::server::store::Store;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::auth::session::now_epoch;
+use did_hosting_common::server::auth::session::now_epoch;
 
 /// Default tick cadence. Public so the daemon can override it for
 /// integration tests (fast loop) if needed.

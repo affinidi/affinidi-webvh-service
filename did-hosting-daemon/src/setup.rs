@@ -214,7 +214,6 @@ pub async fn run_wizard(
         },
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
             did: Some(outcome.vta_did.clone()),
@@ -1061,7 +1060,6 @@ async fn run_self_managed_setup(
         },
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig::default(),
         watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
@@ -1429,7 +1427,6 @@ pub async fn run_setup_offline_complete(
         },
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig {
             url: result.vta_url.clone(),
             did: Some(result.vta_did.clone()),

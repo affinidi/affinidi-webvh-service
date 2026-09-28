@@ -26,6 +26,17 @@ use crate::server::AppState;
 /// A document that does not verify gets no signed answer — a signed refusal
 /// would settle a directive the control plane never sent — so it is answered
 /// `403` with an unsigned, detail-free error document, which settles nothing.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/api/trust-tasks",
+    tag = "trust-tasks",
+    request_body(content = String, description = "A signed Trust Task document", content_type = "application/json"),
+    responses(
+        (status = 200, description = "The edge's signed reply document", content_type = "application/json"),
+        (status = 400, description = "The body is not a Trust Task document", content_type = "application/json"),
+        (status = 403, description = "The document was not accepted; an unsigned refusal", content_type = "application/json"),
+    ),
+))]
 pub async fn receive(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(doc) => doc,

@@ -19,7 +19,7 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
             health::check_value("public_url", &c.public_url);
             health::check_value("server_did", &c.server_did);
             health::check_value("mediator_did", &c.mediator_did);
-            health::check_value("control_url", &c.control_url);
+            health::check_value("control_did", &c.control_did);
             Some(c)
         }
         Err(e) => {
@@ -97,11 +97,16 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
         health::check_did_resolution("Mediator DID resolves", did).await;
     }
 
-    // ── Control Plane Connectivity ─────────────────────────────────
-    if let Some(ref url) = config.control_url {
-        health::section("Control Plane Connectivity");
-        let health_url = format!("{url}/health");
-        health::check_url_reachable("Control plane reachable", &health_url).await;
+    // ── Control Plane ──────────────────────────────────────────────
+    health::section("Control Plane");
+    match config.control_did {
+        Some(ref did) => {
+            health::check_did_resolution("Control plane DID resolves", did).await;
+        }
+        None => health::fail(
+            "control_did is not set — an edge does not run without a control plane \
+             (use did-hosting-daemon for a single host)",
+        ),
     }
 
     eprintln!();
