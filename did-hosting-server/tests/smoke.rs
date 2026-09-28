@@ -84,19 +84,49 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
     (state, dir)
 }
 
+/// Seed both the raw content and its `DidRecord` for `mnemonic` — the pair
+/// register/publish always write together in one commit. `serve_content`
+/// refuses before ever consulting the cache when the record alone is
+/// missing, so a test that wants a 200 must seed both, not content alone.
+async fn seed_did(state: &AppState, mnemonic: &str, did_id: &str, body: &str) {
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+    state
+        .dids_ks
+        .insert(
+            did_key(mnemonic),
+            &DidRecord {
+                owner: "did:example:owner".into(),
+                mnemonic: mnemonic.into(),
+                created_at: 0,
+                updated_at: 0,
+                version_count: 1,
+                did_id: Some(did_id.into()),
+                content_size: body.len() as u64,
+                disabled: false,
+                deleted_at: None,
+                method: "webvh".into(),
+                domain: String::new(),
+                services: None,
+                agent_names: Vec::new(),
+            },
+        )
+        .await
+        .expect("seed DidRecord");
+}
+
 #[tokio::test]
 async fn public_did_resolution_round_trip() {
     let (state, _dir) = make_state().await;
 
     // Seed a DID log under mnemonic "alice".
     let mnemonic = "alice";
-    let body =
-        "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:server.example.com:alice\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
     let app = did_hosting_server::routes::router(1024 * 1024)
         .with_state(state.clone())
@@ -163,6 +193,68 @@ async fn public_did_resolution_round_trip() {
         .to_str()
         .unwrap();
     assert_eq!(cc, "no-store", "404 must not be cached");
+}
+
+/// Regression: a deleted DID must stop resolving immediately, not up to the
+/// content cache's TTL later. `did/delete` (the control plane) removes the
+/// `DidRecord` outright rather than soft-deleting it — a hard delete, not a
+/// disable — so a resolver reading a warm cache entry with no record behind
+/// it any more must refuse before ever consulting that cache.
+#[tokio::test]
+async fn a_deleted_did_stops_resolving_at_once_even_with_a_warm_cache() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+
+    // Warm the content cache.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "precondition: cache is warm"
+    );
+
+    // A hard delete: the record goes, exactly like `did/delete`. Left
+    // deliberately WITHOUT invalidating the cache and without removing the
+    // raw content bytes — this isolates the `serve_content` guard itself
+    // (a missing record refuses before the cache is ever consulted) from
+    // whether some call site remembered to invalidate.
+    state
+        .dids_ks
+        .remove(did_key(mnemonic))
+        .await
+        .expect("remove record");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted DID must not be served from a warm cache"
+    );
 }
 
 /// T25: with both `method-webvh` and `method-web` enabled, the
@@ -395,13 +487,9 @@ async fn public_did_resolution_sets_cors_header() {
     let (state, _dir) = make_state().await;
 
     let mnemonic = "alice";
-    let body =
-        "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:server.example.com:alice\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
     // Assemble the router exactly as `run_rest_thread` does: security headers
     // then the public-resolution CORS layer.
@@ -447,12 +535,9 @@ async fn the_edge_router_serves_resolution_and_no_management_surface() {
     let (state, _dir) = make_state().await;
 
     let mnemonic = "mediator";
-    let body = "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:Q1:server.example.com:mediator\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:Q1:server.example.com:mediator";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
     // The EXACT layer/route ordering run_rest_thread assembles: base +
     // fallback, .with_state, TraceLayer, security_headers,

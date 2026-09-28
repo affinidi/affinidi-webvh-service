@@ -107,6 +107,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        cache_invalidate: None,
     };
     (state, dir)
 }

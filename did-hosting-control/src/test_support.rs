@@ -194,6 +194,7 @@ impl TestServer {
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: None,
         };
 
         Self { state, _dir: dir }

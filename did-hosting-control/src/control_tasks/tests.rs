@@ -763,12 +763,24 @@ async fn witness_publish_answers_where_the_proofs_are_served() {
     let (state, _dir) = state().await;
     let owner = member(&state, 27, Role::Owner).await;
     seed_did(&state, &owner.did, "alpha-beta").await;
+    // `witness` is one witness's proof for one version — `did_ops::upload_witness`
+    // only reads `versionId` and `proof` out of it (`witness`, naming which
+    // witness signed, travels inside `proof.verificationMethod` instead); the
+    // proof's own content is opaque to this handler, which stores it rather
+    // than verifying it.
     let reply = call(
         &state,
         Via::Tsp,
         &owner,
         WITNESS,
-        json!({ "mnemonic": "alpha-beta", "witness": {} }),
+        json!({
+            "mnemonic": "alpha-beta",
+            "witness": {
+                "versionId": "1-abc",
+                "witness": "did:key:zTestWitness",
+                "proof": { "type": "DataIntegrityProof" },
+            },
+        }),
     )
     .await;
     conforms(&reply);

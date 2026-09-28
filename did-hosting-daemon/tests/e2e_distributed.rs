@@ -13,15 +13,21 @@
 //! 1. `domain/create` — a domain, fanned out to the edge's own store.
 //! 2. `webvh/witness/key/create` — a witness identity (always over HTTPS; the
 //!    witness isn't the transport under test).
-//! 3. `did/register` — a did:webvh log naming the watcher, but **not** the
-//!    witness — see the comment in `run_lifecycle` on why a witnessed log can
-//!    never pass `did/register`'s validation today, a bug this test found.
-//! 4. `webvh/witness/sign` proves the witness's own attestation still works,
-//!    against a separate, unregistered log built the same way but naming it.
-//! 5. the outbox settles: the edge serves `/{mnemonic}/did.jsonl`, and the
+//! 3. `did/register` — a did:webvh log naming *both* the watcher and the
+//!    witness. Registering a witnessed log used to be impossible (its
+//!    genesis entry needs a witness proof no one could have produced yet —
+//!    a bug this test found); it is registered directly now.
+//! 4. `webvh/witness/sign` produces the witness's proof over that same
+//!    registered version.
+//! 5. `webvh/witness/publish` carries that proof to the control plane, so
+//!    the sync this settles below carries a log the edge's own witness-
+//!    threshold check accepts.
+//! 6. the outbox settles: the edge serves `/{mnemonic}/did.jsonl`, and the
 //!    watcher mirrors the DID.
-//! 6. `did/set-state` (`suspended`) over `via` — the edge refuses resolution.
-//! 7. `did/delete` over `via` — the watcher no longer mirrors it.
+//! 7. `did/set-state` (`suspended`) over `via` — the edge refuses resolution.
+//! 8. `did/delete` over `via` — the watcher no longer mirrors it, and a `GET`
+//!    against the edge 404s at once (no cache staleness window — a bug this
+//!    test also found).
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -33,6 +39,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use trust_tasks_rs::Payload;
 use trust_tasks_rs::specs::did_management::{did, domain};
+use trust_tasks_rs::specs::webvh::witness::publish::v0_1 as witness_publish;
 
 use did_hosting_common::WitnessClient;
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
@@ -200,6 +207,9 @@ impl Topology {
             ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            // Distributed topology: the edge's cache is kept in step by its
+            // own `webvh/sync/*` handling, not by this hook.
+            cache_invalidate: None,
         };
         dirs.push(control_dir);
 
@@ -537,21 +547,25 @@ async fn run_lifecycle(via: Via) {
     let witness_key_did = key.key.did.to_string();
     let witness_id = key.key.witness_id.to_string();
 
-    // 3. did/register — a webvh log naming the watcher. NOT naming the
-    // witness: `didwebvh_rs::DIDWebVHState::validate()` enforces the witness
-    // threshold unconditionally, even though
-    // `did_hosting_common::did_ops::verify_did_log_proofs` (which `did/register`
-    // calls with no witness content, by design — proofs are meant to arrive
-    // later via `webvh/witness/publish`) documents them as deferred. A log
-    // whose parameters name an active witness therefore can never pass
-    // `did/register`'s validation on its own first entry, since no proof can
-    // exist yet for a not-yet-published version — a chicken-and-egg refusal
-    // (`did-management/did/register:invalidLog`, "Witness proof threshold (1)
-    // was not met. Only (0) proofs were validated") this test tripped over
-    // while writing it. See the witness-attestation check below, which proves
-    // the witness's own signing operation still works correctly in isolation.
-    let (jsonl, _version_id) =
-        build_did_log(EDGE_HOST, &mnemonic, &did_signer, None, &[WATCHER_URL]).await;
+    // 3. did/register — a webvh log naming *both* the watcher and the
+    // witness. Registering the genesis entry of a witnessed DID directly
+    // used to be impossible: `didwebvh_rs::DIDWebVHState::validate()`
+    // enforces the witness threshold unconditionally, even on an entry that
+    // is not published yet and so cannot have a proof — a chicken-and-egg
+    // refusal (`did-management/did/register:invalidLog`, "Witness proof
+    // threshold (1) was not met. Only (0) proofs were validated") this test
+    // tripped over while writing it. Fixed by
+    // `did_hosting_common::did_ops::verify_did_log_for_publish`: the
+    // threshold is enforced only on entries already published before this
+    // call, never on the new tail a register/publish is adding.
+    let (jsonl, version_id) = build_did_log(
+        EDGE_HOST,
+        &mnemonic,
+        &did_signer,
+        Some(&witness_key_did),
+        &[WATCHER_URL],
+    )
+    .await;
     let reply = topo
         .admin
         .call(
@@ -569,26 +583,38 @@ async fn run_lifecycle(via: Via) {
         .await;
     ok(&reply, did::register::v0_1::Payload::TYPE_URI);
 
-    // The witness's own attestation still works: sign a (separate, unregistered)
-    // log built the same way but naming the witness, proving `webvh/witness/sign`
-    // verifies the log and produces a threshold-meeting proof — the half of the
-    // witnessed-DID story that `did/register`'s bug above blocks from ever
-    // reaching the control plane.
-    let (witnessed_jsonl, witnessed_version_id) = build_did_log(
-        EDGE_HOST,
-        &format!("{mnemonic}-witnessed"),
-        &did_signer,
-        Some(&witness_key_did),
-        &[],
-    )
-    .await;
+    // 4. webvh/witness/sign — the witness signs the version just registered.
     let signed = witness_client
-        .sign(&witness_id, &witnessed_version_id, &witnessed_jsonl)
+        .sign(&witness_id, &version_id, &jsonl)
         .await
         .unwrap_or_else(|e| panic!("witness sign: {e}"));
-    assert_eq!(signed.version_id.to_string(), witnessed_version_id);
+    assert_eq!(signed.version_id.to_string(), version_id);
 
-    // 4. the outbox settles: the edge serves the log, the watcher mirrors it.
+    // 5. webvh/witness/publish — carry that proof to the control plane, so
+    // the sync below carries a log the edge's own witness-threshold check
+    // (`did_hosting_common::did_ops::verify_did_log_and_witness_proofs`)
+    // accepts: the genesis entry now has its threshold-meeting proof on
+    // record, before the outbox ever fans it out to the edge.
+    let reply = topo
+        .admin
+        .call(
+            via,
+            &topo.control_did,
+            &topo.control_https_url,
+            witness_publish::Payload::TYPE_URI,
+            json!({
+                "mnemonic": mnemonic,
+                "witness": {
+                    "versionId": version_id,
+                    "witness": witness_key_did,
+                    "proof": signed.proof,
+                },
+            }),
+        )
+        .await;
+    ok(&reply, witness_publish::Payload::TYPE_URI);
+
+    // 6. the outbox settles: the edge serves the log, the watcher mirrors it.
     //
     // Each check below drives `run_tick` itself rather than settling the
     // outbox first and polling separately — `notify_servers_did` enqueues

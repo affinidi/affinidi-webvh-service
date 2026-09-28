@@ -34,6 +34,22 @@ use crate::store::KeyspaceHandle;
 /// permissive when the `domains` keyspace is empty (legacy / test
 /// state) and strict otherwise.
 ///
+/// Evict `mnemonic`'s resolved-content cache entry, if this process also
+/// serves resolution from the same store (the unified daemon).
+///
+/// Call this after every commit that changes or removes `content_log_key`,
+/// or the record's `disabled`/`deleted_at` state — register, publish,
+/// disable, rollback, delete. A no-op for a standalone control plane; see
+/// `AppState::cache_invalidate`'s doc.
+fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
+    if let Some(invalidate) = &state.cache_invalidate {
+        invalidate(&content_log_key(mnemonic));
+        // The witness file is served from the same cache, keyed the same
+        // way — `webvh/witness/publish` and rollback both change it.
+        invalidate(&content_witness_key(mnemonic));
+    }
+}
+
 /// Pulled out as a helper so `register_did_atomic` and `publish_did`
 /// can share the call without duplicating the ACL lookup.
 async fn check_did_host_safety(
@@ -485,16 +501,29 @@ pub async fn register_did_atomic(
         validate_mnemonic(path)?;
     }
 
+    // The slot's currently stored log and witness proofs, if any — a
+    // fresh registration has neither, a re-register of an existing slot
+    // (owner republishing through `did/register` rather than `did/publish`)
+    // has both. For webvh, `verify_publication` uses these to tell
+    // already-published entries (which must still meet their witness
+    // threshold, from the stored witness content) from the new tail this
+    // call is adding (exempt — its proofs arrive later via
+    // `webvh/witness/publish`). See `did_ops::verify_did_log_for_publish`.
+    let existing_log = state.dids_ks.get_raw(content_log_key(path)).await?;
+    let existing_witness = state.dids_ks.get_raw(content_witness_key(path)).await?;
+
     // Verify the publication with its own method's verifier, and reduce
     // it to the facts the shared tail below needs. For webvh this runs
-    // exactly the log-proof chain it always did; for webs it verifies
-    // the key event log and proves the stream establishes the AID this
-    // slot's identifier ends in.
+    // the full log-proof chain, enforcing the witness threshold on
+    // already-published entries only; for webs it verifies the key event
+    // log and proves the stream establishes the AID this slot's identifier
+    // ends in.
     let publication = did_hosting_common::method::publication::verify_publication(
         domain.unwrap_or_default(),
         path,
         did_log.as_bytes(),
-        None,
+        existing_log.as_deref(),
+        existing_witness.as_deref(),
     )
     .map_err(publication_error)?;
 
@@ -697,6 +726,7 @@ pub async fn register_did_atomic(
         batch.remove(&state.dids_ks, agent_name_key(&reg_domain, name));
     }
     batch.commit().await?;
+    invalidate_cached_content(state, path);
 
     // Same rationale as `publish_did`: the atomic register path commits
     // a new log entry, so it must advance the update counters when the
@@ -779,17 +809,25 @@ async fn prepare_republish(
     }
 
     // Verify with the publishing method's own verifier. For webvh this
-    // is the didwebvh-rs chain walk it always was; for webs it verifies
-    // the key event log and refuses an update that rewinds or forks it.
+    // walks the full chain, enforcing the witness threshold on
+    // already-published entries only (the new tail's proofs arrive later
+    // via `webvh/witness/publish` — see
+    // `did_ops::verify_did_log_for_publish`); for webs it verifies the key
+    // event log and refuses an update that rewinds or forks it.
     let existing = state
         .dids_ks
         .get_raw(content_log_key(mnemonic).as_str())
+        .await?;
+    let existing_witness = state
+        .dids_ks
+        .get_raw(content_witness_key(mnemonic).as_str())
         .await?;
     let publication = did_hosting_common::method::publication::verify_publication(
         &record.domain,
         mnemonic,
         did_log.as_bytes(),
         existing.as_deref(),
+        existing_witness.as_deref(),
     )
     .map_err(publication_error)?;
 
@@ -1081,6 +1119,7 @@ pub async fn publish_did(
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
     // last_updated_at advance when the control plane is the authoritative
@@ -1359,35 +1398,71 @@ pub async fn upload_witness(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
-    witness_content: &str,
+    witness_entry: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     use did_hosting_common::server::error::ValidationKind;
-    if witness_content.is_empty() {
-        return Err(AppError::validation(
-            ValidationKind::InvalidWitness,
-            "did-witness.json content cannot be empty",
-        ));
-    }
 
-    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
+    // `webvh/witness/publish`'s `witness` member is one witness's proof for
+    // one version — `{versionId, witness, proof}` — not the did-witness.json
+    // file shape (`[{versionId, proof: [...]}, ...]`, one entry per version,
+    // each aggregating every witness's proof for it). Extract the two fields
+    // the stored file needs; `witness` (which witness signed) travels inside
+    // `proof.verificationMethod` already and is not stored separately.
+    let version_id = witness_entry
+        .get("versionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::validation(
+                ValidationKind::InvalidWitness,
+                "witness object must have a string \"versionId\"",
+            )
+        })?
+        .to_string();
+    let proof = witness_entry.get("proof").cloned().ok_or_else(|| {
         AppError::validation(
             ValidationKind::InvalidWitness,
-            format!("did-witness.json must be valid JSON: {e}"),
+            "witness object must have a \"proof\"",
         )
     })?;
 
+    // Merge into the existing file rather than overwrite it: a threshold
+    // greater than one needs more than one witness's proof recorded per
+    // version, and earlier versions' entries must survive a later
+    // publish. An existing blob this control plane cannot parse is
+    // replaced rather than left to wedge every future publish — the
+    // resolver-side threshold check is what actually gates serving, so
+    // losing a corrupt blob costs nothing that mattered.
+    let existing = state.dids_ks.get_raw(content_witness_key(mnemonic)).await?;
+    let mut entries: Vec<serde_json::Value> = existing
+        .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
+        .unwrap_or_default();
+
+    match entries
+        .iter_mut()
+        .find(|e| e.get("versionId").and_then(|v| v.as_str()) == Some(version_id.as_str()))
+    {
+        Some(entry) => match entry.get_mut("proof").and_then(|p| p.as_array_mut()) {
+            Some(proofs) => proofs.push(proof),
+            None => {
+                entry["proof"] = serde_json::json!([proof]);
+            }
+        },
+        None => entries.push(serde_json::json!({ "versionId": version_id, "proof": [proof] })),
+    }
+
+    let witness_content = serde_json::to_string(&entries)
+        .map_err(|e| AppError::Internal(format!("failed to serialise did-witness.json: {e}")))?;
+
     state
         .dids_ks
-        .insert_raw(
-            content_witness_key(mnemonic),
-            witness_content.as_bytes().to_vec(),
-        )
+        .insert_raw(content_witness_key(mnemonic), witness_content.into_bytes())
         .await?;
+    invalidate_cached_content(state, mnemonic);
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "did-witness.json uploaded on control plane");
+    info!(did = %auth.did, mnemonic = %mnemonic, %version_id, "did-witness.json uploaded on control plane");
 
     Ok(())
 }
@@ -1716,6 +1791,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
@@ -1818,6 +1894,7 @@ pub async fn set_did_disabled(
     }
     record.disabled = disabled;
     state.dids_ks.insert(did_key(mnemonic), &record).await?;
+    invalidate_cached_content(state, mnemonic);
     info!(
         did = %auth.did,
         mnemonic = %mnemonic,
@@ -1915,6 +1992,7 @@ pub async fn rollback_did_to(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     let log_metadata = Some(extract_log_metadata(&truncated));
 
@@ -2397,6 +2475,7 @@ mod tests_atomic {
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: None,
         };
 
         (state, dir)
@@ -2466,6 +2545,81 @@ mod tests_atomic {
 
         let owner_idx = state.dids_ks.get_raw(owner_key(owner, path)).await.unwrap();
         assert!(owner_idx.is_some(), "owner index must be written");
+    }
+
+    /// The unified daemon's mutations (register, publish, disable, delete —
+    /// rollback follows the identical one-line `invalidate_cached_content`
+    /// call) must evict the embedded server's resolved-content cache in the
+    /// same process, since there is no `webvh/sync/*` round-trip within a
+    /// single process to do it the way a standalone edge does. A standalone
+    /// control plane leaves `cache_invalidate: None` and none of these calls
+    /// panic or otherwise misbehave without a hook installed.
+    #[tokio::test]
+    async fn mutations_call_the_cache_invalidate_hook_when_one_is_installed() {
+        let (mut state, _dir) = test_state().await;
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        state.cache_invalidate = Some(Arc::new(move |key: &str| {
+            recorded.lock().unwrap().push(key.to_string());
+        }));
+
+        let owner = "did:example:owner";
+        let path = "cache-hook";
+        let did_log = build_test_did_log("scid-cache-hook", "control.test", path).await;
+        let expected_log_key = content_log_key(path);
+        let expected_witness_key = content_witness_key(path);
+        // Every mutation invalidates both the log and the witness cache
+        // entries — the same `serve_content` serves each, keyed the same
+        // way.
+        let count_of = |calls: &[String], key: &str| calls.iter().filter(|k| *k == key).count();
+
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(count_of(&calls, &expected_log_key), 1, "register: log key");
+            assert_eq!(
+                count_of(&calls, &expected_witness_key),
+                1,
+                "register: witness key"
+            );
+        }
+
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+            .await
+            .expect("publish");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            2,
+            "publish must invalidate too"
+        );
+
+        set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            3,
+            "disable must invalidate too"
+        );
+
+        delete_did(&owner_auth(owner), &state, path, None)
+            .await
+            .expect("delete");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            4,
+            "delete must invalidate too"
+        );
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|k| *k == expected_log_key || *k == expected_witness_key),
+            "every call must invalidate this mnemonic's own content keys"
+        );
     }
 
     /// Same owner re-registering: idempotent path. Slot stays owned by the

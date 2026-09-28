@@ -131,6 +131,7 @@ async fn make_harness() -> Harness {
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        cache_invalidate: None,
     };
 
     Harness { state, _dir: dir }
