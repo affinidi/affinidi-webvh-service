@@ -743,6 +743,61 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Apply `<var_prefix>_*` environment overrides to a [`StoreConfig`].
+///
+/// `var_prefix` is the full variable prefix including the store namespace, e.g.
+/// `"WEBVH_STORE"` for the main store or `"DAEMON_WITNESS_STORE"` for the
+/// daemon's witness store. Recognised suffixes: `DATA_DIR`, `REDIS_URL`,
+/// `DYNAMODB_TABLE_PREFIX`, `DYNAMODB_REGION`, `DYNAMODB_TABLE_NAME`,
+/// `FIRESTORE_PROJECT`, `FIRESTORE_DATABASE`, `COSMOSDB_CONNECTION_STRING`,
+/// `COSMOSDB_DATABASE`, `COSMOSDB_REGION`.
+pub fn apply_store_env_overrides(var_prefix: &str, store: &mut StoreConfig) {
+    macro_rules! env_opt {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = Some(v);
+            }
+        };
+    }
+
+    if let Ok(data_dir) = std::env::var(format!("{var_prefix}_DATA_DIR")) {
+        store.data_dir = PathBuf::from(data_dir);
+    }
+    env_opt!(format!("{var_prefix}_REDIS_URL"), store.redis_url);
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_TABLE_PREFIX"),
+        store.dynamodb_table_prefix
+    );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_REGION"),
+        store.dynamodb_region
+    );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_TABLE_NAME"),
+        store.dynamodb_table_name
+    );
+    env_opt!(
+        format!("{var_prefix}_FIRESTORE_PROJECT"),
+        store.firestore_project
+    );
+    env_opt!(
+        format!("{var_prefix}_FIRESTORE_DATABASE"),
+        store.firestore_database
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_CONNECTION_STRING"),
+        store.cosmosdb_connection_string
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_DATABASE"),
+        store.cosmosdb_database
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_REGION"),
+        store.cosmosdb_region
+    );
+}
+
 /// Apply environment variable overrides to shared config fields.
 ///
 /// Call this from your application's `AppConfig::load()` after deserializing the
@@ -817,43 +872,7 @@ pub fn apply_env_overrides(
     }
 
     // Store
-    let store_data_dir_var = format!("{prefix}_STORE_DATA_DIR");
-    if let Ok(data_dir) = std::env::var(&store_data_dir_var) {
-        store.data_dir = PathBuf::from(data_dir);
-    }
-    env_opt!(&format!("{prefix}_STORE_REDIS_URL"), store.redis_url);
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_TABLE_PREFIX"),
-        store.dynamodb_table_prefix
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_REGION"),
-        store.dynamodb_region
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_TABLE_NAME"),
-        store.dynamodb_table_name
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
-        store.firestore_project
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_DATABASE"),
-        store.firestore_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_CONNECTION_STRING"),
-        store.cosmosdb_connection_string
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
-        store.cosmosdb_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_REGION"),
-        store.cosmosdb_region
-    );
+    apply_store_env_overrides(&format!("{prefix}_STORE"), store);
 
     // Auth
     env_parse!(
@@ -1007,6 +1026,39 @@ pub fn init_tracing(log: &LogConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_env_overrides_apply_dynamodb_single_fields() {
+        // Unique prefix so parallel tests never observe these vars.
+        let p = "TEST_STORE_ENV_A";
+        // SAFETY: unique prefix, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{p}_DYNAMODB_TABLE_NAME"), "tbl");
+            std::env::set_var(format!("{p}_DYNAMODB_REGION"), "eu-west-1");
+            std::env::set_var(format!("{p}_DATA_DIR"), "/tmp/x");
+        }
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("tbl"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(store.data_dir, PathBuf::from("/tmp/x"));
+        assert!(store.redis_url.is_none());
+        unsafe {
+            std::env::remove_var(format!("{p}_DYNAMODB_TABLE_NAME"));
+            std::env::remove_var(format!("{p}_DYNAMODB_REGION"));
+            std::env::remove_var(format!("{p}_DATA_DIR"));
+        }
+    }
+
+    #[test]
+    fn store_env_overrides_leave_config_untouched_when_unset() {
+        let mut store = StoreConfig {
+            dynamodb_table_name: Some("keep".into()),
+            ..StoreConfig::default()
+        };
+        apply_store_env_overrides("TEST_STORE_ENV_UNSET", &mut store);
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("keep"));
+    }
 
     #[test]
     fn agent_names_default_on_for_absent_and_empty_config() {

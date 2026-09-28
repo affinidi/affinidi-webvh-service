@@ -119,6 +119,9 @@ enum Command {
     /// Run health check diagnostics
     Health,
     /// Add an ACL entry
+    ///
+    /// Without `--url`/`--token` this opens the store directly. With both, it
+    /// calls the running service's REST API instead.
     AddAcl {
         /// DID to add to the ACL
         #[arg(long)]
@@ -129,9 +132,28 @@ enum Command {
         /// Optional label
         #[arg(long)]
         label: Option<String>,
+        /// Per-account max total DID document size in bytes
+        #[arg(long)]
+        max_total_size: Option<u64>,
+        /// Per-account max number of DIDs
+        #[arg(long)]
+        max_did_count: Option<u64>,
+        /// Base URL of a running service (live API mode)
+        #[arg(long, requires = "token")]
+        url: Option<String>,
+        /// Admin bearer token (JWT) for live API mode
+        #[arg(long, requires = "url")]
+        token: Option<String>,
     },
     /// List all ACL entries
-    ListAcl,
+    ListAcl {
+        /// Base URL of a running service (live API mode)
+        #[arg(long, requires = "token")]
+        url: Option<String>,
+        /// Admin bearer token (JWT) for live API mode
+        #[arg(long, requires = "url")]
+        token: Option<String>,
+    },
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
     /// Rotate the service's own key-agreement key.
@@ -184,6 +206,12 @@ enum Command {
         /// DID to remove from the ACL
         #[arg(long)]
         did: String,
+        /// Base URL of a running service (live API mode)
+        #[arg(long, requires = "token")]
+        url: Option<String>,
+        /// Admin bearer token (JWT) for live API mode
+        #[arg(long, requires = "url")]
+        token: Option<String>,
     },
     /// Create a passkey enrollment invite
     Invite {
@@ -368,14 +396,32 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::AddAcl { did, role, label }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role, label).await {
+        Some(Command::AddAcl {
+            did,
+            role,
+            label,
+            max_total_size,
+            max_did_count,
+            url,
+            token,
+        }) => {
+            if let Err(e) = run_add_acl(
+                cli.config,
+                did,
+                role,
+                label,
+                max_total_size,
+                max_did_count,
+                url.zip(token),
+            )
+            .await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
+        Some(Command::ListAcl { url, token }) => {
+            if let Err(e) = run_list_acl(cli.config, url.zip(token)).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -405,8 +451,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
+        Some(Command::RemoveAcl { did, url, token }) => {
+            if let Err(e) = run_remove_acl(cli.config, did, url.zip(token)).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1493,7 +1539,7 @@ async fn daemon_fallback(
     #[cfg(not(feature = "ui"))]
     {
         let _ = uri;
-        StatusCode::NOT_FOUND.into_response()
+        axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND)
     }
 }
 
@@ -1531,25 +1577,49 @@ async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
 // CLI management commands
 // ===========================================================================
 
+/// Live-API target for the ACL commands: `(base_url, bearer_token)`.
+type LiveApi = Option<(String, String)>;
+
 async fn run_add_acl(
     config_path: Option<PathBuf>,
     did: String,
     role_str: String,
     label: Option<String>,
+    max_total_size: Option<u64>,
+    max_did_count: Option<u64>,
+    live: LiveApi,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((url, token)) = live {
+        return did_hosting_common::server::cli_acl_http::api_add_acl(
+            &url,
+            &token,
+            did,
+            role_str,
+            label,
+            max_total_size,
+            max_did_count,
+        )
+        .await;
+    }
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_add_acl(
         &config.store,
         did,
         role_str,
         label,
-        None,
-        None,
+        max_total_size,
+        max_did_count,
     )
     .await
 }
 
-async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list_acl(
+    config_path: Option<PathBuf>,
+    live: LiveApi,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((url, token)) = live {
+        return did_hosting_common::server::cli_acl_http::api_list_acl(&url, &token).await;
+    }
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
 }
@@ -1557,7 +1627,11 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
 async fn run_remove_acl(
     config_path: Option<PathBuf>,
     did: String,
+    live: LiveApi,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((url, token)) = live {
+        return did_hosting_common::server::cli_acl_http::api_remove_acl(&url, &token, &did).await;
+    }
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }

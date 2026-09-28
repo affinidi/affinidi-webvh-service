@@ -180,6 +180,15 @@ impl DaemonConfig {
             config.log.level = v;
         }
 
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_STORE",
+            &mut config.store,
+        );
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_WITNESS_STORE",
+            &mut config.witness_store,
+        );
+
         // Normalize
         if let Some(ref mut url) = config.public_url {
             *url = url.trim_end_matches('/').to_string();

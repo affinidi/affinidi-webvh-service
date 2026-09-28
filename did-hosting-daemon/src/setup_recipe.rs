@@ -205,6 +205,25 @@ pub async fn apply_recipe(
         .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Daemon));
     let store_path = data_dir_root.join("store");
     let witness_store_path = data_dir_root.join("witness");
+    // Honour `DAEMON_STORE_*` / `DAEMON_WITNESS_STORE_*` so setup opens (and
+    // records in config.toml) the same backend the runtime will use, e.g. a
+    // pre-provisioned DynamoDB single table.
+    let mut store_config = StoreConfig {
+        data_dir: store_path,
+        ..StoreConfig::default()
+    };
+    did_hosting_common::server::config::apply_store_env_overrides(
+        "DAEMON_STORE",
+        &mut store_config,
+    );
+    let mut witness_store_config = StoreConfig {
+        data_dir: witness_store_path,
+        ..StoreConfig::default()
+    };
+    did_hosting_common::server::config::apply_store_env_overrides(
+        "DAEMON_WITNESS_STORE",
+        &mut witness_store_config,
+    );
 
     let enable = EnableConfig {
         control: recipe.daemon.enable_control.unwrap_or(true),
@@ -241,14 +260,8 @@ pub async fn apply_recipe(
         mediator_did: recipe.identity.mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store: store_config,
+        witness_store: witness_store_config,
         limits: did_hosting_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig {

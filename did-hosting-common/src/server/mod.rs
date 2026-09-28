@@ -3,6 +3,7 @@ pub mod assignment;
 pub mod assignment_seed;
 pub mod auth;
 pub mod cli_acl;
+pub mod cli_acl_http;
 pub mod cli_identity;
 pub mod config;
 pub mod didcomm_profile;
