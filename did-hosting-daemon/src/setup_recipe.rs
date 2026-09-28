@@ -256,7 +256,6 @@ pub async fn apply_recipe(
             did: vta_did_persisted,
             context_id: None,
         },
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features,
         identity: IdentityConfig {

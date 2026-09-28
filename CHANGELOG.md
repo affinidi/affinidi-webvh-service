@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Breaking — the watcher is Trust Tasks only, with its own DID
+
+- **Its own DID.** webvh-watcher is provisioned from a VTA context like the
+  other services (`setup`, interactive or `--from <recipe>` in any VTA mode).
+  Its keys and context credential live in the secrets backend.
+- **One listener.** It serves `webvh/sync/update/0.2`, `webvh/sync/delete/0.2`
+  and `webvh/sync/batch/0.1` on TSP, DIDComm and `POST /api/trust-tasks`.
+  - Only a document signed by one of `sync.source_dids` is applied. A document
+    that does not verify gets no reply. A verified one from any other DID gets
+    a signed `notAuthorized` and takes no room in the replay cache.
+  - Logs are verified as an edge verifies them: the chain and witness proofs,
+    the slot, `versionCount`, and strict extension of the held log and a
+    per-DID high-water mark that a delete keeps.
+- **Removed:** `/api/sync/did`, `/api/sync/delete`, `push_tokens`,
+  `sync.sources`, `sync.reconcile_interval`, and the REST sync wire types. The
+  recipe's `[watcher]` section is now just `source_dids`. The daemon's
+  `watcher_sync` is gone, and its embedded watcher serves resolution only.
+- **Control plane fan-out.** A new `[[registry.watchers]]` maps watcher URLs
+  to DIDs. A published DID is queued for every mapped watcher its log's
+  `watchers` parameter names, and a deleted one for every mapped watcher. It
+  goes through the outbox, with the same delivery, retry and signed
+  acknowledgement as edges. A mapped watcher's DID may acknowledge those
+  syncs and nothing else.
+
 ### Breaking — the witness is Trust Tasks only
 
 webvh-witness serves `webvh/witness/key/create|list|delete/0.1`,
@@ -27,6 +51,51 @@ mediator connection) and `POST /api/trust-tasks`, through one dispatch.
   log, signed by the new DID, and stores a well-formed `did-witness.json`.
 - In the daemon, the embedded witness is reached at
   `POST /witness/api/trust-tasks`.
+
+### Added — offline commands to list, reset and delete TSP relationships
+
+`did-hosting-daemon`, `did-hosting-control` and `did-hosting-server` gain
+`tsp-relationship-list`, `tsp-relationship-reset --peer <did>` and
+`tsp-relationship-delete --peer <did> | --all [--yes]`. Relationship state is
+per endpoint and persisted, so neither restarting the service nor wiping the
+mediator clears it; making two nodes meet as strangers again means clearing
+both halves, and until now there was no way to clear this one. Reset puts our
+half back to `None` (what the SDK does after a reply timeout) so the next send
+re-invites; delete removes the whole record. `--all` covers half-formed
+relationships the store cannot enumerate, and only reports without `--yes`.
+The commands open the store directly, so stop the service first. Shared as
+`server::cli_tsp`.
+
+The keyspace behind the durable relationship store now implements
+`scan_prefix`. It did not, and the trait's default yields nothing, so the SDK's
+enumerating operations (`established_relationships`, `evict_idle`) would have
+seen an empty store. Nothing here called them before; `tsp-relationship-list`
+does.
+
+### Fixed — a wallet proxy login no longer raises an approval popup per request
+
+The console signs every Trust Task it sends. A proxy login (the VTA mints the
+persona's `id_token`) bound no session key, so each call was signed through
+the wallet's `signTrustTask` — which asks the human every time, by design —
+and a page load fired several at once: an endless stack of approval windows.
+The proxy login now binds a fresh session key the way a holder login does,
+sending it as `session_pubkey_b58btc` beside the `id_token` on `POST
+/api/auth/`, and the console signs with it: one approval, at sign-in. The
+route already bound a key it was given; a test now pins that it does.
+
+- **Every route that binds a session key now decodes it.** `/api/auth/` and
+  the REST passkey `login/finish` accepted anything starting `z6Mk`, so a
+  value that only looked like an Ed25519 multikey was stored and every proof
+  it later signed refused. Both now apply the decode `auth/authenticate/0.2`
+  uses for `sessionKey`, shared as
+  `server::auth::session::is_ed25519_multikey`. The passkey route's log line
+  also sliced the refused value by byte, which panicked on a non-ASCII one.
+- **A lost session key ends the session.** A wallet session whose key this
+  browser no longer holds used to fall back to the wallet's `signTrustTask`
+  silently — changing what each request rested on without saying so, and
+  bringing back the popup per request. Every login now binds a key, so the
+  console treats a wallet session like a passkey one: sign in again. The
+  `asDid` principal hint that fallback read is gone with it.
 
 ### Added — wallet logins bind a session key (`auth/authenticate/0.2`)
 

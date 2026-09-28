@@ -48,10 +48,6 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub vta: did_hosting_common::server::config::VtaConfig,
 
-    // Watcher-specific
-    #[serde(default)]
-    pub watcher_sync: webvh_watcher::config::SyncConfig,
-
     // Control-specific
     #[serde(default)]
     pub registry: did_hosting_control::config::RegistryConfig,
@@ -252,11 +248,19 @@ impl DaemonConfig {
     /// Build a webvh-watcher AppConfig from the daemon config.
     pub fn watcher_config(&self) -> webvh_watcher::config::AppConfig {
         webvh_watcher::config::AppConfig {
+            // The embedded watcher serves resolution only: it has no DID and
+            // no listener of its own (see `build_watcher`).
+            features: self.features_config(),
+            server_did: None,
+            mediator_did: None,
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
             fjall: self.fjall,
-            sync: self.watcher_sync.clone(),
+            secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
+            identity: self.identity.clone(),
+            sync: Default::default(),
             config_path: self.config_path.clone(),
         }
     }

@@ -134,6 +134,39 @@ enum Command {
     ListAcl,
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
+    /// List this service's established TSP relationships (offline; stop the
+    /// service first).
+    ///
+    /// Each endpoint keeps its own half of every relationship; the mediator holds
+    /// none, so resetting a peer pairing means clearing both ends.
+    TspRelationshipList,
+    /// Reset our half of a TSP relationship to `None`, so the next send to the
+    /// peer re-invites (offline). Keeps the cached peer capability.
+    TspRelationshipReset {
+        /// The peer's DID (its TSP VID).
+        #[arg(long)]
+        peer: String,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long)]
+        our: Option<String>,
+    },
+    /// Delete TSP relationship records outright (offline).
+    TspRelationshipDelete {
+        /// The peer's DID (its TSP VID).
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        peer: Option<String>,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long, requires = "peer", conflicts_with = "all")]
+        our: Option<String>,
+        /// Delete every record, established or half-formed.
+        #[arg(long)]
+        all: bool,
+        /// Confirm `--all`. Without it, only reports what would be deleted.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Rotate the service's own key-agreement key.
     ///
     /// Publishes a new DID log entry installing a fresh key-agreement key on a
@@ -395,6 +428,29 @@ async fn main() {
             if let Err(e) =
                 run_identity_rotate_keys(cli.config, keys, ka_key, signing_key, grace).await
             {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipList) => {
+            if let Err(e) = run_tsp_relationship_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipReset { peer, our }) => {
+            if let Err(e) = run_tsp_relationship_reset(cli.config, peer, our).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipDelete {
+            peer,
+            our,
+            all,
+            yes,
+        }) => {
+            if let Err(e) = run_tsp_relationship_delete(cli.config, peer, our, all, yes).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1293,17 +1349,13 @@ async fn build_witness(
 async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
-    let watcher_config = config.watcher_config();
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let state = AppState {
-        store: store.clone(),
-        dids_ks,
-        config: Arc::new(watcher_config),
-    };
-
-    let router = webvh_watcher::routes::router().with_state(state);
-    info!("watcher service initialized");
+    // Resolution only. The embedded watcher reads the daemon's one store, and
+    // it has no DID of its own, so it runs no Trust Task listener: nothing is
+    // ever synced into it. A watcher that mirrors control planes is a
+    // standalone `webvh-watcher` with its own DID.
+    let state = AppState::new(store.clone(), config.watcher_config(), None)?;
+    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
 }
@@ -2231,6 +2283,39 @@ async fn run_remove_did(
 }
 
 /// `identity-list` — show which key material this service still honours.
+async fn run_tsp_relationship_list(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    did_hosting_common::server::cli_tsp::run_list(&config.store).await
+}
+
+async fn run_tsp_relationship_reset(
+    config_path: Option<PathBuf>,
+    peer: String,
+    our: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_reset};
+    let config = DaemonConfig::load(config_path)?;
+    run_reset(&config.store, Target::Peer { peer, our }).await
+}
+
+async fn run_tsp_relationship_delete(
+    config_path: Option<PathBuf>,
+    peer: Option<String>,
+    our: Option<String>,
+    all: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_delete};
+    let config = DaemonConfig::load(config_path)?;
+    let target = match peer {
+        Some(peer) if !all => Target::Peer { peer, our },
+        _ => Target::All,
+    };
+    run_delete(&config.store, target, yes).await
+}
+
 async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_identity::run_list_generations(&config.store).await

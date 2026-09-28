@@ -17,15 +17,9 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
             health::check_config_loaded(&c.config_path);
             let listen = format!("{}:{}", c.server.host, c.server.port);
             health::pass(&format!("Listen address: {listen}"));
-            health::info_msg(&format!("Sync sources: {}", c.sync.sources.len()));
-            if c.sync.reconcile_interval > 0 {
-                health::info_msg(&format!(
-                    "Reconcile interval: {}s",
-                    c.sync.reconcile_interval
-                ));
-            } else {
-                health::info_msg("Reconcile interval: disabled");
-            }
+            health::check_value("server_did", &c.server_did);
+            health::check_value("mediator_did", &c.mediator_did);
+            health::info_msg(&format!("Sync sources: {}", c.sync.source_dids.len()));
             Some(c)
         }
         Err(e) => {
@@ -51,9 +45,18 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
         }
     };
 
+    // ── Secrets ────────────────────────────────────────────────────
+    health::section("Secrets");
+    health::check_secrets(&config.secrets, &config.config_path).await;
+
     // ── Store ──────────────────────────────────────────────────────
     health::section("Store");
     health::check_store(&config.store).await;
+
+    if let Some(ref did) = config.server_did {
+        health::section("DID Resolution");
+        health::check_did_resolution("Watcher DID resolves", did).await;
+    }
 
     eprintln!();
     Ok(())

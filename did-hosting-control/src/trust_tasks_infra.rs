@@ -212,10 +212,15 @@ pub(crate) async fn acknowledge_outbox(
     let Some(thread) = thread else {
         return;
     };
-    if !matches!(
-        crate::acl::check_acl(&state.acl_ks, sender).await,
-        Ok(crate::acl::Role::Service)
-    ) {
+    // A registered Service settles what it was sent; so does a configured
+    // watcher (see `server_push::is_configured_watcher`). The outbox only ever
+    // settles an entry on its own target's signature either way.
+    if !crate::server_push::is_configured_watcher(state, sender)
+        && !matches!(
+            crate::acl::check_acl(&state.acl_ks, sender).await,
+            Ok(crate::acl::Role::Service)
+        )
+    {
         warn!(sender, "acknowledgement ignored: Service role required");
         return;
     }

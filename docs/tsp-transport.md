@@ -255,6 +255,27 @@ those ops are bound to the control plane's `AppState` and can't move into
 the crate-agnostic framework dispatcher without lifting `AppState` behind
 a context abstraction — a larger refactor with no behavioural change.
 
+## Clearing relationship state
+
+Each node persists its half of every TSP relationship (`tsp_relationships`
+keyspace, `server::tsp_relationship_store`), so restarting it — or wiping the
+mediator, which holds no relationship state at all — changes nothing. To inspect
+or clear it, stop the service and use the offline commands on any of the three
+binaries:
+
+```
+did-hosting-daemon tsp-relationship-list
+did-hosting-daemon tsp-relationship-reset  --peer <did>            # our half -> None; next send re-invites
+did-hosting-daemon tsp-relationship-delete --peer <did>            # remove the whole record
+did-hosting-daemon tsp-relationship-delete --all [--yes]           # every record, half-formed ones too
+```
+
+A clean first contact needs both halves gone: the peer has its own equivalent
+(`vta tsp-relationships …` on a VTA). Clearing only one side is also a valid
+test — the peer's next send is dropped by this node's §7.2.2 gate (logged
+`Failed to unpack TSP frame … no relationship`) until the peer's reply-timeout
+recovery re-invites.
+
 ## Scope
 
 - **Inbound request/response over TSP**: fully supported — the handler's

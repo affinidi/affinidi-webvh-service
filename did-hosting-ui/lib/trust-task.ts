@@ -20,8 +20,6 @@
 import { ApiError, request } from "./http";
 import {
   clearToken,
-  getAuthMethod,
-  getSessionPrincipalDid,
   getSessionSubjectDid,
 } from "./session";
 import {
@@ -406,13 +404,6 @@ export interface TrustTaskOptions {
   anonymous?: boolean;
 }
 
-interface WalletSigner {
-  signTrustTask: (p: {
-    envelope: Record<string, unknown>;
-    asDid?: string;
-  }) => Promise<{ signedEnvelope: Record<string, unknown> }>;
-}
-
 /** Attach the proof `signer` calls for, setting `issuer` to match. */
 async function sign(
   doc: TrustTaskDocument<unknown>,
@@ -435,49 +426,21 @@ async function sign(
   }
   doc.issuer = subject;
 
-  if (getAuthMethod() === "wallet") {
-    // A wallet holder login bound this browser's session key
-    // (`auth/authenticate/0.2`), so the key signs, with no wallet prompt.
-    // The control plane accepts it as the subject for this session only.
-    // A step-up is not signed here: it goes to the wallet (`stepUpVta`).
-    if (!hasSessionKeypair()) {
-      await restoreSessionKeypair();
-    }
-    if (hasSessionKeypair()) {
-      await signEnvelope(doc as unknown as Record<string, unknown>);
-      return doc;
-    }
-    // No bound key: a proxy login, which binds none, or a key this browser
-    // no longer holds. The wallet signs. A holder login's session is the
-    // wallet's own DID, so it signs as itself; a proxy login's session is a
-    // vault entry's principal, whose key lives at the VTA, so the wallet asks
-    // the VTA to sign as that DID (`asDid`). Without it the proof would name
-    // the holder and the control plane would refuse it as not the
-    // authenticated caller.
-    const wallet =
-      typeof window !== "undefined"
-        ? (window as unknown as { vtaWallet?: WalletSigner }).vtaWallet
-        : undefined;
-    if (!wallet?.signTrustTask) {
-      throw new ApiError(
-        401,
-        "Wallet-authenticated session but the VTA Wallet extension is not available to sign. Re-install the extension or log out + back in with passkey.",
-      );
-    }
-    const principal = getSessionPrincipalDid();
-    const signed = await wallet.signTrustTask({
-      envelope: doc as unknown as Record<string, unknown>,
-      ...(principal ? { asDid: principal } : {}),
-    });
-    // The wallet returns the document with `proof` added; every other member
-    // must be byte-identical, or the control plane's JCS hash will not match.
-    return signed.signedEnvelope as unknown as TrustTaskDocument<unknown>;
-  }
-
-  // Passkey login: the session key the login bound to this session. Restored
-  // from IndexedDB after a reload. There is deliberately no fallback to a new
-  // key — the control plane would refuse its proof, and the user must sign in
-  // again.
+  // Every login binds this browser's session key to its session — passkey
+  // through `auth/passkey/login/finish`, a wallet holder login through
+  // `auth/authenticate/0.2`, a wallet proxy login through
+  // `session_pubkey_b58btc` on `/auth/` — and the control plane accepts it as
+  // the subject for that session only. It signs every call, with no wallet
+  // prompt. A step-up is not signed here: it goes to the wallet (`stepUpVta`).
+  //
+  // The key is restored from IndexedDB after a reload. When it is gone, the
+  // session ends and the user signs in again. There is deliberately no
+  // fallback — not to a new key, which the control plane would refuse, and
+  // not to the wallet's `signTrustTask`: that prompts for every call, so a
+  // silent switch to it changes what each request rests on without saying
+  // so, and turns every page load into a stack of approval windows. One
+  // sign-in is the honest signal; a stream of prompts trains people to click
+  // Approve.
   if (!hasSessionKeypair()) {
     await restoreSessionKeypair();
   }

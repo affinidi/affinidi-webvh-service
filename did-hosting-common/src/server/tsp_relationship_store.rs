@@ -79,6 +79,31 @@ impl RelationshipKv for KeyspaceRelationshipKv {
     async fn delete(&self, key: &[u8]) -> Result<(), ATMError> {
         self.ks.remove(key.to_vec()).await.map_err(to_atm)
     }
+
+    /// Without this the SDK's enumerating operations — `established_relationships`
+    /// (the startup reconcile) and `evict_idle` — see an empty store and silently
+    /// do nothing, because the trait's default yields no entries.
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ATMError> {
+        self.ks
+            .prefix_iter_raw(prefix.to_vec())
+            .await
+            .map_err(to_atm)
+    }
+}
+
+/// The concrete durable store, for callers that need the
+/// [`PersistentRelationshipStore`] extensions (`forget`, `last_active`,
+/// `established_relationships`) rather than the bare trait object.
+pub type KeyspaceRelationshipStore = PersistentRelationshipStore<KeyspaceRelationshipKv>;
+
+/// Open the [`KS_TSP_RELATIONSHIPS`] keyspace as a concrete
+/// [`KeyspaceRelationshipStore`] — the offline CLI's view of the same records
+/// [`build_relationship_store`] hands the messaging service.
+pub fn open_relationship_store(store: &Store) -> Result<KeyspaceRelationshipStore, AppError> {
+    let ks = store.keyspace(KS_TSP_RELATIONSHIPS)?;
+    Ok(PersistentRelationshipStore::new(
+        KeyspaceRelationshipKv::new(ks),
+    ))
 }
 
 /// Build the durable TSP relationship store to inject into the messaging
@@ -91,9 +116,7 @@ impl RelationshipKv for KeyspaceRelationshipKv {
 /// directly — the persistent wrapper already does, and re-deriving its key
 /// layout here would risk divergence from the SDK.
 pub fn build_relationship_store(store: &Store) -> Result<Arc<dyn RelationshipStore>, AppError> {
-    let ks = store.keyspace(KS_TSP_RELATIONSHIPS)?;
-    let kv = KeyspaceRelationshipKv::new(ks);
-    Ok(Arc::new(PersistentRelationshipStore::new(kv)))
+    Ok(Arc::new(open_relationship_store(store)?))
 }
 
 #[cfg(all(test, feature = "store-fjall"))]

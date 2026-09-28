@@ -270,7 +270,6 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | Path | Description |
 | ---- | ----------- |
 | `/watcher/api/health` | Watcher health |
-| `/watcher/api/sync/*` | Server → watcher sync endpoints |
 | `/watcher/{mnemonic}/did.jsonl` | Mirrored public DID resolution |
 
 ### Daemon
