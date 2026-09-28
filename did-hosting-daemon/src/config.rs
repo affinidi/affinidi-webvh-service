@@ -35,8 +35,6 @@ pub struct DaemonConfig {
     // Server-specific
     #[serde(default)]
     pub limits: did_hosting_server::config::LimitsConfig,
-    #[serde(default)]
-    pub watchers: Vec<did_hosting_server::config::WatcherEndpoint>,
 
     // Witness-specific
     #[serde(default)]
@@ -205,8 +203,6 @@ impl DaemonConfig {
             hosting: self.hosting.clone(),
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
-            watchers: self.watchers.clone(),
-            control_url: None,
             control_did: None,
             vta: self.vta.clone(),
             stats: did_hosting_server::config::StatsConfig::default(),

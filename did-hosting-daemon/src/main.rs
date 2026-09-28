@@ -822,16 +822,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
-        match build_server(
-            &config,
-            &secrets,
-            &main_store,
-            &stats_collector,
-            &http_client,
-            identity.clone(),
-        )
-        .await
-        {
+        match build_server(&config, &main_store, &stats_collector, identity.clone()).await {
             Ok((router, state)) => {
                 combined = combined.merge(router);
                 server_state = Some(state);
@@ -1249,58 +1240,21 @@ type ServiceResult = Result<Router, AppError>;
 /// control plane, which is merged at root.
 async fn build_server(
     config: &DaemonConfig,
-    secrets: &ServerSecrets,
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
-    http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
 ) -> Result<(Router, did_hosting_server::server::AppState), AppError> {
     use did_hosting_server::server::AppState;
 
     let server_config = config.server_config();
 
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-    let jwt_keys = init::init_jwt_keys(secrets);
-    let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
-
-    let (parsed_cidrs, bad_cidrs) = did_hosting_common::server::domain::parse_trusted_cidrs(
-        &server_config.server.trusted_proxy_cidrs,
-    );
-    if !bad_cidrs.is_empty() {
-        warn!(
-            bad_cidrs = ?bad_cidrs,
-            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
-        );
-    }
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        dids_ks,
-        config: Arc::new(server_config),
-        trust_tasks_verifier: did_hosting_server::messaging::build_verifier(did_resolver.as_ref()),
-        did_resolver,
-        secrets_resolver,
-        identity,
-        // The daemon's embedded server does not run its own DIDComm listener —
-        // the control plane's handles the full protocol on the authoritative
-        // store (CLAUDE.md, "What the daemon intentionally does NOT mirror").
-        // The slot exists for parity with the standalone server's AppState.
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys,
-        signing_key_bytes,
-        http_client: http_client.clone(),
-        stats_collector: Some(stats_collector.clone()),
-        did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
-            Duration::from_secs(300),
-        )),
-        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
-    };
+    // The daemon's embedded server does not run its own messaging listener —
+    // the control plane's handles the full protocol on the authoritative store
+    // (CLAUDE.md, "What the daemon intentionally does NOT mirror") — so its
+    // `didcomm_service` slot stays empty. It reads the one shared store the
+    // control plane writes, so there is nothing to replicate to it.
+    let mut state = AppState::new(store.clone(), server_config)?.with_identity(identity);
+    state.stats_collector = Some(stats_collector.clone());
 
     let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
     info!("server service initialized (public-only, daemon mode)");

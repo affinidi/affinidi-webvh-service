@@ -24,7 +24,7 @@ use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
 use did_hosting_common::server::config::StoreConfig;
 use did_hosting_common::server::identity::ServiceIdentity;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, Store};
+use did_hosting_common::server::store::{KS_DIDS, Store};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 
 use crate::control_tasks::harness::{self, VIAS, Via};
@@ -112,8 +112,6 @@ async fn edge_state(
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: Some(control_did.into()),
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -121,8 +119,6 @@ async fn edge_state(
     };
     let state = did_hosting_server::server::AppState {
         store: store.clone(),
-        sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-        acl_ks: store.keyspace(KS_ACL).unwrap(),
         dids_ks: store.keyspace(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
@@ -136,9 +132,6 @@ async fn edge_state(
                 .unwrap(),
         ),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
             Duration::from_secs(60),

@@ -844,7 +844,7 @@ async fn do_domain_assign(
     let directive: replica_assign::Payload = payload(body, "replica/domain/assign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/assign")?;
 
-    let now = crate::auth::session::now_epoch();
+    let now = did_hosting_common::server::auth::session::now_epoch();
     record_assignment(&state.store, &domain, &control.did, now)
         .await
         .map_err(OpError::from)?;
@@ -905,7 +905,7 @@ async fn do_domain_unassign(
     let directive: replica_unassign::Payload = payload(body, "replica/domain/unassign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/unassign")?;
 
-    let now = crate::auth::session::now_epoch();
+    let now = did_hosting_common::server::auth::session::now_epoch();
     let outcome = unassign(&state.store, &domain)
         .await
         .map_err(OpError::from)?;

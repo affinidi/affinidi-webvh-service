@@ -23,7 +23,7 @@ use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
 use did_hosting_common::server::identity::ServiceIdentity;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, Store};
+use did_hosting_common::server::store::{KS_DIDS, Store};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_common::server::trust_tasks::send::build_request;
 use did_hosting_server::cache::ContentCache;
@@ -86,8 +86,6 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: Some(control_did),
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -95,8 +93,6 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
     };
     let state = AppState {
         store: store.clone(),
-        sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-        acl_ks: store.keyspace(KS_ACL).unwrap(),
         dids_ks: store.keyspace(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
@@ -110,9 +106,6 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
                 .unwrap(),
         ),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),

@@ -9,10 +9,9 @@ use affinidi_messaging_didcomm_service::{
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
 use did_hosting_common::server::domain::parse_trusted_cidrs;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
+use did_hosting_common::server::store::KS_DIDS;
 use ipnetwork::IpNetwork;
 
-use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
     advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
     wait_for_did_resolution,
@@ -21,8 +20,6 @@ use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::jwt::JwtKeys;
-use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
@@ -39,8 +36,6 @@ use tracing::{Level, debug, error, info, warn};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub sessions_ks: KeyspaceHandle,
-    pub acl_ks: KeyspaceHandle,
     pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
@@ -65,9 +60,6 @@ pub struct AppState {
     /// rotation rebuild the profile in place. A `OnceLock` suffices precisely
     /// because the *service* is never replaced — only its listeners are.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
-    pub jwt_keys: Option<Arc<JwtKeys>>,
-    pub signing_key_bytes: Option<[u8; 32]>,
-    pub http_client: reqwest::Client,
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
     /// In-memory cache for DID content (did.jsonl). TTL-based eviction on read.
     pub did_cache: Arc<crate::cache::ContentCache>,
@@ -78,40 +70,68 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
-    pub fn require_didcomm_auth(
-        &self,
-    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
-        let did_resolver = self
-            .did_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
-        let secrets_resolver = self
-            .secrets_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
-        let jwt_keys = self
-            .jwt_keys
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
-        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
+    /// An edge over `store` with nothing wired but its configuration and a
+    /// fresh content cache: no identity, no resolver, no messaging service.
+    /// The caller — `run`, the daemon, a test — fills in what it has.
+    pub fn new(store: Store, config: AppConfig) -> Result<Self, AppError> {
+        let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
+        if !bad_cidrs.is_empty() {
+            warn!(
+                bad_cidrs = ?bad_cidrs,
+                "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
+            );
+        }
+        Ok(Self {
+            dids_ks: store.keyspace(KS_DIDS)?,
+            store,
+            config: Arc::new(config),
+            did_resolver: None,
+            trust_tasks_verifier: None,
+            secrets_resolver: None,
+            identity: None,
+            didcomm_service: Arc::new(OnceLock::new()),
+            stats_collector: None,
+            did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
+            trusted_proxy_cidrs: Arc::new(parsed_cidrs),
+        })
+    }
+
+    /// Carry `identity`: the resolvers and proof verifier are taken from it.
+    pub fn with_identity(mut self, identity: Option<Arc<ServiceIdentity>>) -> Self {
+        self.did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+        self.secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
+        self.trust_tasks_verifier = crate::messaging::build_verifier(self.did_resolver.as_ref());
+        self.identity = identity;
+        self
     }
 }
 
-impl AuthState for AppState {
-    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
-        self.jwt_keys.as_ref()
+/// Refuse to start an edge that no control plane drives.
+///
+/// An edge is a cache of its control plane: every write it applies is a Trust
+/// Task that control plane signed, and it has no management surface of its
+/// own. Without `control_did` nothing could ever write to it, so a
+/// single-host deployment runs `did-hosting-daemon` instead.
+pub fn require_control_plane(config: &AppConfig) -> Result<(), AppError> {
+    if config.control_did.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config(
+            "control_did is not set. did-hosting-server is an edge that a control plane drives \
+             over Trust Tasks, and does not run without one; for a single-host deployment run \
+             did-hosting-daemon"
+                .into(),
+        ));
     }
-
-    fn sessions_ks(&self) -> &KeyspaceHandle {
-        &self.sessions_ks
+    if config.server_did.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config(
+            "server_did is not set: the control plane addresses and verifies this edge by it"
+                .into(),
+        ));
     }
+    Ok(())
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
-    // Open keyspace handles
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
+    require_control_plane(&config)?;
     let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Integrity check on DID keyspace
@@ -164,18 +184,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-
-    // Initialize JWT keys independently — needed by both DIDComm and passkey auth
-    let jwt_keys = init::init_jwt_keys(&secrets);
-
-    // Extract raw signing key bytes for pack_signed operations
-    let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
-
-    // Always bind TCP — the server must serve public DID documents even when
-    // the management REST API is disabled. The rest_api flag controls whether
-    // /api/* routes are included, not whether HTTP is served.
+    // Bind TCP before anything else: public resolution and the Trust Task
+    // listener's HTTPS binding are served from it.
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let std_listener = {
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
@@ -185,10 +195,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     // Gather storage thread inputs before moving config into Arc
-    let storage_sessions_ks = sessions_ks.clone();
     let storage_dids_ks = dids_ks.clone();
     let storage_auth_config = config.auth.clone();
-    let has_auth = jwt_keys.is_some();
 
     let upload_body_limit = config.limits.upload_body_limit;
     let stats_config = config.stats.clone();
@@ -206,48 +214,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         Arc::new(collector)
     };
 
-    let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
-    if !bad_cidrs.is_empty() {
-        warn!(
-            bad_cidrs = ?bad_cidrs,
-            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
-        );
-    }
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        dids_ks,
-        config: Arc::new(config),
-        trust_tasks_verifier: crate::messaging::build_verifier(did_resolver.as_ref()),
-        did_resolver,
-        secrets_resolver,
-        identity,
-        didcomm_service: Arc::new(OnceLock::new()),
-        jwt_keys,
-        signing_key_bytes,
-        http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build HTTP client"),
-        stats_collector: Some(stats_collector.clone()),
-        did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
-        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
-    };
+    let mut state = AppState::new(store.clone(), config)?.with_identity(identity);
+    state.stats_collector = Some(stats_collector.clone());
 
     // Log startup configuration
     info!("--- enabled services ---");
-    info!(
-        "  REST API : {}",
-        if state.config.features.rest_api {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
     info!(
         "  DIDComm  : {}",
         if state.config.features.didcomm {
@@ -290,11 +261,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 2. Spawn storage thread (independent cleanup, flush, sync)
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_collector = stats_collector.clone();
-    let storage_http = state.http_client.clone();
-    let storage_control_url = state.config.control_url.clone();
-    let storage_server_did = state.config.server_did.clone();
-    let storage_control_did = state.config.control_did.clone();
-    let storage_identity = state.identity.clone();
     let storage_stats_config = stats_config;
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
@@ -302,17 +268,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             run_storage_thread(
                 StorageThreadParams {
                     store,
-                    sessions_ks: storage_sessions_ks,
                     dids_ks: storage_dids_ks,
                     auth_config: storage_auth_config,
-                    has_auth,
                     collector: storage_collector,
                     stats_config: storage_stats_config,
-                    http: storage_http,
-                    control_url: storage_control_url,
-                    server_did: storage_server_did,
-                    control_did: storage_control_did,
-                    identity: storage_identity,
                 },
                 &mut storage_shutdown,
             )
@@ -735,17 +694,10 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
-        // When rest_api is disabled, serve only public DID routes + health.
-        // When enabled, serve full management API + public DID routes.
-        let base_router = if state.config.features.rest_api {
-            info!("HTTP thread started (REST API + public DID serving)");
-            routes::router(upload_body_limit)
-        } else {
-            info!("HTTP thread started (public DID serving only, REST API disabled)");
-            routes::router_public_only()
-                .merge(routes::trust_task_listener(upload_body_limit))
-                .fallback(routes::did_public::serve_public)
-        };
+        // Public DID resolution and the Trust Task listener's HTTPS binding.
+        // There is no management surface to switch on.
+        info!("HTTP thread started (public DID serving + Trust Task listener)");
+        let base_router = routes::router(upload_body_limit);
 
         // Cloned before `with_state` consumes `state`: the health route is
         // added below the router's state type has already collapsed to
@@ -801,33 +753,19 @@ fn run_rest_thread(
 /// Parameters for the background storage thread.
 struct StorageThreadParams {
     store: Store,
-    sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     auth_config: AuthConfig,
-    has_auth: bool,
     collector: Arc<stats::StatsCollector>,
     stats_config: crate::config::StatsConfig,
-    http: reqwest::Client,
-    control_url: Option<String>,
-    server_did: Option<String>,
-    control_did: Option<String>,
-    identity: Option<Arc<did_hosting_common::server::identity::ServiceIdentity>>,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
     let StorageThreadParams {
         store,
-        sessions_ks,
         dids_ks,
         auth_config,
-        has_auth,
         collector,
         stats_config,
-        http,
-        control_url,
-        server_did,
-        control_did,
-        identity,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -836,50 +774,29 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
 
     rt.block_on(async {
         info!(
-            sync_interval = stats_config.sync_interval_secs,
+            flush_interval = stats_config.flush_interval_secs,
             "storage thread started"
         );
 
-        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let did_ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-        let sync_enabled = stats_config.sync_interval_secs > 0 && control_url.is_some();
-        let sync_interval = Duration::from_secs(stats_config.sync_interval_secs.max(1));
-
-        let mut session_timer = tokio::time::interval(session_interval);
         let mut did_timer = tokio::time::interval(did_interval);
-        let mut sync_timer = tokio::time::interval(sync_interval);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
-        session_timer.tick().await;
         did_timer.tick().await;
-        sync_timer.tick().await;
 
         loop {
             tokio::select! {
-                _ = session_timer.tick(), if has_auth => {
-                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
-                        warn!("session cleanup error: {e}");
-                    }
-                }
                 _ = did_timer.tick() => {
                     match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(count = n, "cleaned up empty DID records");
-                            // Adjust count for cleaned up records
                             for _ in 0..n {
                                 collector.decrement_total_dids();
                             }
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
-                    }
-                }
-                _ = sync_timer.tick(), if sync_enabled => {
-                    if let (Some(url), Some(did), Some(control), Some(identity)) =
-                        (&control_url, &server_did, &control_did, &identity)
-                    {
-                        stats::sync_to_control(&http, url, did, control, identity, &collector).await;
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -1068,6 +985,30 @@ mod tests {
     fn mnemonic_from_did_deep_path() {
         let did = "did:webvh:QmABC:example.com:people:staff:glenn";
         assert_eq!(mnemonic_from_did(did).unwrap(), "people/staff/glenn");
+    }
+
+    /// A standalone edge with no control plane is not a supported shape: the
+    /// server refuses to start rather than run with nothing able to write to it.
+    #[test]
+    fn an_edge_without_a_control_plane_does_not_start() {
+        let config = |control: Option<&str>, server: Option<&str>| {
+            let mut c: AppConfig = toml::from_str("").expect("defaults parse");
+            c.control_did = control.map(String::from);
+            c.server_did = server.map(String::from);
+            c
+        };
+        for (control, server) in [
+            (None, Some("did:key:edge")),
+            (Some(""), Some("did:key:edge")),
+            (Some("did:key:control"), None),
+        ] {
+            let err = require_control_plane(&config(control, server)).unwrap_err();
+            assert!(matches!(err, AppError::Config(_)), "{err:?}");
+        }
+        let err = require_control_plane(&config(None, Some("did:key:edge"))).unwrap_err();
+        assert!(err.to_string().contains("did-hosting-daemon"), "{err}");
+        require_control_plane(&config(Some("did:key:control"), Some("did:key:edge")))
+            .expect("an edge with a control plane starts");
     }
 
     #[test]

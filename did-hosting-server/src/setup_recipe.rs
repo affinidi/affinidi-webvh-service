@@ -11,16 +11,13 @@ use did_hosting_common::server::operator_messages::WebvhServerMessages;
 use did_hosting_common::server::setup_recipe::{
     EXIT_RECIPE_INVALID, ServiceKind, SetupRecipe, VtaMode, VtaSetupOutcome, active_backend,
     apply_env_overrides, back_up_config, derive_did_path, inspect_existing, load_recipe,
-    print_recipe_banner, refuse_overwrite, require_service, resolve_admin_did,
-    resolve_secrets_config, run_uninstall_unchecked, run_vta_for_recipe, split_origin_and_did_path,
-    to_log_format,
+    print_recipe_banner, refuse_overwrite, require_service, resolve_secrets_config,
+    run_uninstall_unchecked, run_vta_for_recipe, split_origin_and_did_path, to_log_format,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS};
+use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
-use crate::acl::{AclEntry, Role, store_acl_entry};
-use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, ServerConfig,
     StatsConfig, StoreConfig, VtaConfig,
@@ -54,6 +51,21 @@ pub async fn apply_recipe(
 ) -> Result<(), AppError> {
     apply_env_overrides(&mut recipe);
     print_recipe_banner("did-hosting-server", &recipe);
+
+    // An edge is driven by its control plane and nothing else; refuse before
+    // any VTA round-trip rather than write a config the server won't start on.
+    if recipe
+        .identity
+        .control_did
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(AppError::Config(
+            "the recipe sets no identity.control_did. did-hosting-server is an edge a control \
+             plane drives; for a single-host deployment use did-hosting-daemon"
+                .into(),
+        ));
+    }
 
     // Reprovision scan happens BEFORE any VTA round-trip so we don't
     // burn an enrolled setup DID on an install that's going to refuse.
@@ -250,8 +262,6 @@ pub async fn apply_recipe(
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config.clone(),
         limits: LimitsConfig::default(),
-        watchers: Vec::new(),
-        control_url: recipe.identity.control_url.clone(),
         control_did: recipe.identity.control_did.clone(),
         vta: VtaConfig {
             url: vta_url,
@@ -333,25 +343,6 @@ pub async fn apply_recipe(
             };
         update_server_did_in_config(&recipe.output.config_path, &did_id)
             .map_err(|e| AppError::Config(format!("update server_did: {e}")))?;
-    }
-
-    // Admin ACL seeding (if requested by the recipe).
-    if let Some(admin_did) = resolve_admin_did(&recipe) {
-        let store = Store::open(&config.store).await?;
-        let acl_ks = store.keyspace(KS_ACL)?;
-        let entry = AclEntry {
-            did: admin_did.clone(),
-            role: Role::Admin,
-            label: Some("Setup recipe admin".into()),
-            created_at: now_epoch(),
-            max_total_size: None,
-            max_did_count: None,
-
-            domains: did_hosting_common::server::domain::DomainScope::All,
-        };
-        store_acl_entry(&acl_ks, &entry).await?;
-        store.persist().await?;
-        eprintln!("  [setup-recipe] admin ACL entry added for {admin_did}");
     }
 
     eprintln!();

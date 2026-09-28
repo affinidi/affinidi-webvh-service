@@ -4,7 +4,9 @@
 //! On startup, the server sends a signed `server/register` trust task to the
 //! control plane's DID over whichever binding its DID document advertises.
 //! The control plane validates the server's DID against its ACL (must be
-//! pre-approved with service role) and adds it to the service registry.
+//! pre-approved with service role) and adds it to the service registry. The
+//! edge keeps no ACL of its own: the only party it takes directives from is
+//! the configured `control_did`, established from each document's proof.
 //!
 //! Also provides `apply_single_update` for applying sync'd DID content
 //! received from the control plane (used by `messaging.rs`).
@@ -18,7 +20,6 @@ use did_hosting_common::did_ops::{
     extract_agent_names, extract_service_types, owner_key,
 };
 use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
-use did_hosting_common::server::acl::{AclEntry, Role, get_acl_entry, store_acl_entry};
 use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
@@ -72,38 +73,6 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         control_did = %control_did,
         "registering with control plane via DIDComm"
     );
-
-    // Ensure the control plane DID is in the server's ACL so it can send
-    // sync-update and sync-delete messages that pass the ACL check.
-    match get_acl_entry(&state.acl_ks, &control_did).await {
-        Ok(Some(entry)) => {
-            info!(
-                control_did = %control_did,
-                role = %entry.role,
-                "control plane DID already in ACL"
-            );
-        }
-        Ok(None) => {
-            let entry = AclEntry {
-                did: control_did.clone(),
-                role: Role::Service,
-                label: Some("control-plane".to_string()),
-                created_at: crate::auth::session::now_epoch(),
-                max_total_size: None,
-                max_did_count: None,
-
-                domains: did_hosting_common::server::domain::DomainScope::All,
-            };
-            if let Err(e) = store_acl_entry(&state.acl_ks, &entry).await {
-                warn!(error = %e, "failed to add control plane DID to ACL");
-            } else {
-                info!(control_did = %control_did, "added control plane DID to ACL with service role");
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to check ACL for control plane DID");
-        }
-    }
 
     let public_url = state.config.public_url.clone().unwrap_or_default();
 
@@ -397,7 +366,7 @@ async fn verify_update(
 }
 
 /// Step 3 of [`verify_update`], shared with every other path that replaces a
-/// hosted log (the edge's own `PUT /api/dids/{mnemonic}`): the log must
+/// hosted log: the log must
 /// strictly extend every history this edge has served for the same DID — the
 /// log it holds now, and the high-water log kept for the DID's identity, which
 /// a delete does not clear — and a slot never changes method. Returns the DID's
@@ -601,7 +570,7 @@ pub async fn apply_single_update(
     did_cache: &crate::cache::ContentCache,
     public_url: Option<&str>,
 ) -> Result<SyncApplied, crate::error::AppError> {
-    use crate::auth::session::now_epoch;
+    use did_hosting_common::server::auth::session::now_epoch;
 
     let now = now_epoch();
 

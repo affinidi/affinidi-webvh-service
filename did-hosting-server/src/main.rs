@@ -67,23 +67,6 @@ enum Command {
     },
     /// Run health check diagnostics
     Health,
-    /// Add an access control entry
-    AddAcl {
-        /// DID to grant access to
-        #[arg(long)]
-        did: String,
-        /// Role: admin or owner
-        #[arg(long, default_value = "owner")]
-        role: String,
-        /// Per-account max total DID document size in bytes (overrides global default)
-        #[arg(long)]
-        max_total_size: Option<u64>,
-        /// Per-account max number of DIDs (overrides global default)
-        #[arg(long)]
-        max_did_count: Option<u64>,
-    },
-    /// List all access control entries
-    ListAcl,
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
     /// Rotate the service's own key-agreement key.
@@ -130,12 +113,6 @@ enum Command {
         /// Generation id to retire (see `identity-list`).
         #[arg(long)]
         generation: u64,
-    },
-    /// Remove an access control entry
-    RemoveAcl {
-        /// DID to remove from the ACL
-        #[arg(long)]
-        did: String,
     },
     /// Export server data to a backup file
     Backup {
@@ -449,24 +426,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::AddAcl {
-            did,
-            role,
-            max_total_size,
-            max_did_count,
-        }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role, max_total_size, max_did_count).await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
         Some(Command::IdentityRotateKeys {
             keys,
             ka_key,
@@ -488,12 +447,6 @@ async fn main() {
         }
         Some(Command::IdentityRetireNow { generation }) => {
             if let Err(e) = run_identity_retire_now(cli.config, generation).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -717,38 +670,6 @@ async fn main() {
         }
         None => run_server(cli.config).await,
     }
-}
-
-async fn run_add_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-    role: String,
-    max_total_size: Option<u64>,
-    max_did_count: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_add_acl(
-        &config.store,
-        did,
-        role,
-        None,
-        max_total_size,
-        max_did_count,
-    )
-    .await
-}
-
-async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
-}
-
-async fn run_remove_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }
 
 async fn run_load_did(
