@@ -36,6 +36,10 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    /// How far behind its control plane this edge may fall before it reports
+    /// itself degraded.
+    #[serde(default)]
+    pub replication: ReplicationConfig,
     /// DID of the control plane that drives this edge — the one party whose
     /// signed Trust Tasks it applies. Required: the server does not start
     /// without it.
@@ -49,6 +53,65 @@ pub struct AppConfig {
     pub identity: did_hosting_common::server::config::IdentityConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+/// The replication staleness bound.
+///
+/// The control plane delivers every change through its outbox and retries
+/// until this edge acknowledges it. As a backstop for anything that still goes
+/// missing — an outbox entry dropped past its retry budget, a push lost while
+/// the edge was down — the edge reconciles against the control plane's
+/// `did-management/did/list` every `reconcile_interval_secs`, repairing a
+/// missed disable on the spot and asking for a resync of anything else. When it
+/// has not completed a clean reconcile within `staleness_bound_secs`, its
+/// `/api/health` probe answers `503`, so a load balancer drains it instead of
+/// letting it serve state that may be out of date.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplicationConfig {
+    /// The longest an edge may go without a clean reconcile and still report
+    /// healthy. Default 300 (5 minutes).
+    #[serde(default = "default_staleness_bound_secs")]
+    pub staleness_bound_secs: u64,
+    /// How often the edge reconciles. Must be shorter than the bound, so a
+    /// single missed round does not trip it. Default 60.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+}
+
+fn default_staleness_bound_secs() -> u64 {
+    300
+}
+
+fn default_reconcile_interval_secs() -> u64 {
+    60
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            staleness_bound_secs: default_staleness_bound_secs(),
+            reconcile_interval_secs: default_reconcile_interval_secs(),
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// Refuse a bound the reconcile interval cannot keep.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.reconcile_interval_secs == 0 {
+            return Err(AppError::Config(
+                "replication.reconcile_interval_secs must be at least 1".into(),
+            ));
+        }
+        if self.staleness_bound_secs <= self.reconcile_interval_secs {
+            return Err(AppError::Config(format!(
+                "replication.staleness_bound_secs ({}) must be longer than \
+                 replication.reconcile_interval_secs ({})",
+                self.staleness_bound_secs, self.reconcile_interval_secs
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -185,6 +248,14 @@ impl AppConfig {
         env_opt!("DID_HOSTING_VTA_CONTEXT_ID", config.vta.context_id);
 
         // Limits
+        env_parse!(
+            "DID_HOSTING_REPLICATION_STALENESS_BOUND_SECS",
+            config.replication.staleness_bound_secs
+        );
+        env_parse!(
+            "DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS",
+            config.replication.reconcile_interval_secs
+        );
         env_parse!(
             "DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT",
             config.limits.upload_body_limit

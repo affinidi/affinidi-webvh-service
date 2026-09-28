@@ -262,6 +262,7 @@ pub async fn apply_recipe(
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config.clone(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         control_did: recipe.identity.control_did.clone(),
         vta: VtaConfig {
             url: vta_url,

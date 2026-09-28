@@ -85,6 +85,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         stats: StatsConfig::default(),
         control_did: Some(control_did),
         vta: VtaConfig::default(),
@@ -109,6 +110,9 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
     };
     (state, dir)
 }
@@ -710,5 +714,111 @@ async fn a_foreign_document_reported_as_the_control_planes_is_not_answered() {
         )
         .await;
         assert!(deliver(&state, via, &cp.0, doc).await.is_none(), "{via:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The staleness bound
+// ---------------------------------------------------------------------------
+
+async fn health_status(state: &AppState) -> axum::http::StatusCode {
+    did_hosting_server::routes::health::health(state.clone())
+        .await
+        .0
+}
+
+/// `/api/health` stays 200 while the edge is within the staleness bound —
+/// including a fresh start that has not had time to reconcile — and answers
+/// 503 once the last clean reconcile is older than the bound, so a load
+/// balancer drains it.
+#[tokio::test]
+async fn health_degrades_past_the_staleness_bound() {
+    use axum::http::StatusCode;
+    use did_hosting_common::server::auth::session::now_epoch;
+
+    let (state, _dir) = edge_state().await;
+    let bound = state.config.replication.staleness_bound_secs;
+    assert_eq!(bound, 300, "the documented default");
+
+    assert_eq!(health_status(&state).await, StatusCode::OK, "just started");
+
+    state.replication.mark_reconciled(now_epoch());
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::OK,
+        "just reconciled"
+    );
+
+    state
+        .replication
+        .set_last_reconciled_at(now_epoch() - bound + 5);
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::OK,
+        "within the bound"
+    );
+
+    state
+        .replication
+        .set_last_reconciled_at(now_epoch() - bound - 1);
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "past the bound"
+    );
+
+    // A fresh start past the bound without ever reconciling is stale too.
+    let status = did_hosting_server::replication::ReplicationStatus::new(now_epoch() - bound - 1);
+    assert!(!status.is_fresh(now_epoch(), bound));
+}
+
+/// The bound must be longer than the reconcile interval.
+#[test]
+fn a_bound_the_interval_cannot_keep_is_refused() {
+    use did_hosting_server::config::ReplicationConfig;
+    assert!(ReplicationConfig::default().validate().is_ok());
+    for (bound, interval) in [(60, 60), (30, 60), (300, 0)] {
+        let config = ReplicationConfig {
+            staleness_bound_secs: bound,
+            reconcile_interval_secs: interval,
+        };
+        assert!(config.validate().is_err(), "{bound}/{interval}");
+    }
+}
+
+/// `server/metrics/0.1` answers the control plane with the reconcile age the
+/// bound is measured on, on every transport, and refuses anyone else.
+#[tokio::test]
+async fn metrics_report_replication_freshness_to_the_control_plane_only() {
+    const METRICS: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    for via in VIAS {
+        let reply = deliver(&state, via, &cp.0, signed(METRICS, &cp, json!({})).await)
+            .await
+            .expect("answered");
+        let body = answered(&reply, METRICS);
+        let gauges = body["snapshot"]["gauges"].as_array().unwrap();
+        for name in [
+            "did_hosting_replication_reconcile_age_seconds",
+            "did_hosting_replication_staleness_bound_seconds",
+            "did_hosting_replication_fresh",
+        ] {
+            assert!(
+                gauges.iter().any(|g| g["name"] == name),
+                "{via:?}: no {name}: {body}"
+            );
+        }
+
+        let stranger = signer(66);
+        let reply = deliver(
+            &state,
+            via,
+            &stranger.0,
+            signed(METRICS, &stranger, json!({})).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused(&reply), "permissionDenied", "{via:?}");
     }
 }

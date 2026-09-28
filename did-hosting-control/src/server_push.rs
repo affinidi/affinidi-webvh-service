@@ -29,6 +29,9 @@ pub struct ReportedDid {
     /// never counts as current.
     pub did_id: Option<String>,
     pub version_count: u64,
+    /// The slot's disabled state as the server holds it. `None` from a server
+    /// that did not say, which is then not compared.
+    pub disabled: Option<bool>,
 }
 
 /// Whether a server that reports `reported` for a slot already holds the
@@ -40,11 +43,15 @@ pub struct ReportedDid {
 /// its outbox budget, say) would otherwise keep serving the old DID. On a
 /// mismatch the new log is pushed; the edge's own per-identity high-water mark
 /// still refuses anything that would roll a DID back.
+///
+/// A server that reports the slot's `disabled` state must also hold the
+/// control plane's: a disable it missed is re-sent with the content.
 pub fn edge_is_current(record: &DidRecord, reported: Option<&ReportedDid>) -> bool {
     reported.is_some_and(|have| {
         have.did_id.is_some()
             && have.did_id == record.did_id
             && have.version_count >= record.version_count
+            && have.disabled.is_none_or(|d| d == record.disabled)
     })
 }
 
@@ -60,11 +67,13 @@ pub fn parse_reported(body: &serde_json::Value) -> std::collections::HashMap<Str
                     let mnemonic = e.get("mnemonic")?.as_str()?.to_string();
                     let version_count = e.get("version_count")?.as_u64()?;
                     let did_id = e.get("did_id").and_then(|v| v.as_str()).map(String::from);
+                    let disabled = e.get("disabled").and_then(|v| v.as_bool());
                     Some((
                         mnemonic,
                         ReportedDid {
                             did_id,
                             version_count,
+                            disabled,
                         },
                     ))
                 })

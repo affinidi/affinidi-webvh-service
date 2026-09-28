@@ -57,7 +57,13 @@ pub const CONTROL_PLANE_OPS: &[&str] = &[
     MSG_REPLICA_DOMAIN_UNASSIGN,
     MSG_REPLICA_DOMAIN_PURGE,
     MSG_REPLICA_DOMAIN_UPSERT,
+    MSG_SERVER_METRICS,
 ];
+
+/// `did-management/server/metrics/0.1`: this edge's operational metrics,
+/// answered to its control plane only.
+pub const MSG_SERVER_METRICS: &str =
+    "https://trusttasks.org/spec/did-management/server/metrics/0.1";
 
 /// The `notAuthorized` code `type_uri`'s specification declares: its proven
 /// issuer is not this server's configured control plane.
@@ -311,13 +317,15 @@ pub async fn dispatch_control_plane_op(
     let control = match verify_control_plane(state, transport_sender, &doc, verifier).await {
         Ok(c) => c,
         Err(Refusal::NotAuthorized { issuer }) => {
-            let code = not_authorized_code(&type_uri).expect("CONTROL_PLANE_OPS gates this");
+            let message = format!("{issuer} is not this server's control plane");
+            // A task that declares its own `notAuthorized` is refused with it;
+            // `server/metrics` declares none, and gets the framework's.
+            let payload = match not_authorized_code(&type_uri) {
+                Some(code) => trust_tasks_rs::ErrorPayload::from(code).with_message(message),
+                None => trust_tasks_rs::RejectReason::PermissionDenied { reason: message }.into(),
+            };
             return Some(ControlPlaneReply::Reply(error_value(
-                doc.reject_with(
-                    reply_id,
-                    trust_tasks_rs::ErrorPayload::from(code)
-                        .with_message(format!("{issuer} is not this server's control plane")),
-                ),
+                doc.reject_with(reply_id, payload),
             )));
         }
         Err(refusal) => {
@@ -335,6 +343,7 @@ pub async fn dispatch_control_plane_op(
         MSG_REPLICA_DOMAIN_UNASSIGN => do_domain_unassign(&control, state, &doc.payload).await,
         MSG_REPLICA_DOMAIN_PURGE => do_domain_purge(&control, state, &doc.payload).await,
         MSG_REPLICA_DOMAIN_UPSERT => do_domain_upsert(&control, state, &doc.payload).await,
+        MSG_SERVER_METRICS => do_server_metrics(state, &doc.payload).await,
         _ => unreachable!("CONTROL_PLANE_OPS gates this match"),
     };
     Some(ControlPlaneReply::Reply(match result {
@@ -500,6 +509,9 @@ pub async fn dispatch_inbound_document(
     sender: Option<&str>,
     doc: trust_tasks_rs::TrustTask<Value>,
 ) -> Option<Value> {
+    // A reply to a request this edge sent (its reconcile listing) goes to the
+    // task awaiting it, which verifies it; it is never dispatched as a request.
+    let doc = crate::replication::deliver_reply(doc)?;
     let type_uri = doc.type_uri.to_string();
     if CONTROL_PLANE_OPS.contains(&type_uri.as_str()) {
         let Some(verifier) = state_verifier(state) else {
@@ -1109,6 +1121,63 @@ async fn do_domain_upsert(
         reply::<replica_upsert::Response>(
             json!({ "name": canonical, "status": "applied" }),
             "replica/domain/upsert",
+        )?,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (control plane → server)
+// ---------------------------------------------------------------------------
+
+/// `server/metrics/0.1`, answered to the control plane: the replication
+/// freshness the staleness bound is measured on, and the process counters.
+/// There is no Prometheus endpoint on an edge; this is the only read of them.
+async fn do_server_metrics(state: &AppState, body: &Value) -> Result<(String, Value), OpError> {
+    use trust_tasks_rs::specs::did_management::server::metrics::v0_1 as metrics;
+
+    let _: metrics::Payload = payload(body, "server/metrics")?;
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    let status = &state.replication;
+    let bound = state.config.replication.staleness_bound_secs;
+    let gauge = |name: &str, value: u64| json!({ "name": name, "value": value });
+    let mut gauges = vec![
+        gauge(
+            "did_hosting_replication_reconcile_age_seconds",
+            status.age(now),
+        ),
+        gauge("did_hosting_replication_staleness_bound_seconds", bound),
+        gauge(
+            "did_hosting_replication_fresh",
+            u64::from(status.is_fresh(now, bound)),
+        ),
+        gauge("did_hosting_replication_stale_slots", status.stale_slots()),
+    ];
+    if let Some(at) = status.last_reconciled_at() {
+        gauges.push(gauge("did_hosting_replication_last_reconciled_at", at));
+    }
+    #[allow(unused_mut)]
+    let mut counters = vec![gauge(
+        "did_hosting_replication_repaired_total",
+        status.repaired_total(),
+    )];
+    #[cfg(feature = "metrics")]
+    counters.extend(
+        did_hosting_common::server::metrics::counters()
+            .into_iter()
+            .map(|(name, value)| json!({ "name": name, "value": value })),
+    );
+    Ok((
+        format!("{MSG_SERVER_METRICS}#response"),
+        reply::<metrics::Response>(
+            json!({
+                "snapshot": {
+                    "takenAt": chrono::Utc::now(),
+                    "counters": counters,
+                    "gauges": gauges,
+                    "histograms": [],
+                }
+            }),
+            "server/metrics",
         )?,
     ))
 }

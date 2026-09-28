@@ -111,6 +111,7 @@ async fn edge_state(
         hosting: Default::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         stats: StatsConfig::default(),
         control_did: Some(control_did.into()),
         vta: VtaConfig::default(),
@@ -137,6 +138,9 @@ async fn edge_state(
             Duration::from_secs(60),
         )),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
     };
     (state, dir)
 }
@@ -526,5 +530,180 @@ async fn a_stale_purge_is_refused_and_settled() {
             f.queued().await.is_empty(),
             "{via:?}: the signed, final refusal settles the entry"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The staleness bound
+// ---------------------------------------------------------------------------
+
+impl Fleet {
+    /// Register the edge as a hosting server, as `server/register` leaves it.
+    async fn register_edge(&self) {
+        let instance: crate::registry::ServiceInstance = serde_json::from_value(json!({
+            "instanceId": self.edge_did.replace(':', "_"),
+            "serviceType": "server",
+            "url": "https://edge.example.com",
+            "status": "active",
+            "registeredAt": 1,
+            "metadata": { "did": self.edge_did },
+        }))
+        .unwrap();
+        crate::registry::register_instance(&self.control.registry_ks, &instance)
+            .await
+            .unwrap();
+    }
+
+    /// A request from the edge, answered by the control plane over `via`.
+    async fn ask_control(
+        &self,
+        via: Via,
+        doc: trust_tasks_rs::TrustTask<Value>,
+    ) -> Result<trust_tasks_rs::TrustTask<Value>, String> {
+        let doc = serde_json::to_value(&doc).unwrap();
+        let reply: Value = match via {
+            Via::Tsp => serde_json::from_slice(
+                &crate::tsp::run_tsp_trust_task(
+                    &self.control,
+                    &self.edge_did,
+                    &serde_json::to_vec(&doc).unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("answered"),
+            )
+            .unwrap(),
+            Via::Didcomm => {
+                crate::messaging::run_trust_tasks_envelope(
+                    &self.control,
+                    &self.edge_did,
+                    &envelope(doc),
+                )
+                .await
+                .unwrap()
+                .expect("answered")
+                .1
+            }
+            Via::Https => harness::https(&self.control, None, doc).await,
+        };
+        serde_json::from_value(reply).map_err(|e| e.to_string())
+    }
+}
+
+/// A disable whose push was lost is repaired by the edge's next reconcile
+/// against `did/list`, on each transport. A publish that was lost leaves the
+/// reconcile unclean — the edge re-registers for it — and the control plane
+/// records when the edge last reconciled.
+#[tokio::test]
+async fn reconcile_repairs_a_missed_disable_on_every_transport() {
+    for via in VIAS {
+        let f = fleet().await;
+        f.register_edge().await;
+        did_hosting_common::server::assignment::record_assignment(
+            &f.edge.store,
+            "edge.example.com",
+            &f.control_did,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let mut record = publish(&f.control, "alice").await;
+        queue_sync(&f, &record).await;
+        f.pump(via).await;
+
+        // Disabled at the control plane; the push never arrives.
+        record.disabled = true;
+        f.control
+            .dids_ks
+            .insert(did_key("alice"), &record)
+            .await
+            .unwrap();
+        let held: DidRecord = f.edge.dids_ks.get(did_key("alice")).await.unwrap().unwrap();
+        assert!(!held.disabled, "the edge missed it");
+
+        let report =
+            did_hosting_server::replication::reconcile_once(&f.edge, |doc| f.ask_control(via, doc))
+                .await
+                .unwrap_or_else(|e| panic!("{via:?}: {e}"));
+        assert_eq!(report.repaired, vec!["alice".to_string()], "{via:?}");
+        assert!(report.is_clean(), "{via:?}: {report:?}");
+        let held: DidRecord = f.edge.dids_ks.get(did_key("alice")).await.unwrap().unwrap();
+        assert!(held.disabled, "{via:?}: the reconcile repaired the disable");
+        assert!(f.edge.replication.last_reconciled_at().is_some());
+        let instance =
+            crate::registry::get_instance(&f.control.registry_ks, &f.edge_did.replace(':', "_"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(instance.last_reconcile_at.is_some(), "{via:?}");
+
+        // A publish the edge never received cannot be repaired from a
+        // listing: the reconcile is not clean, and the freshness mark stays.
+        f.edge.replication.set_last_reconciled_at(1);
+        publish(&f.control, "bob").await;
+        let report =
+            did_hosting_server::replication::reconcile_once(&f.edge, |doc| f.ask_control(via, doc))
+                .await
+                .unwrap();
+        assert_eq!(report.behind, vec!["bob".to_string()], "{via:?}");
+        assert!(!report.is_clean());
+        assert_eq!(f.edge.replication.last_reconciled_at(), Some(1));
+    }
+}
+
+/// A DID that is not a registered hosting server — here, one with the Service
+/// role but no server registration — sees only its own slots, so the listing
+/// is no wider than what the control plane already sends that edge.
+#[tokio::test]
+async fn only_a_registered_server_is_given_the_full_listing() {
+    let f = fleet().await;
+    publish(&f.control, "alice").await;
+    let request = did_hosting_server::replication::list_request(&f.edge, 0)
+        .await
+        .unwrap();
+    let reply = f.ask_control(Via::Https, request).await.unwrap();
+    assert_eq!(reply.payload["total"], 0, "{reply:?}");
+
+    f.register_edge().await;
+    let request = did_hosting_server::replication::list_request(&f.edge, 0)
+        .await
+        .unwrap();
+    let reply = f.ask_control(Via::Https, request).await.unwrap();
+    assert_eq!(reply.payload["total"], 1, "{reply:?}");
+}
+
+/// Per-edge replication lag reaches `server/metrics/0.1`: the queued
+/// directives and the age of the oldest.
+#[tokio::test]
+async fn control_metrics_expose_per_edge_replication_lag() {
+    let f = fleet().await;
+    f.register_edge().await;
+    crate::server_push::send_domain_assign(&f.control, &f.edge_did, "edge.example.com")
+        .await
+        .unwrap();
+    let admin = harness::member(&f.control, 7, Role::Admin).await;
+    for via in VIAS {
+        let mut doc = harness::request(
+            "https://trusttasks.org/spec/did-management/server/metrics/0.1",
+            &admin.did,
+            json!({}),
+        );
+        doc["recipient"] = json!(f.control_did);
+        let doc = harness::signed(doc, &admin.key).await;
+        let reply = harness::send(&f.control, via, &admin, doc).await;
+        harness::conforms(&reply);
+        let gauges = reply["payload"]["snapshot"]["gauges"].as_array().unwrap();
+        let find = |name: &str| {
+            gauges
+                .iter()
+                .find(|g| g["name"] == name && g["labels"]["edge"] == f.edge_did.as_str())
+                .unwrap_or_else(|| panic!("{via:?}: no {name} for the edge: {reply}"))
+        };
+        assert_eq!(
+            find("did_hosting_replication_pending")["value"].as_f64(),
+            Some(1.0)
+        );
+        assert!(find("did_hosting_replication_lag_seconds")["value"].is_number());
     }
 }

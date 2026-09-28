@@ -14,6 +14,7 @@ use did_hosting_common::server::pending_purge::parse_grace_string;
 use super::{Cx, TaskError, at, typed};
 use crate::did_ops;
 use crate::error::AppError;
+use crate::server::AppState;
 
 /// `server/info/0.1`: the one public read. Accepted with no proof; answers
 /// only what the service already publishes, and the reply — signed by the DID
@@ -154,17 +155,67 @@ pub(crate) async fn metrics(
         .collect();
     #[cfg(not(feature = "metrics"))]
     let counters: Vec<Value> = Vec::new();
+    let gauges = replication_gauges(cx.state).await?;
     typed(
         json!({
             "snapshot": {
                 "takenAt": chrono::Utc::now(),
                 "counters": counters,
-                "gauges": [],
+                "gauges": gauges,
                 "histograms": [],
             }
         }),
         "server/metrics response",
     )
+}
+
+/// Per-edge replication lag, labelled `{edge: <server DID>}`, for every hosting
+/// server in the registry:
+///
+/// - `did_hosting_replication_pending` — directives queued for it, unacknowledged;
+/// - `did_hosting_replication_lag_seconds` — age of the oldest of them (0 when
+///   none is waiting): how far behind the control plane it is;
+/// - `did_hosting_replication_last_ack_age_seconds` — since its last signed
+///   acknowledgement, when it has sent one;
+/// - `did_hosting_replication_last_reconcile_age_seconds` — since it last
+///   started a reconcile against `did/list`, when it has. An edge past its own
+///   staleness bound here is reporting itself degraded.
+pub(crate) async fn replication_gauges(state: &AppState) -> Result<Vec<Value>, TaskError> {
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    let mut gauges = Vec::new();
+    for instance in crate::registry::list_instances(&state.registry_ks).await? {
+        if instance.service_type != crate::registry::ServiceType::Server {
+            continue;
+        }
+        let Some(edge) = instance.metadata.get("did").and_then(Value::as_str) else {
+            continue;
+        };
+        let pending = crate::outbox::list_pending_for_target(&state.store, edge).await?;
+        let lag = pending
+            .iter()
+            .map(|(_, e)| now.saturating_sub(e.enqueued_at))
+            .max()
+            .unwrap_or(0);
+        let gauge = |name: &str, value: u64| json!({ "name": name, "value": value, "labels": { "edge": edge } });
+        gauges.push(gauge(
+            "did_hosting_replication_pending",
+            pending.len() as u64,
+        ));
+        gauges.push(gauge("did_hosting_replication_lag_seconds", lag));
+        if let Some(at) = instance.last_ack_at {
+            gauges.push(gauge(
+                "did_hosting_replication_last_ack_age_seconds",
+                now.saturating_sub(at),
+            ));
+        }
+        if let Some(at) = instance.last_reconcile_at {
+            gauges.push(gauge(
+                "did_hosting_replication_last_reconcile_age_seconds",
+                now.saturating_sub(at),
+            ));
+        }
+    }
+    Ok(gauges)
 }
 
 /// `stats/get/0.1`: one slot's counters (owner or admin — a slot the caller

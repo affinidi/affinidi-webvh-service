@@ -56,6 +56,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         stats: StatsConfig::default(),
         control_did: None,
         vta: VtaConfig::default(),
@@ -75,6 +76,9 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
     };
     (state, dir)
 }

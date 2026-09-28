@@ -913,6 +913,8 @@ pub(crate) async fn do_server_register(
         last_inbound_at: previous.as_ref().and_then(|p| p.last_inbound_at),
         last_outbound_transport: previous.as_ref().and_then(|p| p.last_outbound_transport),
         last_outbound_at: previous.as_ref().and_then(|p| p.last_outbound_at),
+        last_ack_at: previous.as_ref().and_then(|p| p.last_ack_at),
+        last_reconcile_at: previous.as_ref().and_then(|p| p.last_reconcile_at),
     };
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -2553,6 +2555,8 @@ mod tests {
                 last_inbound_at: None,
                 last_outbound_transport: None,
                 last_outbound_at: None,
+                last_ack_at: None,
+                last_reconcile_at: None,
             },
         )
         .await
@@ -3411,6 +3415,7 @@ mod tests {
         let have = |did_id: Option<&str>, version_count| ReportedDid {
             did_id: did_id.map(String::from),
             version_count,
+            disabled: None,
         };
         assert!(edge_is_current(
             &record,
@@ -3430,6 +3435,16 @@ mod tests {
         assert!(
             !edge_is_current(&record, Some(&have(None, 5))),
             "an edge that does not say which DID it holds → push"
+        );
+        // A disable the edge missed is re-sent with the content.
+        let reported = |disabled| ReportedDid {
+            disabled: Some(disabled),
+            ..have(Some("did:webvh:QmNew:host:alice"), 2)
+        };
+        assert!(edge_is_current(&record, Some(&reported(false))));
+        assert!(
+            !edge_is_current(&record, Some(&reported(true))),
+            "a different disabled state → push"
         );
     }
 

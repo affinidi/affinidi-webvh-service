@@ -1,5 +1,6 @@
 //! `did-management/did/*` and `webvh/witness/publish`.
 
+use did_hosting_common::server::auth::session::now_epoch;
 use serde_json::json;
 use tracing::info;
 use trust_tasks_rs::specs::{
@@ -14,6 +15,7 @@ use did_hosting_common::did_ops::did_key;
 use super::{Cx, TaskError, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
+use crate::server::AppState;
 use crate::server_push;
 
 /// `did/check-name/0.1`: an availability probe, or (`reserve: true`) an atomic
@@ -207,8 +209,18 @@ pub(crate) async fn list(
         None => None,
     };
 
+    // A registered hosting server reconciling against the listing: it is sent
+    // every slot anyway, and the listing is how it catches what it missed
+    // (the replication staleness bound). Only a server-type registry entry
+    // under the caller's own DID qualifies — a witness or watcher with the
+    // Service role does not.
+    let replica = auth.role == Role::Service && is_hosting_server(state, &auth.did).await;
+    if replica && p.owner.is_none() && p.offset.unwrap_or(0) == 0 {
+        crate::registry::record_reconcile(&state.registry_ks, &auth.did, now_epoch()).await;
+    }
     let (records, total) = did_ops::list_dids_page(
         &auth,
+        replica,
         state,
         p.owner.as_deref(),
         domain.as_deref(),
@@ -228,6 +240,15 @@ pub(crate) async fn list(
     typed(
         json!({ "records": records, "total": total }),
         "list response",
+    )
+}
+
+/// Whether `did` is registered here as a hosting server (an edge).
+async fn is_hosting_server(state: &AppState, did: &str) -> bool {
+    matches!(
+        crate::registry::get_instance(&state.registry_ks, &did.replace(':', "_")).await,
+        Ok(Some(instance)) if instance.service_type == crate::registry::ServiceType::Server
+            && instance.metadata.get("did").and_then(|d| d.as_str()) == Some(did)
     )
 }
 

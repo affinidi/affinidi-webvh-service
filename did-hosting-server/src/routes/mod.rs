@@ -1,5 +1,5 @@
 pub mod did_public;
-pub(crate) mod health;
+pub mod health;
 pub mod resolve_agent_name;
 mod resolve_shared;
 #[cfg(feature = "method-web")]
@@ -76,15 +76,10 @@ pub fn trust_task_listener(body_limit: usize) -> Router<AppState> {
 /// Task signed by its control plane, over TSP, DIDComm or `POST
 /// /api/trust-tasks` alike; the edge holds no sessions and no ACL of its own.
 pub fn router_without_fallback(body_limit: usize) -> Router<AppState> {
-    #[allow(unused_mut)]
-    let mut router = router_public_only().merge(trust_task_listener(body_limit));
-
-    // Prometheus metrics endpoint (only when metrics feature is enabled)
-    #[cfg(feature = "metrics")]
-    {
-        router = router.route("/metrics", get(metrics_handler));
-    }
-    router
+    // No Prometheus `/metrics`: an edge's metrics are read by its control
+    // plane as `did-management/server/metrics/0.1`, authenticated like any
+    // other directive.
+    router_public_only().merge(trust_task_listener(body_limit))
 }
 
 /// Public DID-serving routes only (`.well-known` and the agent-name
@@ -120,17 +115,4 @@ pub fn router_public_only() -> Router<AppState> {
 /// The edge's full router, with the DID-serving fallback.
 pub fn router(body_limit: usize) -> Router<AppState> {
     router_without_fallback(body_limit).fallback(did_public::serve_public)
-}
-
-#[cfg(feature = "metrics")]
-async fn metrics_handler() -> (
-    axum::http::StatusCode,
-    [(&'static str, &'static str); 1],
-    String,
-) {
-    (
-        axum::http::StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        did_hosting_common::server::metrics::render(),
-    )
 }

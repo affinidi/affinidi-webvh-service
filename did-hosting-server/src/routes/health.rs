@@ -18,7 +18,7 @@ pub struct HealthResponse {
     tag = "system",
     responses(
         (status = 200, description = "Service is up and its own DID (if configured) resolves locally; returns status + version", content_type = "application/json"),
-        (status = 503, description = "Service is up but its own DID isn't being served locally", content_type = "application/json"),
+        (status = 503, description = "Service is up but its own DID isn't being served locally, or it has not reconciled with its control plane within the staleness bound", content_type = "application/json"),
     ),
 ))]
 // Deliberately generic — no configuration or DID detail — but it must not
@@ -32,12 +32,18 @@ pub struct HealthResponse {
 // it's added the router's state type is already `()` and an extractor-based
 // handler would no longer type-check. The caller closes over a cloned
 // `AppState` instead.
+//
+// It also answers 503 once the edge has gone longer than
+// `replication.staleness_bound_secs` without a clean reconcile against its
+// control plane (`crate::replication`), so a load balancer drains an edge that
+// may be serving out-of-date state. The body stays generic either way.
 pub async fn health(state: AppState) -> (StatusCode, Json<HealthResponse>) {
     let ok = did_hosting_common::server::health::own_did_served_locally(
         &state.dids_ks,
         state.config.server_did.as_deref(),
     )
-    .await;
+    .await
+        && crate::replication::is_fresh(&state);
 
     let status = if ok {
         StatusCode::OK
