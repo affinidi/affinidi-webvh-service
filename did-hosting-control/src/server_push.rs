@@ -559,9 +559,9 @@ pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
     };
     for intent in intents {
         let ops: &[&str] = match intent.op {
-            DomainOp::Assign => &[MSG_DOMAIN_ASSIGN],
-            DomainOp::Unassign => &[MSG_DOMAIN_UNASSIGN],
-            DomainOp::Purge => &[MSG_DOMAIN_UNASSIGN, MSG_DOMAIN_PURGE],
+            DomainOp::Assign => &[MSG_REPLICA_DOMAIN_ASSIGN],
+            DomainOp::Unassign => &[MSG_REPLICA_DOMAIN_UNASSIGN],
+            DomainOp::Purge => &[MSG_REPLICA_DOMAIN_UNASSIGN, MSG_REPLICA_DOMAIN_PURGE],
         };
         for op in ops {
             if let Err(e) = crate::outbox::enqueue(
@@ -579,26 +579,43 @@ pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
     state.outbox_notify.notify_one();
 }
 
-/// Enqueue `MSG_DOMAIN_ASSIGN { domain }` for one server. Returns once
+/// Enqueue `replica/domain/assign { domain }` for one server. Returns once
 /// the outbox row is durable; the worker handles actual delivery and
 /// retry.
+///
+/// A purge of the same domain still queued for this server is dropped first.
+/// Each delivery attempt is signed afresh, so a purge re-sent after this
+/// assignment would carry a later `issuedAt` than the assignment and pass the
+/// server's `stalePurge` check: `replica/domain/purge/0.1` makes dropping it
+/// the control plane's job.
 pub async fn send_domain_assign(
     state: &AppState,
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
     record_domain_intent(state, target_did, domain, DomainOp::Assign).await?;
+    let dropped =
+        crate::outbox::drop_queued(&state.store, target_did, MSG_REPLICA_DOMAIN_PURGE, |body| {
+            body.get("domain").and_then(|d| d.as_str()) == Some(domain)
+        })
+        .await?;
+    if dropped > 0 {
+        info!(
+            target_did,
+            domain, dropped, "re-assign dropped a purge still queued for this server"
+        );
+    }
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_ASSIGN,
+        MSG_REPLICA_DOMAIN_ASSIGN,
         json!({ "domain": domain }),
     )
     .await?;
     Ok(())
 }
 
-/// Enqueue `MSG_DOMAIN_PURGE { domain }` for one server. Bypasses the
+/// Enqueue `replica/domain/purge { domain }` for one server. Bypasses the
 /// grace window on the recipient (audit-logged as
 /// `reason: "admin-immediate"`). Use sparingly.
 pub async fn send_domain_purge(
@@ -610,14 +627,14 @@ pub async fn send_domain_purge(
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_PURGE,
+        MSG_REPLICA_DOMAIN_PURGE,
         json!({ "domain": domain }),
     )
     .await?;
     Ok(())
 }
 
-/// Enqueue `MSG_DOMAIN_UNASSIGN { domain }` for one server. Same
+/// Enqueue `replica/domain/unassign { domain }` for one server. Same
 /// at-least-once semantics as [`send_domain_assign`].
 pub async fn send_domain_unassign(
     state: &AppState,
@@ -628,7 +645,7 @@ pub async fn send_domain_unassign(
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_UNASSIGN,
+        MSG_REPLICA_DOMAIN_UNASSIGN,
         json!({ "domain": domain }),
     )
     .await?;
@@ -639,19 +656,20 @@ pub async fn send_domain_unassign(
 // Domain replication push (split-deployment lifecycle)
 // ---------------------------------------------------------------------------
 
-/// Enqueue `MSG_DOMAIN_UPSERT { ...DomainEntry }` for one server.
+/// Enqueue `replica/domain/upsert { entry }` for one server.
 /// Replicates a control-side create / update / disable / enable so the
 /// server's local store + sweeper stay in sync. Idempotent on the
 /// receiver — re-sending the same row is harmless.
+///
+/// The entry travels in the shared `DomainEntry` wire shape
+/// ([`did_hosting_common::server::domain::wire`]), already canonical.
 pub async fn send_domain_upsert(
     state: &AppState,
     target_did: &str,
     entry: &did_hosting_common::server::domain::DomainEntry,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
-    let body = serde_json::to_value(entry).map_err(|e| {
-        did_hosting_common::server::error::AppError::Internal(format!("serialise DomainEntry: {e}"))
-    })?;
-    crate::outbox::enqueue_and_notify(state, target_did, MSG_DOMAIN_UPSERT, body).await?;
+    let body = json!({ "entry": did_hosting_common::server::domain::wire::to_spec(entry) });
+    crate::outbox::enqueue_and_notify(state, target_did, MSG_REPLICA_DOMAIN_UPSERT, body).await?;
     Ok(())
 }
 

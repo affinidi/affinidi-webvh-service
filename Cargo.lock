@@ -3264,6 +3264,8 @@ dependencies = [
  "dialoguer",
  "did-hosting-common",
  "did-hosting-control",
+ "did-hosting-server",
+ "didwebvh-rs 0.6.1",
  "ed25519-dalek 3.0.0",
  "firestore",
  "fjall",

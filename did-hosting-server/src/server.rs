@@ -137,7 +137,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     //   2. seed_assignments_first_boot — same tier chain, populates
     //      KS_ASSIGNMENTS so this server knows which domains it
     //      serves (matters once a control plane starts driving
-    //      MSG_DOMAIN_ASSIGN / unassign).
+    //      replica/domain/assign / unassign).
     //   3. MigrationRunner::run_pending — runs T13 M-01 which fills
     //      DidRecord.domain for legacy records by parsing the
     //      embedded did_id host. Required for write-side checks
@@ -742,7 +742,9 @@ fn run_rest_thread(
             routes::router(upload_body_limit)
         } else {
             info!("HTTP thread started (public DID serving only, REST API disabled)");
-            routes::router_public_only().fallback(routes::did_public::serve_public)
+            routes::router_public_only()
+                .merge(routes::trust_task_listener(upload_body_limit))
+                .fallback(routes::did_public::serve_public)
         };
 
         // Cloned before `with_state` consumes `state`: the health route is
@@ -920,7 +922,7 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 ///    on every resolve and emits a per-request warn-log.
 /// 2. **Assignment seed** (`seed_assignments_first_boot`) — same tier
 ///    chain, populates `KS_ASSIGNMENTS`. Matters once a control plane
-///    starts driving `MSG_DOMAIN_ASSIGN` / unassign messages.
+///    starts driving `replica/domain/assign` / unassign messages.
 /// 3. **Migration runner** (`MigrationRunner::run_pending`) — runs
 ///    `m01_tag_did_records_with_domain` which fills
 ///    `DidRecord.domain` for legacy records by parsing the embedded

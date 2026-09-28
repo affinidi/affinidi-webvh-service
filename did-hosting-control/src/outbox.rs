@@ -90,7 +90,7 @@ pub const MAX_BACKOFF_SECS: u64 = 5 * 60;
 pub struct OutboxEntry {
     /// Recipient DID (server DID).
     pub target_did: String,
-    /// DIDComm message-type URI (`MSG_DOMAIN_*` / `MSG_SYNC_*` etc).
+    /// Trust Task Type URI (`MSG_REPLICA_DOMAIN_*` / `MSG_SYNC_*` etc).
     pub msg_type: String,
     /// Body as serialized by the original send helper.
     pub body: Value,
@@ -306,6 +306,26 @@ pub async fn record_sent(
     outbox_ks(store)?.insert(key, &next).await
 }
 
+/// Drop every entry queued for `target_did` under `msg_type` whose body
+/// `matches` — an op a later decision has superseded. An entry already sent and
+/// awaiting its acknowledgement is dropped too: if the target applies it after
+/// all, the ack settles nothing. Returns how many were dropped.
+pub async fn drop_queued(
+    store: &Store,
+    target_did: &str,
+    msg_type: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> Result<usize, AppError> {
+    let mut dropped = 0;
+    for (key, entry) in list_pending_for_target(store, target_did).await? {
+        if entry.msg_type == msg_type && matches(&entry.body) {
+            remove(store, key).await?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
 /// The target `signer` acknowledged (or terminally refused) document `doc_id`:
 /// remove the entry awaiting it. Returns whether one was found.
 ///
@@ -334,15 +354,8 @@ pub async fn signed_document(
     entry: &OutboxEntry,
     signer: &Secret,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, Box<dyn std::error::Error + Send + Sync>> {
-    // Entries queued before the upsert op moved onto a Trust Task Type URI.
-    let type_uri = match entry.msg_type.as_str() {
-        did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT_LEGACY => {
-            did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT
-        }
-        other => other,
-    };
     build_signed_request(
-        type_uri,
+        &entry.msg_type,
         control_did,
         &entry.target_did,
         entry.body.clone(),

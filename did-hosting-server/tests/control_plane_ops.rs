@@ -15,8 +15,8 @@ use affinidi_secrets_resolver::secrets::Secret;
 use did_hosting_common::did::{DidDocumentOptions, build_did_document};
 use did_hosting_common::did_ops::{DidRecord, did_key};
 use did_hosting_common::didcomm_types::{
-    MSG_DOMAIN_ASSIGN, MSG_DOMAIN_ASSIGN_ACK, MSG_SYNC_BATCH, MSG_SYNC_BATCH_ACK, MSG_SYNC_DELETE,
-    MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK,
+    MSG_REPLICA_DOMAIN_ASSIGN, MSG_REPLICA_DOMAIN_ASSIGN_ACK, MSG_SYNC_BATCH, MSG_SYNC_BATCH_ACK,
+    MSG_SYNC_DELETE, MSG_SYNC_UPDATE, MSG_SYNC_UPDATE_ACK,
 };
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
@@ -401,7 +401,7 @@ async fn signed_domain_assign_is_applied() {
     let reply = apply(
         &state,
         signed_op(
-            MSG_DOMAIN_ASSIGN,
+            MSG_REPLICA_DOMAIN_ASSIGN,
             &control(),
             json!({ "domain": "tenant.example" }),
         )
@@ -410,10 +410,10 @@ async fn signed_domain_assign_is_applied() {
     .await;
     assert_eq!(
         reply.type_uri.to_string(),
-        MSG_DOMAIN_ASSIGN_ACK,
+        MSG_REPLICA_DOMAIN_ASSIGN_ACK,
         "{reply:?}"
     );
-    assert_eq!(reply.payload["status"], "assigned");
+    assert_eq!(reply.payload["status"], "applied");
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +471,8 @@ async fn a_document_signed_by_another_peer_is_refused_whatever_the_transport_rep
     assert!(stored(&state, "mallory").await.is_none(), "nothing applied");
 }
 
-/// The destructive ops get the same refusal.
+/// The destructive ops get the same refusal: a document that verifies but was
+/// signed by a DID other than the control plane is answered `notAuthorized`.
 #[tokio::test]
 async fn an_unauthorised_delete_or_purge_is_refused() {
     let (state, _dir) = make_state().await;
@@ -494,6 +495,7 @@ async fn an_unauthorised_delete_or_purge_is_refused() {
     )
     .await;
     assert!(is_error(&reply));
+    assert_eq!(reply.payload["code"], "webvh/sync/delete:notAuthorized");
     assert!(stored(&state, "alice").await.is_some(), "the DID survived");
 }
 

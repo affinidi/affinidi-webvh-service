@@ -28,6 +28,8 @@
 //! - `content:<mnemonic>:witness` — the witness file (if any).
 //! - `owner:<did>:<mnemonic>` — the owner index entry.
 //! - `watcher_sync:<mnemonic>` — the watcher-sync cursor (if any).
+//! - `name:<host>:<name>` — the agent-name index for each name the record
+//!   holds.
 //!
 //! All deletes for one DID are batched into a single atomic write
 //! per the existing `Store` API. Cross-DID atomicity is not
@@ -56,6 +58,9 @@ pub struct PurgeReport {
     /// the target. The vast majority of records on a multi-domain
     /// server fall here; reported only for total accounting.
     pub skipped_other_domain: u64,
+    /// Number of matching records whose deletion failed and which are still
+    /// held. Non-zero means the purge is incomplete and worth retrying.
+    pub failed: u64,
 }
 
 /// Delete every DID record on `target_domain` from the local store.
@@ -74,6 +79,7 @@ pub async fn purge_domain_dids(
     let mut deleted = 0u64;
     let mut skipped_no_domain = 0u64;
     let mut skipped_other_domain = 0u64;
+    let mut failed = 0u64;
 
     for (_key, value) in raw {
         let record: DidRecord = match serde_json::from_slice(&value) {
@@ -106,6 +112,16 @@ pub async fn purge_domain_dids(
         batch.remove(&ks, content_witness_key(&record.mnemonic));
         batch.remove(&ks, owner_key(&record.owner, &record.mnemonic));
         batch.remove(&ks, watcher_sync_key(&record.mnemonic));
+        // The agent-name index derived from the record goes with it, keyed on
+        // the host its DID identifier names — the same key the sync path wrote.
+        let host = record
+            .did_id
+            .as_deref()
+            .and_then(|d| super::domain::safety::extract_did_host(d).ok())
+            .unwrap_or_default();
+        for name in &record.agent_names {
+            batch.remove(&ks, crate::did_ops::agent_name_key(&host, &name.name));
+        }
         match batch.commit().await {
             Ok(()) => {
                 deleted += 1;
@@ -123,6 +139,7 @@ pub async fn purge_domain_dids(
                     error = %e,
                     "DID record purge failed mid-batch — leaving in place"
                 );
+                failed += 1;
             }
         }
     }
@@ -137,6 +154,7 @@ pub async fn purge_domain_dids(
     );
 
     Ok(PurgeReport {
+        failed,
         deleted,
         skipped_no_domain,
         skipped_other_domain,
