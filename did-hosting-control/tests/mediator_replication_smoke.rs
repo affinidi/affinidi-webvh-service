@@ -275,8 +275,6 @@ async fn edge_state(
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: Some(control_did.to_string()),
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -284,8 +282,6 @@ async fn edge_state(
     };
     let state = did_hosting_server::server::AppState {
         store: store.clone(),
-        sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-        acl_ks: store.keyspace(KS_ACL).unwrap(),
         dids_ks: store.keyspace(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: Some(did_resolver.clone()),
@@ -295,9 +291,6 @@ async fn edge_state(
         secrets_resolver: None,
         identity: Some(identity),
         didcomm_service: Arc::new(OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
             Duration::from_secs(60),
