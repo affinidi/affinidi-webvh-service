@@ -47,6 +47,7 @@ impl WebVHError {
     }
 }
 
+#[cfg(feature = "server-core")]
 /// Bound and sanitize a server-supplied error string before it is surfaced to the
 /// SDK caller (CWE-209): collapse control characters/whitespace and cap length, so
 /// a verbose or input-echoing server body can't leak detail or inject control
@@ -76,6 +77,7 @@ pub(crate) fn redact_server_message(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "server-core")]
     #[test]
     fn redact_server_message_bounds_and_sanitizes() {
         assert_eq!(redact_server_message("bad request"), "bad request");
