@@ -376,6 +376,17 @@ pub enum WitnessLogRefusal {
     NotListed,
 }
 
+/// What [`verify_log_for_witnessing`] established about a log it accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessedLog {
+    /// The DID's SCID: its identity across every host it moves to.
+    pub scid: String,
+    /// Every entry's versionId, in log order (`version_ids[n - 1]` is entry
+    /// `n`'s). The hash chain makes a matching versionId at position `n` a
+    /// match of the whole log up to it.
+    pub version_ids: Vec<String>,
+}
+
 /// Verify a did:webvh log a witness has been asked to witness, *before* it
 /// signs anything: the chain up to and including the entry (every entry's
 /// proof against its authorised `updateKeys`, the hash chain, pre-rotation and
@@ -389,7 +400,7 @@ pub fn verify_log_for_witnessing(
     content: &str,
     version_id: &str,
     witness_did: &str,
-) -> Result<(), WitnessLogRefusal> {
+) -> Result<WitnessedLog, WitnessLogRefusal> {
     validate_did_jsonl(content).map_err(WitnessLogRefusal::InvalidLog)?;
 
     let mut entries: Vec<LogEntryState> = Vec::new();
@@ -457,7 +468,19 @@ pub fn verify_log_for_witnessing(
     if !listed {
         return Err(WitnessLogRefusal::NotListed);
     }
-    Ok(())
+    let scid = last
+        .validated_parameters
+        .scid
+        .as_deref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log establishes no SCID".into()))?;
+    Ok(WitnessedLog {
+        scid,
+        version_ids: entries
+            .iter()
+            .map(|e| e.get_version_id().to_string())
+            .collect(),
+    })
 }
 
 /// Check that `next` is an acceptable successor of the `did.jsonl` a host

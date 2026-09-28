@@ -264,6 +264,12 @@ fn reply<R: serde::Serialize + serde::de::DeserializeOwned>(
     serde_json::to_value(typed).map_err(internal)
 }
 
+fn invalid_log(reason: String) -> ErrorPayload {
+    ErrorPayload::from(sign::error_codes::INVALID_LOG)
+        .with_message("the log does not verify")
+        .with_details(json!({ "reason": reason }))
+}
+
 fn internal(e: impl std::fmt::Display) -> ErrorPayload {
     RejectReason::InternalError {
         reason: e.to_string(),
@@ -341,8 +347,9 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
 
 /// `webvh/witness/sign/0.1`: the witness signs only an entry it has verified —
 /// the log's chain up to the entry, that the entry is the last, that the DID
-/// is not deactivated, and that the entry's witness parameter names this
-/// witness identity.
+/// is not deactivated, that the entry's witness parameter names this witness
+/// identity, and that the log extends the furthest entry this identity has
+/// already witnessed for the DID.
 async fn sign_task(
     state: &AppState,
     requester: &str,
@@ -359,33 +366,67 @@ async fn sign_task(
             .with_message(format!("no witness identity {witness_id}")));
     };
 
-    if let Err(refusal) = verify_log_for_witnessing(&p.log_content, version_id, &record.did) {
-        warn!(
-            requester,
-            witness_id,
-            version_id,
-            ?refusal,
-            "witness sign refused"
-        );
-        return Err(match refusal {
-            WitnessLogRefusal::InvalidLog(reason) => {
-                ErrorPayload::from(sign::error_codes::INVALID_LOG)
-                    .with_message("the log does not verify")
-                    .with_details(json!({ "reason": reason }))
-            }
-            WitnessLogRefusal::VersionNotLast { last } => {
-                ErrorPayload::from(sign::error_codes::VERSION_NOT_LAST).with_message(format!(
-                    "{version_id} is not the last entry of the log ({last} is)"
-                ))
-            }
-            WitnessLogRefusal::Deactivated => ErrorPayload::from(sign::error_codes::DEACTIVATED)
-                .with_message("the log deactivates the DID"),
-            WitnessLogRefusal::NotListed => ErrorPayload::from(sign::error_codes::NOT_LISTED)
-                .with_message(format!(
-                    "the entry's witness parameter does not name {}",
-                    record.did
-                )),
-        });
+    let witnessed = match verify_log_for_witnessing(&p.log_content, version_id, &record.did) {
+        Ok(w) => w,
+        Err(refusal) => {
+            warn!(
+                requester,
+                witness_id,
+                version_id,
+                ?refusal,
+                "witness sign refused"
+            );
+            return Err(match refusal {
+                WitnessLogRefusal::InvalidLog(reason) => invalid_log(reason),
+                WitnessLogRefusal::VersionNotLast { last } => {
+                    ErrorPayload::from(sign::error_codes::VERSION_NOT_LAST).with_message(format!(
+                        "{version_id} is not the last entry of the log ({last} is)"
+                    ))
+                }
+                WitnessLogRefusal::Deactivated => {
+                    ErrorPayload::from(sign::error_codes::DEACTIVATED)
+                        .with_message("the log deactivates the DID")
+                }
+                WitnessLogRefusal::NotListed => ErrorPayload::from(sign::error_codes::NOT_LISTED)
+                    .with_message(format!(
+                        "the entry's witness parameter does not name {}",
+                        record.did
+                    )),
+            });
+        }
+    };
+
+    // The log must extend what this witness identity has already witnessed for
+    // the DID: a witness proof on entry N vouches for every entry before it, so
+    // witnessing a fork — or an older entry than one already witnessed — would
+    // put this identity's name behind two histories of one DID. The check, the
+    // signature and the record are one step under `sign_lock`.
+    let _guard = state.sign_lock.lock().await;
+    let version_number = witnessed.version_ids.len() as u64;
+    let mark = witness_ops::get_witnessed_mark(&state.witnesses_ks, witness_id, &witnessed.scid)
+        .await
+        .map_err(internal)?;
+    if let Some(mark) = mark.as_ref() {
+        let extends = version_number >= mark.version_number
+            && usize::try_from(mark.version_number)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| witnessed.version_ids.get(i))
+                == Some(&mark.version_id);
+        if !extends {
+            warn!(
+                requester,
+                witness_id,
+                version_id,
+                witnessed = %mark.version_id,
+                "witness sign refused: the log does not extend what this witness has witnessed"
+            );
+            return Err(invalid_log(format!(
+                "the log does not extend {}, which this witness identity has already witnessed \
+                 for this DID",
+                mark.version_id
+            )));
+        }
     }
 
     let (version_id, proof) = witness_ops::sign_witness_proof(
@@ -396,6 +437,23 @@ async fn sign_task(
     )
     .await
     .map_err(internal)?;
+    if mark
+        .as_ref()
+        .is_none_or(|m| version_number > m.version_number)
+    {
+        witness_ops::set_witnessed_mark(
+            &state.witnesses_ks,
+            witness_id,
+            &witnessed.scid,
+            &witness_ops::WitnessedMark {
+                version_number,
+                version_id: version_id.clone(),
+            },
+        )
+        .await
+        .map_err(internal)?;
+    }
+    drop(_guard);
     let did = did_hosting_common::did_ops::extract_did_id(&p.log_content).unwrap_or_default();
     info!(
         audit = true,
