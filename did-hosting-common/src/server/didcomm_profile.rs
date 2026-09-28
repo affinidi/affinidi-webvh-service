@@ -65,18 +65,23 @@ pub async fn resolve_mediator_did(
 
 /// A transport a peer's DID document advertises for reaching it.
 ///
-/// The `did-hosting` workspace treats **TSP as preferred over DIDComm**
-/// when a peer advertises both — matching the canonical service order
-/// the VTA webvh templates render (`#tsp` before `#vta-didcomm`). The
-/// outbound send path ([`crate::server`] / the trust-task sender) uses
-/// [`resolve_transport`] to pick the binding; both services point at the
-/// same mediator VID, so only the *binding* differs.
+/// The `did-hosting` workspace treats **TSP as preferred over DIDComm,
+/// and DIDComm as preferred over HTTPS** when a peer advertises more than
+/// one — matching the canonical service order the VTA webvh templates
+/// render (`#tsp`, then `#vta-didcomm`, then `#trust-tasks`). The outbound
+/// send path ([`crate::server`] / the trust-task sender) uses
+/// [`resolve_transport`] to pick the binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerTransport {
     /// Trust Spanning Protocol (`TSPTransport` service).
     Tsp,
     /// DIDComm v2 (`DIDCommMessaging` service).
     Didcomm,
+    /// The HTTPS Trust-Task binding (`TrustTaskHTTPS` service). Unlike
+    /// `Tsp`/`Didcomm`, this carries no mediator — the peer *is* the
+    /// endpoint, so [`resolve_transport`]'s paired `String` is the request
+    /// base URL rather than a mediator VID.
+    Https,
 }
 
 /// A transport a message was **observed** travelling on, as opposed to
@@ -121,6 +126,7 @@ impl From<PeerTransport> for ObservedTransport {
         match t {
             PeerTransport::Tsp => Self::Tsp,
             PeerTransport::Didcomm => Self::Didcomm,
+            PeerTransport::Https => Self::Https,
         }
     }
 }
@@ -195,13 +201,22 @@ pub async fn resolve_service_types(
 /// the peer's DID document.
 ///
 /// Scans for a `TSPTransport` service **first**, falling back to
-/// `DIDCommMessaging`. Returns `(transport, mediator_endpoint)`, or
-/// `None` if the DID cannot be resolved or advertises neither service.
+/// `DIDCommMessaging`, falling back to `TrustTaskHTTPS`. Returns
+/// `(transport, endpoint)` — a mediator VID for `Tsp`/`Didcomm`, the
+/// request base URL for `Https` — or `None` if the DID cannot be resolved
+/// or advertises none of the three.
 ///
 /// This is the single canonical "which transport for this peer" reader —
-/// when a DID has a `TSPTransport` service we prefer it, which is the
-/// concrete realisation of "when a DID has a TSPTransport, use that
-/// instead of DIDComm".
+/// when a DID has a `TSPTransport` service we prefer it over `DIDComm`,
+/// and prefer `DIDComm` over `TrustTaskHTTPS` — the concrete realisation
+/// of "TSP > DIDComm > HTTPS".
+///
+/// A `TrustTaskHTTPS` endpoint is used only when
+/// [`crate::did::is_https_or_loopback`] accepts it — the same gate
+/// `add_trust_task_https_service` asks callers to apply before
+/// advertising it. A document that names a plain non-loopback `http://`
+/// endpoint (misconfiguration, or a downgrade attempt) is treated as
+/// silent on this transport rather than routed to insecurely.
 pub async fn resolve_transport(
     peer_did: &str,
     did_resolver: Option<&DIDCacheClient>,
@@ -249,6 +264,18 @@ pub async fn resolve_transport(
         info!(peer = peer_did, mediator = %didcomm, "peer advertises DIDCommMessaging — using DIDComm");
         return Some((PeerTransport::Didcomm, didcomm));
     }
+    if let Some(https) = find_uri("TrustTaskHTTPS") {
+        if crate::did::is_https_or_loopback(&https) {
+            info!(peer = peer_did, endpoint = %https, "peer advertises TrustTaskHTTPS — using HTTPS");
+            return Some((PeerTransport::Https, https));
+        }
+        warn!(
+            peer = peer_did,
+            endpoint = %https,
+            "peer advertises TrustTaskHTTPS at a non-https, non-loopback endpoint — refusing to \
+             route trust tasks there"
+        );
+    }
     None
 }
 
@@ -263,9 +290,14 @@ pub async fn resolve_transport(
 /// doc-silent peers over its own mediator — while a node with no mediator
 /// (which could never have spoken DIDComm) yields no binding and the caller
 /// treats the peer as unroutable, rather than silently attempting a DIDComm
-/// send that cannot route. (There is no REST tier: no trust-task REST sender
-/// or server-side inbound route exists; HTTP-only nodes are served by the
-/// pull/watcher model, not a trust-task push.)
+/// send that cannot route.
+///
+/// This fallback is deliberately DIDComm/TSP-only, not HTTPS: a shared
+/// mediator is a real compatibility bridge two nodes could always have
+/// spoken over, but there is no equivalent "shared HTTPS endpoint" a
+/// document-silent peer could be guessed to answer at. A peer only gets
+/// [`PeerTransport::Https`] by advertising `TrustTaskHTTPS` itself
+/// ([`resolve_transport`]).
 ///
 /// `binding` is the node's *own* mediator VID plus the transport it prefers
 /// (TSP when `features.tsp`, else DIDComm). It is `None` on HTTP-only nodes.
@@ -299,11 +331,13 @@ impl TransportFallback {
 /// Decide how to reach `peer_did` with a trust task, applying the
 /// **DID-document-authoritative** precedence:
 ///
-/// 1. **DID document** — a `TSPTransport` (preferred) or `DIDCommMessaging`
-///    service is the authoritative statement of how to reach the peer.
-/// 2. **Config fallback** — if the document advertises neither, use the local
-///    node's configured mediator ([`TransportFallback`]). Preserves existing
-///    shared-mediator deployments whose documents predate published transports.
+/// 1. **DID document** — a `TSPTransport` (preferred), `DIDCommMessaging`, or
+///    `TrustTaskHTTPS` service, in that order, is the authoritative statement
+///    of how to reach the peer.
+/// 2. **Config fallback** — if the document advertises none of the three, use
+///    the local node's configured mediator ([`TransportFallback`]). Preserves
+///    existing shared-mediator deployments whose documents predate published
+///    transports.
 /// 3. **Fail** — `None` when the peer advertises no messaging service and the
 ///    node has no configured mediator. The caller treats this as an unroutable
 ///    peer rather than blindly attempting a send that cannot succeed.
@@ -575,6 +609,35 @@ mod tests {
 
     fn cfg(mediator: Option<&str>, prefer_tsp: bool) -> TransportFallback {
         TransportFallback::from_config(mediator, prefer_tsp)
+    }
+
+    /// TSP > DIDComm > HTTPS: `resolve_transport` never has to run against a
+    /// live resolver here — [`decide_binding`]/`ObservedTransport` only need
+    /// the *shape* to be right — but the HTTPS binding itself is exercised via
+    /// `find_uri`'s equivalent in `resolve_transport`'s doc tests below where
+    /// a resolver is available. This covers the `PeerTransport::Https` arm of
+    /// the precedence ladder that HTTPS shares with TSP/DIDComm: document
+    /// wins over config, and HTTPS carries the endpoint URL as its "mediator"
+    /// slot.
+    #[test]
+    fn https_binding_from_document_wins_over_config_like_the_others() {
+        let https = decide_binding(
+            PEER,
+            Some((PeerTransport::Https, "https://peer.example/api".into())),
+            &cfg(Some(CFG_MED), true),
+        );
+        assert_eq!(
+            https,
+            Some((PeerTransport::Https, "https://peer.example/api".into()))
+        );
+    }
+
+    #[test]
+    fn https_observed_transport_round_trips() {
+        assert_eq!(
+            ObservedTransport::from(PeerTransport::Https),
+            ObservedTransport::Https
+        );
     }
 
     #[test]

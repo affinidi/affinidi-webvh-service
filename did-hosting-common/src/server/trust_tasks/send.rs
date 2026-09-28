@@ -12,11 +12,14 @@
 //! | peer advertises | frame |
 //! |---|---|
 //! | `TSPTransport` | the document's JSON, sealed as a TSP payload |
-//! | otherwise | the document inside a [`trust_tasks_didcomm::ENVELOPE_TYPE`] DIDComm message |
+//! | `DIDCommMessaging` | the document inside a [`trust_tasks_didcomm::ENVELOPE_TYPE`] DIDComm message |
+//! | `TrustTaskHTTPS` | the document's JSON, `POST`ed to `{endpoint}/trust-tasks` |
 //!
-//! Both shapes already have inbound readers: TSP frames are parsed as
-//! `TrustTask<Value>` by each service's `TspHandler`, and the DIDComm envelope
-//! is routed to the same dispatcher. So a trust task is a *transport-agnostic*
+//! All three shapes already have inbound readers: TSP frames are parsed as
+//! `TrustTask<Value>` by each service's `TspHandler`, the DIDComm envelope is
+//! routed to the same dispatcher, and the HTTPS route
+//! (`did-hosting-server`'s `routes::trust_tasks::receive`) hands the posted
+//! body to that dispatcher too. So a trust task is a *transport-agnostic*
 //! unit: the same Type URI, the same payload, the same handler — only the
 //! binding differs, chosen by what the recipient says it speaks.
 //!
@@ -24,20 +27,32 @@
 //!
 //! The binding is chosen by
 //! [`crate::server::didcomm_profile::resolve_send_binding`], which treats the
-//! peer's **DID document as authoritative** (`TSPTransport` preferred, else
-//! `DIDCommMessaging`) and falls back to this node's configured mediator only
-//! when the document advertises neither — the compatibility bridge for DIDs
-//! minted before transports were published, which worked precisely because the
-//! two ends shared a mediator.
+//! peer's **DID document as authoritative** — `TSPTransport` preferred, then
+//! `DIDCommMessaging`, then `TrustTaskHTTPS` — and falls back to this node's
+//! configured mediator only when the document advertises none of the three —
+//! the compatibility bridge for DIDs minted before transports were published,
+//! which worked precisely because the two ends shared a mediator. (The config
+//! fallback is TSP/DIDComm only; there is no "shared HTTPS endpoint"
+//! equivalent, so a document-silent peer is never guessed to speak HTTPS.)
 //!
 //! When neither the document nor config yields a binding, the send **fails**
 //! rather than blindly attempting DIDComm. The former blind-DIDComm default
 //! only ever routed because a mediator existed; a node with no mediator could
 //! not have reached the peer that way regardless, so an explicit error is the
 //! honest outcome and lets the caller (outbox retry, health loop) record an
-//! unroutable peer instead of swallowing a send that cannot succeed. (There is
-//! deliberately no REST tier: no trust-task REST sender or server-side inbound
-//! route exists — HTTP-only nodes are served by the pull/watcher model.)
+//! unroutable peer instead of swallowing a send that cannot succeed.
+//!
+//! ## The HTTPS reply
+//!
+//! Over TSP and DIDComm the reply is a separate message that arrives later on
+//! the mediator connection, verified by the ordinary inbound path
+//! ([`super::bound::verify_sender_bound`]) whenever it shows up. HTTPS has no
+//! separate inbound leg — the reply *is* the HTTP response — so
+//! [`send_over_https`] applies the same rule synchronously: the reply must
+//! carry a `proof` binding it to the peer we addressed, must be addressed back
+//! to us, and must thread to the request. A 2xx response that fails any of
+//! these is treated as a send failure, not a success — an unsigned or
+//! misdirected 2xx is not evidence the peer accepted the task.
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::Message;
@@ -46,6 +61,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::server::didcomm_profile::{PeerTransport, TransportFallback, resolve_send_binding};
+use crate::server::trust_tasks::{build_verifier, verify_sender_bound};
 
 /// Boxed transport error — mirrors the outbox's error type so `deliver()` can
 /// eventually be rewritten on top of this without changing its signature.
@@ -113,6 +129,11 @@ pub async fn send_trust_task(
         Some((PeerTransport::Didcomm, _)) => {
             send_over_didcomm(didcomm, listener_id, from, to, doc).await?;
             Ok(PeerTransport::Didcomm)
+        }
+        Some((PeerTransport::Https, endpoint)) => {
+            send_over_https(from, to, &endpoint, doc, did_resolver).await?;
+            debug!(to, endpoint, type_uri = %doc.type_uri, "trust task sent over HTTPS");
+            Ok(PeerTransport::Https)
         }
         // No binding: the peer advertises no messaging transport AND this node
         // has no configured mediator to fall back on. This replaces the former
@@ -203,6 +224,104 @@ async fn send_over_didcomm(
     didcomm.send_message(listener_id, msg, to).await?;
     debug!(to, type_uri = %doc.type_uri, "trust task sent over DIDComm envelope");
     Ok(())
+}
+
+/// Refuse an HTTPS trust-task reply body larger than this. A reply is one
+/// small signed JSON document; a peer sending more is misbehaving, not slow.
+const HTTPS_MAX_REPLY_BYTES: u64 = 1024 * 1024;
+
+/// `POST doc` to the peer's advertised `TrustTaskHTTPS` endpoint and verify
+/// the reply.
+///
+/// `endpoint` is the Trust-Task **base** URL the peer's DID document
+/// advertises (HTTPS binding 0.2 §6); the request goes to
+/// `{endpoint}/trust-tasks`, matching [`trust_tasks_https::HttpsClient`] and
+/// the inbound route this crate serves at `POST {base}/trust-tasks`.
+///
+/// Uses [`crate::http::outbound_client`] for the shared connect/request
+/// timeouts and redirect refusal (a redirect to another origin would carry
+/// the signed document to a host the peer's document never named). The reply
+/// body is read with a hard cap ([`HTTPS_MAX_REPLY_BYTES`]) so a misbehaving
+/// peer cannot make the caller buffer an unbounded response.
+///
+/// A 2xx HTTP status is not itself success: the reply must additionally be
+/// signed by `to` (the peer this send addressed), addressed back to `from`,
+/// and threaded to `doc` — see the module docs' "The HTTPS reply" section.
+/// Any of these failing is reported as a send failure, same as a transport
+/// error would be.
+async fn send_over_https(
+    from: &str,
+    to: &str,
+    endpoint: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Result<(), SendError> {
+    let url = format!("{}/trust-tasks", endpoint.trim_end_matches('/'));
+
+    let resp = crate::http::outbound_client()
+        .post(&url)
+        .json(doc)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = read_capped_body(resp, HTTPS_MAX_REPLY_BYTES).await?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "trust task HTTPS send to {to} ({url}) failed: HTTP {status}: {}",
+            String::from_utf8_lossy(&body)
+        )
+        .into());
+    }
+
+    let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&body).map_err(|e| {
+        format!("trust task HTTPS reply from {to} ({url}) did not parse as a Trust Task: {e}")
+    })?;
+
+    // Threaded — the reply must correlate to this exact request, the same
+    // check `trust_tasks_https::HttpsClient::send` applies on the generic
+    // client path.
+    let expected_thread = doc.thread_id.clone().unwrap_or_else(|| doc.id.clone());
+    if reply.thread_id.as_deref() != Some(expected_thread.as_str()) {
+        return Err(format!(
+            "trust task HTTPS reply from {to} is not threaded to the request: expected \
+             threadId {expected_thread}, got {:?}",
+            reply.thread_id
+        )
+        .into());
+    }
+
+    // Signed by the peer we addressed, and addressed back to us — the same
+    // sender-bound rule every inbound document on any transport is held to.
+    let verifier = build_verifier(did_resolver).ok_or_else(|| {
+        format!("trust task HTTPS reply from {to}: no DID resolver configured to verify it")
+    })?;
+    verify_sender_bound(&reply, Some(to), None, from, &verifier).await?;
+
+    Ok(())
+}
+
+/// Read `resp`'s body, refusing more than `limit` bytes — from either a
+/// declared `Content-Length` or the bytes actually received, whichever
+/// catches it first.
+async fn read_capped_body(mut resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, SendError> {
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        return Err(
+            format!("trust task HTTPS reply body too large: {len} bytes (limit {limit})").into(),
+        );
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > limit {
+            return Err(
+                format!("trust task HTTPS reply body exceeded the {limit}-byte limit").into(),
+            );
+        }
+    }
+    Ok(body)
 }
 
 /// Build a request document addressed from `from` to `to`.
