@@ -83,7 +83,7 @@ async fn run_watcher(config_path: Option<PathBuf>) {
 
     did_hosting_common::server::config::init_tracing(&config.log);
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 

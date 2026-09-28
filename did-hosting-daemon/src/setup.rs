@@ -212,6 +212,7 @@ pub async fn run_wizard(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
@@ -1057,6 +1058,7 @@ async fn run_self_managed_setup(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
         watcher_sync: webvh_watcher::config::SyncConfig::default(),
@@ -1423,6 +1425,7 @@ pub async fn run_setup_offline_complete(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
             url: result.vta_url.clone(),
