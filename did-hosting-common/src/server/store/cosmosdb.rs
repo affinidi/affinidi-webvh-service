@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use azure_data_cosmos::FeedScope;
-use azure_data_cosmos::options::Region;
+use azure_data_cosmos::options::{ItemWriteOptions, Precondition, Region};
 use azure_data_cosmos::{AccountEndpoint, AccountReference, CosmosClient, RoutingStrategy};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -17,6 +16,12 @@ use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 /// The partition key value used for all items (single-partition design).
 const PARTITION_VALUE: &str = "kv";
+
+/// How many times a conditional (ETag) write is retried under contention
+/// before `take_raw_atomic`/`incr_raw` give up with an error. Each retry
+/// means another writer won, so this is only reached under a sustained
+/// race on one key.
+const CONDITIONAL_WRITE_ATTEMPTS: usize = 16;
 
 /// Document model stored in Cosmos DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,8 +120,6 @@ impl StorageBackend for CosmosDbBackend {
                 client: self.client.clone(),
                 database: self.database.clone(),
                 container_name: name.to_string(),
-                take_lock: Mutex::new(()),
-                incr_lock: Mutex::new(()),
             }),
         ))
     }
@@ -143,13 +146,6 @@ struct CosmosDbKeyspace {
     client: CosmosClient,
     database: String,
     container_name: String,
-    /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
-    /// single-replica-only caveat.
-    take_lock: Mutex<()>,
-    /// Per-keyspace mutex for `incr_raw` — see method doc for the
-    /// single-replica-only caveat. Kept apart from `take_lock` so an
-    /// increment and a take don't contend on an unrelated key.
-    incr_lock: Mutex<()>,
 }
 
 fn encode_doc_id(key: &[u8]) -> String {
@@ -229,43 +225,112 @@ impl KeyspaceOps for CosmosDbKeyspace {
     }
 
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
-        // Cosmos DB does not expose a single-call atomic get-and-remove
-        // primitive; transactional batches are container-bounded and
-        // would require a transactional batch with a read followed by
-        // a delete, which is heavyweight for the refresh-token rotation
-        // path. The current implementation serialises the get-then-
-        // remove with a per-keyspace mutex — correct for **single-
-        // replica** webvh deployments backed by Cosmos DB. Multi-replica
-        // deployments wanting refresh-token rotation atomicity should
-        // pick `store-redis` or `store-dynamodb`, or upgrade this to
-        // a transactional batch in a follow-up.
+        // Read the item and its ETag, then delete it `If-Match` that ETag.
+        // Cosmos DB deletes a given version of an item exactly once, so of
+        // any number of callers — on any replica — racing on the same key,
+        // one delete succeeds and returns the value; the rest see 404 (it's
+        // gone) or 412 (it changed; re-read) and never return it.
         Box::pin(async move {
-            let _guard = self.take_lock.lock().await;
-            let value = self.get_raw(key.clone()).await?;
-            if value.is_some() {
-                self.remove(key).await?;
+            let container = self.container().await?;
+            let doc_id = encode_doc_id(&key);
+            for _ in 0..CONDITIONAL_WRITE_ATTEMPTS {
+                let resp = match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+                    Ok(resp) => resp,
+                    Err(e) if is_not_found(&e) => return Ok(None),
+                    Err(e) => return Err(AppError::Store(format!("cosmosdb read: {e}"))),
+                };
+                let etag = resp
+                    .headers()
+                    .etag()
+                    .cloned()
+                    .ok_or_else(|| AppError::Store("cosmosdb read: no etag".into()))?;
+                let doc: KvDoc = resp
+                    .into_model()
+                    .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}")))?;
+                let options =
+                    ItemWriteOptions::default().with_precondition(Precondition::if_match(etag));
+                match container
+                    .delete_item(PARTITION_VALUE, &doc_id, Some(options))
+                    .await
+                {
+                    Ok(_) => {
+                        let bytes = BASE64
+                            .decode(&doc.data)
+                            .map_err(|e| AppError::Store(format!("cosmosdb decode: {e}")))?;
+                        return Ok(Some(bytes));
+                    }
+                    Err(e) if is_not_found(&e) => return Ok(None),
+                    Err(e) if e.status().is_precondition_failed() => continue,
+                    Err(e) => return Err(AppError::Store(format!("cosmosdb delete: {e}"))),
+                }
             }
-            Ok(value)
+            Err(AppError::Store("cosmosdb take: too much contention".into()))
         })
     }
 
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
-        // Same single-replica caveat as `take_raw_atomic`: Cosmos DB has no
-        // single-call atomic counter in this client, so the read-then-write
-        // is serialised with a per-keyspace mutex — correct for
-        // **single-replica** deployments only. Multi-replica deployments
-        // wanting a cross-replica lockout counter should pick `store-redis`
-        // or `store-dynamodb`, both of which have a native atomic increment.
+        // Optimistic concurrency: create the counter (a create 409s if the
+        // item already exists), or replace it `If-Match` the ETag just read. A racing writer on another replica
+        // makes the write fail (409/412) and this re-reads, so no increment
+        // is ever lost.
         Box::pin(async move {
-            let _guard = self.incr_lock.lock().await;
-            let current = self
-                .get_raw(key.clone())
-                .await?
-                .map(|bytes| decode_counter(&bytes))
-                .unwrap_or(0);
-            let next = current.saturating_add(1);
-            self.insert_raw(key, encode_counter(next)).await?;
-            Ok(next)
+            let container = self.container().await?;
+            let doc_id = encode_doc_id(&key);
+            let counter_doc = |n: u64| KvDoc {
+                id: doc_id.clone(),
+                pk: PARTITION_VALUE.to_string(),
+                data: BASE64.encode(encode_counter(n)),
+            };
+            for _ in 0..CONDITIONAL_WRITE_ATTEMPTS {
+                match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+                    Err(e) if is_not_found(&e) => {
+                        match container
+                            .create_item(PARTITION_VALUE, &doc_id, counter_doc(1), None)
+                            .await
+                        {
+                            Ok(_) => return Ok(1),
+                            Err(e) if e.status().is_conflict() => continue,
+                            Err(e) => return Err(AppError::Store(format!("cosmosdb create: {e}"))),
+                        }
+                    }
+                    Err(e) => return Err(AppError::Store(format!("cosmosdb read: {e}"))),
+                    Ok(resp) => {
+                        let etag = resp
+                            .headers()
+                            .etag()
+                            .cloned()
+                            .ok_or_else(|| AppError::Store("cosmosdb read: no etag".into()))?;
+                        let doc: KvDoc = resp
+                            .into_model()
+                            .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}")))?;
+                        let next = BASE64
+                            .decode(&doc.data)
+                            .map(|bytes| decode_counter(&bytes))
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        let options = ItemWriteOptions::default()
+                            .with_precondition(Precondition::if_match(etag));
+                        match container
+                            .replace_item(
+                                PARTITION_VALUE,
+                                &doc_id,
+                                counter_doc(next),
+                                Some(options),
+                            )
+                            .await
+                        {
+                            Ok(_) => return Ok(next),
+                            Err(e) if e.status().is_precondition_failed() || is_not_found(&e) => {
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(AppError::Store(format!("cosmosdb replace: {e}")));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(AppError::Store("cosmosdb incr: too much contention".into()))
         })
     }
 

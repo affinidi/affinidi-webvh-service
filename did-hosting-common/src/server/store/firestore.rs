@@ -10,7 +10,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use firestore::*;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -64,8 +63,6 @@ impl StorageBackend for FirestoreBackend {
             Arc::new(FirestoreKeyspace {
                 db: self.db.clone(),
                 collection: name.to_string(),
-                take_lock: Mutex::new(()),
-                incr_lock: Mutex::new(()),
             }),
         ))
     }
@@ -90,13 +87,6 @@ impl StorageBackend for FirestoreBackend {
 struct FirestoreKeyspace {
     db: FirestoreDb,
     collection: String,
-    /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
-    /// single-replica-only caveat.
-    take_lock: Mutex<()>,
-    /// Per-keyspace mutex for `incr_raw` — see method doc for the
-    /// single-replica-only caveat. Kept apart from `take_lock` so an
-    /// increment and a take don't contend on an unrelated key.
-    incr_lock: Mutex<()>,
 }
 
 /// Encode raw key bytes to a Firestore-safe document ID (base64url, no pad).
@@ -197,46 +187,88 @@ impl KeyspaceOps for FirestoreKeyspace {
     }
 
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
-        // Firestore does not expose a single-call atomic get-and-remove;
-        // doing it correctly cross-replica would require a transaction
-        // with optimistic concurrency (`run_transaction`). The current
-        // implementation serialises the get-then-remove with a per-
-        // keyspace mutex, which is correct for **single-replica** webvh
-        // deployments backed by Firestore. Multi-replica deployments
-        // wanting refresh-token rotation atomicity should pick the
-        // `store-redis` or `store-dynamodb` backend (both have native
-        // single-call primitives), or upgrade this method to a Firestore
-        // transaction in a follow-up.
+        // A Firestore read-write transaction: the read takes a lock on the
+        // document and the commit fails (and is retried by
+        // `run_transaction`) if another transaction wrote it meanwhile, so
+        // exactly one caller — on any replica — gets the value back.
         Box::pin(async move {
-            let _guard = self.take_lock.lock().await;
-            let value = self.get_raw(key.clone()).await?;
-            if value.is_some() {
-                self.remove(key).await?;
-            }
-            Ok(value)
+            let doc_id = encode_doc_id(&key);
+            let collection = self.collection.clone();
+            let taken = self
+                .db
+                .run_transaction(move |db, tx| {
+                    let doc_id = doc_id.clone();
+                    let collection = collection.clone();
+                    Box::pin(async move {
+                        let current: Option<KvDoc> = db
+                            .fluent()
+                            .select()
+                            .by_id_in(&collection)
+                            .obj()
+                            .one(&doc_id)
+                            .await?;
+                        if current.is_some() {
+                            db.fluent()
+                                .delete()
+                                .from(&collection)
+                                .document_id(&doc_id)
+                                .add_to_transaction(tx)?;
+                        }
+                        Ok(current.map(|d| d.data))
+                    })
+                })
+                .await
+                .map_err(|e| AppError::Store(format!("firestore take: {e}")))?;
+            taken
+                .map(|data| {
+                    BASE64
+                        .decode(&data)
+                        .map_err(|e| AppError::Store(format!("firestore decode: {e}")))
+                })
+                .transpose()
         })
     }
 
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
-        // Same single-replica caveat as `take_raw_atomic`: doing this
-        // correctly cross-replica would need a Firestore transaction
-        // (`run_transaction`). The current implementation serialises the
-        // read-then-write with a per-keyspace mutex, correct for
-        // **single-replica** deployments only. Multi-replica deployments
-        // wanting a cross-replica lockout counter should pick the
-        // `store-redis` or `store-dynamodb` backend (both have a native
-        // atomic increment), or upgrade this method to a transaction in a
-        // follow-up.
+        // Read-increment-write inside a Firestore read-write transaction, so
+        // two replicas racing on the same counter serialise in the store:
+        // the loser's commit aborts and `run_transaction` re-runs it against
+        // the winner's value. No increment is lost, across replicas.
         Box::pin(async move {
-            let _guard = self.incr_lock.lock().await;
-            let current = self
-                .get_raw(key.clone())
-                .await?
-                .map(|bytes| decode_counter(&bytes))
-                .unwrap_or(0);
-            let next = current.saturating_add(1);
-            self.insert_raw(key, encode_counter(next)).await?;
-            Ok(next)
+            let doc_id = encode_doc_id(&key);
+            let collection = self.collection.clone();
+            self.db
+                .run_transaction(move |db, tx| {
+                    let doc_id = doc_id.clone();
+                    let collection = collection.clone();
+                    Box::pin(async move {
+                        let current: Option<KvDoc> = db
+                            .fluent()
+                            .select()
+                            .by_id_in(&collection)
+                            .obj()
+                            .one(&doc_id)
+                            .await?;
+                        let next = current
+                            .and_then(|d| BASE64.decode(&d.data).ok())
+                            .map(|bytes| decode_counter(&bytes))
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        let doc = KvDoc {
+                            key: doc_id.clone(),
+                            data: BASE64.encode(encode_counter(next)),
+                        };
+                        db.fluent()
+                            .update()
+                            .in_col(&collection)
+                            .document_id(&doc_id)
+                            .object(&doc)
+                            .add_to_transaction(tx)?;
+                        Ok(next)
+                    })
+                })
+                .await
+                .map_err(|e| AppError::Store(format!("firestore incr: {e}")))
         })
     }
 

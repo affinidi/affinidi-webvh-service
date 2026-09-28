@@ -641,6 +641,10 @@ pub(crate) async fn redeem_finish(
     }
 
     let store = credential_store(state, ceremony.purpose)?;
+    // Held from this read through `persist`, so a concurrent revoke can't be
+    // lost under this write (nor this credential under the revoke's).
+    let _guard =
+        super::passkey::credentials_guard(state, ceremony.purpose, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&store, &ceremony.subject).await?;
     let uv = p
         .uv_credential
@@ -816,6 +820,8 @@ pub(crate) async fn finish(
             "this enrolment was started by another subject or session".into(),
         ));
     }
+    let _guard =
+        super::passkey::credentials_guard(state, Purpose::Session, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&state.sessions_ks, &ceremony.subject).await?;
     if existing
         .as_ref()

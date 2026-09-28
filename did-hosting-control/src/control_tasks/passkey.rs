@@ -39,15 +39,30 @@ fn revocation_key(id: &str) -> String {
     format!("pk_revoke:{id}")
 }
 
-/// The id a revocation's WebAuthn authentication state is stored under, via
-/// the shared `passkey::store` auth-state helpers.
-fn revocation_webauthn_id(id: &str) -> String {
-    format!("revoke:{id}")
+/// The per-process lock that serialises every read-modify-write of one
+/// subject's credentials of one purpose — revocations against each other (so
+/// two racing revokes can't each see the other's credential still present
+/// and both pass the last-login-passkey guard) and against enrolment (so
+/// neither write loses the other's change). In-process, like every other
+/// `PathLocks` invariant here: the control plane is single-instance.
+pub(crate) async fn credentials_guard(
+    state: &AppState,
+    purpose: Purpose,
+    subject: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    state
+        .path_locks
+        .guard(&format!(
+            "::passkey-credentials:{}:{subject}",
+            purpose.as_str()
+        ))
+        .await
 }
 
 /// An open revocation: the producer's own user-verification ceremony, bound
-/// server-side to the one credential it authorises unbinding. Taken (and its
-/// WebAuthn state with it) by the first finish that presents its id.
+/// server-side to the one credential it authorises unbinding. Its WebAuthn
+/// state lives inside it, so one atomic take by the first finish that
+/// presents its id consumes both.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RevocationCeremony {
     /// Who must answer the user-verification challenge: the caller of
@@ -62,6 +77,7 @@ struct RevocationCeremony {
     /// exactly as the producer named it.
     target_credential_id_wire: String,
     expires_at: u64,
+    webauthn: webauthn_rs::prelude::PasskeyAuthentication,
 }
 
 /// A wire credential id — base64url, the same encoding `serde_json::to_value`
@@ -274,17 +290,12 @@ pub(crate) async fn revoke_start(
         target_credential_id_hex: cred_hex,
         target_credential_id_wire: p.credential_id.to_string(),
         expires_at: now_epoch() + CEREMONY_TTL_SECS,
+        webauthn: auth_state,
     };
     state
         .sessions_ks
         .insert(revocation_key(&revocation_id), &ceremony)
         .await?;
-    pk::store_auth_state(
-        &state.sessions_ks,
-        &revocation_webauthn_id(&revocation_id),
-        &auth_state,
-    )
-    .await?;
     info!(
         did = %auth.did,
         target_subject = %target_subject,
@@ -315,18 +326,23 @@ pub(crate) async fn revoke_finish(
             "no pending revocation has that id".into(),
         )
     };
+    // Only its producer can consume a revocation: checked before the take,
+    // so someone else presenting the id can't cancel it. The take is the
+    // single-use claim — of two racing finishes, one gets it.
+    let peeked: RevocationCeremony = state
+        .sessions_ks
+        .get(revocation_key(&revocation_id))
+        .await?
+        .ok_or_else(not_found)?;
+    if peeked.producer != auth.did {
+        return Err(not_found());
+    }
     let ceremony: RevocationCeremony = state
         .sessions_ks
         .take(revocation_key(&revocation_id))
         .await?
+        .filter(|c: &RevocationCeremony| c.producer == auth.did)
         .ok_or_else(not_found)?;
-    let webauthn_state =
-        pk::take_auth_state(&state.sessions_ks, &revocation_webauthn_id(&revocation_id))
-            .await?
-            .ok_or_else(not_found)?;
-    if ceremony.producer != auth.did {
-        return Err(not_found());
-    }
     if now_epoch() > ceremony.expires_at {
         return Err(TaskError::Declared(
             error_codes::REVOCATION_EXPIRED,
@@ -342,7 +358,7 @@ pub(crate) async fn revoke_finish(
             )
         })?;
     let result = webauthn
-        .finish_passkey_authentication(&credential, &webauthn_state)
+        .finish_passkey_authentication(&credential, &ceremony.webauthn)
         .map_err(|e| {
             warn!(error = %e, "revoke user-verification refused");
             TaskError::Declared(
@@ -370,35 +386,43 @@ pub(crate) async fn revoke_finish(
     }
 
     let store = credential_store(state, ceremony.target_purpose)?;
-    let mut user = pk::get_passkey_user_by_did(&store, &ceremony.target_subject)
-        .await?
-        .ok_or_else(not_found)?;
-    if ceremony.target_purpose == Purpose::Session && user.credentials.len() <= 1 {
-        return Err(TaskError::Declared(
-            error_codes::LAST_CREDENTIAL,
-            "the subject's last login passkey cannot be revoked".into(),
-        ));
-    }
-    if !user
-        .credentials
-        .iter()
-        .any(|c| cred_id_hex(c.cred_id()) == ceremony.target_credential_id_hex)
-    {
-        // Already gone — another revocation completed meanwhile.
-        return Err(not_found());
-    }
-    pk::remove_credential(&store, &mut user, &ceremony.target_credential_id_hex).await?;
-    let remaining = user.credentials.len();
+    let remaining = {
+        let _guard =
+            credentials_guard(state, ceremony.target_purpose, &ceremony.target_subject).await;
+        let mut user = pk::get_passkey_user_by_did(&store, &ceremony.target_subject)
+            .await?
+            .ok_or_else(not_found)?;
+        if ceremony.target_purpose == Purpose::Session && user.credentials.len() <= 1 {
+            return Err(TaskError::Declared(
+                error_codes::LAST_CREDENTIAL,
+                "the subject's last login passkey cannot be revoked".into(),
+            ));
+        }
+        if !user
+            .credentials
+            .iter()
+            .any(|c| cred_id_hex(c.cred_id()) == ceremony.target_credential_id_hex)
+        {
+            // Already gone — another revocation completed meanwhile.
+            return Err(not_found());
+        }
+        pk::remove_credential(&store, &mut user, &ceremony.target_credential_id_hex).await?;
+        user.credentials.len()
+    };
 
     // Update the producer's own credential's use record, since it is the one
     // that was just asserted with — mirrors login/step-up's own bookkeeping.
-    if let Some(mut producer) =
-        pk::get_passkey_user_by_did(&credential_store(state, Purpose::Session)?, &auth.did).await?
+    // Under the producer's own guard, taken only once the target's is
+    // released, so two administrators revoking each other can't deadlock.
     {
-        for c in &mut producer.credentials {
-            c.update_credential(&result);
+        let producer_store = credential_store(state, Purpose::Session)?;
+        let _guard = credentials_guard(state, Purpose::Session, &auth.did).await;
+        if let Some(mut producer) = pk::get_passkey_user_by_did(&producer_store, &auth.did).await? {
+            for c in &mut producer.credentials {
+                c.update_credential(&result);
+            }
+            pk::store_passkey_user(&producer_store, &producer).await?;
         }
-        pk::store_passkey_user(&credential_store(state, Purpose::Session)?, &producer).await?;
     }
 
     info!(

@@ -65,23 +65,23 @@ fn wire_session(session: &Session, expires_at: u64) -> Value {
 // ---------------------------------------------------------------------------
 
 /// A step-up challenge bound to one session.
+///
+/// The WebAuthn ceremony (when one was offered) lives inside this record,
+/// not under a key of its own: the one atomic `take` that consumes the
+/// step-up consumes its ceremony with it, so the ceremony can only ever
+/// answer the exact challenge, subject and session it was opened for, and
+/// exactly once.
 #[derive(Serialize, Deserialize)]
 struct PendingStepUp {
     challenge: String,
     subject: String,
     expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webauthn: Option<webauthn_rs::prelude::PasskeyAuthentication>,
 }
 
 fn step_up_key(session_id: &str) -> String {
     format!("stepup-task:{session_id}")
-}
-
-/// The id a step-up's WebAuthn authentication state (when it opened one) is
-/// stored under, via [`passkey_store::store_auth_state`]/[`passkey_store::take_auth_state`].
-/// Namespaced apart from a login ceremony's `authId` (a bare UUID) so the two
-/// can never collide in the shared `pk_auth:` key space.
-fn step_up_webauthn_id(session_id: &str) -> String {
-    format!("stepup:{session_id}")
 }
 
 /// `auth/revoke-session/0.2`: end one of the caller's own sessions. This is
@@ -210,7 +210,7 @@ pub(crate) async fn step_up_start(
         .await?
         .map(|u| u.credentials)
         .unwrap_or_default();
-    let gate = match (&state.webauthn, step_up_creds.is_empty()) {
+    let mut gate = match (&state.webauthn, step_up_creds.is_empty()) {
         (Some(webauthn), false) => Some(
             webauthn
                 .start_passkey_authentication(&step_up_creds)
@@ -269,6 +269,7 @@ pub(crate) async fn step_up_start(
 
     // Bound only once the request is signed, so a signing failure leaves no
     // orphaned challenge.
+    let offered_webauthn = gate.is_some();
     state
         .sessions_ks
         .insert(
@@ -277,18 +278,11 @@ pub(crate) async fn step_up_start(
                 challenge,
                 subject: session.did.clone(),
                 expires_at,
+                webauthn: gate.take().map(|(_, auth_state)| auth_state),
             },
         )
         .await?;
-    if let Some((_, auth_state)) = &gate {
-        passkey_store::store_auth_state(
-            &state.sessions_ks,
-            &step_up_webauthn_id(&session_id),
-            auth_state,
-        )
-        .await?;
-    }
-    info!(did = %session.did, session_id = %session_id, webauthn = gate.is_some(), "step-up started");
+    info!(did = %session.did, session_id = %session_id, webauthn = offered_webauthn, "step-up started");
     typed(
         json!({ "approveRequest": serde_json::to_value(&signed)? }),
         "step-up start response",
@@ -325,26 +319,35 @@ pub(crate) async fn approve_response(
                 "this relying party binds every step-up to a session".into(),
             )
         })?;
-    let pending: PendingStepUp = state
+    let unknown = || {
+        TaskError::Declared(
+            error_codes::CHALLENGE_UNKNOWN,
+            "no pending step-up has that challenge".into(),
+        )
+    };
+    // A wrong challenge is refused before anything is consumed, so it can't
+    // be used to cancel someone's pending step-up.
+    let peeked: PendingStepUp = state
         .sessions_ks
         .get(step_up_key(&session_id))
         .await?
-        .ok_or_else(|| {
-            TaskError::Declared(error_codes::CHALLENGE_UNKNOWN, "no pending step-up".into())
-        })?;
-    if !constant_time_eq(pending.challenge.as_bytes(), p.challenge.as_bytes()) {
-        return Err(TaskError::Declared(
-            error_codes::CHALLENGE_UNKNOWN,
-            "no pending step-up has that challenge".into(),
-        ));
+        .ok_or_else(unknown)?;
+    if !constant_time_eq(peeked.challenge.as_bytes(), p.challenge.as_bytes()) {
+        return Err(unknown());
     }
-    // Single use: consumed whatever the decision. The WebAuthn ceremony
-    // state (when one was offered) goes with it, whatever the evidence
-    // actually presented.
-    state.sessions_ks.remove(step_up_key(&session_id)).await?;
-    let webauthn_state =
-        passkey_store::take_auth_state(&state.sessions_ks, &step_up_webauthn_id(&session_id))
-            .await?;
+    // Single use: claimed with one atomic `take` — whatever the decision,
+    // and with its WebAuthn ceremony inside it. Of two racing responses
+    // only one gets it back; and the challenge is re-checked on what was
+    // taken, since a fresh `step_up_start` may have replaced the record
+    // between the peek and the take.
+    let pending: PendingStepUp = state
+        .sessions_ks
+        .take(step_up_key(&session_id))
+        .await?
+        .ok_or_else(unknown)?;
+    if !constant_time_eq(pending.challenge.as_bytes(), p.challenge.as_bytes()) {
+        return Err(unknown());
+    }
     if now_epoch() > pending.expires_at {
         return Err(TaskError::Declared(
             error_codes::CHALLENGE_EXPIRED,
@@ -372,7 +375,7 @@ pub(crate) async fn approve_response(
     // already bound to (the same key every other request in the session
     // uses), and the human-facing action is touching the step-up passkey.
     if let Some(Evidence::Webauthn(assertion)) = &p.evidence {
-        let webauthn_state = webauthn_state.ok_or_else(|| {
+        let webauthn_state = pending.webauthn.as_ref().ok_or_else(|| {
             TaskError::Declared(
                 error_codes::NO_GATE,
                 "this step-up was not offered a passkey gate".into(),
@@ -392,7 +395,7 @@ pub(crate) async fn approve_response(
                 )
             })?;
         let result = webauthn
-            .finish_passkey_authentication(&credential, &webauthn_state)
+            .finish_passkey_authentication(&credential, webauthn_state)
             .map_err(|e| {
                 warn!(error = %e, "step-up passkey assertion failed");
                 TaskError::Declared(
@@ -412,6 +415,12 @@ pub(crate) async fn approve_response(
         // built from exactly that subject's `KS_PASSKEY_STEP_UP` passkeys,
         // never the login store.
         let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
+        let _guard = super::passkey::credentials_guard(
+            state,
+            did_hosting_common::server::passkey::invite::Purpose::StepUp,
+            &pending.subject,
+        )
+        .await;
         let cred_id = cred_id_hex(result.cred_id());
         let mut step_up_user = passkey_store::get_passkey_user_by_cred(&step_up_ks, &cred_id)
             .await?

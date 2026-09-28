@@ -1274,3 +1274,170 @@ async fn revoke_authority_is_own_or_administrator_others_are_refused() {
         "{reply}"
     );
 }
+
+/// Open a step-up on `session_id` and return its approve-request payload.
+async fn step_up_payload(state: &AppState, subject: &Caller, session_id: &str) -> Value {
+    let reply = call(
+        state,
+        Via::Https,
+        subject,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    ok(&reply, &t(STEP_UP_START))["approveRequest"]["payload"].clone()
+}
+
+/// A step-up passkey assertion is single use, even raced: two responses
+/// carrying the same valid assertion arrive together and exactly one
+/// elevates the session. Replayed afterwards — into this session or a new
+/// step-up — it is refused.
+#[tokio::test]
+async fn a_step_up_assertion_elevates_once_even_raced_and_never_replays() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 130, Role::Admin).await;
+    let dana = member(&state, 131, Role::Owner).await;
+    let invitee = stranger(132);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    let approve = |challenge: &Value, assertion: &Value| {
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": assertion },
+        })
+    };
+
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    let good = step_up.assert(&payload["webauthn"]);
+    let body = approve(&payload["challenge"], &good);
+    let approve_type = t(STEP_UP_APPROVE);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+    );
+    let response = format!("{}#response", t(STEP_UP_APPROVE));
+    let elevated = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(elevated, 1, "exactly one racer elevates: {a} / {b}");
+
+    // Replayed into the same, now-consumed step-up: refused.
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), body).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:challengeUnknown",
+        "{reply}"
+    );
+
+    // Replayed against a fresh step-up on another session — its own
+    // challenge, the old assertion: the ceremony that assertion answers is
+    // gone, so it does not verify.
+    let other_session = session_for(&state, &dana).await.session_id;
+    let payload = step_up_payload(&state, &dana, &other_session).await;
+    let mut replay = approve(&payload["challenge"], &good);
+    replay["sessionId"] = json!(other_session);
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), replay).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+}
+
+/// Two revocations of a subject's last two login passkeys, finished at the
+/// same moment, can't both pass the last-login-passkey guard: exactly one
+/// revokes, the other is refused, and the survivor still signs in.
+#[tokio::test]
+async fn concurrent_revokes_cannot_remove_the_last_login_passkey() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 140, Role::Admin).await;
+    let dana = member(&state, 141, Role::Owner).await;
+    let invitee = stranger(142);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // A second login credential for Dana: enrolled for another subject, then
+    // rebound to Dana in the store. It is only ever a revoke target here, so
+    // its user handle doesn't matter.
+    let erin = member(&state, 143, Role::Owner).await;
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    // Two open revocations, one per credential; each passes `start`'s guard.
+    let mut finishes = Vec::new();
+    for target in [first.id(), second.id()] {
+        let reply = call(
+            &state,
+            Via::Https,
+            &dana,
+            &t(PK_REVOKE_START),
+            json!({ "credentialId": target }),
+        )
+        .await;
+        let start = ok(&reply, &t(PK_REVOKE_START));
+        let uv = first.assert(&start["uvOptions"]);
+        finishes.push(json!({ "revocationId": start["revocationId"], "uvCredential": uv }));
+    }
+    let finish_type = t(PK_REVOKE_FINISH);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &finish_type, finishes[0].clone()),
+        call(&state, Via::Https, &dana, &finish_type, finishes[1].clone()),
+    );
+    let response = format!("{}#response", t(PK_REVOKE_FINISH));
+    let revoked = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(revoked, 1, "exactly one revoke may win: {a} / {b}");
+
+    let user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.credentials.len(), 1);
+    let survivor = hex(user.credentials[0].cred_id());
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &survivor)
+            .await
+            .unwrap()
+            .is_some(),
+        "the surviving credential is still indexed"
+    );
+}

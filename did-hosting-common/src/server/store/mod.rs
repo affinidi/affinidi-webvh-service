@@ -88,8 +88,9 @@ pub trait KeyspaceOps: Send + Sync {
     ///
     /// Backends are expected to use a native atomic primitive
     /// (Redis `GETDEL`, DynamoDB `DeleteItem` + `ReturnValues=ALL_OLD`,
-    /// SQL transaction, etc.). Single-replica backends (fjall) wrap the
-    /// non-atomic `get + remove` in a process-local mutex.
+    /// a Cosmos DB `If-Match` delete, a Firestore transaction).
+    /// Single-replica backends (fjall) wrap the non-atomic `get + remove`
+    /// in a process-local mutex.
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
 
     /// Atomically increment a counter stored under `key` and return its new
@@ -104,12 +105,11 @@ pub trait KeyspaceOps: Send + Sync {
     /// let an attacker exceed the intended lockout threshold by spreading
     /// guesses across replicas.
     ///
-    /// Backends are expected to use a native atomic counter (Redis `INCR`,
-    /// DynamoDB `UpdateItem` with an `ADD` expression on a `Number`
-    /// attribute, …). Single-replica backends (fjall) and backends with no
-    /// single-call primitive (Cosmos DB, Firestore) wrap the non-atomic
-    /// read-then-write in a process-local mutex, the same caveat
-    /// `take_raw_atomic` documents for those backends.
+    /// Every shared backend makes this atomic in the store itself: Redis
+    /// `INCR`, DynamoDB `UpdateItem` with an `ADD` expression, Cosmos DB an
+    /// ETag-conditional create/replace, Firestore a read-write transaction.
+    /// Only fjall — single-process by construction — uses a process-local
+    /// mutex.
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>>;
 }
 
