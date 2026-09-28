@@ -12,10 +12,8 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { AgentNameChips } from "../components/AgentNameChips";
 import {
   api,
-  clearSessionPrincipalDid,
   setAuthMethod,
   setRefreshToken,
-  setSessionPrincipalDid,
 } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
@@ -139,10 +137,6 @@ export default function Login() {
     try {
       const result = await loginWithWallet();
       setAuthMethod("wallet");
-      // Holder login — session DID is the wallet's holder DID. Trust-task
-      // signing should NOT route via vault/sign-trust-task; clear any
-      // stale principal-DID hint from a previous proxy-login session.
-      clearSessionPrincipalDid();
       setRefreshToken(result.refreshToken || null);
       login(result.accessToken);
       router.replace("/");
@@ -210,15 +204,9 @@ export default function Login() {
     try {
       const outcome = await loginWithWalletProxy(entry);
       setAuthMethod("wallet");
-      // Proxy login — session is authenticated as the entry's
-      // principalDid (the SIOP id_token's iss/sub). Subsequent
-      // trust-task signing MUST sign as this DID, not the wallet's
-      // holder; record it so api.ts's signTrustTask path threads
-      // `asDid` through to the wallet's vault/sign-trust-task call.
-      // `principalDid` is optional on ProxyVaultEntry for forward-compat,
-      // but `listProxyCandidates` already filters out entries without
-      // one — only entries that round-trip with a DID reach this path.
-      setSessionPrincipalDid(entry.principalDid!);
+      // The session is the entry's principal DID (the id_token's iss/sub),
+      // and it is bound to the session key the login generated, which
+      // signs as that principal from here on (`trust-task.ts`).
       setRefreshToken(outcome.result.refreshToken || null);
       login(outcome.result.accessToken);
       // When the operator has enabled the flow visualization, stash

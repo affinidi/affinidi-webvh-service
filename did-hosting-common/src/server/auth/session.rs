@@ -35,6 +35,22 @@ pub async fn store_session(sessions: &KeyspaceHandle, session: &Session) -> Resu
     Ok(())
 }
 
+/// Whether `multikey` is a base58btc multikey encoding an Ed25519 public key
+/// (`0xed 0x01` + 32 bytes) — the only session key a session can be bound to.
+///
+/// A session key is used by resolving `did:key:{pk}#{pk}` and verifying
+/// `eddsa-jcs-2022`, so nothing else can ever sign. Decoded rather than
+/// prefix-matched: a value that only *looks* like one (`z6Mk…` over the wrong
+/// bytes) would bind a key whose every later proof is refused, on a login its
+/// producer was told succeeded. Every route that accepts a session key checks
+/// it here, before the login spends anything.
+pub fn is_ed25519_multikey(multikey: &str) -> bool {
+    matches!(
+        multibase::decode(multikey),
+        Ok((multibase::Base::Base58Btc, bytes)) if bytes.len() == 34 && bytes[..2] == [0xed, 0x01]
+    )
+}
+
 /// Load a session by session_id.
 pub async fn get_session(
     sessions: &KeyspaceHandle,
@@ -690,5 +706,54 @@ mod refresh_token_invariant {
             "a refresh-less Authenticated session is reaped on the next sweep, however recently \
              it was seen — teach cleanup_expired_sessions about last_seen before creating one"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    use super::is_ed25519_multikey;
+
+    fn multikey(prefix: [u8; 2], key_len: usize) -> String {
+        let mut bytes = prefix.to_vec();
+        bytes.extend(std::iter::repeat_n(7u8, key_len));
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    #[test]
+    fn an_ed25519_multikey_is_accepted() {
+        let pk = multikey([0xed, 0x01], 32);
+        assert!(pk.starts_with("z6Mk"));
+        assert!(is_ed25519_multikey(&pk));
+    }
+
+    /// Every one of these passed the `starts_with("z6Mk")` check it replaces.
+    #[test]
+    fn a_value_that_only_looks_like_one_is_refused() {
+        let pk = multikey([0xed, 0x01], 32);
+        let truncated = &pk[..pk.len() - 4];
+        let over_long = format!("{pk}zz");
+        let not_base58 = format!("z6Mk{}", "0OIl".repeat(10));
+        for bad in [truncated, over_long.as_str(), not_base58.as_str(), "z6Mk"] {
+            assert!(bad.starts_with("z6Mk"), "{bad}");
+            assert!(!is_ed25519_multikey(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn another_curve_or_encoding_is_refused() {
+        // secp256k1 (0xe7 0x01), and an Ed25519 key in base64 rather than base58btc.
+        assert!(!is_ed25519_multikey(&multikey([0xe7, 0x01], 33)));
+        let mut ed = vec![0xed, 0x01];
+        ed.extend([7u8; 32]);
+        assert!(!is_ed25519_multikey(&multibase::encode(
+            multibase::Base::Base64,
+            ed
+        )));
+    }
+
+    #[test]
+    fn non_ascii_input_is_refused_not_a_panic() {
+        assert!(!is_ed25519_multikey("z6Mk\u{00e9}\u{1f600}"));
+        assert!(!is_ed25519_multikey(""));
     }
 }
