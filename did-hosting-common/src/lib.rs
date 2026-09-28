@@ -4,6 +4,7 @@ pub mod did;
 pub mod did_ops;
 pub mod didcomm_types;
 mod error;
+#[cfg(feature = "server-core")]
 mod http;
 pub mod method;
 mod types;
