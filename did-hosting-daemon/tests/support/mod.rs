@@ -258,6 +258,9 @@ pub struct AdminClient {
     pending: Pending,
     did_resolver: DIDCacheClient,
     shutdown: CancellationToken,
+    /// Peers this client has already formed (or started forming) a TSP
+    /// relationship with. See `warm_tsp_relationship`.
+    tsp_warmed: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AdminClient {
@@ -327,6 +330,51 @@ impl AdminClient {
             pending,
             did_resolver,
             shutdown,
+            tsp_warmed: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Form (or confirm) a TSP relationship with `to`, and — the first time
+    /// only — give both sides time to finish processing the handshake
+    /// before the caller sends its first application frame.
+    ///
+    /// `tsp_ensure_relationship` returns as soon as *our* invite has been
+    /// handed to the transport; it does not wait for the peer to receive
+    /// and record it, let alone for the peer's accept to come back. That is
+    /// normally fine — recording an inbound invite is supposed to admit the
+    /// application frames that follow it — but `affinidi-messaging-didcomm-
+    /// service`'s live-frame loop (`Listener::process_next_frame`) reads
+    /// successive inbound frames off the shared socket one at a time and
+    /// then dispatches *each* to its own spawned task
+    /// (`tasks.spawn(dispatch_tsp(...))`), with no ordering between them. If
+    /// our invite and our very next application frame both land on the
+    /// peer's socket close together (as they do here — `tsp_send` follows
+    /// `tsp_ensure_relationship` immediately), their two dispatch tasks race:
+    /// the application frame's task can reach `unpack_message` before the
+    /// invite's task finishes `record_incoming_control`, and an unrecorded
+    /// relationship means the peer's §7.2.2 gate silently drops it — no
+    /// reply ever comes, and the caller times out. This reproduces only on
+    /// the *first* exchange with a given peer, exactly what was observed:
+    /// every later call reuses an already-`Bidirectional` relationship, so
+    /// `tsp_ensure_relationship` returns without sending an invite at all
+    /// and there is nothing left to race.
+    ///
+    /// There is no race here to fix in this repository — the spawn-without-
+    /// ordering lives entirely inside the external SDK crate, which this
+    /// workspace only depends on. So this waits it out from the outside:
+    /// a one-time, generous fixed delay after the first invite to a given
+    /// peer, comfortably longer than an in-process mediator round-trip,
+    /// before any payload is sent to it. Idempotent per peer — later calls
+    /// see `to` already in `tsp_warmed` and return immediately.
+    async fn warm_tsp_relationship(&self, to: &str) {
+        self.svc
+            .tsp_ensure_relationship(&self.listener_id, to)
+            .await
+            .unwrap_or_else(|e| panic!("tsp relationship with {to}: {e}"));
+
+        let first_time = self.tsp_warmed.lock().await.insert(to.to_string());
+        if first_time {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -355,10 +403,7 @@ impl AdminClient {
                     .unwrap_or_else(|e| panic!("https send {type_uri} to {to}: {e}"))
             }
             Via::Tsp => {
-                self.svc
-                    .tsp_ensure_relationship(&self.listener_id, to)
-                    .await
-                    .unwrap_or_else(|e| panic!("tsp relationship with {to}: {e}"));
+                self.warm_tsp_relationship(to).await;
                 let rx = self.await_reply(&doc.id).await;
                 let framed = tsp_binding::frame(
                     serde_json::to_vec(&doc).expect("serialise request"),
