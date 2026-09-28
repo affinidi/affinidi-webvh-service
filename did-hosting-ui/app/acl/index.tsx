@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { PasskeysCard } from "../../components/PasskeysCard";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import {
   formatBytes,
@@ -139,7 +140,7 @@ function ScopeEditor({
     const def =
       draft.default && draft.domains.includes(draft.default)
         ? draft.default
-        : draft.domains[0] ?? "";
+        : (draft.domains[0] ?? "");
     onChange({ ...draft, kind, default: def });
   };
 
@@ -217,35 +218,36 @@ function ScopeEditor({
               })}
             </View>
           )}
-          {draft.kind === "allowed_with_default" && draft.domains.length > 1 && (
-            <View>
-              <Text style={styles.editFieldLabel}>Default domain</Text>
-              <View style={styles.scopeDomainsWrap}>
-                {draft.domains.map((name) => {
-                  const active = draft.default === name;
-                  return (
-                    <Pressable
-                      key={name}
-                      style={[
-                        styles.scopeDefaultButton,
-                        active && styles.scopeDefaultButtonActive,
-                      ]}
-                      onPress={() => onChange({ ...draft, default: name })}
-                    >
-                      <Text
+          {draft.kind === "allowed_with_default" &&
+            draft.domains.length > 1 && (
+              <View>
+                <Text style={styles.editFieldLabel}>Default domain</Text>
+                <View style={styles.scopeDomainsWrap}>
+                  {draft.domains.map((name) => {
+                    const active = draft.default === name;
+                    return (
+                      <Pressable
+                        key={name}
                         style={[
-                          styles.scopeDefaultText,
-                          active && styles.scopeDefaultTextActive,
+                          styles.scopeDefaultButton,
+                          active && styles.scopeDefaultButtonActive,
                         ]}
+                        onPress={() => onChange({ ...draft, default: name })}
                       >
-                        {active ? `★ ${name}` : name}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
+                        <Text
+                          style={[
+                            styles.scopeDefaultText,
+                            active && styles.scopeDefaultTextActive,
+                          ]}
+                        >
+                          {active ? `★ ${name}` : name}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
               </View>
-            </View>
-          )}
+            )}
         </View>
       )}
     </View>
@@ -266,6 +268,8 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
   onChangeScope,
+  passkeysExpanded,
+  onTogglePasskeys,
 }: {
   item: AclEntry;
   editing: EditState | null;
@@ -280,154 +284,179 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
   onChangeScope: (next: ScopeDraft) => void;
+  passkeysExpanded: boolean;
+  onTogglePasskeys: (did: string) => void;
 }) {
   const isEditing = editing?.did === item.did;
-  const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
+  const scopeError =
+    isEditing && editing ? validateScopeDraft(editing.scope) : null;
 
   return (
-    <View style={styles.entryCard}>
-      <View style={styles.entryInfo}>
-        <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
-          <Text style={styles.entryDid}>{item.did}</Text>
-        </Link>
-        <View style={styles.entryMeta}>
-          <View
-            style={[
-              styles.roleBadge,
-              item.role === "admin" && styles.adminBadge,
-              item.role === "service" && styles.serviceBadge,
-            ]}
-          >
-            <Text style={styles.roleBadgeText}>{item.role}</Text>
+    <View>
+      <View style={styles.entryCard}>
+        <View style={styles.entryInfo}>
+          <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
+            <Text style={styles.entryDid}>{item.did}</Text>
+          </Link>
+          <View style={styles.entryMeta}>
+            <View
+              style={[
+                styles.roleBadge,
+                item.role === "admin" && styles.adminBadge,
+                item.role === "service" && styles.serviceBadge,
+              ]}
+            >
+              <Text style={styles.roleBadgeText}>{item.role}</Text>
+            </View>
+            {!isEditing && item.label && (
+              <Text style={styles.entryLabel}>{item.label}</Text>
+            )}
+            <Text style={styles.entryDate}>{formatDate(item.created_at)}</Text>
           </View>
-          {!isEditing && item.label && (
-            <Text style={styles.entryLabel}>{item.label}</Text>
-          )}
-          <Text style={styles.entryDate}>
-            {formatDate(item.created_at)}
-          </Text>
-        </View>
 
-        {isEditing ? (
-          <View style={styles.editFields}>
-            <View style={styles.roleRow}>
-              {(["owner", "admin", "service"] as const).map((r) => (
-                <Pressable
-                  key={r}
-                  style={[
-                    styles.roleButton,
-                    editing.role === r && styles.roleActive,
-                  ]}
-                  onPress={() => onChangeRole(r)}
-                >
-                  <Text
+          {isEditing ? (
+            <View style={styles.editFields}>
+              <View style={styles.roleRow}>
+                {(["owner", "admin", "service"] as const).map((r) => (
+                  <Pressable
+                    key={r}
                     style={[
-                      styles.roleText,
-                      editing.role === r && styles.roleTextActive,
+                      styles.roleButton,
+                      editing.role === r && styles.roleActive,
                     ]}
+                    onPress={() => onChangeRole(r)}
                   >
-                    {r.charAt(0).toUpperCase() + r.slice(1)}
+                    <Text
+                      style={[
+                        styles.roleText,
+                        editing.role === r && styles.roleTextActive,
+                      ]}
+                    >
+                      {r.charAt(0).toUpperCase() + r.slice(1)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <TextInput
+                style={styles.editInput}
+                placeholder="Label"
+                placeholderTextColor={colors.textTertiary}
+                value={editing.label}
+                onChangeText={onChangeLabel}
+              />
+              <View style={styles.editRow}>
+                <View style={styles.editFieldHalf}>
+                  <Text style={styles.editFieldLabel}>Max size (MB)</Text>
+                  <TextInput
+                    style={styles.editInput}
+                    placeholder="Default"
+                    placeholderTextColor={colors.textTertiary}
+                    value={editing.maxTotalSize}
+                    onChangeText={onChangeMaxTotalSize}
+                    keyboardType="numeric"
+                  />
+                </View>
+                <View style={styles.editFieldHalf}>
+                  <Text style={styles.editFieldLabel}>Max DIDs</Text>
+                  <TextInput
+                    style={styles.editInput}
+                    placeholder="Default"
+                    placeholderTextColor={colors.textTertiary}
+                    value={editing.maxDidCount}
+                    onChangeText={onChangeMaxDidCount}
+                    keyboardType="numeric"
+                  />
+                </View>
+              </View>
+              {editing && (
+                <ScopeEditor
+                  draft={editing.scope}
+                  availableDomains={availableDomains}
+                  onChange={onChangeScope}
+                />
+              )}
+              {scopeError && (
+                <Text style={styles.scopeError}>{scopeError}</Text>
+              )}
+              <View style={styles.editActions}>
+                <Pressable
+                  style={[
+                    styles.saveButton,
+                    (saving || !!scopeError) && styles.disabled,
+                  ]}
+                  onPress={() => onSave(item.did)}
+                  disabled={saving || !!scopeError}
+                >
+                  <Text style={styles.saveText}>
+                    {saving ? "Saving..." : "Save"}
                   </Text>
                 </Pressable>
-              ))}
-            </View>
-            <TextInput
-              style={styles.editInput}
-              placeholder="Label"
-              placeholderTextColor={colors.textTertiary}
-              value={editing.label}
-              onChangeText={onChangeLabel}
-            />
-            <View style={styles.editRow}>
-              <View style={styles.editFieldHalf}>
-                <Text style={styles.editFieldLabel}>Max size (MB)</Text>
-                <TextInput
-                  style={styles.editInput}
-                  placeholder="Default"
-                  placeholderTextColor={colors.textTertiary}
-                  value={editing.maxTotalSize}
-                  onChangeText={onChangeMaxTotalSize}
-                  keyboardType="numeric"
-                />
-              </View>
-              <View style={styles.editFieldHalf}>
-                <Text style={styles.editFieldLabel}>Max DIDs</Text>
-                <TextInput
-                  style={styles.editInput}
-                  placeholder="Default"
-                  placeholderTextColor={colors.textTertiary}
-                  value={editing.maxDidCount}
-                  onChangeText={onChangeMaxDidCount}
-                  keyboardType="numeric"
-                />
+                <Pressable style={styles.cancelButton} onPress={onCancelEdit}>
+                  <Text style={styles.cancelText}>Cancel</Text>
+                </Pressable>
               </View>
             </View>
-            {editing && (
-              <ScopeEditor
-                draft={editing.scope}
-                availableDomains={availableDomains}
-                onChange={onChangeScope}
-              />
-            )}
-            {scopeError && (
-              <Text style={styles.scopeError}>{scopeError}</Text>
-            )}
-            <View style={styles.editActions}>
-              <Pressable
-                style={[
-                  styles.saveButton,
-                  (saving || !!scopeError) && styles.disabled,
-                ]}
-                onPress={() => onSave(item.did)}
-                disabled={saving || !!scopeError}
-              >
-                <Text style={styles.saveText}>
-                  {saving ? "Saving..." : "Save"}
+          ) : (
+            <View>
+              <View style={styles.quotaRow}>
+                <Text style={styles.quotaText}>
+                  Max Size:{" "}
+                  {item.max_total_size != null
+                    ? formatBytes(item.max_total_size)
+                    : "Default"}
                 </Text>
-              </Pressable>
-              <Pressable style={styles.cancelButton} onPress={onCancelEdit}>
-                <Text style={styles.cancelText}>Cancel</Text>
-              </Pressable>
+                <Text style={styles.quotaText}>
+                  Max DIDs:{" "}
+                  {item.max_did_count != null
+                    ? item.max_did_count.toLocaleString()
+                    : "Default"}
+                </Text>
+              </View>
+              <View style={styles.scopeReadRow}>
+                <Text style={styles.scopeReadLabel}>Domains:</Text>
+                <ScopeBadges entry={item} />
+              </View>
             </View>
-          </View>
-        ) : (
-          <View>
-            <View style={styles.quotaRow}>
-              <Text style={styles.quotaText}>
-                Max Size:{" "}
-                {item.max_total_size != null
-                  ? formatBytes(item.max_total_size)
-                  : "Default"}
+          )}
+        </View>
+
+        {!isEditing && (
+          <View style={styles.entryActions}>
+            <Pressable
+              style={styles.editButton}
+              onPress={() => onStartEdit(item)}
+            >
+              <Text style={styles.editText}>Edit</Text>
+            </Pressable>
+            <Pressable
+              style={styles.editButton}
+              onPress={() => onTogglePasskeys(item.did)}
+            >
+              <Text style={styles.editText}>
+                {passkeysExpanded ? "Hide passkeys" : "Passkeys"}
               </Text>
-              <Text style={styles.quotaText}>
-                Max DIDs:{" "}
-                {item.max_did_count != null
-                  ? item.max_did_count.toLocaleString()
-                  : "Default"}
-              </Text>
-            </View>
-            <View style={styles.scopeReadRow}>
-              <Text style={styles.scopeReadLabel}>Domains:</Text>
-              <ScopeBadges entry={item} />
-            </View>
+            </Pressable>
+            <Pressable
+              style={styles.deleteButton}
+              onPress={() => onDelete(item.did)}
+            >
+              <Text style={styles.deleteText}>Remove</Text>
+            </Pressable>
           </View>
         )}
       </View>
-
-      {!isEditing && (
-        <View style={styles.entryActions}>
-          <Pressable
-            style={styles.editButton}
-            onPress={() => onStartEdit(item)}
-          >
-            <Text style={styles.editText}>Edit</Text>
-          </Pressable>
-          <Pressable
-            style={styles.deleteButton}
-            onPress={() => onDelete(item.did)}
-          >
-            <Text style={styles.deleteText}>Remove</Text>
-          </Pressable>
+      {passkeysExpanded && (
+        <View style={styles.passkeysPanel}>
+          <PasskeysCard
+            subject={item.did}
+            purpose="session"
+            title="Sign-in passkeys"
+          />
+          <PasskeysCard
+            subject={item.did}
+            purpose="stepUp"
+            title="Step-up passkeys"
+          />
         </View>
       )}
     </View>
@@ -457,7 +486,9 @@ export default function AclManagement() {
 
   // New entry form
   const [newDid, setNewDid] = useState("");
-  const [newRole, setNewRole] = useState<"admin" | "owner" | "service">("owner");
+  const [newRole, setNewRole] = useState<"admin" | "owner" | "service">(
+    "owner",
+  );
   const [newLabel, setNewLabel] = useState("");
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
@@ -483,23 +514,41 @@ export default function AclManagement() {
 
   // Invite form
   const [inviteDid, setInviteDid] = useState("");
-  const [inviteRole, setInviteRole] =
-    useState<"admin" | "owner" | "service">("owner");
+  const [inviteRole, setInviteRole] = useState<"admin" | "owner" | "service">(
+    "owner",
+  );
   const [inviting, setInviting] = useState(false);
   const [invitePurpose, setInvitePurpose] = useState<InvitePurpose>("session");
   const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
-  const [inviteCopied, setInviteCopied] = useState<"link" | "code" | null>(null);
+  const [inviteCopied, setInviteCopied] = useState<"link" | "code" | null>(
+    null,
+  );
 
   // Pending invites (from server)
   const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
-  const [editingInvite, setEditingInvite] = useState<
-    { inviteId: string; role: "admin" | "owner" | "service" } | null
-  >(null);
+  const [editingInvite, setEditingInvite] = useState<{
+    inviteId: string;
+    role: "admin" | "owner" | "service";
+  } | null>(null);
   const [invitesBusyId, setInvitesBusyId] = useState<string | null>(null);
 
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Which entries' passkey panel is expanded — a lost passkey is recovered
+  // here: an administrator revokes the missing credential, then re-invites.
+  const [expandedPasskeys, setExpandedPasskeys] = useState<Set<string>>(
+    new Set(),
+  );
+  const togglePasskeys = useCallback((did: string) => {
+    setExpandedPasskeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(did)) next.delete(did);
+      else next.add(did);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(() => {
     if (!isAuthenticated) {
@@ -531,7 +580,11 @@ export default function AclManagement() {
     if (!inviteDid.trim()) return;
     setInviting(true);
     try {
-      const resp = await api.createInvite(inviteDid.trim(), inviteRole, invitePurpose);
+      const resp = await api.createInvite(
+        inviteDid.trim(),
+        inviteRole,
+        invitePurpose,
+      );
       setInvite(resp);
       setInviteCopied(null);
       // Pull in the newly-created invite for the pending list too.
@@ -546,18 +599,22 @@ export default function AclManagement() {
 
   const handleRevokeInvite = useCallback(
     (inviteId: string) => {
-      showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
-        setInvitesBusyId(inviteId);
-        try {
-          await api.revokeInvite(inviteId);
-          refresh();
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Failed to revoke";
-          showAlert("Error", msg);
-        } finally {
-          setInvitesBusyId((prev) => (prev === inviteId ? null : prev));
-        }
-      });
+      showConfirm(
+        "Revoke invite",
+        "Revoke this enrollment invite?",
+        async () => {
+          setInvitesBusyId(inviteId);
+          try {
+            await api.revokeInvite(inviteId);
+            refresh();
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "Failed to revoke";
+            showAlert("Error", msg);
+          } finally {
+            setInvitesBusyId((prev) => (prev === inviteId ? null : prev));
+          }
+        },
+      );
     },
     [api, refresh],
   );
@@ -591,7 +648,9 @@ export default function AclManagement() {
 
   const handleCopyInvite = async (what: "link" | "code") => {
     if (!invite) return;
-    await Clipboard.setStringAsync(what === "link" ? invite.inviteUrl : invite.claimCode);
+    await Clipboard.setStringAsync(
+      what === "link" ? invite.inviteUrl : invite.claimCode,
+    );
     setInviteCopied(what);
     setTimeout(() => setInviteCopied(null), 2000);
   };
@@ -623,8 +682,7 @@ export default function AclManagement() {
       setNewScopeTouched(false);
       refresh();
     } catch (e: unknown) {
-      const msg =
-        e instanceof Error ? e.message : "Failed to create ACL entry";
+      const msg = e instanceof Error ? e.message : "Failed to create ACL entry";
       showAlert("Error", msg);
     } finally {
       setCreating(false);
@@ -653,10 +711,8 @@ export default function AclManagement() {
         .listDids(did)
         .then((dids) => {
           if (dids.length === 0) {
-            showConfirm(
-              "Remove Access",
-              `Remove access for ${did}?`,
-              () => doDelete(false, []),
+            showConfirm("Remove Access", `Remove access for ${did}?`, () =>
+              doDelete(false, []),
             );
           } else {
             showConfirm(
@@ -761,9 +817,7 @@ export default function AclManagement() {
   if (!isAuthenticated) {
     return (
       <View style={styles.containerCenter}>
-        <Text style={styles.hint}>
-          Please log in to manage access control.
-        </Text>
+        <Text style={styles.hint}>Please log in to manage access control.</Text>
         <Link href="/login" asChild>
           <Pressable style={styles.buttonPrimary}>
             <Text style={styles.buttonPrimaryText}>Login</Text>
@@ -788,6 +842,8 @@ export default function AclManagement() {
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
       onChangeScope={onChangeScope}
+      passkeysExpanded={expandedPasskeys.has(item.did)}
+      onTogglePasskeys={togglePasskeys}
     />
   );
 
@@ -810,10 +866,10 @@ export default function AclManagement() {
         <Text style={styles.inviteHelp}>
           Generate an enrollment link and a claim code. Send them over two
           different channels — the link by email, say, and the code by chat or
-          phone: either alone redeems nothing. The invitee opens the link,
-          types the code and registers a passkey. A sign-in invite adds them to
-          the ACL with the selected role; a step-up invite enrols a passkey
-          that only confirms sensitive actions and never signs in.
+          phone: either alone redeems nothing. The invitee opens the link, types
+          the code and registers a passkey. A sign-in invite adds them to the
+          ACL with the selected role; a step-up invite enrols a passkey that
+          only confirms sensitive actions and never signs in.
         </Text>
         {invite ? (
           <View>
@@ -823,7 +879,9 @@ export default function AclManagement() {
                 {invite.inviteUrl}
               </Text>
             </View>
-            <Text style={styles.editFieldLabel}>Claim code (send separately)</Text>
+            <Text style={styles.editFieldLabel}>
+              Claim code (send separately)
+            </Text>
             <View style={styles.inviteUrlBlock}>
               <Text style={styles.inviteUrlText} selectable>
                 {invite.claimCode}
@@ -835,12 +893,18 @@ export default function AclManagement() {
               the link nor the code can be displayed again.
             </Text>
             <View style={styles.editActions}>
-              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("link")}>
+              <Pressable
+                style={styles.saveButton}
+                onPress={() => handleCopyInvite("link")}
+              >
                 <Text style={styles.saveText}>
                   {inviteCopied === "link" ? "Copied" : "Copy Link"}
                 </Text>
               </Pressable>
-              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("code")}>
+              <Pressable
+                style={styles.saveButton}
+                onPress={() => handleCopyInvite("code")}
+              >
                 <Text style={styles.saveText}>
                   {inviteCopied === "code" ? "Copied" : "Copy Code"}
                 </Text>
@@ -865,10 +929,12 @@ export default function AclManagement() {
               autoCorrect={false}
             />
             <View style={styles.roleRow}>
-              {([
-                ["session", "Sign-in"],
-                ["stepUp", "Step-up only"],
-              ] as const).map(([p, text]) => (
+              {(
+                [
+                  ["session", "Sign-in"],
+                  ["stepUp", "Step-up only"],
+                ] as const
+              ).map(([p, text]) => (
                 <Pressable
                   key={p}
                   style={[
@@ -889,27 +955,27 @@ export default function AclManagement() {
               ))}
             </View>
             {invitePurpose === "session" && (
-            <View style={styles.roleRow}>
-              {(["owner", "admin", "service"] as const).map((r) => (
-                <Pressable
-                  key={r}
-                  style={[
-                    styles.roleButton,
-                    inviteRole === r && styles.roleActive,
-                  ]}
-                  onPress={() => setInviteRole(r)}
-                >
-                  <Text
+              <View style={styles.roleRow}>
+                {(["owner", "admin", "service"] as const).map((r) => (
+                  <Pressable
+                    key={r}
                     style={[
-                      styles.roleText,
-                      inviteRole === r && styles.roleTextActive,
+                      styles.roleButton,
+                      inviteRole === r && styles.roleActive,
                     ]}
+                    onPress={() => setInviteRole(r)}
                   >
-                    {r.charAt(0).toUpperCase() + r.slice(1)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
+                    <Text
+                      style={[
+                        styles.roleText,
+                        inviteRole === r && styles.roleTextActive,
+                      ]}
+                    >
+                      {r.charAt(0).toUpperCase() + r.slice(1)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
             )}
             <Pressable
               style={[
@@ -1059,10 +1125,7 @@ export default function AclManagement() {
           {(["owner", "admin", "service"] as const).map((r) => (
             <Pressable
               key={r}
-              style={[
-                styles.roleButton,
-                newRole === r && styles.roleActive,
-              ]}
+              style={[styles.roleButton, newRole === r && styles.roleActive]}
               onPress={() => setNewRole(r)}
             >
               <Text
@@ -1105,9 +1168,7 @@ export default function AclManagement() {
             />
           </View>
         </View>
-        <Text style={styles.quotaHint}>
-          Leave blank to use server default
-        </Text>
+        <Text style={styles.quotaHint}>Leave blank to use server default</Text>
         <ScopeEditor
           draft={newScope}
           availableDomains={availableDomains}
@@ -1120,7 +1181,9 @@ export default function AclManagement() {
               styles.disabled,
           ]}
           onPress={handleCreate}
-          disabled={!newDid.trim() || creating || !!validateScopeDraft(newScope)}
+          disabled={
+            !newDid.trim() || creating || !!validateScopeDraft(newScope)
+          }
         >
           <Text style={styles.buttonPrimaryText}>
             {creating ? "Adding..." : "Add Entry"}
@@ -1354,6 +1417,10 @@ const styles = StyleSheet.create({
   },
   entryActions: {
     gap: spacing.xs,
+  },
+  passkeysPanel: {
+    marginTop: spacing.md,
+    gap: spacing.sm,
   },
   editButton: {
     borderColor: colors.accent,

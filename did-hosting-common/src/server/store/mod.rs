@@ -91,6 +91,26 @@ pub trait KeyspaceOps: Send + Sync {
     /// SQL transaction, etc.). Single-replica backends (fjall) wrap the
     /// non-atomic `get + remove` in a process-local mutex.
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
+
+    /// Atomically increment a counter stored under `key` and return its new
+    /// value. A key that does not exist yet starts at 0, so the first call
+    /// returns 1.
+    ///
+    /// **Required for cross-replica lockout counters** — the passkey
+    /// enrolment invite's wrong-claim-code count is the first user. A plain
+    /// `get` + increment + `insert` races across replicas: two of them can
+    /// both read the same count, both compute the same next value, and both
+    /// write it back, silently losing an attempt — the exact bug that would
+    /// let an attacker exceed the intended lockout threshold by spreading
+    /// guesses across replicas.
+    ///
+    /// Backends are expected to use a native atomic counter (Redis `INCR`,
+    /// DynamoDB `UpdateItem` with an `ADD` expression on a `Number`
+    /// attribute, …). Single-replica backends (fjall) and backends with no
+    /// single-call primitive (Cosmos DB, Firestore) wrap the non-atomic
+    /// read-then-write in a process-local mutex, the same caveat
+    /// `take_raw_atomic` documents for those backends.
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>>;
 }
 
 /// Atomic multi-key write batch identified by keyspace name.
@@ -261,6 +281,15 @@ impl KeyspaceHandle {
     /// token index).
     pub async fn take_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
         self.inner.take_raw_atomic(key.into()).await
+    }
+
+    /// Atomically increment a counter and return its new value.
+    ///
+    /// Backed by `KeyspaceOps::incr_raw` — safe across replicas that share a
+    /// store, so a caller relying on the returned count for a lockout
+    /// decision gets the same guarantee `take` gives a single-use token.
+    pub async fn incr_raw(&self, key: impl Into<Vec<u8>>) -> Result<u64, AppError> {
+        self.inner.incr_raw(key.into()).await
     }
 
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {

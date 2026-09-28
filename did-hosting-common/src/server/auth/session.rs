@@ -206,8 +206,9 @@ pub async fn cleanup_expired_sessions(
     }
 
     // Expired passkey enrolment invites (`pk_invite:` + their `pk_invite_id:`
-    // index) and enrolment ceremonies (`pk_enrol:`). Both carry `expires_at`;
-    // an invite past it can no longer be redeemed, and its hashes go with it.
+    // index and `pk_wrong:` wrong-claim-code counter) and enrolment
+    // ceremonies (`pk_enrol:`). Both carry `expires_at`; an invite past it
+    // can no longer be redeemed, and its hashes go with it.
     #[derive(serde::Deserialize)]
     struct Expiry {
         expires_at: u64,
@@ -219,9 +220,15 @@ pub async fn cleanup_expired_sessions(
             if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
                 && now > e.expires_at
             {
-                sessions.remove(key).await?;
+                sessions.remove(key.clone()).await?;
                 if let Some(id) = e.invite_id {
                     sessions.remove(format!("pk_invite_id:{id}")).await?;
+                }
+                if let Some(token_hash) = key
+                    .strip_prefix(b"pk_invite:".as_slice())
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                {
+                    sessions.remove(format!("pk_wrong:{token_hash}")).await?;
                 }
                 removed += 1;
             }

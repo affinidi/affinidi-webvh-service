@@ -65,6 +65,7 @@ impl StorageBackend for FirestoreBackend {
                 db: self.db.clone(),
                 collection: name.to_string(),
                 take_lock: Mutex::new(()),
+                incr_lock: Mutex::new(()),
             }),
         ))
     }
@@ -92,11 +93,28 @@ struct FirestoreKeyspace {
     /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
     /// single-replica-only caveat.
     take_lock: Mutex<()>,
+    /// Per-keyspace mutex for `incr_raw` — see method doc for the
+    /// single-replica-only caveat. Kept apart from `take_lock` so an
+    /// increment and a take don't contend on an unrelated key.
+    incr_lock: Mutex<()>,
 }
 
 /// Encode raw key bytes to a Firestore-safe document ID (base64url, no pad).
 fn encode_doc_id(key: &[u8]) -> String {
     BASE64.encode(key)
+}
+
+/// A counter as its decimal ASCII representation. Malformed values decode to
+/// 0 (defensive: a counter key should never hold anything else).
+fn decode_counter(bytes: &[u8]) -> u64 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn encode_counter(n: u64) -> Vec<u8> {
+    n.to_string().into_bytes()
 }
 
 impl KeyspaceOps for FirestoreKeyspace {
@@ -196,6 +214,29 @@ impl KeyspaceOps for FirestoreKeyspace {
                 self.remove(key).await?;
             }
             Ok(value)
+        })
+    }
+
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        // Same single-replica caveat as `take_raw_atomic`: doing this
+        // correctly cross-replica would need a Firestore transaction
+        // (`run_transaction`). The current implementation serialises the
+        // read-then-write with a per-keyspace mutex, correct for
+        // **single-replica** deployments only. Multi-replica deployments
+        // wanting a cross-replica lockout counter should pick the
+        // `store-redis` or `store-dynamodb` backend (both have a native
+        // atomic increment), or upgrade this method to a transaction in a
+        // follow-up.
+        Box::pin(async move {
+            let _guard = self.incr_lock.lock().await;
+            let current = self
+                .get_raw(key.clone())
+                .await?
+                .map(|bytes| decode_counter(&bytes))
+                .unwrap_or(0);
+            let next = current.saturating_add(1);
+            self.insert_raw(key, encode_counter(next)).await?;
+            Ok(next)
         })
     }
 

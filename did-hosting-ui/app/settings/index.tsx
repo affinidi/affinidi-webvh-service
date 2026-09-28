@@ -16,6 +16,7 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showConfirm } from "../../lib/alert";
 import { useAgentNames } from "../../lib/use-agent-names";
 import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
+import { PasskeysCard } from "../../components/PasskeysCard";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -207,13 +208,20 @@ export default function SettingsPage() {
     );
   }
 
+  // Everything below "My Passkeys" is control-plane topology, admin only.
+  // Passkeys are the caller's own account, regardless of role.
   if (!isAdmin) {
     return (
-      <View style={styles.containerCenter}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.container}
+      >
+        <Text style={styles.title}>Account Settings</Text>
+        <PasskeysCard title="My Passkeys" />
         <Text style={styles.hint}>
-          Settings are available to administrators only.
+          Control plane settings are available to administrators only.
         </Text>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -236,11 +244,10 @@ export default function SettingsPage() {
   if (!config) return null;
 
   return (
-    <ScrollView
-      style={styles.scroll}
-      contentContainerStyle={styles.container}
-    >
+    <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
       <Text style={styles.title}>Control Plane Settings</Text>
+
+      <PasskeysCard title="My Passkeys" />
 
       {/* Identity */}
       <View style={styles.card}>
@@ -272,9 +279,9 @@ export default function SettingsPage() {
           <Text style={styles.sectionTitle}>Key Generations</Text>
           <Text style={styles.explainer}>
             After a key rotation, peers holding a cached copy of this
-            service&apos;s DID document keep encrypting to the old key. Superseded
-            generations stay decryptable for a grace period so those messages
-            still arrive.
+            service&apos;s DID document keep encrypting to the old key.
+            Superseded generations stay decryptable for a grace period so those
+            messages still arrive.
           </Text>
 
           {generations.map((g) => (
@@ -332,9 +339,7 @@ export default function SettingsPage() {
               emptyLabel="none in DID document"
             />
           ) : (
-            <Text style={styles.advertisedUnknown}>
-              DID not resolved
-            </Text>
+            <Text style={styles.advertisedUnknown}>DID not resolved</Text>
           )}
         </View>
       </View>
@@ -395,9 +400,15 @@ export default function SettingsPage() {
       {config.dataDir || config.logLevel || config.logFormat ? (
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Storage & Logging</Text>
-          {config.dataDir ? <Row label="Data Directory" value={config.dataDir} /> : null}
-          {config.logLevel ? <Row label="Log Level" value={config.logLevel} /> : null}
-          {config.logFormat ? <Row label="Log Format" value={config.logFormat} /> : null}
+          {config.dataDir ? (
+            <Row label="Data Directory" value={config.dataDir} />
+          ) : null}
+          {config.logLevel ? (
+            <Row label="Log Level" value={config.logLevel} />
+          ) : null}
+          {config.logFormat ? (
+            <Row label="Log Format" value={config.logFormat} />
+          ) : null}
         </View>
       ) : null}
     </ScrollView>

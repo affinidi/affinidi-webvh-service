@@ -39,6 +39,10 @@ pub struct PasskeyUser {
     /// The label each credential was enrolled under, by hex credential id.
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// When each credential (by hex id) was bound, epoch seconds. Read by
+    /// `auth/passkey/list` and `auth/passkey/admin-list`'s `registeredAt`.
+    #[serde(default)]
+    pub registered_at: std::collections::BTreeMap<String, u64>,
 }
 
 impl PasskeyUser {
@@ -50,6 +54,7 @@ impl PasskeyUser {
             display_name: did.to_string(),
             credentials: Vec::new(),
             labels: Default::default(),
+            registered_at: Default::default(),
         }
     }
 }
@@ -202,6 +207,22 @@ pub fn stage_new_credential(
         },
     )?;
     Ok(())
+}
+
+/// Unbind one credential from `user` — drops it from `credentials`, its
+/// label and registration time, and its `pk_cred:` index — and write the
+/// result. The mirror of [`stage_new_credential`], for `auth/passkey/revoke`.
+pub async fn remove_credential(
+    ks: &KeyspaceHandle,
+    user: &mut PasskeyUser,
+    cred_id_hex: &str,
+) -> Result<(), AppError> {
+    user.credentials
+        .retain(|c| self::cred_id_hex(c.cred_id()) != cred_id_hex);
+    user.labels.remove(cred_id_hex);
+    user.registered_at.remove(cred_id_hex);
+    ks.remove(credential_mapping_key(cred_id_hex)).await?;
+    store_passkey_user(ks, user).await
 }
 
 pub async fn get_passkey_user(

@@ -116,6 +116,7 @@ impl StorageBackend for CosmosDbBackend {
                 database: self.database.clone(),
                 container_name: name.to_string(),
                 take_lock: Mutex::new(()),
+                incr_lock: Mutex::new(()),
             }),
         ))
     }
@@ -145,6 +146,10 @@ struct CosmosDbKeyspace {
     /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
     /// single-replica-only caveat.
     take_lock: Mutex<()>,
+    /// Per-keyspace mutex for `incr_raw` — see method doc for the
+    /// single-replica-only caveat. Kept apart from `take_lock` so an
+    /// increment and a take don't contend on an unrelated key.
+    incr_lock: Mutex<()>,
 }
 
 fn encode_doc_id(key: &[u8]) -> String {
@@ -244,6 +249,26 @@ impl KeyspaceOps for CosmosDbKeyspace {
         })
     }
 
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        // Same single-replica caveat as `take_raw_atomic`: Cosmos DB has no
+        // single-call atomic counter in this client, so the read-then-write
+        // is serialised with a per-keyspace mutex — correct for
+        // **single-replica** deployments only. Multi-replica deployments
+        // wanting a cross-replica lockout counter should pick `store-redis`
+        // or `store-dynamodb`, both of which have a native atomic increment.
+        Box::pin(async move {
+            let _guard = self.incr_lock.lock().await;
+            let current = self
+                .get_raw(key.clone())
+                .await?
+                .map(|bytes| decode_counter(&bytes))
+                .unwrap_or(0);
+            let next = current.saturating_add(1);
+            self.insert_raw(key, encode_counter(next)).await?;
+            Ok(next)
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
             let container = self.container().await?;
@@ -287,6 +312,19 @@ impl KeyspaceOps for CosmosDbKeyspace {
             Ok(results)
         })
     }
+}
+
+/// A counter as its decimal ASCII representation. Malformed values decode to
+/// 0 (defensive: a counter key should never hold anything else).
+fn decode_counter(bytes: &[u8]) -> u64 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn encode_counter(n: u64) -> Vec<u8> {
+    n.to_string().into_bytes()
 }
 
 /// Check if a Cosmos DB error is a 404 Not Found.

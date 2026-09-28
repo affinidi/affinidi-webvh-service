@@ -91,6 +91,7 @@ impl StorageBackend for FjallBackend {
             Arc::new(FjallKeyspace {
                 keyspace: ks,
                 take_lock: Mutex::new(()),
+                incr_lock: Mutex::new(()),
             }),
         ))
     }
@@ -125,6 +126,9 @@ struct FjallKeyspace {
     /// process-local mutual exclusion is sufficient — no cross-replica
     /// coordination is required.
     take_lock: Mutex<()>,
+    /// Per-keyspace mutex held across the get-then-write of `incr_raw`. Same
+    /// single-process rationale as `take_lock`.
+    incr_lock: Mutex<()>,
 }
 
 impl KeyspaceOps for FjallKeyspace {
@@ -213,6 +217,44 @@ impl KeyspaceOps for FjallKeyspace {
             Ok(value)
         })
     }
+
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            // Per-keyspace mutex serialises the get-then-write so two
+            // concurrent callers cannot both read the same count and both
+            // write back the same next value. fjall is single-process, so
+            // process-local mutual exclusion is the correct primitive.
+            let _guard = self.incr_lock.lock().await;
+            let ks = self.keyspace.clone();
+            let key2 = key.clone();
+            let current = tokio::task::spawn_blocking(move || ks.get(key2))
+                .await
+                .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                .map_err(|e| AppError::Store(e.to_string()))?
+                .map(|v| v.to_vec());
+            let next = current
+                .map(|bytes| decode_counter(&bytes))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let ks = self.keyspace.clone();
+            let value = encode_counter(next);
+            tokio::task::spawn_blocking(move || ks.insert(key, value))
+                .await
+                .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                .map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(next)
+        })
+    }
+}
+
+/// A counter as 8 big-endian bytes. Malformed or short values decode to 0
+/// (defensive: a counter key should never hold anything else).
+fn decode_counter(bytes: &[u8]) -> u64 {
+    bytes.try_into().map(u64::from_be_bytes).unwrap_or_default()
+}
+
+fn encode_counter(n: u64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +349,34 @@ mod tests {
 
         // Key is gone from the store.
         assert!(ks.get_raw(b"refresh:abc".to_vec()).await.unwrap().is_none());
+    }
+
+    /// Many concurrent `incr_raw` calls on the same key must each observe a
+    /// distinct, correctly-ordered value — never the same next value twice.
+    /// This is the contract the passkey invite wrong-code lockout depends on.
+    #[tokio::test]
+    async fn incr_raw_serialises_concurrent_callers() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+
+        const N: u64 = 20;
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let ks = ks.clone();
+            handles.push(tokio::spawn(async move {
+                ks.incr_raw(b"counter:x".to_vec()).await.unwrap()
+            }));
+        }
+        let mut results: Vec<u64> = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        results.sort_unstable();
+        assert_eq!(
+            results,
+            (1..=N).collect::<Vec<_>>(),
+            "lost or duplicate increment"
+        );
     }
 
     #[tokio::test]

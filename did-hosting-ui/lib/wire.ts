@@ -35,6 +35,7 @@ import type {
   InviteListItem,
   LogEntryInfo,
   LogMetadata,
+  PasskeyCredential,
   ServerStats,
   ServiceInstance,
   TimeRange,
@@ -102,7 +103,9 @@ export function logEntriesFromWire(resp: DidLogResponse): LogEntryInfo[] {
  * the members it names, so the effective value of each is the last one set.
  * `null` for an empty log.
  */
-export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | null {
+export function logMetadataFromEntries(
+  entries: LogEntryInfo[],
+): LogMetadata | null {
   if (entries.length === 0) return null;
   const effective: Record<string, any> = {};
   for (const e of entries) {
@@ -110,10 +113,16 @@ export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | n
   }
   const latest = entries[entries.length - 1]!;
   const witness =
-    effective.witness && typeof effective.witness === "object" ? effective.witness : null;
-  const witnessList: unknown[] = Array.isArray(witness?.witnesses) ? witness.witnesses : [];
+    effective.witness && typeof effective.witness === "object"
+      ? effective.witness
+      : null;
+  const witnessList: unknown[] = Array.isArray(witness?.witnesses)
+    ? witness.witnesses
+    : [];
   const watcherUrls: string[] = Array.isArray(effective.watchers)
-    ? effective.watchers.filter((w: unknown): w is string => typeof w === "string")
+    ? effective.watchers.filter(
+        (w: unknown): w is string => typeof w === "string",
+      )
     : [];
   return {
     logEntryCount: entries.length,
@@ -121,10 +130,13 @@ export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | n
     latestVersionTime: latest.versionTime,
     method: typeof effective.method === "string" ? effective.method : null,
     portable: effective.portable === true,
-    preRotation: Array.isArray(effective.nextKeyHashes) && effective.nextKeyHashes.length > 0,
+    preRotation:
+      Array.isArray(effective.nextKeyHashes) &&
+      effective.nextKeyHashes.length > 0,
     witnesses: witnessList.length > 0,
     witnessCount: witnessList.length,
-    witnessThreshold: typeof witness?.threshold === "number" ? witness.threshold : 0,
+    witnessThreshold:
+      typeof witness?.threshold === "number" ? witness.threshold : 0,
     watchers: watcherUrls.length > 0,
     watcherCount: watcherUrls.length,
     watcherUrls,
@@ -179,7 +191,9 @@ export function domainFromWire(wire: object): DomainEntry {
 // Fleet, stats, service
 // ---------------------------------------------------------------------------
 
-export function serviceInstanceFromWire(i: WireServiceInstance): ServiceInstance {
+export function serviceInstanceFromWire(
+  i: WireServiceInstance,
+): ServiceInstance {
   return {
     instanceId: i.instanceId,
     did: i.did,
@@ -191,7 +205,9 @@ export function serviceInstanceFromWire(i: WireServiceInstance): ServiceInstance
     registeredAt: requiredEpoch(i.registeredAt),
     enabledMethods: i.enabledMethods ?? [],
     servedDomains: i.servedDomains,
-    ...(i.advertisedServices ? { advertisedServices: i.advertisedServices } : {}),
+    ...(i.advertisedServices
+      ? { advertisedServices: i.advertisedServices }
+      : {}),
     ...(i.servicesCheckedAt
       ? { servicesCheckedAt: epochSeconds(i.servicesCheckedAt) ?? undefined }
       : {}),
@@ -249,7 +265,9 @@ export function configFromWire(c: ConfigResponse): ControlPlaneConfig {
     mediatorDid: c.mediatorDid ?? null,
     didcommEnabled: c.transports.didcomm,
     tspEnabled: c.transports.tsp,
-    ...(c.advertisedServices ? { advertisedServices: c.advertisedServices } : {}),
+    ...(c.advertisedServices
+      ? { advertisedServices: c.advertisedServices }
+      : {}),
     enabledMethods: c.enabledMethods,
     agentNames: c.agentNames,
     listenAddress: c.listenAddress ?? null,
@@ -317,6 +335,29 @@ export function inviteFromWire(i: InviteSummary): InviteListItem {
   };
 }
 
+/** A wire credential summary — `auth/passkey/list`'s `RegisteredCredential`
+ *  and `auth/passkey/admin-list`'s `ListedCredential` share this shape (the
+ *  latter also carries an optional `signCount` this console doesn't show). */
+interface WireCredentialSummary {
+  credentialId: string;
+  deviceLabel?: string;
+  registeredAt: string;
+  lastUsedAt?: string;
+  transports?: string[];
+}
+
+export function passkeyCredentialFromWire(
+  c: WireCredentialSummary,
+): PasskeyCredential {
+  return {
+    credentialId: c.credentialId,
+    deviceLabel: c.deviceLabel ?? null,
+    registeredAt: requiredEpoch(c.registeredAt),
+    lastUsedAt: epochSeconds(c.lastUsedAt),
+    transports: c.transports ?? [],
+  };
+}
+
 /** Project a spec-wire ACL entry into the `AclEntry` the screens render. The
  *  wire carries webvh fields under `ext["vnd.affinidi.webvh"]`. */
 export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
@@ -327,8 +368,10 @@ export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
     role: role(spec.role),
     label: spec.label ?? null,
     created_at: epochSeconds(spec.createdAt) ?? 0,
-    max_total_size: typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
-    max_did_count: typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
+    max_total_size:
+      typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
+    max_did_count:
+      typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
     domains: (webvh.domains as DomainScope | undefined) ?? { kind: "all" },
   };
 }

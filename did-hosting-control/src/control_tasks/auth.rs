@@ -3,8 +3,13 @@
 //! `enrol`.
 //!
 //! The login ceremony reads login credentials only — the `KS_SESSIONS`
-//! store. Step-up-only passkeys are in a keyspace this module never opens, so
-//! one can neither be offered here nor accepted.
+//! store. A login passkey can never satisfy a step-up, and a step-up-only
+//! passkey can never sign anyone in: the two stores are opened by different
+//! code paths, and neither reads the other. `step_up_start`/`approve_response`
+//! below are the ones that open `KS_PASSKEY_STEP_UP` — when the session's
+//! subject holds a step-up passkey, the approve-request offers `webauthn` as
+//! an `acceptableEvidence` alongside `didSigned`, gated on that store; the
+//! login family (`login_start`/`login_finish`) never opens it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +24,8 @@ use did_hosting_common::server::auth::session::{
     Session, SessionState, create_authenticated_session, delete_session, get_session, now_epoch,
     store_session,
 };
-use did_hosting_common::server::passkey::store as passkey_store;
+use did_hosting_common::server::passkey::store::{self as passkey_store, cred_id_hex};
+use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
 
 use super::{Cx, TaskError, at, new_id, typed};
 use crate::acl::check_acl;
@@ -68,6 +74,14 @@ struct PendingStepUp {
 
 fn step_up_key(session_id: &str) -> String {
     format!("stepup-task:{session_id}")
+}
+
+/// The id a step-up's WebAuthn authentication state (when it opened one) is
+/// stored under, via [`passkey_store::store_auth_state`]/[`passkey_store::take_auth_state`].
+/// Namespaced apart from a login ceremony's `authId` (a bare UUID) so the two
+/// can never collide in the shared `pk_auth:` key space.
+fn step_up_webauthn_id(session_id: &str) -> String {
+    format!("stepup:{session_id}")
 }
 
 /// `auth/revoke-session/0.2`: end one of the caller's own sessions. This is
@@ -183,14 +197,57 @@ pub(crate) async fn step_up_start(
         ));
     }
 
-    let challenge = random_hex(32);
     let expires_at = now_epoch() + CEREMONY_TTL_SECS;
+
+    // Offer a WebAuthn gate when the session's subject holds a step-up
+    // passkey. Its own challenge — not an independently-generated nonce —
+    // becomes the step-up's `challenge`, so the two are the same value: the
+    // spec requires the assertion's `clientDataJSON` challenge to equal
+    // `payload.challenge`, and webauthn-rs, not this service, is what
+    // chooses a passkey ceremony's challenge.
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
+    let step_up_creds = passkey_store::get_passkey_user_by_did(&step_up_ks, &session.did)
+        .await?
+        .map(|u| u.credentials)
+        .unwrap_or_default();
+    let gate = match (&state.webauthn, step_up_creds.is_empty()) {
+        (Some(webauthn), false) => Some(
+            webauthn
+                .start_passkey_authentication(&step_up_creds)
+                .map_err(|e| AppError::Internal(format!("webauthn step-up start failed: {e}")))?,
+        ),
+        _ => None,
+    };
+    let (challenge, acceptable_evidence, webauthn_options) = match &gate {
+        Some((rcr, _)) => {
+            let options = request_options(rcr)?;
+            let challenge = options
+                .get("challenge")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Internal("webauthn options missing challenge".into()))?
+                .to_string();
+            (challenge, json!(["didSigned", "webauthn"]), Some(options))
+        }
+        None => (random_hex(32), json!(["didSigned"]), None),
+    };
+
     let my_vid = state
         .config
         .server_did
         .clone()
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
     let secret = crate::signing::control_signing_secret(state, &my_vid)?;
+    let mut payload = json!({
+        "subject": session.did,
+        "sessionId": session_id,
+        "challenge": challenge,
+        "reason": "Elevate this session to aal2",
+        "targetAcr": STEP_UP_ACR,
+        "acceptableEvidence": acceptable_evidence,
+    });
+    if let Some(options) = webauthn_options {
+        payload["webauthn"] = options;
+    }
     let request: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(json!({
         "id": new_id(),
         "type": <trust_tasks_rs::specs::auth::step_up::approve_request::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI,
@@ -198,14 +255,7 @@ pub(crate) async fn step_up_start(
         "recipient": session.did,
         "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "expiresAt": at(expires_at).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "payload": {
-            "subject": session.did,
-            "sessionId": session_id,
-            "challenge": challenge,
-            "reason": "Elevate this session to aal2",
-            "targetAcr": STEP_UP_ACR,
-            "acceptableEvidence": ["didSigned"],
-        },
+        "payload": payload,
     }))?;
     // The approve-request is the approver's to verify on its own terms before
     // surfacing its reason, so it is checked here against its own schema too.
@@ -230,7 +280,15 @@ pub(crate) async fn step_up_start(
             },
         )
         .await?;
-    info!(did = %session.did, session_id = %session_id, "step-up started");
+    if let Some((_, auth_state)) = &gate {
+        passkey_store::store_auth_state(
+            &state.sessions_ks,
+            &step_up_webauthn_id(&session_id),
+            auth_state,
+        )
+        .await?;
+    }
+    info!(did = %session.did, session_id = %session_id, webauthn = gate.is_some(), "step-up started");
     typed(
         json!({ "approveRequest": serde_json::to_value(&signed)? }),
         "step-up start response",
@@ -243,6 +301,12 @@ pub(crate) async fn step_up_start(
 /// subject, and — approved — it raises the session's assurance level. Tokens
 /// carrying the new level come from `auth/refresh`, which reads the session's
 /// current level.
+///
+/// `evidence.kind: webauthn` additionally requires a user-verified assertion
+/// from the subject's `KS_PASSKEY_STEP_UP` credentials, over the WebAuthn
+/// ceremony `step_up_start` opened for exactly this challenge — a login
+/// passkey can't answer it (it's a different store) and a step-up passkey
+/// can't sign anyone in (this is the only place that verifies one).
 pub(crate) async fn approve_response(
     cx: &Cx<'_>,
     p: approve_response::v0_5::Payload,
@@ -274,8 +338,13 @@ pub(crate) async fn approve_response(
             "no pending step-up has that challenge".into(),
         ));
     }
-    // Single use: consumed whatever the decision.
+    // Single use: consumed whatever the decision. The WebAuthn ceremony
+    // state (when one was offered) goes with it, whatever the evidence
+    // actually presented.
     state.sessions_ks.remove(step_up_key(&session_id)).await?;
+    let webauthn_state =
+        passkey_store::take_auth_state(&state.sessions_ks, &step_up_webauthn_id(&session_id))
+            .await?;
     if now_epoch() > pending.expires_at {
         return Err(TaskError::Declared(
             error_codes::CHALLENGE_EXPIRED,
@@ -295,11 +364,68 @@ pub(crate) async fn approve_response(
             "only the session's subject may approve its step-up".into(),
         ));
     }
-    if matches!(p.evidence, Some(Evidence::Webauthn(_))) {
-        return Err(TaskError::Declared(
-            error_codes::NO_GATE,
-            "this relying party accepts didSigned evidence only".into(),
-        ));
+    // The framework proof already established the approver's DID (verified
+    // as `assertionMethod` before this handler ran) — a self step-up, so
+    // that's the session's own subject, as checked above. `webauthn`
+    // evidence is an *additional* factor on top of that proof, not a
+    // replacement for it: the browser signs with the did:key its session is
+    // already bound to (the same key every other request in the session
+    // uses), and the human-facing action is touching the step-up passkey.
+    if let Some(Evidence::Webauthn(assertion)) = &p.evidence {
+        let webauthn_state = webauthn_state.ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::NO_GATE,
+                "this step-up was not offered a passkey gate".into(),
+            )
+        })?;
+        let webauthn = state.webauthn.as_deref().ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::NO_GATE,
+                "passkeys are not configured on this service".into(),
+            )
+        })?;
+        let credential: webauthn_rs::prelude::PublicKeyCredential =
+            serde_json::from_value(serde_json::to_value(assertion)?).map_err(|e| {
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    format!("unreadable assertion: {e}"),
+                )
+            })?;
+        let result = webauthn
+            .finish_passkey_authentication(&credential, &webauthn_state)
+            .map_err(|e| {
+                warn!(error = %e, "step-up passkey assertion failed");
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    "the assertion did not verify".into(),
+                )
+            })?;
+        if !result.user_verified() {
+            return Err(TaskError::Declared(
+                error_codes::ASSERTION_INVALID,
+                "step-up requires a user-verified passkey assertion".into(),
+            ));
+        }
+        // Defence in depth: the assertion must be from one of the pending
+        // step-up's own subject's step-up-only credentials — which is
+        // already everything `webauthn_state` could answer, since it was
+        // built from exactly that subject's `KS_PASSKEY_STEP_UP` passkeys,
+        // never the login store.
+        let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
+        let cred_id = cred_id_hex(result.cred_id());
+        let mut step_up_user = passkey_store::get_passkey_user_by_cred(&step_up_ks, &cred_id)
+            .await?
+            .filter(|u| u.did == pending.subject)
+            .ok_or_else(|| {
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    "the assertion is not from the subject's step-up passkey".into(),
+                )
+            })?;
+        for c in &mut step_up_user.credentials {
+            c.update_credential(&result);
+        }
+        passkey_store::store_passkey_user(&step_up_ks, &step_up_user).await?;
     }
 
     match p.decision {
@@ -330,8 +456,13 @@ pub(crate) async fn approve_response(
         })?;
     // The ACL still gates: elevation does not outlive an ACL entry.
     check_acl(&state.acl_ks, &session.did).await?;
-    if !session.amr.iter().any(|m| m == "did") {
-        session.amr.push("did".into());
+    let factor = if matches!(p.evidence, Some(Evidence::Webauthn(_))) {
+        "passkey"
+    } else {
+        "did"
+    };
+    if !session.amr.iter().any(|m| m == factor) {
+        session.amr.push(factor.into());
     }
     session.acr = STEP_UP_ACR.to_string();
     session.acr_expires_at = None;
