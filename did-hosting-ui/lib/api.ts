@@ -7,9 +7,10 @@
  * `@openvtc/trust-tasks`; `wire.ts` projects each reply into the view models
  * below, which are what the screens render.
  *
- * Three things stay plain HTTP: the unauthenticated `/api/health` liveness
- * probe, passkey *enrolment* (its Trust Tasks are not served yet), and the
- * REST token refresh in `session.ts`.
+ * Two things stay plain HTTP: the unauthenticated `/api/health` liveness
+ * probe and the REST token refresh in `session.ts`. Passkey enrolment and
+ * login are Trust Tasks too; only the browser's WebAuthn ceremony is not, and
+ * its data rides inside their payloads.
  */
 
 import type * as DidList from "@openvtc/trust-tasks/did-management/did/list/0.1/payload";
@@ -40,6 +41,9 @@ import type * as IdentityList from "@openvtc/trust-tasks/did-management/identity
 import type * as IdentityRetire from "@openvtc/trust-tasks/did-management/identity/retire/0.1/payload";
 import type * as LoginStart from "@openvtc/trust-tasks/auth/passkey/login/start/0.2/payload";
 import type * as LoginFinish from "@openvtc/trust-tasks/auth/passkey/login/finish/0.2/payload";
+import type * as Invite from "@openvtc/trust-tasks/auth/passkey/enroll/invite/0.2/payload";
+import type * as RedeemStart from "@openvtc/trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
+import type * as RedeemFinish from "@openvtc/trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
 import type * as InviteList from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
 import type * as InviteUpdate from "@openvtc/trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
 import type * as InviteRevoke from "@openvtc/trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
@@ -334,20 +338,6 @@ export interface AggregateStats {
   totalUpdates: number;
 }
 
-/** The tokens passkey enrolment (still REST) answers with. */
-export interface TokenResponse {
-  session_id: string;
-  access_token: string;
-  access_expires_at: number;
-  refresh_token: string;
-  refresh_expires_at: number;
-}
-
-export interface EnrollStartResponse {
-  registration_id: string;
-  options: any;
-}
-
 export interface LoginStartResponse {
   authId: string;
   /** WebAuthn request options, in the shape `navigator.credentials.get` takes
@@ -360,12 +350,26 @@ export interface LoginTokens {
   refreshToken: string | null;
 }
 
+/** What a credential enrolled by invite may do: sign in (`session`), or only
+ *  confirm a step-up for one operation (`stepUp`), never sign in. */
+export type InvitePurpose = "session" | "stepUp";
+
+/** A freshly issued invite. `inviteUrl` and `claimCode` are shown once, here,
+ *  and are to be sent over two different channels; the control plane keeps
+ *  only their hashes and never returns either again. */
 export interface CreateInviteResponse {
-  invite_id: string;
-  token: string;
-  enrollment_url: string;
-  expires_at: number;
+  inviteUrl: string;
+  claimCode: string;
+  subject: string;
+  purpose: InvitePurpose;
+  expiresAt: number;
 }
+
+/** The registration an invite authorises, before the passkey is created. */
+export type RedeemStartResponse = RedeemStart.Response;
+
+/** The credential an invite bound. */
+export type RedeemFinishResponse = RedeemFinish.Response;
 
 /** A pending invite as an administrator sees it later: addressed by
  *  `inviteId`. The token is shown once, when the invite is created, and is
@@ -373,6 +377,7 @@ export interface CreateInviteResponse {
 export interface InviteListItem {
   inviteId: string;
   did: string;
+  purpose: InvitePurpose;
   role: "admin" | "owner" | "service";
   createdAt: number;
   expiresAt: number;
@@ -483,6 +488,9 @@ const T = {
   identityRetire: `${DM}identity/retire/0.1` as const satisfies typeof IdentityRetire.TYPE_URI,
   loginStart: `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
   loginFinish: `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
+  invite: `${TT}auth/passkey/enroll/invite/0.2` as const satisfies typeof Invite.TYPE_URI,
+  redeemStart: `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
+  redeemFinish: `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
   inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
   inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
   inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
@@ -1081,28 +1089,62 @@ export const api = {
     return { accessToken: r.tokens.accessToken, refreshToken: r.tokens.refreshToken ?? null };
   },
 
-  // ---- Passkey enrolment (REST until its Trust Tasks are served) ----
+  // ---- Passkey enrolment (Trust Tasks) ----
 
-  passkeyEnrollStart: (token: string) =>
-    request<EnrollStartResponse>("/api/auth/passkey/enroll/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    }),
+  /**
+   * Issue an invite (administrator). A `session` invite enrols a login passkey
+   * with `role`; a `stepUp` invite a step-up-only passkey, which carries no
+   * role and never signs in.
+   */
+  createInvite: async (
+    did: string,
+    role: Role,
+    purpose: InvitePurpose = "session",
+  ): Promise<CreateInviteResponse> => {
+    const r = await trustTask<Invite.Payload, Invite.Response>(T.invite, {
+      subject: did,
+      ...(purpose === "session" ? { role } : { purpose }),
+    });
+    return {
+      inviteUrl: r.invite.url,
+      claimCode: r.claimCode,
+      subject: r.subject,
+      purpose: r.purpose,
+      expiresAt: Math.floor(Date.parse(r.expiresAt) / 1000),
+    };
+  },
 
-  passkeyEnrollFinish: (registrationId: string, credential: any) =>
-    request<TokenResponse>("/api/auth/passkey/enroll/finish", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ registration_id: registrationId, credential }),
-    }),
+  /**
+   * Present an invite's token (from its URL) and its claim code (delivered
+   * separately). Sent anonymously and unsigned: the invitee has no key the
+   * control plane knows, and the two halves are the authorisation.
+   */
+  redeemStart: async (token: string, claimCode: string): Promise<RedeemStartResponse> =>
+    trustTask<RedeemStart.Payload, RedeemStart.Response>(
+      T.redeemStart,
+      { token, claimCode },
+      { signer: "none", anonymous: true },
+    ),
 
-  createInvite: (did: string, role: Role) =>
-    request<CreateInviteResponse>("/api/auth/passkey/invite", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, role }),
-    }),
+  /** Bind the new passkey (and, where asked, prove an existing one). */
+  redeemFinish: async (
+    enrollmentId: string,
+    credential: RedeemFinish.Payload["credential"],
+    uvCredential?: RedeemFinish.Payload["uvCredential"],
+    deviceLabel?: string,
+  ): Promise<RedeemFinishResponse> =>
+    trustTask<RedeemFinish.Payload, RedeemFinish.Response>(
+      T.redeemFinish,
+      {
+        enrollmentId,
+        credential,
+        // Only the members given: an `undefined` member cannot be
+        // canonicalised, and the spec reads an absent one as "none".
+        ...(uvCredential ? { uvCredential } : {}),
+        ...(deviceLabel ? { deviceLabel } : {}),
+      },
+      { signer: "none", anonymous: true },
+    ),
 
   // ---- Enrolment invites (Trust Tasks) ----
 

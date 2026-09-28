@@ -205,18 +205,26 @@ pub async fn cleanup_expired_sessions(
         }
     }
 
-    // Clean up expired enrollment tokens (have an `expires_at` field).
-    let enrollments = sessions.prefix_iter_raw("enroll:").await?;
-    for (key, value) in enrollments {
-        #[derive(serde::Deserialize)]
-        struct EnrollmentExpiry {
-            expires_at: u64,
-        }
-        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value)
-            && now > e.expires_at
-        {
-            sessions.remove(key).await?;
-            removed += 1;
+    // Expired passkey enrolment invites (`pk_invite:` + their `pk_invite_id:`
+    // index) and enrolment ceremonies (`pk_enrol:`). Both carry `expires_at`;
+    // an invite past it can no longer be redeemed, and its hashes go with it.
+    #[derive(serde::Deserialize)]
+    struct Expiry {
+        expires_at: u64,
+        #[serde(default)]
+        invite_id: Option<String>,
+    }
+    for prefix in ["pk_invite:", "pk_enrol:"] {
+        for (key, value) in sessions.prefix_iter_raw(prefix).await? {
+            if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
+                && now > e.expires_at
+            {
+                sessions.remove(key).await?;
+                if let Some(id) = e.invite_id {
+                    sessions.remove(format!("pk_invite_id:{id}")).await?;
+                }
+                removed += 1;
+            }
         }
     }
 

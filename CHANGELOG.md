@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Breaking — passkey enrolment is Trust Tasks, with hashed invites
+
+- **Served** on TSP, DIDComm and `POST /api/trust-tasks`:
+  `auth/passkey/enroll/invite/0.2`, `auth/passkey/enroll/redeem/start/0.1`,
+  `auth/passkey/enroll/redeem/finish/0.1` and
+  `auth/passkey/enroll/{start,finish}/0.2`. WebAuthn's own ceremony data rides
+  inside the payloads; the browser ceremony is the one non-Trust-Task step.
+- **Invites are two secrets, stored hashed.** An invite is a 256-bit token for
+  the URL and a 60-bit claim code for a second channel, each returned once.
+  The store keeps a SHA-256 of the token (its lookup key) and a salted
+  Argon2id digest of the code, compared in constant time. Five wrong codes
+  delete the invite; redemption is also rate-limited per source (client IP on
+  HTTPS, sender on TSP/DIDComm). Invites expire (default 1 h, capped by
+  `auth.passkey_enrollment_ttl`) and are consumed exactly once, atomically
+  with binding the credential. An unknown token, a wrong code and an expired
+  invite get the same refusal.
+- **Step-up-only passkeys** (`purpose: stepUp`) are held in a new keyspace,
+  `passkey_step_up`, which the login ceremony never reads: one can never sign
+  anyone in, and a login passkey never stands in for one.
+- **User verification is bound to the ceremony.** Enrolling a further passkey
+  of a purpose the subject already holds requires a user-verified assertion
+  from one of them, over a challenge distinct from the registration one and
+  stored only in the ceremony record. The first finish takes the record, so a
+  replayed finish, or an assertion made for another ceremony, is refused.
+- **Removed:** the REST routes `/api/auth/passkey/enroll/{start,finish}`,
+  `/api/auth/passkey/login/{start,finish}`,
+  `/api/auth/step-up/passkey/{start,finish}`, `/api/auth/passkey/invite`,
+  `/api/auth/passkey/invites` and `/api/auth/passkey/invite/{invite_id}`. The
+  console already signed in with `auth/passkey/login/*/0.2`, and a session
+  step-up by passkey is `auth/passkey/login/*` with `purpose: stepUp`.
+- **No migration.** Invites in the old plaintext `enroll:` rows are not read;
+  issue new ones. The `invite` CLI now prints the URL and the claim code
+  separately.
+- **Console.** The enrolment page asks for the claim code, shows whose passkey
+  it will be and what it may do before creating it, and redeems over Trust
+  Tasks; the ACL page issues sign-in or step-up invites and shows the link and
+  the code apart, once.
+
 ### Breaking — the watcher is Trust Tasks only, with its own DID
 
 - **Its own DID.** webvh-watcher is provisioned from a VTA context like the

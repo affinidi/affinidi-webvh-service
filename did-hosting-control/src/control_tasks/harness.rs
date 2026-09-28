@@ -105,6 +105,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+        redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
@@ -252,7 +253,9 @@ pub(crate) async fn call(
     } else {
         signed(doc, &caller.key).await
     };
-    send(state, via, caller, doc).await
+    // Boxed: a test chaining many calls would otherwise build one future deep
+    // enough to overflow a debug-build test thread's stack.
+    Box::pin(send(state, via, caller, doc)).await
 }
 
 /// The reply's payload when it is the task's `#response`, else a panic naming

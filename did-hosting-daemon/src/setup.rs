@@ -1108,9 +1108,9 @@ async fn run_self_managed_setup(
         output_path.display()
     );
     eprintln!();
-    eprintln!("    3. Open the printed enrolment URL in a browser to bind a");
-    eprintln!("       passkey to that DID. Subsequent admin login uses the");
-    eprintln!("       passkey.");
+    eprintln!("    3. Open the printed enrolment URL in a browser, type the");
+    eprintln!("       printed claim code, and bind a passkey to that DID.");
+    eprintln!("       Subsequent admin login uses the passkey.");
     eprintln!();
 
     Ok(())

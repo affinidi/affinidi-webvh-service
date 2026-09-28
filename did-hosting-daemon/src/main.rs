@@ -226,7 +226,7 @@ enum Command {
         /// Role (admin or owner)
         #[arg(long, default_value = "owner")]
         role: String,
-        /// Override enrollment TTL (in hours)
+        /// Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
         #[arg(long)]
         ttl_hours: Option<u64>,
     },
@@ -1454,6 +1454,7 @@ async fn build_control(
         pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.
@@ -1585,8 +1586,6 @@ async fn run_invite(
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::passkey::routes::create_enrollment_invite;
-
     let config = DaemonConfig::load(config_path)?;
     let control_config = config.control_config();
 
@@ -1603,23 +1602,14 @@ async fn run_invite(
     let store = Store::open(&control_config.store).await?;
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
-    let resp =
-        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
-
-    eprintln!();
-    eprintln!("  Enrollment invite created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    let ttl_hours_display = enrollment_ttl / 3600;
-    eprintln!(
-        "  Expires: in {ttl_hours_display}h (epoch {})",
-        resp.expires_at
-    );
-    eprintln!();
-    eprintln!("  Enrollment URL:");
-    eprintln!("  {}", resp.enrollment_url);
-    eprintln!();
+    did_hosting_common::server::passkey::run_cli_invite(
+        &sessions_ks,
+        base_url,
+        enrollment_ttl,
+        &did,
+        &role,
+    )
+    .await?;
 
     Ok(())
 }

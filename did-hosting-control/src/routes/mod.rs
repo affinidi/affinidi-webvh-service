@@ -180,45 +180,10 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(task_consent::request),
             (*TASK_CONSENT_REQUEST_0_1).clone(),
         )
-        // Passkey (WebAuthn)
-        .route_with_task_permissive(
-            "/auth/passkey/enroll/start",
-            post(passkey::enroll_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_START_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/enroll/finish",
-            post(passkey::enroll_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1).clone(),
-        )
-        // Passkey login + step-up tasks moved to the 0.2 spec; the 0.1
-        // URIs stay accepted on inbound (deprecated) for backwards
-        // compatibility via `route_with_tasks_permissive`.
-        .route_with_tasks_permissive(
-            "/auth/passkey/login/start",
-            post(passkey::login_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_START_0_2).clone(),
-            vec![(*TASK_AUTH_PASSKEY_LOGIN_START_0_1).clone()],
-        )
-        .route_with_tasks_permissive(
-            "/auth/passkey/login/finish",
-            post(passkey::login_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2).clone(),
-            vec![(*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1).clone()],
-        )
-        // Step-up: elevate the current session to aal2 via a WebAuthn assertion.
-        .route_with_tasks_permissive(
-            "/auth/step-up/passkey/start",
-            post(passkey::step_up_start::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_START_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_PASSKEY_START_0_1).clone()],
-        )
-        .route_with_tasks_permissive(
-            "/auth/step-up/passkey/finish",
-            post(passkey::step_up_finish::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1).clone()],
-        )
+        // Passkey enrolment, login and session step-up are Trust Tasks
+        // (`auth/passkey/enroll/*`, `auth/passkey/login/*`) on
+        // `POST /api/trust-tasks` and the messaging transports; there is no
+        // REST passkey surface.
         // Step-up via VTA approval (wallet-driven, works cross-origin).
         .route_with_tasks_permissive(
             "/auth/step-up/vta/start",
@@ -237,21 +202,6 @@ pub fn router_without_fallback() -> Router<AppState> {
             "/auth/step-up/check",
             get(passkey::step_up_check),
             (*TASK_AUTH_STEP_UP_CHECK_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invite",
-            post(passkey::create_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invites",
-            get(passkey::list_invites::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invite/{invite_id}",
-            put(passkey::update_invite::<AppState>).delete(passkey::revoke_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
         )
         // ACL
         .route_with_task_permissive(
@@ -399,7 +349,7 @@ pub fn router_without_fallback() -> Router<AppState> {
         // before the handler-level Admin check rejects.
         .route_exempt(
             "/trust-tasks",
-            post(trust_tasks::dispatch_trust_task)
+            post(trust_tasks::trust_tasks_endpoint)
                 .layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
         )
         // Exempt from the Trust-Task header: the body is itself a signed

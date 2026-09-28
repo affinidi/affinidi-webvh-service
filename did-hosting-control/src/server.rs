@@ -14,7 +14,6 @@ use did_hosting_common::server::didcomm_profile::{
 };
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
-use did_hosting_common::server::passkey::PasskeyState;
 use did_hosting_common::server::store::{
     KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
@@ -154,6 +153,10 @@ pub struct AppState {
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
     pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
+    /// Per-source limiter for passkey invite redemption
+    /// (`auth/passkey/enroll/redeem/start`). See
+    /// [`crate::rate_limit::SourceRateLimiter`].
+    pub redeem_rate_limiter: Arc<crate::rate_limit::SourceRateLimiter>,
     /// In-flight RP→wallet consent requests, keyed by `challenge`.
     /// The `POST /task-consent/request` endpoint inserts a pending entry
     /// and parks on a `oneshot`; the inbound `task-consent/decision/0.1`
@@ -197,32 +200,6 @@ impl AuthState for AppState {
 
     fn sessions_ks(&self) -> &KeyspaceHandle {
         &self.sessions_ks
-    }
-}
-
-impl PasskeyState for AppState {
-    fn webauthn(&self) -> Option<&Arc<Webauthn>> {
-        self.webauthn.as_ref()
-    }
-
-    fn acl_ks(&self) -> &KeyspaceHandle {
-        &self.acl_ks
-    }
-
-    fn access_token_expiry(&self) -> u64 {
-        self.config.auth.access_token_expiry
-    }
-
-    fn refresh_token_expiry(&self) -> u64 {
-        self.config.auth.refresh_token_expiry
-    }
-
-    fn public_url(&self) -> Option<&str> {
-        self.config.public_url.as_deref()
-    }
-
-    fn enrollment_ttl(&self) -> u64 {
-        self.config.auth.passkey_enrollment_ttl
     }
 }
 
@@ -389,6 +366,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
+        redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
         pending_confirms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };

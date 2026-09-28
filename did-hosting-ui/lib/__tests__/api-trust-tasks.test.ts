@@ -316,6 +316,7 @@ describe("management calls (passkey session)", () => {
       {
         inviteId: "inv-1",
         did: "did:web:new.example",
+        purpose: "session",
         role: "owner",
         createdAt: Date.parse("2026-01-01T00:00:00Z") / 1000,
         expiresAt: Date.parse("2026-01-02T00:00:00Z") / 1000,

@@ -25,6 +25,7 @@ import type {
   AclEntry,
   CreateInviteResponse,
   DidRecord,
+  InvitePurpose,
   DomainScope,
   InviteListItem,
 } from "../../lib/api";
@@ -526,8 +527,9 @@ export default function AclManagement() {
   const [inviteRole, setInviteRole] =
     useState<"admin" | "owner" | "service">("owner");
   const [inviting, setInviting] = useState(false);
+  const [invitePurpose, setInvitePurpose] = useState<InvitePurpose>("session");
   const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
-  const [inviteCopied, setInviteCopied] = useState(false);
+  const [inviteCopied, setInviteCopied] = useState<"link" | "code" | null>(null);
 
   // Pending invites (from server)
   const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
@@ -570,9 +572,9 @@ export default function AclManagement() {
     if (!inviteDid.trim()) return;
     setInviting(true);
     try {
-      const resp = await api.createInvite(inviteDid.trim(), inviteRole);
+      const resp = await api.createInvite(inviteDid.trim(), inviteRole, invitePurpose);
       setInvite(resp);
-      setInviteCopied(false);
+      setInviteCopied(null);
       // Pull in the newly-created invite for the pending list too.
       refresh();
     } catch (e: unknown) {
@@ -628,11 +630,11 @@ export default function AclManagement() {
     }
   }, [api, editingInvite, refresh]);
 
-  const handleCopyInvite = async () => {
+  const handleCopyInvite = async (what: "link" | "code") => {
     if (!invite) return;
-    await Clipboard.setStringAsync(invite.enrollment_url);
-    setInviteCopied(true);
-    setTimeout(() => setInviteCopied(false), 2000);
+    await Clipboard.setStringAsync(what === "link" ? invite.inviteUrl : invite.claimCode);
+    setInviteCopied(what);
+    setTimeout(() => setInviteCopied(null), 2000);
   };
 
   const handleClearInvite = () => {
@@ -847,24 +849,41 @@ export default function AclManagement() {
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Invite by Link</Text>
         <Text style={styles.inviteHelp}>
-          Generate an enrollment link. The invitee opens it in a browser,
-          registers a passkey, and is added to the ACL with the selected role.
+          Generate an enrollment link and a claim code. Send them over two
+          different channels — the link by email, say, and the code by chat or
+          phone: either alone redeems nothing. The invitee opens the link,
+          types the code and registers a passkey. A sign-in invite adds them to
+          the ACL with the selected role; a step-up invite enrols a passkey
+          that only confirms sensitive actions and never signs in.
         </Text>
         {invite ? (
           <View>
             <Text style={styles.editFieldLabel}>Enrollment URL</Text>
             <View style={styles.inviteUrlBlock}>
               <Text style={styles.inviteUrlText} selectable numberOfLines={2}>
-                {invite.enrollment_url}
+                {invite.inviteUrl}
+              </Text>
+            </View>
+            <Text style={styles.editFieldLabel}>Claim code (send separately)</Text>
+            <View style={styles.inviteUrlBlock}>
+              <Text style={styles.inviteUrlText} selectable>
+                {invite.claimCode}
               </Text>
             </View>
             <Text style={styles.inviteExpiry}>
-              Expires in {formatExpiry(invite.expires_at)}
+              {invite.purpose === "stepUp" ? "Step-up passkey. " : ""}
+              Expires in {formatExpiry(invite.expiresAt)}. Shown once: neither
+              the link nor the code can be displayed again.
             </Text>
             <View style={styles.editActions}>
-              <Pressable style={styles.saveButton} onPress={handleCopyInvite}>
+              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("link")}>
                 <Text style={styles.saveText}>
-                  {inviteCopied ? "Copied" : "Copy Link"}
+                  {inviteCopied === "link" ? "Copied" : "Copy Link"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("code")}>
+                <Text style={styles.saveText}>
+                  {inviteCopied === "code" ? "Copied" : "Copy Code"}
                 </Text>
               </Pressable>
               <Pressable
@@ -887,6 +906,31 @@ export default function AclManagement() {
               autoCorrect={false}
             />
             <View style={styles.roleRow}>
+              {([
+                ["session", "Sign-in"],
+                ["stepUp", "Step-up only"],
+              ] as const).map(([p, text]) => (
+                <Pressable
+                  key={p}
+                  style={[
+                    styles.roleButton,
+                    invitePurpose === p && styles.roleActive,
+                  ]}
+                  onPress={() => setInvitePurpose(p)}
+                >
+                  <Text
+                    style={[
+                      styles.roleText,
+                      invitePurpose === p && styles.roleTextActive,
+                    ]}
+                  >
+                    {text}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {invitePurpose === "session" && (
+            <View style={styles.roleRow}>
               {(["owner", "admin", "service"] as const).map((r) => (
                 <Pressable
                   key={r}
@@ -907,6 +951,7 @@ export default function AclManagement() {
                 </Pressable>
               ))}
             </View>
+            )}
             <Pressable
               style={[
                 styles.buttonPrimary,
@@ -946,7 +991,9 @@ export default function AclManagement() {
                         inv.role === "service" && styles.serviceBadge,
                       ]}
                     >
-                      <Text style={styles.roleBadgeText}>{inv.role}</Text>
+                      <Text style={styles.roleBadgeText}>
+                        {inv.purpose === "stepUp" ? "step-up" : inv.role}
+                      </Text>
                     </View>
                     <Text style={styles.entryDate}>
                       {inv.expired
@@ -1005,12 +1052,14 @@ export default function AclManagement() {
                 </View>
                 {!isEditing && (
                   <View style={styles.entryActions}>
-                    <Pressable
-                      style={styles.editButton}
-                      onPress={() => startEditInviteRole(inv)}
-                    >
-                      <Text style={styles.editText}>Role</Text>
-                    </Pressable>
+                    {inv.purpose === "session" && (
+                      <Pressable
+                        style={styles.editButton}
+                        onPress={() => startEditInviteRole(inv)}
+                      >
+                        <Text style={styles.editText}>Role</Text>
+                      </Pressable>
+                    )}
                     <Pressable
                       style={[styles.deleteButton, busy && styles.disabled]}
                       onPress={() => handleRevokeInvite(inv.inviteId)}

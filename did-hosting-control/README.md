@@ -286,10 +286,22 @@ All API endpoints are under the `/api` prefix.
 | `POST` | `/api/auth/challenge`             | Request challenge      |
 | `POST` | `/api/auth/`                      | Submit DIDComm auth    |
 | `POST` | `/api/auth/refresh`               | Refresh token          |
-| `POST` | `/api/auth/passkey/enroll/start`  | Start passkey enroll   |
-| `POST` | `/api/auth/passkey/enroll/finish` | Finish passkey enroll  |
-| `POST` | `/api/auth/passkey/login/start`   | Start passkey login    |
-| `POST` | `/api/auth/passkey/login/finish`  | Finish passkey login   |
+
+Passkeys have no REST routes. Enrolment and login are Trust Tasks on
+`POST /api/trust-tasks` (and TSP and DIDComm), with WebAuthn's ceremony data
+inside their payloads:
+
+| Trust Task | Proof | Purpose |
+| --- | --- | --- |
+| `auth/passkey/enroll/invite/0.2` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
+| `auth/passkey/enroll/redeem/start/0.1` | optional | Present token + claim code; get creation options (and `uvOptions` over existing passkeys of the purpose) |
+| `auth/passkey/enroll/redeem/finish/0.1` | optional | Bind the passkey to the invite's subject and consume the invite |
+| `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one) |
+| `auth/passkey/enroll/invite/{list,update,revoke}/0.1` | administrator | Manage invites by `inviteId` |
+| `auth/passkey/login/start/0.2`, `finish/0.2` | optional / session key | Sign in, or step a session up |
+
+A `stepUp` invite enrols a step-up-only passkey, kept in its own keyspace
+(`passkey_step_up`) that the login ceremony never reads.
 
 ### Access Control (admin only)
 

@@ -215,6 +215,17 @@ pub async fn store_acl_entry(acl: &KeyspaceHandle, entry: &AclEntry) -> Result<(
     acl.insert(acl_key(&entry.did), entry).await
 }
 
+/// Stage an ACL entry into `batch`, to be written with whatever else the batch
+/// carries (a passkey redemption writes the credential and the entry it
+/// authorises together).
+pub fn stage_acl_entry(
+    batch: &mut super::store::WriteBatch,
+    acl: &KeyspaceHandle,
+    entry: &AclEntry,
+) -> Result<(), AppError> {
+    batch.insert(acl, acl_key(&entry.did), entry)
+}
+
 /// Delete an ACL entry by DID.
 pub async fn delete_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<(), AppError> {
     acl.remove(acl_key(did)).await

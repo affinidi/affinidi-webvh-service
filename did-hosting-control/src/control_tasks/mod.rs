@@ -41,16 +41,21 @@ pub(crate) mod agent_name;
 pub(crate) mod auth;
 pub(crate) mod did;
 pub(crate) mod domain;
+pub(crate) mod enrol;
+#[cfg(test)]
+mod enrol_tests;
 #[cfg(test)]
 pub(crate) mod harness;
 pub(crate) mod registry;
 pub(crate) mod server;
 #[cfg(test)]
+pub(crate) mod soft_passkey;
+#[cfg(test)]
 mod tests;
 
 use trust_tasks_rs::specs::{
     auth::{
-        passkey::{enroll::invite as tt_invite, login as tt_login},
+        passkey::{enroll as tt_enroll, enroll::invite as tt_invite, login as tt_login},
         revoke_session as tt_revoke_session, step_up as tt_step_up,
     },
     did_management::{
@@ -160,10 +165,20 @@ control_tasks! {
     // mints a session for the did:key that signs it.
     tt_login::start::v0_2 => Optional, auth::login_start;
     tt_login::finish::v0_2 => SessionKey, auth::login_finish;
+    // Passkey enrolment. An administrator's invite is an operational request;
+    // redeeming it is not signed by anyone the service knows yet — the token
+    // and the separately delivered claim code are the authorisation — so its
+    // proof is optional (and verified when present). An authenticated
+    // subject's own enrolment is signed as that subject.
+    tt_invite::v0_2 => Authentication, enrol::invite;
+    tt_enroll::redeem::start::v0_1 => Optional, enrol::redeem_start;
+    tt_enroll::redeem::finish::v0_1 => Optional, enrol::redeem_finish;
+    tt_enroll::start::v0_2 => Authentication, enrol::start;
+    tt_enroll::finish::v0_2 => Authentication, enrol::finish;
     // Enrolment invites, addressed by inviteId.
-    tt_invite::list::v0_1 => Authentication, auth::invite_list;
-    tt_invite::update::v0_1 => Authentication, auth::invite_update;
-    tt_invite::revoke::v0_1 => Authentication, auth::invite_revoke;
+    tt_invite::list::v0_1 => Authentication, enrol::invite_list;
+    tt_invite::update::v0_1 => Authentication, enrol::invite_update;
+    tt_invite::revoke::v0_1 => Authentication, enrol::invite_revoke;
 }
 
 /// The proof rule for `type_uri`, when this table serves it.
