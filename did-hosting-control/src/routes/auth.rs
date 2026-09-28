@@ -267,7 +267,7 @@ pub async fn authenticate(
     //        would bind a key whose every later proof is refused, and the
     //        producer — told the login succeeded — would never find out why.
     let session_pubkey_b58btc = if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
-        if !is_ed25519_multikey(pk) {
+        if !did_hosting_common::server::auth::session::is_ed25519_multikey(pk) {
             warn!(prefix = %pk.chars().take(8).collect::<String>(), "rejected unsupported session-key shape");
             return Err(AppError::Authentication(
                 "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk…)".into(),
@@ -311,17 +311,6 @@ pub async fn authenticate(
         }
         Err(e) => Err(e),
     }
-}
-
-/// Whether `multikey` is a base58btc multikey encoding an Ed25519 public key
-/// (`0xed 0x01` + 32 bytes) — the only session key this service can verify a
-/// proof from, since the session-key verifier resolves `did:key:{pk}#{pk}` and
-/// checks `eddsa-jcs-2022`.
-pub(crate) fn is_ed25519_multikey(multikey: &str) -> bool {
-    matches!(
-        multibase::decode(multikey),
-        Ok((multibase::Base::Base58Btc, bytes)) if bytes.len() == 34 && bytes[..2] == [0xed, 0x01]
-    )
 }
 
 /// Cheap structural check: does `body` look like a DIDComm-v2 general-JSON

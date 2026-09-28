@@ -13,10 +13,13 @@ sending it as `session_pubkey_b58btc` beside the `id_token` on `POST
 /api/auth/`, and the console signs with it: one approval, at sign-in. The
 route already bound a key it was given; a test now pins that it does.
 
-- **That route now decodes the key.** It accepted anything starting `z6Mk`,
-  so a value that only looked like an Ed25519 multikey was stored and every
-  proof it later signed refused. It now applies the same decode as
-  `auth/authenticate/0.2`'s `sessionKey`, before the challenge is spent.
+- **Every route that binds a session key now decodes it.** `/api/auth/` and
+  the REST passkey `login/finish` accepted anything starting `z6Mk`, so a
+  value that only looked like an Ed25519 multikey was stored and every proof
+  it later signed refused. Both now apply the decode `auth/authenticate/0.2`
+  uses for `sessionKey`, shared as
+  `server::auth::session::is_ed25519_multikey`. The passkey route's log line
+  also sliced the refused value by byte, which panicked on a non-ASCII one.
 - **A lost session key ends the session.** A wallet session whose key this
   browser no longer holds used to fall back to the wallet's `signTrustTask`
   silently — changing what each request rested on without saying so, and

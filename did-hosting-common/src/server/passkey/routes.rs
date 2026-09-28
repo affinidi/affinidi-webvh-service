@@ -10,7 +10,7 @@ use super::{PasskeyState, store};
 use crate::server::acl::{self, AclEntry, Role, check_acl};
 use crate::server::auth::extractor::{AdminAuth, AuthClaims, StepUpAuth};
 use crate::server::auth::session::{
-    TokenResponse, create_authenticated_session, elevate_session, now_epoch,
+    TokenResponse, create_authenticated_session, elevate_session, is_ed25519_multikey, now_epoch,
 };
 use crate::server::error::AppError;
 
@@ -369,20 +369,23 @@ pub async fn login_finish<S: PasskeyState>(
     // Check DID still in ACL
     let role = check_acl(acl_ks, &user.did).await?;
 
-    // Validate the client-supplied session pubkey shape minimally —
-    // only Ed25519 multikey is supported today. `z6Mk` is the
-    // base58btc-encoded multicodec 0xed01 prefix; anything else is
-    // rejected so the server doesn't accept a key shape it can't
-    // later resolve via `did:key`.
+    // Validate the client-supplied session pubkey: only an Ed25519
+    // multikey can later be resolved via `did:key` and verified, and a
+    // value that merely starts `z6Mk` is not one. See
+    // `is_ed25519_multikey`.
+    //
+    // Checked after the ceremony has consumed the auth state, so a refused
+    // key means starting the login again — as for any other refusal here.
     let session_pubkey = match req.session_pubkey_b58btc.as_deref() {
-        Some(pk) if pk.starts_with("z6Mk") => Some(pk.to_string()),
+        Some(pk) if is_ed25519_multikey(pk) => Some(pk.to_string()),
         Some(pk) => {
             warn!(
-                prefix = %&pk[..pk.len().min(8)],
+                // By character, not byte: a byte slice panics mid-codepoint.
+                prefix = %pk.chars().take(8).collect::<String>(),
                 "rejected unsupported session-key shape on passkey login"
             );
             return Err(AppError::Authentication(
-                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
+                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk…)".into(),
             ));
         }
         None => None,
