@@ -466,7 +466,5 @@ jobs:
 
   # NB: there is intentionally no `cargo publish --dry-run` job. The
   # did-hosting-* crates are a deployable service, not libraries — none are
-  # published to crates.io, and did-hosting-common dev-depends on the
-  # unpublished did-hosting-client (so a dry-run can never resolve). If any
-  # crate is ever published, add a targeted job that excludes the unpublished
-  # path dev-deps.
+  # published to crates.io. If any crate is ever published, add a targeted
+  # job for it.

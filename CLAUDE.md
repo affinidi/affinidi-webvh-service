@@ -30,7 +30,9 @@ in the daemon if it falls into any of these buckets:
   unified task, rather than one per service). New periodic work in
   standalone services should land here.
 - **Route changes.** The daemon merges server (public DID resolution
-  only) + control (full management API + UI) at root. The server has no
+  only) + control (its Trust Task listener, `/api/health`, the browser
+  sign-in routes and the UI) at root. Neither has a REST management surface:
+  every management operation is a Trust Task. The server has no
   management routes at all — an edge serves resolution, `/api/health` and
   its Trust Task listener (`POST /api/trust-tasks`, which the daemon does
   not mount: the control plane's listener serves that path). Route
@@ -195,8 +197,8 @@ If a genuine cross-agent need ever appears, the *only* acceptable shape is a
 the DID string): the caller proves it controls a DID on that domain, and only
 then does the edge reveal its control plane — one relationship, not per-DID, and
 nothing visible to anyone who could not already act on it. Until then, note that
-the unauthenticated `/api/server-info` lives on the **control plane** (not the
-edge), so nothing about the topology leaks today. Keep it that way.
+the unauthenticated `server/info` Trust Task is served by the **control plane**
+(not the edge), so nothing about the topology leaks today. Keep it that way.
 
 ## Privileged messages are authorised on their proof, never on the transport
 
@@ -260,8 +262,8 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
 - **Edges verify what they serve.** A synced webvh log must pass the chain
   check and strictly extend the held log and the per-DID high-water mark
   (`control_register::verify_history`); a deactivated DID takes no further
-  entries. Every path that replaces an edge's log — sync *and* the edge's own
-  REST publish — goes through `verify_history` and `stage_high_water`.
+  entries. Every path that replaces an edge's log goes through
+  `verify_history` and `stage_high_water`.
 - **Re-sync compares identity, not just versions** (`server_push::
   edge_is_current`), and domain assign/unassign/purge are re-sent on each
   registration until acknowledged (`server_push::resend_domain_intents`).
@@ -307,9 +309,9 @@ to each other must keep the document as the source of truth.
   DID carries only `TSPTransport` (`#tsp`) and/or `DIDCommMessaging`
   (`#vta-didcomm`) services — **not** a `WebVHHosting` HTTP endpoint. The
   resolution URL is derivable from the `did:webvh` identifier itself, inter-node
-  traffic is DIDComm/TSP, and clients reach the REST API by explicit config
-  (`webvh_client` takes an explicit `server_url`), so nothing discovers the
-  endpoint from the document. Only a **no-mediator (HTTP-only)** node advertises
+  traffic is DIDComm/TSP, and clients reach the control plane's
+  `POST /api/trust-tasks` by explicit config (`WebVHClient` takes an explicit
+  `server_url`), so nothing discovers the endpoint from the document. Only a **no-mediator (HTTP-only)** node advertises
   `WebVHHosting`, because it has no messaging transport to advertise instead.
 
 - **One builder mints them all.** Every setup path (interactive / recipe /
@@ -328,9 +330,9 @@ to each other must keep the document as the source of truth.
   fallback (the compatibility bridge for DIDs minted before transports were
   published); if neither yields a binding, the send **fails** as unroutable.
   Do **not** reintroduce a blind-DIDComm default, and do **not** add a REST tier
-  — there is no trust-task REST sender or inbound `/api/trust-tasks` route
-  *between these services*, and HTTP-only nodes are served by the pull/watcher
-  model, not a trust-task push.
+  — `POST /api/trust-tasks` is the HTTPS binding, the same dispatch TSP and
+  DIDComm reach, never a separate API; and HTTP-only nodes are served by the
+  pull/watcher model, not a trust-task push.
 
 - **Nothing gates on `WebVHHosting`.** `resolve_send_binding` reads only the
   messaging services; registration and health use the DIDComm identity; the

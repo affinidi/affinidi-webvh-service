@@ -1795,3 +1795,195 @@ async fn the_service_describes_itself_to_administrators_only() {
     .await;
     assert_eq!(code(&reply), "permissionDenied");
 }
+
+/// Seed the slot at `mnemonic` holding `did_id`, with these agent names.
+async fn seed_named(state: &AppState, mnemonic: &str, did_id: &str, names: &[(&str, bool)]) {
+    let mut record = seed_did(state, "did:example:operator", mnemonic).await;
+    record.did_id = Some(did_id.into());
+    record.agent_names = names
+        .iter()
+        .map(|(n, enabled)| AgentNameEntry {
+            name: (*n).into(),
+            enabled: *enabled,
+            created_at: 0,
+        })
+        .collect();
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .unwrap();
+}
+
+/// `server/info` asked anonymously over HTTPS, as the login page asks it.
+async fn anonymous_server_info(state: &AppState) -> Value {
+    let uri = t("did-management/server/info/0.1");
+    let mut doc = request(&uri, "unused", json!({}));
+    doc.as_object_mut().unwrap().remove("issuer");
+    ok(&https(state, None, doc).await, &uri)
+}
+
+fn names_of(info: &Value) -> Vec<String> {
+    info["serviceNames"]
+        .as_array()
+        .expect("serviceNames is always present")
+        .iter()
+        .map(|v| v.as_str().expect("a name is a string").to_string())
+        .collect()
+}
+
+/// A client learns whether `/@name` is served before it has a session — it
+/// cannot probe for it, because with the feature off `GET /@name` 404s exactly
+/// as an unknown name does — and the answer tracks the flag.
+#[tokio::test]
+async fn server_info_says_whether_agent_names_are_served() {
+    let (mut state, _dir) = state().await;
+    assert_eq!(anonymous_server_info(&state).await["agentNames"], true);
+    let mut config = (*state.config).clone();
+    config.features.agent_names = false;
+    state.config = std::sync::Arc::new(config);
+    assert_eq!(anonymous_server_info(&state).await["agentNames"], false);
+}
+
+/// The service's own names come from the slot that holds its DID: the
+/// community name is an empty local part, a parked name is omitted, and a
+/// service with none reports an empty list.
+#[tokio::test]
+async fn server_info_names_the_services_own_served_agent_names() {
+    let (state, _dir) = state().await;
+    assert!(names_of(&anonymous_server_info(&state).await).is_empty());
+    seed_named(&state, ".well-known", CONTROL, &[("", true)]).await;
+    assert_eq!(names_of(&anonymous_server_info(&state).await), vec![""]);
+    seed_named(
+        &state,
+        ".well-known",
+        CONTROL,
+        &[("", false), ("live", true)],
+    )
+    .await;
+    assert_eq!(names_of(&anonymous_server_info(&state).await), vec!["live"]);
+}
+
+/// Every pathless DID maps to the one `.well-known` slot, so a root slot
+/// holding some other DID must not be advertised as this service's — and with
+/// agent names off nothing is served, so nothing is advertised.
+#[tokio::test]
+async fn server_info_does_not_advertise_names_it_would_not_serve() {
+    let (mut state, _dir) = state().await;
+    seed_named(
+        &state,
+        ".well-known",
+        "did:webvh:other:someone-else.example",
+        &[("", true)],
+    )
+    .await;
+    assert!(names_of(&anonymous_server_info(&state).await).is_empty());
+
+    seed_named(&state, ".well-known", CONTROL, &[("", true)]).await;
+    let mut config = (*state.config).clone();
+    config.features.agent_names = false;
+    state.config = std::sync::Arc::new(config);
+    assert!(names_of(&anonymous_server_info(&state).await).is_empty());
+}
+
+/// `agent-name/resolve` answers a DID's served names: a root DID's community
+/// name as an empty local part, parked names omitted, and nothing for a DID
+/// with no names, one this service does not host, or a foreign root DID —
+/// which must not inherit the local root DID's names.
+#[tokio::test]
+async fn agent_name_resolve_answers_only_served_names_of_hosted_dids() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 60, Role::Admin).await;
+    let root = "did:webvh:abc:control.example.com";
+    let bob = "did:webvh:abc:control.example.com:bob";
+    let quiet = "did:webvh:abc:control.example.com:quiet";
+    seed_named(&state, ".well-known", root, &[("", true)]).await;
+    seed_named(&state, "bob", bob, &[("parked", false), ("live", true)]).await;
+    seed_named(&state, "quiet", quiet, &[]).await;
+    let uri = t("did-management/agent-name/resolve/0.1");
+
+    let body = ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &uri,
+            json!({ "dids": [
+                root,
+                bob,
+                quiet,
+                "did:webvh:zzz:someone-else.example",
+                "did:web:elsewhere.example",
+            ] }),
+        )
+        .await,
+        &uri,
+    );
+    let mut entries = body["entries"].as_array().unwrap().clone();
+    entries.sort_by_key(|e| e["did"].as_str().unwrap().to_string());
+    assert_eq!(
+        entries,
+        vec![
+            json!({ "did": root, "names": [""] }),
+            json!({ "did": bob, "names": ["live"] }),
+        ]
+    );
+}
+
+/// A registry instance's cached badges reach `registry/list`, and with no
+/// resolver the control plane's own advertised services are unknown, so
+/// `server/config` omits the member rather than reporting an empty list —
+/// "unknown" must never read as "advertises nothing" — while still reporting
+/// the transports config turns on.
+#[tokio::test]
+async fn advertised_services_are_reported_and_unknown_is_omitted() {
+    use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
+
+    let (state, _dir) = state().await;
+    assert!(state.did_resolver.is_none());
+    let admin = member(&state, 61, Role::Admin).await;
+    let instance = ServiceInstance {
+        instance_id: "srv-1".into(),
+        service_type: ServiceType::Server,
+        label: Some("edge".into()),
+        url: "http://edge.example".into(),
+        status: ServiceStatus::Active,
+        last_health_check: None,
+        registered_at: 1_700_000_000,
+        metadata: json!({ "did": "did:webvh:Q1:edge.example" }),
+        enabled_methods: vec!["webvh".into()],
+        served_domains: vec![],
+        protocol_version: "1.0".into(),
+        advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
+        services_checked_at: Some(1_700_000_000),
+        trust_task_capable: false,
+        sync_batch_capable: false,
+        last_inbound_transport: None,
+        last_inbound_at: None,
+        last_outbound_transport: None,
+        last_outbound_at: None,
+        last_ack_at: None,
+        last_reconcile_at: None,
+    };
+    registry::register_instance(&state.registry_ks, &instance)
+        .await
+        .unwrap();
+
+    let uri = t("did-management/registry/list/0.1");
+    let reply = call(&state, Via::Tsp, &admin, &uri, json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert_eq!(
+        body["instances"][0]["advertisedServices"],
+        json!(["WebVHHosting", "TSPTransport"]),
+        "{body}"
+    );
+
+    let uri = t("did-management/server/config/0.1");
+    let reply = call(&state, Via::Tsp, &admin, &uri, json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert!(body.get("advertisedServices").is_none(), "{body}");
+    assert!(body["transports"].get("tsp").is_some(), "{body}");
+    assert!(body["transports"].get("didcomm").is_some(), "{body}");
+}

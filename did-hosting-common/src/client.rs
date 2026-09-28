@@ -1,37 +1,71 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+//! A client for a DID Hosting control plane, over its Trust Task listener.
+//!
+//! Every call is a Trust Task document signed by the requester
+//! (`proofPurpose: authentication`) and addressed to the service's DID, posted
+//! to the control plane's HTTPS binding (`POST {url}/api/trust-tasks`). The
+//! control plane authorises on that proof and the requester's ACL entry alone
+//! — there is no session or bearer token — and every reply it sends is signed;
+//! the client verifies the reply against the service DID before it believes a
+//! word of it.
 
-use affinidi_tdk::didcomm::Message;
-use affinidi_tdk::didcomm::message::pack;
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use serde_json::json;
-use tracing::debug;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use trust_tasks_rs::Payload;
+use trust_tasks_rs::specs::did_management::{
+    agent_name::{
+        check as agent_name_check, remove as agent_name_remove, update as agent_name_update,
+    },
+    did::{check_name, delete, info, list, register},
+    server::info as server_info,
+};
 
 use crate::did::{build_did_document, create_log_entry, encode_host};
-use crate::error::{Result, ServerErrorBody, WebVHError};
+use crate::error::{Result, WebVHError};
+use crate::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
 use crate::types::*;
 
-/// A client for interacting with a did-hosting-server instance.
+/// The requester a [`WebVHClient`] signs as, and the service it addresses.
+struct Requester {
+    did: String,
+    signer: Secret,
+    service_did: String,
+    did_resolver: DIDCacheClient,
+}
+
+/// A client for one DID Hosting control plane.
 pub struct WebVHClient {
-    http: reqwest::Client,
     server_url: String,
     /// Public hosting URL used as the `host` segment of newly minted
     /// `did:webvh:` identifiers. When `None`, the host is derived from
-    /// `server_url` — correct for standalone did-hosting-server deployments
-    /// where management and hosting share an origin. Control-plane
-    /// deployments must set this to the public hosting URL since the
-    /// control plane's URL is not where DID logs are served from.
+    /// `server_url`. Control-plane deployments must set this to the public
+    /// hosting URL, since the control plane's URL is not where DID logs are
+    /// served from.
     hosting_url: Option<String>,
-    access_token: Option<String>,
+    requester: Option<Requester>,
+}
+
+/// One slot of a `did/list` reply: the members a caller acts on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidSummary {
+    pub mnemonic: String,
+    #[serde(default)]
+    pub did_id: Option<String>,
+    #[serde(default)]
+    pub version_count: u64,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl WebVHClient {
-    /// Create a new client pointing at the given server URL.
+    /// Create a new client pointing at the given control plane URL.
     pub fn new(server_url: &str) -> Self {
         Self {
-            http: crate::http::outbound_client(),
             server_url: server_url.trim_end_matches('/').to_string(),
             hosting_url: None,
-            access_token: None,
+            requester: None,
         }
     }
 
@@ -45,237 +79,185 @@ impl WebVHClient {
         self
     }
 
-    /// Authenticate with the server using DIDComm challenge-response.
+    /// Sign every request from here on as `did`, with `signer` (one of its
+    /// `authentication` keys), addressed to the service DID `service_did`.
     ///
-    /// `webvh_did` is the DID of the DID Hosting service the client is talking
-    /// to; it becomes the DIDComm `to` field of the signed authenticate
-    /// message. Today the server only verifies the message signature
-    /// against the `from` DID, but addressing the message to the service
-    /// keeps the wire shape correct and lets the same flow drop straight
-    /// into a fully encrypted DIDComm transport later.
-    ///
-    /// On success the client stores the access token internally so that
-    /// subsequent calls to authenticated endpoints will work automatically.
-    pub async fn authenticate(
-        &mut self,
-        did: &str,
-        secret: &Secret,
-        webvh_did: &str,
-    ) -> Result<AuthenticateResponse> {
-        // 1. Extract private key bytes for signing
-        let private_key_bytes: [u8; 32] = secret
-            .get_private_bytes()
-            .try_into()
-            .map_err(|_| WebVHError::DIDComm("signing key must be 32 bytes".into()))?;
-
-        // 2. Request challenge
-        let challenge_resp: ChallengeResponse = self
-            .http
-            .post(format!("{}/api/auth/challenge", self.server_url))
-            .json(&ChallengeRequest {
-                did: did.to_string(),
-            })
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| WebVHError::DIDComm(format!("challenge request rejected: {e}")))?
-            .json()
-            .await?;
-
-        debug!(session_id = %challenge_resp.session_id, "challenge received");
-
-        // 3. Build DIDComm message
-        let created_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        let msg = Message::build(
-            uuid::Uuid::new_v4().to_string(),
-            "https://trusttasks.org/spec/auth/authenticate/0.1".to_string(),
-            json!({
-                "challenge": challenge_resp.challenge,
-                "session_id": challenge_resp.session_id,
-            }),
-        )
-        .from(did.to_string())
-        .to(webvh_did.to_string())
-        .created_time(created_time)
-        .finalize();
-
-        // 4. Pack signed
-        let packed = pack::pack_signed(&msg, &secret.id, &private_key_bytes)
-            .map_err(|e| WebVHError::DIDComm(format!("failed to pack signed message: {e}")))?;
-
-        // 5. Authenticate
-        let auth_resp: AuthenticateResponse = self
-            .http
-            .post(format!("{}/api/auth/", self.server_url))
-            .body(packed)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| WebVHError::DIDComm(format!("authentication rejected: {e}")))?
-            .json()
-            .await?;
-
-        // 6. Store token
-        self.access_token = Some(auth_resp.tokens.access_token.clone());
-
-        debug!("authenticated successfully");
-
-        Ok(auth_resp)
+    /// Nothing is sent: each request carries its own proof, and `did` must
+    /// hold an ACL entry on the control plane for any of them to succeed.
+    pub async fn sign_as(&mut self, did: &str, signer: &Secret, service_did: &str) -> Result<()> {
+        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .map_err(|e| WebVHError::Resolver(e.to_string()))?;
+        self.requester = Some(Requester {
+            did: did.to_string(),
+            signer: signer.clone(),
+            service_did: service_did.to_string(),
+            did_resolver,
+        });
+        Ok(())
     }
 
     // -------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------
 
-    /// Check whether a custom path/name is available.
-    pub async fn check_name(&self, path: &str) -> Result<CheckNameResponse> {
-        let resp = self
-            .auth_post("/api/dids/check")?
-            .json(&CheckNameRequest {
-                path: path.to_string(),
-            })
-            .send()
-            .await?;
-        self.handle_response(resp).await
+    /// `server/info/0.1`: what the service publishes about itself (its DID,
+    /// whether `/@name` redirects are served, …), signed by that DID.
+    pub async fn server_info(&self) -> Result<Value> {
+        self.call(server_info::v0_1::Payload::TYPE_URI, json!({}))
+            .await
     }
 
-    /// Request a new DID URI. If `path` is `Some`, the server will use
-    /// that custom path; otherwise it generates a random mnemonic.
+    /// `did/check-name/0.1`: is a custom path free?
+    pub async fn check_name(&self, path: &str) -> Result<check_name::v0_1::Response> {
+        self.call(check_name::v0_1::Payload::TYPE_URI, json!({ "path": path }))
+            .await
+    }
+
+    /// Reserve a DID slot (`did/check-name/0.1` with `reserve: true`). If
+    /// `path` is `Some`, the server uses that custom path; otherwise it
+    /// generates a random mnemonic.
     pub async fn request_uri(&self, path: Option<&str>) -> Result<RequestUriResponse> {
-        let mut req = self.auth_post("/api/dids")?;
+        let mut payload = json!({ "reserve": true });
         if let Some(p) = path {
-            req = req.json(&CreateDidRequest {
-                path: Some(p.to_string()),
+            payload["path"] = json!(p);
+        }
+        let resp: Value = self
+            .call(check_name::v0_1::Payload::TYPE_URI, payload)
+            .await?;
+        if resp.get("reserved").and_then(Value::as_bool) != Some(true) {
+            return Err(WebVHError::Refused {
+                code: "did/check-name:notReserved".into(),
+                message: "the path is not available".into(),
             });
         }
-        let resp = req.send().await?;
-        self.handle_response(resp).await
+        let record = resp
+            .get("record")
+            .ok_or_else(|| WebVHError::Transport("reservation reply carries no record".into()))?;
+        let field = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| WebVHError::Transport(format!("reserved record has no `{name}`")))
+        };
+        Ok(RequestUriResponse {
+            mnemonic: field("mnemonic")?,
+            did_url: field("didUrl")?,
+        })
     }
 
-    /// Upload a did.jsonl document for the given mnemonic.
+    /// `did/register/0.1`: publish a signed `did.jsonl` to the slot at
+    /// `mnemonic`.
     pub async fn upload_did(&self, mnemonic: &str, content: &str) -> Result<()> {
-        let resp = self
-            .auth_put(&format!("/api/dids/{mnemonic}"))?
-            .header("Content-Type", "text/plain")
-            .body(content.to_string())
-            .send()
+        let _: Value = self
+            .call(
+                register::v0_1::Payload::TYPE_URI,
+                json!({ "path": mnemonic, "method": "webvh", "didData": content }),
+            )
             .await?;
-        self.handle_response_no_body(resp).await
+        Ok(())
     }
 
-    /// Upload a did-witness.json for the given mnemonic.
-    pub async fn upload_witness(&self, mnemonic: &str, content: &str) -> Result<()> {
-        let resp = self
-            .auth_put(&format!("/api/witness/{mnemonic}"))?
-            .header("Content-Type", "text/plain")
-            .body(content.to_string())
-            .send()
-            .await?;
-        self.handle_response_no_body(resp).await
-    }
-
-    /// Delete a DID by its mnemonic.
+    /// `did/delete/0.1`.
     pub async fn delete_did(&self, mnemonic: &str) -> Result<()> {
-        let resp = self
-            .auth_delete(&format!("/api/dids/{mnemonic}"))?
-            .send()
+        let _: Value = self
+            .call(
+                delete::v0_1::Payload::TYPE_URI,
+                json!({ "mnemonic": mnemonic }),
+            )
             .await?;
-        self.handle_response_no_body(resp).await
+        Ok(())
     }
 
-    /// List all DIDs owned by the authenticated user.
-    pub async fn list_dids(&self) -> Result<Vec<DidListEntry>> {
-        let resp = self.auth_get("/api/dids")?.send().await?;
-        self.handle_response(resp).await
-    }
-
-    /// Get statistics for a DID by its mnemonic.
-    pub async fn get_stats(&self, mnemonic: &str) -> Result<DidStats> {
-        let resp = self
-            .auth_get(&format!("/api/stats/{mnemonic}"))?
-            .send()
-            .await?;
-        self.handle_response(resp).await
-    }
-
-    /// Fetch a single DID's detail record — including its `agentNames`
-    /// registry (with `enabled` flags), which the list endpoint omits.
-    /// Returned as a raw JSON value so a caller can read fields without this
-    /// crate having to mirror the control plane's response type.
-    pub async fn get_did_detail(&self, mnemonic: &str) -> Result<serde_json::Value> {
-        let resp = self
-            .auth_get(&format!("/api/dids/{mnemonic}"))?
-            .send()
-            .await?;
-        self.handle_response(resp).await
-    }
-
-    /// Probe whether an agent name is free on `domain`
-    /// (`POST /api/agent-names/check`). Response carries `available` and
-    /// `reserved` — the latter distinct so a caller can say *why* a name is
-    /// unavailable.
-    pub async fn check_agent_name(
-        &self,
-        name: &str,
-        domain: Option<&str>,
-    ) -> Result<serde_json::Value> {
-        let mut body = serde_json::Map::new();
-        body.insert("name".into(), serde_json::Value::String(name.to_string()));
-        if let Some(d) = domain {
-            body.insert("domain".into(), serde_json::Value::String(d.to_string()));
+    /// `did/list/0.1`: every slot the requester owns (every slot, for an
+    /// administrator), read page by page.
+    pub async fn list_dids(&self) -> Result<Vec<DidSummary>> {
+        #[derive(Deserialize)]
+        struct Page {
+            records: Vec<DidSummary>,
+            total: u64,
         }
-        let resp = self
-            .auth_post("/api/agent-names/check")?
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+        const PAGE: u64 = 100;
+        let mut out = Vec::new();
+        loop {
+            let page: Page = self
+                .call(
+                    list::v0_1::Payload::TYPE_URI,
+                    json!({ "limit": PAGE, "offset": out.len() }),
+                )
+                .await?;
+            let got = page.records.len();
+            out.extend(page.records);
+            if got == 0 || out.len() as u64 >= page.total {
+                return Ok(out);
+            }
+        }
     }
 
-    /// Drive an agent-name mutation — `op` is one of
-    /// `set` / `remove` / `enable` / `disable` — by submitting the freshly
-    /// signed `did.jsonl` whose `alsoKnownAs` claims (`set`/`enable`) or no
-    /// longer claims (`remove`/`disable`) the name. The control plane verifies
-    /// that direction matches the verb, republishes the log, and applies the
-    /// registry change in one commit. Returns the `{record}` response.
+    /// `did/info/0.1`: one slot's record, including its agent-name registry
+    /// (under the record's `ext`). Returned as raw JSON so a caller can read
+    /// fields without this crate mirroring the response type.
+    pub async fn get_did_detail(&self, mnemonic: &str) -> Result<Value> {
+        self.call(
+            info::v0_1::Payload::TYPE_URI,
+            json!({ "mnemonic": mnemonic }),
+        )
+        .await
+    }
+
+    /// `agent-name/check/0.1`: is an agent name free on `domain`? The reply
+    /// carries `available` and `reserved` — the latter distinct so a caller
+    /// can say *why* a name is unavailable.
+    pub async fn check_agent_name(&self, name: &str, domain: Option<&str>) -> Result<Value> {
+        let mut payload = json!({ "name": name });
+        if let Some(d) = domain {
+            payload["domain"] = json!(d);
+        }
+        self.call(agent_name_check::v0_1::Payload::TYPE_URI, payload)
+            .await
+    }
+
+    /// Drive an agent-name mutation — `op` is one of `set` / `enable`
+    /// (`agent-name/update`, `state: active`), `disable` (`agent-name/update`,
+    /// `state: parked`) or `remove` (`agent-name/remove`) — by submitting the
+    /// freshly signed `did.jsonl` whose `alsoKnownAs` claims (`set`/`enable`)
+    /// or no longer claims (`remove`/`disable`) the name. Returns the
+    /// `{record}` reply.
     pub async fn agent_name_op(
         &self,
         op: &str,
         mnemonic: &str,
         name: &str,
         did_log: &str,
-    ) -> Result<serde_json::Value> {
-        let mut body = serde_json::Map::new();
-        body.insert(
-            "mnemonic".into(),
-            serde_json::Value::String(mnemonic.to_string()),
-        );
-        body.insert("name".into(), serde_json::Value::String(name.to_string()));
-        body.insert(
-            "didLog".into(),
-            serde_json::Value::String(did_log.to_string()),
-        );
-        let resp = self
-            .auth_post(&format!("/api/agent-names/{op}"))?
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+    ) -> Result<Value> {
+        let base = json!({ "mnemonic": mnemonic, "name": name, "didData": did_log });
+        let (type_uri, payload) = match op {
+            "set" | "enable" => (
+                agent_name_update::v0_1::Payload::TYPE_URI,
+                with_member(base, "state", "active"),
+            ),
+            "disable" => (
+                agent_name_update::v0_1::Payload::TYPE_URI,
+                with_member(base, "state", "parked"),
+            ),
+            "remove" => (agent_name_remove::v0_1::Payload::TYPE_URI, base),
+            other => {
+                return Err(WebVHError::Transport(format!(
+                    "unknown agent-name operation `{other}`"
+                )));
+            }
+        };
+        self.call(type_uri, payload).await
     }
 
-    /// Returns the server URL this client is configured with.
+    /// Returns the control plane URL this client is configured with.
     pub fn server_url(&self) -> &str {
         &self.server_url
     }
 
-    /// High-level: request a DID URI, build the DID document, create the
-    /// WebVH log entry, upload it, and return everything the caller needs.
-    ///
-    /// This combines `request_uri` + DID doc building + log creation +
-    /// `upload_did` into a single call.
+    /// High-level: reserve a slot, build the DID document, create the WebVH
+    /// log entry, publish it, and return everything the caller needs.
     pub async fn create_did(&self, secret: &Secret, path: Option<&str>) -> Result<CreateDidResult> {
         let create_resp = self.request_uri(path).await?;
 
@@ -310,18 +292,20 @@ impl WebVHClient {
         })
     }
 
-    /// Resolve a DID log (public, no auth required).
+    /// Resolve a DID log from the hosting URL (public, no proof required).
     pub async fn resolve_did(&self, mnemonic: &str) -> Result<String> {
-        let resp = self
-            .http
-            .get(format!("{}/{mnemonic}/did.jsonl", self.server_url))
+        let host_url = self.hosting_url.as_deref().unwrap_or(&self.server_url);
+        let resp = crate::http::outbound_client()
+            .get(format!("{host_url}/{mnemonic}/did.jsonl"))
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            return Err(self.extract_server_error(resp).await);
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(WebVHError::Server {
+                status: status.as_u16(),
+                message: format!("HTTP {status}"),
+            });
         }
-
         Ok(resp.text().await?)
     }
 
@@ -329,67 +313,40 @@ impl WebVHClient {
     // Private helpers
     // -------------------------------------------------------------------
 
-    fn token(&self) -> Result<&str> {
-        self.access_token
-            .as_deref()
-            .ok_or(WebVHError::NotAuthenticated)
-    }
-
-    fn auth_get(&self, path: &str) -> Result<reqwest::RequestBuilder> {
-        let token = self.token()?;
-        Ok(self
-            .http
-            .get(format!("{}{path}", self.server_url))
-            .bearer_auth(token))
-    }
-
-    fn auth_post(&self, path: &str) -> Result<reqwest::RequestBuilder> {
-        let token = self.token()?;
-        Ok(self
-            .http
-            .post(format!("{}{path}", self.server_url))
-            .bearer_auth(token))
-    }
-
-    fn auth_put(&self, path: &str) -> Result<reqwest::RequestBuilder> {
-        let token = self.token()?;
-        Ok(self
-            .http
-            .put(format!("{}{path}", self.server_url))
-            .bearer_auth(token))
-    }
-
-    fn auth_delete(&self, path: &str) -> Result<reqwest::RequestBuilder> {
-        let token = self.token()?;
-        Ok(self
-            .http
-            .delete(format!("{}{path}", self.server_url))
-            .bearer_auth(token))
-    }
-
-    async fn handle_response<T: serde::de::DeserializeOwned>(
+    /// Send one signed request and read the verified reply as `R`.
+    async fn call<R: serde::de::DeserializeOwned>(
         &self,
-        resp: reqwest::Response,
-    ) -> Result<T> {
-        if !resp.status().is_success() {
-            return Err(self.extract_server_error(resp).await);
-        }
-        Ok(resp.json().await?)
+        type_uri: &str,
+        payload: Value,
+    ) -> Result<R> {
+        let requester = self
+            .requester
+            .as_ref()
+            .ok_or(WebVHError::NotAuthenticated)?;
+        let doc = build_signed_request(
+            type_uri,
+            &requester.did,
+            &requester.service_did,
+            payload,
+            &requester.signer,
+        )
+        .await
+        .map_err(|e| WebVHError::Transport(e.to_string()))?;
+        let reply = post_trust_task_https(
+            &requester.did,
+            &requester.service_did,
+            &format!("{}/api/trust-tasks", self.server_url),
+            &doc,
+            Some(&requester.did_resolver),
+        )
+        .await
+        .map_err(|e| WebVHError::Transport(e.to_string()))?;
+        crate::witness_client::read_reply(type_uri, reply)
     }
+}
 
-    async fn handle_response_no_body(&self, resp: reqwest::Response) -> Result<()> {
-        if !resp.status().is_success() {
-            return Err(self.extract_server_error(resp).await);
-        }
-        Ok(())
-    }
-
-    async fn extract_server_error(&self, resp: reqwest::Response) -> WebVHError {
-        let status = resp.status().as_u16();
-        let message = match resp.json::<ServerErrorBody>().await {
-            Ok(body) => crate::error::redact_server_message(&body.to_string()),
-            Err(_) => format!("HTTP {status}"),
-        };
-        WebVHError::Server { status, message }
-    }
+/// `value` with `key` set to `member`.
+fn with_member(mut value: Value, key: &str, member: &str) -> Value {
+    value[key] = json!(member);
+    value
 }

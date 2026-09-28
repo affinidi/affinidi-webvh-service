@@ -203,8 +203,8 @@ fn serialise<T: serde::Serialize>(doc: &T) -> Value {
 /// The caller, as established by the framework — never a body value.
 // `ErrorResponse` is the upstream `TrustTask<ErrorPayload>`, which
 // `result_large_err` flags — here and on each of the three arms below, all of
-// which return it. Same reasoning as the allows in `trust_tasks_did` and
-// `did-hosting-common`'s handlers: the type is upstream, and boxing it at this
+// which return it. Same reasoning as the allows in `did-hosting-common`'s
+// handlers: the type is upstream, and boxing it at this
 // boundary would churn every caller to save one move on a path that is about to
 // serialise the error onto the wire anyway.
 #[allow(clippy::result_large_err)]

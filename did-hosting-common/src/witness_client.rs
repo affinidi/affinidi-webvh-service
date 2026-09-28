@@ -132,7 +132,7 @@ impl WitnessClient {
 
 /// The payload of a verified reply to a `type_uri` request: its `#response`,
 /// or the refusal it carries.
-fn read_reply<R: serde::de::DeserializeOwned>(
+pub(crate) fn read_reply<R: serde::de::DeserializeOwned>(
     type_uri: &str,
     reply: trust_tasks_rs::TrustTask<Value>,
 ) -> Result<R> {
@@ -155,7 +155,7 @@ fn read_reply<R: serde::de::DeserializeOwned>(
         });
     }
     Err(WebVHError::Transport(format!(
-        "the witness answered {type_uri} with a {reply_type} document"
+        "the service answered {type_uri} with a {reply_type} document"
     )))
 }
 

@@ -1,148 +1,110 @@
-//! Prometheus metrics for DID Hosting services.
+//! Operational counters for DID Hosting services.
 //!
-//! Gated behind the `metrics` feature flag. When enabled, provides counters
-//! for DID operations, auth events, cache performance, and stats sync.
-//! Access via `GET /metrics` (unauthenticated).
+//! Gated behind the `metrics` feature flag. When enabled, counts DID
+//! operations, auth events, cache performance and stats syncs. They are read
+//! through the admin-only `did-management/server/metrics/0.1` Trust Task
+//! ([`counters`]); there is no unauthenticated scrape endpoint.
 
-use prometheus::{Encoder, IntCounter, Registry, TextEncoder};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+static RESOLVES: AtomicU64 = AtomicU64::new(0);
+static UPDATES: AtomicU64 = AtomicU64::new(0);
+static AUTH_CHALLENGES: AtomicU64 = AtomicU64::new(0);
+static AUTH_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static STATS_SYNCS: AtomicU64 = AtomicU64::new(0);
 
-static RESOLVES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_resolves_total", "Total DID resolutions").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
+/// Every counter, with the name it is reported under, sorted by name.
+static COUNTERS: [(&str, &AtomicU64); 8] = [
+    ("webvh_auth_challenges_total", &AUTH_CHALLENGES),
+    ("webvh_auth_failures_total", &AUTH_FAILURES),
+    ("webvh_auth_successes_total", &AUTH_SUCCESSES),
+    ("webvh_cache_hits_total", &CACHE_HITS),
+    ("webvh_cache_misses_total", &CACHE_MISSES),
+    ("webvh_resolves_total", &RESOLVES),
+    ("webvh_stats_syncs_total", &STATS_SYNCS),
+    ("webvh_updates_total", &UPDATES),
+];
 
-static UPDATES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_updates_total", "Total DID updates/publishes").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static AUTH_CHALLENGES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new(
-        "webvh_auth_challenges_total",
-        "Total auth challenges issued",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static AUTH_SUCCESSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new(
-        "webvh_auth_successes_total",
-        "Total successful authentications",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static AUTH_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_auth_failures_total", "Total failed authentications").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_cache_hits_total", "Total cache hits").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_cache_misses_total", "Total cache misses").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-static STATS_SYNCS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new("webvh_stats_syncs_total", "Total stats sync operations").unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
+fn inc(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Increment the DID resolve counter.
 pub fn inc_resolve() {
-    RESOLVES.inc();
+    inc(&RESOLVES);
 }
 
-/// Increment the DID update counter.
+/// Increment the DID update/publish counter.
 pub fn inc_update() {
-    UPDATES.inc();
+    inc(&UPDATES);
 }
 
 /// Increment the auth challenge counter.
 pub fn inc_auth_challenge() {
-    AUTH_CHALLENGES.inc();
+    inc(&AUTH_CHALLENGES);
 }
 
 /// Increment the auth success counter.
 pub fn inc_auth_success() {
-    AUTH_SUCCESSES.inc();
+    inc(&AUTH_SUCCESSES);
 }
 
 /// Increment the auth failure counter.
 pub fn inc_auth_failure() {
-    AUTH_FAILURES.inc();
+    inc(&AUTH_FAILURES);
 }
 
 /// Increment the cache hit counter.
 pub fn inc_cache_hit() {
-    CACHE_HITS.inc();
+    inc(&CACHE_HITS);
 }
 
 /// Increment the cache miss counter.
 pub fn inc_cache_miss() {
-    CACHE_MISSES.inc();
+    inc(&CACHE_MISSES);
 }
 
 /// Increment the stats sync counter.
 pub fn inc_stats_sync() {
-    STATS_SYNCS.inc();
+    inc(&STATS_SYNCS);
 }
 
-/// Render all metrics as Prometheus text format.
-pub fn render() -> String {
-    let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
-    let mut buffer = Vec::new();
-    encoder
-        .encode(&metric_families, &mut buffer)
-        .unwrap_or_default();
-    String::from_utf8(buffer).unwrap_or_default()
-}
-
-/// Every counter this service keeps, as `(name, value)`, read at once.
+/// Every counter this service keeps, as `(name, value)`, sorted by name.
 ///
 /// For the authenticated `did-management/server/metrics` Trust Task. The
-/// names are the ones the Prometheus text exposition carried, so a dashboard
-/// re-points with a name mapping only.
+/// names are the ones the retired Prometheus exposition carried, so a
+/// dashboard re-points with a name mapping only.
 pub fn counters() -> Vec<(String, f64)> {
-    let mut out: Vec<(String, f64)> = [
-        &*RESOLVES,
-        &*UPDATES,
-        &*AUTH_CHALLENGES,
-        &*AUTH_SUCCESSES,
-        &*AUTH_FAILURES,
-        &*CACHE_HITS,
-        &*CACHE_MISSES,
-        &*STATS_SYNCS,
-    ]
-    .into_iter()
-    .map(|c| {
-        use prometheus::core::Collector;
-        let name = c
-            .desc()
-            .first()
-            .map(|d| d.fq_name.clone())
-            .unwrap_or_default();
-        (name, c.get() as f64)
-    })
-    .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    COUNTERS
+        .iter()
+        .map(|(name, c)| (name.to_string(), c.load(Ordering::Relaxed) as f64))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(name: &str) -> f64 {
+        counters()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .expect("counter exists")
+            .1
+    }
+
+    #[test]
+    fn counters_are_sorted_by_name_and_count() {
+        let names: Vec<String> = counters().into_iter().map(|(n, _)| n).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+
+        let before = value("webvh_stats_syncs_total");
+        inc_stats_sync();
+        assert!(value("webvh_stats_syncs_total") >= before + 1.0);
+    }
 }

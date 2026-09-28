@@ -78,14 +78,9 @@ pub const MSG_ME_DOMAINS: &str = "https://trusttasks.org/spec/did-management/me/
 //
 // Net-new in DIDComm form: the verbs shipped REST-only, so a VTA that
 // speaks DIDComm/TSP could provision a DID but could not name it. Each verb
-// dispatches to the same `did_ops::*_agent_name` function the REST handler
-// calls, so the two transports cannot drift.
-//
-// These live here rather than in `did_hosting_tasks` because that module is
-// the *REST* task registry (`did-hosting/agent-name/{verb}/1.0`, matched on
-// the `Trust-Task:` header) and carries a cross-crate byte-parity obligation
-// with `did-hosting-client`. The dispatcher matches on `MSG_*`, and every
-// other DIDComm verb declares its request/response pair here.
+// dispatches to the same `did_ops::*_agent_name` function on every transport,
+// so they cannot drift. The dispatcher matches on `MSG_*`, and every other
+// DIDComm verb declares its request/response pair here.
 
 /// Declarative binding-state update (`state: "active" | "parked"`), the
 /// canonical replacement for the retired set / enable / disable verb trio

@@ -33,7 +33,6 @@ pub mod setup_prompts;
 pub mod setup_recipe;
 pub mod stats_collector;
 pub mod store;
-pub mod trust_task;
 /// New trust-tasks framework integration (SPEC.md 0.1). Gated behind
 /// `server-core` because the dispatcher only runs on the server side;
 /// the client crate (no trust-tasks admin surface yet) doesn't compile

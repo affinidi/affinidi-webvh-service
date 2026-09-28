@@ -1,13 +1,12 @@
 # Affinidi DID Hosting Control Plane
 
 The DID Hosting Control Plane is the authoritative source of truth for
-all DID management. It handles DID lifecycle operations (create,
-publish, delete) via DIDComm and optional REST API, and pushes
-updates to server edge nodes via DIDComm through a mediator.
-It also hosts an optional web-based management UI, maintains a
-service registry, acts as a reverse proxy to backend service
-instances, and supports DIDComm v2 and passkey (WebAuthn)
-authentication.
+all DID management. Every management operation (DID lifecycle, agent
+names, domains, ACL, the service registry, stats) is a signed Trust Task,
+served the same over TSP, DIDComm and HTTPS (`POST /api/trust-tasks`); there
+is no REST management API. It pushes updates to server edge nodes as signed
+Trust Tasks, hosts an optional web-based management UI, maintains a service
+registry, and supports passkey (WebAuthn) sign-in.
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -120,8 +119,7 @@ keyring_service = "did-hosting-control"
 
 [registry]
 health_check_interval = 60    # seconds
-# Hosts the control plane may register and PROXY TO. Required if you use the
-# reverse proxy — see "Reverse proxy & the registry allowlist" below.
+# Hosts the control plane may register — see "Registry allowlist" below.
 url_allowlist = ["server-eu.internal", "witness-eu.internal"]
 
 # Watchers: a DID whose log names this URL in its `watchers` parameter is
@@ -135,7 +133,7 @@ url_allowlist = ["server-eu.internal", "witness-eu.internal"]
 ### Service Registry
 
 The `[registry]` section configures backend service instances
-that the control plane manages and proxies requests to.
+that the control plane manages.
 
 Static instances can be defined in `config.toml`:
 
@@ -156,57 +154,21 @@ service_type = "watcher"
 url = "http://watcher-eu:8533"
 ```
 
-Instances can also be managed dynamically via the registry API.
+Instances can also be managed dynamically with the `registry/*` Trust Tasks.
 
-### Reverse proxy & the registry allowlist (security-critical)
+### Registry allowlist
 
-The control plane exposes an **Admin-only reverse proxy** at
-`/api/server/{instance}/{*path}` and `/api/witness/{instance}/{*path}`. It
-forwards the request to a registered instance's `url` **and forwards the
-caller's `Authorization` header** (the Admin bearer) to that backend, since the
-control plane and its backends typically share JWT keys.
+`registry.url_allowlist` bounds which hosts may be registered (by an
+administrator's `registry/admin-register`, or a server's `server/register`).
+Matching is on the URL **host only** (scheme and port are ignored),
+case-insensitive, and **exact** — `example.com` does not match
+`sub.example.com`.
 
-Because a live Admin credential is forwarded, the target host is gated by
-`registry.url_allowlist`:
-
-- **Empty allowlist (the default) ⇒ the proxy is disabled (fail-closed).** A
-  proxy request returns `403` (`"proxy refused: no registry.url_allowlist is
-  configured…"`). Registration itself still refuses non-routable / internal
-  *literal* hosts (loopback, RFC1918, `169.254.169.254`, CGNAT, …) even with an
-  empty allowlist, but a public host can be registered — it just cannot be
-  proxied to.
-- **Non-empty allowlist ⇒ the proxy forwards only to listed hosts.** Any other
-  target (a public attacker host, or a name that isn't listed) is refused, so
-  the Admin credential can only ever reach a host you explicitly trust.
-
-> **⚠️ Behaviour change (SEC-4045 W6).** Earlier releases forwarded the Admin
-> credential to **any** registered URL when the allowlist was empty. If you use
-> the reverse proxy and have not set `registry.url_allowlist`, the proxy will now
-> return `403` until you configure it. This is intentional: an unset allowlist
-> previously let a `service`-role registrant point the proxy at an
-> attacker-controlled host and receive an Admin token.
-
-**Configure it securely:**
-
-1. **List every backend host you proxy to**, and nothing else:
-   ```toml
-   [registry]
-   url_allowlist = ["server-eu.internal", "witness-eu.internal"]
-   ```
-   Matching is on the URL **host only** (scheme and port are ignored),
-   case-insensitive, and **exact** — `example.com` does not match
-   `sub.example.com`. If a backend is on an internal IP literal (e.g.
-   `10.0.0.5`), list that literal exactly (it is otherwise refused as
-   non-routable).
-2. **Prefer hostnames you control end-to-end** (private DNS / service names)
-   over raw IPs, and terminate the backends over **TLS** so the forwarded
-   credential is not sent in clear text.
-3. **Keep the list minimal.** Every entry is a host the control plane will hand
-   an Admin credential to; treat it like an egress allowlist.
-4. **Daemon (all-in-one) deployments need no allowlist** — the registry is empty
-   and the proxy is unused, so leaving `url_allowlist` unset is correct and
-   safe. Only *standalone control planes that manage remote instances through
-   the proxy* must set it.
+- **Empty (the default):** registration refuses non-routable / internal
+  *literal* hosts (loopback, RFC1918, `169.254.169.254`, CGNAT, …); a public
+  host is accepted.
+- **Non-empty:** only listed hosts may be registered. If a backend is on an
+  internal IP literal (e.g. `10.0.0.5`), list that literal exactly.
 
 ### Environment Variable Overrides
 
@@ -258,38 +220,38 @@ providing browser-based passwordless authentication alongside DIDComm
 challenge-response auth. Without a `public_url`, WebAuthn is not
 initialised and authentication falls back to DID challenge-response.
 
-### Reverse Proxy
-
-The control plane proxies requests to registered backend
-service instances. This allows the UI to communicate with
-all services through a single origin (no CORS issues):
-
-```
-UI → /api/server/{instance_id}/dids → did-hosting-server
-UI → /api/witness/{instance_id}/witnesses → webvh-witness
-```
-
 ### Health Checking
 
 Registered service instances are periodically health-checked.
 The health check interval is configurable via
 `registry.health_check_interval` (default: 60 seconds).
 
-## API Endpoints
+## HTTP surface
 
-All API endpoints are under the `/api` prefix.
+The control plane has no REST management API. Its HTTP surface is:
 
-### Authentication
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `POST` | `/api/trust-tasks` | The HTTPS binding of the Trust Task listener: the same dispatch TSP and DIDComm reach. Every management operation arrives here, authorised on the document's own proof. |
+| `GET` | `/api/health` | Unauthenticated liveness probe |
+| `POST` | `/api/auth/challenge` | Browser sign-in, step 1: a challenge for a SIOPv2 `id_token` |
+| `POST` | `/api/auth/` | Browser sign-in, step 2: redeem a SIOPv2 `id_token` minted by the holder's VTA |
+| `POST` | `/api/auth/refresh` | Renew a console session: its refresh token, plus a proof from the browser's bound session key |
+| `GET` | `/*` | The management UI (`ui` feature), for any path outside `/api` |
 
-| Method | Path                              | Description            |
-| ------ | --------------------------------- | ---------------------- |
-| `POST` | `/api/auth/challenge`             | Request challenge      |
-| `POST` | `/api/auth/`                      | Submit DIDComm auth    |
-| `POST` | `/api/auth/refresh`               | Refresh token          |
+The three `/api/auth/*` routes are the one sign-in with no Trust Task form:
+`auth/authenticate/0.2` carries no `id_token`, and a browser session does not
+hold the subject key a Trust Task `auth/refresh` must be signed with. A peer
+that signs its own documents signs in with `auth/challenge/0.1` and
+`auth/authenticate/0.2` on `POST /api/trust-tasks`.
 
-Passkeys have no REST routes. Enrolment and login are Trust Tasks on
-`POST /api/trust-tasks` (and TSP and DIDComm), with WebAuthn's ceremony data
-inside their payloads:
+Operational metrics are the admin-only `did-management/server/metrics/0.1`
+Trust Task; there is no Prometheus scrape endpoint.
+
+### Passkeys
+
+Enrolment and login are Trust Tasks on `POST /api/trust-tasks` (and TSP and
+DIDComm), with WebAuthn's ceremony data inside their payloads:
 
 | Trust Task | Proof | Purpose |
 | --- | --- | --- |
@@ -302,76 +264,6 @@ inside their payloads:
 
 A `stepUp` invite enrols a step-up-only passkey, kept in its own keyspace
 (`passkey_step_up`) that the login ceremony never reads.
-
-### Access Control (admin only)
-
-| Method   | Path             | Description      |
-| -------- | ---------------- | ---------------- |
-| `GET`    | `/api/acl`       | List ACL entries |
-| `POST`   | `/api/acl`       | Create ACL entry |
-| `PUT`    | `/api/acl/{did}` | Update ACL entry |
-| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
-
-### DID Management
-
-All routes require Bearer-token authentication; ownership and admin
-gating is enforced per-handler.
-
-| Method   | Path                            | Description |
-| -------- | ------------------------------- | ----------- |
-| `GET`    | `/api/dids`                     | List DIDs (owners see their own; admins see all, or filter by `?owner=did:...`). |
-| `POST`   | `/api/dids`                     | Reserve a DID slot (mnemonic + URL). Body: `{ "path"?: string, "force"?: bool }`. |
-| `POST`   | `/api/dids/check`               | Check whether a custom path is available. Body: `{ "path": string }`. |
-| `POST`   | `/api/dids/register`            | Atomic claim-and-publish (closes the resolvability gap of `POST /api/dids` + `PUT /api/dids/{m}`). Body: `{ "path": string, "did_log": string, "force"?: bool }`. |
-| `GET`    | `/api/dids/{*mnemonic}`         | Get DID record + log metadata. |
-| `PUT`    | `/api/dids/{*mnemonic}`         | Publish a signed `did.jsonl` log. Body: `text/plain` JSONL. |
-| `DELETE` | `/api/dids/{*mnemonic}`         | Delete a DID and its associated content. |
-| `PUT`    | `/api/owner/{*mnemonic}`        | Transfer ownership. Body: `{ "new_owner": string }`. New owner must be in the ACL. |
-| `PUT`    | `/api/disable/{*mnemonic}`      | Toggle `disabled = true` on the record (resolvers serve gone). |
-| `PUT`    | `/api/enable/{*mnemonic}`       | Toggle `disabled = false`. |
-| `POST`   | `/api/rollback/{*mnemonic}`     | Remove the last log entry (decrements `version_count`). |
-| `GET`    | `/api/log/{*mnemonic}`          | Parsed log entries as structured JSON. |
-| `GET`    | `/api/raw/{*mnemonic}`          | Raw `did.jsonl` content as `text/plain`. |
-| `PUT`    | `/api/witness/{*mnemonic}`      | Upload a witness proof file. Body: `application/json`. |
-
-### Statistics & Time-series
-
-| Method | Path                              | Description |
-| ------ | --------------------------------- | ----------- |
-| `GET`  | `/api/stats`                      | Aggregate stats across the control plane. |
-| `GET`  | `/api/stats/{*mnemonic}`          | Per-DID stats. |
-| `GET`  | `/api/timeseries`                 | Server-wide time-series buckets. Query: `?range=1h\|24h\|7d\|30d` (default `24h`). |
-| `GET`  | `/api/timeseries/{*mnemonic}`     | Per-DID time-series. Same `range` query. |
-
-### Service Topology & Configuration
-
-| Method | Path                       | Description |
-| ------ | -------------------------- | ----------- |
-| `GET`  | `/api/services/overview`   | Full topology: control plane info + every registered service + aggregate stats. |
-| `GET`  | `/api/config`              | Non-sensitive control-plane configuration (DIDs, URLs, feature flags). |
-
-### Service Registry (admin only)
-
-| Method   | Path                                         | Description          |
-| -------- | -------------------------------------------- | -------------------- |
-| `GET`    | `/api/control/registry`                      | List instances       |
-| `POST`   | `/api/control/registry`                      | Register instance    |
-| `GET`    | `/api/control/registry/{instance_id}`        | Get instance         |
-| `DELETE` | `/api/control/registry/{instance_id}`        | Deregister instance  |
-| `POST`   | `/api/control/registry/{instance_id}/health` | Trigger health check |
-
-### Reverse Proxy
-
-| Method | Path                                       | Description              |
-| ------ | ------------------------------------------ | ------------------------ |
-| `*`    | `/api/server/{instance_id}/{path}`         | Proxy to server instance |
-| `*`    | `/api/witness/{instance_id}/{path}`        | Proxy to witness instance|
-
-### Health
-
-| Method | Path          | Description  |
-| ------ | ------------- | ------------ |
-| `GET`  | `/api/health` | Health check |
 
 ## Library Usage
 

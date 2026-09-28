@@ -14,7 +14,7 @@ Each service is mounted at a path prefix:
 | Server  | `/`         | Public DID hosting and resolution |
 | Witness | `/witness`  | Witness proof signing |
 | Watcher | `/watcher`  | Read-only DID mirror |
-| Control | `/`         | DID management (DIDComm + REST API), management UI |
+| Control | `/`         | DID management as Trust Tasks (TSP, DIDComm, `POST /api/trust-tasks`), management UI |
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -237,7 +237,7 @@ did-hosting-daemon restore              # Restore data from backup file
 
 When all services are enabled, the daemon exposes endpoints
 at the following paths. `did-hosting-server` (the public-DID-resolver edge
-node) and `did-hosting-control` (the management API + UI) both merge at
+node) and `did-hosting-control` (the Trust Task listener + UI) both merge at
 root — the daemon is a unified front door rather than a multiplexer.
 Witness and watcher are nested under their own prefixes because their
 APIs are operator-facing and benefit from a clean URL boundary.
@@ -247,13 +247,8 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | Path | Description | Source |
 | ---- | ----------- | ------ |
 | `/api/health` | Combined health endpoint | server / control |
-| `/api/auth/*` | DIDComm auth + passkey auth | control plane |
-| `/api/dids/*` | DID lifecycle management | control plane |
-| `/api/acl/*` | ACL management | control plane |
-| `/api/server/{instance_id}/*` | Reverse proxy to a registered server | control plane |
-| `/api/witness/{instance_id}/*` | Reverse proxy to a registered witness | control plane |
-| `/api/control/registry/*` | Service registry CRUD | control plane |
-| `/api/control/stats` | Service-role stats sync ingest | control plane |
+| `/api/trust-tasks` | Every management operation, as a signed Trust Task (the HTTPS binding) | control plane |
+| `/api/auth/challenge`, `/api/auth/`, `/api/auth/refresh` | Browser SIOPv2 sign-in and console session refresh | control plane |
 | `/{mnemonic}/did.jsonl` | Public DID resolution | server |
 | `/.well-known/did.jsonl` | Service-DID resolution | server |
 | `/`, `/assets/*` | Management UI (when `ui` feature enabled) | control plane |

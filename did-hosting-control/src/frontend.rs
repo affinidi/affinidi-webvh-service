@@ -26,8 +26,11 @@ pub async fn static_handler(uri: Uri) -> Response {
             .into_response();
     }
 
-    // If path has extension, it's a genuine 404
-    if path.contains('.') {
+    // An extension means a genuine 404, and so does anything under `api/`:
+    // the API is `POST /api/trust-tasks` and the few routes beside it, and an
+    // API client that asks for anything else must be told there is nothing
+    // there, not handed the console's HTML.
+    if path.contains('.') || path == "api" || path.starts_with("api/") {
         return StatusCode::NOT_FOUND.into_response();
     }
 

@@ -62,7 +62,6 @@ fn no_transport_asks_which_family_a_document_belongs_to() {
         let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
         for (n, line) in production.lines().enumerate() {
             let decides = line.contains("registered_uris()")
-                || line.contains("trust_tasks_did::owns")
                 || line.contains("trust_tasks_auth::owns")
                 || line.contains("trust_tasks_infra::owns")
                 || line.contains("bridge_did_management(");

@@ -29,7 +29,7 @@ pub(crate) async fn me_domains(
     _p: me_domains_spec::v0_1::Payload,
 ) -> Result<me_domains_spec::v0_1::Response, TaskError> {
     let auth = cx.auth().await?;
-    let resp = crate::routes::domain::fetch_me_domains_for_caller(&auth, cx.state).await?;
+    let resp = super::queries::fetch_me_domains_for_caller(&auth, cx.state).await?;
     let domains: Vec<Value> = resp.domains.iter().map(spec_domain_entry).collect();
     let mut body = serde_json::Map::new();
     body.insert("domains".into(), json!(domains));

@@ -1,6 +1,5 @@
 [workspace]
 members = [
-  "did-hosting-client",
   "did-hosting-common",
   "did-hosting-control",
   "did-hosting-daemon",

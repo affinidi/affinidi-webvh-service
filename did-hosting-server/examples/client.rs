@@ -10,14 +10,14 @@ use tracing::info;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(about = "Create a did:webvh DID and upload it to a did-hosting-server")]
+#[command(about = "Create a did:webvh DID and publish it through a DID Hosting control plane")]
 struct Cli {
-    /// Base URL of the did-hosting-server (e.g. http://localhost:8530)
+    /// Base URL of the control plane (e.g. http://localhost:8532)
     #[arg(long)]
     server_url: String,
 
-    /// DID of the DID Hosting service. Used as the DIDComm `to` field of the
-    /// signed authenticate message.
+    /// DID of the DID Hosting service: every signed request is addressed to
+    /// it, and every reply must be signed by it.
     #[arg(long)]
     webvh_did: String,
 
@@ -44,24 +44,24 @@ async fn main() -> Result<()> {
 
     println!("\n=== Step 1: Identity Generated ===");
     println!("  DID: {my_did}");
-    println!("\nEnsure this DID is in the server ACL (e.g. via did-hosting-server invite).");
+    println!(
+        "\nEnsure this DID is in the server ACL (e.g. `did-hosting-control add-acl --did <did>`)."
+    );
     print!("Press Enter to continue...");
     io::stdout().flush()?;
     let mut buf = String::new();
     io::stdin().read_line(&mut buf)?;
 
     // ------------------------------------------------------------------
-    // Step 2: Authenticate via SDK
+    // Step 2: Sign requests as this identity
     // ------------------------------------------------------------------
-    println!("=== Step 2: Authenticating via DIDComm ===");
+    println!("=== Step 2: Signing requests as {my_did} ===");
 
     let mut client = WebVHClient::new(server_url);
     client
-        .authenticate(&my_did, &my_secret, &cli.webvh_did)
+        .sign_as(&my_did, &my_secret, &cli.webvh_did)
         .await
-        .context("authentication failed")?;
-
-    println!("  Authenticated successfully!");
+        .context("could not set up the signing identity")?;
 
     // ------------------------------------------------------------------
     // Step 3: (Optional) Check name availability

@@ -3,14 +3,14 @@
 //! A rich TUI benchmarking tool for load-testing WebVH DID resolution.
 //!
 //! Supports two modes:
-//! - **Server mode** (default): authenticates with a DID Hosting control plane
+//! - **Server mode** (default): signs Trust Tasks to a DID Hosting control plane
 //!   (`did-hosting-control` or the `did-hosting-daemon`'s embedded control plane)
-//!   via DIDComm, lists active DIDs, and benchmarks resolution against
+//!   over `POST /api/trust-tasks`, lists active DIDs, and benchmarks resolution against
 //!   each DID's own hosting URL. The management endpoint
 //!   (`--server-url`) and the public hosting URL (`--hosting-url`,
 //!   embedded in newly minted DIDs) are different hosts in a control-
-//!   plane deployment. Requires `--webvh-did` (the service's DID, used
-//!   as the DIDComm `to` field of the auth message).
+//!   plane deployment. Requires `--webvh-did` (the service's DID, which
+//!   every request is addressed to and every reply must be signed by).
 //! - **File mode** (`--did-file`): reads `did:webvh:...` identifiers from a
 //!   file and derives resolution URLs directly. No authentication needed —
 //!   works against any hosted WebVH DID.
@@ -122,9 +122,9 @@ struct Args {
     #[arg(long, short = 'f')]
     did_file: Option<String>,
 
-    /// DID of the DID Hosting service we're authenticating against. Used as the
-    /// DIDComm `to` field of the signed authenticate message. Required
-    /// in server mode (when `--did-file` is not set).
+    /// DID of the DID Hosting service: every signed request is addressed to
+    /// it, and every reply must be signed by it. Required in server mode
+    /// (when `--did-file` is not set).
     #[arg(long)]
     webvh_did: Option<String>,
 }
@@ -1888,17 +1888,16 @@ async fn run(args: Args) -> Result<()> {
             io::stdin().read_line(&mut buf)?;
         }
 
-        // Authenticate via DIDComm
-        eprintln!("  Authenticating via DIDComm...");
+        // Every request is a Trust Task signed by this did:key.
+        eprintln!("  Signing requests as {my_did}...");
         let mut client = WebVHClient::new(&server_url);
         if let Some(ref h) = hosting_url {
             client = client.with_hosting_url(h);
         }
         client
-            .authenticate(&my_did, &my_secret, &webvh_did)
+            .sign_as(&my_did, &my_secret, &webvh_did)
             .await
-            .context("DIDComm authentication failed")?;
-        eprintln!("  Authenticated!");
+            .context("could not set up the signing identity")?;
 
         // Create random DIDs if requested
         let (client, _my_secret) = if args.create_dids > 0 {

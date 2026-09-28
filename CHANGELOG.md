@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Breaking — the control plane has no REST management surface
+
+- **Kept:** `POST /api/trust-tasks` (the HTTPS binding of the one Trust Task
+  dispatch), `GET /api/health`, the console's static fallback, and the browser
+  sign-in with no Trust Task form: `POST /api/auth/challenge`,
+  `POST /api/auth/` (a SIOPv2 `id_token` minted by the holder's VTA) and
+  `POST /api/auth/refresh` (refresh token plus the browser's bound session
+  key). The daemon inherits the same router.
+- **Removed:** every REST management route — `/api/dids*`, `/api/witness/*`,
+  `/api/log/*`, `/api/raw/*`, `/api/owner/*`, `/api/disable/*`,
+  `/api/enable/*`, `/api/rollback/*`, `/api/agent-names/*`, `/api/domains*`,
+  `/api/me/domains`, `/api/acl*`, `/api/stats*`, `/api/timeseries*`,
+  `/api/services/overview`, `/api/config`, `/api/server-info`,
+  `/api/control/registry*`, `/api/control/register-service`,
+  `/api/control/stats`, `/api/identity/generations*`,
+  `/api/auth/step-up/vta/{start,finish}`, the demo `/api/auth/step-up/check`,
+  `POST /api/task-consent/request` (and its DIDComm decision handler), the
+  `/api/proxy/{server,witness}/*` pass-through, and the Prometheus `/metrics`
+  endpoint. Each has a Trust Task (`server/metrics/0.1` for the metrics); the
+  proxy and task-consent had no caller. The console's SPA fallback no longer
+  answers any `/api/*` path.
+- **Removed:** the permissive `Trust-Task:` header routing (`TrustTaskRouter`),
+  the house `trusttasks.org/did-hosting/*/1.0` URIs, the undocumented
+  `spec/did-hosting/*/1.0` arms (`trust_tasks_did`), the DIDComm-JWS dialect of
+  `POST /api/auth/` and `/api/auth/refresh`, `ControlClient`, the
+  `did-hosting-client` crate (REST-only, unpublished, no caller) and the
+  `prometheus` dependency. `WebVHClient` now signs Trust Tasks
+  (`sign_as` replaces `authenticate`).
+
 ### Breaking — secrets use `vti-secrets`, with no insecure default
 
 - **One implementation.** Every secrets backend (keyring, AWS, GCP, Azure,
