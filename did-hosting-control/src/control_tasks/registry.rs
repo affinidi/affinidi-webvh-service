@@ -215,6 +215,8 @@ pub(crate) async fn admin_register(
         last_inbound_at: None,
         last_outbound_transport: None,
         last_outbound_at: None,
+        last_ack_at: None,
+        last_reconcile_at: None,
     };
     registry::register_instance(&state.registry_ks, &instance).await?;
     info!(caller = %auth.did, instance_id = %instance.instance_id, "instance registered by an administrator");

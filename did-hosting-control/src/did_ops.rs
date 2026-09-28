@@ -1594,8 +1594,14 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
 /// never widens a non-admin's view, whatever it is passed. `domain` (already
 /// canonical) keeps only slots hosted under it. Ordered by mnemonic so paging
 /// is stable.
+///
+/// `replica` is set when the caller is a hosting server this control plane
+/// drives, reconciling against the full listing (see
+/// `control_tasks::did::list`): with no `owner` filter it is shown every slot,
+/// as an administrator is — the slots it is already sent to serve.
 pub async fn list_dids_page(
     auth: &AuthClaims,
+    replica: bool,
     state: &AppState,
     requested_owner: Option<&str>,
     domain: Option<&str>,
@@ -1606,35 +1612,36 @@ pub async fn list_dids_page(
 
     const MAX_LIST_LIMIT: usize = 1000;
 
-    let mut records: Vec<DidRecord> = if auth.role == Role::Admin && requested_owner.is_none() {
-        let raw = state.dids_ks.prefix_iter_raw("did:").await?;
-        raw.into_iter()
-            .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
-            .collect()
-    } else {
-        let target_owner = if auth.role == Role::Admin {
-            requested_owner.unwrap_or(&auth.did)
+    let mut records: Vec<DidRecord> =
+        if (auth.role == Role::Admin || replica) && requested_owner.is_none() {
+            let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+            raw.into_iter()
+                .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
+                .collect()
         } else {
-            &auth.did
-        };
-        let raw = state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{target_owner}:"))
-            .await?;
-        let mut out = Vec::with_capacity(raw.len());
-        for (_key, value) in raw {
-            let mnemonic = String::from_utf8(value)
-                .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-            // The owner index is a string prefix, and DIDs contain colons, so a
-            // DID that prefixes another shares rows with it: re-check the owner.
-            if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await?
-                && record.owner == target_owner
-            {
-                out.push(record);
+            let target_owner = if auth.role == Role::Admin {
+                requested_owner.unwrap_or(&auth.did)
+            } else {
+                &auth.did
+            };
+            let raw = state
+                .dids_ks
+                .prefix_iter_raw(format!("owner:{target_owner}:"))
+                .await?;
+            let mut out = Vec::with_capacity(raw.len());
+            for (_key, value) in raw {
+                let mnemonic = String::from_utf8(value)
+                    .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+                // The owner index is a string prefix, and DIDs contain colons, so a
+                // DID that prefixes another shares rows with it: re-check the owner.
+                if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await?
+                    && record.owner == target_owner
+                {
+                    out.push(record);
+                }
             }
-        }
-        out
-    };
+            out
+        };
     if let Some(domain) = domain {
         records.retain(|r| {
             let host = if r.domain.is_empty() {

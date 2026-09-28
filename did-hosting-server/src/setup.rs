@@ -233,6 +233,7 @@ pub async fn run_wizard(
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config,
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         control_did,
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
@@ -824,6 +825,7 @@ pub async fn run_setup_offline_complete(
         hosting: crate::config::HostingConfig::default(),
         secrets: state.secrets.clone(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         control_did: state.control_did.clone(),
         vta: VtaConfig {
             url: result.vta_url.clone(),

@@ -217,6 +217,7 @@ impl DaemonConfig {
             hosting: self.hosting.clone(),
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
+            replication: Default::default(),
             control_did: None,
             vta: self.vta.clone(),
             stats: did_hosting_server::config::StatsConfig::default(),

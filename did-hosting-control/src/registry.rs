@@ -155,6 +155,46 @@ pub struct ServiceInstance {
     /// Epoch seconds of that outbound ping.
     #[serde(default)]
     pub last_outbound_at: Option<u64>,
+
+    // ---- Replication lag ----
+    /// Epoch seconds of the last signed acknowledgement (or final refusal)
+    /// this server sent for a queued directive — the last time the outbox
+    /// moved for it.
+    #[serde(default)]
+    pub last_ack_at: Option<u64>,
+    /// Epoch seconds of the last reconcile this server started against the
+    /// full `did/list` — its staleness-bound backstop.
+    #[serde(default)]
+    pub last_reconcile_at: Option<u64>,
+}
+
+/// Record an edge's acknowledgement at `now` (best effort: a failure only
+/// leaves the lag metric older than it is).
+pub async fn record_ack(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
+    update_instance(registry_ks, did, |i| i.last_ack_at = Some(now)).await;
+}
+
+/// Record the start of an edge's reconcile at `now` (best effort).
+pub async fn record_reconcile(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
+    update_instance(registry_ks, did, |i| i.last_reconcile_at = Some(now)).await;
+}
+
+async fn update_instance(
+    registry_ks: &KeyspaceHandle,
+    did: &str,
+    change: impl FnOnce(&mut ServiceInstance),
+) {
+    let id = did.replace(':', "_");
+    match get_instance(registry_ks, &id).await {
+        Ok(Some(mut instance)) => {
+            change(&mut instance);
+            if let Err(e) = register_instance(registry_ks, &instance).await {
+                tracing::warn!(instance_id = %id, error = %e, "failed to record replication progress");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(instance_id = %id, error = %e, "failed to read instance"),
+    }
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -526,6 +566,8 @@ mod tests {
             last_inbound_at: Some(1111),
             last_outbound_transport: Some(ObservedTransport::Didcomm),
             last_outbound_at: Some(2222),
+            last_ack_at: None,
+            last_reconcile_at: None,
         };
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();

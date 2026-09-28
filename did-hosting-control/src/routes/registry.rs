@@ -91,6 +91,8 @@ pub async fn register(
         last_inbound_at: None,
         last_outbound_transport: None,
         last_outbound_at: None,
+        last_ack_at: None,
+        last_reconcile_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -388,6 +390,8 @@ pub async fn register_service(
         last_inbound_at: None,
         last_outbound_transport: None,
         last_outbound_at: None,
+        last_ack_at: None,
+        last_reconcile_at: None,
     };
 
     registry::register_instance(&state.registry_ks, &instance).await?;
@@ -461,6 +465,7 @@ async fn compute_did_sync_updates(
                 .map(|e| crate::server_push::ReportedDid {
                     did_id: e.did_id.clone(),
                     version_count: e.version_count,
+                    disabled: None,
                 })
                 .as_ref(),
         );

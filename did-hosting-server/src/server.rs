@@ -67,6 +67,9 @@ pub struct AppState {
     /// have their `Forwarded` / `X-Forwarded-Host` headers honoured
     /// for request-host detection (multi-domain, T19/T21).
     pub trusted_proxy_cidrs: Arc<Vec<IpNetwork>>,
+    /// How far this edge is behind its control plane — the reconcile loop
+    /// writes it, `/api/health` and `server/metrics` read it.
+    pub replication: Arc<crate::replication::ReplicationStatus>,
 }
 
 impl AppState {
@@ -93,6 +96,9 @@ impl AppState {
             stats_collector: None,
             did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
             trusted_proxy_cidrs: Arc::new(parsed_cidrs),
+            replication: Arc::new(crate::replication::ReplicationStatus::new(
+                did_hosting_common::server::auth::session::now_epoch(),
+            )),
         })
     }
 
@@ -113,6 +119,7 @@ impl AppState {
 /// own. Without `control_did` nothing could ever write to it, so a
 /// single-host deployment runs `did-hosting-daemon` instead.
 pub fn require_control_plane(config: &AppConfig) -> Result<(), AppError> {
+    config.replication.validate()?;
     if config.control_did.as_deref().is_none_or(str::is_empty) {
         return Err(AppError::Config(
             "control_did is not set. did-hosting-server is an edge that a control plane drives \
@@ -317,6 +324,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         });
     }
 
+    // 5a. Reconcile against the control plane's listing every interval — the
+    //     backstop behind the outbox, and what the staleness bound measures.
+    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = watch::channel(false);
+    if let Some(svc) = didcomm_service {
+        let rec_state = state.clone();
+        let rec_svc = svc.clone();
+        tokio::spawn(async move {
+            crate::replication::run_reconcile_loop(rec_state, rec_svc, reconcile_shutdown_rx).await;
+        });
+    } else {
+        warn!(
+            "no messaging service: this edge cannot reconcile with its control plane, and will \
+             report degraded once the staleness bound passes"
+        );
+    }
+
     // 5b. Keep a TSP relationship with the control plane established. Under Rev 3
     //     §7.2.2 the control plane's application pushes (sync/health) are dropped
     //     unless this edge holds a relationship with it, and forming one is the
@@ -399,6 +422,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("identity sweep task didn't shut down cleanly: {e}");
     }
 
+    let _ = reconcile_shutdown_tx.send(true);
     stats_sync_shutdown.cancel();
     didcomm_shutdown.cancel();
     if let Some(svc) = didcomm_service {
