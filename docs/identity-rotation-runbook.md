@@ -52,8 +52,8 @@ grep -A3 '\[secrets\]' config.toml
 `keyring` / `aws` / `gcp` / `azure` / `vault` / `k8s` → fine, `import-secrets`
 writes to the live backend and the running service reads it back.
 
-`plaintext` → also fine **on this branch** (`get()` now re-reads `config.toml`),
-but note the rotation writes new keys into `config.toml` in the clear.
+`plaintext` (tests only) → also fine, but the rotation writes the new keys in
+the clear to the `<config>.secrets.plaintext` file beside `config.toml`.
 
 ### 0c. Baseline
 

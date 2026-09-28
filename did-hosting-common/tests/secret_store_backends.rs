@@ -35,7 +35,7 @@
 #![cfg(all(feature = "vault-secrets", feature = "k8s-secrets"))]
 
 use did_hosting_common::server::config::SecretsConfig;
-use did_hosting_common::server::secret_store::{ServerSecrets, k8s, vault};
+use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
 
 fn sample_secrets() -> ServerSecrets {
     ServerSecrets {
@@ -133,8 +133,9 @@ async fn vault_round_trip() {
         ..SecretsConfig::default()
     };
 
-    let store = vault::from_config(&cfg).expect("build vault store");
-    assert_round_trip(&store).await;
+    let store =
+        create_secret_store(&cfg, std::path::Path::new("config.toml")).expect("build vault store");
+    assert_round_trip(store.as_ref()).await;
     eprintln!("vault_round_trip: OK against path {path}");
 }
 
@@ -154,7 +155,8 @@ async fn k8s_round_trip() {
         ..SecretsConfig::default()
     };
 
-    let store = k8s::from_config(&cfg).expect("build k8s store");
-    assert_round_trip(&store).await;
+    let store =
+        create_secret_store(&cfg, std::path::Path::new("config.toml")).expect("build k8s store");
+    assert_round_trip(store.as_ref()).await;
     eprintln!("k8s_round_trip: OK against Secret {name} (remember to delete it)");
 }

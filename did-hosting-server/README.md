@@ -219,7 +219,13 @@ time via feature flags and at runtime via config/env vars.
 | Azure Key Vault      | `azure-secrets` | `secrets.azure_vault_url`, `secrets.azure_secret_name`                         |
 | HashiCorp Vault      | `vault-secrets` | `secrets.vault_addr`, `secrets.vault_secret_path`, `secrets.vault_auth_method` (`kubernetes`/`token`/`approle`) |
 | Kubernetes Secret    | `k8s-secrets`   | `secrets.k8s_secret_name`, `secrets.k8s_namespace`                             |
-| Plaintext (testing)  | *(default)*     | `[secrets.plaintext]` — **do not use in production**, secrets land on disk    |
+| Plaintext (tests)    | *(always)*      | `secrets.backend = "plaintext"` + `secrets.confirm_plaintext = true` — **tests only**, keys in a clear-text file beside the config |
+
+Every backend is the published [`vti-secrets`](https://crates.io/crates/vti-secrets)
+crate, shared with the VTA and VTC. The OS keyring is the default. A host
+where it cannot be opened (a headless Linux box with no Secret Service) is
+refused at setup with the list of secure backends above: nothing falls back
+to plaintext. Set `secrets.backend` to name the backend explicitly.
 
 The server stores its key material as a JSON-serialized record
 in the backend:

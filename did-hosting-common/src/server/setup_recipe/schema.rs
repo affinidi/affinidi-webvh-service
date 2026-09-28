@@ -283,7 +283,7 @@ pub struct SecretsSection {
     #[serde(default)]
     pub k8s_secret_key: Option<String>,
     /// Required when `backend = "plaintext"`. Acknowledges the recipe
-    /// will produce a config file containing private keys in clear text.
+    /// will produce a clear-text file of private keys (tests only).
     #[serde(default)]
     pub confirm_plaintext: bool,
 }
@@ -301,8 +301,25 @@ pub enum SecretsBackend {
     /// Native Kubernetes `Secret` resource.
     #[serde(rename = "k8s", alias = "kubernetes")]
     K8s,
-    /// Stores key material directly in `config.toml`. Dev only.
+    /// Keeps key material in a clear-text file beside `config.toml`.
+    /// Tests only; requires `confirm_plaintext = true`.
     Plaintext,
+}
+
+impl SecretsBackend {
+    /// The `vti-secrets` backend this recipe value selects.
+    pub fn to_vti(self) -> crate::server::secret_store::SecretBackend {
+        use crate::server::secret_store::SecretBackend as B;
+        match self {
+            Self::Keyring => B::Keyring,
+            Self::Aws => B::Aws,
+            Self::Gcp => B::Gcp,
+            Self::Azure => B::Azure,
+            Self::Vault => B::Vault,
+            Self::K8s => B::Kubernetes,
+            Self::Plaintext => B::Plaintext,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

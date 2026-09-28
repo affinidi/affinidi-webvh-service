@@ -578,9 +578,14 @@ also scopes the cloud secret backends. Replace `<PREFIX>` below with
 | `<PREFIX>_SECRETS_AZURE_VAULT_URL` | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
 | `<PREFIX>_SECRETS_AZURE_SECRET_NAME` | Azure Key Vault secret name |
 
-Selection precedence at runtime: AWS → GCP → Azure → keyring → plaintext.
-Compile-time feature gates (`aws-secrets`, `gcp-secrets`, `azure-secrets`,
-`keyring`) decide which backends are even compiled in. Only compile in the
+`secrets.backend`, when set, selects the backend outright. Otherwise the
+precedence is AWS → GCP → Azure → Vault → Kubernetes → keyring. Plaintext is
+never chosen implicitly: it needs `backend = "plaintext"` and
+`confirm_plaintext = true`, and is for tests only. A backend selected on a
+binary built without its feature, or a keyring that cannot be opened, is a
+startup error listing the secure backends. Compile-time feature gates
+(`aws-secrets`, `gcp-secrets`, `azure-secrets`, `vault-secrets`,
+`k8s-secrets`, `keyring`) decide which backends are compiled in. Only compile in the
 backends you'll use — they each pull a sizable cloud SDK.
 
 ### Storage backends (all binaries)

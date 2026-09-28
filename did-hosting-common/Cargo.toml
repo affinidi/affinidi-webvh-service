@@ -33,6 +33,7 @@ method-webplus = []
 
 metrics = ["server-core", "dep:prometheus"]
 server-core = [
+    "dep:vti-secrets",
     "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
     "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
     "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
@@ -46,29 +47,25 @@ store-redis = ["server-core", "dep:redis"]
 store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types"]
 store-firestore = ["server-core", "dep:firestore", "dep:futures"]
 store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
-# Native OS keyring secret backend.
+# Secret-store backends. Every one is `vti-secrets`' implementation — the
+# same code the VTA and VTC use — wrapped by `server::secret_store`, which
+# stores the service's key envelope as the backend's payload.
 #
-# Supported targets: macOS, Windows, Linux (and any other Unix with a Secret
-# Service implementation reachable over D-Bus). Each backend dep is declared
-# under a `[target.'cfg(...)']` block, so on any *unsupported* target the
-# feature is harmless to enable but `KeyringSecretStore::try_new` returns
-# `AppError::SecretStore("...no native keyring backend available...")`.
-keyring = [
-    "server-core",
-    "dep:keyring-core",
-    "dep:apple-native-keyring-store",
-    "dep:windows-native-keyring-store",
-    "dep:dbus-secret-service-keyring-store",
-]
-aws-secrets = ["server-core", "dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types"]
-gcp-secrets = ["server-core", "dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth", "dep:bytes"]
-azure-secrets = ["server-core", "dep:azure_security_keyvault_secrets", "dep:azure_identity", "dep:azure_core", "dep:futures"]
+# Native OS keyring: macOS Keychain, Windows Credential Manager, or a
+# Secret Service provider over D-Bus on Linux. `vta-sdk/keyring` registers
+# the platform store. A host where none is reachable (a headless Linux box
+# with no Secret Service) is refused at setup with the list of secure
+# backends — there is no silent plaintext fallback.
+keyring = ["server-core", "vti-secrets/keyring", "vta-sdk/keyring"]
+aws-secrets = ["server-core", "vti-secrets/aws-secrets", "dep:aws-smithy-types"]
+gcp-secrets = ["server-core", "vti-secrets/gcp-secrets"]
+azure-secrets = ["server-core", "vti-secrets/azure-secrets"]
 # HashiCorp Vault (KV v2) secret backend, authenticating via Kubernetes
 # ServiceAccount JWT (default), static token, or AppRole.
-vault-secrets = ["server-core", "dep:vaultrs"]
+vault-secrets = ["server-core", "vti-secrets/vault-secrets"]
 # Native Kubernetes `Secret` backend (in-cluster ServiceAccount or local
 # kubeconfig via `Client::try_default`).
-k8s-secrets = ["server-core", "dep:kube", "dep:k8s-openapi"]
+k8s-secrets = ["server-core", "vti-secrets/k8s-secrets"]
 setup-wizard = ["server-core", "dep:dialoguer"]
 passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
 # Test-only seams (e.g. seeding a verifier's deactivation verdicts). Enabled
@@ -230,32 +227,18 @@ firestore = { version = "0.54", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "0.38", features = ["key_auth"], optional = true }
 azure_core = { version = "1.0", optional = true }
-
-# secret store backends (optional)
-keyring-core = { version = "1", optional = true }
-aws-sdk-secretsmanager = { version = "1", optional = true }
+# Used by the DynamoDB store backend.
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 
+# Secret-store backends (the `*-secrets` / `keyring` features above).
+# Published by verifiable-trust-infrastructure; on vti-common ^0.29, so it
+# shares this crate's single vti-common copy.
+vti-secrets = { version = "0.4.8", optional = true }
 # Not called from this crate — a resolver bound, explained in the workspace
 # manifest. Named here because a `[workspace.dependencies]` entry constrains
 # nothing on its own: only a crate that declares the dependency contributes its
-# version requirement, and this is a subtree that pulls `aws-config`.
+# version requirement, and `vti-secrets/aws-secrets` pulls `aws-config`.
 aws-smithy-types = { workspace = true, optional = true }
-google-cloud-secretmanager-v1 = { version = "1", optional = true }
-google-cloud-auth = { version = "1", optional = true }
-bytes = { version = "1", optional = true }
-azure_security_keyvault_secrets = { version = "1.0", optional = true }
-azure_identity = { version = "1.0", optional = true }
-# HashiCorp Vault client (vault-secrets feature). KV v2 + Kubernetes /
-# token / AppRole auth methods. `rustls` is vaultrs's default TLS backend.
-vaultrs = { version = "0.8", optional = true }
-# Kubernetes Secret backend (k8s-secrets feature). Reads/writes the
-# secrets envelope from a namespaced `Secret` via the in-cluster
-# ServiceAccount or a local kubeconfig (`Client::try_default`). The
-# generated k8s-openapi API version is fine here — the core/v1 `Secret`
-# shape is long-stable.
-kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
-k8s-openapi = { version = "0.28", features = ["latest"], optional = true }
 
 # Setup wizard helper (optional, behind `setup-wizard` feature)
 dialoguer = { workspace = true, optional = true }
@@ -270,18 +253,10 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 # base64 (needed by firestore/cosmosdb store backends)
 base64 = { workspace = true }
 
-# Platform-specific keyring backends (only compiled on the target OS)
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1", optional = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = { version = "1", optional = true }
-
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"], optional = true }
-
 [dev-dependencies]
 tempfile = "3"
+# Deletes the keyring round-trip test's entry; the store itself is `vti-secrets`'.
+keyring-core = "1"
 tokio = { workspace = true }
 # Deterministic versionTime stamps in the fuzz seed-corpus generator
 # (`examples/gen_corpus.rs`).
