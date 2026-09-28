@@ -826,10 +826,13 @@ pub(crate) async fn run_trust_tasks_envelope(
     // heavier work of typed parsing, proof verification or dispatch, which
     // is the property the gate exists for.
     let body_bytes = serde_json::to_vec(&message.body).unwrap_or_default();
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check(
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
         &body_bytes,
         &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-    ) {
+        &state.acl_ks,
+    )
+    .await
+    {
         let body = serde_json::to_value(&err).expect("trust-task-error document serialises");
         return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
     }

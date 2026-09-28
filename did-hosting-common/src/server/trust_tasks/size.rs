@@ -113,6 +113,48 @@ pub fn check(body: &[u8], served: &[&str]) -> Result<(), ErrorResponse> {
     check_with(body, |type_uri| max_document_bytes(type_uri, served))
 }
 
+/// [`check`], but a raised limit is granted only to a document whose
+/// claimed `issuer` already holds an entry in `acl`.
+///
+/// The limit is decided before any signature is verified, so an
+/// unauthenticated caller could otherwise claim a raised type (1 MiB for
+/// `did/register`) and make the service parse and verify that much for
+/// nothing. A caller with no ACL entry could never be authorised for a
+/// raised task anyway, so it gets the default. The lookup is one keyspace
+/// read; a claimed issuer that then fails verification is refused as usual.
+pub async fn check_for_known_issuer(
+    body: &[u8],
+    served: &[&str],
+    acl: &crate::server::store::KeyspaceHandle,
+) -> Result<(), ErrorResponse> {
+    if body.len() <= DEFAULT_MAX_DOCUMENT_BYTES {
+        return Ok(());
+    }
+    let known = match peek_issuer(body) {
+        Some(issuer) => matches!(
+            crate::server::acl::get_acl_entry(acl, &issuer).await,
+            Ok(Some(_))
+        ),
+        None => false,
+    };
+    if known {
+        check(body, served)
+    } else {
+        check_with(body, |_| DEFAULT_MAX_DOCUMENT_BYTES)
+    }
+}
+
+/// The document's top-level `issuer`, read the same way as [`peek_type`].
+fn peek_issuer(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct IssuerOnly {
+        issuer: String,
+    }
+    serde_json::from_slice::<IssuerOnly>(body)
+        .ok()
+        .map(|t| t.issuer)
+}
+
 fn check_with(body: &[u8], limit: impl Fn(&str) -> usize) -> Result<(), ErrorResponse> {
     if body.len() <= DEFAULT_MAX_DOCUMENT_BYTES {
         return Ok(());
@@ -191,6 +233,59 @@ mod tests {
     const DID_REGISTER: &str =
         <trust_tasks_rs::specs::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI;
     const ACL_SHOW: &str = <trust_tasks_rs::specs::acl::show::v0_1::Payload as Payload>::TYPE_URI;
+
+    fn register_doc(issuer: &str, bytes: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": DID_REGISTER,
+            "issuer": issuer,
+            "payload": { "log": "x".repeat(bytes) },
+        }))
+        .unwrap()
+    }
+
+    async fn acl_with(did: &str) -> crate::server::store::KeyspaceHandle {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::mem::forget(dir);
+        let store = crate::server::store::Store::open(&cfg)
+            .await
+            .expect("open store");
+        let acl = store
+            .keyspace(crate::server::store::KS_ACL)
+            .expect("acl keyspace");
+        crate::server::acl::store_acl_entry(
+            &acl,
+            &crate::server::acl::AclEntry {
+                did: did.into(),
+                role: crate::server::acl::Role::Admin,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: None,
+                domains: crate::server::domain::DomainScope::All,
+            },
+        )
+        .await
+        .expect("store entry");
+        acl
+    }
+
+    #[tokio::test]
+    async fn a_raised_limit_is_granted_only_to_a_known_issuer() {
+        let acl = acl_with("did:web:admin.example").await;
+        let served = [DID_REGISTER];
+        let big = register_doc("did:web:admin.example", 200 * 1024);
+        assert!(check_for_known_issuer(&big, &served, &acl).await.is_ok());
+        let stranger = register_doc("did:web:stranger.example", 200 * 1024);
+        assert!(
+            check_for_known_issuer(&stranger, &served, &acl)
+                .await
+                .is_err()
+        );
+    }
 
     /// `did/register` as though this deployment served it (the only
     /// caller-relevant fact `max_in`/`largest_in` read from `served`).

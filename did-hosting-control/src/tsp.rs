@@ -105,10 +105,13 @@ pub(crate) async fn run_tsp_trust_task(
     // transports apply (`size`), so a `did/register` log too large for the
     // default here is refused identically on every transport rather than
     // only over HTTPS.
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check(
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
         &document,
         &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-    ) {
+        &state.acl_ks,
+    )
+    .await
+    {
         let body = serde_json::to_vec(&err).expect("trust-task-error serialises");
         return Ok(Some(tsp_binding::frame(body, carriage)));
     }

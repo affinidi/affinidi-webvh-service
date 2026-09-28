@@ -142,10 +142,13 @@ pub async fn dispatch_trust_task(
     //         body at the largest limit any served type declares
     //         (`crate::routes::trust_tasks_body_limit_bytes`); this
     //         narrows further for a type whose own limit is smaller.
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check(
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
         &body,
         &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-    ) {
+        &state.acl_ks,
+    )
+    .await
+    {
         return Ok(into_response(DispatchOutcome::Rejected(err)));
     }
 
