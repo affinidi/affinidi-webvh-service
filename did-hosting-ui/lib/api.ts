@@ -49,9 +49,11 @@ import type * as AclGrant from "@openvtc/trust-tasks/acl/grant/0.1/payload";
 import type * as AclRevoke from "@openvtc/trust-tasks/acl/revoke/0.1/payload";
 import type * as AclChangeRole from "@openvtc/trust-tasks/acl/change-role/0.1/payload";
 import type { Response as ServerInfo } from "@openvtc/trust-tasks/did-management/server/info/0.1/payload";
+import type * as RevokeSession from "@openvtc/trust-tasks/auth/revoke-session/0.2/payload";
 
 import { ApiError, request } from "./http";
 import {
+  clearToken,
   getAuthMethod,
   getRefreshToken,
   getSessionId,
@@ -59,6 +61,7 @@ import {
   setRefreshToken,
   setToken,
 } from "./session";
+import { hasSessionKeypair, restoreSessionKeypair } from "./session-key";
 import { getServiceInfo, isRejection, trustTask } from "./trust-task";
 import { getApiBase } from "./api-base";
 import {
@@ -484,6 +487,7 @@ const T = {
   inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
   inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
   aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
+  revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
   aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
   aclGrant: `${TT}acl/grant/0.1` as const satisfies typeof AclGrant.TYPE_URI,
   aclRevoke: `${TT}acl/revoke/0.1` as const satisfies typeof AclRevoke.TYPE_URI,
@@ -974,6 +978,39 @@ export const api = {
       if (!isRejection(e, "stepUpRequired")) throw e;
       await api.stepUp();
       await purge();
+    }
+  },
+
+  /**
+   * Sign out: end this session at the control plane, then forget it here.
+   *
+   * Clearing the browser's copy alone would leave the session, and any session
+   * key bound to it, live until it expires. `auth/revoke-session` deletes the
+   * row, and every later request made with the token or the key is refused.
+   * It is signed with the session key, so signing out never prompts the wallet.
+   * A session with no bound key (a proxy login) is cleared locally only,
+   * because revoking it would cost a wallet prompt to sign out.
+   *
+   * Best effort. A failed revoke still signs this browser out; the session
+   * then lapses at its expiry.
+   */
+  logout: async (): Promise<void> => {
+    const token = getToken();
+    const sessionId = getSessionId();
+    try {
+      if (!hasSessionKeypair()) await restoreSessionKeypair();
+      if (sessionId && hasSessionKeypair()) {
+        await trustTask<RevokeSession.Payload, RevokeSession.Response>(T.revokeSession, {
+          sessionId,
+          reason: "logout",
+        });
+      }
+    } catch {
+      // Signed out locally regardless; see above.
+    } finally {
+      // Unless a new sign-in has replaced this session while the revoke was
+      // in flight: clearing then would drop the new session's token and key.
+      if (getToken() === token) clearToken();
     }
   },
 

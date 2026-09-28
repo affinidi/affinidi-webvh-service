@@ -1295,7 +1295,7 @@ pub(crate) async fn dispatch_trust_task_doc(
 ///
 /// A response is a document from this control plane to the requester, and a
 /// requester must be able to attribute it by signature, not by the channel it
-/// arrived on: `auth/authenticate/0.1` declares a proof REQUIRED and SPEC §7.3
+/// arrived on: `auth/authenticate/0.2` declares a proof REQUIRED and SPEC §7.3
 /// item 8 applies that to its response, and clients refuse unsigned non-error
 /// replies. So each reply is re-stamped `issuer` = this control plane,
 /// `recipient` = the requester (when the request named none), `issuedAt` = now,
@@ -1679,6 +1679,25 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
         return ProofRule::Optional;
     }
     ProofRule::Authentication
+}
+
+/// Whether a session key bound at login (`auth/authenticate/0.2`, or a passkey
+/// login's browser key) may sign `type_uri` for its session's subject.
+///
+/// Only an ordinary operational request (`ProofRule::Authentication`) may be
+/// signed this way, and not the auth family itself. That rules out:
+///
+/// - an approval (`AssertionMethod`: step-up approve-response). The spec
+///   forbids a session key wherever an `assertionMethod` attestation is
+///   required (Conformance item 11);
+/// - `auth/authenticate` and `auth/refresh`, which would let a session key mint
+///   or extend a session past what the subject's own login granted
+///   (Conformance item 12). A refresh is authorised by the refresh token, and
+///   any proof on it must be the subject's own;
+/// - `Optional` and `SessionKey` ceremonies, which are never signed as a
+///   session's subject.
+pub(crate) fn session_key_may_sign(type_uri: &str) -> bool {
+    proof_rule(type_uri) == ProofRule::Authentication && !crate::trust_tasks_auth::owns(type_uri)
 }
 
 /// The shared proof verifier, or an error when none is configured — without

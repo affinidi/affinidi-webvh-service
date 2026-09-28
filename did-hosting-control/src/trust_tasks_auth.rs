@@ -1,4 +1,5 @@
-//! Control-plane auth trust tasks: `auth/{challenge,authenticate,refresh}/0.1`.
+//! Control-plane auth trust tasks: `auth/challenge/0.1`, `auth/authenticate/0.2`
+//! and `auth/refresh/0.1`.
 //!
 //! Authentication to this control plane existed in two mutually exclusive
 //! shapes, and neither was reachable from the third transport:
@@ -52,6 +53,35 @@
 //! proving identity: accepting the transport's word would make `challenge`
 //! decorative on two of three bindings, and a decorative challenge is one that
 //! stops being checked.
+//!
+//! ## Session keys (`auth/authenticate/0.2`)
+//!
+//! An authenticate document may name a `sessionKey`, a `did:key` the producer
+//! holds. It sits inside the payload, so the subject's own proof is what
+//! authorises the binding. [`authenticate_arm`] stores its Ed25519 multikey on
+//! the new session row, exactly as a passkey login stores its browser key. From
+//! then on the HTTPS binding accepts that key's `authentication` proofs as the
+//! subject:
+//!
+//! - **for that session only.** The key is honoured only alongside the
+//!   session's own bearer token, and only for that token's subject;
+//! - **within the session's bounds.** The bearer extractor reads the session
+//!   row on every request, so expiry, `auth/revoke-session` and logout end the
+//!   key with the session. The session's `acr` is carried unchanged, so
+//!   anything that needs a step-up still does;
+//! - **never where an `assertionMethod` attestation is required.** A step-up
+//!   approval must be signed by the subject's own key, on the Trust Task and
+//!   REST paths alike, and the verifier refuses a delegated approval outright;
+//! - **never to mint or extend a session.** `auth/authenticate` and
+//!   `auth/refresh` refuse a session-key proof (`session_key_may_sign`). A
+//!   refresh is authorised by the refresh token, not by the key. The console's
+//!   REST refresh (`routes::auth::refresh`) does ask for the key's proof, but
+//!   only on top of the refresh token, as proof that the browser presenting
+//!   the token is the one that logged in: the key alone refreshes nothing.
+//!
+//! A key type this service cannot verify is refused with
+//! `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent. It
+//! never falls back to a login without the binding the producer asked for.
 
 use serde_json::Value;
 use tracing::warn;
@@ -59,7 +89,7 @@ use trust_tasks_rs::{
     Dispatcher, ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties,
     StandardCode, TransportHandler, TrustTask,
     specs::auth::{
-        authenticate::v0_1 as authenticate, challenge::v0_1 as challenge, refresh::v0_1 as refresh,
+        authenticate::v0_2 as authenticate, challenge::v0_1 as challenge, refresh::v0_1 as refresh,
     },
 };
 
@@ -235,13 +265,47 @@ async fn challenge_arm(
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }
 
+/// The Ed25519 multikey (`z6Mk…`) inside a `sessionKey` `did:key`, or `None`
+/// when it encodes anything this service cannot verify a proof from.
+///
+/// The session-key verifier resolves `did:key:{pk}#{pk}` and signs with
+/// `eddsa-jcs-2022`, so only an Ed25519 key is usable. Accepting another curve
+/// would bind a key whose every later proof is refused. The schema has already
+/// held the value to `did:key:z…` in base58btc; this checks what it decodes to.
+fn ed25519_session_key(session_key: &str) -> Option<String> {
+    let multikey = session_key.strip_prefix("did:key:")?;
+    let (base, bytes) = multibase::decode(multikey).ok()?;
+    let is_ed25519 =
+        base == multibase::Base::Base58Btc && bytes.len() == 34 && bytes[..2] == [0xed, 0x01];
+    is_ed25519.then(|| multikey.to_string())
+}
+
 #[allow(clippy::result_large_err)]
 async fn authenticate_arm(
     state: &AppState,
     doc: TrustTask<authenticate::Payload>,
     parties: &ResolvedParties,
-) -> Result<TrustTask<vta_sdk::protocols::auth::AuthenticateResponse>, ErrorResponse> {
+) -> Result<TrustTask<authenticate::Response>, ErrorResponse> {
     let signer_did = caller(&doc, parties)?;
+
+    // Refused before the challenge is touched, so the producer can retry the
+    // same challenge without the key. It is never quietly dropped: a login the
+    // producer believes bound a key, and which did not, would have every
+    // later call the key signs refused.
+    let requested_key = doc.payload.session_key.as_ref().map(|k| k.to_string());
+    let session_pubkey_b58btc = match requested_key.as_deref() {
+        None => None,
+        Some(key) => Some(ed25519_session_key(key).ok_or_else(|| {
+            warn!(session_key = %key, "authenticate refused: unsupported session key type");
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::from(authenticate::error_codes::SESSION_KEY_UNSUPPORTED)
+                    .with_message("this service binds Ed25519 did:key session keys only")
+                    .with_details(serde_json::json!({ "requested": key })),
+            )
+        })?),
+    };
+
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
         .map_err(|e| denied(&doc, "authenticate/backend", e))?;
 
@@ -259,9 +323,9 @@ async fn authenticate_arm(
             // time this runs, so there is no separate DIDComm `created_time`
             // for the handler to re-check.
             created_time: None,
-            // A session pubkey is the HTTPS/passkey delegation path's concern;
-            // a trust-task producer signs with its own key.
-            session_pubkey_b58btc: None,
+            // The session key the subject's proof covers, bound to the session
+            // row this creates. See the module doc for what it may then sign.
+            session_pubkey_b58btc,
             // The document's `recipient` is covered by its proof and has been
             // checked against `my_vid` twice already — by the proof gate in
             // `dispatch_trust_task_doc` and by `run_pipeline`.
@@ -274,7 +338,17 @@ async fn authenticate_arm(
     // The challenge is spent: free its slot, whichever binding issued it.
     state.pending_challenges.release_session(&session_id);
 
-    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
+    // The response echoes the bound key (`Session.sessionKey`), so the
+    // producer can confirm the binding it asked for is the one it got.
+    let mut value =
+        serde_json::to_value(&resp).map_err(|e| denied(&doc, "authenticate/response", e))?;
+    if let Some(key) = requested_key {
+        value["session"]["sessionKey"] = Value::String(key);
+    }
+    let payload: authenticate::Response =
+        serde_json::from_value(value).map_err(|e| denied(&doc, "authenticate/response", e))?;
+
+    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
 }
 
 #[allow(clippy::result_large_err)]

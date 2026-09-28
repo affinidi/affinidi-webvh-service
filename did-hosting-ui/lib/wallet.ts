@@ -4,11 +4,12 @@
  * its `host_permissions`. This module is the UI-side feature-detect + a thin
  * wrapper that asks the wallet to log into THIS did-hosting server.
  *
- * The wallet's SIOPv2 path round-trips against `${baseUrl}/auth/challenge` and
- * `${baseUrl}/auth/` — the exact endpoints did-hosting-control exposes — and
- * returns a server-issued bearer token. That token is fed into
- * `AuthProvider.login(...)` identically to the passkey path; both yield the
- * same JWT shape, so nothing else in the UI needs to know which path was taken.
+ * The wallet signs in with `auth/challenge/0.1` then `auth/authenticate/0.2`,
+ * sent to `${baseUrl}/trust-tasks`, and returns a server-issued bearer token.
+ * That token is fed into `AuthProvider.login(...)` identically to the passkey
+ * path; both yield the same JWT shape. Like the passkey path, the login binds
+ * this browser's session key, so later calls are signed without the wallet
+ * (see `wallet-login.ts`).
  *
  * Native (iOS / Android) builds never see `window.vtaWallet`; the helper
  * degrades gracefully via `isWalletAvailable()`.
@@ -17,22 +18,19 @@
 import { Platform } from "react-native";
 
 import { getApiBase } from "./api-base";
+import { clearSessionKeypair } from "./session-key";
 import { getServiceInfo } from "./trust-task";
+import {
+  loginBindingSessionKey,
+  type VtaWalletLoginParams,
+  type VtaWalletLoginResult,
+} from "./wallet-login";
 
-/** A subset of the wallet provider's interface — just the SIOPv2 login.
- *  Declaring it inline keeps did-hosting-ui from depending on the extension
- *  package. The full interface lives in
- *  `@openvtc/pnm-extension/provider.ts`. */
-interface VtaWalletLoginParams {
-  rpDid: string;
-  baseUrl: string;
-}
-export interface VtaWalletLoginResult {
-  accessToken: string;
-  refreshToken: string;
-  sessionId: string;
-  holderDid: string;
-}
+export type { VtaWalletLoginResult };
+
+/* The subset of the wallet provider's interface this UI uses. Declaring it
+ * inline keeps did-hosting-ui from depending on the extension package. The
+ * full interface lives in `@openvtc/pnm-extension/provider.ts`. */
 interface VtaWalletSignTrustTaskParams {
   envelope: Record<string, unknown>;
 }
@@ -177,17 +175,18 @@ export async function getRpDid(): Promise<string> {
 
 export { getApiBase };
 
-/** Trigger the wallet's SIOPv2 login. Resolves to the result containing the
- *  server-issued access token (suitable for `AuthProvider.login`); rejects
- *  if the wallet isn't available, the user denies the consent prompt, or the
- *  server rejects the `id_token`. */
+/** Sign in through the wallet, binding this browser's session key to the new
+ *  session. Resolves to the result containing the server-issued access token
+ *  (suitable for `AuthProvider.login`). Rejects if the wallet isn't
+ *  available, the user denies the consent prompt, the control plane refuses
+ *  the login, or the key was not bound. */
 export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
   if (!isWalletAvailable()) {
     throw new Error(
       "VTA wallet extension is not installed (or this isn't running in a web browser).",
     );
   }
-  return window.vtaWallet!.login({
+  return loginBindingSessionKey(window.vtaWallet!, {
     rpDid: await getRpDid(),
     baseUrl: getApiBase(),
   });
@@ -403,6 +402,10 @@ export async function loginWithWalletProxy(
       "Chosen entry has no principalDid — only did-self-issued entries are supported for SIOP proxy login.",
     );
   }
+  // This login binds no session key, so none may be left over from an earlier
+  // sign-in: `trust-task.ts` would sign with it, and the control plane would
+  // refuse a key this session never bound.
+  clearSessionKeypair();
   const rpDid = await getRpDid();
   const apiBase = getApiBase().replace(/\/+$/, "");
   const steps: ProxyLoginVizStep[] = [];

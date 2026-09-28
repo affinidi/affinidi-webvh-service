@@ -446,6 +446,109 @@ describe("step-up (wallet session)", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("management calls (wallet session)", () => {
+  function stubWallet() {
+    const signTrustTask = vi.fn(async ({ envelope }: { envelope: Doc }) => ({
+      signedEnvelope: {
+        ...envelope,
+        proof: {
+          type: "DataIntegrityProof",
+          cryptosuite: "eddsa-jcs-2022",
+          verificationMethod: `${SUBJECT}#key-1`,
+          proofPurpose: "authentication",
+          proofValue: "zWallet",
+        },
+      },
+      holderDid: SUBJECT,
+    }));
+    vi.stubGlobal("window", { dispatchEvent: vi.fn(), vtaWallet: { signTrustTask } });
+    return signTrustTask;
+  }
+
+  it("signs with the session key the wallet login bound, without asking the wallet", async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    const { didKey } = await generateSessionKeypair();
+    const signTrustTask = stubWallet();
+    const sent = installControlPlane((req) => seal(req, { entries: [], truncated: false }));
+
+    await api.listAcl();
+
+    expect(signTrustTask).not.toHaveBeenCalled();
+    const { doc, bearer } = tasks(sent)[0]!;
+    expect(doc).toMatchObject({
+      issuer: SUBJECT,
+      proof: {
+        proofPurpose: "authentication",
+        verificationMethod: `${didKey}#${didKey.slice("did:key:".length)}`,
+      },
+    });
+    expect(bearer).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("signs out by revoking the session with the session key, then forgets it", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    const { didKey } = await generateSessionKeypair();
+    const signTrustTask = stubWallet();
+    const sent = installControlPlane((req) => seal(req, { revokedCount: 1 }));
+
+    await api.logout();
+
+    expect(signTrustTask).not.toHaveBeenCalled();
+    const { doc, bearer } = tasks(sent)[0]!;
+    expect(doc).toMatchObject({
+      type: "https://trusttasks.org/spec/auth/revoke-session/0.2",
+      payload: { sessionId: "sess-1", reason: "logout" },
+      proof: { verificationMethod: expect.stringMatching(new RegExp(`^${didKey}#`)) },
+    });
+    expect(bearer).toBe(`Bearer ${TOKEN}`);
+    expect(store.get("webvh_token")).toBeUndefined();
+    const sessionKey = await import("../session-key");
+    expect(sessionKey.hasSessionKeypair()).toBe(false);
+  });
+
+  it("still signs out locally when the revoke fails", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet();
+    installControlPlane(() => rejection("internalError"));
+
+    await api.logout();
+
+    expect(store.get("webvh_token")).toBeUndefined();
+  });
+
+  it("leaves a session that replaced this one during the revoke alone", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet();
+    installControlPlane((req) => {
+      // A new sign-in lands while the revoke is in flight.
+      store.set("webvh_token", "newer-token");
+      return seal(req, { revokedCount: 1 });
+    });
+
+    await api.logout();
+
+    expect(store.get("webvh_token")).toBe("newer-token");
+  });
+
+  it("signs through the wallet when the session bound no key", async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    const sessionKey = await import("../session-key");
+    sessionKey.clearSessionKeypair();
+    vi.spyOn(sessionKey, "restoreSessionKeypair").mockResolvedValue();
+    const signTrustTask = stubWallet();
+    const sent = installControlPlane((req) => seal(req, { entries: [], truncated: false }));
+
+    await api.listAcl();
+
+    expect(signTrustTask).toHaveBeenCalledOnce();
+    expect(tasks(sent)[0]!.doc.proof).toMatchObject({ verificationMethod: `${SUBJECT}#key-1` });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe("passkey login", () => {
   beforeEach(() => {
     stubStorage({});

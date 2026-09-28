@@ -167,6 +167,7 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
             "subject": admin.did,
             "sessionId": "no-such-session",
         }),
+        "auth/revoke-session/0.2" => json!({ "sessionId": "no-such-session" }),
         "auth/passkey/login/finish/0.2" => {
             json!({ "authId": "no-such-ceremony", "credential": assertion() })
         }

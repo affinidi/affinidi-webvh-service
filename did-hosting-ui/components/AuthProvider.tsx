@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
-import { getToken, setToken as storeToken, clearToken } from "../lib/api";
+import { api, getToken, setToken as storeToken } from "../lib/api";
 
 interface AuthState {
   token: string | null;
@@ -52,8 +52,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
-    clearToken();
+    // Revoke at the control plane before the session key is dropped: the
+    // revoke is signed with it. The screen signs out at once either way.
     setTokenState(null);
+    void api.logout();
   }, []);
 
   return (

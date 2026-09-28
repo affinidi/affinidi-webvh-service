@@ -10,16 +10,17 @@
 import {
   clearSessionKeypair,
   hasSessionKeypair,
+  restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
 
 const TOKEN_KEY = "webvh_token";
 const REFRESH_TOKEN_KEY = "webvh_refresh_token";
 
-/** Which auth path produced the current session. Trust-task signing
- *  branches on this: `"wallet"` calls `window.vtaWallet.signTrustTask` (the
- *  holder did:peer is the signing identity); anything else uses the
- *  ephemeral session keypair the passkey-login flow generates. */
+/** Which auth path produced the current session. Both passkey and wallet
+ *  holder logins bind the browser's session keypair, which then signs
+ *  trust tasks. A `"wallet"` session with no bound key (a proxy login) falls
+ *  back to `window.vtaWallet.signTrustTask`. */
 export type AuthMethod = "passkey" | "wallet";
 const AUTH_METHOD_KEY = "webvh_auth_method";
 
@@ -115,14 +116,21 @@ export async function renewIfNeeded(): Promise<void> {
     try {
       // Signed with the session keypair, not sent bare. The daemon binds a
       // REST refresh to the key this browser registered at login, so a
-      // stolen refresh token alone will not rotate the session — no weaker
-      // than `auth/refresh` over the Trust Task binding. A session with no bound key (wallet, machine-to-machine)
-      // has nothing to sign with and the daemon does not ask.
+      // stolen refresh token alone will not rotate the session. The refresh
+      // token is still what authorises it: the key proves this is the
+      // browser that logged in, and cannot refresh anything on its own. A
+      // session with no bound key (a proxy login, machine-to-machine) has
+      // nothing to sign with and the daemon does not ask.
       let envelope: Record<string, unknown> = {
         type: REFRESH_TASK_URI,
         id: crypto.randomUUID(),
         payload: { refreshToken: refresh },
       };
+      // After a reload the key is only in IndexedDB. Without restoring it
+      // first, the refresh would go out unsigned and be refused.
+      if (!hasSessionKeypair()) {
+        await restoreSessionKeypair();
+      }
       if (hasSessionKeypair()) {
         envelope = await signEnvelope(envelope);
       }

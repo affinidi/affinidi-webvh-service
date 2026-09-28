@@ -661,35 +661,26 @@ pub async fn step_up_vta_finish(
         .as_ref()
         .ok_or_else(|| AppError::Authentication("approve-response carries no proof".into()))?;
 
-    // ─── 5. Proof-verificationMethod ↔ session binding (SECURITY), mirroring
-    //        `dispatch_trust_task`. Without this, the framework verifier would
-    //        accept a proof from ANY resolvable DID and let a holder elevate a
-    //        session belonging to a different subject.
-    match auth.session_pubkey_b58btc.as_deref() {
-        Some(pk) => {
-            let expected_vm = format!("did:key:{pk}#{pk}");
-            if proof.verification_method != expected_vm {
-                warn!(actual_vm = %proof.verification_method, %expected_vm,
-                    "step-up rejected: proof verificationMethod not bound to this session");
-                return Err(AppError::Authentication(
-                    "proof verificationMethod is not bound to this session".into(),
-                ));
-            }
-        }
-        None => {
-            let proof_did = proof
-                .verification_method
-                .split_once('#')
-                .map(|(d, _)| d)
-                .unwrap_or("");
-            if proof_did != auth.did {
-                warn!(%proof_did, authed = %auth.did,
-                    "step-up rejected: proof verificationMethod DID does not match the authenticated caller");
-                return Err(AppError::Authentication(
-                    "proof verificationMethod DID does not match the authenticated caller".into(),
-                ));
-            }
-        }
+    // ─── 5. Proof-verificationMethod ↔ session binding (SECURITY). The
+    //        approval must be signed by the session subject's OWN key. Without
+    //        this, the framework verifier would accept a proof from ANY
+    //        resolvable DID and let a holder elevate a session belonging to a
+    //        different subject. A session key bound at login never qualifies,
+    //        even for its own session: an approval is an `assertionMethod`
+    //        attestation, and a session key must never make one
+    //        (`auth/authenticate/0.2` Conformance item 11). Otherwise a stolen
+    //        session key could approve its own step-up.
+    let proof_did = proof
+        .verification_method
+        .split_once('#')
+        .map(|(d, _)| d)
+        .unwrap_or("");
+    if proof_did != auth.did {
+        warn!(%proof_did, authed = %auth.did,
+            "step-up rejected: approval not signed by the authenticated subject's own key");
+        return Err(AppError::Authentication(
+            "approval must be signed by the authenticated subject's own key".into(),
+        ));
     }
 
     // ─── 6. Verify the eddsa-jcs-2022 signature against the resolved key.
