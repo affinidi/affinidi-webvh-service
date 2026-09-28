@@ -817,6 +817,12 @@ impl Default for StoreConfig {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SecretsConfig {
+    /// Which backend holds the keys (`keyring`, `aws`, `gcp`, `azure`,
+    /// `vault`, `kubernetes`, `plaintext`). When unset, the backend whose
+    /// selector field is set is used, and failing that the OS keyring — see
+    /// [`crate::server::secret_store::resolve_backend`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<crate::server::secret_store::SecretBackend>,
     pub aws_secret_name: Option<String>,
     pub aws_region: Option<String>,
     pub gcp_project: Option<String>,
@@ -885,33 +891,19 @@ pub struct SecretsConfig {
     /// envelope (k8s-secrets feature). Default `seed`.
     #[serde(default = "default_k8s_secret_key")]
     pub k8s_secret_key: String,
-    /// Explicitly select the plaintext backend even when a keyring backend is
-    /// compiled in. Without this, a keyring-enabled build always prefers the OS
-    /// keyring, which panics on a headless host with no Secret Service. The
-    /// non-interactive recipe sets this for `backend = "plaintext"`; cloud
-    /// backends (AWS/GCP/Azure), when configured, still take precedence.
+    /// Test-only acknowledgement for `backend = "plaintext"`: the service's
+    /// private keys are kept in a clear-text file beside the config. Without
+    /// it, the plaintext backend refuses to build.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub plaintext_mode: bool,
-    /// Plaintext secrets stored directly in the config file.
-    /// Used when no secure backend (keyring, AWS, GCP) is compiled in, or when
-    /// `plaintext_mode` explicitly selects it.
-    pub plaintext: Option<PlaintextSecrets>,
-    /// Plaintext-mode-only stash for the offline-bootstrap ephemeral
-    /// seed (base64url-no-pad, 32 raw bytes). Set during phase 1 of
-    /// the offline wizard when no secure backend is available, and
-    /// removed at the end of phase 2. Never populated when a secure
-    /// backend (keyring, AWS, GCP) is active.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plaintext_bootstrap_seed: Option<String>,
+    pub confirm_plaintext: bool,
 }
 
-// Manual `Debug` redacts the only secret-bearing field
-// (`plaintext_bootstrap_seed`) and delegates to `PlaintextSecrets`'s own
-// redacted Debug for the inline secrets. Cloud-secret-name fields are
+// Manual `Debug` redacts the Vault credentials. Cloud-secret-name fields are
 // non-secret references (operators paste them into config) so they stay.
 impl std::fmt::Debug for SecretsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretsConfig")
+            .field("backend", &self.backend)
             .field("aws_secret_name", &self.aws_secret_name)
             .field("aws_region", &self.aws_region)
             .field("gcp_project", &self.gcp_project)
@@ -942,11 +934,7 @@ impl std::fmt::Debug for SecretsConfig {
             .field("k8s_secret_name", &self.k8s_secret_name)
             .field("k8s_namespace", &self.k8s_namespace)
             .field("k8s_secret_key", &self.k8s_secret_key)
-            .field("plaintext", &self.plaintext)
-            .field(
-                "plaintext_bootstrap_seed",
-                &self.plaintext_bootstrap_seed.as_ref().map(|_| "<redacted>"),
-            )
+            .field("confirm_plaintext", &self.confirm_plaintext)
             .finish()
     }
 }
@@ -1037,43 +1025,6 @@ impl IdentityConfig {
     }
 }
 
-/// Plaintext secret key material stored directly in the configuration file.
-///
-/// **WARNING**: This is insecure and should only be used for testing/development.
-/// For production deployments, compile with a secure backend feature:
-/// `keyring`, `aws-secrets`, or `gcp-secrets`.
-#[derive(Clone, Deserialize, Serialize)]
-pub struct PlaintextSecrets {
-    pub signing_key: String,
-    pub key_agreement_key: String,
-    pub jwt_signing_key: String,
-    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
-    /// Optional — only present when the deployment integrates with a VTA host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vta_credential: Option<String>,
-    /// Key material for identity generations retired but not yet expired.
-    /// Mirrors `ServerSecrets::retired` — without it, a plaintext-backed
-    /// deployment would lose the outgoing key on the very write that installs
-    /// its replacement, and a restart mid-rotation could not decrypt traffic
-    /// still addressed to the old key.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired: Vec<crate::server::secret_store::RetiredKeys>,
-}
-
-impl std::fmt::Debug for PlaintextSecrets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlaintextSecrets")
-            .field("signing_key", &"<redacted>")
-            .field("key_agreement_key", &"<redacted>")
-            .field("jwt_signing_key", &"<redacted>")
-            .field(
-                "vta_credential",
-                &self.vta_credential.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
 fn default_keyring_service() -> String {
     "webvh".to_string()
 }
@@ -1109,6 +1060,7 @@ fn default_k8s_secret_key() -> String {
 impl Default for SecretsConfig {
     fn default() -> Self {
         Self {
+            backend: None,
             aws_secret_name: None,
             aws_region: None,
             gcp_project: None,
@@ -1133,9 +1085,7 @@ impl Default for SecretsConfig {
             k8s_secret_name: None,
             k8s_namespace: None,
             k8s_secret_key: default_k8s_secret_key(),
-            plaintext_mode: false,
-            plaintext: None,
-            plaintext_bootstrap_seed: None,
+            confirm_plaintext: false,
         }
     }
 }

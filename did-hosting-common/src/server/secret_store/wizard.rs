@@ -10,10 +10,12 @@
 //! authenticate (no creds, network down, IAM denied) we surface a
 //! one-line warning and fall back to a free-text input.
 
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Input, Select};
 
 use crate::server::config::SecretsConfig;
 use crate::server::error::AppError;
+
+use super::SecretBackend;
 
 /// Prompt the operator for a secrets backend and its connection params.
 ///
@@ -22,8 +24,10 @@ use crate::server::error::AppError;
 /// 1. Lists every secrets backend compiled into the binary
 ///    (`keyring`, `aws-secrets`, `gcp-secrets`, `azure-secrets`,
 ///    `vault-secrets`, `k8s-secrets`).
-/// 2. If none are compiled in, warns about plaintext storage and
-///    requires explicit confirmation.
+/// 2. Leaves the OS keyring out when this host has none (a headless Linux
+///    box with no Secret Service). If no secure backend is left, refuses with
+///    the list of secure backends — the interactive wizard never offers
+///    plaintext; tests use a recipe with `confirm_plaintext = true`.
 /// 3. For cloud backends (AWS/GCP/Azure), collects connection params
 ///    (region/project/vault URL), then attempts to list existing
 ///    secrets. On success, the operator picks from the list or
@@ -40,7 +44,14 @@ pub async fn prompt_secrets_backend(
     let mut backends: Vec<&str> = Vec::new();
 
     #[cfg(feature = "keyring")]
-    backends.push("OS Keyring (default)");
+    match super::ensure_keyring() {
+        Ok(()) => backends.push("OS Keyring (default)"),
+        Err(e) => {
+            eprintln!();
+            eprintln!("  The OS keyring is not offered: {e}");
+            eprintln!();
+        }
+    }
 
     #[cfg(feature = "aws-secrets")]
     backends.push("AWS Secrets Manager");
@@ -58,28 +69,9 @@ pub async fn prompt_secrets_backend(
     backends.push("Kubernetes Secret");
 
     if backends.is_empty() {
-        eprintln!();
-        eprintln!("  *** WARNING: No secure secrets backend is available. ***");
-        eprintln!("  Secrets will be stored as PLAINTEXT in the configuration file.");
-        eprintln!("  This is INSECURE and should only be used for testing/development.");
-        eprintln!(
-            "  For production, recompile with: keyring, aws-secrets, gcp-secrets, azure-secrets, vault-secrets, or k8s-secrets."
-        );
-        eprintln!();
-
-        let proceed = Confirm::new()
-            .with_prompt("Continue with plaintext secrets storage?")
-            .default(false)
-            .interact()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-
-        if !proceed {
-            return Err(AppError::Config(
-                "setup cancelled — recompile with a secure secrets backend (keyring, aws-secrets, gcp-secrets, azure-secrets, vault-secrets, or k8s-secrets)".into(),
-            ));
-        }
-
-        return Ok(SecretsConfig::default());
+        return Err(super::no_secure_store(
+            "no secure secrets backend is compiled into this binary and usable on this host",
+        ));
     }
 
     let chosen = if backends.len() == 1 {
@@ -115,9 +107,12 @@ pub async fn prompt_secrets_backend(
             let name = pick_or_input_name(
                 "AWS",
                 default_secret_name,
-                super::aws::list_secret_names(region_opt.as_deref()).await,
+                vti_secrets::discovery::list_aws_secrets(region_opt.as_deref())
+                    .await
+                    .map_err(super::from_vti),
             )?;
 
+            secrets_config.backend = Some(SecretBackend::Aws);
             secrets_config.aws_secret_name = Some(name);
             secrets_config.aws_region = region_opt;
         }
@@ -131,9 +126,12 @@ pub async fn prompt_secrets_backend(
             let name = pick_or_input_name(
                 "GCP",
                 default_secret_name,
-                super::gcp::list_secret_names(&project).await,
+                vti_secrets::discovery::list_gcp_secrets(&project)
+                    .await
+                    .map_err(super::from_vti),
             )?;
 
+            secrets_config.backend = Some(SecretBackend::Gcp);
             secrets_config.gcp_project = Some(project);
             secrets_config.gcp_secret_name = Some(name);
         }
@@ -147,9 +145,12 @@ pub async fn prompt_secrets_backend(
             let name = pick_or_input_name(
                 "Azure Key Vault",
                 default_secret_name,
-                super::azure::list_secret_names(&vault_url).await,
+                vti_secrets::discovery::list_azure_secrets(&vault_url)
+                    .await
+                    .map_err(super::from_vti),
             )?;
 
+            secrets_config.backend = Some(SecretBackend::Azure);
             secrets_config.azure_vault_url = Some(vault_url);
             secrets_config.azure_secret_name = Some(name);
         }
@@ -216,6 +217,7 @@ pub async fn prompt_secrets_backend(
                 }
             }
 
+            secrets_config.backend = Some(SecretBackend::Vault);
             secrets_config.vault_addr = Some(addr);
             secrets_config.vault_secret_path = Some(secret_path);
             secrets_config.vault_kv_mount = kv_mount;
@@ -236,13 +238,15 @@ pub async fn prompt_secrets_backend(
                 .interact_text()
                 .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
+            secrets_config.backend = Some(SecretBackend::Kubernetes);
             secrets_config.k8s_secret_name = Some(name);
             if !namespace.is_empty() {
                 secrets_config.k8s_namespace = Some(namespace);
             }
         }
         _ => {
-            // Keyring (or only available backend)
+            // The OS keyring — the only other entry in the list.
+            secrets_config.backend = Some(SecretBackend::Keyring);
             let service: String = Input::new()
                 .with_prompt("Keyring service name")
                 .default(default_keyring_service.to_string())

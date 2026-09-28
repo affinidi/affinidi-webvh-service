@@ -90,27 +90,7 @@ pub fn check_value(label: &str, value: &Option<String>) {
 
 /// Determine the human-readable name of the active secrets backend.
 pub fn active_secrets_backend(secrets: &SecretsConfig) -> &'static str {
-    #[cfg(feature = "aws-secrets")]
-    if secrets.aws_secret_name.is_some() {
-        return "AWS Secrets Manager";
-    }
-
-    #[cfg(feature = "gcp-secrets")]
-    if secrets.gcp_secret_name.is_some() {
-        return "GCP Secret Manager";
-    }
-
-    #[cfg(feature = "keyring")]
-    {
-        let _ = secrets;
-        return "OS keyring";
-    }
-
-    #[allow(unreachable_code)]
-    {
-        let _ = secrets;
-        "Plaintext (config file)"
-    }
+    secret_store::backend_label(secrets)
 }
 
 /// Load secrets and report status.

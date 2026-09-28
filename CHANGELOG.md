@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Breaking — secrets use `vti-secrets`, with no insecure default
+
+- **One implementation.** Every secrets backend (keyring, AWS, GCP, Azure,
+  Vault, Kubernetes, plaintext) is now the published `vti-secrets` crate the
+  VTA and VTC use. The local copies are gone. The service's keys and
+  offline-bootstrap seed are one JSON envelope, stored as the backend's
+  payload. Existing stored secrets are not read: recreate the deployment.
+- **`secrets.backend`** names the backend (`keyring`, `aws`, `gcp`, `azure`,
+  `vault`, `kubernetes`, `plaintext`). Setup writes it. When unset, the
+  backend whose selector field is set is used, and failing that the keyring.
+- **No keychain, no start.** A host where the OS keyring cannot be opened (a
+  headless Linux box with no Secret Service), or a binary built without any
+  secure backend, is refused at setup and start with the list of secure
+  backends. Nothing falls back to plaintext, and a backend selected on a
+  binary built without its feature is an error.
+- **Plaintext is tests only.** It needs `backend = "plaintext"` and
+  `confirm_plaintext = true`, in the recipe and in `config.toml`. The keys go
+  to `<config>.secrets.plaintext` beside the config at `0600`, not into
+  `config.toml`. `[secrets.plaintext]`, `plaintext_mode` and
+  `plaintext_bootstrap_seed` are removed. The interactive wizard no longer
+  offers plaintext.
+
 ### Breaking — passkey enrolment is Trust Tasks, with hashed invites
 
 - **Served** on TSP, DIDComm and `POST /api/trust-tasks`:
