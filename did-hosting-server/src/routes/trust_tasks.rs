@@ -10,13 +10,29 @@
 //! A service's DID document advertises `TrustTaskHTTPS` at `{origin}/api`
 //! (the Trust Task base, per HTTPS binding 0.2 §6), so this is the route a
 //! peer that resolved the edge's DID reaches.
+//!
+//! ## Rate limiting
+//!
+//! Verifying a document's proof means resolving its claimed issuer's DID — an
+//! outbound fetch. `verify_control_plane`'s cheap pre-check refuses a
+//! claimed issuer that isn't `control_did` before that resolution is
+//! attempted, but a claimed issuer that *is* `control_did` still triggers one
+//! (to check whether the proof genuinely is theirs). A per-address limiter
+//! sits in front of both, so one address cannot force unbounded resolver work
+//! by posting documents quickly, whatever they claim.
+
+use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
+use tracing::warn;
 use trust_tasks_rs::{RejectReason, TrustTask};
+
+use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::server::rate_limit::resolve_client_ip;
 
 use crate::server::AppState;
 
@@ -35,9 +51,27 @@ use crate::server::AppState;
         (status = 200, description = "The edge's signed reply document", content_type = "application/json"),
         (status = 400, description = "The body is not a Trust Task document", content_type = "application/json"),
         (status = 403, description = "The document was not accepted; an unsigned refusal", content_type = "application/json"),
+        (status = 429, description = "This address's request rate exceeds the limit", content_type = "application/json"),
     ),
 ))]
-pub async fn receive(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+pub async fn receive(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Per-address rate limit, ahead of parsing and any DID resolution the
+    // document's verification would trigger.
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_ip = resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    if let Err(e) = state
+        .trust_tasks_rate_limiter
+        .try_consume(client_ip, now_epoch())
+    {
+        warn!(ip = %client_ip, error = %e, "trust-tasks request rate limited");
+        return e.into_response();
+    }
+
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(doc) => doc,
         Err(e) => {

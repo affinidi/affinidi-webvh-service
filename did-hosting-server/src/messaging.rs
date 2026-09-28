@@ -21,10 +21,18 @@
 //! - it is fresh (`issuedAt`) and not a replay of a document already applied.
 //!
 //! A document that does not verify gets **no reply at all**: a signed refusal
-//! would settle a directive the control plane never sent. A document that
-//! verifies, but whose proven issuer is some other DID, is refused with the
-//! task's declared `notAuthorized` code — a signed, non-retryable answer, as
-//! each of these specifications requires.
+//! would settle a directive the control plane never sent.
+//!
+//! ## The claimed issuer is checked before its DID is ever resolved
+//!
+//! Checking a proof means resolving its issuer's DID — an outbound fetch.
+//! Before doing that, [`verify_control_plane`] compares the document's
+//! in-band `issuer` against `control_did` as plain strings; a document that
+//! does not even *claim* to be from the control plane is refused right there,
+//! with no reply, and no resolution is attempted. Only a document that claims
+//! the right issuer goes on to have its proof — and therefore that claim —
+//! actually verified. Without this, any address could force this server to
+//! resolve an arbitrary DID per request just by naming it as `issuer`.
 //!
 //! The cores below take a [`VerifiedControlPlane`], which only that function
 //! constructs, so an unverified path to them does not type-check. The
@@ -165,9 +173,23 @@ where
             reason: "this server has no configured DID".into(),
         })
     })?;
-    // The proof is checked against the in-band issuer, whoever that is, so a
-    // well-formed document from another party can be told apart from one that
-    // does not verify at all — only the first is answered.
+    // Cheap pre-check, before any DID resolution: a document whose in-band
+    // `issuer` isn't even claiming to be `control_did` cannot possibly verify
+    // as this server's control plane, whatever its proof says, so there is
+    // nothing worth resolving a DID for. Refused exactly like an unverified
+    // document (no reply) — this is the same "no reply to unverified"
+    // refusal a bad signature gets, not a weaker one, and it closes the
+    // surface a resolve-then-check order left open: without it, any address
+    // could make this server resolve an arbitrary claimed issuer's DID once
+    // per request just by naming it here.
+    if doc.issuer.as_deref() != Some(control_did) {
+        return Err(Refusal::Unverified(RejectReason::PermissionDenied {
+            reason: "issuer is not this server's configured control plane".into(),
+        }));
+    }
+    // The proof is checked against the in-band issuer, which the pre-check
+    // above has already pinned to `control_did` — so a document that reaches
+    // here either verifies as the control plane's, or does not verify at all.
     let did = verify_sender_bound(doc, None, transport_sender, my_did, verifier)
         .await
         .map_err(|e| {
@@ -189,12 +211,12 @@ where
             }
             Refusal::Unverified(e.reject_reason())
         })?;
-    // Authorise before remembering: only the control plane's documents take
-    // room in the replay cache. A stranger can mint any number of DIDs, and
-    // were its documents recorded first they would fill the cache's global
-    // bound and defer every genuine directive (and the reconcile's listing)
-    // until the window passed. A replayed foreign document is refused
-    // `notAuthorized` again, which applies nothing.
+    // Defense in depth: the pre-check above already refused any document
+    // whose claimed issuer isn't `control_did`, and `verify_sender_bound`
+    // binds the proven issuer to that same claimed value, so `did` is always
+    // `control_did` here. Kept so this still fails closed — refusing
+    // `notAuthorized` rather than trusting `did` — if that pre-check is ever
+    // weakened or bypassed by a future change.
     if did != control_did {
         warn!(
             issuer = %did,
@@ -719,6 +741,12 @@ async fn apply_sync_entry(
         ));
     }
 
+    // Serialised: `apply_single_update` reads what this slot (and this DID's
+    // identity) currently holds, checks the new log extends it, and only then
+    // writes. Two updates for the same slot running at once could each pass
+    // that check against the same pre-write state and leave a fork applied —
+    // the same race #232 closed for the watcher's `apply_sync`.
+    let _guard = state.sync_lock.lock().await;
     let status = apply_single_update(
         &state.dids_ks,
         &state.store,
@@ -772,6 +800,11 @@ async fn do_sync_delete(
     let delete: sync_delete::Payload = payload(body, "sync/delete")?;
     let mnemonic = delete.mnemonic.as_str();
 
+    // Serialised with `sync/update` and `sync/batch`: a delete reads the
+    // slot's record and then removes it, which the same race as
+    // `apply_single_update`'s read-check-write can corrupt if it interleaves
+    // with a concurrent update to the same slot.
+    let _guard = state.sync_lock.lock().await;
     let record: Option<did_ops::DidRecord> = state
         .dids_ks
         .get(did_ops::did_key(mnemonic))

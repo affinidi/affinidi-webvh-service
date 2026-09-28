@@ -202,6 +202,10 @@ pub async fn apply_recipe(
         }
     };
 
+    // `ServerSecrets` carries a `jwt_signing_key` for every service alike;
+    // this edge has no JWT-based session auth to sign with it (deleted along
+    // with the rest of its REST management surface), so it is only ever
+    // generated, never read back.
     let jwt_signing_key = did_hosting_common::server::vta_setup::generate_ed25519_multibase();
 
     let host = recipe

@@ -89,6 +89,19 @@ pub fn build_verifier(
     did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
+/// Whether `role` authorises `type_uri`: a witness-admin task
+/// ([`WITNESS_TASKS`]) requires [`Role::Admin`]; every other task (the shared
+/// ACL family, and anything unsupported) requires only some ACL entry. Used
+/// both for the cheap pre-check against a claimed issuer and the real check
+/// against the proven one, so the two can never drift apart.
+fn task_authorised(type_uri: &str, role: Option<Role>) -> bool {
+    if WITNESS_TASKS.contains(&type_uri) {
+        role == Some(Role::Admin)
+    } else {
+        role.is_some()
+    }
+}
+
 /// Verify, authorise and answer one inbound Trust Task document. Returns the
 /// signed reply, or `None` when nothing is to be sent back.
 pub async fn dispatch_inbound_document(
@@ -111,6 +124,27 @@ pub async fn dispatch_inbound_document(
         return None;
     };
 
+    // Cheap pre-check, before any DID resolution: verifying a proof means
+    // resolving its issuer's DID, an outbound fetch, while an ACL lookup is a
+    // local store read. A claimed issuer this witness would refuse anyway —
+    // absent from the ACL, or lacking the role a witness-admin task requires
+    // — is refused right here, with no reply and no resolution attempted.
+    // This is the same "no reply to unverified" refusal an invalid proof
+    // gets, not a weaker one: only a claimed issuer the ACL would actually
+    // authorise goes on to have its proof checked.
+    let claimed_role = match doc.issuer.as_deref() {
+        Some(issuer) => crate::acl::check_acl(&state.acl_ks, issuer).await.ok(),
+        None => None,
+    };
+    if !task_authorised(&type_uri, claimed_role) {
+        warn!(
+            issuer = doc.issuer.as_deref().unwrap_or("unknown"),
+            %type_uri,
+            "trust task dropped: claimed issuer is not authorised; refusing before DID resolution"
+        );
+        return None;
+    }
+
     let principal = match verify_sender_bound(&doc, None, sender, my_did, &verifier).await {
         Ok(p) => p,
         Err(e) => {
@@ -124,14 +158,14 @@ pub async fn dispatch_inbound_document(
         }
     };
 
-    // Authorise before remembering: see the module docs.
+    // Authorise before remembering: see the module docs. Re-checked here
+    // (rather than trusting the pre-check above) because the pre-check ran
+    // against the claimed, unverified issuer — this is the ACL's answer for
+    // the *proven* one, which is what a reply may safely attribute the
+    // refusal to.
     let reply_id = || format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let role = crate::acl::check_acl(&state.acl_ks, &principal).await.ok();
-    let authorised = if WITNESS_TASKS.contains(&type_uri.as_str()) {
-        role == Some(Role::Admin)
-    } else {
-        role.is_some()
-    };
+    let authorised = task_authorised(&type_uri, role);
     if !authorised {
         warn!(issuer = %principal, %type_uri, "trust task refused: the issuer is not authorised");
         let refusal = doc.reject_with(

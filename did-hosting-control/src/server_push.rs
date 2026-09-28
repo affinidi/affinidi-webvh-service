@@ -366,6 +366,19 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
                 ),
             }
         }
+        // Record which watchers this publish named, so a later delete for the
+        // same mnemonic (`notify_servers_delete`) reaches only them — a slot
+        // most watchers never held is not their business, and fanning a
+        // delete out to every configured watcher would tell watchers that
+        // never mirrored the DID that its mnemonic even existed. Written on
+        // every publish (even an empty list) so the record always reflects
+        // the log's current `watchers` parameter, not a stale earlier one.
+        if let Err(e) = dids_ks
+            .insert(notified_watchers_key(&mnemonic), &watchers)
+            .await
+        {
+            warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to record notified watchers");
+        }
 
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
@@ -405,8 +418,8 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
 
 /// Enqueue a DID-delete sync to every active server instance.
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
-    let watcher_peers = state.config.registry.watchers.clone();
     let registry_ks = state.registry_ks.clone();
+    let dids_ks = state.dids_ks.clone();
     let store = state.store.clone();
     let notify = state.outbox_notify.clone();
 
@@ -414,21 +427,34 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
         info!(mnemonic = %mnemonic, "DID deleted — queueing sync to servers");
 
         let body = json!({ "mnemonic": mnemonic });
-        // The log is gone, so which watchers it named is too: every configured
-        // watcher is told. One that mirrors nothing for the slot answers
-        // `absent`.
-        for peer in &watcher_peers {
+        // The log is gone, so which watchers it named at publish time is read
+        // back from what `notify_servers_did` recorded there — not every
+        // configured watcher. A watcher this mnemonic was never sent to has
+        // no business learning it ever existed, which fanning the delete out
+        // to the whole registry would do. One of the named watchers that
+        // mirrors nothing for the slot (already deleted, missed the publish)
+        // answers `absent`, same as before.
+        let watcher_dids: Vec<String> = dids_ks
+            .get(notified_watchers_key(&mnemonic))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        for watcher_did in &watcher_dids {
             if let Err(e) =
-                crate::outbox::enqueue(&store, &peer.did, MSG_SYNC_DELETE, body.clone()).await
+                crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_DELETE, body.clone()).await
             {
-                warn!(watcher_did = %peer.did, mnemonic = %mnemonic, error = %e, "DID delete sync: outbox enqueue failed");
+                warn!(watcher_did, mnemonic = %mnemonic, error = %e, "DID delete sync: outbox enqueue failed");
             }
+        }
+        if let Err(e) = dids_ks.remove(notified_watchers_key(&mnemonic)).await {
+            warn!(mnemonic = %mnemonic, error = %e, "DID delete sync: failed to clear notified-watchers record");
         }
 
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
             None => {
-                if watcher_peers.is_empty() {
+                if watcher_dids.is_empty() {
                     warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
                 } else {
                     notify.notify_one();
@@ -464,6 +490,14 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
 // ---------------------------------------------------------------------------
 // Watchers
 // ---------------------------------------------------------------------------
+
+/// Key holding the watcher DIDs a mnemonic's log named the last time
+/// `notify_servers_did` ran for it. Read (and cleared) by
+/// `notify_servers_delete`, so a delete reaches only the watchers the DID was
+/// actually published to.
+fn notified_watchers_key(mnemonic: &str) -> String {
+    format!("notified_watchers:{mnemonic}")
+}
 
 /// The watcher URLs a did:webvh log names: its `watchers` parameter as last
 /// set (parameters carry forward; `null` or `[]` clears it).

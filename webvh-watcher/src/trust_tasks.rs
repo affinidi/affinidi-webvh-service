@@ -97,6 +97,25 @@ pub async fn dispatch_inbound_document(
         return None;
     };
 
+    // Cheap pre-check, before any DID resolution: verifying a proof means
+    // resolving its issuer's DID, an outbound fetch, while the source
+    // allowlist check is a plain string comparison. A claimed issuer that
+    // isn't a configured source is refused right here, with no reply and no
+    // resolution attempted — the same "no reply to unverified" refusal an
+    // invalid proof gets, not a weaker one: only a claimed issuer that is
+    // actually a configured source goes on to have its proof checked.
+    match doc.issuer.as_deref() {
+        Some(issuer) if state.config.sync.source_dids.iter().any(|s| s == issuer) => {}
+        claimed => {
+            warn!(
+                issuer = claimed.unwrap_or("unknown"),
+                %type_uri,
+                "trust task dropped: claimed issuer is not a configured source; refusing before DID resolution"
+            );
+            return None;
+        }
+    }
+
     let principal = match verify_sender_bound(&doc, None, sender, my_did, &verifier).await {
         Ok(p) => p,
         Err(e) => {

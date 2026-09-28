@@ -26,6 +26,7 @@ pub mod passkey;
 pub mod path_locks;
 pub mod pending_purge;
 pub mod problem_report;
+pub mod rate_limit;
 pub mod replay;
 pub mod secret_store;
 #[cfg(feature = "setup-wizard")]

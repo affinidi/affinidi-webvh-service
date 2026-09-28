@@ -269,10 +269,6 @@ enum Command {
         /// verified against it; omit to fall back to PinnedOnly trust.
         #[arg(long)]
         producer_pubkey: Option<String>,
-        /// Optional Ed25519 JWT signing key (multibase-encoded,
-        /// auto-generated if omitted).
-        #[arg(long)]
-        jwt_key: Option<String>,
         /// Overwrite existing secrets without prompting.
         #[arg(long)]
         force: bool,
@@ -288,9 +284,6 @@ enum Command {
         /// X25519 key agreement key (multibase-encoded, required with --signing-key)
         #[arg(long)]
         ka_key: Option<String>,
-        /// Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
-        #[arg(long)]
-        jwt_key: Option<String>,
         /// VTA credential bundle (base64url-encoded, optional)
         #[arg(long)]
         vta_credential: Option<String>,
@@ -545,7 +538,6 @@ async fn main() {
             vta_bundle,
             signing_key,
             ka_key,
-            jwt_key,
             vta_credential,
             force,
         }) => {
@@ -554,7 +546,6 @@ async fn main() {
                 vta_bundle,
                 signing_key,
                 ka_key,
-                jwt_key,
                 vta_credential,
                 force,
             )
@@ -579,7 +570,6 @@ async fn main() {
             expect_digest,
             seed,
             producer_pubkey,
-            jwt_key,
             force,
         }) => {
             if let Err(e) = run_import_sealed(
@@ -588,7 +578,6 @@ async fn main() {
                 expect_digest,
                 seed,
                 producer_pubkey,
-                jwt_key,
                 force,
             )
             .await
@@ -1165,7 +1154,6 @@ async fn run_import_secrets(
     vta_bundle: Option<String>,
     signing_key: Option<String>,
     ka_key: Option<String>,
-    jwt_key: Option<String>,
     vta_credential: Option<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1230,18 +1218,12 @@ async fn run_import_secrets(
     Secret::from_multibase(&resolved_ka, None)
         .map_err(|e| format!("invalid key agreement key: {e}"))?;
 
-    // Generate or validate JWT key
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
+    // `ServerSecrets` carries a `jwt_signing_key` for every service alike (one
+    // shared storage format); this edge has no JWT-based session auth to sign
+    // with it (deleted along with the rest of its REST management surface —
+    // see `did-hosting-server`'s module docs), so there is nothing here worth
+    // exposing an operator override for. Always freshly generated.
+    let jwt_signing_key = generate_ed25519_multibase();
 
     // Carry forward any retired key material.
     //
@@ -1265,7 +1247,7 @@ async fn run_import_secrets(
     let server_secrets = secret_store::ServerSecrets {
         signing_key: resolved_signing,
         key_agreement_key: resolved_ka,
-        jwt_signing_key: resolved_jwt,
+        jwt_signing_key,
         vta_credential: resolved_vta_cred,
         retired,
     };
@@ -1431,7 +1413,6 @@ async fn run_import_sealed(
     expect_digest: String,
     seed: PathBuf,
     producer_pubkey: Option<String>,
-    jwt_key: Option<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -1469,17 +1450,10 @@ async fn run_import_sealed(
     Secret::from_multibase(&result.key_agreement_multibase, None)
         .map_err(|e| format!("invalid key-agreement key in bundle: {e}"))?;
 
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
+    // See `run_import_secrets`: this edge never reads its own JWT signing
+    // key back (its REST session auth was deleted with the rest of its
+    // management surface), so nothing here needs an operator override.
+    let jwt_signing_key = generate_ed25519_multibase();
 
     // Carry forward any retired key material.
     //
@@ -1503,7 +1477,7 @@ async fn run_import_sealed(
     let server_secrets = secret_store::ServerSecrets {
         signing_key: result.signing_key_multibase,
         key_agreement_key: result.key_agreement_multibase,
-        jwt_signing_key: resolved_jwt,
+        jwt_signing_key,
         vta_credential: None,
         retired,
     };

@@ -3263,6 +3263,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-didcomm",
+ "trust-tasks-proof",
  "trust-tasks-rs",
  "url",
  "utoipa",

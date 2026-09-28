@@ -141,8 +141,12 @@ trust-tasks-rs = { workspace = true, features = ["validate"] }
 anyhow.workspace = true
 # `tests/control_plane_ops.rs` signs control-plane documents with `did:key`
 # signers and verifies them with the crate's local `DidKeyResolver`, so the
-# proof checks run without DID-resolution I/O.
+# proof checks run without DID-resolution I/O. It also asserts the claimed-
+# issuer pre-check never reaches the resolver for a document that does not
+# even claim to be the control plane, via a resolver double from
+# `trust-tasks-proof`'s `ProofPurposeResolver` that panics if called.
 affinidi-data-integrity = { workspace = true }
+trust-tasks-proof = { workspace = true }
 # `tests/webs_resolve.rs` re-derives the DID document from the served
 # artifacts with the method crate directly, so the assertion is against
 # an independent implementation rather than against the same code path

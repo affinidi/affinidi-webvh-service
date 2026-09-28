@@ -192,9 +192,11 @@ pub async fn run_wizard(
         .default("data/did-hosting-server".to_string())
         .interact_text()?;
 
-    // 8. JWT signing key (always generated)
+    // `ServerSecrets` carries a `jwt_signing_key` for every service alike, but
+    // this edge has no JWT-based session auth to sign with it (deleted along
+    // with the rest of its REST management surface); generated silently,
+    // with no operator-facing announcement implying it matters.
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
-    eprintln!("  Generated JWT signing key.");
 
     // 9. Secrets backend selection
     let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
@@ -790,8 +792,9 @@ pub async fn run_setup_offline_complete(
     }
     eprintln!();
 
+    // See the interactive wizard above: unused by this edge, generated only
+    // because `ServerSecrets`'s format is shared across every service.
     let jwt_signing_key = vta_setup::generate_ed25519_multibase();
-    eprintln!("  Generated JWT signing key.");
 
     let (didcomm, tsp) = TransportSelection::parse(&state.transport)
         .map_err(|e| format!("invalid transport in state: {e}"))?
