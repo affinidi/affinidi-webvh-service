@@ -183,6 +183,21 @@ where
             }
             Refusal::Unverified(e.reject_reason())
         })?;
+    // Authorise before remembering: only the control plane's documents take
+    // room in the replay cache. A stranger can mint any number of DIDs, and
+    // were its documents recorded first they would fill the cache's global
+    // bound and defer every genuine directive (and the reconcile's listing)
+    // until the window passed. A replayed foreign document is refused
+    // `notAuthorized` again, which applies nothing.
+    if did != control_did {
+        warn!(
+            issuer = %did,
+            control_did,
+            type_uri = %doc.type_uri,
+            "control-plane document refused: signed by a DID that is not this server's control plane"
+        );
+        return Err(Refusal::NotAuthorized { issuer: did });
+    }
     match REPLAY_CACHE.check(&did, &doc.id) {
         Ok(()) => {}
         Err(did_hosting_common::server::replay::ReplayError::Duplicate) => {
@@ -195,15 +210,6 @@ where
                 retry_after: None,
             }));
         }
-    }
-    if did != control_did {
-        warn!(
-            issuer = %did,
-            control_did,
-            type_uri = %doc.type_uri,
-            "control-plane document refused: signed by a DID that is not this server's control plane"
-        );
-        return Err(Refusal::NotAuthorized { issuer: did });
     }
     let issued_at = doc
         .issued_at
