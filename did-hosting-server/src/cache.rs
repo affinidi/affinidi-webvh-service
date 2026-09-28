@@ -67,6 +67,14 @@ impl ContentCache {
         }
     }
 
+    /// Drop every entry — after a change that removes content in bulk (a
+    /// domain purge), where naming each key would mean re-reading what is gone.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.clear();
+        }
+    }
+
     /// Remove all expired entries (call periodically from cleanup thread).
     pub fn evict_expired(&self) {
         if let Ok(mut entries) = self.entries.write() {

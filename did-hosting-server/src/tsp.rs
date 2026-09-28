@@ -40,6 +40,36 @@ impl ServerTspHandler {
     }
 }
 
+/// The TSP entry point, without the messaging framework around it: open the
+/// frame, dispatch the Trust Task document it carries, and frame the reply the
+/// same way. `Ok(None)` when there is nothing to answer.
+pub async fn run_tsp_trust_task(
+    state: &AppState,
+    sender_vid: &str,
+    payload: &[u8],
+) -> Result<Option<Vec<u8>>, DIDCommServiceError> {
+    let (document, carriage) = tsp_binding::open(payload);
+    let doc = match serde_json::from_slice::<trust_tasks_rs::TrustTask<Value>>(&document) {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!(
+                sender = %sender_vid,
+                error = %e,
+                "inbound TSP: payload is not a trust-task document — dropped"
+            );
+            return Ok(None);
+        }
+    };
+    debug!(sender = %sender_vid, type_uri = %doc.type_uri, "inbound TSP: trust task");
+    match crate::messaging::dispatch_inbound_document(state, Some(sender_vid), doc).await {
+        Some(reply) => Ok(Some(tsp_binding::frame(
+            serde_json::to_vec(&reply).map_err(|e| DIDCommServiceError::Internal(e.to_string()))?,
+            carriage,
+        ))),
+        None => Ok(None),
+    }
+}
+
 #[async_trait]
 impl TspHandler for ServerTspHandler {
     async fn handle(
@@ -52,37 +82,12 @@ impl TspHandler for ServerTspHandler {
         // conformant peer (the VTA) wraps; a not-yet-upgraded sibling sends the
         // bare document. `tsp_binding` explains why both are accepted, and
         // `carriage` is what the reply is framed for.
-        let (document, carriage) = tsp_binding::open(&payload);
-
-        let doc = match serde_json::from_slice::<trust_tasks_rs::TrustTask<Value>>(&document) {
-            Ok(doc) => doc,
-            Err(e) => {
-                warn!(
-                    sender = %sender_vid,
-                    error = %e,
-                    "inbound TSP: payload is not a trust-task document — dropped"
-                );
-                return Ok(None);
-            }
-        };
-        debug!(sender = %sender_vid, type_uri = %doc.type_uri, "inbound TSP: trust task");
-        match crate::messaging::dispatch_inbound_document(&self.state, Some(&sender_vid), doc).await
-        {
-            Some(reply) => Ok(Some(TspResponse::new(tsp_binding::frame(
-                serde_json::to_vec(&reply)
-                    .map_err(|e| DIDCommServiceError::Internal(e.to_string()))?,
-                carriage,
-            )))),
+        match run_tsp_trust_task(&self.state, &sender_vid, &payload).await? {
+            Some(frame) => Ok(Some(TspResponse::new(frame))),
             None => Ok(None),
         }
     }
 
-    /// Answer an inbound TSP relationship control message. This is the arm that
-    /// clears the `no relationship with … discarded` drop the edge logs when it
-    /// has lost its half of the relationship: on the control plane's (or its
-    /// own connect-time) re-invite it accepts, restoring `Bidirectional` so the
-    /// control plane's sync/health pushes are admitted again. Shared policy in
-    /// `did_hosting_common::server::tsp_relationship` — see its module docs.
     async fn handle_control(
         &self,
         ctx: HandlerContext,
@@ -103,8 +108,8 @@ impl TspHandler for ServerTspHandler {
 #[cfg(test)]
 mod tests {
     use did_hosting_common::didcomm_types::{
-        MSG_DOMAIN_ASSIGN, MSG_HEALTH_PING, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
-        MSG_SYNC_UPDATE,
+        MSG_HEALTH_PING, MSG_REPLICA_DOMAIN_ASSIGN, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK,
+        MSG_STATS_SYNC, MSG_SYNC_UPDATE,
     };
 
     /// The infra dispatcher owns exactly the ops the server implements, and
@@ -125,6 +130,6 @@ mod tests {
             assert!(!owns(op), "{op} is a control-plane op, not an infra op");
         }
         assert!(CONTROL_PLANE_OPS.contains(&MSG_SYNC_UPDATE));
-        assert!(CONTROL_PLANE_OPS.contains(&MSG_DOMAIN_ASSIGN));
+        assert!(CONTROL_PLANE_OPS.contains(&MSG_REPLICA_DOMAIN_ASSIGN));
     }
 }

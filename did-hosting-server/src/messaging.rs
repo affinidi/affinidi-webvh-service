@@ -1,9 +1,9 @@
 //! Control-plane → edge operations for the DID Hosting server.
 //!
 //! The server is a read-only node: the control plane pushes it DID sync
-//! (`sync/update`, `sync/batch`, `sync/delete`) and domain operations
-//! (`domain/assign`, `unassign`, `purge`, `upsert`). All DID provisioning is
-//! handled by the control plane.
+//! (`webvh/sync/update/0.2`, `sync/batch/0.1`, `sync/delete/0.2`) and domain
+//! replication (`did-management/replica/domain/{upsert,assign,unassign,purge}`).
+//! All DID provisioning is handled by the control plane.
 //!
 //! ## Every operation is a document the control plane signed
 //!
@@ -19,6 +19,12 @@
 //!   `verificationMethod` is one of that DID's keys;
 //! - it is addressed to this server (`recipient == server_did`);
 //! - it is fresh (`issuedAt`) and not a replay of a document already applied.
+//!
+//! A document that does not verify gets **no reply at all**: a signed refusal
+//! would settle a directive the control plane never sent. A document that
+//! verifies, but whose proven issuer is some other DID, is refused with the
+//! task's declared `notAuthorized` code — a signed, non-retryable answer, as
+//! each of these specifications requires.
 //!
 //! The cores below take a [`VerifiedControlPlane`], which only that function
 //! constructs, so an unverified path to them does not type-check. The
@@ -47,11 +53,27 @@ pub const CONTROL_PLANE_OPS: &[&str] = &[
     MSG_SYNC_UPDATE,
     MSG_SYNC_BATCH,
     MSG_SYNC_DELETE,
-    MSG_DOMAIN_ASSIGN,
-    MSG_DOMAIN_UNASSIGN,
-    MSG_DOMAIN_PURGE,
-    MSG_DOMAIN_UPSERT,
+    MSG_REPLICA_DOMAIN_ASSIGN,
+    MSG_REPLICA_DOMAIN_UNASSIGN,
+    MSG_REPLICA_DOMAIN_PURGE,
+    MSG_REPLICA_DOMAIN_UPSERT,
 ];
+
+/// The `notAuthorized` code `type_uri`'s specification declares: its proven
+/// issuer is not this server's configured control plane.
+fn not_authorized_code(type_uri: &str) -> Option<trust_tasks_rs::DeclaredErrorCode> {
+    use trust_tasks_rs::specs::did_management::replica::domain::{assign, purge, unassign, upsert};
+    Some(match type_uri {
+        MSG_SYNC_UPDATE => sync_update::error_codes::NOT_AUTHORIZED,
+        MSG_SYNC_BATCH => sync_batch::error_codes::NOT_AUTHORIZED,
+        MSG_SYNC_DELETE => sync_delete::error_codes::NOT_AUTHORIZED,
+        MSG_REPLICA_DOMAIN_ASSIGN => assign::v0_1::error_codes::NOT_AUTHORIZED,
+        MSG_REPLICA_DOMAIN_UNASSIGN => unassign::v0_1::error_codes::NOT_AUTHORIZED,
+        MSG_REPLICA_DOMAIN_PURGE => purge::v0_1::error_codes::NOT_AUTHORIZED,
+        MSG_REPLICA_DOMAIN_UPSERT => upsert::v0_1::error_codes::NOT_AUTHORIZED,
+        _ => return None,
+    })
+}
 
 /// Documents already applied, keyed on `(issuer, document id)`. Process-wide:
 /// an edge has exactly one control plane, and the cache only needs to outlive
@@ -85,6 +107,33 @@ pub fn state_verifier(state: &AppState) -> Option<std::sync::Arc<TransportBoundV
     state.trust_tasks_verifier.clone()
 }
 
+/// Why a document was not accepted as the control plane's.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The document did not verify — no proof, a bad one, not addressed to
+    /// this server, stale, a replay — or this server cannot check it. It gets
+    /// no reply; the reason is kept for logs and tests.
+    Unverified(trust_tasks_rs::RejectReason),
+    /// The document verified, but its proven issuer is not this server's
+    /// configured control plane. Answered with the task's `notAuthorized`.
+    NotAuthorized {
+        /// The proven issuer.
+        issuer: String,
+    },
+}
+
+impl Refusal {
+    /// The framework rejection this refusal is logged (or answered) as.
+    pub fn reject_reason(&self) -> trust_tasks_rs::RejectReason {
+        match self {
+            Refusal::Unverified(reason) => reason.clone(),
+            Refusal::NotAuthorized { issuer } => trust_tasks_rs::RejectReason::PermissionDenied {
+                reason: format!("{issuer} is not this server's control plane"),
+            },
+        }
+    }
+}
+
 /// Establish that `doc` comes from the configured control plane. See the module
 /// docs for what is checked. `transport_sender` is the carrying transport's
 /// report, which must agree with the proof but is never sufficient alone.
@@ -93,30 +142,27 @@ pub async fn verify_control_plane<P>(
     transport_sender: Option<&str>,
     doc: &trust_tasks_rs::TrustTask<P>,
     verifier: &TransportBoundVerifier,
-) -> Result<VerifiedControlPlane, trust_tasks_rs::RejectReason>
+) -> Result<VerifiedControlPlane, Refusal>
 where
     P: serde::Serialize + Send + Sync,
 {
     use trust_tasks_rs::RejectReason;
 
     // No configured control plane → no legitimate sender for these ops.
-    let control_did =
-        state
-            .config
-            .control_did
-            .as_deref()
-            .ok_or_else(|| RejectReason::PermissionDenied {
-                reason: "this server has no configured control plane".into(),
-            })?;
-    let my_did =
-        state
-            .config
-            .server_did
-            .as_deref()
-            .ok_or_else(|| RejectReason::PermissionDenied {
-                reason: "this server has no configured DID".into(),
-            })?;
-    let did = verify_sender_bound(doc, Some(control_did), transport_sender, my_did, verifier)
+    let control_did = state.config.control_did.as_deref().ok_or_else(|| {
+        Refusal::Unverified(RejectReason::PermissionDenied {
+            reason: "this server has no configured control plane".into(),
+        })
+    })?;
+    let my_did = state.config.server_did.as_deref().ok_or_else(|| {
+        Refusal::Unverified(RejectReason::PermissionDenied {
+            reason: "this server has no configured DID".into(),
+        })
+    })?;
+    // The proof is checked against the in-band issuer, whoever that is, so a
+    // well-formed document from another party can be told apart from one that
+    // does not verify at all — only the first is answered.
+    let did = verify_sender_bound(doc, None, transport_sender, my_did, verifier)
         .await
         .map_err(|e| {
             if e.is_transient() {
@@ -124,7 +170,7 @@ where
                     control_did,
                     type_uri = %doc.type_uri,
                     error = %e,
-                    "control-plane document not verified: the control plane's DID could not be \
+                    "control-plane document not verified: the signer's DID could not be \
                      resolved from this server (is its did.jsonl reachable?); it will be re-sent"
                 );
             } else {
@@ -132,20 +178,37 @@ where
                     sender = transport_sender.unwrap_or("unknown"),
                     type_uri = %doc.type_uri,
                     error = %e,
-                    "control-plane document rejected: not signed by the configured control plane"
+                    "control-plane document rejected: it does not verify"
                 );
             }
-            e.reject_reason()
+            Refusal::Unverified(e.reject_reason())
         })?;
+    // Authorise before remembering: only the control plane's documents take
+    // room in the replay cache. A stranger can mint any number of DIDs, and
+    // were its documents recorded first they would fill the cache's global
+    // bound and defer every genuine directive (and the reconcile's listing)
+    // until the window passed. A replayed foreign document is refused
+    // `notAuthorized` again, which applies nothing.
+    if did != control_did {
+        warn!(
+            issuer = %did,
+            control_did,
+            type_uri = %doc.type_uri,
+            "control-plane document refused: signed by a DID that is not this server's control plane"
+        );
+        return Err(Refusal::NotAuthorized { issuer: did });
+    }
     match REPLAY_CACHE.check(&did, &doc.id) {
         Ok(()) => {}
         Err(did_hosting_common::server::replay::ReplayError::Duplicate) => {
             warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
-            return Err(RejectReason::IdConflict);
+            return Err(Refusal::Unverified(RejectReason::IdConflict));
         }
         Err(did_hosting_common::server::replay::ReplayError::Full) => {
             warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full");
-            return Err(RejectReason::Unavailable { retry_after: None });
+            return Err(Refusal::Unverified(RejectReason::Unavailable {
+                retry_after: None,
+            }));
         }
     }
     let issued_at = doc
@@ -253,9 +316,19 @@ pub async fn dispatch_control_plane_op(
     let reply_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let control = match verify_control_plane(state, transport_sender, &doc, verifier).await {
         Ok(c) => c,
-        Err(reason) => {
+        Err(Refusal::NotAuthorized { issuer }) => {
+            let code = not_authorized_code(&type_uri).expect("CONTROL_PLANE_OPS gates this");
+            return Some(ControlPlaneReply::Reply(error_value(
+                doc.reject_with(
+                    reply_id,
+                    trust_tasks_rs::ErrorPayload::from(code)
+                        .with_message(format!("{issuer} is not this server's control plane")),
+                ),
+            )));
+        }
+        Err(refusal) => {
             return Some(ControlPlaneReply::Unverified(error_value(
-                doc.reject_with(reply_id, reason),
+                doc.reject_with(reply_id, refusal.reject_reason()),
             )));
         }
     };
@@ -264,31 +337,18 @@ pub async fn dispatch_control_plane_op(
         MSG_SYNC_UPDATE => do_sync_update(&control, state, &doc.payload).await,
         MSG_SYNC_BATCH => do_sync_batch(&control, state, &doc.payload).await,
         MSG_SYNC_DELETE => do_sync_delete(&control, state, &doc.payload).await,
-        MSG_DOMAIN_ASSIGN => do_domain_assign(&control, state, &doc.payload).await,
-        MSG_DOMAIN_UNASSIGN => do_domain_unassign(&control, state, &doc.payload).await,
-        MSG_DOMAIN_PURGE => do_domain_purge(&control, state, &doc.payload).await,
-        MSG_DOMAIN_UPSERT => do_domain_upsert(&control, state, &doc.payload).await,
+        MSG_REPLICA_DOMAIN_ASSIGN => do_domain_assign(&control, state, &doc.payload).await,
+        MSG_REPLICA_DOMAIN_UNASSIGN => do_domain_unassign(&control, state, &doc.payload).await,
+        MSG_REPLICA_DOMAIN_PURGE => do_domain_purge(&control, state, &doc.payload).await,
+        MSG_REPLICA_DOMAIN_UPSERT => do_domain_upsert(&control, state, &doc.payload).await,
         _ => unreachable!("CONTROL_PLANE_OPS gates this match"),
     };
     Some(ControlPlaneReply::Reply(match result {
-        Ok((ack_type, body)) if ack_type != MSG_PROBLEM_REPORT => {
+        Ok((ack_type, body)) => {
             let reply = doc.respond_with(reply_id, body);
             debug_assert_eq!(reply.type_uri.to_string(), ack_type);
             reply
         }
-        Ok((_, body)) => error_value(
-            doc.reject_with(
-                reply_id,
-                trust_tasks_rs::RejectReason::TaskFailed {
-                    reason: body
-                        .get("comment")
-                        .and_then(Value::as_str)
-                        .unwrap_or("the operation was refused")
-                        .to_string(),
-                    details: Some(body),
-                },
-            ),
-        ),
         Err(e) => error_value(doc.reject_with(reply_id, e.reject_reason())),
     }))
 }
@@ -404,8 +464,25 @@ async fn handle_trust_tasks_envelope(
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     // A routing hint only: every privileged document is authorised on its
     // proof, and this is merely required to agree with it.
-    let sender = ctx.sender_did.as_deref();
+    let Some((typ, body)) =
+        run_trust_tasks_envelope(&state, ctx.sender_did.as_deref(), &message).await
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        DIDCommResponse::new(typ, body).thid(message.id.clone()),
+    ))
+}
 
+/// The DIDComm envelope entry point, without the messaging framework around
+/// it: read the Trust Task document the envelope carries, dispatch it, and
+/// return the reply envelope's type and body. `None` when there is nothing to
+/// answer.
+pub async fn run_trust_tasks_envelope(
+    state: &AppState,
+    sender: Option<&str>,
+    message: &Message,
+) -> Option<(String, Value)> {
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
         Ok(d) => d,
         Err(e) => {
@@ -414,17 +491,11 @@ async fn handle_trust_tasks_envelope(
                 error = %e,
                 "trust-tasks envelope: inner body did not parse as TrustTask<Value>"
             );
-            return Ok(None);
+            return None;
         }
     };
-
-    let Some(reply) = dispatch_inbound_document(&state, sender, doc).await else {
-        return Ok(None);
-    };
-    Ok(Some(
-        DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), reply)
-            .thid(message.id.clone()),
-    ))
+    let reply = dispatch_inbound_document(state, sender, doc).await?;
+    Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), reply))
 }
 
 /// Route an inbound Trust Task document — from either transport — to the
@@ -734,47 +805,63 @@ async fn do_sync_delete(
 }
 
 // ---------------------------------------------------------------------------
-// Domain assignment (T28, control plane → server)
+// Domain replication (control plane → server)
 // ---------------------------------------------------------------------------
 //
-// The control plane is the source of truth for which domains a server
-// hosts. Both handlers are idempotent — re-assigning an already-
-// assigned domain or unassigning an unknown domain returns a status
-// ack rather than an error. Only documents signed by the configured control
-// plane reach these cores (see `VerifiedControlPlane`).
+// The control plane is the source of record for which domains a server hosts
+// and for each domain's record. Every directive is idempotent. Only documents
+// signed by the configured control plane reach these cores (see
+// `VerifiedControlPlane`).
 
+use trust_tasks_rs::specs::did_management::replica::domain::{
+    assign::v0_1 as replica_assign, purge::v0_1 as replica_purge,
+    unassign::v0_1 as replica_unassign, upsert::v0_1 as replica_upsert,
+};
+
+/// A directive's domain, which the control plane must already have put in
+/// canonical form: two spellings of one domain must never become two records.
+fn canonical_domain(name: &str, what: &str) -> Result<String, OpError> {
+    let canonical = did_hosting_common::server::domain::normalize_domain_name(name)
+        .map_err(|e| OpError::Refused(format!("{what}: `{name}` is not a domain name: {e}")))?;
+    if canonical != name {
+        return Err(OpError::Refused(format!(
+            "{what}: `{name}` is not in canonical form (expected `{canonical}`)"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn rfc3339(secs: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0).unwrap_or_default()
+}
+
+/// `replica/domain/assign/0.1`: record the assignment on this server's own
+/// clock — refreshing it when the domain is already assigned, since that time
+/// is what the purge freshness rule compares against — and cancel any purge
+/// scheduled for the domain.
 async fn do_domain_assign(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    use did_hosting_common::server::assignment::{AssignOutcome, assign};
-    use did_hosting_common::server::domain::normalize_domain_name;
+    use did_hosting_common::server::assignment::record_assignment;
     use did_hosting_common::server::pending_purge::{self, CancelOutcome};
 
-    let domain_raw = body
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'domain' in domain/assign")?;
-    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
+    let directive: replica_assign::Payload = payload(body, "replica/domain/assign")?;
+    let domain = canonical_domain(&directive.domain, "replica/domain/assign")?;
 
     let now = crate::auth::session::now_epoch();
-    let outcome = assign(&state.store, &domain, &control.did, now)
+    record_assignment(&state.store, &domain, &control.did, now)
         .await
         .map_err(OpError::from)?;
 
-    let (status, log_msg) = match &outcome {
-        AssignOutcome::Created(_) => ("assigned", "domain assigned"),
-        AssignOutcome::Existing(_) => ("already_assigned", "domain re-assign no-op"),
-    };
-
-    // T30: re-assign within the grace window cancels any pending
-    // purge. Audit-log the cancellation so an operator can answer
-    // "did my data survive the unassign / re-assign round trip?".
-    let cancelled = pending_purge::cancel(&state.store, &domain)
+    // A re-assign within the grace window cancels the pending purge. Logged so
+    // an operator can answer "did my data survive the unassign / re-assign
+    // round trip?".
+    if let CancelOutcome::Removed(prev) = pending_purge::cancel(&state.store, &domain)
         .await
-        .map_err(OpError::from)?;
-    if let CancelOutcome::Removed(prev) = cancelled {
+        .map_err(OpError::from)?
+    {
         info!(
             did = %control.did,
             domain = %domain,
@@ -783,143 +870,110 @@ async fn do_domain_assign(
             "domain re-assign cancelled pending purge — data retained"
         );
     }
-
-    info!(
-        did = %control.did,
-        domain = %domain,
-        status,
-        "{log_msg}"
-    );
+    info!(did = %control.did, domain = %domain, "domain assigned");
 
     Ok((
-        MSG_DOMAIN_ASSIGN_ACK.to_string(),
-        json!({ "domain": domain, "status": status }),
+        MSG_REPLICA_DOMAIN_ASSIGN_ACK.to_string(),
+        reply::<replica_assign::Response>(
+            json!({ "domain": domain, "status": "applied" }),
+            "replica/domain/assign",
+        )?,
     ))
 }
 
+/// This server's unassignment grace, from `hosting.unassigned_purge_grace`.
+fn unassign_grace_seconds(state: &AppState) -> u64 {
+    use did_hosting_common::server::pending_purge::parse_grace_string;
+    // A misconfigured value falls back to 2h with a warning, so an unassign
+    // still schedules a purge rather than failing outright.
+    parse_grace_string(&state.config.hosting.unassigned_purge_grace).unwrap_or_else(|e| {
+        warn!(
+            error = %e,
+            config = %state.config.hosting.unassigned_purge_grace,
+            "unassigned_purge_grace unparseable; defaulting to 2h"
+        );
+        2 * 60 * 60
+    })
+}
+
+/// `replica/domain/unassign/0.1`: remove the assignment and schedule the
+/// domain's deletion at this server's clock plus its grace. The answer always
+/// states the schedule now in force: a domain this server does not serve keeps
+/// any existing schedule, or answers `purgeAt` = now when it holds nothing.
 async fn do_domain_unassign(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
-    use did_hosting_common::server::domain::normalize_domain_name;
-    use did_hosting_common::server::pending_purge::{self, parse_grace_string};
+    use did_hosting_common::server::pending_purge;
 
-    let domain_raw = body
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'domain' in domain/unassign")?;
-    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
+    let directive: replica_unassign::Payload = payload(body, "replica/domain/unassign")?;
+    let domain = canonical_domain(&directive.domain, "replica/domain/unassign")?;
 
+    let now = crate::auth::session::now_epoch();
     let outcome = unassign(&state.store, &domain)
         .await
         .map_err(OpError::from)?;
 
-    let (status, log_msg) = match &outcome {
-        UnassignOutcome::Removed(_) => ("unassigned", "domain unassigned"),
-        UnassignOutcome::Missing => ("not_assigned", "domain unassign no-op"),
+    let purge_at = match outcome {
+        UnassignOutcome::Removed(_) => {
+            let grace_seconds = unassign_grace_seconds(state);
+            // A failed schedule is retried: answering `scheduled` would settle a
+            // directive whose deletion was never arranged.
+            pending_purge::schedule(
+                &state.store,
+                &domain,
+                now,
+                grace_seconds,
+                "grace-expired",
+                &control.did,
+            )
+            .await
+            .map_err(OpError::from)?;
+            info!(did = %control.did, domain = %domain, grace_seconds, "domain unassigned; purge scheduled");
+            now.saturating_add(grace_seconds)
+        }
+        UnassignOutcome::Missing => {
+            match pending_purge::get(&state.store, &domain)
+                .await
+                .map_err(OpError::from)?
+            {
+                Some(existing) => existing.scheduled_at.saturating_add(existing.grace_seconds),
+                None => now,
+            }
+        }
     };
 
-    // T30: schedule a grace-period purge. Idempotent — overwriting an
-    // existing pending purge just resets the timer, which is the
-    // right behaviour for "operator unassigned, then unassigned
-    // again". Stops at the schedule step here; the actual purge sweep
-    // (which deletes DID records whose domain matches) lands in T30's
-    // follow-up.
-    if matches!(outcome, UnassignOutcome::Removed(_)) {
-        // Source the grace from `config.hosting.unassigned_purge_grace`.
-        // A misconfigured / unparseable value defaults to 2h and emits
-        // a warn — the server keeps working with a sensible default
-        // rather than failing the unassign entirely.
-        let grace_seconds = parse_grace_string(&state.config.hosting.unassigned_purge_grace)
-            .unwrap_or_else(|e| {
-                warn!(
-                    error = %e,
-                    config = %state.config.hosting.unassigned_purge_grace,
-                    "unassigned_purge_grace unparseable; defaulting to 2h"
-                );
-                2 * 60 * 60
-            });
-        let now = crate::auth::session::now_epoch();
-        if let Err(e) = pending_purge::schedule(
-            &state.store,
-            &domain,
-            now,
-            grace_seconds,
-            "grace-expired",
-            &control.did,
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                domain = %domain,
-                "failed to schedule pending purge; domain is unassigned but \
-                 data retention is unbounded until manual cleanup"
-            );
-        } else {
-            info!(
-                did = %control.did,
-                domain = %domain,
-                grace_seconds,
-                "pending purge scheduled"
-            );
-        }
-    }
-
-    info!(
-        did = %control.did,
-        domain = %domain,
-        status,
-        "{log_msg}"
-    );
-
     Ok((
-        MSG_DOMAIN_UNASSIGN_ACK.to_string(),
-        json!({ "domain": domain, "status": status }),
+        MSG_REPLICA_DOMAIN_UNASSIGN_ACK.to_string(),
+        reply::<replica_unassign::Response>(
+            json!({ "domain": domain, "status": "scheduled", "purgeAt": rfc3339(purge_at) }),
+            "replica/domain/unassign",
+        )?,
     ))
 }
 
-/// Handle `MSG_DOMAIN_PURGE` — admin "Purge now" Trust Task.
-///
-/// Bypasses the grace period and immediately deletes every DID
-/// record on the named domain. The unassignment must already have
-/// happened (the domain is removed from KS_ASSIGNMENTS); admins can
-/// run an explicit unassign-then-purge sequence, or purge a domain
-/// whose grace timer is still running. Either way the pending
-/// purge entry (if any) is cleared after the synchronous purge.
+/// `replica/domain/purge/0.1`: delete every slot this server holds on the
+/// domain now, unless it holds an assignment of the domain made after the
+/// directive was issued.
 async fn do_domain_purge(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::assignment;
-    use did_hosting_common::server::domain::normalize_domain_name;
     use did_hosting_common::server::domain_purge::purge_domain_dids;
     use did_hosting_common::server::pending_purge;
 
-    let domain_raw = body
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'domain' in domain/purge")?;
-    let domain = normalize_domain_name(domain_raw).map_err(OpError::from)?;
+    let directive: replica_purge::Payload = payload(body, "replica/domain/purge")?;
+    let domain = canonical_domain(&directive.domain, "replica/domain/purge")?;
 
-    // Freshness check — defends against the replay-after-reassign-
-    // within-grace scenario:
-    //   1. Operator unassigns foo.example → control plane queues
-    //      purge → mediator goes down before delivery.
-    //   2. Operator changes their mind, re-assigns foo.example within
-    //      the grace window; server stores a new KS_ASSIGNMENTS row
-    //      with a fresh `assigned_at`.
-    //   3. Mediator comes back, delivers the stale purge.
-    //   4. Without this check, the data the operator chose to keep
-    //      gets wiped.
-    // If a current assignment row exists AND the document's signed
-    // `issuedAt` is older than the assignment's `assigned_at`, refuse the
-    // purge. `issuedAt` is covered by the control plane's proof, so unlike
-    // the DIDComm `created_time` this used to read it is always present and
-    // cannot be restamped in transit.
+    // Freshness. Directives wait in the control plane's outbox and may arrive
+    // late: an operator who unassigns a domain, then re-assigns it within the
+    // grace window, must not have the data they chose to keep wiped by the
+    // original purge arriving afterwards. The document's signed `issuedAt` is
+    // compared with the assignment time this server recorded on its own clock.
     // A lookup failure must not skip the check: it is retried, not assumed away.
     if let Some(current) = assignment::get(&state.store, &domain)
         .await
@@ -930,79 +984,82 @@ async fn do_domain_purge(
             did = %control.did,
             domain = %domain,
             issued_at = control.issued_at,
-            assignment_assigned_at = current.assigned_at,
-            "domain/purge refused: document older than current assignment (likely a stale purge replayed after reassign-within-grace)"
+            assigned_at = current.assigned_at,
+            "replica/domain/purge refused: issued before the current assignment"
         );
-        return Ok(problem_report(
-            "e.p.domain.stale-purge",
-            "purge message predates the current assignment; refusing to wipe data that has since been re-assigned",
+        return Err(OpError::Declared(
+            replica_purge::error_codes::STALE_PURGE,
+            "the purge predates this server's current assignment of the domain; nothing was deleted"
+                .into(),
         ));
     }
 
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
         .map_err(OpError::from)?;
+    if report.failed > 0 {
+        return Err(OpError::Transient(format!(
+            "{} slot(s) on {domain} could not be deleted just now",
+            report.failed
+        )));
+    }
+    state.did_cache.clear();
 
-    // Clear any pending purge — the synchronous purge supersedes it.
-    let _ = pending_purge::cancel(&state.store, &domain).await;
+    // The immediate purge supersedes any scheduled one.
+    pending_purge::cancel(&state.store, &domain)
+        .await
+        .map_err(OpError::from)?;
 
     info!(
         did = %control.did,
         domain = %domain,
-        deleted = report.deleted,
+        removed = report.deleted,
         skipped_no_domain = report.skipped_no_domain,
-        skipped_other_domain = report.skipped_other_domain,
-        "domain purged via admin Purge Now"
+        "domain purged on the control plane's directive"
     );
 
     Ok((
-        MSG_DOMAIN_PURGE_ACK.to_string(),
-        json!({
-            "domain": domain,
-            "deleted": report.deleted,
-            "skipped_no_domain": report.skipped_no_domain,
-        }),
+        MSG_REPLICA_DOMAIN_PURGE_ACK.to_string(),
+        reply::<replica_purge::Response>(
+            json!({ "domain": domain, "status": "purged", "removed": report.deleted }),
+            "replica/domain/purge",
+        )?,
     ))
 }
 
-/// Handle `MSG_DOMAIN_UPSERT`. Single-message replication of any
-/// `DomainEntry` mutation from the control plane (create, update,
-/// disable, enable).
-///
-/// Behaviour:
-/// - Upserts the local DomainEntry — `create_domain` if absent,
-///   `update_domain` otherwise.
-/// - If the incoming entry is `Disabled` and carries
-///   `disabled_at` + `purge_at`, schedules a `disable-grace`
-///   pending_purge so this server's sweeper eventually deletes the
-///   entry + all DIDs hosted under the domain.
-/// - If the incoming entry is `Active`, cancels any pending purge —
-///   this is how a re-enable within the grace window cancels the
-///   removal on the server side.
-///
-/// Idempotent. Re-sending the same entry produces an
-/// `already_current` status in the ack rather than churn.
+/// `replica/domain/upsert/0.1`: this server's copy of the domain record
+/// becomes the carried entry. `status: disabled` schedules the domain's purge
+/// at `entry.purgeAt`; `status: active` cancels any scheduled purge.
+/// Re-applying the same entry is a no-op in effect, and answered `applied`.
 async fn do_domain_upsert(
     control: &VerifiedControlPlane,
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::domain::{
-        DISABLE_PURGE_REASON, DomainEntry, DomainStatus, create_domain, get_domain,
-        normalize_domain_name, update_domain,
+        DISABLE_PURGE_REASON, DomainStatus, create_domain, get_domain, normalize_domain_name,
+        update_domain, wire,
     };
     use did_hosting_common::server::pending_purge;
 
-    let entry: DomainEntry = serde_json::from_value(body.clone())
-        .map_err(|e| format!("malformed 'entry' in domain/upsert (expected a DomainEntry): {e}"))?;
-    let canonical = normalize_domain_name(&entry.name).map_err(OpError::from)?;
-    if canonical != entry.name {
-        return Err(format!(
-            "domain/upsert sender sent non-canonical name '{}' (expected '{canonical}')",
-            entry.name
+    let directive: replica_upsert::Payload = payload(body, "replica/domain/upsert")?;
+    let name = directive.entry.name.clone();
+    let canonical = normalize_domain_name(&name).map_err(|e| {
+        OpError::Declared(
+            replica_upsert::error_codes::NON_CANONICAL_NAME,
+            format!("`{name}` is not a domain name: {e}"),
         )
-        .into());
+    })?;
+    if canonical != name {
+        return Err(OpError::Declared(
+            replica_upsert::error_codes::NON_CANONICAL_NAME,
+            format!("`{name}` is not in canonical form (expected `{canonical}`)"),
+        ));
     }
+    let entry_value =
+        serde_json::to_value(&directive.entry).map_err(|e| OpError::Transient(e.to_string()))?;
+    let entry = wire::from_spec(&entry_value)
+        .map_err(|e| OpError::Refused(format!("replica/domain/upsert: {e}")))?;
 
     let existed = get_domain(&state.store, &canonical)
         .await
@@ -1018,70 +1075,48 @@ async fn do_domain_upsert(
             .map_err(OpError::from)?;
     }
 
-    // Status-driven side effects.
-    let status_str = match entry.status {
+    match entry.status {
         DomainStatus::Active => {
             // Re-enable cancels any in-flight grace timer.
-            let _ = pending_purge::cancel(&state.store, &canonical).await;
-            "active"
+            pending_purge::cancel(&state.store, &canonical)
+                .await
+                .map_err(OpError::from)?;
         }
-        DomainStatus::Disabled => {
-            if let (Some(disabled_at), Some(purge_at)) = (entry.disabled_at, entry.purge_at) {
-                let grace_seconds = purge_at.saturating_sub(disabled_at);
-                if let Err(e) = pending_purge::schedule(
+        DomainStatus::Disabled => match (entry.disabled_at, entry.purge_at) {
+            (Some(disabled_at), Some(purge_at)) => {
+                pending_purge::schedule(
                     &state.store,
                     &canonical,
                     disabled_at,
-                    grace_seconds,
+                    purge_at.saturating_sub(disabled_at),
                     DISABLE_PURGE_REASON,
                     &control.did,
                 )
                 .await
-                {
-                    warn!(
-                        error = %e,
-                        domain = %canonical,
-                        "domain/upsert: failed to schedule pending purge — local entry disabled, but grace sweep won't fire"
-                    );
-                }
-            } else {
-                warn!(
-                    domain = %canonical,
-                    "domain/upsert: status=Disabled but timestamps missing — no grace timer scheduled"
-                );
+                .map_err(OpError::from)?;
             }
-            "disabled"
-        }
-    };
+            _ => warn!(
+                domain = %canonical,
+                "replica/domain/upsert: status=disabled without disabledAt/purgeAt — no purge scheduled"
+            ),
+        },
+    }
 
-    let action = if existed { "updated" } else { "created" };
     info!(
         did = %control.did,
         domain = %canonical,
-        action,
-        status = status_str,
+        action = if existed { "updated" } else { "created" },
+        status = ?entry.status,
         "domain entry replicated"
     );
 
     Ok((
-        MSG_DOMAIN_UPSERT_ACK.to_string(),
-        json!({
-            "domain": canonical,
-            "action": action,
-            "status": status_str,
-        }),
+        MSG_REPLICA_DOMAIN_UPSERT_ACK.to_string(),
+        reply::<replica_upsert::Response>(
+            json!({ "name": canonical, "status": "applied" }),
+            "replica/domain/upsert",
+        )?,
     ))
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn problem_report(code: &str, comment: &str) -> (String, Value) {
-    (
-        MSG_PROBLEM_REPORT.to_string(),
-        json!({ "code": code, "comment": comment }),
-    )
 }
 
 #[cfg(test)]

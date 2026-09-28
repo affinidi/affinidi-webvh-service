@@ -207,3 +207,8 @@ affinidi-messaging-test-mediator = "0.14.0"
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.
 did-hosting-control = { path = ".", features = ["test-support"] }
+# `src/replication_e2e.rs` wires a control plane to a real hosting server
+# (edge) through each transport's entry points. The edge does not depend on
+# this crate, so there is no cycle.
+did-hosting-server = { path = "../did-hosting-server" }
+didwebvh-rs = { workspace = true }

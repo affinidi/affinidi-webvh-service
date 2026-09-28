@@ -426,7 +426,7 @@ pub async fn delete_domain_route(
         )));
     }
 
-    // Optional: fanout MSG_DOMAIN_PURGE to every server instance
+    // Optional: fanout replica/domain/purge to every server instance
     // serving this domain. Best-effort per instance — a failure to
     // enqueue for one server must not block the others or the local
     // delete. Anything we miss here will surface in the audit log;

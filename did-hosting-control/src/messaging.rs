@@ -618,7 +618,7 @@ pub(crate) fn do_sync_ack(signer: &str, type_uri: &str, body: &Value) {
 ///
 /// Mirrors the server's view of `served_domains` into the registry so the UI
 /// reflects the change without waiting for the next registration:
-/// `assigned` / `already_assigned` on an assign ack adds the domain, anything
+/// `applied` on an assign ack adds the domain, anything
 /// else removes it. `signer` is the ack's proven issuer and must hold the
 /// Service role — otherwise any DID could rewrite a server's `served_domains`
 /// (dropping a domain hides it from the next purge fan-out).
@@ -631,8 +631,8 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
         return;
     };
     let op = match type_uri {
-        MSG_DOMAIN_ASSIGN_ACK => "assign",
-        MSG_DOMAIN_UNASSIGN_ACK => "unassign",
+        MSG_REPLICA_DOMAIN_ASSIGN_ACK => "assign",
+        MSG_REPLICA_DOMAIN_UNASSIGN_ACK => "unassign",
         _ => "purge",
     };
     info!(
@@ -666,7 +666,8 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
     let instance_id = signer.replace(':', "_");
     match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
         Ok(Some(mut instance)) => {
-            let add = op == "assign" && matches!(status, "assigned" | "already_assigned");
+            // `replica/domain/assign/0.1` answers only `applied`.
+            let add = op == "assign" && status == "applied";
             let mutated = if add {
                 if !instance.served_domains.iter().any(|d| d == domain) {
                     instance.served_domains.push(domain.to_string());
@@ -827,7 +828,7 @@ pub(crate) async fn do_server_register(
     // recording them. A peer Service-role server could still claim to
     // host a real but unrelated tenant's domain. Closing that gap
     // requires a new control-plane-side dispatched-assignments table
-    // (one row per outbound MSG_DOMAIN_{ASSIGN,UNASSIGN}) the register
+    // (one row per outbound replica/domain/{assign,unassign}) the register
     // handler can intersect against. Out of scope for this security
     // fix; HIGH-1 (control-plane pinning on the server-side handlers)
     // already removes the most damaging exploit (a peer issuing
@@ -3560,10 +3561,22 @@ mod tests {
         let mut ops = pending_ops(&state, edge).await;
         ops.sort();
         let mut want = vec![
-            (MSG_DOMAIN_ASSIGN.to_string(), "kept.example".to_string()),
-            (MSG_DOMAIN_UNASSIGN.to_string(), "gone.example".to_string()),
-            (MSG_DOMAIN_UNASSIGN.to_string(), "wiped.example".to_string()),
-            (MSG_DOMAIN_PURGE.to_string(), "wiped.example".to_string()),
+            (
+                MSG_REPLICA_DOMAIN_ASSIGN.to_string(),
+                "kept.example".to_string(),
+            ),
+            (
+                MSG_REPLICA_DOMAIN_UNASSIGN.to_string(),
+                "gone.example".to_string(),
+            ),
+            (
+                MSG_REPLICA_DOMAIN_UNASSIGN.to_string(),
+                "wiped.example".to_string(),
+            ),
+            (
+                MSG_REPLICA_DOMAIN_PURGE.to_string(),
+                "wiped.example".to_string(),
+            ),
         ];
         want.sort();
         assert_eq!(ops, want);
@@ -3573,22 +3586,22 @@ mod tests {
         do_domain_ack(
             &state,
             edge,
-            MSG_DOMAIN_UNASSIGN_ACK,
-            &json!({ "domain": "gone.example", "status": "unassigned" }),
+            MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "gone.example", "status": "scheduled", "purgeAt": "2026-01-01T00:00:00Z" }),
         )
         .await;
         do_domain_ack(
             &state,
             edge,
-            MSG_DOMAIN_PURGE_ACK,
-            &json!({ "domain": "wiped.example", "deleted": 0 }),
+            MSG_REPLICA_DOMAIN_PURGE_ACK,
+            &json!({ "domain": "wiped.example", "status": "purged", "removed": 0 }),
         )
         .await;
         do_domain_ack(
             &state,
             edge,
-            MSG_DOMAIN_ASSIGN_ACK,
-            &json!({ "domain": "kept.example", "status": "assigned" }),
+            MSG_REPLICA_DOMAIN_ASSIGN_ACK,
+            &json!({ "domain": "kept.example", "status": "applied" }),
         )
         .await;
         let intents = domain_intents(&state, edge).await.unwrap();
@@ -3615,8 +3628,8 @@ mod tests {
         do_domain_ack(
             &state,
             edge,
-            MSG_DOMAIN_UNASSIGN_ACK,
-            &json!({ "domain": "a.example", "status": "unassigned" }),
+            MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "a.example", "status": "scheduled", "purgeAt": "2026-01-01T00:00:00Z" }),
         )
         .await;
         let intents = domain_intents(&state, edge).await.unwrap();
@@ -3628,8 +3641,8 @@ mod tests {
         do_domain_ack(
             &state,
             "did:example:not-a-service",
-            MSG_DOMAIN_UNASSIGN_ACK,
-            &json!({ "domain": "a.example", "status": "unassigned" }),
+            MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "a.example", "status": "scheduled", "purgeAt": "2026-01-01T00:00:00Z" }),
         )
         .await;
         assert_eq!(

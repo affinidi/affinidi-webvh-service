@@ -1,6 +1,6 @@
 //! Grace-period scheduling for domain unassignment purges (T30).
 //!
-//! When `MSG_DOMAIN_UNASSIGN` arrives, the server immediately stops
+//! When `replica/domain/unassign` arrives, the server immediately stops
 //! resolving the domain (the T21 safety check rejects on
 //! disabled / missing) but does NOT delete the underlying DID
 //! records right away. Operators may re-assign the same domain

@@ -656,7 +656,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // a freshly-deployed daemon — even with no control plane
     // reachable — has the same effective assignments and will host
     // its bootstrap_domains immediately. Once the control plane sends
-    // `MSG_DOMAIN_ASSIGN` the keyspace is the same; subsequent boots
+    // `replica/domain/assign` the keyspace is the same; subsequent boots
     // short-circuit at tier 0.
     let assignment_now = did_hosting_common::server::auth::session::now_epoch();
     match did_hosting_common::server::assignment_seed::seed_assignments_first_boot(

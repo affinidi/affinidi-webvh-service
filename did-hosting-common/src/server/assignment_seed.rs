@@ -2,7 +2,7 @@
 //!
 //! T28 made the control plane the source of truth for which domains
 //! a server hosts. But a freshly-deployed server hasn't received any
-//! `MSG_DOMAIN_ASSIGN` yet, and an offline control plane means it
+//! `replica/domain/assign` yet, and an offline control plane means it
 //! never will until reconnected. To avoid the new server being
 //! unable to host *anything* until the control plane reaches it, the
 //! server seeds `KS_ASSIGNMENTS` from local config on first boot.
@@ -26,11 +26,11 @@
 //!
 //! ## When the control plane catches up
 //!
-//! The control plane's `MSG_DOMAIN_ASSIGN` handler runs the same
+//! The control plane's `replica/domain/assign` handler runs the same
 //! idempotent `assign()` — so a fallback-seeded entry that the
 //! control plane also "owns" stays as a single row (the `assigner`
 //! field is preserved on the first write). If the control plane
-//! later sends `MSG_DOMAIN_UNASSIGN`, the row is removed; the
+//! later sends `replica/domain/unassign`, the row is removed; the
 //! fallback does NOT re-seed because the keyspace is no longer
 //! empty. This matches the spec's "control plane is authoritative
 //! once contacted" rule.

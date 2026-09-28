@@ -27,6 +27,8 @@ pub mod purge_sweep;
 pub mod rate_limit;
 pub mod registry;
 pub mod replay;
+#[cfg(test)]
+mod replication_e2e;
 pub mod routes;
 pub mod secret_store;
 pub mod server;

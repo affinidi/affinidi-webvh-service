@@ -164,7 +164,7 @@ pub async fn health_check(
 // ---------- POST /api/control/registry/{instance_id}/domains/{domain}/assign ----------
 // ---------- DELETE /api/control/registry/{instance_id}/domains/{domain} ----------
 
-/// Admin trigger for `MSG_DOMAIN_ASSIGN` (T28).
+/// Admin trigger for `replica/domain/assign` (T28).
 ///
 /// Looks up the server instance, extracts its DID from metadata, and
 /// pushes a `domain/assign/1.0` DIDComm message via the mediator.
@@ -196,7 +196,7 @@ pub async fn assign_domain_to_server(
         instance_id = %instance_id,
         domain = %domain,
         target_did,
-        "MSG_DOMAIN_ASSIGN pushed to server"
+        "replica/domain/assign queued for server"
     );
     Ok((
         StatusCode::ACCEPTED,
@@ -206,7 +206,7 @@ pub async fn assign_domain_to_server(
     ))
 }
 
-/// Admin trigger for `MSG_DOMAIN_UNASSIGN` (T28). Same semantics as
+/// Admin trigger for `replica/domain/unassign` (T28). Same semantics as
 /// [`assign_domain_to_server`] — fire-and-forget DIDComm push, server
 /// acks asynchronously, idempotent on the server side.
 pub async fn unassign_domain_from_server(
@@ -233,7 +233,7 @@ pub async fn unassign_domain_from_server(
         instance_id = %instance_id,
         domain = %domain,
         target_did,
-        "MSG_DOMAIN_UNASSIGN pushed to server"
+        "replica/domain/unassign queued for server"
     );
     Ok((
         StatusCode::ACCEPTED,
@@ -271,7 +271,7 @@ pub async fn purge_domain_on_server(
         instance_id = %instance_id,
         domain = %domain,
         target_did,
-        "MSG_DOMAIN_PURGE pushed to server (admin Purge Now)"
+        "replica/domain/purge queued for server (admin Purge Now)"
     );
     Ok((
         StatusCode::ACCEPTED,

@@ -16,6 +16,7 @@ pub mod resolve_webs;
 #[cfg(feature = "method-webvh")]
 pub mod resolve_webvh;
 mod stats;
+pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -47,6 +48,29 @@ fn agent_name_routes() -> Router<AppState> {
         .route("/@", get(resolve_agent_name::serve_community))
         .route("/@{name}", get(resolve_agent_name::serve))
         .route("/@{name}/{*context}", get(resolve_agent_name::serve))
+}
+
+/// The largest Trust Task document the edge's HTTPS binding reads. A
+/// `sync/batch` carries up to 512 KiB of logs (the control plane's cap), and a
+/// single `sync/update` a whole log; this leaves room for the envelope.
+pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The HTTPS binding of the Trust Task listener, `POST /trust-tasks` (mounted
+/// under `/api`). Never smaller than [`TRUST_TASKS_BODY_LIMIT_BYTES`], so the
+/// control plane's largest batch always fits.
+fn trust_task_routes(body_limit: usize) -> Router<AppState> {
+    Router::new().route(
+        "/trust-tasks",
+        post(trust_tasks::receive).layer(DefaultBodyLimit::max(
+            body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
+        )),
+    )
+}
+
+/// `POST /api/trust-tasks` on its own, for a server that serves resolution
+/// and its Trust Task listener only.
+pub fn trust_task_listener(body_limit: usize) -> Router<AppState> {
+    Router::new().nest("/api", trust_task_routes(body_limit))
 }
 
 /// Build the server router without the DID-serving fallback.
@@ -91,7 +115,8 @@ pub fn router_without_fallback(upload_body_limit: usize) -> Router<AppState> {
         .route("/acl", get(acl::list_acl).post(acl::create_acl))
         .route("/acl/{did}", put(acl::update_acl).delete(acl::delete_acl))
         // Merge upload routes (body-limited) into the API router
-        .merge(upload_routes);
+        .merge(upload_routes)
+        .merge(trust_task_routes(upload_body_limit));
 
     #[allow(unused_mut)]
     let mut router = Router::new().nest("/api", api);

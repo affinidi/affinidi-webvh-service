@@ -50,9 +50,10 @@ use serde_json::Value;
 use tracing::warn;
 
 use did_hosting_common::didcomm_types::{
-    MSG_DOMAIN_ASSIGN_ACK, MSG_DOMAIN_PURGE_ACK, MSG_DOMAIN_UNASSIGN_ACK, MSG_DOMAIN_UPSERT_ACK,
-    MSG_HEALTH_PONG, MSG_SERVER_REGISTER, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC,
-    MSG_SYNC_BATCH_ACK, MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE_ACK,
+    MSG_HEALTH_PONG, MSG_REPLICA_DOMAIN_ASSIGN_ACK, MSG_REPLICA_DOMAIN_PURGE_ACK,
+    MSG_REPLICA_DOMAIN_UNASSIGN_ACK, MSG_REPLICA_DOMAIN_UPSERT_ACK, MSG_SERVER_REGISTER,
+    MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK, MSG_STATS_SYNC, MSG_SYNC_BATCH_ACK,
+    MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE_ACK,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 
@@ -74,10 +75,10 @@ pub fn owns(type_uri: &str) -> bool {
             | MSG_SYNC_UPDATE_ACK
             | MSG_SYNC_BATCH_ACK
             | MSG_SYNC_DELETE_ACK
-            | MSG_DOMAIN_ASSIGN_ACK
-            | MSG_DOMAIN_UNASSIGN_ACK
-            | MSG_DOMAIN_PURGE_ACK
-            | MSG_DOMAIN_UPSERT_ACK
+            | MSG_REPLICA_DOMAIN_ASSIGN_ACK
+            | MSG_REPLICA_DOMAIN_UNASSIGN_ACK
+            | MSG_REPLICA_DOMAIN_PURGE_ACK
+            | MSG_REPLICA_DOMAIN_UPSERT_ACK
     )
 }
 
@@ -173,14 +174,16 @@ async fn dispatch_inner(
             acknowledge_outbox(state, sender, &doc).await;
             None
         }
-        uri @ (MSG_DOMAIN_ASSIGN_ACK | MSG_DOMAIN_UNASSIGN_ACK | MSG_DOMAIN_PURGE_ACK) => {
+        uri @ (MSG_REPLICA_DOMAIN_ASSIGN_ACK
+        | MSG_REPLICA_DOMAIN_UNASSIGN_ACK
+        | MSG_REPLICA_DOMAIN_PURGE_ACK) => {
             crate::messaging::do_domain_ack(state, sender, uri, &doc.payload).await;
             acknowledge_outbox(state, sender, &doc).await;
             None
         }
         // The upsert ack carries nothing the registry tracks; it only settles
         // the outbox entry.
-        MSG_DOMAIN_UPSERT_ACK => {
+        MSG_REPLICA_DOMAIN_UPSERT_ACK => {
             acknowledge_outbox(state, sender, &doc).await;
             None
         }

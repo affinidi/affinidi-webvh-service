@@ -12,60 +12,15 @@ use did_hosting_common::server::domain::{
     self as store, DomainEntry, DomainStatus, DomainUrlScheme, normalize_domain_name,
 };
 use did_hosting_common::server::pending_purge;
-use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 use trust_tasks_rs::DeclaredErrorCode;
 
-use super::{Cx, TaskError, at, typed};
+use super::{Cx, TaskError, typed};
 use crate::error::AppError;
 use crate::server::AppState;
 
 /// A stored domain in the shared `DomainEntry` wire shape.
-///
-/// The schema carries the lifecycle (`name`, `label`, `status`,
-/// `defaultDomain`, `createdAt`, `disabledAt`, `purgeAt`); this host's own
-/// settings for the domain — URL scheme, branding, witness and watcher lists,
-/// quota, the `.well-known` switch — travel under the host's extension
-/// namespace, where the schema allows them, rather than as members it does not.
 pub(crate) fn spec_domain_entry(entry: &DomainEntry) -> Value {
-    let mut out = serde_json::Map::new();
-    out.insert("name".into(), json!(entry.name));
-    if let Some(label) = &entry.label {
-        out.insert("label".into(), json!(label));
-    }
-    out.insert(
-        "status".into(),
-        json!(match entry.status {
-            DomainStatus::Active => "active",
-            DomainStatus::Disabled => "disabled",
-        }),
-    );
-    out.insert("defaultDomain".into(), json!(entry.default_domain));
-    out.insert("createdAt".into(), json!(at(entry.created_at)));
-    if entry.status == DomainStatus::Disabled {
-        if let Some(disabled_at) = entry.disabled_at {
-            out.insert("disabledAt".into(), json!(at(disabled_at)));
-        }
-        if let Some(purge_at) = entry.purge_at {
-            out.insert("purgeAt".into(), json!(at(purge_at)));
-        }
-    }
-    let mut host = serde_json::Map::new();
-    host.insert("scheme".into(), json!(entry.scheme));
-    host.insert("wellKnownEnabled".into(), json!(entry.well_known_enabled));
-    if let Some(branding) = &entry.branding {
-        host.insert("branding".into(), json!(branding));
-    }
-    if let Some(witnesses) = &entry.witnesses {
-        host.insert("witnesses".into(), json!(witnesses));
-    }
-    if let Some(watchers) = &entry.watchers {
-        host.insert("watchers".into(), json!(watchers));
-    }
-    if let Some(quota) = &entry.quota {
-        host.insert("quota".into(), json!(quota));
-    }
-    out.insert("ext".into(), json!({ WEBVH_EXT_KEY: host }));
-    Value::Object(out)
+    did_hosting_common::server::domain::wire::to_spec(entry)
 }
 
 /// `me/domains/0.1`: the domains the caller may host DIDs under.

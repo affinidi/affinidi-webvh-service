@@ -681,16 +681,14 @@ pub async fn apply_single_update(
         disabled: update.disabled,
         deleted_at: None,
 
-        // Tagged from the content, not from the push. T13's migration
-        // fills `domain` for legacy webvh records; a did:webs record
-        // needs it from the start, because its identifier — and so the
-        // document derived on every read — cannot be rebuilt without it.
+        // Tagged from the content, not from the push: the host the DID
+        // identifier names. Every method needs it from the start — a domain
+        // purge (`replica/domain/purge`, or the unassignment grace sweep)
+        // selects the slots it deletes by it, so an untagged slot would
+        // outlive the purge of its domain; and a did:webs identifier, with the
+        // document derived from it on every read, cannot be rebuilt without it.
         method: synced_method.to_string(),
-        domain: if synced_method == "webs" {
-            did_host.clone()
-        } else {
-            String::new()
-        },
+        domain: did_host.clone(),
 
         // Derive from the synced log rather than trusting the control
         // plane to send a services list — the log is the authority, and

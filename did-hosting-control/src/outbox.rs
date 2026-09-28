@@ -90,7 +90,7 @@ pub const MAX_BACKOFF_SECS: u64 = 5 * 60;
 pub struct OutboxEntry {
     /// Recipient DID (server DID).
     pub target_did: String,
-    /// DIDComm message-type URI (`MSG_DOMAIN_*` / `MSG_SYNC_*` etc).
+    /// Trust Task Type URI (`MSG_REPLICA_DOMAIN_*` / `MSG_SYNC_*` etc).
     pub msg_type: String,
     /// Body as serialized by the original send helper.
     pub body: Value,
@@ -272,7 +272,36 @@ pub async fn remove(store: &Store, key: Vec<u8>) -> Result<(), AppError> {
     outbox_ks(store)?.remove(key).await
 }
 
-/// Bump attempts + backoff timer + last_error on the existing row.
+/// Serialises the updates that rewrite an outbox row with the removals that
+/// retire it. The worker reads a row, delivers it, then rewrites it
+/// ([`record_sent`] / [`record_failure`]); a removal in between — an
+/// acknowledgement, or [`drop_queued`] superseding a purge — must not be undone
+/// by that rewrite, or a dropped purge comes back, is re-signed with a fresh
+/// `issuedAt`, and passes the edge's `stalePurge` check after the re-assign.
+static ROW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Rewrite `key` with `next` only if the row is still queued.
+async fn rewrite_if_present(
+    store: &Store,
+    key: Vec<u8>,
+    next: &OutboxEntry,
+) -> Result<(), AppError> {
+    let _guard = ROW_LOCK.lock().await;
+    let ks = outbox_ks(store)?;
+    if !ks.contains_key(key.clone()).await? {
+        return Ok(());
+    }
+    ks.insert(key, next).await
+}
+
+/// Remove `key` under [`ROW_LOCK`], so no in-flight rewrite resurrects it.
+async fn retire(store: &Store, key: Vec<u8>) -> Result<(), AppError> {
+    let _guard = ROW_LOCK.lock().await;
+    remove(store, key).await
+}
+
+/// Bump attempts + backoff timer + last_error on the existing row. A row
+/// removed meanwhile stays removed.
 pub async fn record_failure(
     store: &Store,
     key: Vec<u8>,
@@ -286,11 +315,12 @@ pub async fn record_failure(
         awaiting_ack: None,
         ..entry.clone()
     };
-    outbox_ks(store)?.insert(key, &next).await
+    rewrite_if_present(store, key, &next).await
 }
 
 /// Record that the entry was handed to the transport as document `doc_id`;
-/// it now waits up to [`ACK_TIMEOUT_SECS`] for the target's ack.
+/// it now waits up to [`ACK_TIMEOUT_SECS`] for the target's ack. A row removed
+/// meanwhile stays removed.
 pub async fn record_sent(
     store: &Store,
     key: Vec<u8>,
@@ -303,7 +333,27 @@ pub async fn record_sent(
         awaiting_ack: Some(doc_id.to_string()),
         ..entry.clone()
     };
-    outbox_ks(store)?.insert(key, &next).await
+    rewrite_if_present(store, key, &next).await
+}
+
+/// Drop every entry queued for `target_did` under `msg_type` whose body
+/// `matches` — an op a later decision has superseded. An entry already sent and
+/// awaiting its acknowledgement is dropped too: if the target applies it after
+/// all, the ack settles nothing. Returns how many were dropped.
+pub async fn drop_queued(
+    store: &Store,
+    target_did: &str,
+    msg_type: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> Result<usize, AppError> {
+    let mut dropped = 0;
+    for (key, entry) in list_pending_for_target(store, target_did).await? {
+        if entry.msg_type == msg_type && matches(&entry.body) {
+            retire(store, key).await?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// The target `signer` acknowledged (or terminally refused) document `doc_id`:
@@ -315,7 +365,7 @@ pub async fn record_sent(
 pub async fn acknowledge(store: &Store, signer: &str, doc_id: &str) -> Result<bool, AppError> {
     for (key, entry) in list_pending_for_target(store, signer).await? {
         if entry.awaiting_ack.as_deref() == Some(doc_id) {
-            remove(store, key).await?;
+            retire(store, key).await?;
             return Ok(true);
         }
     }
@@ -334,15 +384,8 @@ pub async fn signed_document(
     entry: &OutboxEntry,
     signer: &Secret,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, Box<dyn std::error::Error + Send + Sync>> {
-    // Entries queued before the upsert op moved onto a Trust Task Type URI.
-    let type_uri = match entry.msg_type.as_str() {
-        did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT_LEGACY => {
-            did_hosting_common::didcomm_types::MSG_DOMAIN_UPSERT
-        }
-        other => other,
-    };
     build_signed_request(
-        type_uri,
+        &entry.msg_type,
         control_did,
         &entry.target_did,
         entry.body.clone(),
@@ -652,6 +695,43 @@ mod tests {
         assert!(t.ends_with('…'));
         // 200 char prefix + … (1 char in str sense; multi-byte)
         assert_eq!(t.chars().count(), 201);
+    }
+
+    /// A row dropped while the worker is delivering it stays dropped: the
+    /// worker's rewrite after the send must not bring back a purge that a
+    /// re-assign superseded.
+    #[tokio::test]
+    async fn a_row_dropped_mid_delivery_is_not_resurrected() {
+        let store = fjall_store().await;
+        enqueue(
+            &store,
+            "did:example:edge",
+            "purge",
+            json!({"domain": "a.example"}),
+        )
+        .await
+        .unwrap();
+        // The worker has read the row and is sending it...
+        let (key, entry) = list_pending_for_target(&store, "did:example:edge")
+            .await
+            .unwrap()
+            .remove(0);
+        // ...when a re-assign drops it.
+        let dropped = drop_queued(&store, "did:example:edge", "purge", |_| true)
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+        record_sent(&store, key.clone(), &entry, "urn:uuid:doc-1")
+            .await
+            .unwrap();
+        record_failure(&store, key, &entry, "boom").await.unwrap();
+        assert!(
+            list_pending_for_target(&store, "did:example:edge")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the dropped purge stays dropped"
+        );
     }
 
     /// An entry is removed only on its own target's acknowledgement of the

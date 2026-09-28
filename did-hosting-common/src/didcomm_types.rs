@@ -20,10 +20,8 @@
 //! `*-confirm` / `*-offer` / `*-ack` response) collapses to the
 //! framework `<type>#response` convention (SPEC §4.4.1).
 //!
-//! `MSG_DOMAIN_UPSERT` + `MSG_DOMAIN_UPSERT_ACK` stay on the legacy
-//! `affinidi.com/...` namespace because they're control-plane
-//! → server internal traffic with no Trust-Task spec covering them.
-//! All other constants are canonical.
+//! Control plane → hosting server domain replication uses the
+//! `did-management/replica/domain/*` specifications (`MSG_REPLICA_DOMAIN_*`).
 
 // ---------------------------------------------------------------------------
 // Authentication
@@ -158,59 +156,86 @@ pub const MSG_STATS_ACK: &str =
     "https://trusttasks.org/spec/did-management/server/stats-sync/0.1#response";
 
 // ---------------------------------------------------------------------------
-// Domain assignment (control plane → server, T28)
+// Domain replication (control plane → hosting server)
 // ---------------------------------------------------------------------------
 //
-// The control plane is the source of truth for which domains a server
-// hosts. It pushes `MSG_DOMAIN_ASSIGN` to claim a domain on a
-// registered server and `MSG_DOMAIN_UNASSIGN` to release it. Both are
-// idempotent — re-assigning an already-assigned domain or
-// unassigning an already-unassigned one is a no-op (no audit-log
-// noise). The unassign side queues a `pending_purges` entry; the
-// actual content purge runs in the background sweep (T30) after the
-// configured grace period.
+// The control plane is the source of record for its hosting domains and for
+// which server hosts which. It replicates both with the
+// `did-management/replica/domain/*` directives, which only the server's one
+// configured control plane may send. They are not the administrator-facing
+// `did-management/domain/*` tasks, which an administrator sends the control
+// plane; those are served by `did-hosting-control` from their generated types.
+//
+// Every directive is idempotent, travels through the control plane's durable
+// outbox, and is settled by the server's signed `#response` (or a signed,
+// non-retryable refusal).
 
-pub const MSG_DOMAIN_ASSIGN: &str = "https://trusttasks.org/spec/did-management/domain/assign/0.1";
-pub const MSG_DOMAIN_ASSIGN_ACK: &str =
-    "https://trusttasks.org/spec/did-management/domain/assign/0.1#response";
-pub const MSG_DOMAIN_UNASSIGN: &str =
-    "https://trusttasks.org/spec/did-management/domain/unassign/0.1";
-pub const MSG_DOMAIN_UNASSIGN_ACK: &str =
-    "https://trusttasks.org/spec/did-management/domain/unassign/0.1#response";
+/// `replica/domain/assign/0.1`: the server records the assignment on its own
+/// clock and cancels any purge it had scheduled for the domain.
+pub const MSG_REPLICA_DOMAIN_ASSIGN: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/assign/0.1";
+pub const MSG_REPLICA_DOMAIN_ASSIGN_ACK: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/assign/0.1#response";
 
-/// Replicate a `DomainEntry` from the control plane to a server.
-/// Covers create / update / disable / enable in one message — the
-/// server reacts to the `status` + `disabled_at` / `purge_at` fields:
-///
-/// - `status: "active"` (timestamps unset) → ensure local entry is
-///   Active, cancel any pending purge.
-/// - `status: "disabled"` (timestamps set) → ensure local entry is
-///   Disabled, schedule a `disable-grace` pending_purge using the
-///   carried timestamps so the server's sweeper deletes the entry +
-///   hosted DIDs when grace expires.
-///
-/// Idempotent — re-sending the same entry is a no-op on the server.
-/// Servers that don't yet `assigned` the domain still apply the
-/// upsert so the entry is ready when they later receive a
-/// `domain/assign`.
-///
-/// Carried as a signed Trust Task document like every other control→edge op,
-/// so it needs a Type URI the framework parses; the retired
-/// `affinidi.com/webvh/1.0/domain/upsert` string is not one. An outbox entry
-/// queued under it by an older control plane is delivered under this URI (see
-/// [`MSG_DOMAIN_UPSERT_LEGACY`]).
-pub const MSG_DOMAIN_UPSERT: &str = "https://trusttasks.org/spec/did-management/domain/upsert/0.1";
-pub const MSG_DOMAIN_UPSERT_ACK: &str =
-    "https://trusttasks.org/spec/did-management/domain/upsert/0.1#response";
-/// The pre-Trust-Task spelling of [`MSG_DOMAIN_UPSERT`]. Only ever read, from
-/// outbox entries persisted before the rename.
-pub const MSG_DOMAIN_UPSERT_LEGACY: &str = "https://affinidi.com/webvh/1.0/domain/upsert";
+/// `replica/domain/unassign/0.1`: the server stops accepting content for the
+/// domain and schedules its deletion after its grace period (`purgeAt`).
+pub const MSG_REPLICA_DOMAIN_UNASSIGN: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/unassign/0.1";
+pub const MSG_REPLICA_DOMAIN_UNASSIGN_ACK: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/unassign/0.1#response";
 
-/// Admin "Purge now" Trust Task (T30). Bypasses the grace period
-/// scheduled by an unassignment and deletes every DID on the named
-/// domain immediately. The receiving server audit-logs the reason as
-/// `admin-immediate` so a compliance audit can distinguish a normal
-/// grace-expired purge from an admin-triggered one.
-pub const MSG_DOMAIN_PURGE: &str = "https://trusttasks.org/spec/did-management/domain/purge/0.1";
-pub const MSG_DOMAIN_PURGE_ACK: &str =
-    "https://trusttasks.org/spec/did-management/domain/purge/0.1#response";
+/// `replica/domain/upsert/0.1`: the server's copy of a domain record becomes
+/// the carried `entry`, whole. `status: disabled` schedules the purge at
+/// `entry.purgeAt`; `status: active` cancels any scheduled purge.
+pub const MSG_REPLICA_DOMAIN_UPSERT: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/upsert/0.1";
+pub const MSG_REPLICA_DOMAIN_UPSERT_ACK: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/upsert/0.1#response";
+
+/// `replica/domain/purge/0.1`: delete the domain's content now. Refused with
+/// `stalePurge` when the server holds an assignment of the domain made after
+/// the directive's `issuedAt`.
+pub const MSG_REPLICA_DOMAIN_PURGE: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/purge/0.1";
+pub const MSG_REPLICA_DOMAIN_PURGE_ACK: &str =
+    "https://trusttasks.org/spec/did-management/replica/domain/purge/0.1#response";
+
+#[cfg(all(test, feature = "server-core"))]
+mod tests {
+    use super::*;
+    use trust_tasks_rs::Payload;
+    use trust_tasks_rs::specs::did_management::replica::domain::{assign, purge, unassign, upsert};
+
+    /// The replica constants are the generated specifications' Type URIs, so a
+    /// directive the control plane sends is one the server's typed handler reads.
+    #[test]
+    fn replica_constants_are_the_generated_type_uris() {
+        for (constant, generated) in [
+            (MSG_REPLICA_DOMAIN_ASSIGN, assign::v0_1::Payload::TYPE_URI),
+            (
+                MSG_REPLICA_DOMAIN_ASSIGN_ACK,
+                assign::v0_1::Response::TYPE_URI,
+            ),
+            (
+                MSG_REPLICA_DOMAIN_UNASSIGN,
+                unassign::v0_1::Payload::TYPE_URI,
+            ),
+            (
+                MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+                unassign::v0_1::Response::TYPE_URI,
+            ),
+            (MSG_REPLICA_DOMAIN_UPSERT, upsert::v0_1::Payload::TYPE_URI),
+            (
+                MSG_REPLICA_DOMAIN_UPSERT_ACK,
+                upsert::v0_1::Response::TYPE_URI,
+            ),
+            (MSG_REPLICA_DOMAIN_PURGE, purge::v0_1::Payload::TYPE_URI),
+            (
+                MSG_REPLICA_DOMAIN_PURGE_ACK,
+                purge::v0_1::Response::TYPE_URI,
+            ),
+        ] {
+            assert_eq!(constant, generated);
+        }
+    }
+}

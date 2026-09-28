@@ -2,7 +2,7 @@
 //!
 //! Each running server keeps a local record of which domains it is
 //! currently authoritative for. The list is populated by inbound
-//! `MSG_DOMAIN_ASSIGN` / `MSG_DOMAIN_UNASSIGN` Trust Tasks from the
+//! `replica/domain/assign` / `replica/domain/unassign` Trust Tasks from the
 //! control plane (T28) and read on cold start before the control
 //! plane is reachable (T29's fallback chain).
 //!
@@ -97,6 +97,32 @@ pub async fn assign(
     Ok(AssignOutcome::Created(entry))
 }
 
+/// Record a control plane's assignment of `domain` to this server, at
+/// `now_epoch` — also when the domain is already assigned.
+///
+/// This is `replica/domain/assign/0.1`'s rule: a re-assignment *refreshes* the
+/// assignment time, because that time is what `replica/domain/purge/0.1`'s
+/// freshness check compares a purge's `issuedAt` against. A purge issued before
+/// the operator re-assigned the domain must never wipe it. (The first-boot seed
+/// uses [`assign`], which keeps an existing row as it is.)
+pub async fn record_assignment(
+    store: &Store,
+    domain: &str,
+    assigner: &str,
+    now_epoch: u64,
+) -> Result<AssignmentEntry, AppError> {
+    let entry = AssignmentEntry {
+        domain: domain.to_string(),
+        assigned_at: now_epoch,
+        assigner: assigner.to_string(),
+    };
+    store
+        .keyspace(KS_ASSIGNMENTS)?
+        .insert(assignment_key(domain), &entry)
+        .await?;
+    Ok(entry)
+}
+
 /// Unassign `domain` from this server. Idempotent.
 pub async fn unassign(store: &Store, domain: &str) -> Result<UnassignOutcome, AppError> {
     let ks = store.keyspace(KS_ASSIGNMENTS)?;
@@ -164,6 +190,19 @@ mod tests {
             "re-assign must preserve original timestamp"
         );
         assert_eq!(entry.assigner, "did:example:control");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_assignment_refreshes_its_time() {
+        let store = fjall_store().await;
+        record_assignment(&store, "example.com", "did:example:control", 100)
+            .await
+            .unwrap();
+        record_assignment(&store, "example.com", "did:example:control", 200)
+            .await
+            .unwrap();
+        let entry = get(&store, "example.com").await.unwrap().unwrap();
+        assert_eq!(entry.assigned_at, 200);
     }
 
     #[tokio::test]
