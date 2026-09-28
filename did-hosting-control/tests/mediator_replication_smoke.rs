@@ -275,6 +275,7 @@ async fn edge_state(
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
+        replication: Default::default(),
         control_did: Some(control_did.to_string()),
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -296,6 +297,9 @@ async fn edge_state(
             Duration::from_secs(60),
         )),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
     };
     (state, dir)
 }
