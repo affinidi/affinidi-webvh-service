@@ -1451,7 +1451,6 @@ async fn build_control(
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
-        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),

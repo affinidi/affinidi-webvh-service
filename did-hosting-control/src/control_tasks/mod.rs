@@ -46,6 +46,7 @@ pub(crate) mod enrol;
 mod enrol_tests;
 #[cfg(test)]
 pub(crate) mod harness;
+pub(crate) mod queries;
 pub(crate) mod registry;
 pub(crate) mod server;
 #[cfg(test)]

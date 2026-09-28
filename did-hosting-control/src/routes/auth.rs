@@ -1,4 +1,6 @@
-//! DIDComm challenge-response authentication routes.
+//! The browser sign-in routes that have no Trust Task form: the SIOPv2
+//! challenge and `id_token` authenticate, and the console's session refresh.
+//! See `routes/mod.rs` for why each stays plain HTTP.
 
 use std::net::SocketAddr;
 
@@ -6,15 +8,11 @@ use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde_json::Value;
 use tracing::{info, warn};
-use trust_tasks_rs::TrustTask;
 
-use did_hosting_common::server::auth::constant_time_eq;
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
-use crate::auth::AuthClaims;
-use crate::auth::session::{self, now_epoch};
+use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;
@@ -134,12 +132,13 @@ pub(crate) async fn issue_challenge(
 
 /// POST /api/auth/ — authenticate with a SIOPv2 self-issued `id_token`.
 ///
-/// The request body is a Trust-Task-shaped envelope whose `type` is the
-/// flat, exact-match-routed `did-hosting/auth/authenticate/1.0` URL and
-/// whose `payload` carries an [`AuthenticatePayload`] (`id_token`,
-/// `session_id`, optional `session_pubkey_b58btc`). Because that flat URL
-/// is not a framework `/spec/<slug>/<ver>` `TypeUri`, the envelope is
-/// parsed by hand rather than as a `trust_tasks_rs::TrustTask<Value>`.
+/// The request body is a Trust-Task-shaped envelope whose `type` is
+/// `auth/authenticate/0.1` and whose `payload` carries an
+/// [`AuthenticatePayload`] (`id_token`, `session_id`, optional
+/// `session_pubkey_b58btc`) — not that spec's payload, so the envelope is
+/// parsed by hand rather than as a typed `TrustTask`. This is the one sign-in
+/// with no Trust Task form: the `id_token` is minted by the holder's VTA
+/// (`vault/proxy-login`), and `auth/authenticate/0.2` carries none.
 ///
 /// The `id_token` is a compact EdDSA JWS the wallet self-issues, signed
 /// by its `did:key`. We verify it by resolving the issuer DID and
@@ -156,31 +155,6 @@ pub async fn authenticate(
     use did_hosting_common::server::didcomm_unpack;
 
     let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
-
-    // ─── 0. Content-negotiate the request-body shape.
-    //
-    // Two authenticate dialects share this endpoint (additive — the
-    // SIOPv2 path below is the default and unchanged):
-    //
-    // - SIOPv2 id_token Trust-Task envelope `{type, payload}` — the
-    //   wallet/control contract handled inline below.
-    // - DIDComm-v2 JWS envelope — a general-JSON JWS carrying a
-    //   `signatures` array (no Trust-Task `type` field). This is what
-    //   `did-hosting-server` accepts and what a provisioning VTA sends
-    //   (`build_authenticate_message`: type
-    //   `https://trusttasks.org/spec/auth/authenticate/0.1`, body
-    //   `{session_id, challenge}`, `pack_signed` by the VTA DID). Because
-    //   the unified daemon mounts *this* control route (not the server's
-    //   `/auth/`), a VTA publish would otherwise fail with `400 missing
-    //   field type`. We detect the JWS by its top-level `signatures`
-    //   array and dispatch to the DIDComm path.
-    //
-    // A JWS envelope has no Trust-Task `type` field, and the SIOPv2
-    // envelope has no `signatures` array, so the shapes are unambiguous
-    // and neither dialect can be misrouted.
-    if is_didcomm_jws_envelope(&body) {
-        return authenticate_didcomm_jws(&state, &body, did_resolver).await;
-    }
 
     // ─── 1. Parse the Trust-Task envelope.
     #[derive(serde::Deserialize)]
@@ -199,7 +173,7 @@ pub async fn authenticate(
         }
     };
 
-    let expected_type = did_hosting_common::did_hosting_tasks::TASK_AUTH_AUTHENTICATE_0_1.as_str();
+    let expected_type = AUTHENTICATE_TASK_URI;
     if envelope.type_uri != expected_type {
         return Ok(trust_task_malformed(&format!(
             "unexpected Trust-Task type: expected {expected_type}, got {}",
@@ -288,7 +262,7 @@ pub async fn authenticate(
             session_id: payload.session_id.clone(),
             challenge: verified.nonce.clone(),
             signer_did: signer_did.clone(),
-            // SIOPv2 / REST — no DIDComm created_time to thread.
+            // SIOPv2 — no message created_time to thread.
             created_time: None,
             session_pubkey_b58btc,
             // The id_token's `aud` was checked against `server_did` above.
@@ -307,107 +281,6 @@ pub async fn authenticate(
                 .pending_challenges
                 .release_session(&payload.session_id);
             info!(did = %signer_did, "authenticated via SIOPv2 id_token");
-            Ok(Json(canonical_to_local_auth_response(resp)).into_response())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Cheap structural check: does `body` look like a DIDComm-v2 general-JSON
-/// JWS envelope (a top-level `signatures` array)?
-///
-/// The SIOPv2 Trust-Task envelope this route otherwise expects is
-/// `{type, payload}` with no `signatures` array, so a `true` here
-/// unambiguously means "route to the DIDComm-JWS path". A body that is
-/// neither shape (e.g. junk) returns `false` and falls through to the
-/// SIOPv2 parser, which emits the existing `trust-task-error` document —
-/// so the malformed-request behaviour for non-JWS bodies is unchanged.
-fn is_didcomm_jws_envelope(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    value
-        .get("signatures")
-        .and_then(|s| s.as_array())
-        .is_some_and(|arr| !arr.is_empty())
-}
-
-/// Authenticate via a DIDComm-v2 JWS envelope (the `did-hosting-server`
-/// contract) — the second dialect this endpoint accepts, in addition to
-/// the default SIOPv2 id_token path.
-///
-/// This mirrors `did-hosting-server`'s `routes/auth.rs::authenticate`:
-/// `unpack_signed` verifies the JWS signature and binds the *verified*
-/// signer base DID (an attacker cannot forge `from`), the message `type`
-/// must be the authenticate task URI, and the `{session_id, challenge}`
-/// body is threaded into the same canonical `handle_authenticate` the
-/// SIOPv2 path uses. The canonical handler re-looks-up the signer's ACL
-/// role, so a signer that is not in the ACL is still rejected — this
-/// path adds an accepted *envelope shape*, not a trust relaxation. The
-/// provisioning VTA is authorised only because setup seeded its ACL
-/// entry (see `acl::seed_provisioning_vta_acl`).
-async fn authenticate_didcomm_jws(
-    state: &AppState,
-    body: &[u8],
-    did_resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
-) -> Result<Response, AppError> {
-    use did_hosting_common::server::didcomm_unpack;
-
-    let body_str = std::str::from_utf8(body)
-        .map_err(|e| AppError::Authentication(format!("JWS body is not valid UTF-8: {e}")))?;
-
-    let (msg, signer_did) = didcomm_unpack::unpack_signed(body_str, did_resolver).await?;
-
-    // #207: a signed message is forwardable, so it must be addressed here.
-    didcomm_unpack::require_addressed_to(&msg, state.config.server_did.as_deref())?;
-
-    // The canonical authenticate Type URI — the same one did-hosting-server
-    // accepts, so the VTA's envelope routes here verbatim. The legacy
-    // `affinidi.com/webvh/1.0/authenticate` arm that sat beside it is gone:
-    // it was the last thing keeping a retired vendor URI alive on this
-    // route, and a second accepted spelling is a second thing to keep true.
-    if msg.typ.as_str() != "https://trusttasks.org/spec/auth/authenticate/0.1" {
-        return Err(AppError::Authentication(format!(
-            "unexpected message type: {}",
-            msg.typ
-        )));
-    }
-
-    let challenge = msg
-        .body
-        .get("challenge")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing challenge in message body".into()))?
-        .to_string();
-    let session_id = msg
-        .body
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?
-        .to_string();
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)?;
-    let result = vti_common::auth::handlers::handle_authenticate(
-        &backend,
-        vti_common::auth::AuthenticateInput {
-            session_id: session_id.clone(),
-            challenge,
-            signer_did: signer_did.clone(),
-            created_time: msg.created_time,
-            session_pubkey_b58btc: None,
-            // `require_addressed_to` above has already bound the signed
-            // message to this service's DID (#207).
-            audience: vti_common::auth::AudienceBinding::Transport,
-        },
-    )
-    .await;
-
-    match result {
-        Ok(resp) => {
-            // Release the pending-challenge slot on success, mirroring
-            // the SIOPv2 path's bookkeeping.
-            state.pending_challenges.release_session(&session_id);
-            info!(did = %signer_did, "authenticated via DIDComm-JWS envelope");
             Ok(Json(canonical_to_local_auth_response(resp)).into_response())
         }
         Err(e) => Err(e),
@@ -496,356 +369,22 @@ fn trust_task_malformed(reason: &str) -> Response {
         .into_response()
 }
 
-/// Build the signed `auth/step-up/approve-request/0.2` document.
+/// POST /api/auth/refresh — renew a console session.
 ///
-/// A full Trust Task document per the spec: `issuer` = the control DID
-/// (the relying party), `recipient` = the subject DID (self-approve
-/// path — the wallet holding the subject key is the approver), and the
-/// spec's REQUIRED Data Integrity proof (`eddsa-jcs-2022`,
-/// `proofPurpose: authentication`) signed with the control DID's
-/// operational key, so the wallet can verify the `reason` it renders is
-/// this RP's before surfacing it. The payload carries exactly the
-/// schema's REQUIRED members (`subject`, `sessionId`, `challenge`,
-/// `reason`); the schema is closed (`additionalProperties: false`) and
-/// has no `expiresAt` — expiry is the RP's server-side nonce policy.
-async fn build_signed_step_up_approve_request(
-    control_did: &str,
-    signing_secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
-    subject: &str,
-    session_id: &str,
-    challenge: &str,
-    reason: &str,
-) -> Result<Value, AppError> {
-    use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
-
-    let unsigned = serde_json::json!({
-        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": TASK_AUTH_STEP_UP_VTA_START_0_2.as_str(),
-        "issuer": control_did,
-        "recipient": subject,
-        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "payload": {
-            "subject": subject,
-            "sessionId": session_id,
-            "challenge": challenge,
-            "reason": reason,
-        },
-    });
-    crate::signing::sign_trust_task_document(unsigned, signing_secret).await
-}
-
-/// POST /api/auth/step-up/vta/start — issue a step-up nonce bound to the
-/// caller's session, minted as a signed
-/// `auth/step-up/approve-request/0.2` Trust Task document. The wallet
-/// verifies the document's proof, shows the `reason`, and signs an
-/// approve-response committing to the `challenge`.
-///
-/// Response shape (coordinated-rollout superset):
-/// - `document` — the signed `auth/step-up/approve-request/0.2` Trust
-///   Task document. New consumers MUST use this.
-/// - `subject`, `sessionId`, `challenge`, `reason` — **deprecated**
-///   legacy top-level copies of the document's payload fields, kept
-///   verbatim for existing consumers that parse the bare shape. They
-///   will be removed once the wallet side reads `document`.
-pub async fn step_up_vta_start(
-    auth: AuthClaims,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // The control DID signs the request; both are required to finish the
-    // flow anyway (`step_up_vta_finish` needs `server_did` + verifier).
-    let control_did = state.config.server_did.as_deref().ok_or_else(|| {
-        AppError::Config("server_did not configured; cannot sign the step-up request".into())
-    })?;
-    let signing_secret = crate::signing::control_signing_secret(&state, control_did)?;
-
-    let challenge = rand::random::<[u8; 32]>()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    // Spec `auth/step-up/approve-request/0.2` payload fields. The subject is
-    // the session's authenticated DID; the wallet signs an approve-response
-    // that echoes `subject`/`sessionId`/`challenge` and proves control of the
-    // subject key (holder-self-signs — the VTA is no longer in the loop).
-    let reason = "Elevate this session to aal2";
-    let document = build_signed_step_up_approve_request(
-        control_did,
-        &signing_secret,
-        &auth.did,
-        &auth.session_id,
-        &challenge,
-        reason,
-    )
-    .await?;
-
-    // Persist the nonce only after the document signed, so a signing
-    // failure leaves no orphaned challenge bound to the session.
-    state
-        .sessions_ks
-        .insert_raw(
-            format!("stepup-nonce:{}", auth.session_id),
-            challenge.as_bytes().to_vec(),
-        )
-        .await?;
-
-    Ok(Json(serde_json::json!({
-        // Deprecated legacy fields — kept for wire compatibility during
-        // the coordinated rollout; consumers should move to `document`.
-        "subject": auth.did,
-        "sessionId": auth.session_id,
-        "challenge": challenge,
-        "reason": reason,
-        "document": document,
-    })))
-}
-
-/// POST /api/auth/step-up/vta/finish — verify the wallet's signed
-/// `auth/step-up/approve-response/0.2` document and elevate the caller's
-/// session to `aal2`.
-///
-/// Converged to the holder-self-signs model (trusttasks-tf
-/// `auth/step-up/approve-response/0.2`): the wallet — not the VTA — signs the
-/// approval with a W3C Data Integrity proof (`eddsa-jcs-2022`) over the
-/// session-subject key, and the RP verifies that proof. The proof binds the
-/// user's fresh possession of the subject DID to the step-up `challenge`; the
-/// VTA is no longer a trusted third party for step-up.
-// The `_0_1` task const is deprecated in favour of `_0_2`, but we still
-// accept the 0.1 type URI on inbound for backwards compatibility.
-#[allow(deprecated)]
-pub async fn step_up_vta_finish(
-    State(state): State<AppState>,
-    auth: AuthClaims,
-    Json(doc): Json<TrustTask<Value>>,
-) -> Result<Json<did_hosting_common::server::auth::session::TokenResponse>, AppError> {
-    use did_hosting_common::did_hosting_tasks::{
-        TASK_AUTH_STEP_UP_VTA_FINISH_0_1, TASK_AUTH_STEP_UP_VTA_FINISH_0_2,
-    };
-
-    let rp_id = state
-        .config
-        .server_did
-        .as_deref()
-        .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
-    let jwt_keys = state
-        .jwt_keys
-        .as_deref()
-        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
-
-    // ─── 1. Task type: approve-response/0.2 (0.1 accepted as legacy alias).
-    let type_uri = doc.type_uri.to_string();
-    if type_uri != TASK_AUTH_STEP_UP_VTA_FINISH_0_2.as_str()
-        && type_uri != TASK_AUTH_STEP_UP_VTA_FINISH_0_1.as_str()
-    {
-        return Err(AppError::Authentication(format!(
-            "unexpected step-up document type: {type_uri}"
-        )));
-    }
-
-    // ─── 2. Typed payload fields.
-    let payload = &doc.payload;
-    let field = |k: &str| payload.get(k).and_then(Value::as_str);
-    let subject = field("subject")
-        .ok_or_else(|| AppError::Authentication("approve-response missing subject".into()))?;
-    let session_id = field("sessionId")
-        .ok_or_else(|| AppError::Authentication("approve-response missing sessionId".into()))?;
-    let challenge = field("challenge")
-        .ok_or_else(|| AppError::Authentication("approve-response missing challenge".into()))?;
-    let decision = field("decision")
-        .ok_or_else(|| AppError::Authentication("approve-response missing decision".into()))?;
-
-    // ─── 3. A signed refusal is valid but elevates nothing.
-    if decision != "approved" {
-        return Err(AppError::Forbidden(format!(
-            "step-up not approved (decision: {decision})"
-        )));
-    }
-
-    // ─── 4. The proof is mandatory in the converged flow.
-    let proof = doc
-        .proof
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("approve-response carries no proof".into()))?;
-
-    // ─── 5. Proof-verificationMethod ↔ session binding (SECURITY). The
-    //        approval must be signed by the session subject's OWN key. Without
-    //        this, the framework verifier would accept a proof from ANY
-    //        resolvable DID and let a holder elevate a session belonging to a
-    //        different subject. A session key bound at login never qualifies,
-    //        even for its own session: an approval is an `assertionMethod`
-    //        attestation, and a session key must never make one
-    //        (`auth/authenticate/0.2` Conformance item 11). Otherwise a stolen
-    //        session key could approve its own step-up.
-    let proof_did = proof
-        .verification_method
-        .split_once('#')
-        .map(|(d, _)| d)
-        .unwrap_or("");
-    if proof_did != auth.did {
-        warn!(%proof_did, authed = %auth.did,
-            "step-up rejected: approval not signed by the authenticated subject's own key");
-        return Err(AppError::Authentication(
-            "approval must be signed by the authenticated subject's own key".into(),
-        ));
-    }
-
-    // ─── 6. Verify the eddsa-jcs-2022 signature against the resolved key.
-    let verifier = state
-        .trust_tasks_verifier
-        .as_deref()
-        .ok_or_else(|| AppError::Config("trust-tasks proof verifier not configured".into()))?;
-    //        An approval is the holder's attestation: `assertionMethod` purpose,
-    //        a key listed under `assertionMethod`, and — for `did:webvh` — a
-    //        signer that has not deactivated its DID.
-    verifier.verify_approval(&doc).await.map_err(|e| {
-        warn!(error = %e, "step-up rejected: approve-response proof failed verification");
-        AppError::Authentication("approve-response proof failed verification".into())
-    })?;
-
-    // ─── 7. Framework bindings.
-    if subject != auth.did {
-        warn!(authed = %auth.did, %subject, "step-up rejected: approval subject mismatch");
-        return Err(AppError::Authentication(
-            "approval subject does not match the authenticated DID".into(),
-        ));
-    }
-    if session_id != auth.session_id {
-        return Err(AppError::Authentication(
-            "approval sessionId does not match the authenticated session".into(),
-        ));
-    }
-    if let Some(issuer) = doc.issuer.as_deref()
-        && issuer != subject
-    {
-        return Err(AppError::Authentication(
-            "approval issuer does not match subject".into(),
-        ));
-    }
-    // Audience binding (SPEC §4.8.2): the signed `recipient` binds the proof to
-    // this RP, so an approval captured elsewhere can't be replayed here.
-    match doc.recipient.as_deref() {
-        Some(r) if r == rp_id => {}
-        _ => {
-            return Err(AppError::Authentication(
-                "approval recipient does not bind this service".into(),
-            ));
-        }
-    }
-
-    // ─── 8. Consume the session-bound challenge (single use).
-    let stored = state
-        .sessions_ks
-        .take_raw(format!("stepup-nonce:{}", auth.session_id))
-        .await?
-        .ok_or_else(|| {
-            AppError::Authentication("no step-up challenge issued for this session".into())
-        })?;
-    let stored = String::from_utf8(stored)
-        .map_err(|e| AppError::Internal(format!("stored challenge not utf8: {e}")))?;
-    if !constant_time_eq(stored.as_bytes(), challenge.as_bytes()) {
-        warn!(session_id = %auth.session_id, "step-up rejected: challenge mismatch");
-        return Err(AppError::Authentication(
-            "step-up challenge mismatch".into(),
-        ));
-    }
-
-    // ─── 9. Freshness: the proof `created` must be neither in the future nor
-    //        older than the step-up window (defence in depth on top of the
-    //        single-use challenge).
-    const CLOCK_SKEW_SECS: i64 = 60;
-    const MAX_PROOF_AGE_SECS: i64 = 300;
-    let now = now_epoch() as i64;
-    let created = proof.created.timestamp();
-    if created > now + CLOCK_SKEW_SECS {
-        return Err(AppError::Authentication(
-            "approval proof `created` is in the future".into(),
-        ));
-    }
-    if created < now - MAX_PROOF_AGE_SECS {
-        return Err(AppError::Authentication("approval proof is too old".into()));
-    }
-
-    // ─── 10. Elevate. The holder self-signed, so `amr` reflects `did` only
-    //         (the VTA is no longer part of the step-up assurance).
-    let role = crate::acl::check_acl(&state.acl_ks, &auth.did).await?;
-    let token_resp = session::elevate_session(
-        &state.sessions_ks,
-        jwt_keys,
-        &auth.session_id,
-        &role,
-        vec!["did".to_string()],
-        "aal2",
-        state.config.auth.access_token_expiry,
-        state.config.auth.refresh_token_expiry,
-    )
-    .await?;
-
-    info!(did = %auth.did, "step-up complete via wallet-signed approval: session elevated to aal2");
-    Ok(Json(token_resp))
-}
-
-/// POST /api/auth/refresh — refresh an access token.
-///
-/// Thin dispatcher: parse the JWS-signed DIDComm refresh
-/// envelope (proves the holder has the signing key, not just the
-/// bearer refresh token), then call the canonical refresh
-/// handler. The canonical handler atomically claims the
-/// refresh-token reverse-index, preserves the pre-rotation AAL,
-/// re-looks-up the ACL role, and mints a new session +
-/// access/refresh pair.
+/// The body is an `auth/refresh/0.1` document (see
+/// [`try_refresh_trust_task`]). The shared handler atomically claims the
+/// refresh-token reverse-index, preserves the pre-rotation AAL, re-looks-up
+/// the ACL role, and mints a new session + access/refresh pair.
 pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<did_hosting_common::RefreshResponse>, AppError> {
-    use did_hosting_common::server::didcomm_unpack;
-
-    // Plain Trust-Task dialect, tried first. The admin console has no
-    // DIDComm stack and never had one, so before this the refresh token it
-    // was handed at login was unusable — it discarded the token and let the
-    // session die instead. Byte-identical to the VTC's REST refresh, so one
-    // browser client speaks to both services with one document builder.
-    if let Some(resp) = try_refresh_trust_task(&state, &body).await? {
-        return Ok(Json(resp));
+    match try_refresh_trust_task(&state, &body).await? {
+        Some(resp) => Ok(Json(resp)),
+        None => Err(AppError::Authentication(format!(
+            "the body is not an {REFRESH_TASK_URI} document"
+        ))),
     }
-
-    let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
-
-    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
-
-    // The canonical refresh URI. This route accepted only
-    // `…/webvh/1.0/authenticate/refresh` — the one refresh acceptor in the
-    // workspace with no canonical arm, while `did-hosting-server` and
-    // `webvh-witness` took both. A client on the canonical form worked against
-    // those two and failed here, which is the same asymmetry that broke the
-    // wallet on the DIDComm router.
-    if msg.typ != REFRESH_TASK_URI {
-        return Err(AppError::Authentication(format!(
-            "unexpected message type: {}",
-            msg.typ
-        )));
-    }
-
-    let refresh_token = msg
-        .body
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?
-        .to_string();
-
-    // The DIDComm arm proves its sender through the signed envelope, so it
-    // needs no session-key binding — only the idle policy applies.
-    if let Some(session) = resolve_refresh_session(&state, &refresh_token).await? {
-        refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)?;
-    }
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
-    let resp = vti_common::auth::handlers::handle_refresh(
-        &backend,
-        vti_common::auth::RefreshInput {
-            refresh_token,
-            signer_did: Some(sender_base),
-        },
-    )
-    .await?;
-    Ok(Json(canonical_to_local_auth_response(resp)))
 }
 
 /// Load the session a refresh token belongs to, if any.
@@ -910,10 +449,9 @@ fn refuse_if_idle_session(
 
 /// Bind a REST refresh to the device that logged in.
 ///
-/// The DIDComm dialect proves its sender through the signed envelope. This
-/// one carries no envelope, so without a check here possession of the
-/// refresh token alone would authorise a rotation from anywhere — strictly
-/// weaker than the dialect it sits beside, on the same endpoint.
+/// The refresh document carries no envelope that proves its sender, so
+/// without a check here possession of the refresh token alone would authorise
+/// a rotation from anywhere.
 ///
 /// The binding reuses what the console already has: the passkey login flow
 /// generates an ephemeral Ed25519 keypair, sends its public multikey as
@@ -983,14 +521,13 @@ async fn verify_session_bound_proof(
 
 /// Refresh from a plain `auth/refresh/0.1` Trust Task document.
 ///
-/// Returns `Ok(None)` when the body is not such a document, so the DIDComm
-/// path still sees everything it used to.
+/// Returns `Ok(None)` when the body is not such a document.
 ///
 /// No proof is carried and none is required: the opaque refresh token *is*
 /// the bearer credential (RFC 6749 §10.4 rotation), verified by the shared
-/// handler's single-use rotating index. `signer_did` is therefore `None` —
-/// the same posture the DIDComm arm ends in, where the envelope proves who
-/// sent it but the token is what authorises the rotation.
+/// handler's single-use rotating index. `signer_did` is therefore `None`.
+/// A session with a bound key must also carry that key's proof
+/// ([`verify_session_bound_proof`]).
 async fn try_refresh_trust_task(
     state: &AppState,
     body: &str,
@@ -1034,16 +571,16 @@ async fn try_refresh_trust_task(
     Ok(Some(canonical_to_local_auth_response(resp)))
 }
 
-/// The canonical refresh Type URI, shared by both dialects.
+/// The refresh document's Type URI.
 const REFRESH_TASK_URI: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
+
+/// The Type URI of the SIOPv2 authenticate envelope.
+const AUTHENTICATE_TASK_URI: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    use affinidi_data_integrity::DidKeyResolver;
-    use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
     use serde_json::json;
 
     use did_hosting_common::server::auth::session::{Session, SessionState};
@@ -1083,8 +620,7 @@ mod tests {
     }
 
     /// A session that registered a key must prove possession of it. Without
-    /// this, a stolen refresh token alone would rotate the session — the
-    /// gap that made this dialect weaker than the DIDComm one beside it.
+    /// this, a stolen refresh token alone would rotate the session.
     #[tokio::test]
     async fn a_bound_session_refresh_without_a_proof_is_refused() {
         let session = session_with(Some("z6MkExampleKeyMaterialNotReal"), 0);
@@ -1138,65 +674,5 @@ mod tests {
         let err =
             refuse_if_idle_session(&stale, 900).expect_err("1200s idle is outside a 900s window");
         assert!(format!("{err}").contains("inactivity"), "{err}");
-    }
-
-    /// The step-up approve-request document's proof verifies with the
-    /// same machinery the finish leg uses (`TransportBoundVerifier`),
-    /// and the issuer binding holds: `issuer` == control DID == the DID
-    /// of `proof.verificationMethod`.
-    #[tokio::test]
-    async fn signed_step_up_request_verifies_and_binds_issuer() {
-        use did_hosting_common::did_hosting_tasks::TASK_AUTH_STEP_UP_VTA_START_0_2;
-        use trust_tasks_rs::ProofVerifier;
-
-        let (control_did, signer) = crate::signing::test_util::did_key_signer(&[13u8; 32]);
-
-        let subject = "did:web:alice.example";
-        let session_id = "sess-1234";
-        let challenge = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        let document = build_signed_step_up_approve_request(
-            &control_did,
-            &signer,
-            subject,
-            session_id,
-            challenge,
-            "Elevate this session to aal2",
-        )
-        .await
-        .expect("build + sign");
-
-        // Envelope shape per the spec: RP as issuer, approver (the
-        // subject wallet, self-approve path) as recipient.
-        assert_eq!(document["type"], TASK_AUTH_STEP_UP_VTA_START_0_2.as_str());
-        assert_eq!(document["issuer"], control_did);
-        assert_eq!(document["recipient"], subject);
-        assert_eq!(document["payload"]["subject"], subject);
-        assert_eq!(document["payload"]["sessionId"], session_id);
-        assert_eq!(document["payload"]["challenge"], challenge);
-
-        // Proof binding: operational key of the issuer DID, eddsa-jcs-2022.
-        let vm = document["proof"]["verificationMethod"]
-            .as_str()
-            .expect("proof carries a verificationMethod");
-        assert_eq!(vm.split('#').next().unwrap(), control_did);
-        assert_eq!(document["proof"]["cryptosuite"], "eddsa-jcs-2022");
-        // A request is the service's operational message, not an attestation.
-        assert_eq!(document["proof"]["proofPurpose"], "authentication");
-
-        // Verifies under the shared verifier (issuer ↔ vm binding included).
-        let doc: TrustTask<Value> =
-            serde_json::from_value(document.clone()).expect("signed doc parses as a TrustTask");
-        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
-            .verify(&doc)
-            .await
-            .expect("approve-request proof verifies");
-
-        // The signature covers the rendered reason: tampering breaks it.
-        let mut tampered = doc;
-        tampered.payload["reason"] = json!("Hand over the keys");
-        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
-            .verify(&tampered)
-            .await
-            .expect_err("tampered reason must fail verification");
     }
 }

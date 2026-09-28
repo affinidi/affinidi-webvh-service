@@ -1,29 +1,18 @@
-//! End-to-end coverage for VTA-provisioned trust: the daemon (control
-//! plane) trusts the VTA that provisioned it to publish DIDs from the
-//! get-go, over the DIDComm-JWS auth dialect the VTA speaks.
+//! The browser sign-in the control plane still serves over plain HTTP:
+//! `POST /api/auth/challenge` then `POST /api/auth/` with a SIOPv2 `id_token`,
+//! driven against the real Axum router (`routes::router_without_fallback`)
+//! via `tower::ServiceExt::oneshot`.
 //!
-//! Two additive pieces are exercised here against the real Axum router
-//! (`routes::router_without_fallback`) via `tower::ServiceExt::oneshot`:
+//! An ACL entry is what lets a subject obtain a session. The *challenge* is
+//! issued to anyone — vti-common's canonical handler deliberately does not
+//! gate it (VTI-SES-006: answering only known subjects is an enumeration
+//! oracle) — so the ACL is read where the challenge is redeemed. The entry
+//! `acl::seed_provisioning_vta_acl` writes at setup grants the provisioning
+//! VTA an **admin** session.
 //!
-//! (A) An ACL entry for the provisioning VTA DID (seeded at setup by
-//!     `acl::seed_provisioning_vta_acl`) is what lets the VTA obtain a
-//!     session. The *challenge* is issued to anyone — vti-common's
-//!     canonical handler deliberately does not gate it (VTI-SES-006:
-//!     answering only known subjects is an enumeration oracle) — so the
-//!     ACL is read where the challenge is redeemed: without the entry
-//!     there is no session for `POST /api/auth/authenticate` to find,
-//!     and the challenge the VTA holds is unusable.
-//!
-//! (B) `POST /api/auth/` now content-negotiates: a DIDComm-v2 JWS
-//!     envelope (the `did-hosting-server` contract the VTA sends via
-//!     `build_authenticate_message`) is accepted *in addition to* the
-//!     SIOPv2 id_token Trust-Task envelope. The daemon unified binary
-//!     mounts this control route, so before this change the VTA's
-//!     envelope failed with `400 missing field type`.
-//!
-//! The regression case proves the SIOPv2 id_token dialect on the *same*
-//! endpoint still authenticates unchanged — the DIDComm-JWS path is
-//! additive, not a replacement.
+//! The route takes only the SIOPv2 envelope. The DIDComm-v2 JWS dialect it
+//! used to accept beside it is gone: a peer that signs its own documents
+//! signs in with `auth/authenticate` over `POST /api/trust-tasks`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -57,8 +46,7 @@ use tower::ServiceExt;
 // Test harness
 // ---------------------------------------------------------------------------
 
-/// RP DID the authenticate paths bind to (SIOPv2 `aud`; the DIDComm
-/// envelope's `to`). Set as the control plane's `server_did`.
+/// RP DID the sign-in binds to (the SIOPv2 `aud`). Set as the control plane's `server_did`.
 const RP_DID: &str = "did:web:control.test";
 
 struct Harness {
@@ -142,7 +130,6 @@ async fn make_harness() -> Harness {
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
-        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
@@ -203,26 +190,14 @@ fn challenge_request(did: &str) -> Request<Body> {
     req
 }
 
-/// Build the DIDComm-v2 JWS authenticate envelope the VTA sends
-/// (`build_authenticate_message` equivalent): type
-/// `spec/auth/authenticate/0.1`, body `{session_id, challenge}`,
-/// `from`/`to` set, JWS-packed with the identity's Ed25519 key.
+/// A DIDComm-v2 JWS authenticate envelope — the retired dialect: type
+/// `spec/auth/authenticate/0.1`, body `{session_id, challenge}`, addressed to
+/// the control plane and JWS-packed with the identity's Ed25519 key.
 fn didcomm_authenticate_body(
     id: &KeyIdentity,
     session_id: &str,
     challenge: &str,
     now: u64,
-) -> String {
-    didcomm_authenticate_body_to(id, session_id, challenge, now, Some(vec![RP_DID]))
-}
-
-/// As [`didcomm_authenticate_body`], addressed to `to` (`None` = no `to`).
-fn didcomm_authenticate_body_to(
-    id: &KeyIdentity,
-    session_id: &str,
-    challenge: &str,
-    now: u64,
-    to: Option<Vec<&str>>,
 ) -> String {
     let mut msg = Message::build(
         uuid::Uuid::new_v4().to_string(),
@@ -232,13 +207,12 @@ fn didcomm_authenticate_body_to(
     .from(id.did.clone())
     .created_time(now)
     .finalize();
-    msg.to = to.map(|v| v.into_iter().map(String::from).collect());
+    msg.to = Some(vec![RP_DID.to_string()]);
 
     pack_signed(&msg, &id.kid, &id.signing_key_bytes).expect("pack_signed")
 }
 
-/// Build a SIOPv2 id_token Trust-Task envelope (the existing dialect) —
-/// used by the regression case to prove that path is unchanged.
+/// Build a SIOPv2 id_token Trust-Task envelope.
 fn siop_authenticate_body(id: &KeyIdentity, session_id: &str, challenge: &str, now: u64) -> String {
     siop_authenticate_body_binding(id, session_id, challenge, now, None)
 }
@@ -325,7 +299,7 @@ async fn do_challenge(state: &AppState, did: &str) -> (StatusCode, String, Strin
 // Cases
 // ---------------------------------------------------------------------------
 
-/// (A) Without the VTA ACL entry, the VTA cannot authenticate. The
+/// Without the VTA ACL entry, the VTA cannot authenticate. The
 /// *challenge* is issued — deliberately, per vti-common's canonical
 /// handler (VTI-SES-006/007): a challenge endpoint that refuses an
 /// unknown subject and answers a known one is an enumeration oracle,
@@ -352,7 +326,7 @@ async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
     );
 
     // The redemption is where authority is decided, and there is none.
-    let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let body = siop_authenticate_body(&vta, &session_id, &challenge, now_secs());
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
@@ -365,16 +339,15 @@ async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
     );
 }
 
-/// (A)+(B) End-to-end: after the provisioning ACL seed, the VTA can run
-/// its native DIDComm-JWS challenge→authenticate flow and receives an
-/// **admin** session — exactly the role that unblocks publishing. This
-/// is the whole feature: no manual `add-acl`, no second auth dialect.
+/// After the provisioning ACL seed, the VTA's sign-in yields an **admin**
+/// session — exactly the role that unblocks publishing, with no manual
+/// `add-acl`.
 #[tokio::test]
-async fn provisioning_vta_authenticates_via_didcomm_jws_and_gets_admin_session() {
+async fn the_provisioning_vta_seed_grants_an_admin_session() {
     let harness = make_harness().await;
     let vta = key_identity([22u8; 32]);
 
-    // (A) Setup-time seed: authorize the provisioning VTA.
+    // Setup-time seed: authorize the provisioning VTA.
     let created = seed_provisioning_vta_acl(&harness.state.acl_ks, &vta.did)
         .await
         .expect("seed vta acl");
@@ -388,8 +361,7 @@ async fn provisioning_vta_authenticates_via_didcomm_jws_and_gets_admin_session()
         "seeded VTA passes the challenge gate"
     );
 
-    // (B) Authenticate with the DIDComm-JWS envelope the VTA speaks.
-    let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let body = siop_authenticate_body(&vta, &session_id, &challenge, now_secs());
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
@@ -398,7 +370,7 @@ async fn provisioning_vta_authenticates_via_didcomm_jws_and_gets_admin_session()
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "daemon must accept the VTA's DIDComm-JWS authenticate envelope"
+        "the seeded VTA must be able to sign in"
     );
 
     let out = read_json(resp.into_body()).await;
@@ -419,12 +391,10 @@ async fn provisioning_vta_authenticates_via_didcomm_jws_and_gets_admin_session()
     );
 }
 
-/// affinidi-webvh-service#207: a signed sign-in is forwardable, so one
-/// addressed to another service — the relay — is refused, as is one that
-/// names no recipient or more than one. None of them consumes the
-/// session, so the holder's own sign-in still succeeds afterwards.
+/// A DIDComm-v2 JWS sign-in is not accepted here any more — even from a
+/// subject that holds an admin entry and a live challenge.
 #[tokio::test]
-async fn a_signed_sign_in_not_addressed_to_the_control_plane_is_refused() {
+async fn a_didcomm_jws_sign_in_is_refused() {
     let harness = make_harness().await;
     let vta = key_identity([23u8; 32]);
     seed_provisioning_vta_acl(&harness.state.acl_ks, &vta.did)
@@ -433,62 +403,22 @@ async fn a_signed_sign_in_not_addressed_to_the_control_plane_is_refused() {
     let (status, session_id, challenge) = do_challenge(&harness.state, &vta.did).await;
     assert_eq!(status, StatusCode::OK);
 
-    for (to, want, why) in [
-        (
-            Some(vec!["did:web:some-other-service.example"]),
-            StatusCode::UNAUTHORIZED,
-            "addressed to another service (the relay)",
-        ),
-        (
-            Some(vec![RP_DID, "did:web:some-other-service.example"]),
-            StatusCode::UNAUTHORIZED,
-            "addressed to this service and another",
-        ),
-        (None, StatusCode::BAD_REQUEST, "no `to` at all"),
-        (Some(vec![]), StatusCode::BAD_REQUEST, "an empty `to`"),
-    ] {
-        let body = didcomm_authenticate_body_to(&vta, &session_id, &challenge, now_secs(), to);
-        let resp = did_hosting_control::routes::router_without_fallback()
-            .with_state(harness.state.clone())
-            .oneshot(authenticate_request(body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), want, "{why}");
-    }
-
     let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
-    let resp = did_hosting_control::routes::router_without_fallback()
-        .with_state(harness.state.clone())
-        .oneshot(authenticate_request(body.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "the refused messages must not have consumed the session"
-    );
-
-    // And that accepted sign-in is single-use: replaying the very same
-    // envelope is refused. The `to` binding carries no replay protection of
-    // its own — `unpack_signed`'s freshness window and the canonical
-    // handler's single-use challenge row do.
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
         .await
         .unwrap();
-    assert_ne!(
-        resp.status(),
-        StatusCode::OK,
-        "a correctly-addressed sign-in must not be replayable for a second session"
+    assert!(
+        resp.status().is_client_error(),
+        "a JWS envelope must be refused, got {}",
+        resp.status()
     );
 }
 
-/// (B) Regression: the SIOPv2 id_token dialect still authenticates on
-/// the same endpoint. Proves the DIDComm-JWS acceptance is additive —
-/// the wallet/control path is unchanged.
+/// The SIOPv2 id_token sign-in authenticates.
 #[tokio::test]
-async fn siop_id_token_authenticate_still_works() {
+async fn siop_id_token_authenticate_works() {
     let harness = make_harness().await;
     let wallet = key_identity([33u8; 32]);
 
@@ -613,12 +543,9 @@ async fn siop_id_token_authenticate_refuses_a_malformed_session_key() {
     );
 }
 
-/// (B) A malformed, non-JWS, non-Trust-Task body still yields the
-/// existing `trust-task-error` document (the SIOPv2 parser's malformed
-/// path) rather than being misrouted — the content-negotiation only
-/// diverts genuine JWS envelopes.
+/// A malformed body yields a `trust-task-error` document with a 4xx status.
 #[tokio::test]
-async fn junk_body_still_hits_siop_malformed_path() {
+async fn a_junk_body_is_a_malformed_request() {
     let harness = make_harness().await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
@@ -627,11 +554,9 @@ async fn junk_body_still_hits_siop_malformed_path() {
         ))
         .await
         .unwrap();
-    // The SIOPv2 malformed-envelope path returns a trust-task-error doc
-    // with a 4xx status (unchanged behaviour).
     assert!(
         resp.status().is_client_error(),
-        "junk body must surface a client error via the unchanged SIOP path, got {}",
+        "junk body must surface a client error, got {}",
         resp.status()
     );
 }

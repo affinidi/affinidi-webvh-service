@@ -1,5 +1,3 @@
-use std::fmt;
-
 #[derive(Debug, thiserror::Error)]
 pub enum WebVHError {
     #[error("HTTP error: {0}")]
@@ -46,18 +44,6 @@ impl WebVHError {
             Self::Refused { .. } => "refused",
             Self::Transport(_) => "transport",
         }
-    }
-}
-
-/// Server error response shape: `{"error": "..."}`.
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct ServerErrorBody {
-    pub error: String,
-}
-
-impl fmt::Display for ServerErrorBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.error)
     }
 }
 

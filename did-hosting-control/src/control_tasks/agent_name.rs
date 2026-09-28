@@ -118,15 +118,14 @@ pub(crate) async fn check(
 ) -> Result<check::v0_1::Response, TaskError> {
     let auth = cx.auth().await?;
     let state = cx.state;
-    let domain =
-        crate::routes::did_manage::resolve_agent_name_domain(&auth, state, p.domain.as_deref())
-            .await
-            .map_err(|e| {
-                TaskError::Declared(
-                    check::v0_1::error_codes::UNKNOWN_DOMAIN,
-                    AppErrorMessage(e).to_string(),
-                )
-            })?;
+    let domain = super::queries::resolve_agent_name_domain(&auth, state, p.domain.as_deref())
+        .await
+        .map_err(|e| {
+            TaskError::Declared(
+                check::v0_1::error_codes::UNKNOWN_DOMAIN,
+                AppErrorMessage(e).to_string(),
+            )
+        })?;
     // The only validation this probe does is the name's grammar.
     let result = did_ops::check_agent_name(state, &domain, &p.name)
         .await

@@ -291,7 +291,7 @@ pub fn build_did_document(
 /// HTTP DID-log hosting endpoint (`did-host-http*` templates).
 pub const SERVICE_TYPE_WEBVH_HOSTING: &str = "WebVHHosting";
 /// Legacy read-only alias for [`SERVICE_TYPE_WEBVH_HOSTING`]. Never written;
-/// accepted on read per `docs/did-hosting-client-crate-spec.md` §5.
+/// accepted on read.
 pub const SERVICE_TYPE_WEBVH_HOSTING_LEGACY: &str = "WebVHHostingService";
 /// Trust Spanning Protocol transport (`#tsp`).
 pub const SERVICE_TYPE_TSP: &str = "TSPTransport";

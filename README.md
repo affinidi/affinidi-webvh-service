@@ -45,7 +45,7 @@ Standalone mode:                          Daemon mode:
 | [did-hosting-server](did-hosting-server/) | `did-hosting-server` | Read-only DID hosting edge node — serves DID documents publicly and receives sync updates from the control plane via DIDComm |
 | [webvh-witness](webvh-witness/) | `webvh-witness` | Witness node — generates and manages cryptographic witness proofs for DID integrity verification |
 | [webvh-watcher](webvh-watcher/) | `webvh-watcher` | Read-only DID mirror — receives pushed DID updates from servers and serves them publicly for redundancy |
-| [did-hosting-control](did-hosting-control/) | `did-hosting-control` | Control plane — DID lifecycle management via DIDComm and REST API, management UI, service registry, passkey authentication |
+| [did-hosting-control](did-hosting-control/) | `did-hosting-control` | Control plane — DID lifecycle management as Trust Tasks over TSP, DIDComm and HTTPS, management UI, service registry, passkey authentication |
 | [did-hosting-daemon](did-hosting-daemon/) | `did-hosting-daemon` | Unified daemon — embeds server + witness + watcher + control plane in a single binary (recommended for most deployments) |
 | [did-hosting-common](did-hosting-common/) | *(library)* | Shared types, traits, auth, ACL, storage, config, and passkey modules used by all services |
 

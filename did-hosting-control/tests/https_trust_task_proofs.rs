@@ -225,23 +225,31 @@ async fn https_reply_is_signed_by_the_control_plane() {
         .expect("HTTPS reply is signed by the control plane for the caller");
 }
 
-async fn post_stats(h: &TestServer, doc: &Value) -> StatusCode {
-    h.router()
+/// POST a stats-sync document to the HTTPS binding with no bearer token, and
+/// whether it was answered with the task's `#response`.
+async fn post_stats(h: &TestServer, doc: &Value) -> bool {
+    let resp = h
+        .router()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/control/stats")
+                .uri("/api/trust-tasks")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(doc).unwrap()))
                 .unwrap(),
         )
         .await
-        .expect("router responds")
-        .status()
+        .expect("router responds");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    body["type"]
+        .as_str()
+        .is_some_and(|t| t.ends_with("/server/stats-sync/0.1#response"))
 }
 
-/// HTTPS stats sync is a signed document from a Service-role server; there is
-/// no bearer token and nothing else is accepted.
+/// HTTPS stats sync is a signed document from a Service-role server, on the
+/// one Trust Task binding; there is no bearer token and nothing else is
+/// accepted.
 #[tokio::test]
 async fn https_stats_sync_requires_a_signed_document_from_a_service() {
     let h = harness().await;
@@ -258,22 +266,16 @@ async fn https_stats_sync_requires_a_signed_document_from_a_service() {
         })
     };
 
-    assert_eq!(
-        post_stats(&h, &stats(&edge)).await,
-        StatusCode::FORBIDDEN,
-        "unsigned"
-    );
-    assert_eq!(
+    assert!(!post_stats(&h, &stats(&edge)).await, "unsigned");
+    assert!(
         post_stats(&h, &sign_as(stats(&edge), &key).await).await,
-        StatusCode::OK,
         "signed by the Service"
     );
 
     let (owner, _, owner_key) = did_key_signer(34);
     h.add_acl(&owner, Role::Owner).await;
-    assert_eq!(
-        post_stats(&h, &sign_as(stats(&owner), &owner_key).await).await,
-        StatusCode::FORBIDDEN,
+    assert!(
+        !post_stats(&h, &sign_as(stats(&owner), &owner_key).await).await,
         "signed, but not a Service"
     );
 }

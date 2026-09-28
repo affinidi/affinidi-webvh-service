@@ -38,7 +38,7 @@ pub(crate) async fn info(
     );
     body.insert(
         "serviceNames".into(),
-        json!(crate::routes::server_info::server_agent_names(state).await),
+        json!(super::queries::server_agent_names(state).await),
     );
     if let Ok(grace) = parse_grace_string(&state.config.hosting.disable_purge_grace) {
         body.insert("domainPurgeGraceSeconds".into(), json!(grace));
@@ -81,7 +81,7 @@ pub(crate) async fn config(
         "transports".into(),
         json!({ "tsp": c.features.tsp, "didcomm": c.features.didcomm }),
     );
-    if let Some(services) = crate::routes::did_manage::control_advertised_services(state).await {
+    if let Some(services) = super::queries::control_advertised_services(state).await {
         body.insert("advertisedServices".into(), json!(services));
     }
     body.insert(
@@ -303,8 +303,7 @@ pub(crate) async fn timeseries(
                     other => other.into(),
                 })?;
             did_ops::ensure_slot_domain_matches(&record, domain.map(|d| d.as_str()))?;
-            crate::routes::did_manage::query_timeseries(&state.timeseries_ks, mnemonic, range)
-                .await?
+            super::queries::query_timeseries(&state.timeseries_ks, mnemonic, range).await?
         }
         (None, Some(domain)) => {
             let unknown = || {
@@ -333,11 +332,11 @@ pub(crate) async fn timeseries(
                     return Err(unknown());
                 }
             }
-            crate::routes::did_manage::query_timeseries_by_domain(state, &canonical, range).await?
+            super::queries::query_timeseries_by_domain(state, &canonical, range).await?
         }
         (None, None) => {
             cx.admin().await?;
-            crate::routes::did_manage::query_timeseries(&state.timeseries_ks, "_all", range).await?
+            super::queries::query_timeseries(&state.timeseries_ks, "_all", range).await?
         }
     };
     let points: Vec<Value> = points

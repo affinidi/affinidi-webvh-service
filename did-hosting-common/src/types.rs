@@ -692,6 +692,22 @@ pub struct CreateDidResult {
     pub public_key_multibase: String,
 }
 
+/// An update the control plane sends back for a DID that needs refreshing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidSyncUpdate {
+    pub mnemonic: String,
+    pub did_id: String,
+    pub log_content: String,
+    /// Absent means the slot holds no witness proofs, never "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_content: Option<String>,
+    pub version_count: u64,
+    /// Whether the source has disabled the slot. A replica stops serving a
+    /// disabled slot and resumes only on an update carrying `false`.
+    pub disabled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

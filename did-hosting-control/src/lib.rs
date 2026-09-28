@@ -40,7 +40,6 @@ pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod trust_tasks_auth;
-pub mod trust_tasks_did;
 pub mod trust_tasks_infra;
 pub mod tsp;
 #[cfg(test)]

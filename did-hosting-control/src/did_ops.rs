@@ -152,24 +152,6 @@ async fn get_authorized_record(
     Ok(record)
 }
 
-/// Authorize a caller to read per-DID metadata (stats / time-series) for
-/// `mnemonic`: the mnemonic must be well-formed and the caller must own the
-/// record (or be an admin). Returns the record so the caller can reuse its
-/// `domain`/`owner` without a second load.
-///
-/// This is the owner-scoping the id-addressed log/record handlers get for free
-/// via [`get_authorized_record`]; the stats/time-series read paths did not route
-/// through it, which let any authenticated caller read another tenant's DID
-/// activity by mnemonic (SEC-4045 W2).
-pub(crate) async fn authorize_did_read(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<DidRecord, AppError> {
-    validate_mnemonic(mnemonic)?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await
-}
-
 // ---------------------------------------------------------------------------
 // Per-account quota enforcement (SEC-4045 W3)
 // ---------------------------------------------------------------------------
@@ -2414,7 +2396,6 @@ mod tests_atomic {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
-            pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
