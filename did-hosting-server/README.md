@@ -2,12 +2,16 @@
 
 The DID Hosting Server is a read-only DID hosting edge node for
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
-documents publicly and receives sync updates from the
-[control plane](../did-hosting-control/) via DIDComm through a mediator.
+documents publicly and is fed by its
+[control plane](../did-hosting-control/) with signed Trust Tasks —
+`webvh/sync/*` and `did-management/replica/domain/*` — over TSP,
+DIDComm or HTTPS (`POST /api/trust-tasks`).
 
 All DID lifecycle management (create, publish, delete) is handled
-by the control plane. The server's role is to host and resolve
-DIDs at its public URL. For a self-contained deployment, use the
+by the control plane. The edge has no management API, no sessions and
+no ACL: the only party it takes directives from is its configured
+`control_did`, established from each document's proof. It does not
+start without one. For a single-host deployment, use the
 [daemon](../did-hosting-daemon/) instead.
 
 > **IMPORTANT:**
@@ -114,14 +118,15 @@ different path with the `--config` flag or the
 ### Example `config.toml`
 
 ```toml
-# Server DID identity (required for DIDComm auth)
+# Server DID identity (required: the control plane addresses and verifies it)
 server_did = "did:webvh:webvh.example.com"
 mediator_did = "did:webvh:mediator.example.com"
 public_url = "https://webvh.example.com"
+# The control plane that drives this edge (required)
+control_did = "did:webvh:control.example.com"
 
 [features]
 didcomm = true
-rest_api = true
 # agent_names = true   # serve GET /@alice -> 302 to the DID. On by default;
                        # set false to leave the /@… namespace unserved.
 
@@ -137,10 +142,6 @@ format = "text"      # text or json
 data_dir = "data/did-hosting-server"   # Persistent data directory (fjall)
 
 [auth]
-access_token_expiry = 900                   # 15 minutes
-refresh_token_expiry = 86400                # 24 hours
-challenge_ttl = 300                         # 5 minutes
-session_cleanup_interval = 600              # 10 minutes
 cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
 
 [secrets]
@@ -157,14 +158,7 @@ keyring_service = "webvh"                   # OS keyring service name (default b
 # k8s_namespace = "webvh"                          # optional; defaults to the pod's namespace
 
 [limits]
-upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
-default_max_total_size = 1048576            # Per-account total DID size (bytes), default 1MB
-default_max_did_count = 20                  # Per-account max number of DIDs
-
-# Optional: push DID updates to watcher instances
-# [[watchers]]
-# url = "http://watcher1.example.com:8533"
-# token = "shared-secret-token"
+upload_body_limit = 102400                  # Max Trust Task body over HTTPS (floor 1 MiB)
 ```
 
 Private keys (signing, key agreement, JWT signing) are **not**
@@ -172,45 +166,14 @@ stored in the config file. They are managed by the secrets
 backend selected during `did-hosting-server setup`. See
 [Secrets Backends](#secrets-backends) below.
 
-#### Resource Limits
+#### Limits
 
-The `[limits]` section controls per-account resource quotas:
+- **`upload_body_limit`** — Maximum body of a `POST /api/trust-tasks`
+  request. Never below 1 MiB, so the control plane's largest
+  `sync/batch` always fits.
 
-- **`upload_body_limit`** — Maximum request body size for
-  `did.jsonl` and witness uploads. Requests exceeding this are
-  rejected with `413 Payload Too Large`. Default: `102400`
-  (100 KB).
-
-- **`default_max_total_size`** — Default per-account total size
-  across all DID documents. When an upload would push an
-  account's combined DID content above this limit, the request
-  is rejected. Default: `1048576` (1 MB).
-
-- **`default_max_did_count`** — Default per-account maximum
-  number of DIDs. Once reached, new DID creation requests are
-  rejected. Default: `20`.
-
-Admins are exempt from all quota checks. Per-account overrides
-can be set via the ACL API by including `max_total_size` and/or
-`max_did_count` in the ACL entry — these take precedence over
-the global defaults.
-
-#### Watcher Push
-
-The optional `[[watchers]]` section configures DID replication
-to [watcher](../webvh-watcher/) instances. When a DID is
-published, updated, or deleted, the server pushes the change to
-each registered watcher. Push failures are logged but do not
-block the primary operation.
-
-```toml
-[[watchers]]
-url = "http://watcher1.example.com:8533"
-token = "shared-secret-token"
-
-[[watchers]]
-url = "http://watcher2.example.com:8533"
-```
+Per-account quotas are the control plane's concern: an edge serves
+whatever its control plane has accepted.
 
 ### Secrets Backends
 
@@ -373,9 +336,6 @@ did-hosting-server setup                # Interactive config wizard
 did-hosting-server setup --from <recipe.toml>  # Non-interactive — see below
 did-hosting-server uninstall            # Teardown: clear secrets + remove config
 did-hosting-server health               # Run health check diagnostics
-did-hosting-server add-acl              # Add ACL entry
-did-hosting-server list-acl             # List ACL entries
-did-hosting-server remove-acl           # Remove ACL entry
 did-hosting-server list-dids            # List all DIDs in the store
 did-hosting-server remove-did           # Remove a DID from the store
 did-hosting-server dump-did             # Dump DID log for a path
@@ -386,35 +346,6 @@ did-hosting-server recover-did          # Recover a soft-deleted DID
 did-hosting-server import-secrets       # Import secrets from VTA bundle or keys
 did-hosting-server backup               # Export data to backup file
 did-hosting-server restore              # Restore data from backup file
-```
-
-### Access Control
-
-The `add-acl` command creates ACL entries directly from the
-command line, without needing a running server or authenticated
-API call. Useful for bootstrapping the first admin account.
-
-```bash
-# Add an admin
-did-hosting-server add-acl --did did:key:z6Mk... --role admin
-
-# Add an owner (default role)
-did-hosting-server add-acl --did did:key:z6Mk...
-
-# Add an owner with per-account quota overrides
-did-hosting-server add-acl --did did:key:z6Mk... --max-total-size 2097152 --max-did-count 50
-
-# With a specific config file
-did-hosting-server --config /path/to/config.toml add-acl --did did:key:z6Mk... --role admin
-```
-
-The command will refuse to overwrite an existing entry — delete
-it via the API first if you need to change a role.
-
-### Listing ACL entries
-
-```bash
-did-hosting-server list-acl
 ```
 
 ### Backup & Restore
@@ -441,66 +372,19 @@ Ephemeral data (active sessions, refresh tokens, auth
 challenges) is excluded. All keys and values are base64url
 encoded.
 
-## API Endpoints
-
-All API endpoints are under the `/api` prefix.
-
-### Public
+## HTTP Endpoints
 
 | Method | Path                            | Description     |
 | ------ | ------------------------------- | --------------- |
-| `GET`  | `/api/health`                   | Health check    |
+| `GET`  | `/api/health`                   | Liveness probe  |
+| `POST` | `/api/trust-tasks`              | Trust Task listener (HTTPS binding) |
 | `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
 | `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
 | `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
 | `GET`  | `/.well-known/did-witness.json` | Root witness    |
 
-### Authentication
-
-| Method | Path                  | Description         |
-| ------ | --------------------- | ------------------- |
-| `POST` | `/api/auth/challenge` | Request challenge   |
-| `POST` | `/api/auth/`          | Submit DIDComm auth |
-| `POST` | `/api/auth/refresh`   | Refresh token       |
-
-### DID Sync & Introspection (authenticated)
-
-| Method   | Path                           | Description         |
-| -------- | ------------------------------ | ------------------- |
-| `GET`    | `/api/dids`                    | List DIDs           |
-| `GET`    | `/api/dids/{mnemonic}`         | Get DID details     |
-| `PUT`    | `/api/dids/{mnemonic}`         | Upload DID log      |
-| `PUT`    | `/api/witness/{mnemonic}`      | Upload witness      |
-| `PUT`    | `/api/disable/{mnemonic}`      | Disable a DID       |
-| `PUT`    | `/api/enable/{mnemonic}`       | Enable a DID        |
-| `DELETE` | `/api/dids/{mnemonic}`         | Delete a DID        |
-| `GET`    | `/api/log/{mnemonic}`          | Get DID log entries |
-| `GET`    | `/api/raw/{mnemonic}`          | Get raw DID log     |
-| `GET`    | `/api/services`                | List services       |
-
-### Statistics (authenticated)
-
-| Method | Path                           | Description         |
-| ------ | ------------------------------ | ------------------- |
-| `GET`  | `/api/stats`                   | Server-wide stats   |
-| `GET`  | `/api/stats/{mnemonic}`        | Per-DID stats       |
-| `GET`  | `/api/timeseries`              | Server time-series  |
-| `GET`  | `/api/timeseries/{mnemonic}`   | Per-DID time-series |
-
-### Configuration (admin only)
-
-| Method | Path          | Description    |
-| ------ | ------------- | -------------- |
-| `GET`  | `/api/config` | Server config  |
-
-### Access Control (admin only)
-
-| Method   | Path             | Description      |
-| -------- | ---------------- | ---------------- |
-| `GET`    | `/api/acl`       | List ACL entries |
-| `POST`   | `/api/acl`       | Create ACL entry |
-| `PUT`    | `/api/acl/{did}` | Update ACL entry |
-| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
+There is no management API. DIDs, domains and their state reach the
+edge only as Trust Tasks signed by its control plane.
 
 ## Performance Testing
 

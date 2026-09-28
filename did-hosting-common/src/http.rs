@@ -1,6 +1,6 @@
 //! Shared outbound HTTP client construction.
 //!
-//! Every inter-service client (`WatcherClient`, `WitnessClient`,
+//! Every inter-service client (`WitnessClient`,
 //! `ControlClient`, `WebVHClient`) talks to a peer over the network, so each
 //! must fail fast rather than hang a task forever on a peer that accepts the
 //! connection and then never responds, and must not silently follow a 3xx to an

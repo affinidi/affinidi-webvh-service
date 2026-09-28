@@ -16,8 +16,8 @@ use did_hosting_common::did_ops::{
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_common::server::store::Store;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
 use did_hosting_server::server::AppState;
@@ -33,8 +33,6 @@ async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) 
         ..StoreConfig::default()
     };
     let store = Store::open(&store_config).await.expect("open store");
-    let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-    let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
     let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
 
     let config = AppConfig {
@@ -54,8 +52,6 @@ async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) 
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: None,
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -64,8 +60,6 @@ async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) 
 
     let state = AppState {
         store: store.clone(),
-        sessions_ks,
-        acl_ks,
         dids_ks,
         config: Arc::new(config),
         did_resolver: None,
@@ -73,9 +67,6 @@ async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) 
         secrets_resolver: None,
         identity: None,
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),

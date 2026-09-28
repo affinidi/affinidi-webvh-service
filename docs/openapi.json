@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Affinidi DID Hosting — upload/resolve API",
-    "description": "HTTP surface of the did-hosting-server edge node: authenticated upload/introspection of did:webvh slots and public, unauthenticated DID resolution. DID lifecycle management (create/rollback/recover) happens over DIDComm on the control plane and is not part of this spec.",
+    "title": "Affinidi DID Hosting — edge HTTP surface",
+    "description": "HTTP surface of the did-hosting-server edge node: public, unauthenticated DID resolution, a liveness probe, and the HTTPS binding of the Trust Task listener. The edge is written to only by its control plane's signed Trust Tasks, which arrive over TSP, DIDComm or this binding alike.",
     "contact": {
       "name": "Glenn Gore",
       "email": "glenn@affinidi.com"
@@ -33,185 +33,6 @@
         }
       }
     },
-    "/api/dids": {
-      "get": {
-        "tags": [
-          "dids"
-        ],
-        "operationId": "list_dids",
-        "parameters": [
-          {
-            "name": "owner",
-            "in": "query",
-            "description": "Filter by owner DID (admin only)",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Page size",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Page offset",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of hosted DID slots",
-            "content": {
-              "application/json": {}
-            }
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/api/dids/{mnemonic}": {
-      "get": {
-        "tags": [
-          "dids"
-        ],
-        "operationId": "get_did",
-        "parameters": [
-          {
-            "name": "mnemonic",
-            "in": "path",
-            "description": "Slot path (mnemonic); may contain '/'",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "DID metadata + log summary",
-            "content": {
-              "application/json": {}
-            }
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
-          },
-          "403": {
-            "description": "Caller not authorized for this slot"
-          },
-          "404": {
-            "description": "No such DID slot"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      },
-      "put": {
-        "tags": [
-          "dids"
-        ],
-        "operationId": "upload_did",
-        "parameters": [
-          {
-            "name": "mnemonic",
-            "in": "path",
-            "description": "Slot path (mnemonic); may contain '/'",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "description": "did:webvh log — one JSON LogEntry per line (JSONL)",
-          "content": {
-            "application/jsonl+json": {
-              "schema": {
-                "type": "string"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Published; content stored and watchers notified"
-          },
-          "400": {
-            "description": "Invalid did.jsonl, failed proof verification, or DID id/host mismatch"
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
-          },
-          "403": {
-            "description": "Caller not authorized for this slot"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      },
-      "delete": {
-        "tags": [
-          "dids"
-        ],
-        "operationId": "delete_did",
-        "parameters": [
-          {
-            "name": "mnemonic",
-            "in": "path",
-            "description": "Slot path (mnemonic); may contain '/'",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Soft-deleted; content retained for the recovery window"
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
-          },
-          "403": {
-            "description": "Caller not authorized for this slot"
-          },
-          "404": {
-            "description": "No such DID slot"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
     "/api/health": {
       "get": {
         "tags": [
@@ -235,66 +56,16 @@
         }
       }
     },
-    "/api/log/{mnemonic}": {
-      "get": {
+    "/api/trust-tasks": {
+      "post": {
         "tags": [
-          "dids"
+          "trust-tasks"
         ],
-        "operationId": "get_did_log",
-        "parameters": [
-          {
-            "name": "mnemonic",
-            "in": "path",
-            "description": "Slot path (mnemonic); may contain '/'",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Parsed log entries (versionId, versionTime, state, parameters)",
-            "content": {
-              "application/json": {}
-            }
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
-          },
-          "403": {
-            "description": "Caller not authorized for this slot"
-          },
-          "404": {
-            "description": "No such DID slot"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/api/witness/{mnemonic}": {
-      "put": {
-        "tags": [
-          "dids"
-        ],
-        "operationId": "upload_witness",
-        "parameters": [
-          {
-            "name": "mnemonic",
-            "in": "path",
-            "description": "Slot path (mnemonic); may contain '/'",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "summary": "Hand the posted document to the edge's one inbound dispatch and answer with\nits signed reply.",
+        "description": "A document that does not verify gets no signed answer — a signed refusal\nwould settle a directive the control plane never sent — so it is answered\n`403` with an unsigned, detail-free error document, which settles nothing.",
+        "operationId": "receive",
         "requestBody": {
-          "description": "Witness-proof document (did-witness.json) for the slot's current log",
+          "description": "A signed Trust Task document",
           "content": {
             "application/json": {
               "schema": {
@@ -305,24 +76,25 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": "Witness proofs stored"
+          "200": {
+            "description": "The edge's signed reply document",
+            "content": {
+              "application/json": {}
+            }
           },
           "400": {
-            "description": "Invalid witness document"
-          },
-          "401": {
-            "description": "Missing/invalid bearer token"
+            "description": "The body is not a Trust Task document",
+            "content": {
+              "application/json": {}
+            }
           },
           "403": {
-            "description": "Caller not authorized for this slot"
+            "description": "The document was not accepted; an unsigned refusal",
+            "content": {
+              "application/json": {}
+            }
           }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
+        }
       }
     },
     "/{mnemonic}/did.jsonl": {
@@ -358,19 +130,11 @@
       }
     }
   },
-  "components": {
-    "securitySchemes": {
-      "bearer": {
-        "type": "http",
-        "scheme": "bearer",
-        "bearerFormat": "JWT"
-      }
-    }
-  },
+  "components": {},
   "tags": [
     {
-      "name": "dids",
-      "description": "Authenticated DID slot management + content sync"
+      "name": "trust-tasks",
+      "description": "The HTTPS binding of the Trust Task listener"
     },
     {
       "name": "resolve",

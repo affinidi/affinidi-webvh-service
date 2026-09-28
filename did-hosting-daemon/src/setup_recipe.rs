@@ -251,7 +251,6 @@ pub async fn apply_recipe(
         },
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig {
             url: vta_url,
             did: vta_did_persisted,

@@ -163,17 +163,13 @@ pub async fn run_wizard(
 
     // 4. Control plane DID (for DIDComm sync)
     eprintln!();
-    eprintln!("  The control plane manages all DIDs and pushes updates to this");
-    eprintln!("  server via DIDComm through the mediator. Enter the control");
-    eprintln!("  plane's DID so this server can authenticate sync messages.");
-    eprintln!("  (Leave empty to configure later in config.toml)");
+    eprintln!("  The control plane manages all DIDs and replicates them to this");
+    eprintln!("  server as signed Trust Tasks. Enter the control plane's DID: it is");
+    eprintln!("  the only party this server takes directives from, and the server");
+    eprintln!("  does not start without it. (For a single host with no separate");
+    eprintln!("  control plane, run did-hosting-daemon instead.)");
     eprintln!();
-    let control_did = setup_prompts::prompt_long_value("Control plane DID", true)?;
-    let control_did = if control_did.is_empty() {
-        None
-    } else {
-        Some(control_did)
-    };
+    let control_did = Some(prompt_control_did()?);
 
     // 5. Host / Port
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
@@ -237,8 +233,6 @@ pub async fn run_wizard(
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config,
         limits: LimitsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did,
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
@@ -652,13 +646,7 @@ pub async fn run_setup_offline_prepare(
     };
 
     eprintln!();
-    let control_did =
-        setup_prompts::prompt_long_value("Control plane DID (leave empty to set later)", true)?;
-    let control_did = if control_did.is_empty() {
-        None
-    } else {
-        Some(control_did)
-    };
+    let control_did = Some(prompt_control_did()?);
 
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port = setup_prompts::prompt_listen_port(8530)?;
@@ -836,8 +824,6 @@ pub async fn run_setup_offline_complete(
         hosting: crate::config::HostingConfig::default(),
         secrets: state.secrets.clone(),
         limits: LimitsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: state.control_did.clone(),
         vta: VtaConfig {
             url: result.vta_url.clone(),
@@ -970,4 +956,16 @@ pub fn update_server_did_in_config(
 
     std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
     Ok(())
+}
+
+/// The control plane's DID, which an edge requires: asked until one is given.
+fn prompt_control_did() -> Result<String, Box<dyn std::error::Error>> {
+    loop {
+        let did = setup_prompts::prompt_long_value("Control plane DID", false)?;
+        let did = did.trim().to_string();
+        if did.starts_with("did:") {
+            return Ok(did);
+        }
+        eprintln!("  A control plane DID (did:...) is required.");
+    }
 }

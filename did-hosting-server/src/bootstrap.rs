@@ -9,13 +9,13 @@ use did_hosting_common::did::{
 };
 use tracing::info;
 
-use crate::auth::session::now_epoch;
 use crate::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, extract_did_id,
     extract_service_types, owner_key, validate_did_jsonl,
 };
 use crate::error::AppError;
 use crate::store::{KeyspaceHandle, Store};
+use did_hosting_common::server::auth::session::now_epoch;
 
 /// Result of bootstrapping the root DID.
 #[derive(Debug)]
