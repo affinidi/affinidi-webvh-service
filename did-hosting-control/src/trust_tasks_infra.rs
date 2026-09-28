@@ -220,7 +220,15 @@ pub(crate) async fn acknowledge_outbox(
         return;
     }
     match crate::outbox::acknowledge(&state.store, sender, thread).await {
-        Ok(true) => state.outbox_notify.notify_one(),
+        Ok(true) => {
+            crate::registry::record_ack(
+                &state.registry_ks,
+                sender,
+                crate::auth::session::now_epoch(),
+            )
+            .await;
+            state.outbox_notify.notify_one();
+        }
         Ok(false) => tracing::debug!(sender, thread, "acknowledgement for no awaited entry"),
         Err(e) => warn!(sender, error = %e, "failed to settle acknowledged outbox entry"),
     }

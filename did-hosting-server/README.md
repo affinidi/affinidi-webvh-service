@@ -159,12 +159,42 @@ keyring_service = "webvh"                   # OS keyring service name (default b
 
 [limits]
 upload_body_limit = 102400                  # Max Trust Task body over HTTPS (floor 1 MiB)
+
+[replication]
+staleness_bound_secs = 300                  # /api/health answers 503 past this (default 5 min)
+reconcile_interval_secs = 60                # How often to reconcile with the control plane
 ```
 
 Private keys (signing, key agreement, JWT signing) are **not**
 stored in the config file. They are managed by the secrets
 backend selected during `did-hosting-server setup`. See
 [Secrets Backends](#secrets-backends) below.
+
+#### Replication staleness bound
+
+The control plane delivers every change through its durable outbox and
+retries until the edge acknowledges it. As the backstop, the edge
+reconciles against the control plane's `did-management/did/list` every
+`reconcile_interval_secs` (default 60), as a signed Trust Task whose
+signed reply must come from its configured `control_did`:
+
+- a slot whose **disabled** state differs is repaired on the spot, so a
+  DID the control plane disabled stops resolving here even if the push
+  was lost;
+- a slot the edge is missing, holds behind, or holds but the control
+  plane no longer lists makes the edge re-register, and the control plane
+  queues exactly the updates and deletes it needs.
+
+When the edge has not completed a clean reconcile within
+`staleness_bound_secs` (default **300 seconds**, which must exceed the
+interval), `GET /api/health` answers `503`, so a load balancer drains
+it rather than let it serve state that may be out of date. The reconcile
+age is reported to the control plane in `did-management/server/metrics/0.1`;
+the control plane's own `server/metrics` carries each edge's outbox
+depth, the age of its oldest unacknowledged directive, and the time
+since its last acknowledgement and last reconcile, labelled by edge DID.
+Both are also settable as `DID_HOSTING_REPLICATION_STALENESS_BOUND_SECS`
+and `DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS`.
 
 #### Limits
 
@@ -376,7 +406,7 @@ encoded.
 
 | Method | Path                            | Description     |
 | ------ | ------------------------------- | --------------- |
-| `GET`  | `/api/health`                   | Liveness probe  |
+| `GET`  | `/api/health`                   | Liveness probe; 503 past the staleness bound |
 | `POST` | `/api/trust-tasks`              | Trust Task listener (HTTPS binding) |
 | `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
 | `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |

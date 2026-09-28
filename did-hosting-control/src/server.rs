@@ -856,6 +856,8 @@ pub async fn seed_registry(state: &AppState) {
             last_inbound_at: None,
             last_outbound_transport: None,
             last_outbound_at: None,
+            last_ack_at: None,
+            last_reconcile_at: None,
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {

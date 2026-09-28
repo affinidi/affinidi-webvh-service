@@ -139,6 +139,8 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
                     "mnemonic": r.mnemonic,
                     "did_id": r.did_id,
                     "version_count": r.version_count,
+                    // So a disable this edge missed is re-sent too.
+                    "disabled": r.disabled,
                 })
             })
             .collect(),

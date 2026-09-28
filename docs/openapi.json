@@ -48,7 +48,7 @@
             }
           },
           "503": {
-            "description": "Service is up but its own DID isn't being served locally",
+            "description": "Service is up but its own DID isn't being served locally, or it has not reconciled with its control plane within the staleness bound",
             "content": {
               "application/json": {}
             }

@@ -277,6 +277,8 @@ async fn services_overview_exposes_instance_advertised_services() {
         last_inbound_at: None,
         last_outbound_transport: None,
         last_outbound_at: None,
+        last_ack_at: None,
+        last_reconcile_at: None,
     };
     registry::register_instance(&h.state.registry_ks, &instance)
         .await
