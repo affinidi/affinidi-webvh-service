@@ -361,6 +361,128 @@ fn verify_did_log_chain(content: &str, witness_content: Option<&str>) -> Result<
     Ok(witnessed)
 }
 
+/// Why a witness refuses to witness an entry — the refusals
+/// `webvh/witness/sign/0.1` declares, in the order it checks them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessLogRefusal {
+    /// The log does not verify as a did:webvh log (`invalidLog`).
+    InvalidLog(String),
+    /// The versionId asked for is not the log's last entry (`versionNotLast`).
+    VersionNotLast { last: String },
+    /// The log deactivates the DID at or before the entry (`deactivated`).
+    Deactivated,
+    /// The witness parameter in force for the entry does not name this
+    /// witness (`notListed`).
+    NotListed,
+}
+
+/// What [`verify_log_for_witnessing`] established about a log it accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessedLog {
+    /// The DID's SCID: its identity across every host it moves to.
+    pub scid: String,
+    /// Every entry's versionId, in log order (`version_ids[n - 1]` is entry
+    /// `n`'s). The hash chain makes a matching versionId at position `n` a
+    /// match of the whole log up to it.
+    pub version_ids: Vec<String>,
+}
+
+/// Verify a did:webvh log a witness has been asked to witness, *before* it
+/// signs anything: the chain up to and including the entry (every entry's
+/// proof against its authorised `updateKeys`, the hash chain, pre-rotation and
+/// the parameter transitions), that `version_id` is the last entry, that the
+/// DID is not deactivated, and that the witness parameter in force for that
+/// entry names `witness_did`.
+///
+/// The entry's own witness proofs are not checked — they are what is being
+/// produced. Every other rule of [`verify_did_log_proofs`] applies.
+pub fn verify_log_for_witnessing(
+    content: &str,
+    version_id: &str,
+    witness_did: &str,
+) -> Result<WitnessedLog, WitnessLogRefusal> {
+    validate_did_jsonl(content).map_err(WitnessLogRefusal::InvalidLog)?;
+
+    let mut entries: Vec<LogEntryState> = Vec::new();
+    let mut version = None;
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry = LogEntry::deserialize_string(line, version).map_err(|e| {
+            WitnessLogRefusal::InvalidLog(format!("invalid log entry at line {}: {e}", idx + 1))
+        })?;
+        version = Some(entry.get_webvh_version());
+        let version_number = entry
+            .get_version_id_fields()
+            .map_err(|e| {
+                WitnessLogRefusal::InvalidLog(format!("invalid versionId at line {}: {e}", idx + 1))
+            })?
+            .0;
+        entries.push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
+    }
+
+    let mut deactivated = false;
+    for idx in 0..entries.len() {
+        let (before, rest) = entries.split_at_mut(idx);
+        let entry = &mut rest[0];
+        entry.verify_log_entry(before.last()).map_err(|e| {
+            WitnessLogRefusal::InvalidLog(format!(
+                "entry {} does not verify: {e}",
+                entry.get_version_id()
+            ))
+        })?;
+        if entry.validated_parameters.deactivated == Some(true) {
+            deactivated = true;
+        }
+    }
+
+    let last = entries
+        .last()
+        .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log has no entries".into()))?;
+    if last.get_version_id() != version_id {
+        return Err(WitnessLogRefusal::VersionNotLast {
+            last: last.get_version_id().to_string(),
+        });
+    }
+    if deactivated {
+        return Err(WitnessLogRefusal::Deactivated);
+    }
+    let listed = last
+        .validated_parameters
+        .active_witness
+        .as_deref()
+        .and_then(|w| w.witnesses())
+        .is_some_and(|ws| {
+            ws.iter().any(|w| {
+                let id = w.id.to_string();
+                id == witness_did || format!("did:key:{id}") == witness_did
+            })
+        });
+    if !listed {
+        return Err(WitnessLogRefusal::NotListed);
+    }
+    let scid = last
+        .validated_parameters
+        .scid
+        .as_deref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log establishes no SCID".into()))?;
+    Ok(WitnessedLog {
+        scid,
+        version_ids: entries
+            .iter()
+            .map(|e| e.get_version_id().to_string())
+            .collect(),
+    })
+}
+
 /// Check that `next` is an acceptable successor of the `did.jsonl` a host
 /// already holds (`previous`), independent of who sent it.
 ///

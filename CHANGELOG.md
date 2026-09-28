@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Breaking — the watcher is Trust Tasks only, with its own DID
+
+- **Its own DID.** webvh-watcher is provisioned from a VTA context like the
+  other services (`setup`, interactive or `--from <recipe>` in any VTA mode).
+  Its keys and context credential live in the secrets backend.
+- **One listener.** It serves `webvh/sync/update/0.2`, `webvh/sync/delete/0.2`
+  and `webvh/sync/batch/0.1` on TSP, DIDComm and `POST /api/trust-tasks`.
+  - Only a document signed by one of `sync.source_dids` is applied. A document
+    that does not verify gets no reply. A verified one from any other DID gets
+    a signed `notAuthorized` and takes no room in the replay cache.
+  - Logs are verified as an edge verifies them: the chain and witness proofs,
+    the slot, `versionCount`, and strict extension of the held log and a
+    per-DID high-water mark that a delete keeps.
+- **Removed:** `/api/sync/did`, `/api/sync/delete`, `push_tokens`,
+  `sync.sources`, `sync.reconcile_interval`, and the REST sync wire types. The
+  recipe's `[watcher]` section is now just `source_dids`. The daemon's
+  `watcher_sync` is gone, and its embedded watcher serves resolution only.
+- **Control plane fan-out.** A new `[[registry.watchers]]` maps watcher URLs
+  to DIDs. A published DID is queued for every mapped watcher its log's
+  `watchers` parameter names, and a deleted one for every mapped watcher. It
+  goes through the outbox, with the same delivery, retry and signed
+  acknowledgement as edges. A mapped watcher's DID may acknowledge those
+  syncs and nothing else.
+
+### Breaking — the witness is Trust Tasks only
+
+webvh-witness serves `webvh/witness/key/create|list|delete/0.1`,
+`webvh/witness/sign/0.1` and `acl/*` as Trust Tasks, on TSP and DIDComm (its
+mediator connection) and `POST /api/trust-tasks`, through one dispatch.
+
+- **Removed:** `/api/auth/*`, `/api/witnesses*`, `/api/proof/*`, `/api/acl*`,
+  the `/api/didcomm` 501 stub, the witness's JWT sessions and its `[auth]`
+  settings. `/api/health` is unchanged.
+- **Every request is authorised on its own proof** — `proofPurpose:
+  authentication`, bound to the in-band issuer, addressed to the witness,
+  fresh, and not a replay. A document that does not verify gets no reply; a
+  verified one from a DID the witness does not authorise gets a signed
+  `permissionDenied`, and takes no room in the replay cache. Every reply is
+  signed.
+- **`witness/sign` verifies before it signs.** It carries the log, and the
+  witness refuses an entry whose chain does not verify (`invalidLog`), that is
+  not the last (`versionNotLast`), of a deactivated DID (`deactivated`), or
+  whose witness parameter does not name it (`notListed`).
+- **`WitnessClient`** is a Trust Task client over HTTPS; it verifies every
+  reply against the witness DID. The `--witness-*` bootstrap in
+  `did-hosting-server` and `did-hosting-daemon` sends `witness/sign` with the
+  log, signed by the new DID, and stores a well-formed `did-witness.json`.
+- In the daemon, the embedded witness is reached at
+  `POST /witness/api/trust-tasks`.
+
 ### Added — offline commands to list, reset and delete TSP relationships
 
 `did-hosting-daemon`, `did-hosting-control` and `did-hosting-server` gain

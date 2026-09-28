@@ -28,8 +28,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub fjall: FjallTuning,
     #[serde(default)]
-    pub auth: AuthConfig,
-    #[serde(default)]
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub vta: VtaConfig,
@@ -83,7 +81,8 @@ impl AppConfig {
             &mut config.server,
             &mut config.log,
             &mut config.store,
-            &mut config.auth,
+            // The witness holds no sessions: nothing reads the auth settings.
+            &mut AuthConfig::default(),
             &mut config.secrets,
         )?;
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /

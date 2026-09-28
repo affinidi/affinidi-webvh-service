@@ -5,13 +5,13 @@ use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
-use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
-    StoreConfig, VtaConfig,
+    AppConfig, FeaturesConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig, StoreConfig,
+    VtaConfig,
 };
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
+use did_hosting_common::server::auth::session::now_epoch;
 use did_hosting_common::server::store::KS_ACL;
 
 use did_hosting_common::server::operator_messages::WebvhWitnessMessages;
@@ -107,7 +107,6 @@ pub async fn run_wizard(
 
     let enable_didcomm = selected.contains(&0);
     let enable_rest_api = selected.contains(&1);
-    let auth = AuthConfig::default();
 
     // 3. VTA online provision: prompt for VTA DID + context + mediator,
     //    mint ephemeral did:key, print PNM `contexts create` command,
@@ -212,7 +211,6 @@ pub async fn run_wizard(
             ..StoreConfig::default()
         },
         fjall: Default::default(),
-        auth,
         secrets: secrets_config,
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
@@ -836,7 +834,6 @@ pub async fn run_setup_offline_complete(
             ..StoreConfig::default()
         },
         fjall: Default::default(),
-        auth: AuthConfig::default(),
         secrets: state.secrets.clone(),
         vta: VtaConfig {
             url: result.vta_url.clone(),

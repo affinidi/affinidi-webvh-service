@@ -1,9 +1,9 @@
-//! DIDComm listener for the witness service.
+//! DIDComm listener for the watcher service.
 //!
 //! Uses the `affinidi-messaging-didcomm-service` framework for mediator
 //! connection management, message dispatch, and response packing/sending.
 //!
-//! Every witness operation arrives as a signed Trust Task document inside the
+//! Every sync arrives as a signed Trust Task document inside the
 //! framework's DIDComm trust-task envelope, and is handed to
 //! [`crate::trust_tasks::dispatch_inbound_document`] — the same dispatch the
 //! TSP handler and `POST /api/trust-tasks` use. There are no bare-message
@@ -24,8 +24,8 @@ use did_hosting_common::server::problem_report::log_problem_report;
 use crate::server::AppState;
 use crate::trust_tasks::{Via, dispatch_inbound_document};
 
-/// Build the DIDComm router for the witness service.
-pub fn build_witness_router(state: AppState) -> Result<Router, DIDCommServiceError> {
+/// Build the DIDComm router for the watcher service.
+pub fn build_watcher_router(state: AppState) -> Result<Router, DIDCommServiceError> {
     Ok(Router::new()
         .extension(state)
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
@@ -91,7 +91,7 @@ async fn handle_fallback(
     let sender = ctx.sender_did.as_deref();
     // Inbound problem-reports describe failures on the remote side; log them
     // and never answer (that would create a ping-pong loop).
-    if log_problem_report("witness", sender, &message) {
+    if log_problem_report("watcher", sender, &message) {
         return Ok(None);
     }
     warn!(

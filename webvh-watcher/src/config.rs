@@ -3,11 +3,22 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use did_hosting_common::server::config::{
-    FjallTuning, LogConfig, LogFormat, ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, IdentityConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
+    /// Which transports the Trust Task listener carries on the mediator
+    /// connection (`didcomm`, `tsp`), and whether the HTTP listener
+    /// (resolution and `POST /api/trust-tasks`) runs (`rest_api`).
+    #[serde(default)]
+    pub features: FeaturesConfig,
+    /// The watcher's own DID, whose keys live in a VTA context: it signs every
+    /// Trust Task reply and is the `recipient` every sync document must name.
+    pub server_did: Option<String>,
+    /// The mediator the watcher's DID advertises for TSP and DIDComm.
+    pub mediator_did: Option<String>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -22,60 +33,35 @@ pub struct AppConfig {
     #[serde(default)]
     pub fjall: FjallTuning,
     #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub vta: VtaConfig,
+    /// How the watcher's own identity is produced.
+    #[serde(default)]
+    pub identity: IdentityConfig,
+    #[serde(default)]
     pub sync: SyncConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
 
-#[derive(Default, Clone, Deserialize, Serialize)]
+/// Where the watcher takes its content from.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct SyncConfig {
-    /// Shared secret tokens that source servers must present when pushing.
+    /// The DIDs of the control planes this watcher mirrors. A
+    /// `webvh/sync/*` document is applied only when its proof binds it to one
+    /// of them; one from any other signer is refused `notAuthorized`. Empty
+    /// means the watcher applies nothing.
     #[serde(default)]
-    pub push_tokens: Vec<String>,
-    /// Source servers to pull from on startup (reconciliation).
-    #[serde(default)]
-    pub sources: Vec<SourceConfig>,
-    /// Reconciliation interval in seconds (0 = disabled).
-    #[serde(default)]
-    pub reconcile_interval: u64,
-}
-
-// `push_tokens` are the shared bearer secrets that gate the /sync push
-// endpoint (checked by SyncAuth via constant_time_eq). Manual Debug avoids
-// leaking the live credentials via tracing or error formatting.
-impl std::fmt::Debug for SyncConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncConfig")
-            .field(
-                "push_tokens",
-                &format_args!("[<{} redacted>]", self.push_tokens.len()),
-            )
-            .field("sources", &self.sources)
-            .field("reconcile_interval", &self.reconcile_interval)
-            .finish()
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct SourceConfig {
-    pub url: String,
-    pub token: Option<String>,
-}
-
-// `token` is the bearer credential this watcher presents when pulling from a
-// source server — same redaction class as SyncConfig.push_tokens above.
-impl std::fmt::Debug for SourceConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceConfig")
-            .field("url", &self.url)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .finish()
-    }
+    pub source_dids: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
             server: ServerConfig {
                 host: "0.0.0.0".into(),
                 port: 8533,
@@ -88,6 +74,9 @@ impl Default for AppConfig {
                 ..StoreConfig::default()
             },
             fjall: FjallTuning::default(),
+            secrets: SecretsConfig::default(),
+            vta: VtaConfig::default(),
+            identity: IdentityConfig::default(),
             sync: SyncConfig::default(),
             config_path: PathBuf::new(),
         }
@@ -122,8 +111,28 @@ impl AppConfig {
                 .parse()
                 .map_err(|e| AppError::Config(format!("invalid WATCHER_SERVER_PORT: {e}")))?;
         }
-        if let Ok(v) = std::env::var("WATCHER_LOG_LEVEL") {
-            config.log.level = v;
+        did_hosting_common::server::config::apply_env_overrides(
+            "WATCHER",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            // The watcher holds no sessions: nothing reads the auth settings.
+            &mut AuthConfig::default(),
+            &mut config.secrets,
+        )?;
+        if let Ok(v) = std::env::var("WATCHER_SERVER_DID") {
+            config.server_did = Some(v);
+        }
+        if let Ok(v) = std::env::var("WATCHER_MEDIATOR_DID") {
+            config.mediator_did = Some(v);
+        }
+        if let Ok(v) = std::env::var("WATCHER_SOURCE_DIDS") {
+            config.sync.source_dids = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
 
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /

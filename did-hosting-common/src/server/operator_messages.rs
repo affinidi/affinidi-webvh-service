@@ -87,6 +87,26 @@ impl OperatorMessages for WebvhWitnessMessages {
     }
 }
 
+/// Messages for the `webvh-watcher` binary (standalone watcher service).
+pub struct WebvhWatcherMessages;
+
+impl OperatorMessages for WebvhWatcherMessages {
+    fn integration_label(&self) -> &str {
+        "WebVH watcher"
+    }
+
+    fn integration_label_lower(&self) -> &str {
+        "webvh watcher"
+    }
+
+    fn pnm_admin_command_hint(&self, context_id: &str, setup_did: &str) -> String {
+        format!(
+            "pnm contexts create --id {context_id} --name \"WebVH watcher\" \\\n  \
+             --admin-did {setup_did} --admin-expires 1h"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

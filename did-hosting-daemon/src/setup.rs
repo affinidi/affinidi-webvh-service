@@ -219,7 +219,6 @@ pub async fn run_wizard(
             did: Some(outcome.vta_did.clone()),
             context_id: None,
         },
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features,
         identity: IdentityConfig::default(),
@@ -1061,7 +1060,6 @@ async fn run_self_managed_setup(
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features,
         identity: IdentityConfig {
@@ -1432,7 +1430,6 @@ pub async fn run_setup_offline_complete(
             did: Some(result.vta_did.clone()),
             context_id: None,
         },
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),

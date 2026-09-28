@@ -17,14 +17,13 @@ use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::acl::{AclEntry, Role, store_acl_entry};
-use crate::auth::session::now_epoch;
 use crate::config::{
-    AppConfig, AuthConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig,
-    VtaConfig,
+    AppConfig, FeaturesConfig, LogConfig, LogFormat, ServerConfig, StoreConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use crate::store::Store;
+use did_hosting_common::server::auth::session::now_epoch;
 
 pub async fn run_from_recipe(
     recipe_path: &Path,
@@ -208,7 +207,6 @@ pub async fn apply_recipe(
             ..StoreConfig::default()
         },
         fjall: Default::default(),
-        auth: AuthConfig::default(),
         secrets: secrets_config.clone(),
         vta: VtaConfig {
             url: vta_url,

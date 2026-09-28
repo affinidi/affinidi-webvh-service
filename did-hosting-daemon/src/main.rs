@@ -26,7 +26,7 @@ use did_hosting_common::server::store::{KeyspaceHandle, Store};
 
 use config::DaemonConfig;
 use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
 
 #[derive(Parser)]
@@ -895,7 +895,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &secrets, &witness_store, identity.clone()).await {
+        match build_witness(&config, &witness_store, identity.clone()).await {
             Ok(router) => {
                 combined = combined.nest("/witness", router);
                 enabled_services.push("witness (/witness)");
@@ -1322,40 +1322,23 @@ async fn build_server(
 
 async fn build_witness(
     config: &DaemonConfig,
-    secrets: &ServerSecrets,
     store: &Store,
     identity: Option<Arc<ServiceIdentity>>,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
     use webvh_witness::signing::LocalSigner;
 
-    let witness_config = config.witness_config();
-
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
-
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-    let jwt_keys = init::init_jwt_keys(secrets);
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        witnesses_ks,
-        config: Arc::new(witness_config),
-        did_resolver,
-        secrets_resolver,
+    // The daemon's embedded witness runs no messaging listener of its own —
+    // the control plane's carries the mediator connection — so its Trust Task
+    // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
+    // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
+    // the witness's rotation path an inert no-op here.
+    let state = AppState::new(
+        store.clone(),
+        config.witness_config(),
         identity,
-        // The daemon's embedded witness runs no DIDComm listener of its own —
-        // the control plane's listener carries the whole protocol. The slot
-        // exists for parity with the standalone witness's AppState, and leaving
-        // it empty is what makes the witness's rotation path an inert no-op here.
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys,
-        signer: Arc::new(LocalSigner),
-    };
+        Arc::new(LocalSigner),
+    )?;
 
     let router = webvh_witness::routes::router().with_state(state);
     info!("witness service initialized");
@@ -1366,17 +1349,13 @@ async fn build_witness(
 async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
-    let watcher_config = config.watcher_config();
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let state = AppState {
-        store: store.clone(),
-        dids_ks,
-        config: Arc::new(watcher_config),
-    };
-
-    let router = webvh_watcher::routes::router().with_state(state);
-    info!("watcher service initialized");
+    // Resolution only. The embedded watcher reads the daemon's one store, and
+    // it has no DID of its own, so it runs no Trust Task listener: nothing is
+    // ever synced into it. A watcher that mirrors control planes is a
+    // standalone `webvh-watcher` with its own DID.
+    let state = AppState::new(store.clone(), config.watcher_config(), None)?;
+    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
 }
@@ -1735,43 +1714,24 @@ async fn run_bootstrap_did(
 
         // Optional: request witness proof
         if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
-            use did_hosting_common::WitnessClient;
-
             eprintln!("  Requesting witness proof...");
-            let mut witness_client = WitnessClient::new(&w_url);
-            if let Err(e) = witness_client
-                .authenticate(&w_did, &result.did_id, &signing_secret)
+            eprintln!("  NOTE: the DID must already be served (by a running server) for the");
+            eprintln!("  witness to resolve it and verify the request.");
+            match bootstrap::request_witness_proof(&w_url, &w_did, &w_id, &result, &signing_secret)
                 .await
             {
-                eprintln!("  Warning: witness authentication failed: {e}");
-            } else {
-                let version_id = result
-                    .jsonl
-                    .lines()
-                    .last()
-                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .and_then(|v| {
-                        v.get("versionId")
-                            .and_then(|id| id.as_str())
-                            .map(String::from)
-                    });
-
-                if let Some(vid) = version_id {
-                    match witness_client.request_proof(&w_id, &vid).await {
-                        Ok(proof) => {
-                            let proof_json = serde_json::to_string(&proof)?;
-                            dids_ks
-                                .insert_raw(
-                                    did_hosting_server::did_ops::content_witness_key(&mnemonic),
-                                    proof_json.into_bytes(),
-                                )
-                                .await?;
-                            eprintln!("  Witness proof stored.");
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: witness proof request failed: {e}");
-                        }
-                    }
+                Ok(witness_file) => {
+                    dids_ks
+                        .insert_raw(
+                            did_hosting_server::did_ops::content_witness_key(&mnemonic),
+                            witness_file.into_bytes(),
+                        )
+                        .await?;
+                    eprintln!("  Witness proof stored.");
+                }
+                Err(e) => {
+                    eprintln!("  Warning: witness proof request failed: {e}");
+                    eprintln!("  The DID was created but has no witness proof.");
                 }
             }
         }

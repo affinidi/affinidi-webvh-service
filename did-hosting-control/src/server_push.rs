@@ -301,6 +301,7 @@ const SYNC_BATCH_MAX_BYTES: usize = 512 * 1024;
 /// servers that are offline at enqueue time still get the update
 /// when they reconnect.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
+    let watcher_peers = state.config.registry.watchers.clone();
     let registry_ks = state.registry_ks.clone();
     let dids_ks = state.dids_ks.clone();
     let store = state.store.clone();
@@ -347,14 +348,33 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             _ => None,
         };
 
+        let log_for_watchers = log_content.clone();
         let Some(body) = sync_update_body(&record, log_content, witness_content) else {
             return;
         };
 
+        // The watchers the log names, through the configured URL → DID map.
+        let watchers = watcher_dids_for(&watcher_peers, &log_for_watchers);
+        for watcher_did in &watchers {
+            match crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_UPDATE, body.clone()).await {
+                Ok(_) => info!(watcher_did, mnemonic = %mnemonic, "DID sync: queued for watcher"),
+                Err(e) => warn!(
+                    watcher_did,
+                    mnemonic = %mnemonic,
+                    error = %e,
+                    "DID sync: outbox enqueue failed"
+                ),
+            }
+        }
+
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
             None => {
-                warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                if watchers.is_empty() {
+                    warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                } else {
+                    notify.notify_one();
+                }
                 return;
             }
         };
@@ -385,6 +405,7 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
 
 /// Enqueue a DID-delete sync to every active server instance.
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
+    let watcher_peers = state.config.registry.watchers.clone();
     let registry_ks = state.registry_ks.clone();
     let store = state.store.clone();
     let notify = state.outbox_notify.clone();
@@ -392,15 +413,30 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     tokio::spawn(async move {
         info!(mnemonic = %mnemonic, "DID deleted — queueing sync to servers");
 
+        let body = json!({ "mnemonic": mnemonic });
+        // The log is gone, so which watchers it named is too: every configured
+        // watcher is told. One that mirrors nothing for the slot answers
+        // `absent`.
+        for peer in &watcher_peers {
+            if let Err(e) =
+                crate::outbox::enqueue(&store, &peer.did, MSG_SYNC_DELETE, body.clone()).await
+            {
+                warn!(watcher_did = %peer.did, mnemonic = %mnemonic, error = %e, "DID delete sync: outbox enqueue failed");
+            }
+        }
+
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
             None => {
-                warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                if watcher_peers.is_empty() {
+                    warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                } else {
+                    notify.notify_one();
+                }
                 return;
             }
         };
 
-        let body = json!({ "mnemonic": mnemonic });
         for (server_did, instance_id) in &servers {
             if let Err(e) =
                 crate::outbox::enqueue(&store, server_did, MSG_SYNC_DELETE, body.clone()).await
@@ -423,6 +459,57 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
         }
         notify.notify_one();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Watchers
+// ---------------------------------------------------------------------------
+
+/// The watcher URLs a did:webvh log names: its `watchers` parameter as last
+/// set (parameters carry forward; `null` or `[]` clears it).
+pub fn watchers_named(log: &str) -> Vec<String> {
+    let mut current: Vec<String> = Vec::new();
+    for line in log.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(watchers) = entry.get("parameters").and_then(|p| p.get("watchers")) else {
+            continue;
+        };
+        current = watchers
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|u| u.trim_end_matches('/').to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    current
+}
+
+/// The DIDs of the configured watchers `log` names. A named URL with no
+/// configured DID is skipped (and logged): the control plane pushes only to
+/// watchers it was told the DID of.
+pub fn watcher_dids_for(peers: &[crate::config::WatcherPeer], log: &str) -> Vec<String> {
+    let mut dids = Vec::new();
+    for url in watchers_named(log) {
+        match peers.iter().find(|p| p.url.trim_end_matches('/') == url) {
+            Some(peer) if !dids.contains(&peer.did) => dids.push(peer.did.clone()),
+            Some(_) => {}
+            None => {
+                warn!(watcher_url = %url, "DID sync: the log names a watcher with no configured DID; not pushing to it")
+            }
+        }
+    }
+    dids
+}
+
+/// Whether `did` is a watcher this control plane is configured to push to —
+/// the only standing a watcher has here: acknowledging what it was sent.
+pub fn is_configured_watcher(state: &AppState, did: &str) -> bool {
+    state.config.registry.watchers.iter().any(|p| p.did == did)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,4 +843,46 @@ pub async fn fanout_domain_upsert(
         }
     }
     (enqueued, skipped)
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+    use crate::config::WatcherPeer;
+
+    fn log(params: &[serde_json::Value]) -> String {
+        params
+            .iter()
+            .map(|p| json!({ "versionId": "1-x", "parameters": p }).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_last_watchers_parameter_wins() {
+        let l = log(&[
+            json!({ "watchers": ["https://a.example/"] }),
+            json!({}),
+            json!({ "watchers": ["https://b.example", "https://c.example"] }),
+        ]);
+        assert_eq!(
+            watchers_named(&l),
+            vec!["https://b.example", "https://c.example"]
+        );
+        let cleared = log(&[
+            json!({ "watchers": ["https://a.example"] }),
+            json!({ "watchers": null }),
+        ]);
+        assert!(watchers_named(&cleared).is_empty());
+    }
+
+    #[test]
+    fn only_configured_watchers_are_pushed_to() {
+        let peers = vec![WatcherPeer {
+            url: "https://b.example/".into(),
+            did: "did:example:b".into(),
+        }];
+        let l = log(&[json!({ "watchers": ["https://a.example", "https://b.example"] })]);
+        assert_eq!(watcher_dids_for(&peers, &l), vec!["did:example:b"]);
+    }
 }
