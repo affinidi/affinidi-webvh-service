@@ -1293,17 +1293,13 @@ async fn build_witness(
 async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
-    let watcher_config = config.watcher_config();
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let state = AppState {
-        store: store.clone(),
-        dids_ks,
-        config: Arc::new(watcher_config),
-    };
-
-    let router = webvh_watcher::routes::router().with_state(state);
-    info!("watcher service initialized");
+    // Resolution only. The embedded watcher reads the daemon's one store, and
+    // it has no DID of its own, so it runs no Trust Task listener: nothing is
+    // ever synced into it. A watcher that mirrors control planes is a
+    // standalone `webvh-watcher` with its own DID.
+    let state = AppState::new(store.clone(), config.watcher_config(), None)?;
+    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
 }

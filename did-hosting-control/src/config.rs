@@ -134,6 +134,22 @@ pub struct RegistryConfig {
     /// `validate_proxy_target_url` (proxy) for the enforcement.
     #[serde(default)]
     pub url_allowlist: Vec<String>,
+    /// The watchers this control plane may push to (`[[registry.watchers]]`).
+    ///
+    /// A DID log names its watchers by URL (the `watchers` parameter); this map
+    /// says which DID answers at each URL, so the control plane can send that
+    /// watcher signed `webvh/sync/*` Trust Tasks through its outbox. A watcher
+    /// a log names but this map does not is not pushed to. A listed watcher's
+    /// DID may acknowledge what it was sent, and nothing else.
+    #[serde(default)]
+    pub watchers: Vec<WatcherPeer>,
+}
+
+/// One watcher: the URL DID logs name it by, and its DID.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatcherPeer {
+    pub url: String,
+    pub did: String,
 }
 
 impl Default for RegistryConfig {
@@ -142,6 +158,7 @@ impl Default for RegistryConfig {
             instances: Vec::new(),
             health_check_interval: default_health_check_interval(),
             url_allowlist: Vec::new(),
+            watchers: Vec::new(),
         }
     }
 }

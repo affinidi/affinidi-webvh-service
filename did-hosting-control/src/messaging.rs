@@ -1443,10 +1443,11 @@ async fn route_trust_task_doc(
             .unwrap_or(false);
         if doc.proof.is_some()
             && !retryable
-            && matches!(
-                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
-                Ok(Some(_))
-            )
+            && (crate::server_push::is_configured_watcher(state, sender)
+                || matches!(
+                    did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                    Ok(Some(_))
+                ))
             && let Ok(signer) =
                 verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
         {
@@ -1510,7 +1511,15 @@ async fn route_trust_task_doc(
             ),
         ))));
     }
+    // A configured watcher has no ACL entry: its only standing here is
+    // acknowledging the syncs it was sent, so that — and nothing else — gets
+    // past this pre-filter on its DID.
+    let watcher_ack = matches!(
+        type_uri.as_str(),
+        MSG_SYNC_UPDATE_ACK | MSG_SYNC_DELETE_ACK | MSG_SYNC_BATCH_ACK
+    ) && crate::server_push::is_configured_watcher(state, sender);
     if needs_acl
+        && !watcher_ack
         && !matches!(
             did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
             Ok(Some(_))
