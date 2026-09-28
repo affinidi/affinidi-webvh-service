@@ -67,11 +67,11 @@ aws-smithy-types = ">=1.6.1, <1.7"
 # whichever vta-sdk/vti-common pair the block below pins, and move it in the
 # same commit. A plain `cargo update` that floats vti-common on its own is how
 # a second affinidi-tdk copy gets added; see the vta-sdk note.
-affinidi-tdk = "0.18"
+affinidi-tdk = "0.20"
 # `tsp` feature: routes inbound TSP frames on the shared mediator socket
 # to the `TspHandler`. Without it the handler is stored but never invoked
 # (the crate compiles TSP support out).
-affinidi-messaging-didcomm-service = { version = "0.14", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.15.1", features = ["tsp"] }
 affinidi-tdk-common = "0.6"
 affinidi-messaging-didcomm = "0.15.9"
 affinidi-secrets-resolver = "0.5"
@@ -284,7 +284,7 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
-vta-sdk = { version = "0.54", features = [
+vta-sdk = { version = "0.56", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -329,23 +329,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # `trust-tasks-rs`: 0.13 pinned `trust-tasks-rs "0.23"`; 0.14 moved to
 # `"0.24"`, and pulled `affinidi-messaging-sdk` 0.29 with it — bumped our own
 # direct pin (0.28.1 → 0.29.0, below) to match rather than carry a second
-# copy of that too. `vta-sdk` 0.54.0 and `vti-common` 0.27.0 are unchanged
-# (already the newest release of each) and still pin `trust-tasks-tsp` /
-# `trust-tasks-capability-client` at their old 0.23.x majors — neither has
-# republished for 0.24 yet, so `cargo tree -d -e normal,build,dev` still
-# lists a second, older copy of `trust-tasks-rs` (and of
-# `trust-tasks-tsp`/`trust-tasks-capability-client` themselves) pulled in
-# behind them, via `affinidi-tdk`'s still-0.28.1 `affinidi-messaging-sdk`.
-# Tolerated, the same way past dev-graph splits were: neither vta-sdk's nor
-# vti-common's use of those crates is `pub`, so it never reaches a type we
-# consume. Re-run `cargo tree -d -e normal,build,dev` after the next
-# vta-sdk/vti-common bump to check whether it has closed.
+# copy of that too.
 #
-# The dev-graph half needed test-mediator `0.11` → `0.12` (mediator 0.31,
-# affinidi-messaging-sdk 0.29, affinidi-tdk 0.19) to keep pace with the
-# affinidi-messaging-sdk bump above; test-mediator itself still pins
-# `trust-tasks-rs`/`trust-tasks-proof` at 0.23 (its own subgraph, never
-# crossed — it is a fixture we only spawn).
+# **This closes for good on the 0.56/0.24.2 move.** `vta-sdk` 0.54.0 → 0.56.0
+# and `vti-common` 0.27.0 → 0.29.0 (the four `vti-common = "0.27"`
+# declarations below moved to `"0.29"` alongside it) are the releases that
+# retire the "still pin trust-tasks-tsp / trust-tasks-capability-client at
+# their old 0.23.x majors" residual this note used to describe: 0.56 and
+# 0.29.0 both declare `trust-tasks-rs ^0.24.2`, the same line
+# `affinidi-messaging-didcomm-service` 0.15.1 and this workspace's own five
+# `trust-tasks-*` lines (below) are now on. `cargo tree -d -e
+# normal,build,dev` was run after this move and lists no duplicate of
+# `trust-tasks-rs`, `trust-tasks-tsp` or `trust-tasks-capability-client` —
+# confirm this stays true before assuming a future bump keeps it that way.
+#
+# The dev-graph half needed test-mediator `0.12` → `0.14` (mediator 0.33,
+# affinidi-messaging-sdk 0.30, affinidi-tdk 0.20) to keep pace with the
+# affinidi-messaging-sdk bump above and to land on the same `vta-sdk` 0.56
+# line; `did-hosting-control`'s own `affinidi-messaging-test-mediator` pin
+# (below) moved with it.
 #
 # The compiler-invisible check was run again and still passes: the
 # framework emits `trust-task-error/0.5`, unchanged since 0.9, and
@@ -541,16 +543,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # `AcceptUnvalidated` (see `run_pipeline` in did-hosting-common): re-enable
 # more broadly only if a future spec's constraints are similarly
 # unrepresentable and need the same treatment.
-trust-tasks-rs = { version = "0.24.0", default-features = false }
-trust-tasks-https = { version = "0.24.0", default-features = false, features = ["server", "client", "jwt"] }
-trust-tasks-didcomm = { version = "0.24.0", default-features = false }
-trust-tasks-proof = { version = "0.24.0", default-features = false, features = ["affinidi"] }
+trust-tasks-rs = { version = "0.24.2", default-features = false }
+trust-tasks-https = { version = "0.24.2", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.24.2", default-features = false }
+trust-tasks-proof = { version = "0.24.2", default-features = false, features = ["affinidi"] }
 # TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
 # Tasks framework — the sibling of `trust-tasks-didcomm`, built on
 # `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
 # TSP-delivered trust-task documents. Moves in lockstep with the rest of
 # the `trust-tasks-*` family.
-trust-tasks-tsp = { version = "0.24.0", default-features = false }
+trust-tasks-tsp = { version = "0.24.2", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers; also
 # the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
@@ -563,7 +565,7 @@ affinidi-tsp = { version = "0.2", features = ["messaging-core"] }
 # already resolves (transitively via vta-sdk / -didcomm-service), pinned here so
 # a crate can name it. Moves with that family; `tsp` feature exposes the store
 # surface.
-affinidi-messaging-sdk = { version = "0.29.0", features = ["tsp"] }
+affinidi-messaging-sdk = { version = "0.30.0", features = ["tsp"] }
 # Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
 # resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
 # Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the
