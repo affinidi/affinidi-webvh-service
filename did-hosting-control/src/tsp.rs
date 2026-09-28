@@ -573,7 +573,7 @@ mod tests {
         use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
         use did_hosting_common::server::domain::DomainScope;
 
-        // `auth/authenticate/0.1` requires a proof, so the caller is a did:key
+        // `auth/authenticate/0.2` requires a proof, so the caller is a did:key
         // that signs its documents, verified without network I/O.
         let (caller, signer) = crate::signing::test_util::did_key_signer(&[21u8; 32]);
         let (mut state, _dir) = test_state().await;
@@ -613,7 +613,7 @@ mod tests {
         let authenticate = async |challenge: &str| {
             let unsigned = json!({
                 "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.2",
                 "issuer": caller,
                 "recipient": SERVICE_DID,
                 "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -637,7 +637,7 @@ mod tests {
 
         let doc = authenticate(&first.challenge).await;
         assert_eq!(
-            doc["type"], "https://trusttasks.org/spec/auth/authenticate/0.1#response",
+            doc["type"], "https://trusttasks.org/spec/auth/authenticate/0.2#response",
             "{doc}"
         );
         assert_eq!(state.pending_challenges.count_for(&caller), 1);
@@ -723,7 +723,7 @@ mod tests {
         let request = crate::signing::test_util::sign_operational(
             json!({
                 "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.2",
                 "issuer": caller,
                 "recipient": control,
                 "issuedAt": now(),
@@ -739,7 +739,7 @@ mod tests {
         let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             reply.type_uri.to_string(),
-            "https://trusttasks.org/spec/auth/authenticate/0.1#response",
+            "https://trusttasks.org/spec/auth/authenticate/0.2#response",
             "{reply:?}"
         );
         verify_sender_bound(&reply, Some(&control), None, &caller, &client_verifier)

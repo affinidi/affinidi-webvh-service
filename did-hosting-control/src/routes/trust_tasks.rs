@@ -89,79 +89,68 @@ pub async fn dispatch_trust_task(
 
     // ─── 3. With a bearer session, the proof must be bound to it (SECURITY).
     //
-    // (a) The session carries an ephemeral session key (passkey Web UI flow):
-    //     the proof's `verificationMethod` MUST be that `did:key:{pk}#{pk}`.
-    //     Otherwise a key the server never bound to this session could sign as
-    //     its subject.
+    // Two keys may sign for the session's subject:
     //
-    // (b) It carries none (wallet or machine sessions): the proof's
-    //     `verificationMethod` MUST belong to the session's subject, or any
-    //     resolvable DID's key could be attributed to it.
+    // (a) The subject's own key: the proof's `verificationMethod` belongs to
+    //     the session's DID. Always accepted. It is what a wallet signs an
+    //     approval or a refresh with, even in a session that has a key bound.
     //
-    // Enforced before verification, so a forged attribution is refused with
-    // its reason rather than a generic `proofInvalid`.
+    // (b) The session key bound at login (`auth/authenticate/0.2`
+    //     `sessionKey`, or a passkey login's browser key): exactly
+    //     `did:key:{pk}#{pk}`, and only for a task a session key may sign
+    //     (`session_key_may_sign`). Never an approval, and never the auth
+    //     family, so it cannot step itself up or outlive the login.
+    //
+    // Anything else is refused, or any resolvable DID's key could be
+    // attributed to the subject. Checked before verification, so a forged
+    // attribution is refused with its reason rather than a generic
+    // `proofInvalid`.
+    let session_key_vm = auth
+        .as_ref()
+        .and_then(|a| a.session_pubkey_b58btc.as_deref())
+        .filter(|_| crate::messaging::session_key_may_sign(&doc.type_uri.to_string()))
+        .map(|pk| format!("did:key:{pk}#{pk}"));
     if let (Some(auth), Some(proof)) = (auth.as_ref(), doc.proof.as_ref()) {
-        if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
-            let expected_vm = format!("did:key:{pk}#{pk}");
-            if proof.verification_method != expected_vm {
-                tracing::warn!(
-                    actual_vm = %proof.verification_method,
-                    expected_vm,
-                    "trust-task proof verificationMethod does not match the JWT-bound \
-                     session pubkey — rejecting as proof_invalid"
-                );
-                let reject = RejectReason::ProofInvalid {
-                    reason: "proof verificationMethod is not bound to this session".to_string(),
-                };
-                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
-                return Ok(into_response(DispatchOutcome::Rejected(routed)));
-            }
-        } else {
-            let proof_did = proof
-                .verification_method
-                .split_once('#')
-                .map(|(d, _)| d)
-                .unwrap_or("");
-            if proof_did != auth.did {
-                tracing::warn!(
-                    proof_did = %proof_did,
-                    auth_did = %auth.did,
-                    "trust-task proof verificationMethod DID does not match the \
-                     authenticated caller — rejecting as proof_invalid"
-                );
-                let reject = RejectReason::ProofInvalid {
-                    reason: "proof verificationMethod DID does not match the authenticated caller"
-                        .to_string(),
-                };
-                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
-                return Ok(into_response(DispatchOutcome::Rejected(routed)));
-            }
+        let own_key = did_hosting_common::server::trust_tasks::verifier::controller_did(
+            &proof.verification_method,
+        ) == auth.did;
+        let session_key = session_key_vm.as_deref() == Some(proof.verification_method.as_str());
+        if !own_key && !session_key {
+            tracing::warn!(
+                actual_vm = %proof.verification_method,
+                auth_did = %auth.did,
+                session_key_vm = ?session_key_vm,
+                type_uri = %doc.type_uri,
+                "trust-task proof is neither the session subject's key nor a session key \
+                 this task accepts — rejecting as proof_invalid"
+            );
+            let reject = RejectReason::ProofInvalid {
+                reason: "proof verificationMethod is not bound to this session".to_string(),
+            };
+            let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+            return Ok(into_response(DispatchOutcome::Rejected(routed)));
         }
     }
 
     // ─── Route, through `messaging::dispatch_trust_task_doc`: the same entry
     // DIDComm and TSP use, so what a document means is decided in one place.
     //
-    // A passkey session signs with its session key on behalf of the session's
+    // A session with a bound key signs with it on behalf of the session's
     // subject, so its verifier accepts exactly that key for exactly that
-    // principal — built per request from the verified bearer token, never on
-    // the shared verifier. Every other caller signs as itself.
+    // principal. It is built per request from the verified bearer token, never
+    // on the shared verifier, and only for a task that key may sign. Every
+    // other caller signs as itself.
     let shared = state
         .trust_tasks_verifier
         .as_deref()
         .ok_or_else(|| AppError::Config("no trust-task proof verifier configured".into()))?;
     let delegated;
-    let verifier = match auth
-        .as_ref()
-        .and_then(|a| a.session_pubkey_b58btc.as_deref().map(|pk| (a, pk)))
-    {
-        Some((auth, pk)) => {
-            delegated = shared
-                .clone()
-                .with_session_delegate(auth.did.clone(), format!("did:key:{pk}#{pk}"));
+    let verifier = match (auth.as_ref(), session_key_vm) {
+        (Some(auth), Some(vm)) => {
+            delegated = shared.clone().with_session_delegate(auth.did.clone(), vm);
             &delegated
         }
-        None => shared,
+        _ => shared,
     };
 
     // The peer: the bearer session's subject, or — with no session — the

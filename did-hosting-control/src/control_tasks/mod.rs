@@ -51,7 +51,7 @@ mod tests;
 use trust_tasks_rs::specs::{
     auth::{
         passkey::{enroll::invite as tt_invite, login as tt_login},
-        step_up as tt_step_up,
+        revoke_session as tt_revoke_session, step_up as tt_step_up,
     },
     did_management::{
         agent_name as tt_agent_name, did as tt_did, domain as tt_domain, identity as tt_identity,
@@ -153,6 +153,9 @@ control_tasks! {
     // decision is the approver's attestation.
     tt_step_up::start::v0_1 => Authentication, auth::step_up_start;
     tt_step_up::approve_response::v0_5 => AssertionMethod, auth::approve_response;
+    // Logout: end one of the caller's own sessions, and any session key bound
+    // to it.
+    tt_revoke_session::v0_2 => Authentication, auth::revoke_session;
     // Passkey login: opening a ceremony authorises nothing; finishing one
     // mints a session for the did:key that signs it.
     tt_login::start::v0_2 => Optional, auth::login_start;
