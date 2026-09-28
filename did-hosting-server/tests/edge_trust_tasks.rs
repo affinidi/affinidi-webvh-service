@@ -71,6 +71,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
     };
     let store = Store::open(&store_config).await.expect("open store");
     let config = AppConfig {
+        fjall: Default::default(),
         features: FeaturesConfig {
             tsp: true,
             ..Default::default()

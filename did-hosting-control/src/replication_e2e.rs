@@ -97,6 +97,7 @@ async fn edge_state(
     };
     let store = Store::open(&store_config).await.unwrap();
     let config = AppConfig {
+        fjall: Default::default(),
         features: FeaturesConfig {
             tsp: true,
             ..Default::default()
