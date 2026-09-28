@@ -328,6 +328,68 @@ impl ServiceIdentity {
         }))
     }
 
+    /// [`Self::from_signing_secret`] plus a key-agreement secret and a
+    /// mediator, for integration tests that drive a **real** DIDComm listener
+    /// (e.g. against `affinidi-messaging-test-mediator`) rather than resolving
+    /// a published DID document.
+    ///
+    /// `from_signing_secret`'s "carries no key-agreement key" limitation is
+    /// exactly what this lifts: `signing_secret.id` and `ka_secret.id` become
+    /// the generation's `signing_kid`/`ka_kid` as-is, so callers minting a
+    /// `did:peer` (whose secrets already carry the right `#key-N` ids) can
+    /// pass them straight through. Both secrets are inserted into the
+    /// identity's own `secrets_resolver` — [`load_identity`] does the same for
+    /// every live generation's secrets — so a real `DIDCommService` listener
+    /// build from this identity can actually unpack inbound messages.
+    ///
+    /// No document is resolved or trusted here: `ka_public_multibase` is
+    /// `None`, `protocols` and `mediator_did` are exactly what the caller
+    /// passes, and nothing is persisted. Gated behind `test-support` (like
+    /// other test-only crate surface, e.g.
+    /// `TransportBoundVerifier::record_deactivation_verdict`) so a downstream
+    /// integration test can reach it too.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn for_didcomm_test(
+        did: &str,
+        signing_secret: Secret,
+        ka_secret: Secret,
+        mediator_did: &str,
+        protocols: ProtocolSet,
+    ) -> Result<Arc<Self>, AppError> {
+        let did_resolver = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_cache_ttl(DID_CACHE_TTL_SECS)
+                .build(),
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("DID cache: {e}")))?;
+        let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+        secrets_resolver.insert(signing_secret.clone()).await;
+        secrets_resolver.insert(ka_secret.clone()).await;
+        let generation = IdentityGeneration {
+            id: 0,
+            did: did.to_string(),
+            signing_kid: signing_secret.id.clone(),
+            ka_kid: ka_secret.id.clone(),
+            ka_public_multibase: None,
+            mediator_did: Some(mediator_did.to_string()),
+            protocols,
+            created_at: now_epoch(),
+            retired_at: None,
+            expires_at: None,
+        };
+        Ok(Arc::new(Self {
+            did: did.to_string(),
+            did_resolver,
+            secrets_resolver: Arc::new(secrets_resolver),
+            live: RwLock::new(LiveSet {
+                generations: vec![generation],
+                secrets: vec![signing_secret, ka_secret],
+            }),
+            rotation: tokio::sync::Mutex::new(()),
+        }))
+    }
+
     /// Build a `ServiceIdentity` directly, for tests in sibling modules.
     ///
     /// `live` is private to this module, so `identity_drain`'s tests cannot

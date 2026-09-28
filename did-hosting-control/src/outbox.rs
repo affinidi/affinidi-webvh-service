@@ -52,7 +52,7 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use did_hosting_common::server::didcomm_profile::TransportFallback;
+use did_hosting_common::server::didcomm_profile::{PeerTransport, TransportFallback};
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::{KS_OUTBOUND_QUEUE, KeyspaceHandle, Store};
 use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
@@ -396,9 +396,12 @@ pub async fn signed_document(
 
 /// Send one entry via the messaging service, as a signed Trust Task document.
 ///
-/// The binding follows the target's DID document (`send_trust_task`): a TSP
-/// frame when it advertises `TSPTransport`, else the DIDComm trust-task
-/// envelope, with the same TSP→DIDComm fallback as every other trust-task send.
+/// The binding follows the target's DID document (`send_trust_task`): TSP,
+/// else DIDComm, else HTTPS, with the same TSP→DIDComm fallback as every
+/// other trust-task send. Returns the transport that actually carried it
+/// alongside the document id — [`run_tick`] uses the transport to decide
+/// whether this send already carries its own acknowledgement (HTTPS) or must
+/// still wait for one to arrive later (TSP/DIDComm).
 async fn deliver(
     didcomm: &DIDCommService,
     control_did: &str,
@@ -406,9 +409,9 @@ async fn deliver(
     signer: &Secret,
     fallback: &TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(String, PeerTransport), Box<dyn std::error::Error + Send + Sync>> {
     let doc = signed_document(control_did, entry, signer).await?;
-    send_trust_task(
+    let transport = send_trust_task(
         didcomm,
         "control",
         control_did,
@@ -417,8 +420,8 @@ async fn deliver(
         fallback,
         did_resolver,
     )
-    .await
-    .map(|_| doc.id.clone())
+    .await?;
+    Ok((doc.id.clone(), transport))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -524,18 +527,52 @@ pub async fn run_tick(state: &AppState) -> TickReport {
             )
             .await
             {
-                Ok(doc_id) => {
+                Ok((doc_id, transport)) => {
                     // Handed to the transport, not delivered: the entry stays
-                    // until the target acknowledges this document.
+                    // until the target acknowledges this document — except
+                    // over HTTPS, where the send already *is* the round trip
+                    // (see below).
                     debug!(
                         target_did = %target,
                         msg_type = %entry.msg_type,
                         attempts = entry.attempts + 1,
                         %doc_id,
+                        ?transport,
                         "outbox: sent; awaiting acknowledgement"
                     );
                     let _ = record_sent(&state.store, key, &entry, &doc_id).await;
                     report.sent += 1;
+
+                    // HTTPS carries its own ack: `send_trust_task` already
+                    // verified the reply is signed by the target, addressed
+                    // back to us, and threaded to this exact document (see
+                    // `did_hosting_common::server::trust_tasks::send`'s "The
+                    // HTTPS reply" docs) before returning `Ok`. There is no
+                    // later, separate ack to wait for, so settle now — an
+                    // entry never asked to self-acknowledge would otherwise
+                    // sit `awaiting_ack` until [`ACK_TIMEOUT_SECS`] and resend,
+                    // even though the target already answered.
+                    if transport == PeerTransport::Https {
+                        match acknowledge(&state.store, &target, &doc_id).await {
+                            Ok(true) => debug!(
+                                target_did = %target,
+                                %doc_id,
+                                "outbox: HTTPS send self-acknowledged"
+                            ),
+                            Ok(false) => warn!(
+                                target_did = %target,
+                                %doc_id,
+                                "outbox: HTTPS send succeeded but found no matching \
+                                 awaiting_ack row to settle"
+                            ),
+                            Err(e) => warn!(
+                                target_did = %target,
+                                %doc_id,
+                                error = %e,
+                                "outbox: failed to self-acknowledge HTTPS send"
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     let err_str = e.to_string();
