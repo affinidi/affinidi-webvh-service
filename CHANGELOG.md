@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added — offline commands to list, reset and delete TSP relationships
+
+`did-hosting-daemon`, `did-hosting-control` and `did-hosting-server` gain
+`tsp-relationship-list`, `tsp-relationship-reset --peer <did>` and
+`tsp-relationship-delete --peer <did> | --all [--yes]`. Relationship state is
+per endpoint and persisted, so neither restarting the service nor wiping the
+mediator clears it; making two nodes meet as strangers again means clearing
+both halves, and until now there was no way to clear this one. Reset puts our
+half back to `None` (what the SDK does after a reply timeout) so the next send
+re-invites; delete removes the whole record. `--all` covers half-formed
+relationships the store cannot enumerate, and only reports without `--yes`.
+The commands open the store directly, so stop the service first. Shared as
+`server::cli_tsp`.
+
+The keyspace behind the durable relationship store now implements
+`scan_prefix`. It did not, and the trait's default yields nothing, so the SDK's
+enumerating operations (`established_relationships`, `evict_idle`) would have
+seen an empty store. Nothing here called them before; `tsp-relationship-list`
+does.
+
 ### Fixed — a wallet proxy login no longer raises an approval popup per request
 
 The console signs every Trust Task it sends. A proxy login (the VTA mints the
