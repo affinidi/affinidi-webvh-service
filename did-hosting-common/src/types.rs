@@ -674,29 +674,6 @@ pub struct StatsSyncPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Watcher sync types
-// ---------------------------------------------------------------------------
-
-/// Pushed from did-hosting-server to webvh-watcher when a DID is published.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncDidRequest {
-    pub mnemonic: String,
-    pub did_id: Option<String>,
-    pub log_content: String,
-    pub witness_content: Option<String>,
-    pub source_url: String,
-    pub updated_at: u64,
-    pub disabled: bool,
-}
-
-/// Pushed from did-hosting-server to webvh-watcher when a DID is deleted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncDeleteRequest {
-    pub mnemonic: String,
-    pub source_url: String,
-}
-
-// ---------------------------------------------------------------------------
 // High-level create result
 // ---------------------------------------------------------------------------
 

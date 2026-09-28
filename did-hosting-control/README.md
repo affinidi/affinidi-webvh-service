@@ -123,6 +123,13 @@ health_check_interval = 60    # seconds
 # Hosts the control plane may register and PROXY TO. Required if you use the
 # reverse proxy — see "Reverse proxy & the registry allowlist" below.
 url_allowlist = ["server-eu.internal", "witness-eu.internal"]
+
+# Watchers: a DID whose log names this URL in its `watchers` parameter is
+# pushed there (signed webvh/sync/* Trust Tasks, through the outbox). The DID
+# may acknowledge those syncs and nothing else.
+# [[registry.watchers]]
+# url = "https://watcher1.example.com"
+# did = "did:webvh:...:watcher1.example.com"
 ```
 
 ### Service Registry

@@ -1,6 +1,6 @@
 mod did_public;
 pub mod health;
-mod sync;
+pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -8,18 +8,14 @@ use axum::routing::{get, post};
 
 use crate::server::AppState;
 
-pub fn router() -> Router<AppState> {
-    // Sync routes with explicit body limit (matches server's upload limit)
-    let sync_routes = Router::new()
-        .route("/did", post(sync::receive_did))
-        .route("/delete", post(sync::receive_delete))
-        .layer(DefaultBodyLimit::max(256 * 1024)); // 256 KB
+/// The largest Trust Task document the watcher reads. A `sync/batch` carries
+/// up to 512 KiB of logs (the control plane's cap), a `sync/update` a whole
+/// log; this leaves room for the envelope.
+pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
-    let api = Router::new().nest("/sync", sync_routes);
-
+/// Public DID serving only: the mirrored logs and witness proofs.
+pub fn router_public_only() -> Router<AppState> {
     Router::new()
-        .nest("/api", api)
-        // Public DID serving
         .route(
             "/.well-known/did.jsonl",
             get(did_public::serve_root_did_log),
@@ -29,4 +25,15 @@ pub fn router() -> Router<AppState> {
             get(did_public::serve_root_witness),
         )
         .fallback(did_public::serve_public)
+}
+
+/// The watcher's HTTP surface: public resolution, and the HTTPS binding of
+/// its Trust Task listener, `POST /api/trust-tasks`. There is no sync REST
+/// API — a source pushes signed `webvh/sync/*` documents, the same on every
+/// transport.
+pub fn router() -> Router<AppState> {
+    router_public_only().route(
+        "/api/trust-tasks",
+        post(trust_tasks::receive).layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
+    )
 }

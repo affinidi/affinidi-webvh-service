@@ -211,6 +211,8 @@ did-hosting-control = { path = ".", features = ["test-support"] }
 # (edge) through each transport's entry points. The edge does not depend on
 # this crate, so there is no cycle.
 did-hosting-server = { path = "../did-hosting-server" }
+# `src/watcher_e2e.rs` fans syncs out to a real watcher the same way.
+webvh-watcher = { path = "../webvh-watcher" }
 # Same feature-unification trick as the self-dependency above: `did-hosting-common`
 # is already a regular `[dependencies]` entry, so this only *adds*
 # `test-support` (Cargo unifies to one instance) — needed by
