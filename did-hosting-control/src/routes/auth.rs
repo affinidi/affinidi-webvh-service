@@ -261,12 +261,16 @@ pub async fn authenticate(
     }
 
     // ─── 4. Session pubkey validation (route-layer concern —
-    //        the canonical handler treats it opaquely).
+    //        the canonical handler treats it opaquely). Decoded, not
+    //        prefix-matched, exactly as `auth/authenticate/0.2` checks its
+    //        `sessionKey`: a value that only *looks* like an Ed25519 multikey
+    //        would bind a key whose every later proof is refused, and the
+    //        producer — told the login succeeded — would never find out why.
     let session_pubkey_b58btc = if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
-        if !pk.starts_with("z6Mk") {
-            warn!(prefix = %&pk[..pk.len().min(8)], "rejected unsupported session-key shape");
+        if !is_ed25519_multikey(pk) {
+            warn!(prefix = %pk.chars().take(8).collect::<String>(), "rejected unsupported session-key shape");
             return Err(AppError::Authentication(
-                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
+                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk…)".into(),
             ));
         }
         Some(pk.to_string())
@@ -307,6 +311,17 @@ pub async fn authenticate(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether `multikey` is a base58btc multikey encoding an Ed25519 public key
+/// (`0xed 0x01` + 32 bytes) — the only session key this service can verify a
+/// proof from, since the session-key verifier resolves `did:key:{pk}#{pk}` and
+/// checks `eddsa-jcs-2022`.
+pub(crate) fn is_ed25519_multikey(multikey: &str) -> bool {
+    matches!(
+        multibase::decode(multikey),
+        Ok((multibase::Base::Base58Btc, bytes)) if bytes.len() == 34 && bytes[..2] == [0xed, 0x01]
+    )
 }
 
 /// Cheap structural check: does `body` look like a DIDComm-v2 general-JSON

@@ -560,6 +560,58 @@ async fn siop_id_token_authenticate_binds_a_session_key() {
     );
 }
 
+/// A `session_pubkey_b58btc` that only *looks* like an Ed25519 multikey — the
+/// right `z6Mk` prefix over bytes that are not one — is refused, not stored:
+/// a bound key whose every later proof fails would leave the producer with a
+/// session it believes works. Refused before the challenge is spent, so the
+/// same challenge still redeems.
+#[tokio::test]
+async fn siop_id_token_authenticate_refuses_a_malformed_session_key() {
+    let harness = make_harness().await;
+    let persona = key_identity([36u8; 32]);
+    let browser = key_identity([37u8; 32]);
+    let pk = browser.did.trim_start_matches("did:key:").to_string();
+    seed_owner(&harness.state, &persona.did).await;
+
+    let (status, session_id, challenge) = do_challenge(&harness.state, &persona.did).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let truncated = pk[..pk.len() - 4].to_string();
+    let not_base58 = format!("z6Mk{}", "0OIl".repeat(10));
+    let extended = format!("{pk}zz");
+    for bad in [truncated.as_str(), not_base58.as_str(), extended.as_str()] {
+        let body = siop_authenticate_body_binding(
+            &persona,
+            &session_id,
+            &challenge,
+            now_secs(),
+            Some(bad),
+        );
+        let resp = did_hosting_control::routes::router_without_fallback()
+            .with_state(harness.state.clone())
+            .oneshot(authenticate_request(body))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "{bad}: a malformed session key must be refused, got {}",
+            resp.status()
+        );
+    }
+
+    let body = siop_authenticate_body(&persona, &session_id, &challenge, now_secs());
+    let resp = did_hosting_control::routes::router_without_fallback()
+        .with_state(harness.state.clone())
+        .oneshot(authenticate_request(body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the challenge survives a refused key"
+    );
+}
+
 /// (B) A malformed, non-JWS, non-Trust-Task body still yields the
 /// existing `trust-task-error` document (the SIOPv2 parser's malformed
 /// path) rather than being misrouted — the content-negotiation only
