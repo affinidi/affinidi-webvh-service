@@ -166,6 +166,12 @@ webauthn-rs = { version = "0.5", features = [
   "danger-allow-state-serialisation",
 ] }
 webauthn-rs-proto = "0.5"
+# Passkey enrolment invites: the claim code is short enough to type, so it is
+# stored only as a slow, salted Argon2id hash (`auth/passkey/enroll/invite/0.2`
+# Conformance item 4). No `password-hash`: the salt and parameters are kept
+# beside the digest by `passkey::invite`. 0.6 is the line already in the lock.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+subtle = "2.6"
 url = "2"
 
 # CLI argument parsing
@@ -571,6 +577,14 @@ affinidi-messaging-sdk = { version = "0.30.1", features = ["tsp"] }
 # Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the
 # signature-only-when-issuer-absent path.
 affinidi-data-integrity = "0.7"
+
+# Argon2 in an unoptimised build takes seconds per hash, and every test that
+# issues or redeems an enrolment invite runs one; optimise just the hash.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.

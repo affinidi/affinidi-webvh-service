@@ -171,7 +171,7 @@ enum Command {
         /// Role (admin or owner)
         #[arg(long, default_value = "owner")]
         role: String,
-        /// Override enrollment TTL (in hours)
+        /// Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
         #[arg(long)]
         ttl_hours: Option<u64>,
     },
@@ -648,8 +648,6 @@ async fn run_invite(
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::passkey::routes::create_enrollment_invite;
-
     let config = AppConfig::load(config_path)?;
 
     let base_url = config
@@ -665,20 +663,14 @@ async fn run_invite(
     let store = store::Store::open(&config.store).await?;
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
-    let resp =
-        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
-
-    eprintln!();
-    eprintln!("  Enrollment invite created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    let ttl_hours = enrollment_ttl / 3600;
-    eprintln!("  Expires: in {ttl_hours}h (epoch {})", resp.expires_at);
-    eprintln!();
-    eprintln!("  Enrollment URL:");
-    eprintln!("  {}", resp.enrollment_url);
-    eprintln!();
+    did_hosting_common::server::passkey::run_cli_invite(
+        &sessions_ks,
+        base_url,
+        enrollment_ttl,
+        &did,
+        &role,
+    )
+    .await?;
 
     Ok(())
 }

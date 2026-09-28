@@ -1,15 +1,16 @@
 //! Step-up (`auth/step-up/start`, `auth/step-up/approve-response/0.5`),
-//! passkey login (`auth/passkey/login/{start,finish}/0.2`) and invite
-//! management (`auth/passkey/enroll/invite/{list,update,revoke}`).
+//! and passkey login (`auth/passkey/login/{start,finish}/0.2`). Enrolment is
+//! `enrol`.
+//!
+//! The login ceremony reads login credentials only — the `KS_SESSIONS`
+//! store. Step-up-only passkeys are in a keyspace this module never opens, so
+//! one can neither be offered here nor accepted.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 use trust_tasks_rs::specs::auth::{
-    passkey::{
-        enroll::invite::{list as invite_list, revoke as invite_revoke, update as invite_update},
-        login::{finish as login_finish, start as login_start},
-    },
+    passkey::login::{finish as login_finish, start as login_start},
     revoke_session,
     step_up::{approve_response, start as step_up_start},
 };
@@ -18,7 +19,7 @@ use did_hosting_common::server::auth::session::{
     Session, SessionState, create_authenticated_session, delete_session, get_session, now_epoch,
     store_session,
 };
-use did_hosting_common::server::passkey::{routes as passkey_routes, store as passkey_store};
+use did_hosting_common::server::passkey::store as passkey_store;
 
 use super::{Cx, TaskError, at, new_id, typed};
 use crate::acl::check_acl;
@@ -608,155 +609,4 @@ pub(crate) async fn login_finish(
         }),
         "login finish response",
     )
-}
-
-// ---------------------------------------------------------------------------
-// Invites
-// ---------------------------------------------------------------------------
-
-/// A pending invite in the shared `InviteSummary` shape — never its token.
-fn summary(item: &passkey_routes::InviteListItem) -> Value {
-    json!({
-        "inviteId": item.invite_id,
-        "subject": item.did,
-        "purpose": "session",
-        "role": item.role,
-        "createdAt": at(item.created_at),
-        "expiresAt": at(item.expires_at),
-        "expired": item.expired,
-    })
-}
-
-/// `auth/passkey/enroll/invite/list/0.1`. Admin.
-pub(crate) async fn invite_list(
-    cx: &Cx<'_>,
-    p: invite_list::v0_1::Payload,
-) -> Result<invite_list::v0_1::Response, TaskError> {
-    admin_or(cx, invite_list::v0_1::error_codes::NOT_ADMINISTRATOR).await?;
-    let include_expired = p.include_expired.unwrap_or(false);
-    let invites: Vec<Value> = passkey_routes::pending_invites(&cx.state.sessions_ks)
-        .await?
-        .iter()
-        .filter(|i| include_expired || !i.expired)
-        .map(summary)
-        .collect();
-    typed(json!({ "invites": invites }), "invite list response")
-}
-
-/// `auth/passkey/enroll/invite/update/0.1`: change an outstanding invite's
-/// role or expiry, by `inviteId`. Admin.
-///
-/// The generated `Payload` (trust-tasks 0.24+) is a permissive struct — every
-/// member but `inviteId` is `Option` — because the schema's `oneOf` (a role
-/// alone with no expiry change, or `expiresAt` XOR `extendBy`, each with an
-/// optional role alongside it) has no Rust type shape that enforces it the
-/// way `deny_unknown_fields` enforces `additionalProperties: false`. Struct
-/// shape alone would accept `{inviteId}` alone (a silent no-op) or
-/// `{inviteId, expiresAt, extendBy}` together (two conflicting expiry
-/// changes). So this handler re-validates the raw payload against the
-/// spec's schema before acting, and refuses with the framework's
-/// `malformedRequest` — the same code `Dispatcher::dispatch_or_reject` would
-/// have produced for a shape violation, had the schema been representable
-/// as one — when it does not conform.
-pub(crate) async fn invite_update(
-    cx: &Cx<'_>,
-    p: invite_update::v0_1::Payload,
-) -> Result<invite_update::v0_1::Response, TaskError> {
-    use invite_update::v0_1::error_codes;
-    use trust_tasks_rs::validate::ValidatedPayload;
-
-    let auth = cx.admin().await?;
-
-    // Re-serialize the typed (already `deny_unknown_fields`-checked) payload
-    // and validate it against `PAYLOAD_SCHEMA`. This recovers exactly the
-    // `oneOf` the codegen's Rust type cannot express: at least one of
-    // `role`/`expiresAt`/`extendBy` present, and `expiresAt`/`extendBy`
-    // mutually exclusive.
-    let raw = serde_json::to_value(&p).map_err(|e| {
-        TaskError::Standard(
-            trust_tasks_rs::StandardCode::InternalError,
-            format!("invite update payload did not re-serialize: {e}"),
-        )
-    })?;
-    if let Err(e) = invite_update::v0_1::Payload::validate_value(&raw) {
-        return Err(TaskError::Standard(
-            trust_tasks_rs::StandardCode::MalformedRequest,
-            format!(
-                "an update changes at least one of role, expiresAt or extendBy, \
-                 and expiresAt/extendBy are mutually exclusive: {e}"
-            ),
-        ));
-    }
-
-    let existing = passkey_store::find_enrollment_by_invite_id(&cx.state.sessions_ks, &p.invite_id)
-        .await?
-        .ok_or_else(|| TaskError::Declared(error_codes::NOT_FOUND, "no such invite".into()))?;
-    if existing.expires_at < now_epoch() {
-        return Err(TaskError::Declared(
-            error_codes::INVITE_LAPSED,
-            "the invite has lapsed; issue a new one".into(),
-        ));
-    }
-    if let Some(r) = p.role.as_deref()
-        && r.parse::<crate::acl::Role>().is_err()
-    {
-        return Err(TaskError::Declared(
-            error_codes::ROLE_NOT_ALLOWED,
-            format!("`{r}` is not a role this service grants"),
-        ));
-    }
-    let item = passkey_routes::update_invite_by_id(
-        &cx.state.sessions_ks,
-        &p.invite_id,
-        p.role.as_deref().cloned(),
-        p.expires_at.map(|t| t.timestamp().max(0) as u64),
-        p.extend_by.map(|s| s.get()),
-    )
-    .await
-    .map_err(|e| match e {
-        AppError::NotFound(m) => TaskError::Declared(error_codes::NOT_FOUND, m),
-        other => other.into(),
-    })?;
-    info!(caller = %auth.did, invite_id = %p.invite_id.as_str(), "invite updated");
-    typed(
-        json!({ "invite": summary(&item) }),
-        "invite update response",
-    )
-}
-
-/// `auth/passkey/enroll/invite/revoke/0.1`: withdraw an invite by `inviteId`.
-/// Admin.
-pub(crate) async fn invite_revoke(
-    cx: &Cx<'_>,
-    p: invite_revoke::v0_1::Payload,
-) -> Result<invite_revoke::v0_1::Response, TaskError> {
-    let auth = cx.admin().await?;
-    passkey_routes::revoke_invite_by_id(&cx.state.sessions_ks, &p.invite_id)
-        .await
-        .map_err(|e| match e {
-            AppError::NotFound(m) => {
-                TaskError::Declared(invite_revoke::v0_1::error_codes::NOT_FOUND, m)
-            }
-            other => other.into(),
-        })?;
-    info!(caller = %auth.did, invite_id = %p.invite_id.as_str(), "invite revoked");
-    typed(
-        json!({ "inviteId": p.invite_id.as_str(), "revokedAt": chrono::Utc::now() }),
-        "invite revoke response",
-    )
-}
-
-/// [`Cx::admin`], refused under `code` rather than `permissionDenied`.
-async fn admin_or(
-    cx: &Cx<'_>,
-    code: trust_tasks_rs::DeclaredErrorCode,
-) -> Result<crate::auth::AuthClaims, TaskError> {
-    let auth = cx.auth().await?;
-    if auth.role != crate::acl::Role::Admin {
-        return Err(TaskError::Declared(
-            code,
-            "administrator standing required".into(),
-        ));
-    }
-    Ok(auth)
 }

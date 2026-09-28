@@ -250,11 +250,14 @@ did-hosting-daemon --config config.toml
 #    (typically a did:key from a wallet you control).
 did-hosting-daemon invite --did <ADMIN_DID> --role admin --config config.toml
 
-# 3. Open the printed enrolment URL in a browser and bind a passkey.
+# 3. It prints an enrolment URL and, separately, a claim code. Open the URL
+#    in a browser, type the claim code, and bind a passkey.
 #    Subsequent admin login uses the passkey.
 ```
 
-The `invite` subcommand is the single source of truth for admin onboarding — re-run it any time the operator needs another admin. Lost the URL before redeeming? Just run `did-hosting-daemon invite` again to mint a new one.
+The URL and the claim code are two halves of one invite: deliver them over different channels when the admin is someone else. Neither is stored — the control plane keeps only their hashes — and five wrong claim codes cancel the invite.
+
+The `invite` subcommand is the operator's bootstrap for admin onboarding; once an admin is signed in, further invites are issued from the console (`auth/passkey/enroll/invite/0.2`). Lost the URL or the code before redeeming? Run `did-hosting-daemon invite` again to mint a new invite.
 
 ### Config shape
 

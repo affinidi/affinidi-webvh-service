@@ -1,66 +1,27 @@
+//! Passkey credentials and the state of an open WebAuthn ceremony.
+//!
+//! Credentials live in one of two keyspaces, by purpose, in the same layout:
+//!
+//! - **login** (`purpose: session`) credentials in
+//!   [`KS_SESSIONS`](crate::server::store::KS_SESSIONS) — the only store the
+//!   passkey login ceremony reads;
+//! - **step-up-only** credentials in
+//!   [`KS_PASSKEY_STEP_UP`](crate::server::store::KS_PASSKEY_STEP_UP).
+//!
+//! Every function here takes the keyspace it works on; which one is the
+//! caller's decision, made once from the purpose. Nothing reads both.
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
+use super::invite::Purpose;
 use crate::server::error::AppError;
-use crate::server::store::KeyspaceHandle;
+use crate::server::store::{KeyspaceHandle, WriteBatch};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/// One-time enrollment invitation created by the CLI `invite` subcommand.
-#[derive(Serialize, Deserialize)]
-pub struct Enrollment {
-    /// The bearer secret the invitee redeems. Disclosed once, when the invite
-    /// is issued, and never again: every later read or change addresses the
-    /// invite by [`Self::invite_id`].
-    pub token: String,
-    /// The invite's handle for administrators — list, update, revoke. Carries
-    /// no authority.
-    pub invite_id: String,
-    pub did: String,
-    pub role: String,
-    pub created_at: u64,
-    pub expires_at: u64,
-    /// Set when an `enroll_start` call has begun the WebAuthn ceremony
-    /// for this token. Within `ENROLLMENT_CLAIM_WINDOW_SECS` of this
-    /// timestamp, a second concurrent `enroll_start` is rejected as
-    /// "in progress" — without this, an attacker who steals the
-    /// invite link can open it, decline the ceremony, and effectively
-    /// deny the legitimate invitee from enrolling. After the window
-    /// expires the legitimate user may retry. Only consumed
-    /// (`take_enrollment`) once the WebAuthn ceremony successfully
-    /// completes in `enroll_finish`. `#[serde(default)]` for
-    /// backwards-compat with v0.6 enrollments persisted before this
-    /// field existed.
-    #[serde(default)]
-    pub claimed_at: Option<u64>,
-}
-
-/// How long an in-progress enrollment claim blocks others. Sized for
-/// a generous WebAuthn ceremony (browser dialog + key tap); legitimate
-/// users retrying after a failed ceremony only wait this long before
-/// the claim expires.
-pub const ENROLLMENT_CLAIM_WINDOW_SECS: u64 = 300;
-
-// Manual `Debug` keeps the diagnostic fields visible while redacting the
-// invite token. The token is the bearer credential — leaking it via a stray
-// `tracing::debug!(?enrollment, …)` is exactly the regression class the
-// rest of the workspace's manual-Debug pattern is set up to prevent.
-impl std::fmt::Debug for Enrollment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Enrollment")
-            .field("token", &"<redacted>")
-            .field("invite_id", &self.invite_id)
-            .field("did", &self.did)
-            .field("role", &self.role)
-            .field("created_at", &self.created_at)
-            .field("expires_at", &self.expires_at)
-            .field("claimed_at", &self.claimed_at)
-            .finish()
-    }
-}
 
 /// Maps a credential ID (hex-encoded) to a user UUID.
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,35 +36,83 @@ pub struct PasskeyUser {
     pub did: String,
     pub display_name: String,
     pub credentials: Vec<Passkey>,
+    /// The label each credential was enrolled under, by hex credential id.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+impl PasskeyUser {
+    /// A user for `did` with no credentials yet.
+    pub fn new(did: &str) -> Self {
+        Self {
+            user_uuid: Uuid::new_v4(),
+            did: did.to_string(),
+            display_name: did.to_string(),
+            credentials: Vec::new(),
+            labels: Default::default(),
+        }
+    }
+}
+
+/// How an enrolment ceremony was authorised.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum CeremonyOrigin {
+    /// `auth/passkey/enroll/redeem/start`: an invite, by its token hash.
+    Invite {
+        token_hash: String,
+        invite_id: String,
+        role: Option<String>,
+        issued_by: String,
+    },
+    /// `auth/passkey/enroll/start/0.2`: the subject's own signed request, and
+    /// the bearer session it arrived with, when there was one.
+    Subject { session_id: Option<String> },
+}
+
+/// An open enrolment ceremony, keyed by its `enrollmentId`.
+///
+/// It binds the registration challenge — and, when the subject already holds
+/// credentials of the purpose, a distinct user-verification challenge — to
+/// the subject, the purpose and what authorised it. It is taken (consumed) by
+/// the first finish that presents its id, whatever the outcome, so neither
+/// challenge can be answered twice.
+#[derive(Serialize, Deserialize)]
+pub struct Ceremony {
+    pub enrollment_id: String,
+    pub subject: String,
+    pub purpose: Purpose,
+    pub origin: CeremonyOrigin,
+    pub user_uuid: Uuid,
+    pub device_label: Option<String>,
+    pub registration: PasskeyRegistration,
+    pub user_verification: Option<PasskeyAuthentication>,
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for Ceremony {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ceremony")
+            .field("enrollment_id", &self.enrollment_id)
+            .field("subject", &self.subject)
+            .field("purpose", &self.purpose)
+            .field("origin", &self.origin)
+            .field("uv", &self.user_verification.is_some())
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Key helpers
 // ---------------------------------------------------------------------------
 
-fn enrollment_key(token: &str) -> String {
-    format!("enroll:{token}")
-}
-
-fn registration_state_key(id: &str) -> String {
-    format!("pk_reg:{id}")
-}
-
 fn auth_state_key(id: &str) -> String {
     format!("pk_auth:{id}")
 }
 
-fn registration_user_key(reg_id: &str) -> String {
-    format!("pk_reg_user:{reg_id}")
-}
-
-/// Maps a registration_id to the enrollment token that authorised it.
-/// Used by `enroll_finish` to find and consume the enrollment after the
-/// WebAuthn ceremony succeeds — without it, the consume would have to
-/// happen at `enroll_start` time and a failed ceremony would orphan the
-/// invite.
-fn registration_enrollment_key(reg_id: &str) -> String {
-    format!("pk_reg_enroll:{reg_id}")
+fn ceremony_key(id: &str) -> String {
+    format!("pk_enrol:{id}")
 }
 
 fn credential_mapping_key(cred_id_hex: &str) -> String {
@@ -118,85 +127,27 @@ fn passkey_did_key(did: &str) -> String {
     format!("pk_did:{did}")
 }
 
+/// A credential id as the store keys it.
+pub fn cred_id_hex(id: &CredentialID) -> String {
+    hex::encode(AsRef::<[u8]>::as_ref(id))
+}
+
 // ---------------------------------------------------------------------------
-// Enrollment CRUD
+// Ceremony state
 // ---------------------------------------------------------------------------
 
-pub async fn store_enrollment(
-    ks: &KeyspaceHandle,
-    enrollment: &Enrollment,
-) -> Result<(), AppError> {
-    ks.insert(enrollment_key(&enrollment.token), enrollment)
+pub async fn store_ceremony(ks: &KeyspaceHandle, ceremony: &Ceremony) -> Result<(), AppError> {
+    ks.insert(ceremony_key(&ceremony.enrollment_id), ceremony)
         .await
 }
 
-/// Atomically retrieve and delete an enrollment token.
-/// Returns the enrollment if it existed, or `None` if already consumed.
-pub async fn take_enrollment(
-    ks: &KeyspaceHandle,
-    token: &str,
-) -> Result<Option<Enrollment>, AppError> {
-    ks.take(enrollment_key(token)).await
-}
-
-/// Retrieve an enrollment by token without consuming it. Used by the
-/// admin management endpoints (list / update) where we don't want the
-/// side effect of `take_enrollment`.
-pub async fn get_enrollment(
-    ks: &KeyspaceHandle,
-    token: &str,
-) -> Result<Option<Enrollment>, AppError> {
-    ks.get(enrollment_key(token)).await
-}
-
-/// List every enrollment currently in the store. Deserialises each
-/// value; silently skips entries that fail to parse (corrupt / old
-/// schema) so a bad row can't hide the rest from admins.
-pub async fn list_enrollments(ks: &KeyspaceHandle) -> Result<Vec<Enrollment>, AppError> {
-    let pairs = ks.prefix_iter_raw(b"enroll:".to_vec()).await?;
-    let mut out = Vec::with_capacity(pairs.len());
-    for (_key, value) in pairs {
-        match serde_json::from_slice::<Enrollment>(&value) {
-            Ok(e) => out.push(e),
-            Err(e) => tracing::warn!(error = %e, "skipping unparseable enrollment entry"),
-        }
-    }
-    Ok(out)
-}
-
-/// The enrollment an administrator addresses by `invite_id`.
-pub async fn find_enrollment_by_invite_id(
-    ks: &KeyspaceHandle,
-    invite_id: &str,
-) -> Result<Option<Enrollment>, AppError> {
-    Ok(list_enrollments(ks)
-        .await?
-        .into_iter()
-        .find(|e| e.invite_id == invite_id))
+/// Atomically retrieve and delete a ceremony: exactly one finish gets it.
+pub async fn take_ceremony(ks: &KeyspaceHandle, id: &str) -> Result<Option<Ceremony>, AppError> {
+    ks.take(ceremony_key(id)).await
 }
 
 // ---------------------------------------------------------------------------
-// Registration state (temporary, during WebAuthn ceremony)
-// ---------------------------------------------------------------------------
-
-pub async fn store_registration_state(
-    ks: &KeyspaceHandle,
-    id: &str,
-    state: &PasskeyRegistration,
-) -> Result<(), AppError> {
-    ks.insert(registration_state_key(id), state).await
-}
-
-/// Atomically retrieve and delete a registration state.
-pub async fn take_registration_state(
-    ks: &KeyspaceHandle,
-    id: &str,
-) -> Result<Option<PasskeyRegistration>, AppError> {
-    ks.take(registration_state_key(id)).await
-}
-
-// ---------------------------------------------------------------------------
-// Authentication state (temporary, during WebAuthn ceremony)
+// Authentication state (temporary, during a login ceremony)
 // ---------------------------------------------------------------------------
 
 pub async fn store_auth_state(
@@ -216,87 +167,41 @@ pub async fn take_auth_state(
 }
 
 // ---------------------------------------------------------------------------
-// Registration-to-user mapping (links reg_id to user UUID during ceremony)
-// ---------------------------------------------------------------------------
-
-pub async fn store_registration_user(
-    ks: &KeyspaceHandle,
-    reg_id: &str,
-    user_uuid: &Uuid,
-) -> Result<(), AppError> {
-    ks.insert_raw(
-        registration_user_key(reg_id),
-        user_uuid.to_string().into_bytes(),
-    )
-    .await
-}
-
-pub async fn get_registration_user(
-    ks: &KeyspaceHandle,
-    reg_id: &str,
-) -> Result<Option<Uuid>, AppError> {
-    match ks.get_raw(registration_user_key(reg_id)).await? {
-        Some(bytes) => {
-            let s = String::from_utf8(bytes)
-                .map_err(|e| AppError::Internal(format!("invalid registration user UUID: {e}")))?;
-            let uuid = Uuid::parse_str(&s)
-                .map_err(|e| AppError::Internal(format!("invalid registration user UUID: {e}")))?;
-            Ok(Some(uuid))
-        }
-        None => Ok(None),
-    }
-}
-
-pub async fn delete_registration_user(ks: &KeyspaceHandle, reg_id: &str) -> Result<(), AppError> {
-    ks.remove(registration_user_key(reg_id)).await
-}
-
-// ---------------------------------------------------------------------------
-// Registration-to-enrollment-token mapping (defer-take)
-// ---------------------------------------------------------------------------
-
-/// Persist the enrollment token that authorised a registration ceremony.
-/// `enroll_finish` uses it to consume the enrollment after the WebAuthn
-/// ceremony succeeds — so a ceremony that fails (browser closed, key
-/// not present, RP mismatch) leaves the invite intact for the
-/// legitimate user to retry.
-pub async fn store_registration_enrollment(
-    ks: &KeyspaceHandle,
-    reg_id: &str,
-    enrollment_token: &str,
-) -> Result<(), AppError> {
-    ks.insert_raw(
-        registration_enrollment_key(reg_id),
-        enrollment_token.as_bytes().to_vec(),
-    )
-    .await
-}
-
-/// Atomically read and remove the registration-to-enrollment mapping.
-pub async fn take_registration_enrollment(
-    ks: &KeyspaceHandle,
-    reg_id: &str,
-) -> Result<Option<String>, AppError> {
-    match ks.take_raw(registration_enrollment_key(reg_id)).await? {
-        Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-            AppError::Internal(format!("invalid enrollment token bytes: {e}"))
-        })?)),
-        None => Ok(None),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Passkey user CRUD
+// Passkey users and their credentials
 // ---------------------------------------------------------------------------
 
 pub async fn store_passkey_user(ks: &KeyspaceHandle, user: &PasskeyUser) -> Result<(), AppError> {
     ks.insert(passkey_user_key(&user.user_uuid), user).await?;
-    // Maintain DID → user UUID reverse index
     ks.insert_raw(
         passkey_did_key(&user.did),
         user.user_uuid.to_string().into_bytes(),
     )
     .await
+}
+
+/// Stage `user` — with a credential just added — into `batch`: the user row,
+/// its DID index, and the new credential's id mapping. Nothing is written
+/// until the batch commits, so the credential appears whole or not at all.
+pub fn stage_new_credential(
+    batch: &mut WriteBatch,
+    ks: &KeyspaceHandle,
+    user: &PasskeyUser,
+    new_cred_id_hex: &str,
+) -> Result<(), AppError> {
+    batch.insert(ks, passkey_user_key(&user.user_uuid), user)?;
+    batch.insert_raw(
+        ks,
+        passkey_did_key(&user.did),
+        user.user_uuid.to_string().into_bytes(),
+    );
+    batch.insert(
+        ks,
+        credential_mapping_key(new_cred_id_hex),
+        &CredentialMapping {
+            user_uuid: user.user_uuid,
+        },
+    )?;
+    Ok(())
 }
 
 pub async fn get_passkey_user(
@@ -306,7 +211,7 @@ pub async fn get_passkey_user(
     ks.get(passkey_user_key(uuid)).await
 }
 
-/// Find a PasskeyUser by scanning credential mappings.
+/// The user a credential id belongs to.
 pub async fn get_passkey_user_by_cred(
     ks: &KeyspaceHandle,
     cred_id_hex: &str,
@@ -318,50 +223,22 @@ pub async fn get_passkey_user_by_cred(
     }
 }
 
-/// Find a PasskeyUser by DID, using the `pk_did:` reverse index.
-/// Falls back to a full scan for backward compatibility with existing data.
+/// The user for `did`, by the `pk_did:` index.
 pub async fn get_passkey_user_by_did(
     ks: &KeyspaceHandle,
     did: &str,
 ) -> Result<Option<PasskeyUser>, AppError> {
-    // Try the reverse index first
-    if let Some(bytes) = ks.get_raw(passkey_did_key(did)).await? {
-        let uuid_str = String::from_utf8(bytes)
-            .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
-        let uuid = Uuid::parse_str(&uuid_str)
-            .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
-        if let Some(user) = get_passkey_user(ks, &uuid).await? {
-            return Ok(Some(user));
-        }
-    }
-
-    // Fallback: linear scan for pre-index data
-    let entries = ks.prefix_iter_raw("pk_user:").await?;
-    for (_key, value) in entries {
-        if let Ok(user) = serde_json::from_slice::<PasskeyUser>(&value)
-            && user.did == did
-        {
-            return Ok(Some(user));
-        }
-    }
-    Ok(None)
+    let Some(bytes) = ks.get_raw(passkey_did_key(did)).await? else {
+        return Ok(None);
+    };
+    let uuid_str = String::from_utf8(bytes)
+        .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
+    let uuid = Uuid::parse_str(&uuid_str)
+        .map_err(|e| AppError::Internal(format!("invalid DID index UUID: {e}")))?;
+    get_passkey_user(ks, &uuid).await
 }
 
-// ---------------------------------------------------------------------------
-// Credential mapping
-// ---------------------------------------------------------------------------
-
-pub async fn store_credential_mapping(
-    ks: &KeyspaceHandle,
-    cred_id_hex: &str,
-    user_uuid: Uuid,
-) -> Result<(), AppError> {
-    let mapping = CredentialMapping { user_uuid };
-    ks.insert(credential_mapping_key(cred_id_hex), &mapping)
-        .await
-}
-
-/// Collect all stored passkeys from credential mappings (for discoverable login).
+/// Every credential in `ks` (for discoverable login, over the login store).
 pub async fn get_all_passkeys(ks: &KeyspaceHandle) -> Result<Vec<Passkey>, AppError> {
     let entries = ks.prefix_iter_raw("pk_user:").await?;
     let mut passkeys = Vec::new();

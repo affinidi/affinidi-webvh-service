@@ -69,6 +69,17 @@ fn assertion() -> Value {
     })
 }
 
+/// A WebAuthn attestation in the shape the schema requires — it will not
+/// verify either.
+fn attestation() -> Value {
+    json!({
+        "id": "AAAA",
+        "rawId": "AAAA",
+        "type": "public-key",
+        "response": { "attestationObject": "AAAA", "clientDataJSON": "AAAA" },
+    })
+}
+
 /// A request for every row that reaches its handler. `n` keeps each
 /// transport's run on its own slots.
 async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> Value {
@@ -97,7 +108,17 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
         | "did-management/stats/get/0.1"
         | "did-management/identity/list/0.1"
         | "auth/passkey/login/start/0.2"
-        | "auth/passkey/enroll/invite/list/0.1" => json!({}),
+        | "auth/passkey/enroll/invite/list/0.1"
+        | "auth/passkey/enroll/start/0.2" => json!({}),
+        "auth/passkey/enroll/invite/0.2" => {
+            json!({ "subject": format!("did:example:invitee-{n}") })
+        }
+        "auth/passkey/enroll/redeem/start/0.1" => {
+            json!({ "token": "inv_no-such-invite-token", "claimCode": "0000-0000-0000" })
+        }
+        "auth/passkey/enroll/redeem/finish/0.1" | "auth/passkey/enroll/finish/0.2" => {
+            json!({ "enrollmentId": "no-such-enrolment", "credential": attestation() })
+        }
         "did-management/did/change-owner/0.1" => {
             seed_did(state, &admin.did, &slot).await;
             let heir = member(state, 100 + (n % 150) as u8, Role::Owner).await;
@@ -1188,15 +1209,34 @@ async fn passkey_login_start_is_open_to_an_unsigned_request() {
 async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
     let (state, _dir) = state().await;
     let admin = member(&state, 43, Role::Admin).await;
-    let created = did_hosting_common::server::passkey::routes::create_enrollment_invite(
-        &state.sessions_ks,
-        "http://control.test",
-        3600,
-        "did:example:invitee",
-        "owner",
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/0.2"),
+        json!({ "subject": "did:example:invitee" }),
     )
-    .await
-    .unwrap();
+    .await;
+    let issued = ok(&reply, &t("auth/passkey/enroll/invite/0.2"));
+    let token = issued["invite"]["token"].as_str().unwrap().to_string();
+    let listed = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/list/0.1"),
+        json!({}),
+    )
+    .await;
+    let invite_id =
+        ok(&listed, &t("auth/passkey/enroll/invite/list/0.1"))["invites"][0]["inviteId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    struct Created {
+        token: String,
+        invite_id: String,
+    }
+    let created = Created { token, invite_id };
 
     let reply = call(
         &state,
@@ -1231,6 +1271,8 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
         "admin"
     );
 
+    let later = (chrono::Utc::now() + chrono::Duration::hours(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     // A role change may ride alongside an expiry change — the spec's `oneOf`
     // only pits `expiresAt` against `extendBy`, not either against `role`.
     let reply = call(
@@ -1238,7 +1280,7 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
         Via::Tsp,
         &admin,
         &t("auth/passkey/enroll/invite/update/0.1"),
-        json!({ "inviteId": created.invite_id, "role": "owner", "expiresAt": "2099-01-01T00:00:00Z" }),
+        json!({ "inviteId": created.invite_id, "role": "owner", "expiresAt": later }),
     )
     .await;
     conforms(&reply);
@@ -1265,7 +1307,7 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
         Via::Tsp,
         &admin,
         &t("auth/passkey/enroll/invite/update/0.1"),
-        json!({ "inviteId": created.invite_id, "role": "admin", "expiresAt": "2099-01-01T00:00:00Z", "extendBy": 60 }),
+        json!({ "inviteId": created.invite_id, "role": "admin", "expiresAt": later, "extendBy": 60 }),
     )
     .await;
     assert_eq!(code(&reply), "malformedRequest", "{reply}");
@@ -1279,10 +1321,18 @@ async fn invites_are_managed_by_invite_id_and_never_disclose_a_token() {
     .await;
     let body = ok(&reply, &t("auth/passkey/enroll/invite/list/0.1"));
     assert_eq!(body["invites"][0]["role"], "owner", "{reply}");
-    assert_eq!(
-        body["invites"][0]["expiresAt"], "2099-01-01T00:00:00Z",
-        "{reply}"
-    );
+    assert_eq!(body["invites"][0]["expiresAt"], later, "{reply}");
+
+    // Never past the longest invite this service would issue.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("auth/passkey/enroll/invite/update/0.1"),
+        json!({ "inviteId": created.invite_id, "expiresAt": "2099-01-01T00:00:00Z" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "malformedRequest", "{reply}");
 
     let reply = call(
         &state,

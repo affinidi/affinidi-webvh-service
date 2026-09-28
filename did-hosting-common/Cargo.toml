@@ -67,7 +67,10 @@ vault-secrets = ["server-core", "vti-secrets/vault-secrets"]
 # kubeconfig via `Client::try_default`).
 k8s-secrets = ["server-core", "vti-secrets/k8s-secrets"]
 setup-wizard = ["server-core", "dep:dialoguer"]
-passkey = ["server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto"]
+passkey = [
+    "server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto", "dep:argon2", "dep:subtle",
+    "dep:sha2",
+]
 # Test-only seams (e.g. seeding a verifier's deactivation verdicts). Enabled
 # only from dev-dependencies; never compiled into a release.
 test-support = ["server-core"]
@@ -246,6 +249,11 @@ dialoguer = { workspace = true, optional = true }
 # passkey / WebAuthn (optional)
 webauthn-rs = { workspace = true, optional = true }
 webauthn-rs-proto = { workspace = true, optional = true }
+# Hashed enrolment invites (`passkey::invite`): SHA-256 over the 256-bit token,
+# Argon2id over the short claim code, compared in constant time.
+argon2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 # Prometheus metrics (optional, behind `metrics` feature)
 prometheus = { version = "0.14", default-features = false, optional = true }

@@ -192,6 +192,10 @@ trust-tasks-rs = { workspace = true, features = ["validate"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 base64 = { workspace = true }
+# A software authenticator for the passkey enrolment tests (P-256 keys and
+# ECDSA signatures for real attestations and assertions). The same `openssl`
+# `webauthn-rs` already links, so it adds nothing to the graph.
+openssl = "0.10"
 # Embedded mediator fixture for in-process DIDComm flow tests.
 # Defaults to MemoryStore (no Redis required); spawns on 127.0.0.1:0.
 #

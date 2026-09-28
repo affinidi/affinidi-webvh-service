@@ -309,6 +309,7 @@ export function inviteFromWire(i: InviteSummary): InviteListItem {
   return {
     inviteId: i.inviteId,
     did: i.subject,
+    purpose: i.purpose,
     role: role(i.role),
     createdAt: requiredEpoch(i.createdAt),
     expiresAt: requiredEpoch(i.expiresAt),

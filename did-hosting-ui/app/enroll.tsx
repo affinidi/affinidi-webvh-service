@@ -1,90 +1,162 @@
-import { useEffect, useState } from "react";
-import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
+import { useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  ActivityIndicator,
+  Pressable,
+  TextInput,
+} from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
-import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
-import { api } from "../lib/api";
-import { createPasskeyCredential } from "../lib/passkey";
+import type { RedeemFinishResponse, RedeemStartResponse } from "../lib/api";
+import {
+  completeRedemption,
+  describePurpose,
+  startRedemption,
+} from "../lib/enrol-flow";
+import { createPasskeyCredential, getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 
 type EnrollState =
-  | { phase: "registering" }
-  | { phase: "success" }
-  | { phase: "error"; message: string };
+  | { phase: "code"; error?: string }
+  | { phase: "checking" }
+  | { phase: "confirm"; start: RedeemStartResponse; error?: string }
+  | { phase: "registering"; start: RedeemStartResponse }
+  | { phase: "success"; done: RedeemFinishResponse };
 
+/**
+ * Redeem a passkey enrolment invite. The link carries the invite token; the
+ * claim code was sent separately and is typed here. The page shows whose
+ * passkey this will be, and what it may do, before the browser creates it.
+ */
 export default function Enroll() {
   const { token } = useLocalSearchParams<{ token: string }>();
-  const { login } = useAuth();
   const router = useRouter();
-  const [state, setState] = useState<EnrollState>({ phase: "registering" });
+  const [claimCode, setClaimCode] = useState("");
+  const [label, setLabel] = useState("");
+  const [state, setState] = useState<EnrollState>({ phase: "code" });
 
-  useEffect(() => {
-    if (!token) {
-      setState({ phase: "error", message: "No enrollment token provided." });
-      return;
+  const message = (e: unknown, fallback: string) =>
+    e instanceof Error && e.message ? e.message : fallback;
+
+  const handleCheck = async () => {
+    setState({ phase: "checking" });
+    try {
+      const start = await startRedemption(token ?? "", claimCode);
+      if (start.deviceLabel) setLabel(start.deviceLabel);
+      setState({ phase: "confirm", start });
+    } catch (e) {
+      setState({ phase: "code", error: message(e, "The invite could not be checked.") });
     }
+  };
 
-    let cancelled = false;
-
-    (async () => {
-      try {
-        // 1. Start enrollment
-        const { registration_id, options } =
-          await api.passkeyEnrollStart(token);
-
-        if (cancelled) return;
-
-        // 2. Create credential in browser
-        const credential = await createPasskeyCredential(options);
-
-        if (cancelled) return;
-
-        // 3. Finish enrollment
-        const result = await api.passkeyEnrollFinish(
-          registration_id,
-          credential,
-        );
-
-        if (cancelled) return;
-
-        // 4. Save token and redirect
-        login(result.access_token);
-        setState({ phase: "success" });
-
-        setTimeout(() => {
-          if (!cancelled) router.replace("/");
-        }, 1500);
-      } catch (err: any) {
-        if (!cancelled) {
-          const msg =
-            err?.message || "Enrollment failed. The link may be expired or already used.";
-          setState({ phase: "error", message: msg });
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
+  const handleRegister = async (start: RedeemStartResponse) => {
+    setState({ phase: "registering", start });
+    try {
+      const done = await completeRedemption(
+        start,
+        { create: createPasskeyCredential, get: getPasskeyCredential },
+        label,
+      );
+      setState({ phase: "success", done });
+    } catch (e) {
+      setState({
+        phase: "confirm",
+        start,
+        error: message(e, "The passkey could not be registered."),
+      });
+    }
+  };
 
   return (
     <View style={styles.container}>
       <View style={styles.card}>
         <AffinidiLogo size={36} />
 
-        {state.phase === "registering" && (
+        {!token && (
           <>
-            <Text style={styles.title}>Registering Passkey</Text>
-            <Text style={styles.hint}>
-              Follow your browser's prompts to register a passkey for this
-              server.
+            <Text style={styles.title}>Enrollment Failed</Text>
+            <Text style={[styles.hint, { color: colors.error }]}>
+              This link has no invite token. Open the link you were sent.
             </Text>
-            <ActivityIndicator
-              color={colors.accent}
-              size="large"
-              style={{ marginTop: spacing.lg }}
+          </>
+        )}
+
+        {token && (state.phase === "code" || state.phase === "checking") && (
+          <>
+            <Text style={styles.title}>Register a Passkey</Text>
+            <Text style={styles.hint}>
+              Enter the claim code you were sent separately from this link.
+            </Text>
+            <TextInput
+              style={styles.input}
+              placeholder="XXXX-XXXX-XXXX"
+              placeholderTextColor={colors.textTertiary}
+              value={claimCode}
+              onChangeText={setClaimCode}
+              autoCapitalize="characters"
+              autoComplete="off"
+              autoCorrect={false}
+              editable={state.phase === "code"}
             />
+            {state.phase === "code" && state.error && (
+              <Text style={[styles.hint, { color: colors.error }]}>{state.error}</Text>
+            )}
+            <Pressable
+              style={[
+                styles.button,
+                (!claimCode.trim() || state.phase === "checking") && styles.disabled,
+              ]}
+              onPress={handleCheck}
+              disabled={!claimCode.trim() || state.phase === "checking"}
+            >
+              <Text style={styles.buttonText}>
+                {state.phase === "checking" ? "Checking..." : "Continue"}
+              </Text>
+            </Pressable>
+          </>
+        )}
+
+        {(state.phase === "confirm" || state.phase === "registering") && (
+          <>
+            <Text style={styles.title}>Confirm Your Passkey</Text>
+            <Text style={styles.hint}>This passkey will be bound to:</Text>
+            <Text style={styles.subject} selectable>
+              {state.start.subject}
+            </Text>
+            <Text style={styles.hint}>
+              It will be {describePurpose(state.start.purpose)}.
+              {state.start.uvOptions
+                ? " You will first confirm with a passkey you already use here."
+                : ""}
+            </Text>
+            <Text style={styles.hint}>
+              If this is not you, close this page and tell whoever sent the invite.
+            </Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Device label (optional)"
+              placeholderTextColor={colors.textTertiary}
+              value={label}
+              onChangeText={setLabel}
+              maxLength={256}
+              editable={state.phase === "confirm"}
+            />
+            {state.phase === "confirm" && state.error && (
+              <Text style={[styles.hint, { color: colors.error }]}>{state.error}</Text>
+            )}
+            {state.phase === "registering" ? (
+              <ActivityIndicator
+                color={colors.accent}
+                size="large"
+                style={{ marginTop: spacing.lg }}
+              />
+            ) : (
+              <Pressable style={styles.button} onPress={() => handleRegister(state.start)}>
+                <Text style={styles.buttonText}>Create Passkey</Text>
+              </Pressable>
+            )}
           </>
         )}
 
@@ -92,17 +164,18 @@ export default function Enroll() {
           <>
             <Text style={styles.title}>Enrollment Complete</Text>
             <Text style={[styles.hint, { color: colors.success }]}>
-              Your passkey has been registered. Redirecting to dashboard...
+              Your passkey has been registered for {state.done.subject}.
             </Text>
-          </>
-        )}
-
-        {state.phase === "error" && (
-          <>
-            <Text style={styles.title}>Enrollment Failed</Text>
-            <Text style={[styles.hint, { color: colors.error }]}>
-              {state.message}
-            </Text>
+            {state.done.purpose === "session" ? (
+              <Pressable style={styles.button} onPress={() => router.replace("/login")}>
+                <Text style={styles.buttonText}>Sign In</Text>
+              </Pressable>
+            ) : (
+              <Text style={styles.hint}>
+                It confirms sensitive actions when you are asked to; it does not
+                sign you in. You can close this page.
+              </Text>
+            )}
           </>
         )}
       </View>
@@ -139,5 +212,37 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     color: colors.textSecondary,
     lineHeight: 20,
+    marginBottom: spacing.sm,
+  },
+  subject: {
+    fontSize: 13,
+    fontFamily: fonts.mono,
+    color: colors.textPrimary,
+    marginBottom: spacing.md,
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.md,
+    padding: spacing.md,
+    marginVertical: spacing.md,
+    color: colors.textPrimary,
+    fontFamily: fonts.regular,
+    fontSize: 15,
+  },
+  button: {
+    backgroundColor: colors.accent,
+    borderRadius: radii.md,
+    padding: spacing.md,
+    alignItems: "center",
+    marginTop: spacing.md,
+  },
+  buttonText: {
+    color: colors.textOnAccent,
+    fontFamily: fonts.bold,
+    fontSize: 15,
+  },
+  disabled: {
+    opacity: 0.5,
   },
 });
