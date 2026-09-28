@@ -4,6 +4,7 @@ pub mod assignment_seed;
 pub mod auth;
 pub mod cli_acl;
 pub mod cli_identity;
+pub mod cli_tsp;
 pub mod config;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;
