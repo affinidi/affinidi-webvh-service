@@ -274,7 +274,8 @@ async fn challenge_arm(
 /// held the value to `did:key:z…` in base58btc; this checks what it decodes to.
 fn ed25519_session_key(session_key: &str) -> Option<String> {
     let multikey = session_key.strip_prefix("did:key:")?;
-    crate::routes::auth::is_ed25519_multikey(multikey).then(|| multikey.to_string())
+    did_hosting_common::server::auth::session::is_ed25519_multikey(multikey)
+        .then(|| multikey.to_string())
 }
 
 #[allow(clippy::result_large_err)]
