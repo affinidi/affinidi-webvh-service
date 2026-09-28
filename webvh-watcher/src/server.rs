@@ -37,6 +37,10 @@ pub struct AppState {
     pub trust_tasks_verifier: Option<Arc<TransportBoundVerifier>>,
     /// Syncs already applied, keyed on `(proven source, document id)`.
     pub replay_cache: Arc<ReplayCache>,
+    /// Serialises the syncs: each reads what is mirrored, checks the new log
+    /// extends it, and writes — two at once could each pass against the same
+    /// old state and leave a fork mirrored.
+    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
     /// The running messaging service, once started.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
 }
@@ -57,6 +61,7 @@ impl AppState {
             trust_tasks_verifier: crate::trust_tasks::build_verifier(did_resolver.as_ref()),
             identity,
             replay_cache: Arc::new(ReplayCache::new()),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             didcomm_service: Arc::new(OnceLock::new()),
         })
     }

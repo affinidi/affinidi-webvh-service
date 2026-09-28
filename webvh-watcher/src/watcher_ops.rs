@@ -90,6 +90,9 @@ pub enum SyncRefusal {
     HistoryRewrite(String),
     /// The DID is held as deactivated (`deactivated`).
     Deactivated(String),
+    /// The slot holds a different DID, written by a different source: one
+    /// source cannot take over, or delete, another's slot (`notAuthorized`).
+    NotOwner(String),
     /// The watcher could not apply it just now (storage): retryable.
     Transient(String),
 }
@@ -174,6 +177,18 @@ pub async fn apply_sync(
         .get_raw(content_log_key(&entry.mnemonic))
         .await?
         .map(|b| String::from_utf8_lossy(&b).into_owned());
+    // A slot is its writer's: another source may extend the same DID there
+    // (the history checks below still hold it to that DID's log), but it may
+    // not re-point the slot at a different DID.
+    if let Some(prev) = held.as_ref()
+        && prev.source_did != source_did
+        && webvh_scid(&prev.did_id).as_deref() != Some(scid.as_str())
+    {
+        return Err(SyncRefusal::NotOwner(format!(
+            "slot {} mirrors a DID another source syncs",
+            entry.mnemonic
+        )));
+    }
     let same_did_held = held_log.clone().filter(|_| {
         held.as_ref().and_then(|r| webvh_scid(&r.did_id)).as_deref() == Some(scid.as_str())
     });
@@ -238,14 +253,18 @@ pub async fn apply_sync(
     Ok(SyncApplied::Applied)
 }
 
-/// Stop mirroring a slot. The high-water mark stays, so a later sync cannot
-/// roll the DID back. Returns whether anything was held.
+/// Stop mirroring a slot for `source_did`. The high-water mark stays, so a
+/// later sync cannot roll the DID back. Returns whether anything was held for
+/// that source: a slot another source wrote is left alone, and reported as
+/// not held, so a source learns nothing of other sources' slots.
 pub async fn delete_record(
     store: &Store,
     ks: &KeyspaceHandle,
     mnemonic: &str,
+    source_did: &str,
 ) -> Result<bool, AppError> {
-    if ks.get_raw(did_key(mnemonic)).await?.is_none() {
+    let held: Option<WatcherRecord> = ks.get(did_key(mnemonic)).await?;
+    if held.is_none_or(|r| r.source_did != source_did) {
         return Ok(false);
     }
     let mut batch = store.batch();

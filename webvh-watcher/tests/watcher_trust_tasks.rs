@@ -545,3 +545,102 @@ async fn a_snake_case_payload_is_refused() {
     assert_eq!(code, "malformedRequest");
     assert!(held(&state, "frank").await.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// One source cannot take over or delete another source's slot
+// ---------------------------------------------------------------------------
+
+/// A one-entry did:webvh log for `mnemonic` on `host`.
+async fn did_log_on(host: &str, mnemonic: &str) -> (String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[11u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(host, mnemonic, &pk_mb, &DidDocumentOptions::default());
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            &doc,
+            &params,
+            &signing,
+        )
+        .await
+        .expect("create webvh log entry");
+    let log = state
+        .log_entries()
+        .iter()
+        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let did = did_hosting_common::did_ops::extract_did_id(&log).unwrap();
+    (did, log)
+}
+
+#[tokio::test]
+async fn a_source_cannot_take_over_or_delete_another_sources_slot() {
+    let (mut state, _dir) = watcher_state().await;
+    let (a, b) = (source(), signer(83));
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.push(b.0.clone());
+    state.config = Arc::new(config);
+
+    let (did_a, log_a) = did_log_on("origin.example.com", "frank").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("frank", &did_a, &log_a)).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE);
+
+    // Another source's DID at the same slot is refused.
+    let (did_b, log_b) = did_log_on("other.example.com", "frank").await;
+    assert_ne!(did_a, did_b);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("frank", &did_b, &log_b)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert_eq!(held(&state, "frank").await.unwrap().did_id, did_a);
+
+    // Its delete leaves the slot alone, and says nothing of it.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "frank" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{MSG_SYNC_DELETE}#response"),
+        "{reply}"
+    );
+    signed_by_the_watcher(&reply, &b.0);
+    assert_eq!(reply["payload"]["status"], "absent");
+    assert!(held(&state, "frank").await.is_some());
+
+    // The slot's own source can delete it.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_DELETE, &a, json!({ "mnemonic": "frank" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert!(held(&state, "frank").await.is_none());
+}

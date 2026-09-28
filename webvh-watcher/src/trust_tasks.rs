@@ -241,6 +241,9 @@ fn refusal_payload(refusal: SyncRefusal) -> ErrorPayload {
         SyncRefusal::Deactivated(m) => {
             ErrorPayload::from(sync_update::error_codes::DEACTIVATED).with_message(m)
         }
+        SyncRefusal::NotOwner(m) => {
+            ErrorPayload::from(sync_update::error_codes::NOT_AUTHORIZED).with_message(m)
+        }
         SyncRefusal::Transient(reason) => {
             warn!(%reason, "sync not applied (transient); the source will re-send it");
             RejectReason::InternalError { reason }.into()
@@ -253,6 +256,7 @@ fn refusal_code(refusal: &SyncRefusal) -> Option<&'static str> {
         SyncRefusal::InvalidLog(_) => Some(sync_update::error_codes::INVALID_LOG.code),
         SyncRefusal::HistoryRewrite(_) => Some(sync_update::error_codes::HISTORY_REWRITE.code),
         SyncRefusal::Deactivated(_) => Some(sync_update::error_codes::DEACTIVATED.code),
+        SyncRefusal::NotOwner(_) => Some(sync_update::error_codes::NOT_AUTHORIZED.code),
         SyncRefusal::Transient(_) => None,
     }
 }
@@ -290,6 +294,7 @@ async fn sync_update_task(
         u.version_count.get(),
         u.disabled,
     );
+    let _guard = state.sync_lock.lock().await;
     let status = watcher_ops::apply_sync(&state.store, &state.dids_ks, source, &e)
         .await
         .map_err(refusal_payload)?;
@@ -306,6 +311,7 @@ async fn sync_batch_task(
     doc: &TrustTask<Value>,
 ) -> Result<Value, ErrorPayload> {
     let b: sync_batch::Payload = payload(doc)?;
+    let _guard = state.sync_lock.lock().await;
     let mut results = Vec::with_capacity(b.updates.len());
     let mut transient: Option<String> = None;
     for u in b.updates {
@@ -356,7 +362,8 @@ async fn sync_delete_task(
             reason: format!("mnemonic: {e}"),
         })
     })?;
-    let held = watcher_ops::delete_record(&state.store, &state.dids_ks, mnemonic)
+    let _guard = state.sync_lock.lock().await;
+    let held = watcher_ops::delete_record(&state.store, &state.dids_ks, mnemonic, source)
         .await
         .map_err(internal)?;
     info!(source, mnemonic, held, "sync delete applied");
