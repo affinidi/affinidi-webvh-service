@@ -77,16 +77,21 @@ fn step_up_key(session_id: &str) -> String {
 /// the access token and the key stop working at once, not at expiry
 /// (`auth/authenticate/0.2`: the binding ends on revoke or logout).
 ///
-/// A session key may sign this, since revoking only reduces authority. A
-/// session that does not exist, or belongs to someone else, answers
-/// `sessionNotFound` the same way, so the answer discloses nothing. `all` and
-/// `subject` are not offered: the console only ever ends the session it holds.
+/// A session key may sign this, since revoking only reduces authority, but
+/// only for its own session: it speaks for its subject in that session and no
+/// other (`auth/authenticate/0.2` Conformance item 10), so a stolen key cannot
+/// sign its subject out of their other devices.
+///
+/// A session that does not exist, was already revoked, belongs to someone
+/// else, or is out of reach of the session key that signed, answers
+/// `revokedCount: 0`, identically. That discloses nothing, and a retried
+/// logout succeeds (`auth/revoke-session/0.2` Conformance item 2, the
+/// RECOMMENDED form). `all` and `subject` are not offered: the console only
+/// ever ends the session it holds.
 pub(crate) async fn revoke_session(
     cx: &Cx<'_>,
     p: revoke_session::v0_2::Payload,
 ) -> Result<revoke_session::v0_2::Response, TaskError> {
-    use revoke_session::v0_2::error_codes;
-
     let caller = cx.caller()?.to_string();
     if p.all.is_some() || p.subject.is_some() {
         return Err(AppError::Validation(
@@ -99,17 +104,23 @@ pub(crate) async fn revoke_session(
         .as_ref()
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Validation("sessionId is required".into()))?;
-    let not_found = || {
-        TaskError::Declared(
-            error_codes::SESSION_NOT_FOUND,
-            "no session of yours has that id".into(),
-        )
+    let revoked = |count: u32| typed(json!({ "revokedCount": count }), "revoke-session response");
+
+    // Signed by the bearer session's bound key: that session only.
+    let by_session_key_elsewhere = cx.bearer_session().is_some_and(|b| {
+        b.session_id != session_id
+            && b.session_pubkey_b58btc.as_deref().is_some_and(|pk| {
+                cx.proof_vm.as_deref() == Some(format!("did:key:{pk}#{pk}").as_str())
+            })
+    });
+    if by_session_key_elsewhere {
+        return revoked(0);
+    }
+    let Some(session) = get_session(&cx.state.sessions_ks, &session_id).await? else {
+        return revoked(0);
     };
-    let session = get_session(&cx.state.sessions_ks, &session_id)
-        .await?
-        .ok_or_else(not_found)?;
     if session.did != caller {
-        return Err(not_found());
+        return revoked(0);
     }
     delete_session(&cx.state.sessions_ks, &session_id).await?;
     info!(
@@ -118,7 +129,7 @@ pub(crate) async fn revoke_session(
         reason = p.reason.as_deref().map(String::as_str).unwrap_or(""),
         "session revoked",
     );
-    typed(json!({ "revokedCount": 1 }), "revoke-session response")
+    revoked(1)
 }
 
 /// `auth/step-up/start/0.1`: bind a fresh challenge to the caller's own

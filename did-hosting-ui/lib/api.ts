@@ -995,6 +995,7 @@ export const api = {
    * then lapses at its expiry.
    */
   logout: async (): Promise<void> => {
+    const token = getToken();
     const sessionId = getSessionId();
     try {
       if (!hasSessionKeypair()) await restoreSessionKeypair();
@@ -1007,7 +1008,9 @@ export const api = {
     } catch {
       // Signed out locally regardless; see above.
     } finally {
-      clearToken();
+      // Unless a new sign-in has replaced this session while the revoke was
+      // in flight: clearing then would drop the new session's token and key.
+      if (getToken() === token) clearToken();
     }
   },
 

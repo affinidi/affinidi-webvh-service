@@ -74,7 +74,10 @@
 //!   REST paths alike, and the verifier refuses a delegated approval outright;
 //! - **never to mint or extend a session.** `auth/authenticate` and
 //!   `auth/refresh` refuse a session-key proof (`session_key_may_sign`). A
-//!   refresh is authorised by the refresh token, not by the key.
+//!   refresh is authorised by the refresh token, not by the key. The console's
+//!   REST refresh (`routes::auth::refresh`) does ask for the key's proof, but
+//!   only on top of the refresh token, as proof that the browser presenting
+//!   the token is the one that logged in: the key alone refreshes nothing.
 //!
 //! A key type this service cannot verify is refused with
 //! `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent. It

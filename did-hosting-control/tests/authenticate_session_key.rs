@@ -319,10 +319,63 @@ async fn a_session_cannot_be_revoked_by_another_subject() {
     )
     .await;
     let (status, body) = post(&h, Some(&bob_token), &d).await;
-    assert_ne!(status, StatusCode::OK, "{body}");
-    assert_eq!(code(&body), "auth/revoke-session:sessionNotFound", "{body}");
+    // Answered exactly as a session that does not exist: nothing revoked.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["revokedCount"], 0, "{body}");
     let (status, body) = list_as(&h, &alice_token, &alice, &alice).await;
     assert_eq!(status, StatusCode::OK, "alice's session survives: {body}");
+}
+
+#[tokio::test]
+async fn the_session_key_revokes_only_its_own_session_and_a_retry_succeeds() {
+    let h = harness().await;
+    let (alice, browser) = (key(22), key(23));
+    h.add_acl(&alice.did, Role::Admin).await;
+    let (token, body) = login(&h, &alice, Some(&browser)).await;
+    let own = body["payload"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other_token = session_for(&h, &alice, None).await;
+    let other = h
+        .state
+        .jwt_keys
+        .as_ref()
+        .expect("jwt keys")
+        .decode(&other_token)
+        .expect("decode")
+        .session_id;
+
+    let revoke = |session_id: &str| {
+        doc(
+            "auth/revoke-session/0.2",
+            &alice.did,
+            json!({ "sessionId": session_id }),
+        )
+    };
+
+    // The session key cannot end the subject's other session.
+    let d = sign(revoke(&other), &browser, "authentication").await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["revokedCount"], 0, "{body}");
+    assert!(
+        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &other)
+            .await
+            .unwrap()
+            .is_some(),
+        "the other session survives"
+    );
+
+    // It can end its own, and a retried logout still succeeds.
+    let d = sign(revoke(&own), &browser, "authentication").await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["revokedCount"], 1, "{body}");
+    let d = sign(revoke(&own), &alice, "authentication").await;
+    let (status, body) = post(&h, None, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["revokedCount"], 0, "{body}");
 }
 
 #[tokio::test]

@@ -27,7 +27,9 @@ session, as a passkey login binds its browser key.
   its refresh.
 - **Logout.** New `auth/revoke-session/0.2` ends one of the caller's own
   sessions. The console's sign-out now calls it, signed with the session key,
-  so logout ends the session server-side, not only in the browser.
+  so logout ends the session server-side, not only in the browser. A session
+  key may end only its own session. A session that is gone, or not the
+  caller's to end, answers `revokedCount: 0`, so a retried logout succeeds.
 - **Console.** A wallet login generates a non-extractable session key and
   passes it as `sessionKey`. Later calls are signed with it instead of
   prompting the wallet. Step-up still goes through the wallet.

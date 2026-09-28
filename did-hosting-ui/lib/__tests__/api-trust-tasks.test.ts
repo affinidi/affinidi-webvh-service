@@ -517,6 +517,21 @@ describe("management calls (wallet session)", () => {
     expect(store.get("webvh_token")).toBeUndefined();
   });
 
+  it("leaves a session that replaced this one during the revoke alone", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet();
+    installControlPlane((req) => {
+      // A new sign-in lands while the revoke is in flight.
+      store.set("webvh_token", "newer-token");
+      return seal(req, { revokedCount: 1 });
+    });
+
+    await api.logout();
+
+    expect(store.get("webvh_token")).toBe("newer-token");
+  });
+
   it("signs through the wallet when the session bound no key", async () => {
     stubStorage({ webvh_token: TOKEN, webvh_auth_method: "wallet" });
     const sessionKey = await import("../session-key");
