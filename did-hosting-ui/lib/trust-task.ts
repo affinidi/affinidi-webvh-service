@@ -436,8 +436,10 @@ async function sign(
   doc.issuer = subject;
 
   if (getAuthMethod() === "wallet") {
-    // A wallet holder login bound this browser's session key
-    // (`auth/authenticate/0.2`), so the key signs, with no wallet prompt.
+    // A wallet login bound this browser's session key — a holder login
+    // through `auth/authenticate/0.2`, a proxy login through
+    // `session_pubkey_b58btc` on `/auth/` — so the key signs, with no wallet
+    // prompt.
     // The control plane accepts it as the subject for this session only.
     // A step-up is not signed here: it goes to the wallet (`stepUpVta`).
     if (!hasSessionKeypair()) {
@@ -447,8 +449,8 @@ async function sign(
       await signEnvelope(doc as unknown as Record<string, unknown>);
       return doc;
     }
-    // No bound key: a proxy login, which binds none, or a key this browser
-    // no longer holds. The wallet signs. A holder login's session is the
+    // No key in hand: this browser no longer holds the one the session
+    // was bound to (or the session predates key binding). The wallet signs. A holder login's session is the
     // wallet's own DID, so it signs as itself; a proxy login's session is a
     // vault entry's principal, whose key lives at the VTA, so the wallet asks
     // the VTA to sign as that DID (`asDid`). Without it the proof would name

@@ -19,6 +19,11 @@
  * plane never accepts a session key where an `assertionMethod` approval is
  * required.
  *
+ * A proxy login cannot go through `wallet.login`: the VTA mints the persona's
+ * `id_token` and the page posts it to `/auth/` itself. It binds the same key
+ * there instead, as `session_pubkey_b58btc` — see
+ * {@link authenticateIdTokenBindingSessionKey}.
+ *
  * Kept free of `react-native` so the test runner can reach it; `wallet.ts`
  * re-exports the entry point.
  */
@@ -64,6 +69,69 @@ export async function loginBindingSessionKey(
       );
     }
     return result;
+  } catch (err) {
+    clearSessionKeypair();
+    throw err;
+  }
+}
+
+/** The canonical `/auth/` response: `{ session, tokens }`, both camelCase. */
+export interface IdTokenAuthResponse {
+  session: { id: string; subject: string; issuedAt: string; expiresAt: string };
+  tokens: {
+    accessToken: string;
+    refreshToken?: string;
+    tokenType: string;
+    expiresIn: number;
+    refreshExpiresIn?: number;
+  };
+}
+
+/**
+ * Post a proxy login's `id_token` to `{apiBase}/auth/`, binding a fresh
+ * session key to the new session.
+ *
+ * The persona's own key lives at the VTA, so without a session key every call
+ * the session makes is signed through the wallet's `signTrustTask` — which
+ * asks the human each time, by design, and a page load fires several at once.
+ * The route refuses a key it cannot bind rather than dropping it, so a success
+ * means the key is bound. On any failure the key pair is dropped, as in
+ * {@link loginBindingSessionKey}.
+ *
+ * Returns the envelope sent, for the login screen's walkthrough.
+ */
+export async function authenticateIdTokenBindingSessionKey(
+  apiBase: string,
+  args: { idToken: string; sessionId: string; typeUri: string },
+  fetchFn: typeof fetch = fetch,
+): Promise<{ response: IdTokenAuthResponse; sent: Record<string, unknown> }> {
+  const { pubkeyMultikey } = await generateSessionKeypair();
+  const sent = {
+    type: args.typeUri,
+    payload: {
+      id_token: args.idToken,
+      // Snake_case: `AuthenticatePayload` has no `rename_all`.
+      session_id: args.sessionId,
+      session_pubkey_b58btc: pubkeyMultikey,
+    },
+  };
+  try {
+    const res = await fetchFn(`${apiBase}/auth/`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sent),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`/auth/ failed (${res.status}): ${text}`);
+    }
+    const response = (await res.json()) as IdTokenAuthResponse;
+    if (!response.tokens?.accessToken) {
+      throw new Error(
+        `/auth/: missing tokens.accessToken in response — got ${JSON.stringify(response).slice(0, 200)}`,
+      );
+    }
+    return { response, sent };
   } catch (err) {
     clearSessionKeypair();
     throw err;

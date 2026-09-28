@@ -239,6 +239,19 @@ fn didcomm_authenticate_body_to(
 /// Build a SIOPv2 id_token Trust-Task envelope (the existing dialect) —
 /// used by the regression case to prove that path is unchanged.
 fn siop_authenticate_body(id: &KeyIdentity, session_id: &str, challenge: &str, now: u64) -> String {
+    siop_authenticate_body_binding(id, session_id, challenge, now, None)
+}
+
+/// As [`siop_authenticate_body`], optionally naming a
+/// `session_pubkey_b58btc` for the session to be bound to — what the Web UI's
+/// wallet proxy login sends.
+fn siop_authenticate_body_binding(
+    id: &KeyIdentity,
+    session_id: &str,
+    challenge: &str,
+    now: u64,
+    session_pubkey: Option<&str>,
+) -> String {
     let header = json!({ "alg": "EdDSA", "typ": "JWT", "kid": id.kid });
     let payload = json!({
         "iss": id.did,
@@ -254,11 +267,14 @@ fn siop_authenticate_body(id: &KeyIdentity, session_id: &str, challenge: &str, n
     let sig = id.signing_key.sign(signing_input.as_bytes());
     let id_token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
-    let envelope = json!({
+    let mut envelope = json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
         "payload": { "id_token": id_token, "session_id": session_id },
     });
+    if let Some(pk) = session_pubkey {
+        envelope["payload"]["session_pubkey_b58btc"] = json!(pk);
+    }
     serde_json::to_string(&envelope).unwrap()
 }
 
@@ -496,6 +512,51 @@ async fn siop_id_token_authenticate_still_works() {
     assert_eq!(
         out["session"]["subject"].as_str(),
         Some(wallet.did.as_str())
+    );
+}
+
+/// The wallet proxy login binds the Web UI's session key through this route:
+/// the VTA mints the `id_token`, and the page — which holds the key — sends
+/// `session_pubkey_b58btc` beside it. The key must land on the session row,
+/// which is what lets it sign the session's calls in place of the wallet.
+#[tokio::test]
+async fn siop_id_token_authenticate_binds_a_session_key() {
+    let harness = make_harness().await;
+    let persona = key_identity([34u8; 32]);
+    let browser = key_identity([35u8; 32]);
+    let browser_pk = browser.did.trim_start_matches("did:key:").to_string();
+    seed_owner(&harness.state, &persona.did).await;
+
+    let (status, session_id, challenge) = do_challenge(&harness.state, &persona.did).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = siop_authenticate_body_binding(
+        &persona,
+        &session_id,
+        &challenge,
+        now_secs(),
+        Some(&browser_pk),
+    );
+    let resp = did_hosting_control::routes::router_without_fallback()
+        .with_state(harness.state.clone())
+        .oneshot(authenticate_request(body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = read_json(resp.into_body()).await;
+    let bound_session = out["session"]["id"].as_str().expect("session id");
+
+    let session = did_hosting_common::server::auth::session::get_session(
+        &harness.state.sessions_ks,
+        bound_session,
+    )
+    .await
+    .expect("read session")
+    .expect("session exists");
+    assert_eq!(session.did, persona.did);
+    assert_eq!(
+        session.session_pubkey_b58btc.as_deref(),
+        Some(browser_pk.as_str())
     );
 }
 

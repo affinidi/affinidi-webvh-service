@@ -17,10 +17,10 @@ import {
 const TOKEN_KEY = "webvh_token";
 const REFRESH_TOKEN_KEY = "webvh_refresh_token";
 
-/** Which auth path produced the current session. Both passkey and wallet
- *  holder logins bind the browser's session keypair, which then signs
- *  trust tasks. A `"wallet"` session with no bound key (a proxy login) falls
- *  back to `window.vtaWallet.signTrustTask`. */
+/** Which auth path produced the current session. Passkey, wallet holder and
+ *  wallet proxy logins all bind the browser's session keypair, which then
+ *  signs trust tasks. A `"wallet"` session whose key this browser no longer
+ *  holds falls back to `window.vtaWallet.signTrustTask`. */
 export type AuthMethod = "passkey" | "wallet";
 const AUTH_METHOD_KEY = "webvh_auth_method";
 
@@ -119,7 +119,7 @@ export async function renewIfNeeded(): Promise<void> {
       // stolen refresh token alone will not rotate the session. The refresh
       // token is still what authorises it: the key proves this is the
       // browser that logged in, and cannot refresh anything on its own. A
-      // session with no bound key (a proxy login, machine-to-machine) has
+      // session with no bound key (machine-to-machine) has
       // nothing to sign with and the daemon does not ask.
       let envelope: Record<string, unknown> = {
         type: REFRESH_TASK_URI,
