@@ -244,7 +244,7 @@ jobs:
         run: >
           cargo test -p did-hosting-common --lib
           --features server-core,store-fjall,keyring
-          server::secret_store::keyring::tests::keyring_round_trip_when_backend_available
+          server::secret_store::tests::keyring_round_trip_when_backend_available
           --
           --nocapture
       - name: Run keyring round-trip on Linux (under dbus + gnome-keyring)
@@ -262,7 +262,7 @@ jobs:
             export GNOME_KEYRING_CONTROL DBUS_SESSION_BUS_ADDRESS
             cargo test -p did-hosting-common --lib \
               --features server-core,store-fjall,keyring \
-              server::secret_store::keyring::tests::keyring_round_trip_when_backend_available \
+              server::secret_store::tests::keyring_round_trip_when_backend_available \
               -- --nocapture
           '
 

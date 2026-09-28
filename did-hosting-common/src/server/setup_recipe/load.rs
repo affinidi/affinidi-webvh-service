@@ -249,6 +249,9 @@ pub fn resolve_secrets_config(
 ) -> crate::server::config::SecretsConfig {
     let mut out = crate::server::config::SecretsConfig::default();
     let backend = recipe.secrets.backend.unwrap_or(SecretsBackend::Keyring);
+    // Name the backend in the generated config rather than leaving it to be
+    // inferred from whichever selector field is set.
+    out.backend = Some(backend.to_vti());
 
     match backend {
         SecretsBackend::Keyring => {
@@ -347,11 +350,9 @@ pub fn resolve_secrets_config(
             out.keyring_service = default_keyring_service.to_string();
         }
         SecretsBackend::Plaintext => {
-            // Explicitly select plaintext so a keyring-enabled build doesn't
-            // silently prefer the OS keyring (which panics on headless hosts
-            // with no Secret Service). The validator already demanded
-            // `confirm_plaintext = true`.
-            out.plaintext_mode = true;
+            // The validator already demanded `confirm_plaintext = true`; the
+            // store checks it again, so a hand-edited config cannot skip it.
+            out.confirm_plaintext = recipe.secrets.confirm_plaintext;
             out.keyring_service = default_keyring_service.to_string();
         }
     }

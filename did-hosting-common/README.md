@@ -33,9 +33,10 @@ Shared infrastructure for authenticated services:
   (Admin/Owner), and CRUD operations on the ACL keyspace
 - **`store`** — Storage abstraction over fjall with
   `KeyspaceHandle`, batch operations, and persistence
-- **`secret_store`** — Pluggable secrets backend trait with
-  implementations for OS keyring, plaintext (dev only),
-  AWS Secrets Manager, and GCP Secret Manager
+- **`secret_store`** — The service's key envelope, stored through the
+  `vti-secrets` backends: OS keyring, AWS Secrets Manager, GCP Secret
+  Manager, Azure Key Vault, HashiCorp Vault, Kubernetes `Secret`, and a
+  test-only plaintext file
 - **`error`** — `AppError` enum with Axum `IntoResponse`
   implementation
 - **`passkey`** — WebAuthn passkey enrollment and login
