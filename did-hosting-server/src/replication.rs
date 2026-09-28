@@ -144,7 +144,11 @@ pub fn deliver_reply(
     let Some(thread) = doc.thread_id.clone() else {
         return Some(doc);
     };
-    let waiter = PENDING.lock().ok()?.remove(&thread);
+    // A poisoned table must not swallow every inbound document.
+    let waiter = PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&thread);
     match waiter {
         Some(tx) => {
             let _ = tx.send(doc);

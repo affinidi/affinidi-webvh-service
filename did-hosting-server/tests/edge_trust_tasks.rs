@@ -911,3 +911,73 @@ async fn a_strangers_health_ping_is_not_answered() {
         assert_eq!(reply["threadId"], ping["id"], "{via:?}");
     }
 }
+
+/// The reconcile trusts only its control plane's signed, threaded answer: a
+/// listing signed by anyone else, left unsigned, or threaded to another
+/// request fails the reconcile and leaves the freshness mark where it was —
+/// so nobody but the control plane can reset the staleness bound.
+#[tokio::test]
+async fn a_listing_not_signed_by_the_control_plane_does_not_reconcile() {
+    use did_hosting_server::replication::reconcile_once;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Forgery {
+        Stranger,
+        Unsigned,
+        OtherThread,
+    }
+    let (state, _dir) = edge_state().await;
+    let empty = json!({ "records": [], "total": 0 });
+    for forgery in [Forgery::Stranger, Forgery::Unsigned, Forgery::OtherThread] {
+        let outcome = reconcile_once(&state, |request| {
+            let empty = empty.clone();
+            async move {
+                let mut reply =
+                    request.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), empty);
+                let key = match forgery {
+                    Forgery::Stranger => {
+                        let stranger = signer(69);
+                        reply.issuer = Some(stranger.0.clone());
+                        Some(stranger.1)
+                    }
+                    Forgery::Unsigned => None,
+                    Forgery::OtherThread => {
+                        reply.thread_id = Some("urn:uuid:another-request".into());
+                        Some(control().1)
+                    }
+                };
+                Ok(match key {
+                    Some(key) => {
+                        did_hosting_common::server::trust_tasks::sign_document(&reply, &key)
+                            .await
+                            .unwrap()
+                    }
+                    None => reply,
+                })
+            }
+        })
+        .await;
+        assert!(outcome.is_err(), "{forgery:?}: {outcome:?}");
+        assert!(
+            state.replication.last_reconciled_at().is_none(),
+            "{forgery:?}: the freshness mark did not move"
+        );
+    }
+
+    // The control plane's own signed answer does reconcile.
+    let report = reconcile_once(&state, |request| {
+        let empty = empty.clone();
+        async move {
+            let reply = request.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), empty);
+            Ok(
+                did_hosting_common::server::trust_tasks::sign_document(&reply, &control().1)
+                    .await
+                    .unwrap(),
+            )
+        }
+    })
+    .await
+    .expect("the control plane's listing reconciles");
+    assert!(report.is_clean());
+    assert!(state.replication.last_reconciled_at().is_some());
+}

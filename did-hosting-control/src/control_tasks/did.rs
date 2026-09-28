@@ -213,7 +213,10 @@ pub(crate) async fn list(
     // every slot anyway, and the listing is how it catches what it missed
     // (the replication staleness bound). Only a server-type registry entry
     // under the caller's own DID qualifies — a witness or watcher with the
-    // Service role does not.
+    // Service role does not, unless it has registered as a server, which
+    // already hands it every slot's content. The listing it gets withholds
+    // each slot's owner and resolve count (below), so it discloses nothing
+    // beyond that sync.
     let replica = auth.role == Role::Service && is_hosting_server(state, &auth.did).await;
     if replica && p.owner.is_none() && p.offset.unwrap_or(0) == 0 {
         crate::registry::record_reconcile(&state.registry_ks, &auth.did, now_epoch()).await;
@@ -233,7 +236,19 @@ pub(crate) async fn list(
         .map(|(record, total_resolves)| {
             let mut value =
                 serde_json::to_value(spec_record::<list::v0_1::DidRecord>(state, record)?)?;
-            value["totalResolves"] = json!(total_resolves);
+            if replica {
+                // A replica reconciles on the slot, its DID, version and
+                // disabled state. Who owns each slot, and how often it is
+                // resolved, is tenant data it has no use for — and is not in
+                // the sync it is already sent — so it is withheld. `owner` is
+                // required by the record schema, so it stays, empty.
+                value["owner"] = json!("");
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("totalResolves");
+                }
+            } else {
+                value["totalResolves"] = json!(total_resolves);
+            }
             Ok(value)
         })
         .collect::<Result<Vec<_>, TaskError>>()?;

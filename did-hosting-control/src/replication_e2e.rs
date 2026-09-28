@@ -671,6 +671,11 @@ async fn only_a_registered_server_is_given_the_full_listing() {
         .unwrap();
     let reply = f.ask_control(Via::Https, request).await.unwrap();
     assert_eq!(reply.payload["total"], 1, "{reply:?}");
+    // Each slot's owner and resolve count are withheld from a replica.
+    let record = &reply.payload["records"][0];
+    assert_eq!(record["owner"], "", "{reply:?}");
+    assert!(record.get("totalResolves").is_none(), "{reply:?}");
+    assert_eq!(record["mnemonic"], "alice");
 }
 
 /// Per-edge replication lag reaches `server/metrics/0.1`: the queued
