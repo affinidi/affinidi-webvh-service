@@ -43,11 +43,9 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub stats: StatsConfig,
-    #[serde(default)]
-    pub watchers: Vec<WatcherEndpoint>,
-    /// URL of the control plane for service registration.
-    pub control_url: Option<String>,
-    /// DID of the control plane service (for DIDComm authentication).
+    /// DID of the control plane that drives this edge — the one party whose
+    /// signed Trust Tasks it applies. Required: the server does not start
+    /// without it.
     pub control_did: Option<String>,
     #[serde(default)]
     pub vta: VtaConfig,
@@ -58,24 +56,6 @@ pub struct AppConfig {
     pub identity: did_hosting_common::server::config::IdentityConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct WatcherEndpoint {
-    pub url: String,
-    pub token: Option<String>,
-}
-
-// Manual Debug: `token` is a bearer secret used by webvh-watcher's /sync push
-// auth. Leaking it via a stray debug/trace log of the loaded config would
-// hand any reader live push credentials.
-impl std::fmt::Debug for WatcherEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WatcherEndpoint")
-            .field("url", &self.url)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -208,7 +188,6 @@ impl AppConfig {
         env_opt!("DID_HOSTING_SERVER_DID", config.server_did);
         env_opt!("DID_HOSTING_MEDIATOR_DID", config.mediator_did);
         env_opt!("DID_HOSTING_PUBLIC_URL", config.public_url);
-        env_opt!("DID_HOSTING_CONTROL_URL", config.control_url);
         env_opt!("DID_HOSTING_CONTROL_DID", config.control_did);
 
         // VTA config
@@ -260,10 +239,6 @@ impl AppConfig {
 
         // Normalize: strip trailing slashes from URLs
         if let Some(ref mut url) = config.public_url {
-            let trimmed = url.trim_end_matches('/').to_string();
-            *url = trimmed;
-        }
-        if let Some(ref mut url) = config.control_url {
             let trimmed = url.trim_end_matches('/').to_string();
             *url = trimmed;
         }

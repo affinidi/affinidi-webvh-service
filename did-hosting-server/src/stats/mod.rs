@@ -12,87 +12,15 @@ pub use did_hosting_common::server::stats_collector::{StatsAggregate, StatsColle
 
 use affinidi_messaging_didcomm_service::DIDCommService;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Monotonic sequence counter for stats sync idempotency.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Push per-DID stat deltas to the control plane via HTTP.
-///
-/// The body is a `.../server/stats-sync/0.1` Trust Task document signed by
-/// this server's DID for the control plane — the same signed document the
-/// messaging path sends — so the control plane credits the deltas to the
-/// server whose key signed them, not to whoever reached the endpoint.
-///
-/// Drains the collector's accumulated deltas only once a document can be
-/// signed; if nothing changed since the last sync, nothing is sent.
-pub async fn sync_to_control(
-    http: &reqwest::Client,
-    control_url: &str,
-    server_did: &str,
-    control_did: &str,
-    identity: &did_hosting_common::server::identity::ServiceIdentity,
-    collector: &StatsCollector,
-) {
-    use did_hosting_common::didcomm_types::MSG_STATS_SYNC;
-    use did_hosting_common::server::trust_tasks::send::build_signed_request;
-
-    let signer = match did_hosting_common::server::trust_tasks::identity_signing_secret(
-        identity, server_did,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!(error = %e, "stats sync skipped: no signing key");
-            return;
-        }
-    };
-    let deltas = collector.drain_for_sync();
-    if deltas.is_empty() {
-        return; // Nothing changed — skip the POST
-    }
-
-    let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let payload = did_hosting_common::StatsSyncPayload {
-        server_did: server_did.to_string(),
-        seq,
-        did_deltas: deltas,
-    };
-    let body = match serde_json::to_value(&payload) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(error = %e, "stats sync: payload does not serialise");
-            return;
-        }
-    };
-    let doc =
-        match build_signed_request(MSG_STATS_SYNC, server_did, control_did, body, &signer).await {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, "stats sync: could not sign the document");
-                return;
-            }
-        };
-
-    let url = format!("{control_url}/api/control/stats");
-    match http.post(&url).json(&doc).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            #[cfg(feature = "metrics")]
-            did_hosting_common::server::metrics::inc_stats_sync();
-        }
-        Ok(resp) => {
-            warn!(status = %resp.status(), url = %url, "control plane refused the stats sync");
-        }
-        Err(e) => {
-            warn!(error = %e, url = %url, "failed to sync stats to control plane");
-        }
-    }
-}
-
 /// Push per-DID stat deltas to the control plane over the messaging transport.
 ///
-/// Same semantics as `sync_to_control` but routes through the mediator
-/// instead of requiring direct HTTP access to the control plane.
+/// The binding (TSP or DIDComm) follows the control plane's DID document;
+/// there is no HTTPS side channel to the control plane.
 ///
 /// Sent as a signed `.../server/stats-sync/0.1` trust task: the control plane
 /// credits the deltas to the server whose DID signed the document, so an

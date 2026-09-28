@@ -30,10 +30,11 @@ in the daemon if it falls into any of these buckets:
   unified task, rather than one per service). New periodic work in
   standalone services should land here.
 - **Route changes.** The daemon merges server (public DID resolution
-  only) + control (full management API + UI) at root. The server's
-  `/api/*` routes are not exposed — the control plane provides all
-  management routes. Route additions to either service must be tested
-  in daemon mode.
+  only) + control (full management API + UI) at root. The server has no
+  management routes at all — an edge serves resolution, `/api/health` and
+  its Trust Task listener (`POST /api/trust-tasks`, which the daemon does
+  not mount: the control plane's listener serves that path). Route
+  additions to either service must be tested in daemon mode.
 - **DIDComm message types.** The daemon runs the control plane's
   inbound DIDComm listener (`build_control_router`). Any new `MSG_*`
   routed there is automatically picked up; no separate daemon wiring
@@ -68,9 +69,10 @@ sense in the all-in-one model.
   the full provisioning protocol on the authoritative store. The
   server's DIDComm path applies only to the distributed deployment
   where it receives sync updates from a remote control plane.
-- **HTTP stats sync.** The standalone server periodically POSTs stats
-  deltas to the standalone control plane. In the daemon, stats are
-  shared in-process via `Arc<StatsCollector>` — there is no HTTP
+- **Stats sync.** A standalone edge periodically sends its stats deltas
+  to its control plane as a signed `server/stats-sync` Trust Task over the
+  transport the control plane's DID document advertises. In the daemon,
+  stats are shared in-process via `Arc<StatsCollector>` — there is no
   round-trip and the sync task is not spawned.
 - **Outbound ATM / mediator client for inter-service sync.** No
   external servers exist to push DID updates to from a daemon's

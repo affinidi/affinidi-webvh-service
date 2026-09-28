@@ -21,7 +21,7 @@ use did_hosting_common::didcomm_types::{
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS, Store};
+use did_hosting_common::server::store::{KS_DIDS, Store};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_common::server::trust_tasks::send::{build_request, build_signed_request};
 use did_hosting_server::cache::ContentCache;
@@ -77,8 +77,6 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: Some(control_did),
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -86,8 +84,6 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
     };
     let state = AppState {
         store: store.clone(),
-        sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-        acl_ks: store.keyspace(KS_ACL).unwrap(),
         dids_ks: store.keyspace(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
@@ -95,9 +91,6 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         secrets_resolver: None,
         identity: None,
         didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
@@ -973,76 +966,4 @@ async fn an_unverified_document_gets_no_reply() {
     .expect("the control plane's op is answered");
     assert_eq!(reply["type"], MSG_SYNC_UPDATE_ACK);
     assert!(reply.get("proof").is_some(), "{reply}");
-}
-
-fn admin() -> did_hosting_server::auth::AuthClaims {
-    did_hosting_server::auth::AuthClaims {
-        did: "did:key:admin".into(),
-        role: did_hosting_server::acl::Role::Admin,
-        session_id: String::new(),
-        session_pubkey_b58btc: None,
-        amr: vec!["did".into()],
-        acr: "aal1".into(),
-    }
-}
-
-/// The edge's own `PUT /api/dids/{mnemonic}` is held to the same history rule
-/// as a sync: it cannot roll a DID back, and after a delete it cannot bring
-/// back a history older than the one the edge last served.
-#[tokio::test]
-async fn a_rest_publish_cannot_roll_back_the_served_history() {
-    use did_hosting_server::did_ops::{create_did, publish_did};
-
-    let (state, _dir) = make_state().await;
-    let (mut webvh, key) = new_log("alice").await;
-    let v1 = jsonl(&webvh);
-    let id = did_id(&v1);
-    append(&mut webvh, &key, 1).await;
-    let v2 = jsonl(&webvh);
-    append(&mut webvh, &key, 0).await;
-    let v3 = jsonl(&webvh);
-
-    let synced = apply(
-        &state,
-        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
-    )
-    .await;
-    assert!(!is_error(&synced), "{synced:?}");
-
-    // Rollback over the held log.
-    let err = publish_did(&admin(), &state, "alice", &v1)
-        .await
-        .err()
-        .expect("a rollback is refused");
-    assert!(err.to_string().contains("not an extension"), "{err}");
-
-    // Delete, re-create the slot, and try the older history again.
-    let del = apply(
-        &state,
-        signed_op(MSG_SYNC_DELETE, &control(), json!({"mnemonic": "alice"})).await,
-    )
-    .await;
-    assert!(!is_error(&del), "{del:?}");
-    create_did(&admin(), &state, Some("alice"))
-        .await
-        .expect("slot re-created");
-    let err = publish_did(&admin(), &state, "alice", &v1)
-        .await
-        .err()
-        .expect("the high-water mark survives the delete");
-    assert!(err.to_string().contains("not an extension"), "{err}");
-
-    // A strict extension is fine, and becomes the new high-water mark.
-    publish_did(&admin(), &state, "alice", &v3)
-        .await
-        .expect("an extension is published");
-    let back = apply(
-        &state,
-        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
-    )
-    .await;
-    assert!(
-        is_error(&back),
-        "a sync cannot undo the REST publish: {back:?}"
-    );
 }

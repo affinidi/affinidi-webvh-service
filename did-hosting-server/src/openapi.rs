@@ -1,65 +1,38 @@
-//! OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47, item #5).
+//! OpenAPI 3.1 spec for the edge's HTTP surface (issue #47, item #5).
 //!
-//! Behind the off-by-default `openapi` feature. The spec covers the routes a
-//! black-box / E2E fuzzer cares about: the authenticated `PUT /api/dids/...`
-//! upload path and the public resolve routes, plus the surrounding
-//! introspection surface.
+//! Behind the off-by-default `openapi` feature. An edge serves public DID
+//! resolution, the unauthenticated health probe, and `POST /api/trust-tasks` —
+//! the HTTPS binding of its Trust Task listener. It has no management API:
+//! every write is a Trust Task signed by its control plane.
 //!
 //! [`ApiDoc::openapi`] yields the spec programmatically; the committed
 //! `docs/openapi.json` snapshot is regenerated and drift-checked by the
 //! `openapi_snapshot_in_sync` test below.
 
 use utoipa::OpenApi;
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::routes::resolve_webvh;
-use crate::routes::{did_manage, did_public, health};
+use crate::routes::{did_public, health, trust_tasks};
 
-/// Registers the `bearer` (JWT) HTTP security scheme referenced by the
-/// authenticated endpoints.
-struct SecurityAddon;
-
-impl utoipa::Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        let components = openapi.components.get_or_insert_with(Default::default);
-        components.add_security_scheme(
-            "bearer",
-            SecurityScheme::Http(
-                HttpBuilder::new()
-                    .scheme(HttpAuthScheme::Bearer)
-                    .bearer_format("JWT")
-                    .build(),
-            ),
-        );
-    }
-}
-
-/// The aggregated OpenAPI document for the server's HTTP API.
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Affinidi DID Hosting — upload/resolve API",
-        description = "HTTP surface of the did-hosting-server edge node: authenticated \
-            upload/introspection of did:webvh slots and public, unauthenticated DID \
-            resolution. DID lifecycle management (create/rollback/recover) happens over \
-            DIDComm on the control plane and is not part of this spec.",
+        title = "Affinidi DID Hosting — edge HTTP surface",
+        description = "HTTP surface of the did-hosting-server edge node: public, \
+            unauthenticated DID resolution, a liveness probe, and the HTTPS binding of the \
+            Trust Task listener. The edge is written to only by its control plane's signed \
+            Trust Tasks, which arrive over TSP, DIDComm or this binding alike.",
         version = env!("CARGO_PKG_VERSION"),
         license(name = "Apache-2.0"),
     ),
     paths(
-        did_manage::upload_did,
-        did_manage::upload_witness,
-        did_manage::get_did,
-        did_manage::get_did_log,
-        did_manage::list_dids,
-        did_manage::delete_did,
+        trust_tasks::receive,
         health::health,
         did_public::serve_public,
         resolve_webvh::serve_root_did_log,
     ),
-    modifiers(&SecurityAddon),
     tags(
-        (name = "dids", description = "Authenticated DID slot management + content sync"),
+        (name = "trust-tasks", description = "The HTTPS binding of the Trust Task listener"),
         (name = "resolve", description = "Public, unauthenticated DID resolution"),
         (name = "system", description = "Health / diagnostics"),
     ),
