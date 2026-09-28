@@ -96,6 +96,7 @@ export default function Enroll() {
               value={claimCode}
               onChangeText={setClaimCode}
               autoCapitalize="characters"
+              autoComplete="off"
               autoCorrect={false}
               editable={state.phase === "code"}
             />

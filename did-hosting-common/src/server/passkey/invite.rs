@@ -286,9 +286,24 @@ static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
 /// concurrent wrong codes are each counted.
 static ATTEMPT_LOCKS: LazyLock<PathLocks> = LazyLock::new(PathLocks::new);
 
+/// Claim-code hashes run at once, service-wide. Each takes
+/// [`ARGON2_M_KIB`] of memory, and a stranger can ask for one per redemption
+/// attempt — from as many sources as they can mint VIDs — so the per-source
+/// rate limit alone does not bound the memory and CPU they can make the
+/// service spend. Past this many, attempts queue.
+const MAX_CONCURRENT_HASHES: usize = 8;
+
+static HASH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HASHES);
+
+/// Run one claim-code hash on the blocking pool, within [`HASH_PERMITS`].
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, AppError> {
+    let _permit = HASH_PERMITS
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("hashing permits closed: {e}")))?;
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| AppError::Internal(format!("hashing task failed: {e}")))
@@ -339,7 +354,10 @@ pub async fn issue(ks: &KeyspaceHandle, req: InviteRequest) -> Result<IssuedInvi
     })
 }
 
-/// Store (or rewrite) an invite and its id index.
+/// Store (or rewrite) an invite and its id index, unlocked: for a new invite,
+/// or under the invite's [`ATTEMPT_LOCKS`] guard. A rewrite of an existing
+/// invite goes through [`update`], so it cannot bring back one that was taken
+/// meanwhile.
 pub async fn save(ks: &KeyspaceHandle, invite: &Invite) -> Result<(), AppError> {
     ks.insert(invite_key(&invite.token_hash), invite).await?;
     ks.insert_raw(
@@ -381,12 +399,43 @@ pub async fn list(ks: &KeyspaceHandle) -> Result<Vec<Invite>, AppError> {
 
 /// Consume the invite under `token_hash`, atomically: exactly one caller gets
 /// it. Its id index goes with it.
+///
+/// Taken under the invite's [`ATTEMPT_LOCKS`] guard, so a wrong-code count,
+/// a ceremony or an administrator's update in flight cannot write the invite
+/// back after it is gone — a consumed or revoked invite stays consumed.
 pub async fn take(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Invite>, AppError> {
+    let _guard = ATTEMPT_LOCKS.guard(token_hash).await;
+    take_locked(ks, token_hash).await
+}
+
+/// [`take`], for a caller already holding the invite's guard.
+async fn take_locked(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Invite>, AppError> {
     let taken: Option<Invite> = ks.take(invite_key(token_hash)).await?;
     if let Some(ref invite) = taken {
         ks.remove(invite_id_key(&invite.invite_id)).await?;
     }
     Ok(taken)
+}
+
+/// Change the invite an administrator addresses by `invite_id`: `change` sees
+/// the stored invite, read under its guard, and the result is written back
+/// only if `change` succeeds. `None` when there is no such invite — including
+/// one taken while the change waited for the guard.
+pub async fn update<E: From<AppError>>(
+    ks: &KeyspaceHandle,
+    invite_id: &str,
+    change: impl FnOnce(&mut Invite) -> Result<(), E>,
+) -> Result<Option<Invite>, E> {
+    let Some(found) = by_id(ks, invite_id).await? else {
+        return Ok(None);
+    };
+    let _guard = ATTEMPT_LOCKS.guard(&found.token_hash).await;
+    let Some(mut invite) = by_token_hash(ks, &found.token_hash).await? else {
+        return Ok(None);
+    };
+    change(&mut invite)?;
+    save(ks, &invite).await?;
+    Ok(Some(invite))
 }
 
 /// Withdraw an invite by `invite_id`. `false` when there was none.
@@ -447,7 +496,7 @@ pub async fn redeem(
     }
     invite.wrong_codes += 1;
     if invite.wrong_codes >= MAX_WRONG_CODES {
-        take(ks, &token_hash).await?;
+        take_locked(ks, &token_hash).await?;
         info!(
             target: "audit",
             event = "passkey.invite.locked",
@@ -644,6 +693,62 @@ mod tests {
         );
         assert!(
             by_id(&ks, &issued.invite.invite_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A wrong code in flight while the invite is consumed must not write the
+    /// invite back: once taken, it stays gone.
+    #[tokio::test]
+    async fn a_taken_invite_is_not_brought_back_by_a_racing_wrong_code() {
+        let (ks, _dir) = ks().await;
+        for _ in 0..8 {
+            let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+            let wrong = {
+                let ks = ks.clone();
+                let token = issued.token.clone();
+                tokio::spawn(async move { redeem(&ks, &token, "WRONGWRONG12").await.unwrap() })
+            };
+            let taken = {
+                let ks = ks.clone();
+                let hash = issued.invite.token_hash.clone();
+                tokio::spawn(async move { take(&ks, &hash).await.unwrap() })
+            };
+            wrong.await.unwrap();
+            assert!(taken.await.unwrap().is_some());
+            assert!(
+                by_token_hash(&ks, &issued.invite.token_hash)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a consumed invite was written back"
+            );
+        }
+    }
+
+    /// An administrator's update of an invite that has since been consumed
+    /// finds nothing, and writes nothing.
+    #[tokio::test]
+    async fn an_update_does_not_bring_back_a_taken_invite() {
+        let (ks, _dir) = ks().await;
+        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        assert!(
+            take(&ks, &issued.invite.token_hash)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let updated = update::<AppError>(&ks, &issued.invite.invite_id, |i| {
+            i.expires_at += 60;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(updated.is_none());
+        assert!(
+            by_token_hash(&ks, &issued.invite.token_hash)
                 .await
                 .unwrap()
                 .is_none()

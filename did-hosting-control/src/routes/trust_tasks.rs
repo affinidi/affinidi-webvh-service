@@ -92,18 +92,16 @@ pub async fn trust_tasks_endpoint(
 }
 
 /// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
+///
+/// Read exactly as [`dispatch_trust_task`] and the task table read it — the
+/// whole body as a `TrustTask`, its parsed `type` compared as the router
+/// compares it — so no body the router serves as a redemption (duplicate
+/// members, escapes, any other quirk of a lighter parse) slips past the limit.
 fn is_redeem_start(body: &[u8]) -> bool {
     use trust_tasks_rs::Payload;
-    #[derive(serde::Deserialize)]
-    struct Typed<'a> {
-        #[serde(rename = "type", borrow)]
-        type_uri: Option<std::borrow::Cow<'a, str>>,
-    }
-    serde_json::from_slice::<Typed<'_>>(body).is_ok_and(|t| {
-        t.type_uri.as_deref()
-            == Some(
-                trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI,
-            )
+    serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
+        doc.type_uri.to_string()
+            == trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
     })
 }
 

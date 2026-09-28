@@ -924,53 +924,56 @@ pub(crate) async fn invite_update(
         ));
     }
     let ks = &cx.state.sessions_ks;
-    let mut existing = invite::by_id(ks, &p.invite_id)
-        .await?
-        .ok_or_else(|| TaskError::Declared(error_codes::NOT_FOUND, "no such invite".into()))?;
     let now = now_epoch();
-    if existing.is_expired(now) {
-        return Err(TaskError::Declared(
-            error_codes::INVITE_LAPSED,
-            "the invite has lapsed; issue a new one".into(),
-        ));
-    }
-    if let Some(r) = p.role.as_deref() {
-        if existing.purpose == Purpose::StepUp {
-            return Err(TaskError::Declared(
-                error_codes::ROLE_NOT_ALLOWED,
-                "a stepUp invite confers no role".into(),
-            ));
-        }
-        if r.parse::<Role>().is_err() {
-            return Err(TaskError::Declared(
-                error_codes::ROLE_NOT_ALLOWED,
-                format!("`{r}` is not a role this service grants"),
-            ));
-        }
-        existing.role = Some(r.to_string());
-    }
     // No invite outlives the longest one this service would issue: an
     // `expiresAt` past that is refused, an `extendBy` clamped to it
     // (Conformance item 5).
     let max = now.saturating_add(cx.state.config.auth.passkey_enrollment_ttl.max(1));
-    match (p.expires_at, p.extend_by) {
-        (Some(t), _) => {
-            let t = t.timestamp().max(0) as u64;
-            if t <= now || t > max {
-                return Err(TaskError::Standard(
-                    StandardCode::MalformedRequest,
-                    format!(
-                        "expiresAt must lie in the future and within {}s of now",
-                        max - now
-                    ),
+    // Read, checked and rewritten under the invite's guard, so an update
+    // racing a redemption cannot bring back an invite that was just consumed.
+    let existing = invite::update(ks, &p.invite_id, |existing| {
+        if existing.is_expired(now) {
+            return Err(TaskError::Declared(
+                error_codes::INVITE_LAPSED,
+                "the invite has lapsed; issue a new one".into(),
+            ));
+        }
+        if let Some(r) = p.role.as_deref() {
+            if existing.purpose == Purpose::StepUp {
+                return Err(TaskError::Declared(
+                    error_codes::ROLE_NOT_ALLOWED,
+                    "a stepUp invite confers no role".into(),
                 ));
             }
-            existing.expires_at = t;
+            if r.parse::<Role>().is_err() {
+                return Err(TaskError::Declared(
+                    error_codes::ROLE_NOT_ALLOWED,
+                    format!("`{r}` is not a role this service grants"),
+                ));
+            }
+            existing.role = Some(r.to_string());
         }
-        (None, Some(s)) => existing.expires_at = now.saturating_add(s.get()).min(max),
-        (None, None) => {}
-    }
-    invite::save(ks, &existing).await?;
+        match (p.expires_at, p.extend_by) {
+            (Some(t), _) => {
+                let t = t.timestamp().max(0) as u64;
+                if t <= now || t > max {
+                    return Err(TaskError::Standard(
+                        StandardCode::MalformedRequest,
+                        format!(
+                            "expiresAt must lie in the future and within {}s of now",
+                            max - now
+                        ),
+                    ));
+                }
+                existing.expires_at = t;
+            }
+            (None, Some(s)) => existing.expires_at = now.saturating_add(s.get()).min(max),
+            (None, None) => {}
+        }
+        Ok(())
+    })
+    .await?
+    .ok_or_else(|| TaskError::Declared(error_codes::NOT_FOUND, "no such invite".into()))?;
     info!(caller = %auth.did, invite_id = %existing.invite_id, "invite updated");
     typed(
         json!({ "invite": summary(&existing, now) }),
