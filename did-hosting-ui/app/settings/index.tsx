@@ -212,10 +212,7 @@ export default function SettingsPage() {
   // Passkeys are the caller's own account, regardless of role.
   if (!isAdmin) {
     return (
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={styles.container}
-      >
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
         <Text style={styles.title}>Account Settings</Text>
         <PasskeysCard title="My Passkeys" />
         <Text style={styles.hint}>
@@ -244,7 +241,10 @@ export default function SettingsPage() {
   if (!config) return null;
 
   return (
-    <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
+    <ScrollView
+      style={styles.scroll}
+      contentContainerStyle={styles.container}
+    >
       <Text style={styles.title}>Control Plane Settings</Text>
 
       <PasskeysCard title="My Passkeys" />
@@ -279,9 +279,9 @@ export default function SettingsPage() {
           <Text style={styles.sectionTitle}>Key Generations</Text>
           <Text style={styles.explainer}>
             After a key rotation, peers holding a cached copy of this
-            service&apos;s DID document keep encrypting to the old key.
-            Superseded generations stay decryptable for a grace period so those
-            messages still arrive.
+            service&apos;s DID document keep encrypting to the old key. Superseded
+            generations stay decryptable for a grace period so those messages
+            still arrive.
           </Text>
 
           {generations.map((g) => (
@@ -339,7 +339,9 @@ export default function SettingsPage() {
               emptyLabel="none in DID document"
             />
           ) : (
-            <Text style={styles.advertisedUnknown}>DID not resolved</Text>
+            <Text style={styles.advertisedUnknown}>
+              DID not resolved
+            </Text>
           )}
         </View>
       </View>
@@ -400,15 +402,9 @@ export default function SettingsPage() {
       {config.dataDir || config.logLevel || config.logFormat ? (
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Storage & Logging</Text>
-          {config.dataDir ? (
-            <Row label="Data Directory" value={config.dataDir} />
-          ) : null}
-          {config.logLevel ? (
-            <Row label="Log Level" value={config.logLevel} />
-          ) : null}
-          {config.logFormat ? (
-            <Row label="Log Format" value={config.logFormat} />
-          ) : null}
+          {config.dataDir ? <Row label="Data Directory" value={config.dataDir} /> : null}
+          {config.logLevel ? <Row label="Log Level" value={config.logLevel} /> : null}
+          {config.logFormat ? <Row label="Log Format" value={config.logFormat} /> : null}
         </View>
       ) : null}
     </ScrollView>

@@ -436,10 +436,7 @@ export interface ControlPlaneConfig {
   listenAddress: string | null;
   vtaUrl: string | null;
   vtaDid: string | null;
-  registry: {
-    healthCheckIntervalSecs: number;
-    configuredInstances: number;
-  } | null;
+  registry: { healthCheckIntervalSecs: number; configuredInstances: number } | null;
   sessions: {
     accessTokenExpiry: number;
     refreshTokenExpiry: number;
@@ -497,81 +494,47 @@ const T = {
   didList: `${DM}did/list/0.1` as const satisfies typeof DidList.TYPE_URI,
   didInfo: `${DM}did/info/0.1` as const satisfies typeof DidInfo.TYPE_URI,
   didLog: `${DM}did/log/0.1` as const satisfies typeof DidLog.TYPE_URI,
-  didCheckName:
-    `${DM}did/check-name/0.1` as const satisfies typeof DidCheckName.TYPE_URI,
-  didRegister:
-    `${DM}did/register/0.1` as const satisfies typeof DidRegister.TYPE_URI,
+  didCheckName: `${DM}did/check-name/0.1` as const satisfies typeof DidCheckName.TYPE_URI,
+  didRegister: `${DM}did/register/0.1` as const satisfies typeof DidRegister.TYPE_URI,
   didDelete: `${DM}did/delete/0.1` as const satisfies typeof DidDelete.TYPE_URI,
-  didChangeOwner:
-    `${DM}did/change-owner/0.1` as const satisfies typeof DidChangeOwner.TYPE_URI,
-  didRollback:
-    `${DM}did/rollback/0.1` as const satisfies typeof DidRollback.TYPE_URI,
-  witnessPublish:
-    `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
-  agentNameCheck:
-    `${DM}agent-name/check/0.1` as const satisfies typeof AgentNameCheck.TYPE_URI,
-  agentNameResolve:
-    `${DM}agent-name/resolve/0.1` as const satisfies typeof AgentNameResolve.TYPE_URI,
-  domainList:
-    `${DM}domain/list/0.1` as const satisfies typeof DomainList.TYPE_URI,
+  didChangeOwner: `${DM}did/change-owner/0.1` as const satisfies typeof DidChangeOwner.TYPE_URI,
+  didRollback: `${DM}did/rollback/0.1` as const satisfies typeof DidRollback.TYPE_URI,
+  witnessPublish: `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
+  agentNameCheck: `${DM}agent-name/check/0.1` as const satisfies typeof AgentNameCheck.TYPE_URI,
+  agentNameResolve: `${DM}agent-name/resolve/0.1` as const satisfies typeof AgentNameResolve.TYPE_URI,
+  domainList: `${DM}domain/list/0.1` as const satisfies typeof DomainList.TYPE_URI,
   meDomains: `${DM}me/domains/0.1` as const satisfies typeof MeDomains.TYPE_URI,
-  domainCreate:
-    `${DM}domain/create/0.1` as const satisfies typeof DomainCreate.TYPE_URI,
-  domainSetState:
-    `${DM}domain/set-state/0.1` as const satisfies typeof DomainSetState.TYPE_URI,
-  domainSetDefault:
-    `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
-  domainPurge:
-    `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
-  domainAssign:
-    `${DM}domain/assign/0.1` as const satisfies typeof DomainAssign.TYPE_URI,
-  domainUnassign:
-    `${DM}domain/unassign/0.1` as const satisfies typeof DomainUnassign.TYPE_URI,
-  registryList:
-    `${DM}registry/list/0.1` as const satisfies typeof RegistryList.TYPE_URI,
-  registryPurgeDomain:
-    `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
+  domainCreate: `${DM}domain/create/0.1` as const satisfies typeof DomainCreate.TYPE_URI,
+  domainSetState: `${DM}domain/set-state/0.1` as const satisfies typeof DomainSetState.TYPE_URI,
+  domainSetDefault: `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
+  domainPurge: `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
+  domainAssign: `${DM}domain/assign/0.1` as const satisfies typeof DomainAssign.TYPE_URI,
+  domainUnassign: `${DM}domain/unassign/0.1` as const satisfies typeof DomainUnassign.TYPE_URI,
+  registryList: `${DM}registry/list/0.1` as const satisfies typeof RegistryList.TYPE_URI,
+  registryPurgeDomain: `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
   statsGet: `${DM}stats/get/0.1` as const satisfies typeof StatsGet.TYPE_URI,
-  statsTimeseries:
-    `${DM}stats/timeseries/0.1` as const satisfies typeof StatsTimeseries.TYPE_URI,
-  serverConfig:
-    `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
-  identityList:
-    `${DM}identity/list/0.1` as const satisfies typeof IdentityList.TYPE_URI,
-  identityRetire:
-    `${DM}identity/retire/0.1` as const satisfies typeof IdentityRetire.TYPE_URI,
-  loginStart:
-    `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
-  loginFinish:
-    `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
-  invite:
-    `${TT}auth/passkey/enroll/invite/0.2` as const satisfies typeof Invite.TYPE_URI,
-  redeemStart:
-    `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
-  redeemFinish:
-    `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
-  inviteList:
-    `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
-  inviteUpdate:
-    `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
-  inviteRevoke:
-    `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
-  passkeyList:
-    `${TT}auth/passkey/list/0.1` as const satisfies typeof PasskeyList.TYPE_URI,
-  passkeyAdminList:
-    `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
-  passkeyRevokeStart:
-    `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
-  passkeyRevokeFinish:
-    `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
+  statsTimeseries: `${DM}stats/timeseries/0.1` as const satisfies typeof StatsTimeseries.TYPE_URI,
+  serverConfig: `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
+  identityList: `${DM}identity/list/0.1` as const satisfies typeof IdentityList.TYPE_URI,
+  identityRetire: `${DM}identity/retire/0.1` as const satisfies typeof IdentityRetire.TYPE_URI,
+  loginStart: `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
+  loginFinish: `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
+  invite: `${TT}auth/passkey/enroll/invite/0.2` as const satisfies typeof Invite.TYPE_URI,
+  redeemStart: `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
+  redeemFinish: `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
+  inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
+  inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
+  inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
+  passkeyList: `${TT}auth/passkey/list/0.1` as const satisfies typeof PasskeyList.TYPE_URI,
+  passkeyAdminList: `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
+  passkeyRevokeStart: `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
+  passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
   aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
-  revokeSession:
-    `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
+  revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
   aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
   aclGrant: `${TT}acl/grant/0.1` as const satisfies typeof AclGrant.TYPE_URI,
   aclRevoke: `${TT}acl/revoke/0.1` as const satisfies typeof AclRevoke.TYPE_URI,
-  aclChangeRole:
-    `${TT}acl/change-role/0.1` as const satisfies typeof AclChangeRole.TYPE_URI,
+  aclChangeRole: `${TT}acl/change-role/0.1` as const satisfies typeof AclChangeRole.TYPE_URI,
 } as const;
 
 /** Largest page `did/list` answers. */
@@ -625,9 +588,7 @@ export function looksLikeAgentName(input: string): boolean {
  *  this parser understands — an empty domain, the community name
  *  (`example.com/@`, which no ACL role can be granted to), or a second
  *  `/@` marker. Domain is lower-cased; the local name keeps its case. */
-export function splitAgentName(
-  input: string,
-): { domain: string; name: string } | null {
+export function splitAgentName(input: string): { domain: string; name: string } | null {
   const noScheme = input.trim().replace(/^https?:\/\//i, "");
   const idx = noScheme.indexOf("/@");
   if (idx < 1) return null;
@@ -652,10 +613,7 @@ export const api = {
 
   listIdentityGenerations: async (): Promise<IdentityGenerationsResponse> =>
     identityFromWire(
-      await trustTask<IdentityList.Payload, IdentityList.Response>(
-        T.identityList,
-        {},
-      ),
+      await trustTask<IdentityList.Payload, IdentityList.Response>(T.identityList, {}),
     ),
 
   /**
@@ -663,12 +621,9 @@ export const api = {
    * The key is dropped from the live secrets resolver before this returns.
    */
   retireIdentityGeneration: async (id: number): Promise<void> => {
-    await trustTask<IdentityRetire.Payload, IdentityRetire.Response>(
-      T.identityRetire,
-      {
-        generationId: id,
-      },
-    );
+    await trustTask<IdentityRetire.Payload, IdentityRetire.Response>(T.identityRetire, {
+      generationId: id,
+    });
   },
 
   // ---- DIDs ----
@@ -677,15 +632,12 @@ export const api = {
    *  following `did/list`'s pages to the end. */
   listDids: async (owner?: string): Promise<DidRecord[]> => {
     const out: DidRecord[] = [];
-    for (let offset = 0; ;) {
-      const page = await trustTask<DidList.Payload, DidList.Response>(
-        T.didList,
-        {
-          ...(owner ? { owner } : {}),
-          limit: DID_LIST_PAGE,
-          ...(offset > 0 ? { offset } : {}),
-        },
-      );
+    for (let offset = 0; ; ) {
+      const page = await trustTask<DidList.Payload, DidList.Response>(T.didList, {
+        ...(owner ? { owner } : {}),
+        limit: DID_LIST_PAGE,
+        ...(offset > 0 ? { offset } : {}),
+      });
       out.push(...page.records.map(didRecordFromWire));
       offset += page.records.length;
       if (page.records.length === 0 || offset >= page.total) return out;
@@ -719,86 +671,55 @@ export const api = {
   /** Claim a slot (`did/check-name` with `reserve: true`) — at `path`, or an
    *  auto-assigned one. Without `domain` the control plane uses the caller's
    *  default, then the system default. */
-  createDid: async (
-    path?: string,
-    domain?: string,
-  ): Promise<CreateDidResponse> => {
-    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(
-      T.didCheckName,
-      {
-        reserve: true,
-        ...(path ? { path } : {}),
-        ...(domain ? { domain } : {}),
-      },
-    );
+  createDid: async (path?: string, domain?: string): Promise<CreateDidResponse> => {
+    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(T.didCheckName, {
+      reserve: true,
+      ...(path ? { path } : {}),
+      ...(domain ? { domain } : {}),
+    });
     if (!resp.reserved || !resp.record) {
-      throw new ApiError(
-        409,
-        path ? `"${path}" is already taken` : "no slot could be reserved",
-      );
+      throw new ApiError(409, path ? `"${path}" is already taken` : "no slot could be reserved");
     }
-    return {
-      mnemonic: resp.record.mnemonic,
-      didUrl: resp.record.didUrl ?? null,
-    };
+    return { mnemonic: resp.record.mnemonic, didUrl: resp.record.didUrl ?? null };
   },
 
   changeOwner: async (mnemonic: string, newOwner: string): Promise<DidRecord> =>
     didRecordFromWire(
       (
-        await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(
-          T.didChangeOwner,
-          {
-            mnemonic,
-            newOwner,
-          },
-        )
+        await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(T.didChangeOwner, {
+          mnemonic,
+          newOwner,
+        })
       ).record,
     ),
 
   /** Is `path` free? A read-only probe. */
-  checkName: async (
-    path: string,
-    domain?: string,
-  ): Promise<CheckNameResponse> => {
-    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(
-      T.didCheckName,
-      {
-        path,
-        ...(domain ? { domain } : {}),
-      },
-    );
+  checkName: async (path: string, domain?: string): Promise<CheckNameResponse> => {
+    const resp = await trustTask<DidCheckName.Payload, DidCheckName.Response>(T.didCheckName, {
+      path,
+      ...(domain ? { domain } : {}),
+    });
     return { available: resp.available };
   },
 
   /** Is an agent name (`/@name`) free to claim on `domain`? Binding itself is
    *  a signed did.jsonl publish through the user's agent. */
-  checkAgentName: async (
-    name: string,
-    domain?: string,
-  ): Promise<AgentNameAvailability> => {
+  checkAgentName: async (name: string, domain?: string): Promise<AgentNameAvailability> => {
     const r = await trustTask<AgentNameCheck.Payload, AgentNameCheck.Response>(
       T.agentNameCheck,
       { name, ...(domain ? { domain } : {}) },
     );
-    return {
-      name: r.name,
-      domain: r.domain,
-      available: r.available,
-      reserved: r.reserved,
-    };
+    return { name: r.name, domain: r.domain, available: r.available, reserved: r.reserved };
   },
 
   /** DID -> its served agent names, batched. Only DIDs the caller may read
    *  and this service serves come back; read a miss and an empty list alike. */
-  resolveAgentNames: async (
-    dids: string[],
-  ): Promise<AgentNameResolveResponse> => {
+  resolveAgentNames: async (dids: string[]): Promise<AgentNameResolveResponse> => {
     if (dids.length === 0) return { names: {} };
-    const r = await trustTask<
-      AgentNameResolve.Payload,
-      AgentNameResolve.Response
-    >(T.agentNameResolve, { dids: dids as [string, ...string[]] });
+    const r = await trustTask<AgentNameResolve.Payload, AgentNameResolve.Response>(
+      T.agentNameResolve,
+      { dids: dids as [string, ...string[]] },
+    );
     const names: Record<string, string[]> = {};
     for (const e of r.entries) names[e.did] = e.names;
     return { names };
@@ -814,49 +735,32 @@ export const api = {
   },
 
   /** Publish witness proofs (`did-witness.json`) for a slot. */
-  uploadWitness: async (
-    mnemonic: string,
-    witnessJson: string,
-  ): Promise<void> => {
+  uploadWitness: async (mnemonic: string, witnessJson: string): Promise<void> => {
     let witness: object;
     try {
       witness = JSON.parse(witnessJson);
     } catch (e) {
-      throw new ApiError(
-        400,
-        `witness proofs are not valid JSON: ${(e as Error).message}`,
-      );
+      throw new ApiError(400, `witness proofs are not valid JSON: ${(e as Error).message}`);
     }
-    await trustTask<WitnessPublish.Payload, WitnessPublish.Response>(
-      T.witnessPublish,
-      {
-        mnemonic,
-        witness,
-      },
-    );
-  },
-
-  deleteDid: async (mnemonic: string): Promise<void> => {
-    await trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, {
+    await trustTask<WitnessPublish.Payload, WitnessPublish.Response>(T.witnessPublish, {
       mnemonic,
+      witness,
     });
   },
 
+  deleteDid: async (mnemonic: string): Promise<void> => {
+    await trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, { mnemonic });
+  },
+
   /** Discard the last log entry: roll back to `versionCount - 1`. */
-  rollbackDid: async (
-    mnemonic: string,
-    versionCount: number,
-  ): Promise<DidRecord> => {
+  rollbackDid: async (mnemonic: string, versionCount: number): Promise<DidRecord> => {
     if (versionCount < 2) {
       throw new ApiError(400, "the first log entry cannot be rolled back");
     }
-    const r = await trustTask<DidRollback.Payload, DidRollback.Response>(
-      T.didRollback,
-      {
-        mnemonic,
-        targetVersion: versionCount - 1,
-      },
-    );
+    const r = await trustTask<DidRollback.Payload, DidRollback.Response>(T.didRollback, {
+      mnemonic,
+      targetVersion: versionCount - 1,
+    });
     return didRecordFromWire(r.record);
   },
 
@@ -864,28 +768,21 @@ export const api = {
 
   getStats: async (mnemonic: string): Promise<DidStats> =>
     statsFromWire(
-      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {
-        mnemonic,
-      }),
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }),
     ),
 
   getServerStats: async (): Promise<ServerStats> =>
-    statsFromWire(
-      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}),
-    ),
+    statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {})),
 
   getServerTimeseries: async (
     range: TimeRange = "24h",
     domain?: string,
   ): Promise<TimeSeriesPoint[]> =>
     timeseriesFromWire(
-      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(
-        T.statsTimeseries,
-        {
-          range: timeRangeToWire(range),
-          ...(domain ? { domain } : {}),
-        },
-      ),
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
+        range: timeRangeToWire(range),
+        ...(domain ? { domain } : {}),
+      }),
     ),
 
   getDidTimeseries: async (
@@ -893,23 +790,17 @@ export const api = {
     range: TimeRange = "24h",
   ): Promise<TimeSeriesPoint[]> =>
     timeseriesFromWire(
-      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(
-        T.statsTimeseries,
-        {
-          range: timeRangeToWire(range),
-          mnemonic,
-        },
-      ),
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
+        range: timeRangeToWire(range),
+        mnemonic,
+      }),
     ),
 
   // ---- The deployment ----
 
   getConfig: async (): Promise<ControlPlaneConfig> =>
     configFromWire(
-      await trustTask<ServerConfig.Payload, ServerConfig.Response>(
-        T.serverConfig,
-        {},
-      ),
+      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}),
     ),
 
   /** Control plane + fleet + totals, for the dashboard. Admin. */
@@ -928,9 +819,7 @@ export const api = {
         publicUrl: config.publicUrl,
         didcommEnabled: config.didcommEnabled,
         tspEnabled: config.tspEnabled,
-        ...(config.advertisedServices
-          ? { advertisedServices: config.advertisedServices }
-          : {}),
+        ...(config.advertisedServices ? { advertisedServices: config.advertisedServices } : {}),
         enabledMethods: config.enabledMethods,
       },
       services,
@@ -948,47 +837,29 @@ export const api = {
 
   listRegistry: async (): Promise<ServiceInstance[]> =>
     (
-      await trustTask<RegistryList.Payload, RegistryList.Response>(
-        T.registryList,
-        {},
-      )
+      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {})
     ).instances.map(serviceInstanceFromWire),
 
   /** Assign a hosting domain to a server instance; the control plane queues
    *  the directive to the edge. */
-  assignDomainToServer: async (
-    instanceId: string,
-    domain: string,
-  ): Promise<void> => {
-    await trustTask<DomainAssign.Payload, DomainAssign.Response>(
-      T.domainAssign,
-      {
-        instanceId,
-        domain,
-      },
-    );
+  assignDomainToServer: async (instanceId: string, domain: string): Promise<void> => {
+    await trustTask<DomainAssign.Payload, DomainAssign.Response>(T.domainAssign, {
+      instanceId,
+      domain,
+    });
   },
 
   /** Unassign; the edge schedules its purge after its grace period. */
-  unassignDomainFromServer: async (
-    instanceId: string,
-    domain: string,
-  ): Promise<void> => {
-    await trustTask<DomainUnassign.Payload, DomainUnassign.Response>(
-      T.domainUnassign,
-      {
-        instanceId,
-        domain,
-      },
-    );
+  unassignDomainFromServer: async (instanceId: string, domain: string): Promise<void> => {
+    await trustTask<DomainUnassign.Payload, DomainUnassign.Response>(T.domainUnassign, {
+      instanceId,
+      domain,
+    });
   },
 
   /** Admin "Purge now" on one edge. Refused while the domain is still
    *  assigned to that edge (`stillAssigned`). */
-  purgeDomainOnServer: async (
-    instanceId: string,
-    domain: string,
-  ): Promise<void> => {
+  purgeDomainOnServer: async (instanceId: string, domain: string): Promise<void> => {
     await trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(
       T.registryPurgeDomain,
       { instanceId, domain },
@@ -1000,10 +871,7 @@ export const api = {
   // The webvh-specific members travel under `ext["vnd.affinidi.webvh"]`.
 
   listAcl: async (): Promise<AclListResponse> => {
-    const resp = await trustTask<AclList.Payload, AclList.Response>(
-      T.aclList,
-      {},
-    );
+    const resp = await trustTask<AclList.Payload, AclList.Response>(T.aclList, {});
     return { entries: (resp.entries ?? []).map(aclEntryFromWire) };
   },
 
@@ -1038,8 +906,7 @@ export const api = {
     }
     const served = `${parsed.domain}/@${parsed.name}`;
     const dids = await api.listDids();
-    const hasDidId = (d: DidRecord): d is DidRecord & { didId: string } =>
-      d.didId !== null;
+    const hasDidId = (d: DidRecord): d is DidRecord & { didId: string } => d.didId !== null;
     const candidates = dids.filter(
       (d): d is DidRecord & { didId: string } =>
         hasDidId(d) &&
@@ -1047,9 +914,7 @@ export const api = {
         (d.agentNames ?? []).some((e) => e.enabled && e.name === parsed.name),
     );
     if (candidates.length > 0) {
-      const { names } = await api.resolveAgentNames(
-        candidates.map((d) => d.didId),
-      );
+      const { names } = await api.resolveAgentNames(candidates.map((d) => d.didId));
       const match = candidates.find((d) => names[d.didId]?.includes(served));
       if (match) return match.didId;
     }
@@ -1082,21 +947,14 @@ export const api = {
     },
   ): Promise<AclEntry> => {
     const did = await api.resolveAclSubject(subject);
-    const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(
-      T.aclGrant,
-      {
-        entry: {
-          subject: did,
-          role,
-          ...(opts?.label !== undefined ? { label: opts.label } : {}),
-          ext: webvhAclExt(
-            opts?.domains ?? { kind: "all" },
-            opts?.maxTotalSize,
-            opts?.maxDidCount,
-          ),
-        },
+    const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+      entry: {
+        subject: did,
+        role,
+        ...(opts?.label !== undefined ? { label: opts.label } : {}),
+        ext: webvhAclExt(opts?.domains ?? { kind: "all" }, opts?.maxTotalSize, opts?.maxDidCount),
       },
-    );
+    });
     return aclEntryFromWire(resp.entry);
   },
 
@@ -1123,14 +981,10 @@ export const api = {
       const current = await api.aclShow(did);
       if (!current) throw notFound();
       if (current.role !== updates.role) {
-        const resp = await trustTask<
-          AclChangeRole.Payload,
-          AclChangeRole.Response
-        >(T.aclChangeRole, {
-          subject: did,
-          fromRole: current.role,
-          toRole: updates.role,
-        });
+        const resp = await trustTask<AclChangeRole.Payload, AclChangeRole.Response>(
+          T.aclChangeRole,
+          { subject: did, fromRole: current.role, toRole: updates.role },
+        );
         entry = aclEntryFromWire(resp.entry);
       } else {
         entry = current;
@@ -1147,25 +1001,18 @@ export const api = {
       const base = entry ?? (await api.aclShow(did));
       if (!base) throw notFound();
       const label = updates.label === undefined ? base.label : updates.label;
-      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(
-        T.aclGrant,
-        {
-          entry: {
-            subject: did,
-            role: base.role,
-            ...(label !== null && label !== undefined ? { label } : {}),
-            ext: webvhAclExt(
-              updates.domains ?? base.domains ?? { kind: "all" },
-              updates.maxTotalSize === undefined
-                ? base.max_total_size
-                : updates.maxTotalSize,
-              updates.maxDidCount === undefined
-                ? base.max_did_count
-                : updates.maxDidCount,
-            ),
-          },
+      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+        entry: {
+          subject: did,
+          role: base.role,
+          ...(label !== null && label !== undefined ? { label } : {}),
+          ext: webvhAclExt(
+            updates.domains ?? base.domains ?? { kind: "all" },
+            updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize,
+            updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount,
+          ),
         },
-      );
+      });
       entry = aclEntryFromWire(resp.entry);
     }
 
@@ -1179,26 +1026,19 @@ export const api = {
 
   /** Single-entry lookup. `null` when the subject is not in the ACL. */
   aclShow: async (did: string): Promise<AclEntry | null> => {
-    const resp = await trustTask<AclShow.Payload, AclShow.Response>(T.aclShow, {
-      subject: did,
-    });
+    const resp = await trustTask<AclShow.Payload, AclShow.Response>(T.aclShow, { subject: did });
     return resp.entry ? aclEntryFromWire(resp.entry) : null;
   },
 
   deleteAcl: async (did: string): Promise<void> => {
-    await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, {
-      subject: did,
-    });
+    await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, { subject: did });
   },
 
   // ---- Hosting domains ----
 
   /** Every domain. Admin. */
   listDomains: async (): Promise<DomainListResponse> => {
-    const r = await trustTask<DomainList.Payload, DomainList.Response>(
-      T.domainList,
-      {},
-    );
+    const r = await trustTask<DomainList.Payload, DomainList.Response>(T.domainList, {});
     return {
       domains: r.domains.map((d) => domainFromWire(d)),
       default: r.default ?? null,
@@ -1207,10 +1047,7 @@ export const api = {
 
   /** The caller's domains, with the caller's default. */
   listMyDomains: async (): Promise<DomainListResponse> => {
-    const r = await trustTask<MeDomains.Payload, MeDomains.Response>(
-      T.meDomains,
-      {},
-    );
+    const r = await trustTask<MeDomains.Payload, MeDomains.Response>(T.meDomains, {});
     return {
       domains: r.domains.map((d) => domainFromWire(d)),
       default: r.default ?? null,
@@ -1223,40 +1060,31 @@ export const api = {
     label?: string;
     setAsDefault?: boolean;
   }): Promise<DomainEntry> => {
-    const r = await trustTask<DomainCreate.Payload, DomainCreate.Response>(
-      T.domainCreate,
-      {
-        name: input.name,
-        ...(input.label ? { label: input.label } : {}),
-        ...(input.setAsDefault ? { setAsDefault: true } : {}),
-      },
-    );
+    const r = await trustTask<DomainCreate.Payload, DomainCreate.Response>(T.domainCreate, {
+      name: input.name,
+      ...(input.label ? { label: input.label } : {}),
+      ...(input.setAsDefault ? { setAsDefault: true } : {}),
+    });
     return domainFromWire(r.entry);
   },
 
   disableDomain: async (name: string): Promise<DomainEntry> =>
     domainFromWire(
       (
-        await trustTask<DomainSetState.Payload, DomainSetState.Response>(
-          T.domainSetState,
-          {
-            name,
-            state: "disabled",
-          },
-        )
+        await trustTask<DomainSetState.Payload, DomainSetState.Response>(T.domainSetState, {
+          name,
+          state: "disabled",
+        })
       ).entry,
     ),
 
   enableDomain: async (name: string): Promise<DomainEntry> =>
     domainFromWire(
       (
-        await trustTask<DomainSetState.Payload, DomainSetState.Response>(
-          T.domainSetState,
-          {
-            name,
-            state: "active",
-          },
-        )
+        await trustTask<DomainSetState.Payload, DomainSetState.Response>(T.domainSetState, {
+          name,
+          state: "active",
+        })
       ).entry,
     ),
 
@@ -1280,10 +1108,7 @@ export const api = {
    *
    * `purgeServers` also sends the purge to every edge serving the domain.
    */
-  deleteDomain: async (
-    name: string,
-    opts?: { purgeServers?: boolean },
-  ): Promise<void> => {
+  deleteDomain: async (name: string, opts?: { purgeServers?: boolean }): Promise<void> => {
     const purge = () =>
       trustTask<DomainPurge.Payload, DomainPurge.Response>(T.domainPurge, {
         name,
@@ -1317,13 +1142,10 @@ export const api = {
     try {
       if (!hasSessionKeypair()) await restoreSessionKeypair();
       if (sessionId && hasSessionKeypair()) {
-        await trustTask<RevokeSession.Payload, RevokeSession.Response>(
-          T.revokeSession,
-          {
-            sessionId,
-            reason: "logout",
-          },
-        );
+        await trustTask<RevokeSession.Payload, RevokeSession.Response>(T.revokeSession, {
+          sessionId,
+          reason: "logout",
+        });
       }
     } catch {
       // Signed out locally regardless; see above.
@@ -1396,15 +1218,9 @@ export const api = {
       { signer: "fresh-session-key", anonymous: true },
     );
     if (r.purpose !== "login" || !r.tokens) {
-      throw new ApiError(
-        502,
-        "the control plane finished a login without issuing a session",
-      );
+      throw new ApiError(502, "the control plane finished a login without issuing a session");
     }
-    return {
-      accessToken: r.tokens.accessToken,
-      refreshToken: r.tokens.refreshToken ?? null,
-    };
+    return { accessToken: r.tokens.accessToken, refreshToken: r.tokens.refreshToken ?? null };
   },
 
   // ---- Passkey enrolment (Trust Tasks) ----
@@ -1437,10 +1253,7 @@ export const api = {
    * separately). Sent anonymously and unsigned: the invitee has no key the
    * control plane knows, and the two halves are the authorisation.
    */
-  redeemStart: async (
-    token: string,
-    claimCode: string,
-  ): Promise<RedeemStartResponse> =>
+  redeemStart: async (token: string, claimCode: string): Promise<RedeemStartResponse> =>
     trustTask<RedeemStart.Payload, RedeemStart.Response>(
       T.redeemStart,
       { token, claimCode },
@@ -1470,10 +1283,7 @@ export const api = {
   // ---- Enrolment invites (Trust Tasks) ----
 
   listInvites: async (): Promise<InviteListResponse> => {
-    const r = await trustTask<InviteList.Payload, InviteList.Response>(
-      T.inviteList,
-      {},
-    );
+    const r = await trustTask<InviteList.Payload, InviteList.Response>(T.inviteList, {});
     return { invites: r.invites.map(inviteFromWire) };
   },
 
@@ -1485,27 +1295,17 @@ export const api = {
     // Only the members actually given: a document carrying an `undefined`
     // member cannot be canonicalised for its proof, and the spec reads an
     // absent member as "unchanged".
-    const r = await trustTask<InviteUpdate.Payload, InviteUpdate.Response>(
-      T.inviteUpdate,
-      {
-        inviteId,
-        ...(updates.role !== undefined ? { role: updates.role } : {}),
-        ...(updates.expiresAt !== undefined
-          ? { expiresAt: updates.expiresAt }
-          : {}),
-        ...(updates.extendBy !== undefined
-          ? { extendBy: updates.extendBy }
-          : {}),
-      },
-    );
+    const r = await trustTask<InviteUpdate.Payload, InviteUpdate.Response>(T.inviteUpdate, {
+      inviteId,
+      ...(updates.role !== undefined ? { role: updates.role } : {}),
+      ...(updates.expiresAt !== undefined ? { expiresAt: updates.expiresAt } : {}),
+      ...(updates.extendBy !== undefined ? { extendBy: updates.extendBy } : {}),
+    });
     return inviteFromWire(r.invite);
   },
 
   revokeInvite: async (inviteId: string): Promise<void> => {
-    await trustTask<InviteRevoke.Payload, InviteRevoke.Response>(
-      T.inviteRevoke,
-      { inviteId },
-    );
+    await trustTask<InviteRevoke.Payload, InviteRevoke.Response>(T.inviteRevoke, { inviteId });
   },
 
   // ---- Passkey management (Trust Tasks) ----
@@ -1513,10 +1313,7 @@ export const api = {
   /** The caller's own passkeys, of every purpose — the credential-management
    *  counterpart to the session list: this answers "what can sign me in?". */
   listPasskeys: async (): Promise<PasskeyCredential[]> => {
-    const r = await trustTask<PasskeyList.Payload, PasskeyList.Response>(
-      T.passkeyList,
-      {},
-    );
+    const r = await trustTask<PasskeyList.Payload, PasskeyList.Response>(T.passkeyList, {});
     return r.credentials.map(passkeyCredentialFromWire);
   },
 
@@ -1526,10 +1323,10 @@ export const api = {
     subject: string,
     purpose: InvitePurpose,
   ): Promise<PasskeyCredential[]> => {
-    const r = await trustTask<
-      PasskeyAdminList.Payload,
-      PasskeyAdminList.Response
-    >(T.passkeyAdminList, { subject, purpose });
+    const r = await trustTask<PasskeyAdminList.Payload, PasskeyAdminList.Response>(
+      T.passkeyAdminList,
+      { subject, purpose },
+    );
     return r.credentials.map(passkeyCredentialFromWire);
   },
 
@@ -1544,23 +1341,20 @@ export const api = {
     credentialId: string,
     subject?: string,
   ): Promise<RevokePasskeyStartResponse> =>
-    trustTask<PasskeyRevokeStart.Payload, PasskeyRevokeStart.Response>(
-      T.passkeyRevokeStart,
-      {
-        credentialId,
-        ...(subject ? { subject } : {}),
-      },
-    ),
+    trustTask<PasskeyRevokeStart.Payload, PasskeyRevokeStart.Response>(T.passkeyRevokeStart, {
+      credentialId,
+      ...(subject ? { subject } : {}),
+    }),
 
   /** Present the user-verification assertion `revokePasskeyStart` asked for. */
   revokePasskeyFinish: async (
     revocationId: string,
     uvCredential: PasskeyRevokeFinish.Payload["uvCredential"],
   ): Promise<RevokePasskeyFinishResponse> => {
-    const r = await trustTask<
-      PasskeyRevokeFinish.Payload,
-      PasskeyRevokeFinish.Response
-    >(T.passkeyRevokeFinish, { revocationId, uvCredential });
+    const r = await trustTask<PasskeyRevokeFinish.Payload, PasskeyRevokeFinish.Response>(
+      T.passkeyRevokeFinish,
+      { revocationId, uvCredential },
+    );
     return {
       credentialId: r.credentialId,
       subject: r.subject,
