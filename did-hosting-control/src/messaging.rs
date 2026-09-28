@@ -817,6 +817,26 @@ pub(crate) async fn run_trust_tasks_envelope(
     sender: &str,
     message: &Message,
 ) -> Result<Option<(String, Value)>, DIDCommServiceError> {
+    // Per-type document size, the same gate the HTTPS and TSP transports
+    // apply before their own parse (`size`). The DIDComm messaging layer
+    // has already decoded `message.body` into a `Value` by the time it
+    // reaches us — there is no raw pre-parse buffer left to peek — so the
+    // check runs against its re-serialised bytes instead. That still
+    // refuses an oversized document before anything below does the
+    // heavier work of typed parsing, proof verification or dispatch, which
+    // is the property the gate exists for.
+    let body_bytes = serde_json::to_vec(&message.body).unwrap_or_default();
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+        &body_bytes,
+        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+        &state.acl_ks,
+    )
+    .await
+    {
+        let body = serde_json::to_value(&err).expect("trust-task-error document serialises");
+        return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
+    }
+
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
         Ok(d) => d,
         Err(e) => {

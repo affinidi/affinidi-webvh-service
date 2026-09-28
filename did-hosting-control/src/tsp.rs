@@ -100,6 +100,22 @@ pub(crate) async fn run_tsp_trust_task(
     // sends the bare document. See `tsp_binding` for why both are accepted.
     let (document, carriage) = tsp_binding::open(payload);
 
+    // Per-type document size, decided from the bytes alone before they are
+    // parsed into `TrustTask<Value>` — the same gate the HTTPS and DIDComm
+    // transports apply (`size`), so a `did/register` log too large for the
+    // default here is refused identically on every transport rather than
+    // only over HTTPS.
+    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+        &document,
+        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+        &state.acl_ks,
+    )
+    .await
+    {
+        let body = serde_json::to_vec(&err).expect("trust-task-error serialises");
+        return Ok(Some(tsp_binding::frame(body, carriage)));
+    }
+
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_slice(&document) {
         Ok(d) => d,
         Err(e) => {

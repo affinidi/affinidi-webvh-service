@@ -190,6 +190,27 @@ pub(crate) fn proof_rule(type_uri: &str) -> Option<ProofRule> {
         .map(|(_, rule)| *rule)
 }
 
+/// Every Type URI this control plane dispatches: this table's rows plus
+/// the ACL family `did_hosting_common::server::trust_tasks` routes.
+///
+/// The single "served" list `size::check` and
+/// `size::largest_max_document_bytes` take — a type raised above the
+/// default in `size::DECLARED` (`did/register`) is in force only while it
+/// appears here, so a type this deployment does not actually route can't
+/// buy an unauthenticated caller a larger body to canonicalise before it
+/// is refused as unrouted.
+///
+/// Computed once: `TASKS` and `ACL_TASK_URIS` are both `'static`, but they
+/// live in two different const arrays of two different shapes, and `const`
+/// arithmetic can't concatenate them into one array whose length isn't
+/// spelled out by hand.
+pub(crate) static SERVED_TRUST_TASK_URIS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut uris: Vec<&'static str> = TASKS.iter().map(|(uri, _)| *uri).collect();
+        uris.extend_from_slice(did_hosting_common::server::trust_tasks::ACL_TASK_URIS);
+        uris
+    });
+
 /// Narrow `doc` into `P`, run the framework pipeline, and hand the typed
 /// payload to `handler`.
 async fn serve<P, V>(

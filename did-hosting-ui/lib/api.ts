@@ -527,6 +527,44 @@ function webvhAclExt(
   return { [WEBVH_EXT]: ext };
 }
 
+// ---------------------------------------------------------------------------
+// ACL subject resolution — an agent name typed where an ACL takes a DID
+// ---------------------------------------------------------------------------
+//
+// `acl/grant` stores whatever `subject` it is given verbatim — the control
+// plane resolves nothing (unlike the removed REST `POST /api/acl`, which
+// resolved a name to a DID server-side via `resolve_did_or_agent_name`
+// before it ever reached storage). A subject typed as a name the console
+// doesn't resolve first would silently create an entry keyed on a string
+// nothing can ever authenticate as.
+
+/** Cheap syntactic test — the `/@` marker — mirroring
+ *  `agent_names::AgentName::looks_like_agent_name` (Rust) used server-side
+ *  for the same purpose. No network access; just decides whether `input`
+ *  is an agent name shape before doing any resolution work. */
+export function looksLikeAgentName(input: string): boolean {
+  return input.includes("/@");
+}
+
+/** Split an agent name (`example.com/@alice`, with or without a leading
+ *  `https://`, and tolerant of trailing context path segments or a
+ *  trailing slash) into its hosting domain and bare local name. `null`
+ *  when the `/@` marker is present but the surrounding shape isn't one
+ *  this parser understands — an empty domain, the community name
+ *  (`example.com/@`, which no ACL role can be granted to), or a second
+ *  `/@` marker. Domain is lower-cased; the local name keeps its case. */
+export function splitAgentName(input: string): { domain: string; name: string } | null {
+  const noScheme = input.trim().replace(/^https?:\/\//i, "");
+  const idx = noScheme.indexOf("/@");
+  if (idx < 1) return null;
+  const domain = noScheme.slice(0, idx).toLowerCase();
+  const afterMarker = noScheme.slice(idx + 2).replace(/\/+$/, "");
+  const nextSlash = afterMarker.indexOf("/");
+  const name = nextSlash === -1 ? afterMarker : afterMarker.slice(0, nextSlash);
+  if (!domain || !name || name.includes("/@")) return null;
+  return { domain, name };
+}
+
 type Role = "admin" | "owner" | "service";
 
 export const api = {
@@ -802,17 +840,78 @@ export const api = {
     return { entries: (resp.entries ?? []).map(aclEntryFromWire) };
   },
 
+  /**
+   * Turn what an operator typed into the ACL "Add Entry" field into a
+   * DID. A DID is returned verbatim — `acl/grant` stores whatever
+   * `subject` it is given, so this is the only place a name gets resolved
+   * before it lands there.
+   *
+   * An agent name is resolved once, here: every DID this deployment hosts
+   * is searched for one whose registry currently serves the name, and
+   * `agent-name/resolve` — the same task an owner's console calls to show
+   * a DID's addresses — confirms the binding is still live (enabled, and
+   * claimed by the DID's current document) before it is accepted. The ACL
+   * entry is then created against the DID, never the name: the name can
+   * be released and re-claimed by someone else later, and that must not
+   * silently move the grant (mirrors the removed REST route's
+   * `resolve_did_or_agent_name`, which resolved once at write time for
+   * the same reason).
+   *
+   * Throws when the input looks like an agent name but does not resolve
+   * to a DID hosted here. Anything that doesn't look like an agent name
+   * (including a malformed DID) is passed through unchanged — `acl/grant`
+   * is left to refuse it in whatever shape it likes.
+   */
+  resolveAclSubject: async (input: string): Promise<string> => {
+    const trimmed = input.trim();
+    if (!looksLikeAgentName(trimmed)) return trimmed;
+    const parsed = splitAgentName(trimmed);
+    if (!parsed) {
+      throw new ApiError(400, `'${trimmed}' is not a valid agent name`);
+    }
+    const served = `${parsed.domain}/@${parsed.name}`;
+    const dids = await api.listDids();
+    const hasDidId = (d: DidRecord): d is DidRecord & { didId: string } => d.didId !== null;
+    const candidates = dids.filter(
+      (d): d is DidRecord & { didId: string } =>
+        hasDidId(d) &&
+        d.domain === parsed.domain &&
+        (d.agentNames ?? []).some((e) => e.enabled && e.name === parsed.name),
+    );
+    if (candidates.length > 0) {
+      const { names } = await api.resolveAgentNames(candidates.map((d) => d.didId));
+      const match = candidates.find((d) => names[d.didId]?.includes(served));
+      if (match) return match.didId;
+    }
+    throw new ApiError(
+      404,
+      `agent name '${trimmed}' does not resolve to a DID hosted here — bind it first, or use the DID directly`,
+    );
+  },
+
+  /**
+   * `acl/grant`. `subject` is a DID, or an agent name hosted here
+   * (`example.com/@alice`) — resolved to the DID it currently serves
+   * before the grant is sent; see `resolveAclSubject`. `acl/grant`'s
+   * scopes are explicit on the wire and the maintainer no longer infers
+   * one (the removed REST route did, for a domain-less Owner) — a caller
+   * granting Owner access is expected to pass `opts.domains` itself
+   * (`Add Entry`'s default-domain-scope logic is what fills it in when
+   * the operator hasn't chosen one). Omitting it falls back to `all`
+   * here, matching the unrestricted default a bare Admin/Service grant
+   * already gets.
+   */
   createAcl: async (
-    did: string,
+    subject: string,
     role: Role,
     opts?: {
       label?: string;
       maxTotalSize?: number;
       maxDidCount?: number;
-      /** Omit to let the control plane pick the role's default scope. */
       domains?: DomainScope;
     },
   ): Promise<AclEntry> => {
+    const did = await api.resolveAclSubject(subject);
     const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
       entry: {
         subject: did,
