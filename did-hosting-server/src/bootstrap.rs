@@ -26,6 +26,55 @@ pub struct BootstrapResult {
     pub mnemonic: String,
 }
 
+/// Have a witness service witness a freshly bootstrapped DID's last log entry
+/// with `webvh/witness/sign/0.1`, and return the `did-witness.json` to serve
+/// with it.
+///
+/// The request is signed by the new DID itself (its `#key-0`, the
+/// `authentication` key [`bootstrap_did`] gives it), so the witness resolves
+/// that DID to verify the request: the DID must already be served where its
+/// identifier says, and the witness must list it as an administrator. The
+/// witness verifies the whole log before it signs, and its signed reply is
+/// verified against `witness_did` before the proof is used.
+pub async fn request_witness_proof(
+    witness_url: &str,
+    witness_did: &str,
+    witness_id: &str,
+    result: &BootstrapResult,
+    signing_secret: &Secret,
+) -> Result<String, AppError> {
+    let version_id = result
+        .jsonl
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .and_then(|v| v.get("versionId")?.as_str().map(String::from))
+        .ok_or_else(|| AppError::Internal("the DID log has no versionId to witness".into()))?;
+    let mut signer = signing_secret.clone();
+    signer.id = format!("{}#key-0", result.did_id);
+    let resolver = affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+        affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("DID resolver: {e}")))?;
+    let client = did_hosting_common::WitnessClient::new(
+        witness_url,
+        witness_did,
+        &result.did_id,
+        signer,
+        resolver,
+    );
+    let signed = client
+        .sign(witness_id, &version_id, &result.jsonl)
+        .await
+        .map_err(|e| AppError::Internal(format!("witness/sign: {e}")))?;
+    let witness_file = serde_json::json!([{
+        "versionId": signed.version_id.as_str(),
+        "proof": [signed.proof],
+    }]);
+    Ok(witness_file.to_string())
+}
+
 /// Check whether the `.well-known` root DID already exists.
 pub async fn root_did_exists(dids_ks: &KeyspaceHandle) -> Result<bool, AppError> {
     dids_ks.contains_key(did_key(".well-known")).await

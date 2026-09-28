@@ -239,7 +239,6 @@ impl DaemonConfig {
             log: self.log.clone(),
             store: self.witness_store.clone(),
             fjall: self.fjall,
-            auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
             // Carried through for completeness. The daemon's control plane owns

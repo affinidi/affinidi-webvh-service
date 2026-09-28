@@ -257,9 +257,34 @@ async fn send_over_https(
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<(), SendError> {
     let url = format!("{}/trust-tasks", endpoint.trim_end_matches('/'));
+    post_trust_task_https(from, to, &url, doc, did_resolver)
+        .await
+        .map(|_| ())
+}
 
+/// `POST doc` to `url` — a peer's `POST /trust-tasks` route — and return the
+/// reply once it has been verified.
+///
+/// The reply must be signed by `to` (the peer this request addressed),
+/// addressed back to `from`, and threaded to `doc`; anything else is an error,
+/// whatever the HTTP status. The returned document may be the task's
+/// `#response` or a (signed) `trust-task-error`: telling them apart is the
+/// caller's business. A peer that refuses to answer a document it could not
+/// verify answers with a non-2xx status, reported as an error here.
+///
+/// Uses [`crate::http::outbound_client`] for the shared connect/request
+/// timeouts and redirect refusal (a redirect to another origin would carry the
+/// signed document to a host the peer never named). The reply body is read
+/// with a hard cap ([`HTTPS_MAX_REPLY_BYTES`]).
+pub async fn post_trust_task_https(
+    from: &str,
+    to: &str,
+    url: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
     let resp = crate::http::outbound_client()
-        .post(&url)
+        .post(url)
         .json(doc)
         .send()
         .await?;
@@ -298,7 +323,7 @@ async fn send_over_https(
     })?;
     verify_sender_bound(&reply, Some(to), None, from, &verifier).await?;
 
-    Ok(())
+    Ok(reply)
 }
 
 /// Read `resp`'s body, refusing more than `limit` bytes — from either a

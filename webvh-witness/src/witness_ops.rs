@@ -61,7 +61,7 @@ pub async fn create_witness(
 
     let did = format!("did:key:{public_key_multibase}");
 
-    let now = crate::auth::session::now_epoch();
+    let now = did_hosting_common::server::auth::session::now_epoch();
 
     let record = WitnessRecord {
         witness_id: public_key_multibase.clone(),

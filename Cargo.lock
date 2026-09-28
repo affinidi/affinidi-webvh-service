@@ -9787,9 +9787,9 @@ dependencies = [
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
+ "affinidi-tsp",
  "async-trait",
  "axum",
- "axum-extra",
  "chrono",
  "clap",
  "dialoguer",
@@ -9798,7 +9798,6 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "http-body-util",
- "jsonwebtoken 10.4.0",
  "multibase",
  "rand 0.10.3",
  "serde",
@@ -9812,9 +9811,12 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "trust-tasks-didcomm",
+ "trust-tasks-https",
+ "trust-tasks-proof",
+ "trust-tasks-rs",
  "uuid",
  "vta-sdk",
- "vti-common",
 ]
 
 [[package]]

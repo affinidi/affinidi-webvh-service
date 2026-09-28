@@ -674,43 +674,6 @@ pub struct StatsSyncPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Witness types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WitnessResponse {
-    pub witness_id: String,
-    pub did: String,
-    pub label: Option<String>,
-    pub created_at: u64,
-    pub proofs_signed: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WitnessListResponse {
-    pub witnesses: Vec<WitnessResponse>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignProofRequest {
-    pub version_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignProofResponse {
-    pub version_id: String,
-    pub proof: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateWitnessRequest {
-    pub label: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Watcher sync types
 // ---------------------------------------------------------------------------
 

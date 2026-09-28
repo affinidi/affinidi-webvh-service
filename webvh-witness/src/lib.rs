@@ -1,6 +1,9 @@
 //! WebVH Witness — generates and signs cryptographic witness proofs for
 //! DID integrity verification.
 //!
+//! Every operation is a Trust Task ([`trust_tasks`]), served identically over
+//! TSP, DIDComm and `POST /api/trust-tasks`.
+//!
 //! # Stability
 //!
 //! Pre-1.0 — the public-module surface is intentionally wide so that
@@ -14,7 +17,6 @@
 //! intended to remain stable across the 0.6 series.
 
 pub mod acl;
-pub mod auth;
 pub mod config;
 pub mod error;
 pub mod health;
@@ -27,4 +29,6 @@ pub mod setup;
 pub mod setup_recipe;
 pub mod signing;
 pub mod store;
+pub mod trust_tasks;
+pub mod tsp;
 pub mod witness_ops;

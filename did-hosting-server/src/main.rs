@@ -933,50 +933,24 @@ async fn run_bootstrap_did(
 
         // Optional: request witness proof
         if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
-            use did_hosting_common::WitnessClient;
-
             eprintln!("  Requesting witness proof...");
-            eprintln!("  NOTE: the server must be running (on another process) for the");
-            eprintln!("  witness to resolve the DID during authentication.");
-            eprintln!();
-
-            let mut witness_client = WitnessClient::new(&w_url);
-            if let Err(e) = witness_client
-                .authenticate(&w_did, &result.did_id, &signing_secret)
+            eprintln!("  NOTE: the DID must already be served (by a running server) for the");
+            eprintln!("  witness to resolve it and verify the request.");
+            match bootstrap::request_witness_proof(&w_url, &w_did, &w_id, &result, &signing_secret)
                 .await
             {
-                eprintln!("  Warning: witness authentication failed: {e}");
-                eprintln!("  The DID was created but has no witness proof.");
-            } else {
-                let version_id = result
-                    .jsonl
-                    .lines()
-                    .last()
-                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .and_then(|v| {
-                        v.get("versionId")
-                            .and_then(|id| id.as_str())
-                            .map(String::from)
-                    });
-
-                if let Some(vid) = version_id {
-                    match witness_client.request_proof(&w_id, &vid).await {
-                        Ok(proof) => {
-                            let proof_json = serde_json::to_string(&proof)?;
-                            dids_ks
-                                .insert_raw(
-                                    did_hosting_server::did_ops::content_witness_key(&mnemonic),
-                                    proof_json.into_bytes(),
-                                )
-                                .await?;
-                            eprintln!("  Witness proof stored.");
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: witness proof request failed: {e}");
-                        }
-                    }
-                } else {
-                    eprintln!("  Warning: could not extract versionId for witness proof.");
+                Ok(witness_file) => {
+                    dids_ks
+                        .insert_raw(
+                            did_hosting_server::did_ops::content_witness_key(&mnemonic),
+                            witness_file.into_bytes(),
+                        )
+                        .await?;
+                    eprintln!("  Witness proof stored.");
+                }
+                Err(e) => {
+                    eprintln!("  Warning: witness proof request failed: {e}");
+                    eprintln!("  The DID was created but has no witness proof.");
                 }
             }
         }

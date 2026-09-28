@@ -263,9 +263,7 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | Path | Description |
 | ---- | ----------- |
 | `/witness/api/health` | Witness health |
-| `/witness/api/auth/*` | Witness authentication |
-| `/witness/api/witnesses/*` | Witness management |
-| `/witness/api/proof/*` | Proof signing |
+| `/witness/api/trust-tasks` | The witness's Trust Tasks (`webvh/witness/*`, `acl/*`), HTTPS binding |
 
 ### Watcher (nested at `/watcher`)
 

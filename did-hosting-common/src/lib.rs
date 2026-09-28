@@ -9,6 +9,7 @@ mod error;
 mod http;
 pub mod method;
 mod types;
+#[cfg(feature = "server-core")]
 mod witness_client;
 
 #[cfg(feature = "server-core")]
@@ -20,6 +21,7 @@ pub use control_client::{
 };
 pub use error::{Result, WebVHError};
 pub use types::*;
+#[cfg(feature = "server-core")]
 pub use witness_client::WitnessClient;
 
 // Re-export Secret so SDK users don't need affinidi-tdk directly.

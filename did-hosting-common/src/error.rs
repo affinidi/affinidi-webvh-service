@@ -19,6 +19,15 @@ pub enum WebVHError {
 
     #[error("resolver error: {0}")]
     Resolver(String),
+
+    /// A Trust Task the peer verified and refused, with the error code it
+    /// answered.
+    #[error("trust task refused ({code}): {message}")]
+    Refused { code: String, message: String },
+
+    /// A Trust Task could not be delivered, or its reply did not verify.
+    #[error("trust task transport error: {0}")]
+    Transport(String),
 }
 
 pub type Result<T> = std::result::Result<T, WebVHError>;
@@ -34,6 +43,8 @@ impl WebVHError {
             Self::Server { .. } => "server",
             Self::DIDComm(_) => "didcomm",
             Self::Resolver(_) => "resolver",
+            Self::Refused { .. } => "refused",
+            Self::Transport(_) => "transport",
         }
     }
 }

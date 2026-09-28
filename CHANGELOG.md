@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Breaking — the witness is Trust Tasks only
+
+webvh-witness serves `webvh/witness/key/create|list|delete/0.1`,
+`webvh/witness/sign/0.1` and `acl/*` as Trust Tasks, on TSP and DIDComm (its
+mediator connection) and `POST /api/trust-tasks`, through one dispatch.
+
+- **Removed:** `/api/auth/*`, `/api/witnesses*`, `/api/proof/*`, `/api/acl*`,
+  the `/api/didcomm` 501 stub, the witness's JWT sessions and its `[auth]`
+  settings. `/api/health` is unchanged.
+- **Every request is authorised on its own proof** — `proofPurpose:
+  authentication`, bound to the in-band issuer, addressed to the witness,
+  fresh, and not a replay. A document that does not verify gets no reply; a
+  verified one from a DID the witness does not authorise gets a signed
+  `permissionDenied`, and takes no room in the replay cache. Every reply is
+  signed.
+- **`witness/sign` verifies before it signs.** It carries the log, and the
+  witness refuses an entry whose chain does not verify (`invalidLog`), that is
+  not the last (`versionNotLast`), of a deactivated DID (`deactivated`), or
+  whose witness parameter does not name it (`notListed`).
+- **`WitnessClient`** is a Trust Task client over HTTPS; it verifies every
+  reply against the witness DID. The `--witness-*` bootstrap in
+  `did-hosting-server` and `did-hosting-daemon` sends `witness/sign` with the
+  log, signed by the new DID, and stores a well-formed `did-witness.json`.
+- In the daemon, the embedded witness is reached at
+  `POST /witness/api/trust-tasks`.
+
 ### Added — wallet logins bind a session key (`auth/authenticate/0.2`)
 
 The control plane serves `auth/authenticate/0.2` (trustoverip/dtgwg-trust-tasks-tf#675)
