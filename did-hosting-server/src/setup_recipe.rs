@@ -246,6 +246,7 @@ pub async fn apply_recipe(
             data_dir,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config.clone(),

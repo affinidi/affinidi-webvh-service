@@ -156,6 +156,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<(), Box<dyn std:
             data_dir: PathBuf::from(&data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         sync: SyncConfig {
             push_tokens,
             sources,
@@ -266,6 +267,7 @@ pub async fn apply_recipe(
             data_dir,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         sync: SyncConfig {
             push_tokens: recipe.watcher.push_tokens.clone(),
             sources,

@@ -211,6 +211,7 @@ pub async fn run_wizard(
             data_dir: PathBuf::from(&data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth,
         secrets: secrets_config,
         vta: VtaConfig {
@@ -834,6 +835,7 @@ pub async fn run_setup_offline_complete(
             data_dir: PathBuf::from(&state.data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: state.secrets.clone(),
         vta: VtaConfig {

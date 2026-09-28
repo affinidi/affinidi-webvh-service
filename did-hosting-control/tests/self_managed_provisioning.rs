@@ -59,6 +59,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config.clone(),
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(), // headline: all None

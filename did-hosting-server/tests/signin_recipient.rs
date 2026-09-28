@@ -204,6 +204,7 @@ async fn a_signed_sign_in_must_be_addressed_to_this_server() {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config,
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),

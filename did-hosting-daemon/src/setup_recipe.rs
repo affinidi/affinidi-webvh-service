@@ -249,6 +249,7 @@ pub async fn apply_recipe(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         watchers: Vec::new(),
         vta: VtaConfig {

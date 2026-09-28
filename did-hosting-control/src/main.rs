@@ -545,7 +545,7 @@ async fn run_control(config_path: Option<PathBuf>) {
         }
     };
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 

@@ -2,7 +2,9 @@ use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub use did_hosting_common::server::config::{LogConfig, LogFormat, ServerConfig, StoreConfig};
+pub use did_hosting_common::server::config::{
+    FjallTuning, LogConfig, LogFormat, ServerConfig, StoreConfig,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -12,6 +14,13 @@ pub struct AppConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
     #[serde(default)]
     pub sync: SyncConfig,
     #[serde(skip)]
@@ -78,6 +87,7 @@ impl Default for AppConfig {
                 data_dir: PathBuf::from("data/webvh-watcher"),
                 ..StoreConfig::default()
             },
+            fjall: FjallTuning::default(),
             sync: SyncConfig::default(),
             config_path: PathBuf::new(),
         }
@@ -115,6 +125,11 @@ impl AppConfig {
         if let Ok(v) = std::env::var("WATCHER_LOG_LEVEL") {
             config.log.level = v;
         }
+
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         Ok(config)
     }

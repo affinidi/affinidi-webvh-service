@@ -232,6 +232,7 @@ pub async fn run_wizard(
             data_dir: PathBuf::from(&data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),
         secrets: secrets_config,
@@ -830,6 +831,7 @@ pub async fn run_setup_offline_complete(
             data_dir: PathBuf::from(&state.data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),
         secrets: state.secrets.clone(),
