@@ -41,18 +41,25 @@ async fn serve_content(
     track_stats: bool,
     request_host: Option<&str>,
 ) -> Result<Response, AppError> {
-    if let Some(record) = state
+    match state
         .dids_ks
         .get::<DidRecord>(did_ops::did_key(mnemonic))
         .await?
     {
-        if record.disabled || record.deleted_at.is_some() {
-            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        Some(record) => {
+            if record.disabled || record.deleted_at.is_some() {
+                return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+            }
+            if let Some(ref did_id) = record.did_id {
+                assert_resolution_allowed(&state.store, request_host, did_id).await?;
+            }
         }
-        if let Some(host) = request_host
-            && let Some(ref did_id) = record.did_id
-        {
-            assert_resolution_allowed(&state.store, host, did_id).await?;
+        // No record at all — e.g. `did/delete`, which removes the record
+        // outright rather than soft-deleting it. Refuse before ever
+        // consulting the cache below: a warm entry there must not outlive
+        // the record it was read from by up to the cache's TTL.
+        None => {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
     }
 
@@ -68,6 +75,27 @@ async fn serve_content(
             .get_raw(key)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+        // The did:webvh log itself (not its witness-proof sidecar): serve
+        // only up to the last version that verifies and — for an entry that
+        // configures one — meets its witness threshold. A resolver must not
+        // serve an entry naming a witness it has no threshold-meeting proof
+        // for; per did:webvh this truncates the log rather than refusing it
+        // outright, so a DID with a satisfied genesis and an unwitnessed
+        // republish still resolves to its last witnessed version.
+        let data = if content_type == "application/jsonl+json" {
+            let log_text = String::from_utf8(data)
+                .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+            let witness_text = state
+                .dids_ks
+                .get_raw(did_ops::content_witness_key(mnemonic))
+                .await?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            did_ops::servable_did_log(&log_text, witness_text.as_deref())
+                .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?
+                .into_bytes()
+        } else {
+            data
+        };
         state.did_cache.insert(key.to_string(), data.clone());
         std::sync::Arc::new(data)
     };

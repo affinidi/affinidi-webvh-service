@@ -764,23 +764,177 @@ async fn change_owner_moves_the_slot_to_an_acl_member_only() {
     );
 }
 
+/// Seed a slot with a real, signed, single-entry did:webvh log configuring
+/// one witness at threshold 1 — the minimum `did_ops::upload_witness` now
+/// needs to accept a proof for it (SEC finding #165): the proof must
+/// cryptographically verify over the genesis `versionId`, *and* its signer
+/// must be the witness this log actually names.
+///
+/// Returns the genesis `versionId` and the matching witness's signing key.
+async fn seed_witnessed_genesis(
+    state: &AppState,
+    owner: &str,
+    mnemonic: &str,
+) -> (String, affinidi_secrets_resolver::secrets::Secret) {
+    use didwebvh_rs::parameters::Parameters;
+    use didwebvh_rs::witness::{Witness, Witnesses};
+    use didwebvh_rs::{DIDWebVHState, Multibase};
+
+    let mut key = affinidi_secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+    let pk = key.get_public_keymultibase().expect("update key multibase");
+    key.id = format!("did:key:{pk}#{pk}");
+
+    let mut witness_key = affinidi_secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+    let witness_pk = witness_key
+        .get_public_keymultibase()
+        .expect("witness key multibase");
+    witness_key.id = format!("did:key:{witness_pk}#{witness_pk}");
+    let witness_did = format!("did:key:{witness_pk}");
+
+    let params = Parameters {
+        update_keys: Some(std::sync::Arc::new(vec![Multibase::new(pk)])),
+        portable: Some(false),
+        witness: Some(std::sync::Arc::new(Witnesses::Value {
+            threshold: 1,
+            witnesses: vec![Witness {
+                id: Multibase::new(witness_did),
+            }],
+        })),
+        ..Default::default()
+    };
+    let did_id = format!("did:webvh:{{SCID}}:control.test:{mnemonic}");
+    let doc = json!({
+        "id": &did_id,
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "verificationMethod": [{
+            "id": format!("{did_id}#key-0"),
+            "type": "Multikey",
+            "publicKeyMultibase": key.get_public_keymultibase().unwrap(),
+            "controller": &did_id,
+        }],
+        "authentication": [format!("{did_id}#key-0")],
+        "assertionMethod": [format!("{did_id}#key-0")],
+    });
+
+    let mut vh_state = DIDWebVHState::default();
+    vh_state
+        .create_log_entry(None, &doc, &params, &key)
+        .await
+        .expect("genesis entry");
+    let version_id = vh_state
+        .log_entries()
+        .last()
+        .unwrap()
+        .get_version_id()
+        .to_string();
+    let jsonl = vh_state
+        .log_entries()
+        .iter()
+        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    seed_did(state, owner, mnemonic).await;
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), jsonl.into_bytes())
+        .await
+        .unwrap();
+
+    (version_id, witness_key)
+}
+
 #[tokio::test]
-async fn witness_publish_answers_where_the_proofs_are_served() {
+async fn witness_publish_stores_a_proof_that_verifies_against_the_log() {
     let (state, _dir) = state().await;
     let owner = member(&state, 27, Role::Owner).await;
-    seed_did(&state, &owner.did, "alpha-beta").await;
+    let (version_id, witness_key) = seed_witnessed_genesis(&state, &owner.did, "alpha-beta").await;
+
+    let proof = affinidi_data_integrity::DataIntegrityProof::sign(
+        &json!({ "versionId": &version_id }),
+        &witness_key,
+        affinidi_data_integrity::SignOptions::new(),
+    )
+    .await
+    .expect("sign witness proof");
+
     let reply = call(
         &state,
         Via::Tsp,
         &owner,
         WITNESS,
-        json!({ "mnemonic": "alpha-beta", "witness": {} }),
+        json!({
+            "mnemonic": "alpha-beta",
+            "witness": {
+                "versionId": version_id,
+                "witness": witness_key.id.split('#').next().unwrap(),
+                "proof": serde_json::to_value(&proof).unwrap(),
+            },
+        }),
     )
     .await;
     conforms(&reply);
     assert_eq!(
         ok(&reply, WITNESS)["witnessUrl"],
         "http://control.test/alpha-beta/did-witness.json"
+    );
+}
+
+/// SEC finding #165: a `did:key` proof is self-certifying — its public key
+/// travels inside `verificationMethod`, so it trivially "verifies" against
+/// itself no matter who signed it. A proof from a key the log's own
+/// `witness` parameter doesn't name must still be refused, not merely
+/// signature-checked.
+#[tokio::test]
+async fn witness_publish_rejects_a_proof_from_a_key_the_log_does_not_name_as_witness() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 28, Role::Owner).await;
+    let (version_id, _real_witness_key) =
+        seed_witnessed_genesis(&state, &owner.did, "gamma-delta").await;
+
+    let mut forger = affinidi_secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+    let forger_pk = forger
+        .get_public_keymultibase()
+        .expect("forger key multibase");
+    forger.id = format!("did:key:{forger_pk}#{forger_pk}");
+    let bogus_proof = affinidi_data_integrity::DataIntegrityProof::sign(
+        &json!({ "versionId": &version_id }),
+        &forger,
+        affinidi_data_integrity::SignOptions::new(),
+    )
+    .await
+    .expect("sign bogus proof — well-formed, just from the wrong key");
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        WITNESS,
+        json!({
+            "mnemonic": "gamma-delta",
+            "witness": {
+                "versionId": version_id,
+                "witness": format!("did:key:{forger_pk}"),
+                "proof": serde_json::to_value(&bogus_proof).unwrap(),
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "webvh/witness/publish:invalidWitness",
+        "a proof from a non-witness key must be refused, not stored: {reply}"
+    );
+    assert!(
+        state
+            .dids_ks
+            .get_raw(did_hosting_common::did_ops::content_witness_key(
+                "gamma-delta"
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected proof must leave no witness-content behind",
     );
 }
 

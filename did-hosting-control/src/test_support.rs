@@ -197,6 +197,7 @@ impl TestServer {
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: None,
         };
 
         Self { state, _dir: dir }

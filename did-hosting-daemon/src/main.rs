@@ -931,6 +931,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &stats_collector,
             &http_client,
             identity.clone(),
+            server_state.as_ref().map(|s| s.did_cache.clone()),
         )
         .await
         {
@@ -1379,8 +1380,18 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
+    did_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
-    use did_hosting_control::server::AppState;
+    use did_hosting_control::server::{AppState, CacheInvalidateFn};
+
+    // Lets the control plane's own mutations (register, publish, disable,
+    // rollback, delete) evict the embedded server's resolved-content cache
+    // in the same process — there is no sync round-trip to do it the way a
+    // standalone edge does on receipt of `webvh/sync/*`. `None` when the
+    // server component isn't enabled in this deployment: nothing serves
+    // resolution, so nothing to invalidate.
+    let cache_invalidate: Option<Arc<CacheInvalidateFn>> = did_cache
+        .map(|cache| Arc::new(move |key: &str| cache.invalidate(key)) as Arc<CacheInvalidateFn>);
 
     let control_config = config.control_config();
 
@@ -1454,6 +1465,7 @@ async fn build_control(
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        cache_invalidate,
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

@@ -106,20 +106,30 @@ impl Publication {
 /// `domain` and `mnemonic` identify the slot being published to; they are
 /// only consulted for methods whose identifier is not inside the content
 /// (today, `webs`). `existing` is the currently stored content for the
-/// slot, if any — used for continuity checks that need the prior state.
+/// slot, if any — used for continuity checks that need the prior state,
+/// and (for webvh) to tell already-published entries from the new tail this
+/// call is adding. `existing_witness` is the DID's currently stored
+/// witness-proof file, if any — consulted only for webvh, to satisfy the
+/// witness threshold on those already-published entries; see
+/// `did_ops::verify_did_log_for_publish`.
 ///
 /// # Errors
 /// [`MethodError::Validation`] if the content does not verify, or
 /// [`MethodError::Malformed`] if no compiled-in method recognises it.
-// `domain`, `mnemonic` and `existing` are consulted only by methods whose
-// identifier is not inside the content — today just `webs`. They stay in the
-// signature when it is compiled out so callers do not need their own cfg.
-#[cfg_attr(not(feature = "method-webs"), allow(unused_variables))]
+// `domain`, `mnemonic`, `existing` and `existing_witness` are consulted only
+// by methods that need them — `existing`/`existing_witness` by webvh and
+// webs, `domain`/`mnemonic` by webs alone. They stay in the signature when a
+// method is compiled out so callers do not need their own cfg.
+#[cfg_attr(
+    any(not(feature = "method-webs"), not(feature = "method-webvh")),
+    allow(unused_variables)
+)]
 pub fn verify_publication(
     domain: &str,
     mnemonic: &str,
     content: &[u8],
     existing: Option<&[u8]>,
+    existing_witness: Option<&[u8]>,
 ) -> Result<Publication, MethodError> {
     let method = detect_method(content).ok_or_else(|| {
         MethodError::Malformed(
@@ -131,7 +141,7 @@ pub fn verify_publication(
 
     match method {
         #[cfg(feature = "method-webvh")]
-        "webvh" => verify_webvh(content),
+        "webvh" => verify_webvh(content, existing, existing_witness),
         #[cfg(feature = "method-web")]
         "web" => verify_web(content),
         #[cfg(feature = "method-webs")]
@@ -146,11 +156,29 @@ pub fn verify_publication(
 }
 
 #[cfg(feature = "method-webvh")]
-fn verify_webvh(content: &[u8]) -> Result<Publication, MethodError> {
+fn verify_webvh(
+    content: &[u8],
+    existing: Option<&[u8]>,
+    existing_witness: Option<&[u8]>,
+) -> Result<Publication, MethodError> {
     let text = std::str::from_utf8(content)
         .map_err(|e| MethodError::Validation(format!("did.jsonl is not valid UTF-8: {e}")))?;
 
-    crate::did_ops::verify_did_log_proofs(text).map_err(MethodError::Validation)?;
+    // How many entries the currently stored log already has — the entries
+    // this call is adding (if any) are the new, not-yet-witnessed tail. See
+    // `did_ops::verify_did_log_for_publish`.
+    let previously_published = existing
+        .map(|bytes| String::from_utf8_lossy(bytes))
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let existing_witness_text = existing_witness.map(|w| String::from_utf8_lossy(w));
+
+    crate::did_ops::verify_did_log_for_publish(
+        text,
+        existing_witness_text.as_deref(),
+        previously_published,
+    )
+    .map_err(MethodError::Validation)?;
 
     // The current document is the last non-blank entry's `state`. Read
     // through the same path `extract_did_id` uses so the document and
@@ -256,7 +284,8 @@ mod tests {
     #[cfg(feature = "method-webs")]
     #[test]
     fn verifies_a_webs_publication_and_builds_its_did() {
-        let p = verify_publication(DOMAIN, AID, KERI, None).expect("reference artifacts verify");
+        let p =
+            verify_publication(DOMAIN, AID, KERI, None, None).expect("reference artifacts verify");
         assert_eq!(p.method, "webs");
         assert_eq!(
             p.did_id.as_deref(),
@@ -271,7 +300,7 @@ mod tests {
     fn refuses_a_webs_publication_to_a_slot_that_is_not_its_aid() {
         // The stream verifies, but it establishes a different AID than
         // the slot's — so it is not this DID's log.
-        let err = verify_publication(DOMAIN, "EAnotherAidEntirely00000000000", KERI, None)
+        let err = verify_publication(DOMAIN, "EAnotherAidEntirely00000000000", KERI, None, None)
             .expect_err("a KEL may only be published to its own AID's slot");
         assert!(matches!(err, MethodError::Validation(_)));
     }
@@ -279,7 +308,7 @@ mod tests {
     #[cfg(feature = "method-webs")]
     #[test]
     fn refuses_a_webs_publication_with_no_domain() {
-        let err = verify_publication("", AID, KERI, None)
+        let err = verify_publication("", AID, KERI, None, None)
             .expect_err("a did:webs DID cannot be built without its domain");
         assert!(matches!(err, MethodError::Validation(_)));
         assert!(err.to_string().contains("domain"));
@@ -296,7 +325,7 @@ mod tests {
             .expect("stream has more than one message");
         let truncated = &KERI[..second_event];
 
-        let err = verify_publication(DOMAIN, AID, truncated, Some(KERI))
+        let err = verify_publication(DOMAIN, AID, truncated, Some(KERI), None)
             .expect_err("an update may not rewind the hosted key event log");
         assert!(err.to_string().contains("rewinds"));
     }
@@ -304,7 +333,7 @@ mod tests {
     #[cfg(feature = "method-webs")]
     #[test]
     fn a_webs_document_yields_services_and_no_agent_names() {
-        let p = verify_publication(DOMAIN, AID, KERI, None).unwrap();
+        let p = verify_publication(DOMAIN, AID, KERI, None, None).unwrap();
         // Read, and genuinely empty — not `None`, which would mean
         // "could not read" and must not be cached as "advertises none".
         assert_eq!(p.services(), Some(vec![]));
@@ -316,8 +345,8 @@ mod tests {
     #[cfg(feature = "method-webvh")]
     #[test]
     fn rejects_content_no_method_recognises() {
-        let err =
-            verify_publication("example.com", "alice", b"nonsense", None).expect_err("must reject");
+        let err = verify_publication("example.com", "alice", b"nonsense", None, None)
+            .expect_err("must reject");
         assert!(matches!(err, MethodError::Malformed(_)));
     }
 }
@@ -338,7 +367,7 @@ mod webs_domain_encoding_tests {
     /// carry the wrong `id`.
     #[test]
     fn a_ported_host_becomes_a_single_did_label() {
-        let p = verify_publication("did-webs-service:7676", AID, KERI, None)
+        let p = verify_publication("did-webs-service:7676", AID, KERI, None, None)
             .expect("the reference artifacts are published on a ported host");
         assert_eq!(
             p.did_id.as_deref(),
@@ -358,8 +387,8 @@ mod webs_domain_encoding_tests {
     /// shape a DID label is written in — gets the same answer.
     #[test]
     fn an_already_encoded_host_is_left_alone() {
-        let a = verify_publication("did-webs-service:7676", AID, KERI, None).unwrap();
-        let b = verify_publication("did-webs-service%3A7676", AID, KERI, None).unwrap();
+        let a = verify_publication("did-webs-service:7676", AID, KERI, None, None).unwrap();
+        let b = verify_publication("did-webs-service%3A7676", AID, KERI, None, None).unwrap();
         assert_eq!(a.did_id, b.did_id);
     }
 
@@ -367,7 +396,7 @@ mod webs_domain_encoding_tests {
     /// an encoding artefact.
     #[test]
     fn a_plain_host_is_untouched() {
-        let p = verify_publication("hosting.example.com", AID, KERI, None).unwrap();
+        let p = verify_publication("hosting.example.com", AID, KERI, None, None).unwrap();
         assert_eq!(
             p.did_id.as_deref(),
             Some(format!("did:webs:hosting.example.com:{AID}").as_str()),
