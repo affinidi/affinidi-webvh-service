@@ -156,6 +156,8 @@ impl Pair {
                 use http_body_util::BodyExt;
                 let response = webvh_watcher::routes::trust_tasks::receive(
                     axum::extract::State(self.watcher.clone()),
+                    axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+                    axum::http::HeaderMap::new(),
                     axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
                 )
                 .await
@@ -315,6 +317,97 @@ async fn an_unconfigured_watcher_is_not_pushed_to() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A delete reaches only the watchers the DID's log actually named at
+/// publish time — not every configured watcher. Two watchers are
+/// configured; the log names only one of them, and only that one ever sees
+/// either message: the other's outbox stays empty throughout, including
+/// across the delete (the leak `notify_servers_delete` used to have, fanning
+/// every delete out to every configured watcher).
+#[tokio::test]
+async fn a_delete_reaches_only_the_watchers_the_did_was_published_to() {
+    let (mut control, _dir) = harness::state().await;
+    let (named_watcher_did, _) = crate::signing::test_util::did_key_signer(&[93; 32]);
+    let (other_watcher_did, _) = crate::signing::test_util::did_key_signer(&[94; 32]);
+    let mut config = (*control.config).clone();
+    config.registry.watchers = vec![
+        WatcherPeer {
+            url: format!("{WATCHER_URL}/"),
+            did: named_watcher_did.clone(),
+        },
+        WatcherPeer {
+            url: "https://other-watcher.example.com/".into(),
+            did: other_watcher_did.clone(),
+        },
+    ];
+    control.config = Arc::new(config);
+
+    publish(&control, "alice", &[WATCHER_URL]).await;
+    crate::server_push::notify_servers_did(&control, "alice".into());
+    wait_for_target(&control, &named_watcher_did, 1).await;
+    assert_eq!(
+        crate::outbox::list_pending_for_target(&control.store, &named_watcher_did)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the named watcher gets the update"
+    );
+    assert!(
+        crate::outbox::list_pending_for_target(&control.store, &other_watcher_did)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the other configured watcher gets nothing"
+    );
+
+    // Settle the update so the delete's queue is unambiguous.
+    for (key, entry) in crate::outbox::list_pending_for_target(&control.store, &named_watcher_did)
+        .await
+        .unwrap()
+    {
+        crate::outbox::record_sent(&control.store, key, &entry, "urn:uuid:settled")
+            .await
+            .unwrap();
+        crate::outbox::acknowledge(&control.store, &named_watcher_did, "urn:uuid:settled")
+            .await
+            .unwrap();
+    }
+
+    crate::server_push::notify_servers_delete(&control, "alice".into());
+    wait_for_target(&control, &named_watcher_did, 1).await;
+    assert_eq!(
+        crate::outbox::list_pending_for_target(&control.store, &named_watcher_did)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the named watcher gets the delete"
+    );
+    assert!(
+        crate::outbox::list_pending_for_target(&control.store, &other_watcher_did)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the delete must not fan out to a watcher the DID's log never named"
+    );
+}
+
+/// Wait for the spawned fan-out to queue `n` entries for `target`.
+async fn wait_for_target(control: &AppState, target: &str, n: usize) {
+    for _ in 0..200 {
+        if crate::outbox::list_pending_for_target(&control.store, target)
+            .await
+            .unwrap()
+            .len()
+            >= n
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("nothing was queued for {target}");
 }
 
 /// A configured watcher's DID may acknowledge a sync, and nothing else: any

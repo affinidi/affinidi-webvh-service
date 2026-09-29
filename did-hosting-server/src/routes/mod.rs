@@ -15,6 +15,7 @@ pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::routing::{get, post};
 
 use crate::server::AppState;
@@ -54,12 +55,24 @@ pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 /// under `/api`). Never smaller than [`TRUST_TASKS_BODY_LIMIT_BYTES`], so the
 /// control plane's largest batch always fits.
 fn trust_task_routes(body_limit: usize) -> Router<AppState> {
-    Router::new().route(
-        "/trust-tasks",
-        post(trust_tasks::receive).layer(DefaultBodyLimit::max(
-            body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
-        )),
-    )
+    Router::new()
+        .route(
+            "/trust-tasks",
+            post(trust_tasks::receive).layer(DefaultBodyLimit::max(
+                body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
+            )),
+        )
+        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, which
+        // `into_make_service_with_connect_info` supplies per real connection
+        // in production. A router driven directly — `.oneshot()` in tests,
+        // with no real connection behind it — carries no such extension;
+        // `ConnectInfo`'s extractor falls back to this layer's address
+        // exactly when the real one is absent, so it never affects a
+        // genuine request.
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))))
 }
 
 /// `POST /api/trust-tasks` on its own, for a server that serves resolution

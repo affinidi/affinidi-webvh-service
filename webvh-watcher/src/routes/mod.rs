@@ -4,6 +4,7 @@ pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::routing::{get, post};
 
 use crate::server::AppState;
@@ -32,8 +33,19 @@ pub fn router_public_only() -> Router<AppState> {
 /// API — a source pushes signed `webvh/sync/*` documents, the same on every
 /// transport.
 pub fn router() -> Router<AppState> {
-    router_public_only().route(
-        "/api/trust-tasks",
-        post(trust_tasks::receive).layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
-    )
+    router_public_only()
+        .route(
+            "/api/trust-tasks",
+            post(trust_tasks::receive).layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
+        )
+        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
+        // per real connection in production by
+        // `into_make_service_with_connect_info`. This is the fallback
+        // `ConnectInfo`'s extractor uses when a router is driven directly
+        // (`.oneshot()` in tests) with no real connection behind it; it never
+        // affects a genuine request.
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))))
 }

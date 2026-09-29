@@ -307,6 +307,14 @@ impl Topology {
             replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
             )),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         dirs.push(edge_dir);
         let edge_router = did_hosting_server::routes::router(1024 * 1024).with_state(edge.clone());

@@ -142,6 +142,14 @@ async fn edge_state(
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, dir)
 }
@@ -204,6 +212,8 @@ impl Fleet {
                 use http_body_util::BodyExt;
                 let response = did_hosting_server::routes::trust_tasks::receive(
                     axum::extract::State(self.edge.clone()),
+                    axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+                    axum::http::HeaderMap::new(),
                     axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
                 )
                 .await

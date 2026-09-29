@@ -196,6 +196,18 @@ since its last acknowledgement and last reconcile, labelled by edge DID.
 Both are also settable as `DID_HOSTING_REPLICATION_STALENESS_BOUND_SECS`
 and `DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS`.
 
+**A restart resets the grace period.** The staleness clock counts from the
+last *clean* reconcile, or, when there has not been one yet this process,
+from when the process started — so a freshly started edge answers healthy
+for a full `staleness_bound_secs` even before its first reconcile completes.
+Restarting the process (a crash loop, a bad deploy repeatedly bounced by a
+supervisor, a manual restart) resets that clock every time: `/api/health`
+can read healthy indefinitely across repeated restarts even if the edge
+never actually completes a clean reconcile — e.g. because its control plane
+has been unreachable the whole time. A load balancer or supervisor relying
+solely on `/api/health` to detect a genuinely stuck edge should also watch
+for repeated restarts, not just probe failures.
+
 #### Limits
 
 - **`upload_body_limit`** — Maximum body of a `POST /api/trust-tasks`

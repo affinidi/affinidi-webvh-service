@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use affinidi_data_integrity::DidKeyResolver;
 use affinidi_messaging_didcomm::Message;
@@ -35,6 +36,18 @@ use webvh_witness::config::AppConfig;
 use webvh_witness::server::AppState;
 use webvh_witness::signing::LocalSigner;
 use webvh_witness::witness_ops;
+
+/// A fresh loopback address, distinct from every other call in this process.
+///
+/// `receive`'s per-address rate limiter would otherwise treat every HTTPS
+/// delivery in a test file that exercises many tasks as one address — a
+/// test artifact, not the real-address-per-connection world the limiter
+/// defends. Each simulated "connection" here gets its own.
+fn fresh_https_addr() -> std::net::SocketAddr {
+    static NEXT: AtomicU16 = AtomicU16::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::net::SocketAddr::from(([127, 0, (n >> 8) as u8, n as u8], 0))
+}
 
 /// A `did:key` signer, so proofs verify with no I/O.
 fn signer(seed: u8) -> (String, Secret) {
@@ -185,6 +198,8 @@ async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option
             use http_body_util::BodyExt;
             let response = webvh_witness::routes::trust_tasks::receive(
                 axum::extract::State(state.clone()),
+                axum::extract::ConnectInfo(fresh_https_addr()),
+                axum::http::HeaderMap::new(),
                 axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
             )
             .await
@@ -565,9 +580,12 @@ async fn unverified_documents_get_no_reply() {
     }
 }
 
-/// A validly signed document from a DID the witness does not authorise is
-/// answered with a signed `permissionDenied` and changes nothing — and a
-/// requester that is on the ACL but not an admin may not use the witness keys.
+/// A document from a DID the witness would not authorise — a stranger, or,
+/// for a witness-admin task, a requester that is on the ACL but not an admin
+/// — is refused before its proof is ever checked (the cheap ACL pre-check in
+/// `dispatch_inbound_document` looks up the claimed issuer's role, a local
+/// store read, ahead of the DID resolution verification would need), so it
+/// gets no reply at all and changes nothing.
 #[tokio::test]
 async fn a_foreign_signer_is_refused() {
     for via in VIAS {
@@ -576,29 +594,24 @@ async fn a_foreign_signer_is_refused() {
         let before = snapshot(&state).await;
         for (type_uri, payload) in tasks {
             let s = stranger();
-            let reply = deliver(
-                &state,
-                via,
-                &s.0,
-                signed(type_uri, &s, payload.clone()).await,
-            )
-            .await
-            .unwrap_or_else(|| panic!("{via:?} {type_uri}: a verified stranger is answered"));
             assert_eq!(
-                refused(&reply, &s.0),
-                "permissionDenied",
-                "{via:?} {type_uri}"
+                deliver(
+                    &state,
+                    via,
+                    &s.0,
+                    signed(type_uri, &s, payload.clone()).await,
+                )
+                .await,
+                None,
+                "{via:?} {type_uri}: a stranger must not be answered"
             );
 
             if type_uri.contains("/witness/") {
                 let o = owner();
-                let reply = deliver(&state, via, &o.0, signed(type_uri, &o, payload).await)
-                    .await
-                    .expect("answered");
                 assert_eq!(
-                    refused(&reply, &o.0),
-                    "permissionDenied",
-                    "{via:?} {type_uri}"
+                    deliver(&state, via, &o.0, signed(type_uri, &o, payload).await).await,
+                    None,
+                    "{via:?} {type_uri}: a non-admin owner must not be answered"
                 );
             }
         }
@@ -631,18 +644,17 @@ async fn a_replay_is_refused() {
     }
 }
 
-/// A stranger's documents are refused before anything is recorded: the same
-/// document, resent by the stranger, is refused again — not dropped as a replay.
+/// A stranger's documents are refused before anything is recorded — the ACL
+/// pre-check drops them with no reply, ahead of the replay cache, which never
+/// sees them: the same document, resent, is refused the same way again, not
+/// dropped as a replay.
 #[tokio::test]
 async fn a_strangers_documents_take_no_room_in_the_replay_cache() {
     let (state, _dir) = witness_state().await;
     let s = stranger();
     let doc = signed(key_list::Payload::TYPE_URI, &s, json!({})).await;
     for _ in 0..2 {
-        let reply = deliver(&state, Via::Https, &s.0, doc.clone())
-            .await
-            .expect("answered");
-        assert_eq!(refused(&reply, &s.0), "permissionDenied");
+        assert_eq!(deliver(&state, Via::Https, &s.0, doc.clone()).await, None);
     }
 }
 

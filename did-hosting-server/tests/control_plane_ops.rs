@@ -98,6 +98,14 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, dir)
 }
@@ -469,8 +477,11 @@ async fn a_document_signed_by_another_peer_is_refused_whatever_the_transport_rep
     assert!(stored(&state, "mallory").await.is_none(), "nothing applied");
 }
 
-/// The destructive ops get the same refusal: a document that verifies but was
-/// signed by a DID other than the control plane is answered `notAuthorized`.
+/// The destructive ops get the same refusal: a document whose claimed issuer
+/// is not the control plane is refused before its signature is ever checked
+/// — a signer that genuinely controls its own DID gets no signed
+/// `notAuthorized` telling it so, only silence, exactly like a document that
+/// never verified at all (see the pre-check in `verify_control_plane`).
 #[tokio::test]
 async fn an_unauthorised_delete_or_purge_is_refused() {
     let (state, _dir) = make_state().await;
@@ -487,14 +498,51 @@ async fn an_unauthorised_delete_or_purge_is_refused() {
     .await;
 
     let attacker = signer(66);
-    let reply = apply(
-        &state,
-        signed_op(MSG_SYNC_DELETE, &attacker, json!({ "mnemonic": "alice" })).await,
-    )
-    .await;
+    let doc = signed_op(MSG_SYNC_DELETE, &attacker, json!({ "mnemonic": "alice" })).await;
+    let reply = dispatch_control_plane_op(&state, Some(&attacker.0), doc, &verifier())
+        .await
+        .unwrap();
+    let ControlPlaneReply::Unverified(reply) = reply else {
+        panic!("a claimed issuer that is not the control plane must not verify: {reply:?}");
+    };
     assert!(is_error(&reply));
-    assert_eq!(reply.payload["code"], "webvh/sync/delete:notAuthorized");
     assert!(stored(&state, "alice").await.is_some(), "the DID survived");
+}
+
+/// The claimed-issuer pre-check refuses before any DID resolution: a
+/// document naming a stranger as `issuer` never reaches the proof verifier's
+/// resolver, whose key lookup is where the outbound fetch — and the DoS
+/// surface a resolve-before-ACL-check order opens — would happen.
+#[tokio::test]
+async fn an_unknown_issuer_is_refused_without_a_did_fetch() {
+    struct PanicResolver;
+
+    #[async_trait::async_trait]
+    impl trust_tasks_proof::affinidi::ProofPurposeResolver for PanicResolver {
+        async fn resolve_vm_for_purpose(
+            &self,
+            _vm: &str,
+            _purpose: trust_tasks_proof::affinidi::ProofPurpose,
+        ) -> Result<affinidi_data_integrity::ResolvedKey, affinidi_data_integrity::DataIntegrityError>
+        {
+            panic!(
+                "DID resolution attempted for an issuer that never claimed to be the control plane"
+            );
+        }
+    }
+
+    let (state, _dir) = make_state().await;
+    let panics_if_resolved = TransportBoundVerifier::with_resolver(Arc::new(PanicResolver));
+
+    let attacker = signer(66);
+    let doc = signed_op(MSG_SYNC_UPDATE, &attacker, json!({})).await;
+    let reply = dispatch_control_plane_op(&state, Some(&attacker.0), doc, &panics_if_resolved)
+        .await
+        .unwrap();
+    let ControlPlaneReply::Unverified(reply) = reply else {
+        panic!("an unknown issuer must not verify: {reply:?}");
+    };
+    assert!(is_error(&reply));
 }
 
 /// A document the control plane signed for a different edge cannot be
@@ -536,6 +584,46 @@ async fn a_replayed_document_is_refused() {
     let second = apply(&state, doc).await;
     assert!(is_error(&second));
     assert_eq!(second.payload["code"], "idConflict");
+}
+
+/// `sync/update` (and `sync/batch`, `sync/delete`) serialise on
+/// `state.sync_lock`: each reads the slot's held state, checks the new log
+/// extends it, and writes, which two concurrent syncs racing against the
+/// same read could each pass. Proven here by holding the lock ourselves, as a
+/// slower concurrent sync would, and observing that a second sync for the
+/// same mnemonic cannot proceed past it until it's released.
+#[tokio::test]
+async fn concurrent_syncs_for_the_same_slot_are_serialised() {
+    let (state, _dir) = make_state().await;
+    let (did_id, log) = valid_did_log("frank").await;
+    let doc = signed_op(
+        MSG_SYNC_UPDATE,
+        &control(),
+        update_body("frank", &did_id, &log),
+    )
+    .await;
+
+    // Hold the lock as if another sync for this slot were already mid-flight,
+    // between its read and its write.
+    let guard = state.sync_lock.clone().lock_owned().await;
+
+    let racing_state = state.clone();
+    let handle = tokio::spawn(async move { apply(&racing_state, doc).await });
+
+    // The spawned sync must block on the held lock rather than run its
+    // read-check-write against the pre-lock state.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !handle.is_finished(),
+        "a concurrent sync must wait for the held sync lock"
+    );
+    assert!(stored(&state, "frank").await.is_none(), "not applied yet");
+
+    // Once the lock is released, the sync proceeds and applies normally.
+    drop(guard);
+    let reply = handle.await.expect("the sync task completes");
+    assert!(!is_error(&reply), "{reply:?}");
+    assert!(stored(&state, "frank").await.is_some());
 }
 
 /// Rolling a DID back to an earlier log — e.g. to before a key rotation — is

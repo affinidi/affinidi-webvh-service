@@ -4,13 +4,14 @@
 //! outbox signs them.
 //!
 //! Covers the `did-management/replica/domain/*` directives, `webvh/sync/*`,
-//! the `stalePurge` freshness rule, and the two refusals every one of these
-//! tasks makes: a document that does not verify gets no signed reply, and one
-//! that verifies but was signed by a DID other than the configured control
-//! plane is answered `notAuthorized`.
+//! the `stalePurge` freshness rule, and the refusal every one of these tasks
+//! makes: a document that does not verify — including one whose claimed
+//! issuer isn't even this edge's configured control plane — gets no signed
+//! reply at all.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use affinidi_data_integrity::DidKeyResolver;
@@ -30,6 +31,18 @@ use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
 use did_hosting_server::server::AppState;
 use serde_json::{Value, json};
+
+/// A fresh loopback address, distinct from every other call in this process.
+///
+/// `receive`'s per-address rate limiter would otherwise treat every HTTPS
+/// delivery in a test file that exercises many directives as one address —
+/// a test artifact, not the real-address-per-connection world the limiter
+/// defends. Each simulated "connection" here gets its own.
+fn fresh_https_addr() -> std::net::SocketAddr {
+    static NEXT: AtomicU16 = AtomicU16::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::net::SocketAddr::from(([127, 0, (n >> 8) as u8, n as u8], 0))
+}
 
 /// A `did:key` signer, so proofs verify with no I/O.
 fn signer(seed: u8) -> (String, Secret) {
@@ -114,6 +127,14 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, dir)
 }
@@ -174,6 +195,8 @@ async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option
             use http_body_util::BodyExt;
             let response = did_hosting_server::routes::trust_tasks::receive(
                 axum::extract::State(state.clone()),
+                axum::extract::ConnectInfo(fresh_https_addr()),
+                axum::http::HeaderMap::new(),
                 axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
             )
             .await
@@ -614,8 +637,10 @@ async fn a_purge_issued_before_the_current_assignment_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// Every directive, on every transport: an unsigned document from the control
-/// plane gets no signed reply, and one signed by any other DID is answered
-/// `notAuthorized` — in both cases nothing is applied.
+/// plane gets no signed reply, and one signed by any other DID gets no reply
+/// either — the claimed-issuer pre-check in `verify_control_plane` refuses it
+/// before its proof (and DID) is ever resolved, exactly like a document that
+/// never verified. In both cases nothing is applied.
 #[tokio::test]
 async fn unsigned_and_foreign_signed_directives_are_refused() {
     let (did_id, log) = valid_did_log("mallory").await;
@@ -646,14 +671,6 @@ async fn unsigned_and_foreign_signed_directives_are_refused() {
             json!({ "domain": "server.example.com" }),
         ),
     ];
-    let slug = |type_uri: &str| {
-        type_uri
-            .trim_start_matches("https://trusttasks.org/spec/")
-            .rsplit_once('/')
-            .unwrap()
-            .0
-            .to_string()
-    };
 
     for via in VIAS {
         let (state, _dir) = edge_state().await;
@@ -674,15 +691,10 @@ async fn unsigned_and_foreign_signed_directives_are_refused() {
             );
 
             let foreign = signed(type_uri, &stranger, payload.clone()).await;
-            let reply = deliver(&state, via, &stranger.0, foreign)
-                .await
-                .unwrap_or_else(|| panic!("{via:?} {type_uri}: a foreign signer is answered"));
-            assert_eq!(
-                refused(&reply),
-                format!("{}:notAuthorized", slug(type_uri)),
-                "{via:?} {type_uri}"
+            assert!(
+                deliver(&state, via, &stranger.0, foreign).await.is_none(),
+                "{via:?} {type_uri}: a signer that is not the control plane is not answered"
             );
-            assert_eq!(reply["recipient"], stranger.0, "answered to its signer");
         }
         assert!(stored(&state, "mallory").await.is_none(), "{via:?}");
         assert!(
@@ -811,6 +823,9 @@ async fn metrics_report_replication_freshness_to_the_control_plane_only() {
             );
         }
 
+        // A signer that is not the control plane is refused by the
+        // claimed-issuer pre-check before its proof is ever resolved — no
+        // reply, exactly like a document that never verified.
         let stranger = signer(66);
         let reply = deliver(
             &state,
@@ -818,9 +833,8 @@ async fn metrics_report_replication_freshness_to_the_control_plane_only() {
             &stranger.0,
             signed(METRICS, &stranger, json!({})).await,
         )
-        .await
-        .expect("answered");
-        assert_eq!(refused(&reply), "permissionDenied", "{via:?}");
+        .await;
+        assert!(reply.is_none(), "{via:?}: {reply:?}");
     }
 }
 

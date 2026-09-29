@@ -174,7 +174,6 @@ and `acl` keyspaces).
 | Section          | Service | Description |
 | ---------------- | ------- | ----------- |
 | `[limits]`       | Server  | Upload body limit, per-account quotas |
-| `[[watchers]]`   | Server  | Watcher push endpoints |
 | `[vta]`          | Witness | VTA remote key management |
 | `[watcher_sync]` | Watcher | Push tokens and source servers |
 | `[registry]`     | Control | Service instance registry |
