@@ -138,6 +138,10 @@ pub(crate) async fn revoke_session(
         return revoked(0);
     }
     delete_session(&cx.state.sessions_ks, &session_id).await?;
+    // The row a proxied `auth/authenticate/0.3` login left (its `actor` and
+    // absolute-lifetime cap) outlives neither the session nor its refresh
+    // token: a direct 0.2 login never wrote one, so this is a no-op there.
+    crate::trust_tasks_auth::delete_auth_proxy_meta(cx.state, &session_id).await?;
     info!(
         did = %caller,
         session_id = %session_id,

@@ -642,3 +642,108 @@ async fn refresh_past_the_absolute_lifetime_is_refused() {
         "{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Logout (`auth/revoke-session/0.2`) on a proxied session
+// ---------------------------------------------------------------------------
+
+/// Logging out a proxied login must not leave anything behind: the session
+/// row, its refresh-token index, and the auth-proxy meta row that carried
+/// `actor` and the absolute-lifetime cap all go together. A meta row an
+/// old bug left behind after revoke would silently outlive its session
+/// forever — nothing else ever reads or reaps it.
+#[tokio::test]
+async fn revoking_a_proxied_session_takes_its_meta_row_and_refresh_token_with_it() {
+    let h = harness().await;
+    let (principal, delegate, session_key) = (key(27), key(28), key(29));
+
+    let (refresh_token, body, session_id) =
+        proxied_login_binding_session_key(&h, &principal, &delegate, &session_key).await;
+    let access_token = body["payload"]["tokens"]["accessToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let meta_key = format!("auth-proxy-meta:{session_id}");
+    assert!(
+        h.state
+            .sessions_ks
+            .get_raw(meta_key.clone())
+            .await
+            .unwrap()
+            .is_some(),
+        "a proxied login must leave a meta row behind"
+    );
+
+    // Logout: the bound session key, over the live bearer session it was
+    // issued with — exactly what the console's logout sends.
+    let d = sign(
+        doc(
+            "auth/revoke-session/0.2",
+            &principal.did,
+            json!({ "sessionId": session_id, "reason": "logout" }),
+        ),
+        &session_key,
+        "authentication",
+    )
+    .await;
+    let resp = h
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/trust-tasks")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {access_token}"))
+                .body(Body::from(serde_json::to_vec(&d).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["revokedCount"], 1, "{body}");
+
+    assert!(
+        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the session row must be gone"
+    );
+    assert!(
+        did_hosting_common::server::auth::session::get_session_by_refresh(
+            &h.state.sessions_ks,
+            &refresh_token
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the refresh-token index must be gone"
+    );
+    assert!(
+        h.state
+            .sessions_ks
+            .get_raw(meta_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the auth-proxy meta row (actor + absolute lifetime) must not outlive the session"
+    );
+
+    // The refresh token itself is dead: a revoked session cannot be renewed.
+    let d = sign(
+        refresh_doc(&refresh_token, &session_key.did),
+        &session_key,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, &d).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a revoked session's refresh token must not work: {body}"
+    );
+}
