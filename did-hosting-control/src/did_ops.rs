@@ -501,6 +501,22 @@ pub async fn register_did_atomic(
         validate_mnemonic(path)?;
     }
 
+    // Hold the per-path write lock from here through the commit below —
+    // covering the `existing_log`/`existing_witness` read, the
+    // witness-threshold verification that trusts it, and the write. Without
+    // this, a concurrent publish/register on the same path could commit a
+    // longer, already-witnessed log *between* this read and this call's own
+    // commit; this call's `verify_publication` would have computed
+    // `previously_published` from the stale, shorter snapshot it read
+    // first, exempting from the witness threshold entries that are, by the
+    // time this call writes, already published and meant to require one — a
+    // real witness-threshold bypass, not merely a lost update. Locking only
+    // around the later record-read + write (as this used to) closes the
+    // lost-update race but not this one, since `verify_publication` had
+    // already run — and had already decided which entries need a proof —
+    // before the lock was ever taken.
+    let _path_guard = state.path_locks.guard(path).await;
+
     // The slot's currently stored log and witness proofs, if any — a
     // fresh registration has neither, a re-register of an existing slot
     // (owner republishing through `did/register` rather than `did/publish`)
@@ -564,15 +580,11 @@ pub async fn register_did_atomic(
             .map_err(AppError::Validation)?;
     }
 
-    // Hold the per-path write lock for the read + build + commit
-    // window. Without this, two concurrent fresh-slot calls could both
-    // observe `existing == None`, both build records, and both commit
-    // — fjall batches are atomic per-commit but not conditional, so
-    // the second would silently overwrite the first. The lock is held
-    // until this function returns; dropped automatically on `?` early
-    // exit too.
-    let _path_guard = state.path_locks.guard(path).await;
-
+    // `_path_guard`, acquired above, already covers this read: without it,
+    // two concurrent fresh-slot calls could both observe `existing == None`,
+    // both build records, and both commit — fjall batches are atomic
+    // per-commit but not conditional, so the second would silently
+    // overwrite the first.
     let existing: Option<DidRecord> = state.dids_ks.get(did_key(path)).await?;
 
     let owner_changed = match &existing {
@@ -1410,7 +1422,9 @@ pub async fn upload_witness(
     // file shape (`[{versionId, proof: [...]}, ...]`, one entry per version,
     // each aggregating every witness's proof for it). Extract the two fields
     // the stored file needs; `witness` (which witness signed) travels inside
-    // `proof.verificationMethod` already and is not stored separately.
+    // `proof.verificationMethod` already and is not stored separately. The
+    // proof is verified below, against this DID's own stored log, before
+    // either field is persisted.
     let version_id = witness_entry
         .get("versionId")
         .and_then(|v| v.as_str())
@@ -1427,6 +1441,36 @@ pub async fn upload_witness(
             "witness object must have a \"proof\"",
         )
     })?;
+
+    // Verify the proof before it ever touches storage: it must
+    // cryptographically verify over `version_id`, and the key that signed it
+    // must actually be one of the witnesses this DID's own log configures
+    // for that version — not merely a self-consistent `did:key` signature,
+    // which any attacker-generated key can produce for itself. Deferring
+    // this to resolve time (as before) let any caller authorized on the
+    // mnemonic — not necessarily a witness — persist an arbitrary proof
+    // blob; resolve-time verification meant it was never *served*, but it
+    // still polluted the witness-content store. See
+    // `did_hosting_common::did_ops::verify_witness_proof_for_version`'s doc
+    // for why the threshold itself stays a resolve-time check.
+    let log_content = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| {
+            AppError::validation(
+                ValidationKind::InvalidWitness,
+                "no published log exists for this DID yet",
+            )
+        })?;
+    let log_content = String::from_utf8(log_content)
+        .map_err(|e| AppError::Internal(format!("stored did:webvh log is not valid UTF-8: {e}")))?;
+    did_hosting_common::did_ops::verify_witness_proof_for_version(
+        &log_content,
+        &version_id,
+        &proof,
+    )
+    .map_err(|e| AppError::validation(ValidationKind::InvalidWitness, e))?;
 
     // Merge into the existing file rather than overwrite it: a threshold
     // greater than one needs more than one witness's proof recorded per
@@ -4692,6 +4736,239 @@ mod tests_atomic {
                 .as_deref(),
             Some("slot-a"),
             "A's index entry must survive B's release"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // register/publish witness-threshold race (SEC finding #166)
+    // -----------------------------------------------------------------
+
+    /// A fresh Ed25519 key with the `did:key:{pk}#{pk}` verification-method
+    /// id `create_log_entry`/witness-proof lookups both require. Mirrors
+    /// `did_hosting_common::did_ops`'s own (private) test helper of the
+    /// same shape.
+    fn race_signing_key() -> Secret {
+        let mut key = Secret::generate_ed25519(None, None);
+        let pk = key.get_public_keymultibase().unwrap();
+        key.id = format!("did:key:{pk}#{pk}");
+        key
+    }
+
+    /// A witness identity: its signing key, plus the bare `did:key:...` id a
+    /// `Witness` list entry names it by.
+    fn race_witness_identity() -> (Secret, String) {
+        let key = race_signing_key();
+        let witness_did = key.id.split('#').next().unwrap().to_string();
+        (key, witness_did)
+    }
+
+    /// The smallest DID document `verify_log_entry` accepts.
+    fn race_doc_with_key(did: &str, key: &Secret) -> serde_json::Value {
+        let pk = key.get_public_keymultibase().unwrap();
+        serde_json::json!({
+            "id": did,
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "verificationMethod": [{
+                "id": format!("{did}#key-0"),
+                "type": "Multikey",
+                "publicKeyMultibase": pk,
+                "controller": did
+            }],
+            "authentication": [format!("{did}#key-0")],
+            "assertionMethod": [format!("{did}#key-0")],
+        })
+    }
+
+    /// A signed witness proof over `version_id`.
+    async fn race_sign_witness_proof(
+        witness_key: &Secret,
+        version_id: &str,
+    ) -> affinidi_data_integrity::DataIntegrityProof {
+        affinidi_data_integrity::DataIntegrityProof::sign(
+            &serde_json::json!({ "versionId": version_id }),
+            witness_key,
+            affinidi_data_integrity::SignOptions::new(),
+        )
+        .await
+        .expect("sign witness proof")
+    }
+
+    /// A witnessed genesis (threshold 1, naming `witness_did`) plus a second
+    /// entry extending it. Per didwebvh's own parameter-inheritance rule, the
+    /// second entry's empty `Parameters` does not clear the witness config —
+    /// it stays active, so the second entry needs its own proof too, once it
+    /// stops being exempt as the "new tail".
+    ///
+    /// Returns `(genesis-only jsonl, genesis+second jsonl, genesis version_id)`.
+    async fn race_witnessed_log_and_extension(witness_did: &str) -> (String, String, String) {
+        use didwebvh_rs::Multibase;
+        use didwebvh_rs::parameters::Parameters;
+        use didwebvh_rs::witness::{Witness, Witnesses};
+
+        let key = race_signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            witness: Some(Arc::new(Witnesses::Value {
+                threshold: 1,
+                witnesses: vec![Witness {
+                    id: Multibase::new(witness_did.to_string()),
+                }],
+            })),
+            ..Default::default()
+        };
+        let doc = race_doc_with_key("did:webvh:{SCID}:control.test:race", &key);
+
+        // Explicit, one-second-apart `versionTime`s: two `create_log_entry`
+        // calls landing in the same wall-clock second (`None` stamps "now")
+        // would otherwise fail the chain's own monotonic-versionTime check.
+        let base_time = (chrono::Utc::now() - chrono::Duration::seconds(10)).fixed_offset();
+
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis_version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+        let to_jsonl = |state: &didwebvh_rs::DIDWebVHState| {
+            state
+                .log_entries()
+                .iter()
+                .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let genesis_jsonl = to_jsonl(&state);
+
+        state
+            .create_log_entry(
+                Some(base_time + chrono::Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        let extended_jsonl = to_jsonl(&state);
+
+        (genesis_jsonl, extended_jsonl, genesis_version_id)
+    }
+
+    /// Regression for the write-time TOCTOU behind SEC finding #166:
+    /// `register_did_atomic` used to read `existing_log`/`existing_witness`
+    /// — and run the whole witness-threshold verification against them —
+    /// *before* acquiring `state.path_locks`. A commit landing on the same
+    /// path between that read and this call's own (later) lock acquisition
+    /// was invisible to a verification that had already run and already
+    /// decided which entries were exempt "new tail".
+    ///
+    /// Rather than relying on real scheduler timing to reproduce the race,
+    /// this test holds the path lock itself, spawns the call, and only then
+    /// mutates the stored log — deterministically standing in for "another
+    /// commit landed first". If `register_did_atomic` read before acquiring
+    /// the lock (the bug), it would have already captured the log as it
+    /// stood *before* this mutation, computed a smaller
+    /// `previously_published`, and succeeded; fixed, it reads only after
+    /// the mutation is visible, correctly inflating `previously_published`
+    /// to cover the new entry too — which has no matching witness proof, so
+    /// the call must fail.
+    #[tokio::test]
+    async fn register_atomic_rereads_state_under_the_path_lock_not_before_it() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:race-owner";
+        let path = "race";
+
+        let (witness_key, witness_did) = race_witness_identity();
+        let (genesis_jsonl, extended_jsonl, genesis_version_id) =
+            race_witnessed_log_and_extension(&witness_did).await;
+
+        // Fresh registration: no prior content, so the witnessed genesis is
+        // exempt from the threshold check outright — its proof arrives later.
+        register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &genesis_jsonl,
+            false,
+            None,
+        )
+        .await
+        .expect("witnessed genesis registers with no proof yet");
+
+        // The witness now attests the genesis, satisfying its threshold.
+        let proof = race_sign_witness_proof(&witness_key, &genesis_version_id).await;
+        let witness_entry = serde_json::json!({
+            "versionId": genesis_version_id,
+            "proof": serde_json::to_value(&proof).unwrap(),
+        });
+        upload_witness(
+            &owner_auth(owner),
+            &state,
+            path,
+            witness_entry.as_object().unwrap(),
+        )
+        .await
+        .expect("witness proof verifies and is stored");
+
+        // Hold the path lock ourselves, standing in for a commit in flight.
+        let guard = state.path_locks.guard(path).await;
+
+        let state_clone = state.clone();
+        let owner_clone = owner.to_string();
+        let path_clone = path.to_string();
+        let extended = extended_jsonl.clone();
+        let task = tokio::spawn(async move {
+            register_did_atomic(
+                &owner_auth(&owner_clone),
+                &state_clone,
+                &path_clone,
+                &extended,
+                false,
+                None,
+            )
+            .await
+        });
+
+        // Give the spawned call a chance to run up to — and block on — the
+        // lock we're holding.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "the spawned call must block on our guard"
+        );
+
+        // Stand in for "a concurrent commit already landed": inflate the
+        // stored log's line count so a read taken *after* the lock sees two
+        // already-published entries — both now requiring their own witness
+        // proof — rather than the one genesis entry that was really there
+        // when this test started.
+        state
+            .dids_ks
+            .insert_raw(content_log_key(path), b"1\n2\n3\n4\n5\n".to_vec())
+            .await
+            .unwrap();
+
+        drop(guard);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("spawned call must finish once the guard is dropped")
+            .unwrap()
+            .expect_err(
+                "a read taken under the lock must see the inflated previously_published count \
+                 and demand a witness proof for the new entry, which was never provided",
+            );
+        assert!(
+            err.to_string().contains("threshold"),
+            "expected a witness-threshold refusal, got: {err}"
         );
     }
 
