@@ -19,11 +19,12 @@
 use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{error, warn};
 use trust_tasks_rs::{RejectReason, TrustTask};
 
 use did_hosting_common::server::auth::session::now_epoch;
@@ -31,6 +32,20 @@ use did_hosting_common::server::rate_limit::resolve_client_ip;
 
 use crate::server::AppState;
 use crate::trust_tasks::{Via, dispatch_inbound_document};
+
+/// Logs, but does not itself refuse, a request reaching this route with no
+/// `ConnectInfo<SocketAddr>` extension. Production always serves this router
+/// through `into_make_service_with_connect_info`, which sets it on every real
+/// connection; if it is ever missing (a serve path regresses, a test drives
+/// the router directly), `receive`'s own `ConnectInfo` extractor already
+/// fails the request closed with a 500 rather than sharing a fallback
+/// address — this only makes that otherwise-silent rejection visible.
+pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
+    if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
+        error!("trust-tasks request has no ConnectInfo<SocketAddr>; it will be refused with a 500");
+    }
+    next.run(req).await
+}
 
 /// Hand the posted document to the witness's one inbound dispatch and answer
 /// with its signed reply.

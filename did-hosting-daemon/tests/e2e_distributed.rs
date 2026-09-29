@@ -231,9 +231,12 @@ impl Topology {
         let control_router =
             did_hosting_control::routes::router_without_fallback().with_state(control.clone());
         http_tasks.push(tokio::spawn(async move {
-            axum::serve(control_listener, control_router.into_make_service())
-                .await
-                .expect("control HTTPS server");
+            axum::serve(
+                control_listener,
+                control_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("control HTTPS server");
         }));
 
         // Register the edge as an active server instance — the prerequisite
@@ -332,9 +335,12 @@ impl Topology {
         dirs.push(edge_dir);
         let edge_router = did_hosting_server::routes::router(1024 * 1024).with_state(edge.clone());
         http_tasks.push(tokio::spawn(async move {
-            axum::serve(edge_listener, edge_router.into_make_service())
-                .await
-                .expect("edge HTTPS server");
+            axum::serve(
+                edge_listener,
+                edge_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("edge HTTPS server");
         }));
 
         // ---- witness: did:key, HTTPS only ----
@@ -377,9 +383,12 @@ impl Topology {
         dirs.push(witness_dir);
         let witness_router = webvh_witness::routes::router().with_state(witness.clone());
         http_tasks.push(tokio::spawn(async move {
-            axum::serve(witness_listener, witness_router.into_make_service())
-                .await
-                .expect("witness HTTPS server");
+            axum::serve(
+                witness_listener,
+                witness_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("witness HTTPS server");
         }));
 
         // ---- watcher: HTTPS-only did:peer, mirrors this control plane ----
@@ -414,9 +423,12 @@ impl Topology {
         dirs.push(watcher_dir);
         let watcher_router = webvh_watcher::routes::router().with_state(watcher.clone());
         http_tasks.push(tokio::spawn(async move {
-            axum::serve(watcher_listener, watcher_router.into_make_service())
-                .await
-                .expect("watcher HTTPS server");
+            axum::serve(
+                watcher_listener,
+                watcher_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("watcher HTTPS server");
         }));
 
         // ---- admin identity: real did:peer, ACL Admin on control ----

@@ -15,7 +15,6 @@ pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::connect_info::MockConnectInfo;
 use axum::routing::{get, post};
 
 use crate::server::AppState;
@@ -62,17 +61,17 @@ fn trust_task_routes(body_limit: usize) -> Router<AppState> {
                 body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
             )),
         )
-        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, which
-        // `into_make_service_with_connect_info` supplies per real connection
-        // in production. A router driven directly — `.oneshot()` in tests,
-        // with no real connection behind it — carries no such extension;
-        // `ConnectInfo`'s extractor falls back to this layer's address
-        // exactly when the real one is absent, so it never affects a
-        // genuine request.
-        .layer(MockConnectInfo(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            0,
-        ))))
+        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
+        // per real connection in production by
+        // `into_make_service_with_connect_info`. There is deliberately no
+        // `MockConnectInfo` layer here: production must never silently fall
+        // back to a shared address, so a router driven directly (`.oneshot()`
+        // in tests) with no real connection behind it has to supply its own
+        // mock, or `receive`'s extractor fails the request closed with a 500.
+        // This layer only logs that case; it never masks it.
+        .layer(axum::middleware::from_fn(
+            trust_tasks::log_missing_connect_info,
+        ))
 }
 
 /// `POST /api/trust-tasks` on its own, for a server that serves resolution

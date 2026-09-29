@@ -275,7 +275,11 @@ async fn a_deleted_did_stops_resolving_at_once_even_with_a_warm_cache() {
 async fn route_ordering_specific_routes_beat_method_dispatchers() {
     let (state, _dir) = make_state().await;
 
-    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state);
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state)
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ));
 
     // `/api/trust-tasks` is a specific route; a malformed body must reach
     // its handler (400), not be swallowed by the catch-all fallback (which
@@ -558,6 +562,13 @@ async fn the_edge_router_serves_resolution_and_no_management_surface() {
             did_hosting_common::server::security_headers,
         ))
         .layer(did_hosting_common::server::public_resolution_cors())
+        // `receive` requires a real `ConnectInfo<SocketAddr>`; a router
+        // driven directly via `.oneshot()` carries no real connection, so
+        // this test supplies the mock the production `MockConnectInfo`
+        // layer used to bake into the router itself.
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ))
         // Stand-in health handler; only the route SHAPE matters for
         // reproducing the layering/ordering bug, not the body.
         .route("/api/health", axum::routing::get(|| async { "ok" }));
