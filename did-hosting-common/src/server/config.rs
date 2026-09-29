@@ -576,6 +576,19 @@ pub struct AuthConfig {
     /// compiled-in default; also pinned equal by a unit test in that crate.
     #[serde(default = "default_max_pending_challenges_per_did")]
     pub max_pending_challenges_per_did: usize,
+    /// The absolute ceiling on a session's life, in seconds from
+    /// authentication (`auth/authenticate/0.2` or `/0.3`'s `Session.issuedAt`).
+    /// No `auth/refresh/0.2` may advance `Session.expiresAt` — nor, in this
+    /// implementation, the underlying refresh-token deadline — past
+    /// `issuedAt + absolute_session_lifetime`; a session that has already
+    /// reached it refuses refresh outright
+    /// (`auth/refresh:sessionLifetimeExceeded`) rather than silently
+    /// returning a token with a shrunk window. This is the backstop for a
+    /// refresh token (and, where bound, a session key) that stays quietly
+    /// compromised: however long undetected, neither can keep a session
+    /// alive past this instant — only a fresh `auth/authenticate` can.
+    #[serde(default = "default_absolute_session_lifetime")]
+    pub absolute_session_lifetime: u64,
 }
 
 /// 15 minutes of inactivity.
@@ -626,6 +639,12 @@ fn default_max_pending_challenges_per_did() -> usize {
     10
 }
 
+/// 30 days. Generous enough that a normally-active session never notices
+/// it, tight enough that a compromise nobody caught still ends on its own.
+fn default_absolute_session_lifetime() -> u64 {
+    30 * 24 * 60 * 60
+}
+
 impl AuthConfig {
     /// Validate configuration values are within acceptable ranges.
     pub fn validate(&self) -> Result<(), AppError> {
@@ -663,6 +682,13 @@ impl AuthConfig {
                 "max_pending_challenges_per_did must be at least 1".into(),
             ));
         }
+        // Shorter than a single refresh cycle, the ceiling would refuse the
+        // very first refresh a normal session attempts.
+        if self.absolute_session_lifetime < self.refresh_token_expiry {
+            return Err(AppError::Config(
+                "absolute_session_lifetime must be at least refresh_token_expiry".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -691,6 +717,7 @@ impl Default for AuthConfig {
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
             max_global_pending_challenges: default_max_global_pending_challenges(),
             max_pending_challenges_per_did: default_max_pending_challenges_per_did(),
+            absolute_session_lifetime: default_absolute_session_lifetime(),
         }
     }
 }

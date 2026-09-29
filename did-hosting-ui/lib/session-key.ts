@@ -131,6 +131,19 @@ export function hasSessionKeypair(): boolean {
   return sessionKeypair !== null;
 }
 
+/** The current session keypair's `did:key`, or `null` if none is cached.
+ * Synchronous, same caveat as {@link hasSessionKeypair}: call
+ * `restoreSessionKeypair()` first if the cache may be empty after a reload.
+ *
+ * Callers that build their own envelope around this key — the auth family's
+ * `auth/authenticate/0.3` and `auth/refresh/0.2` calls, which the session key
+ * signs as its *own* issuer rather than as a delegate for the session's
+ * subject (see `trust-task.ts`'s `"fresh-session-key"` signer) — read this to
+ * set `issuer` to the same `did:key` {@link signEnvelope} signs with. */
+export function getSessionDidKey(): string | null {
+  return sessionDidKey;
+}
+
 /**
  * Attempt to restore the session keypair from IndexedDB into the
  * module-scope cache. No-op if the cache already has one or no entry

@@ -548,7 +548,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # `AcceptUnvalidated` (see `run_pipeline` in did-hosting-common): re-enable
 # more broadly only if a future spec's constraints are similarly
 # unrepresentable and need the same treatment.
-trust-tasks-rs = { version = "0.24.3", default-features = false }
+trust-tasks-rs = { version = "0.24.7", default-features = false }
 trust-tasks-https = { version = "0.24.2", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.24.2", default-features = false }
 trust-tasks-proof = { version = "0.24.2", default-features = false, features = ["affinidi"] }

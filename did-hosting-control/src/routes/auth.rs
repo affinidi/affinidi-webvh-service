@@ -1,14 +1,17 @@
-//! The browser sign-in routes that have no Trust Task form: the SIOPv2
-//! challenge and `id_token` authenticate, and the console's session refresh.
-//! See `routes/mod.rs` for why each stays plain HTTP.
+//! The one browser sign-in route that has no Trust Task form: the
+//! challenge nonce (`auth/challenge/0.1` has a Trust Task form too, served
+//! identically from `trust_tasks_auth`, but the console always reaches it
+//! over plain REST before it holds any credential to sign a Trust Task
+//! envelope with). See `routes/mod.rs` for why it alone stays plain HTTP —
+//! authenticate and refresh both moved onto `auth/authenticate/0.3` and
+//! `auth/refresh/0.2` over `/api/trust-tasks` (`trust_tasks_auth`).
 
 use std::net::SocketAddr;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use axum::response::{IntoResponse, Response};
-use tracing::{info, warn};
+use tracing::warn;
 
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
@@ -81,7 +84,8 @@ pub async fn challenge(
 
 /// Reserve a pending-challenge slot for `did`, run the canonical challenge
 /// handler, and bind the slot to the session it minted — the one issuance path
-/// for every binding (REST here, DIDComm/TSP in `trust_tasks_auth`).
+/// for every binding (REST here, DIDComm/TSP/HTTPS-trust-task in
+/// `trust_tasks_auth`).
 ///
 /// The canonical handler's own per-DID limit is disabled in this backend; the
 /// tracker is the single source of truth. The slot is taken whether or not the
@@ -130,297 +134,21 @@ pub(crate) async fn issue_challenge(
     }
 }
 
-/// POST /api/auth/ — authenticate with a SIOPv2 self-issued `id_token`.
-///
-/// The request body is a Trust-Task-shaped envelope whose `type` is
-/// `auth/authenticate/0.1` and whose `payload` carries an
-/// [`AuthenticatePayload`] (`id_token`, `session_id`, optional
-/// `session_pubkey_b58btc`) — not that spec's payload, so the envelope is
-/// parsed by hand rather than as a typed `TrustTask`. This is the one sign-in
-/// with no Trust Task form: the `id_token` is minted by the holder's VTA
-/// (`vault/proxy-login`), and `auth/authenticate/0.2` carries none.
-///
-/// The `id_token` is a compact EdDSA JWS the wallet self-issues, signed
-/// by its `did:key`. We verify it by resolving the issuer DID and
-/// checking the signature, then bind the JWT to the resolved DID.
-///
-/// Body is accepted as raw bytes (mirroring `routes/trust_tasks.rs`) so
-/// a malformed envelope surfaces a `trust-task-error` document with
-/// `code: malformed_request` rather than axum's text/plain default.
-pub async fn authenticate(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Result<Response, AppError> {
-    use did_hosting_common::AuthenticatePayload;
-    use did_hosting_common::server::didcomm_unpack;
-
-    let (did_resolver, _secrets_resolver, _jwt_keys) = state.require_didcomm_auth()?;
-
-    // ─── 1. Parse the Trust-Task envelope.
-    #[derive(serde::Deserialize)]
-    struct AuthEnvelope {
-        #[serde(rename = "type")]
-        type_uri: String,
-        payload: serde_json::Value,
-    }
-
-    let envelope: AuthEnvelope = match serde_json::from_slice(&body) {
-        Ok(e) => e,
-        Err(e) => {
-            return Ok(trust_task_malformed(&format!(
-                "body did not parse as an authenticate envelope: {e}"
-            )));
-        }
-    };
-
-    let expected_type = AUTHENTICATE_TASK_URI;
-    if envelope.type_uri != expected_type {
-        return Ok(trust_task_malformed(&format!(
-            "unexpected Trust-Task type: expected {expected_type}, got {}",
-            envelope.type_uri
-        )));
-    }
-
-    let payload: AuthenticatePayload = match serde_json::from_value(envelope.payload) {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(trust_task_malformed(&format!(
-                "authenticate payload malformed: {e}"
-            )));
-        }
-    };
-
-    // ─── 2. SIOPv2 id_token verification (transport layer).
-    //
-    // Verifies signature against the iss did:key, checks
-    // iss == sub, returns the bound claims. Everything else —
-    // session lookup, challenge match, signer-DID-binds-to-
-    // session-DID, challenge TTL — flows through the canonical
-    // handler.
-    let verified = didcomm_unpack::verify_siop_id_token(&payload.id_token, did_resolver).await?;
-
-    // ─── 3. id_token-layer checks the canonical handler doesn't
-    //        know about: audience binding to this service's
-    //        `server_did`, plus the JWT's own iat/exp window.
-    //        These are properties of the SIOPv2 token, not the
-    //        challenge-response session.
-    let rp_id = state.config.server_did.as_deref().ok_or_else(|| {
-        AppError::Config("server_did not configured; cannot verify id_token `aud`".into())
-    })?;
-    if verified.audience != rp_id {
-        warn!(
-            expected = %rp_id,
-            actual = %verified.audience,
-            "authentication rejected: id_token `aud` does not match this service",
-        );
-        return Err(AppError::Authentication(
-            "id_token `aud` does not match this service".into(),
-        ));
-    }
-
-    let now = now_epoch();
-    const CLOCK_SKEW_SECS: u64 = 60;
-    if verified.expires_at <= now {
-        return Err(AppError::Authentication("id_token has expired".into()));
-    }
-    if verified.issued_at > now + CLOCK_SKEW_SECS {
-        return Err(AppError::Authentication(
-            "id_token `iat` is in the future".into(),
-        ));
-    }
-    if verified.issued_at > verified.expires_at {
-        return Err(AppError::Authentication(
-            "id_token `iat` is after `exp`".into(),
-        ));
-    }
-
-    // ─── 4. Session pubkey validation (route-layer concern —
-    //        the canonical handler treats it opaquely). Decoded, not
-    //        prefix-matched, exactly as `auth/authenticate/0.2` checks its
-    //        `sessionKey`: a value that only *looks* like an Ed25519 multikey
-    //        would bind a key whose every later proof is refused, and the
-    //        producer — told the login succeeded — would never find out why.
-    let session_pubkey_b58btc = if let Some(pk) = payload.session_pubkey_b58btc.as_deref() {
-        if !did_hosting_common::server::auth::session::is_ed25519_multikey(pk) {
-            warn!(prefix = %pk.chars().take(8).collect::<String>(), "rejected unsupported session-key shape");
-            return Err(AppError::Authentication(
-                "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk…)".into(),
-            ));
-        }
-        Some(pk.to_string())
-    } else {
-        None
-    };
-
-    // ─── 5. The verified signer DID.
-    let signer_did = verified.issuer.clone();
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(&state)?;
-    let result = vti_common::auth::handlers::handle_authenticate(
-        &backend,
-        vti_common::auth::AuthenticateInput {
-            session_id: payload.session_id.clone(),
-            challenge: verified.nonce.clone(),
-            signer_did: signer_did.clone(),
-            // SIOPv2 — no message created_time to thread.
-            created_time: None,
-            session_pubkey_b58btc,
-            // The id_token's `aud` was checked against `server_did` above.
-            audience: vti_common::auth::AudienceBinding::Transport,
-        },
-    )
-    .await;
-
-    // Release the pending-challenge slot on success. A failure does not
-    // consume the challenge — the canonical handler leaves the row, so the
-    // caller may retry within the TTL — so its slot stays held until the
-    // challenge authenticates or expires.
-    match result {
-        Ok(resp) => {
-            state
-                .pending_challenges
-                .release_session(&payload.session_id);
-            info!(did = %signer_did, "authenticated via SIOPv2 id_token");
-            Ok(Json(canonical_to_local_auth_response(resp)).into_response())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Translate the canonical `vta_sdk::protocols::auth::AuthenticateResponse`
-/// returned by `vti_common::auth::handlers::handle_*` into did-hosting's own
-/// [`did_hosting_common::AuthenticateResponse`].
-///
-/// These are two genuinely different types, not two copies of one type: the
-/// SDK owns the canonical SIOPv2 / RFC-6749 shape, while `did-hosting-common`
-/// declares its own in `types.rs` so the client crates have a wire type that
-/// does not drag the SDK in. Both serialise identically, so the translation is
-/// a pure field-copy — but it is a permanent boundary, not a workaround for a
-/// duplicated dependency. (An earlier version of this comment claimed the
-/// latter and predicted the helper would disappear once vta-sdk consolidated
-/// onto one published version; that consolidation happened at vta-sdk 0.20 /
-/// vti-common 0.11.30 and the helper is still required.)
-///
-/// A `From` impl would be the natural home for this, but neither type is local
-/// to this crate, so the orphan rule rules it out here.
-fn canonical_to_local_auth_response(
-    a: vta_sdk::protocols::auth::AuthenticateResponse,
-) -> did_hosting_common::AuthenticateResponse {
-    did_hosting_common::AuthenticateResponse {
-        session: did_hosting_common::Session {
-            id: a.session.id,
-            subject: a.session.subject,
-            issued_at: a.session.issued_at,
-            expires_at: a.session.expires_at,
-            amr: a.session.amr,
-            acr: a.session.acr,
-        },
-        tokens: did_hosting_common::TokenBundle {
-            access_token: a.tokens.access_token,
-            refresh_token: a.tokens.refresh_token,
-            token_type: a.tokens.token_type,
-            expires_in: a.tokens.expires_in,
-            refresh_expires_in: a.tokens.refresh_expires_in,
-            scope: a.tokens.scope,
-        },
-    }
-}
-
-/// Build a `trust-task-error` HTTP response for a malformed
-/// authenticate envelope. Mirrors `routes/trust_tasks.rs::body_parse_error`
-/// — unrouted (no source issuer/recipient to draw from), `code:
-/// malformed_request`, mapped to its spec status via `status_for_code`.
-fn trust_task_malformed(reason: &str) -> Response {
-    use trust_tasks_https::status_for_code;
-    use trust_tasks_rs::{ErrorPayload, RejectReason};
-    use uuid::Uuid;
-
-    let reject = RejectReason::MalformedRequest {
-        reason: reason.to_string(),
-    };
-    let payload: ErrorPayload = reject.into();
-    let status_u16 = status_for_code(&payload.code);
-    let status =
-        axum::http::StatusCode::from_u16(status_u16).unwrap_or(axum::http::StatusCode::BAD_REQUEST);
-    let err_doc = trust_tasks_rs::ErrorResponse {
-        id: format!("urn:uuid:{}", Uuid::new_v4()),
-        thread_id: None,
-        // Unrouted: the envelope never parsed, so there is no request to read
-        // an enclosing exchange from (SPEC §4.9.2) — nor a ceremony to stay
-        // inside (§7.1).
-        parent_thread_id: None,
-        ceremony: None,
-        type_uri: did_hosting_common::server::trust_tasks::framework_error_type_uri(),
-        issuer: None,
-        recipient: None,
-        issued_at: Some(chrono::Utc::now()),
-        expires_at: None,
-        payload,
-        context: None,
-        proof: None,
-        extra: Default::default(),
-    };
-    let body = serde_json::to_vec(&err_doc).expect("error document serialises");
-    (
-        status,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
-}
-
-/// POST /api/auth/refresh — renew a console session.
-///
-/// The body is an `auth/refresh/0.1` document (see
-/// [`try_refresh_trust_task`]). The shared handler atomically claims the
-/// refresh-token reverse-index, preserves the pre-rotation AAL, re-looks-up
-/// the ACL role, and mints a new session + access/refresh pair.
-pub async fn refresh(
-    State(state): State<AppState>,
-    body: String,
-) -> Result<Json<did_hosting_common::RefreshResponse>, AppError> {
-    match try_refresh_trust_task(&state, &body).await? {
-        Some(resp) => Ok(Json(resp)),
-        None => Err(AppError::Authentication(format!(
-            "the body is not an {REFRESH_TASK_URI} document"
-        ))),
-    }
-}
-
-/// Load the session a refresh token belongs to, if any.
-///
-/// Reads the index rather than `take_session_id_by_refresh`: the take is
-/// the rotation's atomic claim, and consuming it here would destroy the
-/// token these pre-checks are only inspecting.
-///
-/// `None` means the token is unknown — left to `handle_refresh` to answer
-/// with its canonical "not found or consumed" rather than pre-empted here.
-async fn resolve_refresh_session(
-    state: &AppState,
-    refresh_token: &str,
-) -> Result<Option<did_hosting_common::server::auth::session::Session>, AppError> {
-    use did_hosting_common::server::auth::session::{get_session, get_session_by_refresh};
-
-    let Some(session_id) = get_session_by_refresh(&state.sessions_ks, refresh_token).await? else {
-        return Ok(None);
-    };
-    get_session(&state.sessions_ks, &session_id).await
-}
-
 /// Refuse a renewal for a session that has gone quiet longer than
-/// `auth.admin_idle_timeout`.
+/// `auth.admin_idle_timeout`. Shared by `trust_tasks_auth`'s
+/// `auth/refresh/0.2` arm — the only surviving refresh path since the REST
+/// `/api/auth/refresh` route was retired.
 ///
-/// Checked in this crate rather than inside the shared `handle_refresh` so
-/// the policy is ours and needs no vti-common release to change. It runs
-/// **before** the handler because the handler's first act is to
-/// claim-and-delete the refresh-token index: refusing afterwards would burn
-/// the caller's token on the way to telling them no, so an idled-out
-/// session could not even report itself consistently on a retry.
+/// Checked separately from — and before — the shared `handle_refresh`, so
+/// the policy is ours and needs no vti-common release to change, and so an
+/// idled-out session is refused before anything is spent: the handler's
+/// first act is to claim-and-delete the refresh-token index, and refusing
+/// afterwards would burn the caller's token on the way to telling them no.
 ///
 /// A session whose `last_seen` predates the field (`0`) falls back to
 /// `created_at`, so rows written before idle tracking existed are judged
 /// from when they began rather than being refused outright.
-fn refuse_if_idle_session(
+pub(crate) fn refuse_if_idle_session(
     session: &did_hosting_common::server::auth::session::Session,
     idle_ttl: u64,
 ) -> Result<(), AppError> {
@@ -447,18 +175,21 @@ fn refuse_if_idle_session(
     Ok(())
 }
 
-/// Bind a REST refresh to the device that logged in.
+/// Bind a refresh to the device that logged in.
 ///
-/// The refresh document carries no envelope that proves its sender, so
-/// without a check here possession of the refresh token alone would authorise
+/// A refresh token proves nothing about the party presenting it beyond
+/// possession, so without a check here a stolen token alone would authorise
 /// a rotation from anywhere.
 ///
-/// The binding reuses what the console already has: the passkey login flow
+/// The binding reuses what the console already has: the login flow
 /// generates an ephemeral Ed25519 keypair, sends its public multikey as
 /// `session_pubkey_b58btc`, and the server stores it on the session row.
-/// Requiring a Data Integrity proof from that key means a stolen refresh
-/// token is not enough on its own — the attacker also needs a key that
-/// never left the browser that logged in.
+/// Requiring a Data Integrity proof from that key (SPEC `auth/refresh/0.2`
+/// item 3: "the located session carries a bound `sessionKey`... MUST
+/// require that `proof` be present and its `verificationMethod` resolve to
+/// exactly that `sessionKey`") means a stolen refresh token is not enough on
+/// its own — the attacker also needs a key that never left the browser that
+/// logged in.
 ///
 /// **Sessions with no bound key are unchanged.** Wallet and
 /// machine-to-machine sessions sign with their own DID's verification
@@ -470,7 +201,7 @@ fn refuse_if_idle_session(
 /// Mirrors the case (a) / case (b) split in
 /// `routes::trust_tasks::dispatch_trust_task`, where the same binding is
 /// enforced for every other document the console signs.
-async fn verify_session_bound_proof(
+pub(crate) async fn verify_session_bound_proof(
     doc: &trust_tasks_rs::TrustTask<serde_json::Value>,
     session: &did_hosting_common::server::auth::session::Session,
 ) -> Result<(), AppError> {
@@ -519,64 +250,6 @@ async fn verify_session_bound_proof(
         })
 }
 
-/// Refresh from a plain `auth/refresh/0.1` Trust Task document.
-///
-/// Returns `Ok(None)` when the body is not such a document.
-///
-/// No proof is carried and none is required: the opaque refresh token *is*
-/// the bearer credential (RFC 6749 §10.4 rotation), verified by the shared
-/// handler's single-use rotating index. `signer_did` is therefore `None`.
-/// A session with a bound key must also carry that key's proof
-/// ([`verify_session_bound_proof`]).
-async fn try_refresh_trust_task(
-    state: &AppState,
-    body: &str,
-) -> Result<Option<did_hosting_common::RefreshResponse>, AppError> {
-    use trust_tasks_rs::TrustTask;
-
-    // Parsed as the typed envelope, not free-form JSON, so the proof member
-    // arrives in the shape the verifier takes. Bounded by
-    // `routes::AUTH_BODY_LIMIT_BYTES`: this runs before any credential is
-    // checked, so the body is attacker-chosen and must be small before it is
-    // parsed at all.
-    let Ok(doc) = serde_json::from_str::<TrustTask<serde_json::Value>>(body) else {
-        return Ok(None);
-    };
-    if doc.type_uri.to_string() != REFRESH_TASK_URI {
-        return Ok(None);
-    }
-    let refresh_token = doc
-        .payload
-        .get("refreshToken")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AppError::Authentication("missing payload.refreshToken in refresh document".into())
-        })?
-        .to_string();
-
-    if let Some(session) = resolve_refresh_session(state, &refresh_token).await? {
-        refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)?;
-        verify_session_bound_proof(&doc, &session).await?;
-    }
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)?;
-    let resp = vti_common::auth::handlers::handle_refresh(
-        &backend,
-        vti_common::auth::RefreshInput {
-            refresh_token,
-            signer_did: None,
-        },
-    )
-    .await?;
-    Ok(Some(canonical_to_local_auth_response(resp)))
-}
-
-/// The refresh document's Type URI.
-const REFRESH_TASK_URI: &str = "https://trusttasks.org/spec/auth/refresh/0.1";
-
-/// The Type URI of the SIOPv2 authenticate envelope.
-const AUTHENTICATE_TASK_URI: &str = "https://trusttasks.org/spec/auth/authenticate/0.1";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,7 +282,7 @@ mod tests {
         proof: Option<serde_json::Value>,
     ) -> trust_tasks_rs::TrustTask<serde_json::Value> {
         let mut v = json!({
-            "type": REFRESH_TASK_URI,
+            "type": "https://trusttasks.org/spec/auth/refresh/0.2",
             "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
             "payload": { "refreshToken": "tok" },
         });
@@ -655,7 +328,7 @@ mod tests {
 
     /// Wallet and machine-to-machine sessions never supplied a session key.
     /// They are unchanged — and this is not a downgrade an attacker can
-    /// pick, because it is a property of the stored row, not the request.
+    /// pick, because it is a property of the stored row, not of the request.
     #[tokio::test]
     async fn a_session_with_no_bound_key_needs_no_proof() {
         let session = session_with(None, 0);

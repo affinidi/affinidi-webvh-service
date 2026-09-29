@@ -276,9 +276,6 @@ export async function resolveProxyEntry(): Promise<{
 // flow completes. The visualization is the M2B.4 demo deliverable;
 // auth still works without rendering it.
 
-const AUTH_AUTHENTICATE_TYPE_URI =
-  "https://trusttasks.org/spec/auth/authenticate/0.1";
-
 /** One step in the visualisation. Captured with timing so the UI can
  *  render relative durations. */
 export interface ProxyLoginVizStep {
@@ -486,30 +483,32 @@ export async function loginWithWalletProxy(
     },
   });
 
-  // ─── Step 3: post the id_token to /auth/. The server verifies the
-  //            signature against the entry's DID + checks nonce + aud
-  //            + iat/exp window, then issues access tokens — for a session
-  //            bound to a fresh key this browser holds, so the session's
-  //            calls are signed without a wallet prompt each.
-  //
-  // `challenge` answers camelCase (`sessionId`); `AuthenticatePayload` wants
-  // snake_case (`session_id`). The response is the canonical
-  // AuthenticateResponse, `{ session, tokens }`, fully camelCase.
+  // ─── Step 3: post the id_token, wrapped as an `auth/authenticate/0.3`
+  //            proxied authenticate, to /trust-tasks. The server verifies
+  //            the outer document's proof (the fresh session key, as the
+  //            delegate), then independently verifies the id_token itself as
+  //            `delegationEvidence` — signature, nonce against this same
+  //            challenge, aud, iat/exp — before honoring `principal`. Success
+  //            issues access tokens for a session bound to that same fresh
+  //            key, so the session's calls are signed without a wallet
+  //            prompt each.
   const tAuth = performance.now();
   const { response: tokenResp, sent: authEnv } = await authenticateIdTokenBindingSessionKey(
     apiBase,
     {
       idToken: idTokenCompact,
       sessionId: chJson.sessionId,
-      typeUri: AUTH_AUTHENTICATE_TYPE_URI,
+      challenge: chJson.challenge,
+      principalDid: entry.principalDid,
+      rpDid,
     },
   );
   steps.push({
     label: "3. Server verifies + issues bearer",
-    description: `Server resolves the entry's DID, verifies the id_token signature, checks the nonce matches the challenge it issued in step 1, and issues a bearer access token bound to the principal DID — and to the session key this browser generated, which signs the session's calls from here on.`,
+    description: `Server verifies the outer document's proof from the session key (the delegate), independently verifies the id_token as delegationEvidence for the principal DID, checks its nonce matches the challenge from step 1, and issues a bearer access token bound to the principal DID — and to the session key this browser generated, which signs the session's calls from here on.`,
     durationMs: Math.round(performance.now() - tAuth),
     detail: {
-      url: `${apiBase}/auth/`,
+      url: `${apiBase}/trust-tasks`,
       requestBody: authEnv,
       response: {
         sessionId: tokenResp.session.id,
