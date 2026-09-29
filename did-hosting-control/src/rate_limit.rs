@@ -148,8 +148,21 @@ pub const REDEEM_LIMITER_NAME: &str = "passkey-redeem-per-source";
 ///
 /// A source is what the transport can vouch for: the client IP on HTTPS
 /// (`ip:…`), the authenticated sender on TSP and DIDComm (`vid:…`). The
-/// per-invite wrong-code limit is the real guard on a claim code; this one
-/// keeps a single source from spraying invites or burning CPU.
+/// per-invite wrong-code limit is the real guard on a claim code (and, unlike
+/// this limiter, holds across replicas — its counter lives in the shared
+/// store behind an atomic increment; see
+/// `did_hosting_common::server::passkey::invite`). This one keeps a single
+/// source from spraying invites or burning CPU.
+///
+/// **Per-process, by design.** Unlike the wrong-code counter, this limiter's
+/// buckets are an in-memory `HashMap` — nothing here is shared across
+/// replicas. A source spread across N replicas behind a load balancer gets
+/// effectively `N * REDEEM_MAX_PER_WINDOW` attempts per window, not
+/// `REDEEM_MAX_PER_WINDOW`. That's an accepted tradeoff: this limiter sheds
+/// load and guessing pressure, it isn't the security boundary (the per-invite
+/// wrong-code lockout is), so making it cross-replica would trade a store
+/// round trip on every redemption attempt for a guarantee this limiter
+/// doesn't need to make.
 #[derive(Debug, Default)]
 pub struct SourceRateLimiter {
     buckets: Mutex<HashMap<String, Bucket>>,

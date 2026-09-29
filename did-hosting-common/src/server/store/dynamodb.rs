@@ -17,6 +17,10 @@ use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
 const VAL_ATTR: &str = "val";
+/// Numeric attribute `incr_raw` adds to atomically — kept apart from
+/// `VAL_ATTR` so an increment never collides with a JSON blob some other
+/// caller stores at the same partition key.
+const CNT_ATTR: &str = "cnt";
 
 // ---------------------------------------------------------------------------
 // DynamoDbBackend
@@ -237,6 +241,42 @@ impl KeyspaceOps for DynamoDbKeyspace {
                     }
                 })
             }))
+        })
+    }
+
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            ensure_table(&self.client, &self.table, &self.verified).await?;
+            // `ADD` on a Number attribute is DynamoDB's native atomic
+            // counter: the read-modify-write happens server-side under the
+            // partition key's lock, so two replicas racing this call each
+            // get a distinct, correctly-ordered result — never the same
+            // next value twice. `UpdatedNew` returns the post-increment
+            // value in the same round trip.
+            let response = self
+                .client
+                .update_item()
+                .table_name(&self.table)
+                .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .update_expression("ADD #cnt :one")
+                .expression_attribute_names("#cnt", CNT_ATTR)
+                .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+                .return_values(ReturnValue::UpdatedNew)
+                .send()
+                .await
+                .map_err(|e| AppError::Store(format!("dynamodb update (incr): {e}")))?;
+            let n = response
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs.get(CNT_ATTR))
+                .and_then(|attr| match attr {
+                    AttributeValue::N(s) => s.parse::<u64>().ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    AppError::Store("dynamodb incr: no numeric counter in response".into())
+                })?;
+            Ok(n)
         })
     }
 
