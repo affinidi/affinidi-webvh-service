@@ -279,9 +279,19 @@ pub async fn assert_did_host_allowed_when_domains_configured(
 /// resolving its DIDs; the moment a domain exists, enforcement turns
 /// on automatically.
 ///
+/// `request_host` is `Option` because a caller cannot always resolve one —
+/// no `Host` header, no trusted `Forwarded`/`X-Forwarded-Host`, nothing.
+/// Every caller must route through this function rather than skipping it on
+/// `None`: once at least one domain is configured, a request with no
+/// resolvable host is refused rather than served with the domain-ownership
+/// gate silently bypassed. Skipping the call on `None` — the bug this
+/// replaces — meant *any* tenant's content was resolvable by a request that
+/// simply omitted its Host header.
+///
 /// Returns:
-/// - **404** (`AppError::NotFound`) on host mismatch (per spec, hide
-///   the DID from the wrong domain).
+/// - **404** (`AppError::NotFound`) on a missing host once domains are
+///   configured, or on host mismatch (per spec, hide the DID from the
+///   wrong domain).
 /// - **503** (`AppError::DomainDisabled`) when the matched domain is
 ///   disabled.
 /// - **Ok** when the keyspace is empty (legacy), or when host matches
@@ -290,7 +300,7 @@ pub async fn assert_did_host_allowed_when_domains_configured(
 /// [`KS_DOMAINS`]: crate::server::store::KS_DOMAINS
 pub async fn assert_resolution_allowed(
     store: &Store,
-    request_host: &str,
+    request_host: Option<&str>,
     did_id: &str,
 ) -> Result<(), AppError> {
     use crate::server::store::KS_DOMAINS;
@@ -304,11 +314,22 @@ pub async fn assert_resolution_allowed(
     if !any_domain {
         tracing::warn!(
             did = %did_id,
-            request_host = %request_host,
+            request_host = ?request_host,
             "domains keyspace is empty — skipping resolve-side safety check"
         );
         return Ok(());
     }
+    let Some(request_host) = request_host else {
+        tracing::warn!(
+            did = %did_id,
+            "no resolvable request host (no Host header, and none of Forwarded / \
+             X-Forwarded-Host from a trusted peer); refusing to serve now that at least \
+             one domain is configured"
+        );
+        return Err(AppError::NotFound(format!(
+            "no resolvable request host for {did_id}"
+        )));
+    };
     assert_request_host_matches_did(request_host, did_id)?;
     assert_domain_active_for_resolution(store, request_host).await
 }
@@ -702,9 +723,13 @@ mod tests {
     async fn resolution_allowed_empty_keyspace_is_permissive() {
         let store = fjall_store().await;
         assert!(
-            assert_resolution_allowed(&store, "example.com", "did:webvh:Q1:example.com:user1")
-                .await
-                .is_ok()
+            assert_resolution_allowed(
+                &store,
+                Some("example.com"),
+                "did:webvh:Q1:example.com:user1"
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -715,9 +740,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            assert_resolution_allowed(&store, "example.com", "did:webvh:Q1:example.com:user1")
-                .await
-                .is_ok()
+            assert_resolution_allowed(
+                &store,
+                Some("example.com"),
+                "did:webvh:Q1:example.com:user1"
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -735,7 +764,7 @@ mod tests {
             .unwrap();
         let err = assert_resolution_allowed(
             &store,
-            "domain-b.example",
+            Some("domain-b.example"),
             "did:webvh:Q1:domain-a.example:user1",
         )
         .await
@@ -751,12 +780,24 @@ mod tests {
             .unwrap();
         let err = assert_resolution_allowed(
             &store,
-            "disabled.example",
+            Some("disabled.example"),
             "did:webvh:Q1:disabled.example:user1",
         )
         .await
         .expect_err("disabled domain must 503");
         assert!(matches!(err, AppError::DomainDisabled { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolution_allowed_missing_host_rejected_once_domains_exist() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        let err = assert_resolution_allowed(&store, None, "did:webvh:Q1:example.com:user1")
+            .await
+            .expect_err("no resolvable host must not bypass the domain-ownership gate");
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 
     // ---- end-to-end: assert_did_host_allowed ----

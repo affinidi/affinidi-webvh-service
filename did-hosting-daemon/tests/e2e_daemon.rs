@@ -361,20 +361,17 @@ async fn daemon_lifecycle_over_https() {
     )
     .await;
 
-    // did/delete. Verified via `did/info`, not a public GET: this test
-    // tripped over a real cache-invalidation bug in
-    // `did_hosting_server::routes::resolve_webvh::serve_content` — a slot
-    // once resolved is cached in `AppState::did_cache` (60s TTL) *before* the
-    // disabled/deleted check, but only the disabled/deleted check on the
-    // *record* runs on every request; deleting a slot removes the record
-    // entirely, so a subsequent request skips that check altogether (there's
-    // no record to read it off) and falls straight through to the still-warm
-    // cache entry. A DID that was ever successfully resolved keeps serving
-    // its last content for up to a minute after being deleted. `disable`
-    // doesn't hit this (the record — and its `disabled` flag — still exists),
-    // which is exactly why this test caught the asymmetry: the same
-    // `get_log`-based check that correctly proved `set-state suspended`
-    // above timed out here.
+    // did/delete — the daemon refuses resolution at once, with no
+    // cache-staleness window. `serve_content` used to check the
+    // disabled/deleted flag only when a record existed; `did/delete` removes
+    // the record outright (unlike `disable`, which only flips a flag on it),
+    // so that check was skipped entirely and a request fell straight through
+    // to the still-warm `AppState::did_cache` entry from the `get_log` calls
+    // above — a DID that was ever successfully resolved kept serving its
+    // last content for up to the cache's TTL after being deleted. Fixed by
+    // having `serve_content` treat a missing record as not found before ever
+    // consulting the cache, so this `get_log` needs no `wait_until`: the
+    // refusal is immediate, proven against a deliberately warm cache.
     let reply = daemon
         .call(
             did::delete::v0_1::Payload::TYPE_URI,
@@ -382,30 +379,10 @@ async fn daemon_lifecycle_over_https() {
         )
         .await;
     ok(&reply, did::delete::v0_1::Payload::TYPE_URI);
-    // `daemon.call` treats a non-2xx HTTP status as a hard error (matching
-    // `post_trust_task_https`'s production behaviour), so a refusal — this
-    // one included, `did/info` answers a deleted mnemonic with a signed
-    // `notFound` error carried on HTTP 422 — is inspected via the plain
-    // signed-document request below rather than through it.
-    let info_doc = build_signed_request(
-        did::info::v0_1::Payload::TYPE_URI,
-        &daemon.admin_did,
-        &daemon.daemon_did,
-        json!({ "mnemonic": mnemonic }),
-        &daemon.admin_signer,
-    )
-    .await
-    .expect("build did/info request");
-    let resp = reqwest::Client::new()
-        .post(format!("{}/api/trust-tasks", daemon.base_url))
-        .json(&info_doc)
-        .send()
-        .await
-        .expect("POST did/info");
-    let body: serde_json::Value = resp.json().await.expect("did/info reply is JSON");
     assert_eq!(
-        body["payload"]["code"], "did-management/did/info:notFound",
-        "a deleted DID is gone from the store: {body}"
+        daemon.get_log(mnemonic).await.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a deleted DID must stop resolving immediately, not after the cache's TTL"
     );
 
     daemon.teardown().await;

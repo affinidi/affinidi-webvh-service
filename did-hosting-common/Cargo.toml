@@ -280,3 +280,8 @@ async-trait = "0.1"
 # generated ed25519 `did:key` to exercise the bind-when-present /
 # signature-only-when-absent paths end-to-end.
 affinidi-secrets-resolver = "0.5"
+# `did_ops::tests` signs real witness proofs (the same way didwebvh-rs's own
+# witness-threshold tests do) to exercise
+# `verify_did_log_for_publish`'s register/publish witness-threshold split
+# end-to-end, without needing a running witness service.
+affinidi-data-integrity = { workspace = true }

@@ -14,7 +14,7 @@ use did_hosting_common::server::auth::session::now_epoch;
 pub use did_hosting_common::did_ops::{
     DidRecord, LogEntryInfo, LogMetadata, content_log_key, content_witness_key, did_key,
     extract_did_id, extract_did_web_document, extract_log_metadata, extract_service_types,
-    owner_key, parse_log_entries, watcher_sync_key,
+    owner_key, parse_log_entries, servable_did_log, watcher_sync_key,
 };
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.

@@ -75,6 +75,7 @@ pub(crate) fn redact_server_message(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server-core")]
     use super::*;
 
     #[cfg(feature = "server-core")]

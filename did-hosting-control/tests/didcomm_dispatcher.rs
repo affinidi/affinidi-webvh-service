@@ -96,6 +96,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        cache_invalidate: None,
     };
 
     (state, dir)

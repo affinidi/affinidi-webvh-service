@@ -32,6 +32,10 @@ use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
+/// A cache-eviction hook: takes the store key whose cached content is now
+/// stale. See `AppState::cache_invalidate`.
+pub type CacheInvalidateFn = dyn Fn(&str) + Send + Sync;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -147,6 +151,20 @@ pub struct AppState {
     /// this notify so delivery happens promptly in the happy path.
     /// On notify-miss the worker still runs on its 30 s tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
+    /// Evicts a resolved-content cache entry (keyed by
+    /// `did_ops::content_log_key(mnemonic)`) when this process also serves
+    /// resolution from the same store — the unified `did-hosting-daemon`,
+    /// which wires this to its embedded server's `did_cache`.
+    ///
+    /// `None` for a standalone control plane: it holds no content cache of
+    /// its own, and a registered edge's cache is kept in step independently,
+    /// by `webvh/sync/*` invalidating on receipt
+    /// (`did-hosting-server::control_register`). Without this hook, a direct
+    /// mutation here (register, publish, disable, rollback, delete) would
+    /// leave the daemon's embedded server serving a stale or since-deleted
+    /// cache entry for up to its TTL — there is no sync round-trip within a
+    /// single process to invalidate it the way a standalone edge does.
+    pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
 }
 
 impl AppState {
@@ -348,6 +366,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        // Standalone control plane: no content cache of its own to
+        // invalidate. See the field doc.
+        cache_invalidate: None,
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.

@@ -313,8 +313,7 @@ pub(crate) async fn witness_publish(
 ) -> Result<witness_publish::v0_1::Response, TaskError> {
     let auth = cx.auth().await?;
     let state = cx.state;
-    let witness = serde_json::to_string(&p.witness)?;
-    did_ops::upload_witness(&auth, state, &p.mnemonic, &witness).await?;
+    did_ops::upload_witness(&auth, state, &p.mnemonic, &p.witness).await?;
     let base_url = state
         .config
         .did_hosting_url
