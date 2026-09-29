@@ -1257,10 +1257,14 @@ async fn route_trust_task_doc(
     //    in either's favour.
     //
     //    Each task's `ProofRule` says what its proof must be:
-    //    - `Optional`: the documents that authorise nothing and that a peer
-    //      must be able to send before it can sign anything useful — capability
-    //      discovery, an auth challenge, the public `server/info`, and opening a
-    //      passkey login;
+    //    - `Optional`: capability discovery, the public `server/info`,
+    //      opening a passkey login, and the whole `auth/challenge` /
+    //      `auth/authenticate` / `auth/refresh` family — not because a proof
+    //      is optional there (several of these require one), but because the
+    //      ACL pre-filter below is the wrong question for a family whose own
+    //      handlers already decide who may act, on a signer the ACL may
+    //      legitimately never list (a proxied login's delegate) or has not
+    //      listed yet (a first login);
     //    - `Authentication`: an operational request, `proofPurpose:
     //      authentication` under the signer's `authentication` relationship;
     //    - `AssertionMethod`: a human approver's decision, an attestation under
@@ -1453,9 +1457,21 @@ async fn route_trust_task_doc(
 
 /// What [`dispatch_trust_task_doc`] requires of `type_uri`'s proof.
 ///
-/// The control plane's table says for its own rows. Of the rest, only
-/// discovery and asking for an auth challenge authorise nothing and must be
-/// sendable before a peer can sign anything useful; every other task — ACL
+/// The control plane's table says for its own rows. Of the rest, capability
+/// discovery and the whole auth family (`crate::trust_tasks_auth::owns`:
+/// challenge, authenticate, refresh) get `Optional` too — not because their
+/// proof is optional (`auth/authenticate`'s is REQUIRED by its own spec, and
+/// `signed` below still verifies whichever proof is present), but because the
+/// upfront **ACL pre-filter** `needs_acl` gates on is the wrong question for
+/// this family. A proxied `auth/authenticate/0.3`'s issuer is a *delegate*
+/// that may never itself hold an ACL entry — only the `principal` it
+/// authenticates as does — and an ordinary login's own subject, and a
+/// refresh's session key, are exactly the identities this family's own arms
+/// already authorise (an ACL lookup on the acting party inside
+/// `handle_authenticate`, a bound-key check inside `refresh_v2_arm`). Gating
+/// on the *signer* holding one first would refuse every proxied login
+/// outright, and gating an ordinary first login on an ACL entry that same
+/// login is what establishes control of is circular. Every other task — ACL
 /// reads included — is privileged, including a Type URI nobody serves, which
 /// is then refused as unsupported only once it has been proven.
 pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
@@ -1464,7 +1480,7 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
         return rule;
     }
     if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
-        || type_uri == trust_tasks_rs::specs::auth::challenge::v0_1::Payload::TYPE_URI
+        || crate::trust_tasks_auth::owns(type_uri)
     {
         return ProofRule::Optional;
     }

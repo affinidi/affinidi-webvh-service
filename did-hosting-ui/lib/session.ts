@@ -9,10 +9,20 @@
 
 import {
   clearSessionKeypair,
+  getSessionDidKey,
   hasSessionKeypair,
   restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
+// `trust-task.ts` imports `clearToken`/`getSessionSubjectDid` from this
+// module, so a static top-level import back the other way is a genuine
+// cycle, not one that "resolves fine": `trust-task.ts` declares `class
+// TrustTaskRejection extends ApiError` at module-eval time, and whichever of
+// the two modules a caller reaches first leaves the other only partially
+// evaluated when that class body runs — `ApiError` is still unbound and the
+// `extends` throws. A dynamic `import()` inside `renewIfNeeded` below defers
+// the load until first call, by which point both modules have finished
+// evaluating.
 
 const TOKEN_KEY = "webvh_token";
 const REFRESH_TOKEN_KEY = "webvh_refresh_token";
@@ -64,7 +74,7 @@ export function setRefreshToken(token: string | null): void {
   }
 }
 
-const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.1";
+const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.2";
 
 /** Seconds since the epoch at which `token` expires, or null if unreadable. */
 function tokenExpiry(token: string): number | null {
@@ -94,10 +104,15 @@ let lastRenewAttemptMs = 0;
  * second simultaneous renewal would present a token the first had already
  * consumed and be rejected.
  *
- * The daemon refuses a renewal once the session has been idle past
- * `auth.admin_idle_timeout`, which is what stops this timer from keeping a
- * tab signed in forever. Never throws: a failed renewal leaves the session
- * alone and the caller's own request reports the failure.
+ * Sent as an `auth/refresh/0.2` Trust Task over `POST /api/trust-tasks` —
+ * there is no dedicated REST refresh route any more. The daemon refuses a
+ * renewal once the session has been idle past `auth.admin_idle_timeout`
+ * (its own policy layered in front of the shared handler, unrelated to the
+ * Trust Task spec), which is what stops this timer from keeping a tab
+ * signed in forever, and once the session has reached its
+ * `absoluteExpiresAt` — that one only a fresh sign-in can lift. Never
+ * throws: a failed renewal leaves the session alone and the caller's own
+ * request reports the failure.
  */
 export async function renewIfNeeded(): Promise<void> {
   const access = getToken();
@@ -115,35 +130,39 @@ export async function renewIfNeeded(): Promise<void> {
 
   renewInFlight = (async () => {
     try {
-      // Signed with the session keypair, not sent bare. The daemon binds a
-      // REST refresh to the key this browser registered at login, so a
-      // stolen refresh token alone will not rotate the session. The refresh
-      // token is still what authorises it: the key proves this is the
-      // browser that logged in, and cannot refresh anything on its own. A
-      // session with no bound key (machine-to-machine) has
-      // nothing to sign with and the daemon does not ask.
-      let envelope: Record<string, unknown> = {
-        type: REFRESH_TASK_URI,
-        id: crypto.randomUUID(),
-        payload: { refreshToken: refresh },
-      };
       // After a reload the key is only in IndexedDB. Without restoring it
-      // first, the refresh would go out unsigned and be refused.
+      // first, the refresh would go out unsigned and be refused — every
+      // login this UI offers binds one, so in practice this always signs.
       if (!hasSessionKeypair()) {
         await restoreSessionKeypair();
       }
-      if (hasSessionKeypair()) {
-        envelope = await signEnvelope(envelope);
-      }
-      const res = await fetch("/api/auth/refresh", {
+      if (!hasSessionKeypair()) return;
+
+      const { TRUST_TASKS_PATH, getServiceInfo } = await import("./trust-task");
+      const { serviceDid } = await getServiceInfo();
+      let envelope: Record<string, unknown> = {
+        type: REFRESH_TASK_URI,
+        id: crypto.randomUUID(),
+        recipient: serviceDid,
+        issuedAt: new Date().toISOString(),
+        // The auth family verifies a proof bound to its own `issuer` — the
+        // session key signs as *itself*, not as a delegate for the
+        // session's subject (unlike an ordinary authenticated call; see
+        // `trust-task.ts`'s `"session"` signer). Mirrors the session-key
+        // binding `auth/authenticate/0.2`/`0.3` established at login.
+        issuer: getSessionDidKey(),
+        payload: { refreshToken: refresh },
+      };
+      envelope = await signEnvelope(envelope);
+      const res = await fetch(TRUST_TASKS_PATH, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(envelope),
       });
       if (!res.ok) return;
       const body = await res.json();
-      const nextAccess = body?.access_token ?? body?.tokens?.accessToken;
-      const nextRefresh = body?.refresh_token ?? body?.tokens?.refreshToken;
+      const nextAccess = body?.payload?.tokens?.accessToken;
+      const nextRefresh = body?.payload?.tokens?.refreshToken;
       if (typeof nextAccess === "string") setToken(nextAccess);
       if (typeof nextRefresh === "string") setRefreshToken(nextRefresh);
     } catch {

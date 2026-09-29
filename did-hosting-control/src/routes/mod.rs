@@ -6,13 +6,12 @@
 //! surface beside it. What else stays plain HTTP:
 //!
 //! - `GET /api/health`, the unauthenticated liveness probe;
-//! - the browser sign-in ceremony that has no Trust Task form:
-//!   `POST /api/auth/challenge` then `POST /api/auth/` with a SIOPv2
-//!   `id_token` minted by the holder's VTA (`auth/authenticate/0.2` carries no
-//!   `id_token`), and `POST /api/auth/refresh`, which renews a console session
-//!   on its refresh token and the browser's bound session key (the Trust Task
-//!   `auth/refresh` must be signed by the subject, whose key a browser session
-//!   does not hold);
+//! - `POST /api/auth/challenge`, which mints the challenge every sign-in
+//!   completes over the Trust Task surface (`auth/authenticate/0.2` for the
+//!   VTI Wallet extension, which this deployment cannot re-version; `0.3` for
+//!   the did-hosting UI's own wallet login and its VTA-proxied SIOP login —
+//!   see `trust_tasks_auth`). The console's session refresh went the same
+//!   way: `auth/refresh/0.2` over `/api/trust-tasks`, not a REST route;
 //! - the admin console's static assets, as the fallback (standalone mode).
 
 pub(crate) mod auth;
@@ -41,12 +40,9 @@ pub fn trust_tasks_body_limit_bytes() -> usize {
     )
 }
 
-/// Maximum body size accepted on the **unauthenticated** auth surface
-/// (`/auth/challenge`, `/auth/`, `/auth/refresh`) in bytes.
-///
-/// These routes take no credential before parsing: a refresh document is a
-/// type URI, a uuid and an opaque token, and the largest legitimate body here
-/// is a SIOPv2 `id_token` envelope. 32 KB is generous for both.
+/// Maximum body size accepted on the **unauthenticated** `/auth/challenge`
+/// route, in bytes. It takes no credential before parsing: the body is a
+/// DID and nothing else. 32 KB is generous.
 pub const AUTH_BODY_LIMIT_BYTES: usize = 32 * 1024;
 
 /// Build the control plane router without the UI fallback (daemon mode).
@@ -60,14 +56,6 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route(
             "/api/auth/challenge",
             post(auth::challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/auth/",
-            post(auth::authenticate).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/auth/refresh",
-            post(auth::refresh).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
         )
         .route("/api/health", get(health::health))
 }

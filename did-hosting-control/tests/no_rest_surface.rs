@@ -86,6 +86,11 @@ const REMOVED: &[(&str, &str)] = &[
     ("POST", "/api/task-consent/request"),
     ("GET", "/api/proxy/server/srv-1/api/health"),
     ("POST", "/api/proxy/witness/wit-1/api/trust-tasks"),
+    // Sign-in and refresh moved onto the Trust Task surface
+    // (`auth/authenticate/0.2`/`0.3`, `auth/refresh/0.1`/`0.2` over
+    // `/api/trust-tasks`); only `/api/auth/challenge` stays plain REST.
+    ("POST", "/api/auth/"),
+    ("POST", "/api/auth/refresh"),
 ];
 
 async fn status(app: axum::Router, method: &str, path: &str) -> StatusCode {
@@ -145,8 +150,6 @@ async fn the_trust_task_binding_and_sign_in_routes_are_served() {
         ("POST", "/api/trust-tasks"),
         ("GET", "/api/health"),
         ("POST", "/api/auth/challenge"),
-        ("POST", "/api/auth/"),
-        ("POST", "/api/auth/refresh"),
     ] {
         let got = status(h.router(), method, path).await;
         assert_ne!(got, StatusCode::NOT_FOUND, "{method} {path} must be served");
