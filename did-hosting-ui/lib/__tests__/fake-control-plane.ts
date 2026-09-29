@@ -11,6 +11,18 @@
 
 import { vi } from "vitest";
 
+import {
+  type AuthMethod,
+  clearToken,
+  getAuthMethod,
+  getRefreshToken,
+  getToken,
+  resetSessionCacheForTests,
+  setAuthMethod,
+  setRefreshToken,
+  setToken,
+} from "../session";
+
 export const SERVICE_DID = "did:webvh:QmTest:control.example.com";
 export const SERVER_INFO = "https://trusttasks.org/spec/did-management/server/info/0.1";
 export const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.3";
@@ -132,13 +144,68 @@ export function installControlPlane(handler: Handler, serverInfo?: Handler): Sen
   return sent;
 }
 
-/** A `localStorage` holding `entries`. */
+/**
+ * Seed the session module's in-memory cache with `entries` — the same
+ * `webvh_token` / `webvh_refresh_token` / `webvh_auth_method` keys the old
+ * `localStorage`-backed store used, now routed through `session.ts`'s own
+ * getters/setters (tokens no longer touch `localStorage` at all).
+ *
+ * Returns a `Map`-shaped view over that cache so existing assertions
+ * (`store.get("webvh_token")`) and mid-test mutations (`store.set(...)`,
+ * simulating another tab racing a sign-in) keep working unchanged.
+ */
 export function stubStorage(entries: Record<string, string>): Map<string, string> {
-  const store = new Map(Object.entries(entries));
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => store.get(k) ?? null,
-    setItem: (k: string, v: string) => void store.set(k, v),
-    removeItem: (k: string) => void store.delete(k),
-  });
-  return store;
+  // The cache is a module-scope singleton: without this, a token seeded by
+  // an earlier test would still be there for one that expects none.
+  resetSessionCacheForTests();
+  if ("webvh_token" in entries) setToken(entries.webvh_token!);
+  if ("webvh_refresh_token" in entries) setRefreshToken(entries.webvh_refresh_token ?? null);
+  if ("webvh_auth_method" in entries) {
+    setAuthMethod(entries.webvh_auth_method as AuthMethod);
+  }
+
+  interface StorageView {
+    get(key: string): string | undefined;
+    set(key: string, value: string): StorageView;
+    delete(key: string): boolean;
+  }
+  const view: StorageView = {
+    get(key: string): string | undefined {
+      switch (key) {
+        case "webvh_token":
+          return getToken() ?? undefined;
+        case "webvh_refresh_token":
+          return getRefreshToken() ?? undefined;
+        case "webvh_auth_method":
+          return getAuthMethod() ?? undefined;
+        default:
+          return undefined;
+      }
+    },
+    set(key: string, value: string): StorageView {
+      switch (key) {
+        case "webvh_token":
+          setToken(value);
+          break;
+        case "webvh_refresh_token":
+          setRefreshToken(value);
+          break;
+        case "webvh_auth_method":
+          setAuthMethod(value as AuthMethod);
+          break;
+      }
+      return view;
+    },
+    delete(key: string): boolean {
+      if (key === "webvh_token" || key === "webvh_refresh_token" || key === "webvh_auth_method") {
+        // No single-field delete on the session cache — a test that needs
+        // one has none today; clearing everything would be the wrong
+        // simulation of "one key vanished".
+        clearToken();
+        return true;
+      }
+      return false;
+    },
+  };
+  return view as unknown as Map<string, string>;
 }

@@ -25,6 +25,7 @@ import {
   resetServiceInfo,
   retryDelayMs,
 } from "../api";
+import { resetSessionCacheForTests, setToken } from "../session";
 import {
   SERVER_INFO,
   installControlPlane,
@@ -180,12 +181,8 @@ describe("trustTask — re-issue behaviour", () => {
     // fake timers keep the suite instant.
     vi.useFakeTimers();
     resetServiceInfo();
-    const token = tokenFor(SUBJECT);
-    vi.stubGlobal("localStorage", {
-      getItem: (key: string) => (key === "webvh_token" ? token : null),
-      setItem: () => {},
-      removeItem: () => {},
-    });
+    resetSessionCacheForTests();
+    setToken(tokenFor(SUBJECT));
   });
 
   it("signs an ACL read and names the session subject as its issuer", async () => {

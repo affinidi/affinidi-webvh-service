@@ -646,6 +646,24 @@ async fn get_auth_proxy_meta(
     state.sessions_ks.get(auth_proxy_meta_key(session_id)).await
 }
 
+/// Remove `session_id`'s auth-proxy meta row, if any.
+///
+/// Called from `auth/revoke-session` (the console's logout) and from any
+/// other path that ends a session outright, so a proxied login's `actor`
+/// and absolute-lifetime cap never outlive the session they were minted
+/// for. Sessions never proxied (a direct `auth/authenticate/0.2` login)
+/// have no row here — deleting a key that was never written is a no-op,
+/// not an error.
+pub(crate) async fn delete_auth_proxy_meta(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), crate::error::AppError> {
+    state
+        .sessions_ks
+        .remove(auth_proxy_meta_key(session_id))
+        .await
+}
+
 #[allow(clippy::result_large_err)]
 async fn authenticate_v3_arm(
     state: &AppState,

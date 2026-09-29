@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
-import { api, getToken, setToken as storeToken } from "../lib/api";
+import { api, getToken, restoreSession, setToken as storeToken } from "../lib/api";
 
 interface AuthState {
   token: string | null;
@@ -37,13 +37,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null);
 
   useEffect(() => {
-    const saved = getToken();
-    if (saved) setTokenState(saved);
+    // The token cache lives in memory, restored from IndexedDB — on a fresh
+    // page load nothing has populated it yet.
+    let cancelled = false;
+    void (async () => {
+      await restoreSession();
+      if (cancelled) return;
+      const saved = getToken();
+      if (saved) setTokenState(saved);
+    })();
 
     // Clear React state when the API client detects an expired/invalid token
     const onUnauthorized = () => setTokenState(null);
     window.addEventListener("webvh:unauthorized", onUnauthorized);
-    return () => window.removeEventListener("webvh:unauthorized", onUnauthorized);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("webvh:unauthorized", onUnauthorized);
+    };
   }, []);
 
   const login = useCallback((t: string) => {

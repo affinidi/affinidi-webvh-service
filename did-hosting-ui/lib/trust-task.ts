@@ -21,6 +21,7 @@ import { ApiError, request } from "./http";
 import {
   clearToken,
   getSessionSubjectDid,
+  restoreSession,
 } from "./session";
 import {
   generateSessionKeypair,
@@ -417,6 +418,11 @@ async function sign(
     return doc;
   }
 
+  // The token cache lives in memory, restored from IndexedDB lazily — a
+  // trust task signed before anything else has read the session (a page
+  // whose own mount effect fires ahead of `AuthProvider`'s) must still see
+  // it. No-op after the first restore.
+  await restoreSession();
   const subject = getSessionSubjectDid();
   if (!subject) {
     throw new ApiError(

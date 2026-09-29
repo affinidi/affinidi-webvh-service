@@ -66,6 +66,7 @@ import {
   getRefreshToken,
   getSessionId,
   getToken,
+  restoreSession,
   setRefreshToken,
   setToken,
 } from "./session";
@@ -1137,6 +1138,10 @@ export const api = {
    * then lapses at its expiry.
    */
   logout: async (): Promise<void> => {
+    // The token/session cache lives in memory, restored from IndexedDB — a
+    // logout clicked before anything else has read the session must still
+    // see it.
+    await restoreSession();
     const token = getToken();
     const sessionId = getSessionId();
     try {
@@ -1165,6 +1170,7 @@ export const api = {
    * Only a wallet session can do this; a passkey session is `aal2` from login.
    */
   stepUp: async (): Promise<void> => {
+    await restoreSession();
     const wallet = typeof window !== "undefined" ? window.vtaWallet : undefined;
     const accessToken = getToken();
     const refreshToken = getRefreshToken();
