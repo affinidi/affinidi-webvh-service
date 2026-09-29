@@ -327,16 +327,39 @@ async fn cross_method_resolve_isolation() {
     seed_two_domains(&state).await;
 
     // did:webvh on a.example: request arriving on b.example must reject.
-    let err = assert_resolution_allowed(&state.store, "b.example", "did:webvh:Q1:a.example:alpha")
-        .await
-        .expect_err("cross-domain resolve must reject");
+    let err = assert_resolution_allowed(
+        &state.store,
+        Some("b.example"),
+        "did:webvh:Q1:a.example:alpha",
+    )
+    .await
+    .expect_err("cross-domain resolve must reject");
     let msg = err.to_string();
     assert!(msg.contains("a.example") || msg.contains("b.example"));
 
     // did:web on a.example: same isolation.
-    let err = assert_resolution_allowed(&state.store, "b.example", "did:web:a.example:alpha")
+    let err = assert_resolution_allowed(&state.store, Some("b.example"), "did:web:a.example:alpha")
         .await
         .expect_err("did:web cross-domain resolve must reject");
     let msg = err.to_string();
     assert!(msg.contains("a.example") || msg.contains("b.example"));
+}
+
+/// The fix for a real gap: once at least one domain exists, a request with
+/// no resolvable host at all (no `Host` header, and none of `Forwarded` /
+/// `X-Forwarded-Host` from a trusted peer) must be refused, not silently
+/// served with the domain-ownership gate skipped — the ACL check used to
+/// live inside `if let Some(host) = request_host`, so `None` bypassed it
+/// entirely.
+#[tokio::test]
+async fn missing_request_host_is_refused_once_domains_are_configured() {
+    use did_hosting_common::server::domain::assert_resolution_allowed;
+
+    let (state, _dir) = make_state().await;
+    seed_two_domains(&state).await;
+
+    let err = assert_resolution_allowed(&state.store, None, "did:webvh:Q1:a.example:alpha")
+        .await
+        .expect_err("no resolvable host must not bypass the domain-ownership gate");
+    assert!(err.to_string().contains("resolvable request host"), "{err}");
 }

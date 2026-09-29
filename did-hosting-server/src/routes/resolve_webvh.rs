@@ -50,10 +50,8 @@ async fn serve_content(
             if record.disabled || record.deleted_at.is_some() {
                 return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
             }
-            if let Some(host) = request_host
-                && let Some(ref did_id) = record.did_id
-            {
-                assert_resolution_allowed(&state.store, host, did_id).await?;
+            if let Some(ref did_id) = record.did_id {
+                assert_resolution_allowed(&state.store, request_host, did_id).await?;
             }
         }
         // No record at all — e.g. `did/delete`, which removes the record
