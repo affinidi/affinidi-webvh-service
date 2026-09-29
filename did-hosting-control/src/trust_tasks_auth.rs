@@ -376,6 +376,30 @@ async fn authenticate_v2_arm(
     // The challenge is spent: free its slot, whichever binding issued it.
     state.pending_challenges.release_session(&session_id);
 
+    // The absolute session lifetime is this deployment's own backstop
+    // (`AuthConfig::absolute_session_lifetime`) against a refresh token (and,
+    // where bound, a session key) that stays quietly compromised — and its
+    // own doc comment states the ceiling in terms of "authenticated
+    // (`auth/authenticate/0.2` or `/0.3`)", not just 0.3. `refresh_v2_arm`
+    // enforces it by reading this same meta row; a 0.2 login that never wrote
+    // one would refresh forever with no ceiling at all, exactly the
+    // unbounded-compromise case this config exists to close. So every login
+    // through this arm gets one too, with no `actor` — 0.2 has no proxied
+    // form.
+    //
+    // Keyed by `resp.session.id` (the DID-keyed session `handle_authenticate`
+    // just minted) — never the local `session_id` above, which is
+    // `payload.sessionId`, the just-released *challenge* row. See
+    // `authenticate_v3_arm`'s identical note.
+    store_auth_proxy_meta(
+        state,
+        &resp.session.id,
+        None,
+        now_epoch() + state.config.auth.absolute_session_lifetime,
+    )
+    .await
+    .map_err(|e| denied(&doc, "authenticate/meta", e))?;
+
     // The response echoes the bound key (`Session.sessionKey`), so the
     // producer can confirm the binding it asked for is the one it got.
     let mut value =
@@ -407,8 +431,16 @@ const MANDATE_EVIDENCE_KIND: &str = "mandateCredential";
 /// document minted for some *other* purpose — signed by the same principal,
 /// addressed to the same service, naming the same delegate by coincidence of
 /// field names — cannot be replayed here as a mandate it never was.
+///
+/// `local/…`, not `_local/…`: a Trust Task *Type URI* slug segment must start
+/// with an ASCII lowercase letter (SPEC.md §6.1's grammar; `TypeUri::from_str`
+/// enforces it), so a leading underscore fails to parse at all — every
+/// mandate a producer could ever present would be refused as "not a Trust
+/// Task document" before its own contents were ever checked, which is a
+/// silent, total outage of this evidence kind rather than the deliberate
+/// unenforced-kind refusal `delegationNotRecognized` is for.
 const MANDATE_EVIDENCE_TYPE_URI: &str =
-    "https://trusttasks.org/spec/_local/did-hosting-auth-mandate/0.1";
+    "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1";
 
 /// `payload.delegate` on a `mandateCredential`: the delegate the principal is
 /// entitling, which MUST equal the authenticate document's own signer.
@@ -711,9 +743,20 @@ async fn authenticate_v3_arm(
 
     state.pending_challenges.release_session(&session_id);
 
+    // Keyed by `resp.session.id` — the canonical, DID-keyed session id
+    // `handle_authenticate` just minted — never `session_id` above, which is
+    // `payload.sessionId`, the now-consumed *challenge*'s row. The two are
+    // different identifiers throughout the session's whole life (a fresh
+    // login mints a new challenge id every time; the authenticated session id
+    // is the subject's own DID and outlives it), and `refresh_v2_arm` reads
+    // this row back keyed by the former, not the latter. Keying the write by
+    // the challenge id silently orphaned every meta row the instant the
+    // challenge it was written under was released a line above — no refresh
+    // could ever find it again, so neither the absolute lifetime cap nor
+    // `actor` ever actually reached a refresh.
     let absolute_expires_at = now_epoch() + state.config.auth.absolute_session_lifetime;
     let actor = proxied.then(|| signer_did.clone());
-    store_auth_proxy_meta(state, &session_id, actor.clone(), absolute_expires_at)
+    store_auth_proxy_meta(state, &resp.session.id, actor.clone(), absolute_expires_at)
         .await
         .map_err(|e| denied(&doc, "authenticate/meta", e))?;
 
@@ -761,15 +804,22 @@ async fn refresh_v1_arm(
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
 }
 
-/// A minimal probe carrying only `doc`'s `id`, `type` and `proof` — enough
-/// for [`crate::routes::auth::verify_session_bound_proof`], which reads
-/// `proof` alone. Built rather than reusing `doc` directly because that
-/// function's signature predates the typed `refresh::Payload` and takes the
-/// framework's untyped `TrustTask<Value>`.
-fn proof_probe<P>(doc: &TrustTask<P>) -> TrustTask<Value> {
-    let mut probe = TrustTask::new(doc.id.clone(), doc.type_uri.clone(), Value::Null);
-    probe.proof = doc.proof.clone();
-    probe
+/// Re-type `doc` as the framework's untyped `TrustTask<Value>`, for
+/// [`crate::routes::auth::verify_session_bound_proof`], whose signature
+/// predates the typed `refresh::Payload`.
+///
+/// MUST carry every member exactly as received — `issuer`, `recipient`,
+/// `issuedAt` and the real `payload` alongside `id`/`type`/`proof` — not a
+/// reconstruction with the payload nulled out. A Data Integrity proof signs
+/// the whole document (canonicalised, minus `proof` itself); verifying it
+/// against anything else, however "unused" that field looks, recomputes a
+/// different hash than the one the signature covers and can never succeed.
+/// An earlier version of this helper built a stripped `{id, type, proof}`
+/// probe on exactly that mistaken premise — a session that bound a key could
+/// then never pass its own binding check, on this refresh version alone.
+fn proof_probe<P: serde::Serialize>(doc: &TrustTask<P>) -> TrustTask<Value> {
+    let value = serde_json::to_value(doc).expect("TrustTask serialises");
+    serde_json::from_value(value).expect("TrustTask<Value> re-parses from its own serialisation")
 }
 
 #[allow(clippy::result_large_err)]

@@ -15,9 +15,14 @@ import {
   signEnvelope,
 } from "./session-key";
 // `trust-task.ts` imports `clearToken`/`getSessionSubjectDid` from this
-// module — both only called inside function bodies here and there, so the
-// cycle resolves fine under ES module semantics.
-import { TRUST_TASKS_PATH, getServiceInfo } from "./trust-task";
+// module, so a static top-level import back the other way is a genuine
+// cycle, not one that "resolves fine": `trust-task.ts` declares `class
+// TrustTaskRejection extends ApiError` at module-eval time, and whichever of
+// the two modules a caller reaches first leaves the other only partially
+// evaluated when that class body runs — `ApiError` is still unbound and the
+// `extends` throws. A dynamic `import()` inside `renewIfNeeded` below defers
+// the load until first call, by which point both modules have finished
+// evaluating.
 
 const TOKEN_KEY = "webvh_token";
 const REFRESH_TOKEN_KEY = "webvh_refresh_token";
@@ -133,6 +138,7 @@ export async function renewIfNeeded(): Promise<void> {
       }
       if (!hasSessionKeypair()) return;
 
+      const { TRUST_TASKS_PATH, getServiceInfo } = await import("./trust-task");
       const { serviceDid } = await getServiceInfo();
       let envelope: Record<string, unknown> = {
         type: REFRESH_TASK_URI,

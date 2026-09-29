@@ -1,22 +1,34 @@
-//! The browser sign-in the control plane still serves over plain HTTP:
-//! `POST /api/auth/challenge` then `POST /api/auth/` with a SIOPv2 `id_token`,
-//! driven against the real Axum router (`routes::router_without_fallback`)
-//! via `tower::ServiceExt::oneshot`.
+//! The VTA-proxied SIOPv2 sign-in: `POST /api/auth/challenge` (still plain
+//! REST — see `routes/mod.rs`) then a proxied `auth/authenticate/0.3` over
+//! `POST /api/trust-tasks`, driven against the real Axum router
+//! (`routes::router_without_fallback`) via `tower::ServiceExt::oneshot`.
 //!
-//! An ACL entry is what lets a subject obtain a session. The *challenge* is
-//! issued to anyone — vti-common's canonical handler deliberately does not
-//! gate it (VTI-SES-006: answering only known subjects is an enumeration
-//! oracle) — so the ACL is read where the challenge is redeemed. The entry
-//! `acl::seed_provisioning_vta_acl` writes at setup grants the provisioning
-//! VTA an **admin** session.
+//! Mirrors the did-hosting UI's own client
+//! (`wallet-login.ts::authenticateIdTokenBindingSessionKey`): a fresh
+//! ephemeral `did:key` is the document's own `issuer` — the *delegate* the
+//! proxied form names, whose framework `proof` the control plane verifies
+//! exactly as any other authenticate signer — and the persona's SIOPv2
+//! `id_token` (signed by the persona's own key) becomes
+//! `payload.delegationEvidence` (`kind: "siopIdToken"`), naming
+//! `payload.principal` as the persona actually being authenticated. The
+//! challenge is requested, unauthenticated, naming the persona directly (the
+//! REST endpoint answers any subject — VTI-SES-006/007 — so identity is
+//! established only at authenticate time, by the framework proof plus the
+//! delegation evidence, never by the challenge request).
 //!
-//! The route takes only the SIOPv2 envelope. The DIDComm-v2 JWS dialect it
-//! used to accept beside it is gone: a peer that signs its own documents
-//! signs in with `auth/authenticate` over `POST /api/trust-tasks`.
+//! An ACL entry is what lets a subject obtain a session: the *challenge* is
+//! issued to anyone, but only an enrolled persona's evidence redeems into
+//! one. The entry `acl::seed_provisioning_vta_acl` writes at setup grants the
+//! provisioning VTA an **admin** session.
+//!
+//! The DIDComm-v2 JWS dialect this used to accept is gone entirely: a peer
+//! that signs its own documents signs in with `auth/authenticate` over
+//! `POST /api/trust-tasks` — the framework's own proof, not a bespoke JWS.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use affinidi_data_integrity::DidKeyResolver;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
 use affinidi_tdk::didcomm::Message;
@@ -34,6 +46,7 @@ use did_hosting_common::server::store::Store;
 use did_hosting_common::server::store::{
     KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
+use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_control::auth::jwt::JwtKeys;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::server::AppState;
@@ -103,6 +116,13 @@ async fn make_harness() -> Harness {
             .0,
     );
 
+    // Every reply on `/api/trust-tasks` is a signed Trust Task document
+    // (`doc.respond_with`/`reject_with`), so the node needs a signing
+    // identity for its own DID — REST replies never needed one.
+    let identity = did_hosting_common::server::identity::ServiceIdentity::generated_for(RP_DID)
+        .await
+        .expect("test identity");
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -112,8 +132,15 @@ async fn make_harness() -> Harness {
         config: Arc::new(config),
         did_resolver: Some(did_resolver),
         secrets_resolver: Some(secrets_resolver),
-        identity: None,
-        trust_tasks_verifier: None,
+        identity: Some(identity),
+        // `auth/authenticate/0.3` documents now travel over `/api/trust-tasks`
+        // (see the module doc), so the outer envelope's framework proof —
+        // the *delegate*'s own signature, independent of the SIOP `id_token`
+        // inside `delegationEvidence` — needs a verifier configured. A
+        // `did:key` resolver is enough: every identity here is one.
+        trust_tasks_verifier: Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
+            DidKeyResolver,
+        )))),
         jwt_keys: Some(jwt_keys),
         webauthn: None,
         http_client: reqwest::Client::new(),
@@ -196,7 +223,10 @@ fn challenge_request(did: &str) -> Request<Body> {
 
 /// A DIDComm-v2 JWS authenticate envelope — the retired dialect: type
 /// `spec/auth/authenticate/0.1`, body `{session_id, challenge}`, addressed to
-/// the control plane and JWS-packed with the identity's Ed25519 key.
+/// the control plane and JWS-packed with the identity's Ed25519 key. Posted as
+/// a raw string body to `/api/trust-tasks`, which expects a plain JSON Trust
+/// Task document — a packed JWS is neither, so this is refused before it is
+/// ever a candidate for an auth dialect at all.
 fn didcomm_authenticate_body(
     id: &KeyIdentity,
     session_id: &str,
@@ -216,21 +246,9 @@ fn didcomm_authenticate_body(
     pack_signed(&msg, &id.kid, &id.signing_key_bytes).expect("pack_signed")
 }
 
-/// Build a SIOPv2 id_token Trust-Task envelope.
-fn siop_authenticate_body(id: &KeyIdentity, session_id: &str, challenge: &str, now: u64) -> String {
-    siop_authenticate_body_binding(id, session_id, challenge, now, None)
-}
-
-/// As [`siop_authenticate_body`], optionally naming a
-/// `session_pubkey_b58btc` for the session to be bound to — what the Web UI's
-/// wallet proxy login sends.
-fn siop_authenticate_body_binding(
-    id: &KeyIdentity,
-    session_id: &str,
-    challenge: &str,
-    now: u64,
-    session_pubkey: Option<&str>,
-) -> String {
+/// A SIOPv2 self-issued `id_token`: `iss`/`sub` is `id`, `aud` is the control
+/// plane, `nonce` is the challenge this login is redeeming.
+fn siop_id_token(id: &KeyIdentity, challenge: &str, now: u64) -> String {
     let header = json!({ "alg": "EdDSA", "typ": "JWT", "kid": id.kid });
     let payload = json!({
         "iss": id.did,
@@ -244,23 +262,89 @@ fn siop_authenticate_body_binding(
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let signing_input = format!("{header_b64}.{payload_b64}");
     let sig = id.signing_key.sign(signing_input.as_bytes());
-    let id_token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
-
-    let mut envelope = json!({
-        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/auth/authenticate/0.1",
-        "payload": { "id_token": id_token, "session_id": session_id },
-    });
-    if let Some(pk) = session_pubkey {
-        envelope["payload"]["session_pubkey_b58btc"] = json!(pk);
-    }
-    serde_json::to_string(&envelope).unwrap()
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
 
-fn authenticate_request(body: String) -> Request<Body> {
+/// A `Secret` over the same key material as `id`, for signing the outer
+/// Trust Task envelope's framework `proof` (Data Integrity, not the SIOP
+/// JWT — the two are independent signatures per `auth/authenticate/0.3`
+/// Conformance item 3).
+fn secret_for(id: &KeyIdentity) -> affinidi_tdk::secrets_resolver::secrets::Secret {
+    let secret = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(
+        None,
+        Some(&id.signing_key_bytes),
+    );
+    let mut secret = secret;
+    secret.id = id.kid.clone();
+    secret
+}
+
+/// Sign `doc` (proof-less) with `id`'s key, `proofPurpose: authentication`.
+async fn sign_envelope(doc: Value, id: &KeyIdentity) -> Value {
+    let typed: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(doc).unwrap();
+    let canonical = serde_json::to_value(&typed).unwrap();
+    let proof = affinidi_data_integrity::DataIntegrityProof::sign(
+        &canonical,
+        &secret_for(id),
+        affinidi_data_integrity::SignOptions::new().with_proof_purpose("authentication"),
+    )
+    .await
+    .expect("sign");
+    let mut out = canonical;
+    out["proof"] = serde_json::to_value(&proof).unwrap();
+    out
+}
+
+/// Build a proxied `auth/authenticate/0.3` document: `delegate` signs as
+/// `issuer`, naming `principal` as the persona being authenticated, with a
+/// `siopIdToken` naming `principal`'s own SIOPv2 token as delegation
+/// evidence — exactly the shape `wallet-login.ts`'s
+/// `authenticateIdTokenBindingSessionKey` sends.
+async fn proxied_authenticate_body(
+    delegate: &KeyIdentity,
+    principal: &KeyIdentity,
+    session_id: &str,
+    challenge: &str,
+    now: u64,
+    session_key: Option<&str>,
+) -> Value {
+    let id_token = siop_id_token(principal, challenge, now);
+    let mut payload = json!({
+        "challenge": challenge,
+        "sessionId": session_id,
+        "principal": principal.did,
+        "delegationEvidence": {
+            "kind": "siopIdToken",
+            "credential": { "idToken": id_token },
+        },
+    });
+    if let Some(k) = session_key {
+        payload["sessionKey"] = json!(k);
+    }
+    let doc = json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/auth/authenticate/0.3",
+        "issuer": delegate.did,
+        "recipient": RP_DID,
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": payload,
+    });
+    sign_envelope(doc, delegate).await
+}
+
+fn authenticate_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/api/auth/")
+        .uri("/api/trust-tasks")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn junk_authenticate_request(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/trust-tasks")
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
@@ -320,6 +404,7 @@ async fn do_challenge(state: &AppState, did: &str) -> (StatusCode, String, Strin
 async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
     let harness = make_harness().await;
     let vta = key_identity([11u8; 32]);
+    let delegate = key_identity([111u8; 32]);
 
     let (status, session_id, challenge) = do_challenge(&harness.state, &vta.did).await;
     assert_eq!(
@@ -330,16 +415,19 @@ async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
     );
 
     // The redemption is where authority is decided, and there is none.
-    let body = siop_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let body =
+        proxied_authenticate_body(&delegate, &vta, &session_id, &challenge, now_secs(), None).await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
         .await
         .unwrap();
+    let status = resp.status();
+    let out = read_json(resp.into_body()).await;
     assert_ne!(
-        resp.status(),
+        status,
         StatusCode::OK,
-        "un-authorized VTA DID must not obtain a session"
+        "un-authorized VTA DID must not obtain a session: {out}"
     );
 }
 
@@ -350,6 +438,7 @@ async fn unauthorized_vta_gets_a_challenge_it_cannot_redeem() {
 async fn the_provisioning_vta_seed_grants_an_admin_session() {
     let harness = make_harness().await;
     let vta = key_identity([22u8; 32]);
+    let delegate = key_identity([122u8; 32]);
 
     // Setup-time seed: authorize the provisioning VTA.
     let created = seed_provisioning_vta_acl(&harness.state.acl_ks, &vta.did)
@@ -365,7 +454,8 @@ async fn the_provisioning_vta_seed_grants_an_admin_session() {
         "seeded VTA passes the challenge gate"
     );
 
-    let body = siop_authenticate_body(&vta, &session_id, &challenge, now_secs());
+    let body =
+        proxied_authenticate_body(&delegate, &vta, &session_id, &challenge, now_secs(), None).await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
@@ -379,14 +469,21 @@ async fn the_provisioning_vta_seed_grants_an_admin_session() {
 
     let out = read_json(resp.into_body()).await;
     assert_eq!(
-        out["session"]["subject"].as_str(),
+        out["payload"]["session"]["subject"].as_str(),
         Some(vta.did.as_str()),
-        "session subject is the VTA DID"
+        "session subject is the VTA persona, not the delegate that signed"
+    );
+    assert_eq!(
+        out["payload"]["session"]["actor"].as_str(),
+        Some(delegate.did.as_str()),
+        "session actor records the delegate that opened it"
     );
     // The seeded entry is Admin, so the issued session carries the admin
     // role — the role that bypasses the per-DID ownership check on the
     // publish endpoints.
-    let access_token = out["tokens"]["accessToken"].as_str().expect("access token");
+    let access_token = out["payload"]["tokens"]["accessToken"]
+        .as_str()
+        .expect("access token");
     let claims = decode_jwt_claims(access_token);
     assert_eq!(
         claims["role"].as_str(),
@@ -410,7 +507,7 @@ async fn a_didcomm_jws_sign_in_is_refused() {
     let body = didcomm_authenticate_body(&vta, &session_id, &challenge, now_secs());
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
-        .oneshot(authenticate_request(body))
+        .oneshot(junk_authenticate_request(body))
         .await
         .unwrap();
     assert!(
@@ -420,11 +517,13 @@ async fn a_didcomm_jws_sign_in_is_refused() {
     );
 }
 
-/// The SIOPv2 id_token sign-in authenticates.
+/// The SIOPv2 id_token sign-in, wrapped as a proxied `auth/authenticate/0.3`,
+/// authenticates.
 #[tokio::test]
 async fn siop_id_token_authenticate_works() {
     let harness = make_harness().await;
     let wallet = key_identity([33u8; 32]);
+    let delegate = key_identity([133u8; 32]);
 
     // Wallet is an Owner (the passkey/SIOP enrolment role).
     seed_owner(&harness.state, &wallet.did).await;
@@ -432,46 +531,58 @@ async fn siop_id_token_authenticate_works() {
     let (status, session_id, challenge) = do_challenge(&harness.state, &wallet.did).await;
     assert_eq!(status, StatusCode::OK);
 
-    let body = siop_authenticate_body(&wallet, &session_id, &challenge, now_secs());
+    let body = proxied_authenticate_body(
+        &delegate,
+        &wallet,
+        &session_id,
+        &challenge,
+        now_secs(),
+        None,
+    )
+    .await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "SIOPv2 id_token path must remain unchanged (additive change)"
-    );
+    let status = resp.status();
     let out = read_json(resp.into_body()).await;
     assert_eq!(
-        out["session"]["subject"].as_str(),
+        status,
+        StatusCode::OK,
+        "SIOPv2 id_token delegation evidence must authenticate the persona: {out}"
+    );
+    assert_eq!(
+        out["payload"]["session"]["subject"].as_str(),
         Some(wallet.did.as_str())
     );
 }
 
-/// The wallet proxy login binds the Web UI's session key through this route:
-/// the VTA mints the `id_token`, and the page — which holds the key — sends
-/// `session_pubkey_b58btc` beside it. The key must land on the session row,
-/// which is what lets it sign the session's calls in place of the wallet.
+/// The wallet proxy login binds the Web UI's session key through this
+/// document: a fresh `did:key` is both the document's own `issuer` (the
+/// delegate) and, named again as `sessionKey`, the key the control plane
+/// binds to the new session — see `wallet-login.ts`. The key must land on
+/// the session row, which is what lets it sign the session's later calls in
+/// place of the wallet.
 #[tokio::test]
 async fn siop_id_token_authenticate_binds_a_session_key() {
     let harness = make_harness().await;
     let persona = key_identity([34u8; 32]);
-    let browser = key_identity([35u8; 32]);
-    let browser_pk = browser.did.trim_start_matches("did:key:").to_string();
+    let delegate = key_identity([35u8; 32]);
     seed_owner(&harness.state, &persona.did).await;
 
     let (status, session_id, challenge) = do_challenge(&harness.state, &persona.did).await;
     assert_eq!(status, StatusCode::OK);
 
-    let body = siop_authenticate_body_binding(
+    let body = proxied_authenticate_body(
+        &delegate,
         &persona,
         &session_id,
         &challenge,
         now_secs(),
-        Some(&browser_pk),
-    );
+        Some(&delegate.did),
+    )
+    .await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
@@ -479,7 +590,9 @@ async fn siop_id_token_authenticate_binds_a_session_key() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let out = read_json(resp.into_body()).await;
-    let bound_session = out["session"]["id"].as_str().expect("session id");
+    let bound_session = out["payload"]["session"]["id"]
+        .as_str()
+        .expect("session id");
 
     let session = did_hosting_common::server::auth::session::get_session(
         &harness.state.sessions_ks,
@@ -491,37 +604,39 @@ async fn siop_id_token_authenticate_binds_a_session_key() {
     assert_eq!(session.did, persona.did);
     assert_eq!(
         session.session_pubkey_b58btc.as_deref(),
-        Some(browser_pk.as_str())
+        Some(delegate.did.trim_start_matches("did:key:"))
     );
 }
 
-/// A `session_pubkey_b58btc` that only *looks* like an Ed25519 multikey — the
-/// right `z6Mk` prefix over bytes that are not one — is refused, not stored:
-/// a bound key whose every later proof fails would leave the producer with a
+/// A `sessionKey` that only *looks* like an Ed25519 `did:key` — the right
+/// `z6Mk` prefix over bytes that are not one — is refused, not stored: a
+/// bound key whose every later proof fails would leave the producer with a
 /// session it believes works. Refused before the challenge is spent, so the
 /// same challenge still redeems.
 #[tokio::test]
 async fn siop_id_token_authenticate_refuses_a_malformed_session_key() {
     let harness = make_harness().await;
     let persona = key_identity([36u8; 32]);
-    let browser = key_identity([37u8; 32]);
-    let pk = browser.did.trim_start_matches("did:key:").to_string();
+    let delegate = key_identity([37u8; 32]);
     seed_owner(&harness.state, &persona.did).await;
 
     let (status, session_id, challenge) = do_challenge(&harness.state, &persona.did).await;
     assert_eq!(status, StatusCode::OK);
 
-    let truncated = pk[..pk.len() - 4].to_string();
-    let not_base58 = format!("z6Mk{}", "0OIl".repeat(10));
-    let extended = format!("{pk}zz");
+    let pk = delegate.did.trim_start_matches("did:key:").to_string();
+    let truncated = format!("did:key:{}", &pk[..pk.len() - 4]);
+    let not_base58 = format!("did:key:z6Mk{}", "0OIl".repeat(10));
+    let extended = format!("{}zz", delegate.did);
     for bad in [truncated.as_str(), not_base58.as_str(), extended.as_str()] {
-        let body = siop_authenticate_body_binding(
+        let body = proxied_authenticate_body(
+            &delegate,
             &persona,
             &session_id,
             &challenge,
             now_secs(),
             Some(bad),
-        );
+        )
+        .await;
         let resp = did_hosting_control::routes::router_without_fallback()
             .with_state(harness.state.clone())
             .oneshot(authenticate_request(body))
@@ -534,7 +649,15 @@ async fn siop_id_token_authenticate_refuses_a_malformed_session_key() {
         );
     }
 
-    let body = siop_authenticate_body(&persona, &session_id, &challenge, now_secs());
+    let body = proxied_authenticate_body(
+        &delegate,
+        &persona,
+        &session_id,
+        &challenge,
+        now_secs(),
+        None,
+    )
+    .await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
         .oneshot(authenticate_request(body))
@@ -553,7 +676,7 @@ async fn a_junk_body_is_a_malformed_request() {
     let harness = make_harness().await;
     let resp = did_hosting_control::routes::router_without_fallback()
         .with_state(harness.state.clone())
-        .oneshot(authenticate_request(
+        .oneshot(junk_authenticate_request(
             "{\"not\":\"an envelope\"}".to_string(),
         ))
         .await

@@ -278,12 +278,24 @@ pub async fn dispatch_trust_task(
         // The framework outcome keeps its reject code, which is the whole reason
         // the router hands it back whole: SPEC's status table is HTTPS's alone.
         crate::messaging::RoutedReply::Framework(outcome) => Ok(into_response(*outcome)),
-        crate::messaging::RoutedReply::Document(value) => Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::to_vec(&value).expect("Trust Task response serialises"),
-        )
-            .into_response()),
+        crate::messaging::RoutedReply::Document(value) => {
+            // `trust_tasks_auth::dispatch` (the auth family's own local
+            // dispatcher — see `messaging::route_trust_task_doc`) hands back a
+            // bare serialised document, success or `trust-task-error` alike,
+            // with no `DispatchOutcome` wrapper to carry a status through. A
+            // refusal — `delegationNotRecognized`, `sessionKeyProofRequired`,
+            // `sessionLifetimeExceeded`, every code this family raises —
+            // answered `200 OK` would tell a caller that gates on the status
+            // line, before ever reading the body, that its login or refresh
+            // succeeded. Map it through the same table `into_response` uses.
+            let status = document_status(&value);
+            Ok((
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_vec(&value).expect("Trust Task response serialises"),
+            )
+                .into_response())
+        }
         crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -364,6 +376,38 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             StatusCode::NO_CONTENT.into_response()
         }
     }
+}
+
+/// The status for a bare serialised reply document from
+/// `trust_tasks_auth::dispatch` — `200` for a success (or anything not shaped
+/// like a framework error), and [`status_for_code`]'s mapping for a
+/// `trust-task-error` document, exactly as [`into_response`] applies it to a
+/// routed [`DispatchOutcome::Rejected`].
+fn document_status(value: &Value) -> StatusCode {
+    let error_type_uri =
+        did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string();
+    let is_error = value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|t| t == error_type_uri)
+        .unwrap_or(false);
+    if !is_error {
+        return StatusCode::OK;
+    }
+    let Some(code) = value
+        .get("payload")
+        .and_then(|p| p.get("code"))
+        .and_then(Value::as_str)
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    let Ok(code) = code.parse::<trust_tasks_rs::TrustTaskCode>() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    StatusCode::from_u16(status_for_code(&code)).unwrap_or_else(|_| {
+        tracing::error!(code = %code, "unexpected status code from status_for_code");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[cfg(test)]
