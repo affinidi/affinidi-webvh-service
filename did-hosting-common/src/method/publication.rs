@@ -120,7 +120,10 @@ impl Publication {
 // by methods that need them — `existing`/`existing_witness` by webvh and
 // webs, `domain`/`mnemonic` by webs alone. They stay in the signature when a
 // method is compiled out so callers do not need their own cfg.
-#[cfg_attr(not(feature = "method-webs"), allow(unused_variables))]
+#[cfg_attr(
+    any(not(feature = "method-webs"), not(feature = "method-webvh")),
+    allow(unused_variables)
+)]
 pub fn verify_publication(
     domain: &str,
     mnemonic: &str,
