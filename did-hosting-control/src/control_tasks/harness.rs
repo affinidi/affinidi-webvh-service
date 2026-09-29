@@ -292,6 +292,25 @@ pub(crate) fn conforms(reply: &Value) {
     }
 }
 
+/// A live session for `caller`, as a login would leave it.
+pub(crate) async fn session_for(
+    state: &AppState,
+    caller: &Caller,
+) -> did_hosting_common::server::auth::session::TokenResponse {
+    did_hosting_common::server::auth::session::create_authenticated_session(
+        &state.sessions_ks,
+        state.jwt_keys.as_deref().unwrap(),
+        &caller.did,
+        &caller.role,
+        900,
+        3600,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
 /// Seed a published record owned by `owner`, with its owner index.
 pub(crate) async fn seed_did(state: &AppState, owner: &str, mnemonic: &str) -> DidRecord {
     let record = DidRecord {

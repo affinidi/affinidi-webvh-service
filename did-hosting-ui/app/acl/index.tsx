@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { PasskeysCard } from "../../components/PasskeysCard";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import {
   formatBytes,
@@ -266,6 +267,8 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
   onChangeScope,
+  passkeysExpanded,
+  onTogglePasskeys,
 }: {
   item: AclEntry;
   editing: EditState | null;
@@ -280,11 +283,14 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
   onChangeScope: (next: ScopeDraft) => void;
+  passkeysExpanded: boolean;
+  onTogglePasskeys: (did: string) => void;
 }) {
   const isEditing = editing?.did === item.did;
   const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
 
   return (
+    <View>
     <View style={styles.entryCard}>
       <View style={styles.entryInfo}>
         <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
@@ -423,11 +429,26 @@ const AclEntryRow = memo(function AclEntryRow({
             <Text style={styles.editText}>Edit</Text>
           </Pressable>
           <Pressable
+            style={styles.editButton}
+            onPress={() => onTogglePasskeys(item.did)}
+          >
+            <Text style={styles.editText}>
+              {passkeysExpanded ? "Hide passkeys" : "Passkeys"}
+            </Text>
+          </Pressable>
+          <Pressable
             style={styles.deleteButton}
             onPress={() => onDelete(item.did)}
           >
             <Text style={styles.deleteText}>Remove</Text>
           </Pressable>
+        </View>
+      )}
+    </View>
+      {passkeysExpanded && (
+        <View style={styles.passkeysPanel}>
+          <PasskeysCard subject={item.did} purpose="session" title="Sign-in passkeys" />
+          <PasskeysCard subject={item.did} purpose="stepUp" title="Step-up passkeys" />
         </View>
       )}
     </View>
@@ -500,6 +521,18 @@ export default function AclManagement() {
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Which entries' passkey panel is expanded — a lost passkey is recovered
+  // here: an administrator revokes the missing credential, then re-invites.
+  const [expandedPasskeys, setExpandedPasskeys] = useState<Set<string>>(new Set());
+  const togglePasskeys = useCallback((did: string) => {
+    setExpandedPasskeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(did)) next.delete(did);
+      else next.add(did);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(() => {
     if (!isAuthenticated) {
@@ -788,6 +821,8 @@ export default function AclManagement() {
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
       onChangeScope={onChangeScope}
+      passkeysExpanded={expandedPasskeys.has(item.did)}
+      onTogglePasskeys={togglePasskeys}
     />
   );
 
@@ -1354,6 +1389,10 @@ const styles = StyleSheet.create({
   },
   entryActions: {
     gap: spacing.xs,
+  },
+  passkeysPanel: {
+    marginTop: spacing.md,
+    gap: spacing.sm,
   },
   editButton: {
     borderColor: colors.accent,

@@ -145,3 +145,29 @@ tempfile = "3"
 # verifier tests; dev-only, so never part of a release build.
 did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
 trust-tasks-rs = { workspace = true }
+# `tests/e2e_*.rs`: real daemon (bin) + distributed-mode (in-process) end to
+# end smoke tests, driven across TSP, DIDComm and HTTPS.
+uuid = { workspace = true }
+chrono = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-data-integrity = { workspace = true }
+didwebvh-rs = { workspace = true }
+# Embedded mediator fixture — same pin `did-hosting-control`'s own
+# `tests/mediator_replication_smoke.rs` uses; see the note there. Unlike that
+# file, this workspace's tests drive genuine TSP traffic through it (the
+# admin RPC client's TSP transport), so — unlike every other consumer of this
+# dependency in the workspace — the `tsp` feature is turned on here.
+affinidi-messaging-test-mediator = { version = "0.14.0", features = ["tsp"] }
+# A hand-rolled capturing `TspHandler` for the e2e admin RPC client (there is
+# no library-provided one — every other TSP-driving test in this workspace
+# dispatches in-process instead of over a real socket).
+async-trait = "0.1"
+# Reads the body out of an in-process `axum::response::Response` when
+# checking the edge's HTTP resolution and driving the daemon's HTTPS API.
+http-body-util = "0.1"
+# `HostPolicy::AllowPrivate` — the daemon-mode e2e test's own DID resolver
+# has to resolve a real did:webvh whose host is `localhost`, which the
+# resolver's default `PublicOnly` policy refuses (SSRF hardening that a
+# same-machine test has no use for).
+affinidi-did-web = "0.1"

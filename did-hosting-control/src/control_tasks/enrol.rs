@@ -72,7 +72,7 @@ const DEFAULT_ROLE: &str = "owner";
 /// truncate to).
 const MAX_ENTITY_NAME: usize = 64;
 
-fn require_webauthn(state: &AppState) -> Result<&webauthn_rs::Webauthn, TaskError> {
+pub(crate) fn require_webauthn(state: &AppState) -> Result<&webauthn_rs::Webauthn, TaskError> {
     state.webauthn.as_deref().ok_or_else(|| {
         TaskError::Standard(
             StandardCode::Unavailable,
@@ -82,7 +82,10 @@ fn require_webauthn(state: &AppState) -> Result<&webauthn_rs::Webauthn, TaskErro
 }
 
 /// The credential store for `purpose`. Nothing else chooses one.
-fn credential_store(state: &AppState, purpose: Purpose) -> Result<KeyspaceHandle, TaskError> {
+pub(crate) fn credential_store(
+    state: &AppState,
+    purpose: Purpose,
+) -> Result<KeyspaceHandle, TaskError> {
     Ok(match purpose {
         Purpose::Session => state.sessions_ks.clone(),
         Purpose::StepUp => state.store.keyspace(KS_PASSKEY_STEP_UP)?,
@@ -172,7 +175,7 @@ fn creation_options(ccr: &CreationChallengeResponse) -> Result<Value, TaskError>
 }
 
 /// Request options in the shape the shared WebAuthn schema allows.
-fn uv_options(rcr: &RequestChallengeResponse) -> Result<Value, TaskError> {
+pub(crate) fn uv_options(rcr: &RequestChallengeResponse) -> Result<Value, TaskError> {
     let value = serde_json::to_value(rcr)?;
     let pk = value.get("publicKey").cloned().unwrap_or(value);
     let mut out = pick(
@@ -358,12 +361,30 @@ async fn persist(
     if let Some(label) = label {
         user.labels.insert(id.clone(), label.to_string());
     }
+    user.registered_at.insert(id.clone(), now_epoch());
     let mut batch = state.store.batch();
     pk::stage_new_credential(&mut batch, &store, user, &id)?;
     if let Some(entry) = acl_entry.as_ref() {
         acl::stage_acl_entry(&mut batch, &state.acl_ks, entry)?;
     }
     batch.commit().await?;
+
+    // `auth/passkey/enroll` SHOULD notify the subject when a credential is
+    // newly bound to their DID, so they can catch one they didn't request.
+    // This service has no subject-facing push channel today (no messaging
+    // endpoint is recorded independent of the credential/session itself, and
+    // the control-plane outbox is durable delivery for control-to-server
+    // sync, not subject notices) — so until one exists, this audit event
+    // *is* the notification: any external audit or alerting pipeline reading
+    // this service's `target: "audit"` stream can act on it.
+    info!(
+        target: "audit",
+        event = "passkey.bound.notify",
+        subject = %user.did,
+        purpose = purpose.as_str(),
+        credential_id = %id,
+        "passkey bound to subject: notification (audit trail only; no subject-facing channel configured)"
+    );
     Ok(())
 }
 
@@ -620,6 +641,10 @@ pub(crate) async fn redeem_finish(
     }
 
     let store = credential_store(state, ceremony.purpose)?;
+    // Held from this read through `persist`, so a concurrent revoke can't be
+    // lost under this write (nor this credential under the revoke's).
+    let _guard =
+        super::passkey::credentials_guard(state, ceremony.purpose, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&store, &ceremony.subject).await?;
     let uv = p
         .uv_credential
@@ -795,6 +820,8 @@ pub(crate) async fn finish(
             "this enrolment was started by another subject or session".into(),
         ));
     }
+    let _guard =
+        super::passkey::credentials_guard(state, Purpose::Session, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&state.sessions_ks, &ceremony.subject).await?;
     if existing
         .as_ref()

@@ -16,6 +16,7 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showConfirm } from "../../lib/alert";
 import { useAgentNames } from "../../lib/use-agent-names";
 import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
+import { PasskeysCard } from "../../components/PasskeysCard";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -207,13 +208,17 @@ export default function SettingsPage() {
     );
   }
 
+  // Everything below "My Passkeys" is control-plane topology, admin only.
+  // Passkeys are the caller's own account, regardless of role.
   if (!isAdmin) {
     return (
-      <View style={styles.containerCenter}>
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
+        <Text style={styles.title}>Account Settings</Text>
+        <PasskeysCard title="My Passkeys" />
         <Text style={styles.hint}>
-          Settings are available to administrators only.
+          Control plane settings are available to administrators only.
         </Text>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -241,6 +246,8 @@ export default function SettingsPage() {
       contentContainerStyle={styles.container}
     >
       <Text style={styles.title}>Control Plane Settings</Text>
+
+      <PasskeysCard title="My Passkeys" />
 
       {/* Identity */}
       <View style={styles.card}>
