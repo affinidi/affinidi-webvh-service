@@ -59,6 +59,11 @@ pub struct AppState {
     /// witness has already witnessed, the signature, and the record of it are
     /// one step, so two forks of the same DID cannot both be witnessed.
     pub sign_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
+    /// the document's claimed issuer is checked against the ACL, so a single
+    /// address cannot force unbounded DID-resolution work by posting
+    /// documents that name a fresh issuer on every request.
+    pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
 }
 
 impl AppState {
@@ -86,6 +91,13 @@ impl AppState {
             acl_locks: PathLocks::new(),
             replay_cache: Arc::new(ReplayCache::new()),
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
         })
     }
 }
@@ -389,13 +401,16 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                let _ = rx.changed().await;
-            })
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
 
         info!("REST thread shutting down");
     });

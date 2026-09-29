@@ -99,6 +99,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         cache_invalidate: None,
     };

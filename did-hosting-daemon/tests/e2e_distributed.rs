@@ -206,6 +206,9 @@ impl Topology {
             ),
             ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
             // Distributed topology: the edge's cache is kept in step by its
             // own `webvh/sync/*` handling, not by this hook.
@@ -317,6 +320,14 @@ impl Topology {
             replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
             )),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         dirs.push(edge_dir);
         let edge_router = did_hosting_server::routes::router(1024 * 1024).with_state(edge.clone());

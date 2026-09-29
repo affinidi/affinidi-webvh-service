@@ -139,6 +139,12 @@ pub struct AppState {
     /// (`auth/passkey/enroll/redeem/start`). See
     /// [`crate::rate_limit::SourceRateLimiter`].
     pub redeem_rate_limiter: Arc<crate::rate_limit::SourceRateLimiter>,
+    /// Per-address budget for large documents (over the framework's default
+    /// 64 KiB) a claimed — not yet verified — known issuer is granted a
+    /// raised size limit for. See
+    /// [`did_hosting_common::server::trust_tasks::size`].
+    pub large_document_budget:
+        Arc<did_hosting_common::server::trust_tasks::size::LargeDocumentBudget>,
     /// Wakes the [`crate::outbox`] worker when a new entry lands in
     /// the durable outbound queue. The route handlers call
     /// `outbox::enqueue_and_notify`, which writes to fjall + fires
@@ -356,6 +362,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         pending_challenges: Arc::new(pending_challenges),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         // Standalone control plane: no content cache of its own to
         // invalidate. See the field doc.

@@ -70,6 +70,17 @@ pub struct AppState {
     /// How far this edge is behind its control plane — the reconcile loop
     /// writes it, `/api/health` and `server/metrics` read it.
     pub replication: Arc<crate::replication::ReplicationStatus>,
+    /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
+    /// the document's claimed issuer is checked against `control_did`, so a
+    /// single address cannot force unbounded DID-resolution work by posting
+    /// documents that name a fresh issuer on every request.
+    pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Serialises `sync/update`, `sync/batch` and `sync/delete`: each reads
+    /// what this edge holds for a slot, checks the new log extends it (or, for
+    /// a delete, reads the record to remove), and writes — two such
+    /// operations running at once could each pass their read-check against
+    /// the same stale state. Mirrors the watcher's `sync_lock`.
+    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -99,6 +110,14 @@ impl AppState {
             replication: Arc::new(crate::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
             )),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -758,13 +777,16 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                let _ = rx.changed().await;
-            })
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
 
         info!("REST thread shutting down");
     });

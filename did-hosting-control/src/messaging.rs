@@ -825,17 +825,30 @@ pub(crate) async fn run_trust_tasks_envelope(
     // refuses an oversized document before anything below does the
     // heavier work of typed parsing, proof verification or dispatch, which
     // is the property the gate exists for.
+    //
+    // A document large enough to need its claimed (not yet verified)
+    // issuer's ACL entry is charged against that sender's large-document
+    // budget first (`vid:{sender}` — the transport's own authenticated
+    // report of who sent it, not yet the document's proven issuer).
     let body_bytes = serde_json::to_vec(&message.body).unwrap_or_default();
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
-        &body_bytes,
-        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-        &state.acl_ks,
-    )
-    .await
-    {
-        let body = serde_json::to_value(&err).expect("trust-task-error document serialises");
-        return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
-    }
+    let large_doc_charge =
+        match did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+            &body_bytes,
+            &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+            &state.acl_ks,
+            &state.large_document_budget,
+            &format!("vid:{sender}"),
+            did_hosting_common::server::auth::session::now_epoch(),
+        )
+        .await
+        {
+            Ok(charge) => charge,
+            Err(err) => {
+                let body =
+                    serde_json::to_value(&err).expect("trust-task-error document serialises");
+                return Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body)));
+            }
+        };
 
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
         Ok(d) => d,
@@ -875,9 +888,17 @@ pub(crate) async fn run_trust_tasks_envelope(
     // `did-hosting/*/1.0` protocol, auth, infra, ACL + discovery, and the
     // legacy `MSG_*` bridge.
     let verifier = require_verifier(state)?;
-    match dispatch_trust_task_doc(state, sender, None, &transport, doc, verifier)
-        .await?
-        .into_document()
+    match dispatch_trust_task_doc(
+        state,
+        sender,
+        None,
+        &transport,
+        doc,
+        verifier,
+        large_doc_charge,
+    )
+    .await?
+    .into_document()
     {
         Some(body) => Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body))),
         None => {
@@ -1006,6 +1027,11 @@ impl RoutedReply {
 /// anonymous HTTPS request that names no issuer); `bearer` is the session an
 /// HTTPS request presented, when it presented one. Neither authorises anything
 /// on its own.
+///
+/// `large_doc_charge` is what the caller's own `size::check_for_known_issuer`
+/// returned, if this document was large enough to need one — settled below,
+/// once proof verification concludes, against exactly the address it was
+/// charged against.
 pub(crate) async fn dispatch_trust_task_doc(
     state: &AppState,
     sender: &str,
@@ -1013,6 +1039,7 @@ pub(crate) async fn dispatch_trust_task_doc(
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+    large_doc_charge: Option<did_hosting_common::server::trust_tasks::size::LargeDocumentCharge>,
 ) -> Result<RoutedReply, DIDCommServiceError> {
     // Fail closed: a control plane that cannot sign refuses to start (see
     // `signing::require_signing_identity`), and this is the same rule at
@@ -1041,7 +1068,16 @@ pub(crate) async fn dispatch_trust_task_doc(
             )));
         }
     };
-    let reply = route_trust_task_doc(state, sender, bearer, transport, doc, verifier).await?;
+    let reply = route_trust_task_doc(
+        state,
+        sender,
+        bearer,
+        transport,
+        doc,
+        verifier,
+        large_doc_charge,
+    )
+    .await?;
     Ok(seal_reply(state, &secret, sender, reply).await)
 }
 
@@ -1141,6 +1177,7 @@ async fn route_trust_task_doc(
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+    large_doc_charge: Option<did_hosting_common::server::trust_tasks::size::LargeDocumentCharge>,
 ) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
@@ -1296,6 +1333,15 @@ async fn route_trust_task_doc(
             }
             _ => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
         };
+        // Settle any large-document charge against this verification's own
+        // outcome — before the early return below, so a claimed issuer that
+        // failed to verify is penalised exactly as one that verified to
+        // someone else. See `size`'s module docs.
+        did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+            &state.large_document_budget,
+            large_doc_charge.as_ref(),
+            bound.as_ref().ok().map(String::as_str),
+        );
         match bound {
             Ok(principal) => principal,
             Err(e) => {
@@ -1546,6 +1592,9 @@ mod tests {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
             cache_invalidate: None,
         };

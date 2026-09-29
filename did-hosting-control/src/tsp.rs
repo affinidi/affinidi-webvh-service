@@ -105,16 +105,28 @@ pub(crate) async fn run_tsp_trust_task(
     // transports apply (`size`), so a `did/register` log too large for the
     // default here is refused identically on every transport rather than
     // only over HTTPS.
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
-        &document,
-        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-        &state.acl_ks,
-    )
-    .await
-    {
-        let body = serde_json::to_vec(&err).expect("trust-task-error serialises");
-        return Ok(Some(tsp_binding::frame(body, carriage)));
-    }
+    //
+    // A document large enough to need its claimed (not yet verified)
+    // issuer's ACL entry is charged against that sender's large-document
+    // budget first (`vid:{sender}` — the TSP-authenticated sender VID, not
+    // yet the document's proven issuer).
+    let large_doc_charge =
+        match did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+            &document,
+            &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+            &state.acl_ks,
+            &state.large_document_budget,
+            &format!("vid:{sender}"),
+            did_hosting_common::server::auth::session::now_epoch(),
+        )
+        .await
+        {
+            Ok(charge) => charge,
+            Err(err) => {
+                let body = serde_json::to_vec(&err).expect("trust-task-error serialises");
+                return Ok(Some(tsp_binding::frame(body, carriage)));
+            }
+        };
 
     let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_slice(&document) {
         Ok(d) => d,
@@ -152,9 +164,17 @@ pub(crate) async fn run_tsp_trust_task(
     // way — `into_document` is where that flattening belongs, beside the router
     // rather than in each binding.
     let verifier = crate::messaging::require_verifier(state)?;
-    match dispatch_trust_task_doc(state, sender, None, &transport, doc, verifier)
-        .await?
-        .into_document()
+    match dispatch_trust_task_doc(
+        state,
+        sender,
+        None,
+        &transport,
+        doc,
+        verifier,
+        large_doc_charge,
+    )
+    .await?
+    .into_document()
     {
         Some(value) => Ok(Some(tsp_binding::frame(
             serde_json::to_vec(&value).expect("response serialises"),
@@ -248,6 +268,9 @@ mod tests {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
             cache_invalidate: None,
         };

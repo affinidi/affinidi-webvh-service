@@ -146,6 +146,8 @@ async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option
             use http_body_util::BodyExt;
             let response = webvh_watcher::routes::trust_tasks::receive(
                 axum::extract::State(state.clone()),
+                axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+                axum::http::HeaderMap::new(),
                 axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
             )
             .await
@@ -193,15 +195,6 @@ fn refused(reply: &Value, to: &str) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
-}
-
-/// The spec slug of a Type URI: `webvh/sync/update` for `…/webvh/sync/update/0.2`.
-fn slug(type_uri: &str) -> &str {
-    type_uri
-        .trim_start_matches("https://trusttasks.org/spec/")
-        .rsplit_once('/')
-        .unwrap()
-        .0
 }
 
 /// A did:webvh log for `mnemonic` on `origin.example.com`: one entry, or two
@@ -384,10 +377,13 @@ async fn unverified_documents_get_no_reply() {
     }
 }
 
-/// The source-DID allowlist: a validly signed sync from a DID that is not a
-/// configured source is refused with the task's `notAuthorized`, applies
-/// nothing, and takes no room in the replay cache — the same document resent
-/// is refused again, not dropped as a replay.
+/// The source-DID allowlist: a claimed issuer that is not a configured
+/// source is refused before its proof is ever checked — no reply at all,
+/// exactly like a document that never verified (the pre-check in
+/// `dispatch_inbound_document` compares the claimed issuer against
+/// `source_dids` before any DID resolution). Applies nothing, and takes no
+/// room in the replay cache — the same document resent is refused again, not
+/// dropped as a replay.
 #[tokio::test]
 async fn only_configured_sources_are_applied() {
     for via in VIAS {
@@ -396,15 +392,10 @@ async fn only_configured_sources_are_applied() {
         for (type_uri, payload) in payloads().await {
             let doc = signed(type_uri, &x, payload).await;
             for _ in 0..2 {
-                let reply = deliver(&state, via, &x.0, doc.clone())
-                    .await
-                    .unwrap_or_else(|| {
-                        panic!("{via:?} {type_uri}: a verified stranger is answered")
-                    });
                 assert_eq!(
-                    refused(&reply, &x.0),
-                    format!("{}:notAuthorized", slug(type_uri)),
-                    "{via:?}"
+                    deliver(&state, via, &x.0, doc.clone()).await,
+                    None,
+                    "{via:?} {type_uri}: a claimed issuer outside the source allowlist must not be answered"
                 );
             }
         }
@@ -412,7 +403,9 @@ async fn only_configured_sources_are_applied() {
     }
 }
 
-/// With no configured source, nothing is ever applied.
+/// With no configured source, nothing is ever applied — and, per the
+/// pre-check above, nothing is even resolved: every claimed issuer fails the
+/// (empty) allowlist before its proof is checked.
 #[tokio::test]
 async fn an_empty_allowlist_applies_nothing() {
     let (mut state, _dir) = watcher_state().await;
@@ -427,9 +420,8 @@ async fn an_empty_allowlist_applies_nothing() {
         &s.0,
         signed(MSG_SYNC_UPDATE, &s, update_body("dave", &did, &log)).await,
     )
-    .await
-    .expect("answered");
-    assert_eq!(refused(&reply, &s.0), "webvh/sync/update:notAuthorized");
+    .await;
+    assert_eq!(reply, None);
     assert!(held(&state, "dave").await.is_none());
 }
 
