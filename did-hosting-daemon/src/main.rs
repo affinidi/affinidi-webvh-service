@@ -1454,6 +1454,9 @@ async fn build_control(
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.

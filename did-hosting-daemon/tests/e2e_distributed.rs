@@ -199,6 +199,9 @@ impl Topology {
             ),
             ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
             redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
         };
         dirs.push(control_dir);
