@@ -42,6 +42,22 @@
 //! regardless of how the document arrived. The HTTPS door additionally
 //! caps its request body at [`largest_max_document_bytes`], so no body
 //! larger than any served type accepts is ever buffered by that route.
+//!
+//! # A claimed issuer is not a verified one
+//!
+//! [`check_for_known_issuer`] grants the raised limit to a document whose
+//! in-band `issuer` merely *names* a DID with an ACL entry — the field is
+//! read straight off the unparsed body, before any proof is checked. That
+//! is deliberate (a stranger could never be authorised for a raised task
+//! anyway, so refusing it earlier costs it nothing legitimate), but taken
+//! alone it is a DoS amplifier: anyone who has ever seen an admin's DID can
+//! claim it as `issuer` and buy themselves the full 1 MiB of parsing and
+//! proof verification, over and over, whether or not they can actually
+//! sign for it. [`LargeDocumentBudget`] closes that gap — the caller
+//! charges one address-scoped budget before granting the raised limit, and
+//! [`settle_large_document_charge`] doubles that address's next cost
+//! whenever the claim does not pan out (a verification failure, or a
+//! verified issuer that turns out to be someone else).
 
 use trust_tasks_rs::{ErrorPayload, ErrorResponse, Payload, RejectReason, TrustTask};
 
@@ -113,34 +129,202 @@ pub fn check(body: &[u8], served: &[&str]) -> Result<(), ErrorResponse> {
     check_with(body, |type_uri| max_document_bytes(type_uri, served))
 }
 
+/// Large documents (over [`DEFAULT_MAX_DOCUMENT_BYTES`]) a single address may
+/// have [`check_for_known_issuer`] grant the raised limit to per minute,
+/// before its claimed issuer's proof has even been read. See the module
+/// docs: this is what keeps naming a known admin's DID from being free rein
+/// to make the service parse and verify 1 MiB documents indefinitely. 5 is
+/// generous for a legitimate high-frequency `did/register` caller and cheap
+/// to hold an attacker to.
+pub const LARGE_DOCUMENT_BUDGET_PER_WINDOW: u64 = 5;
+
+/// Fixed-window length, in seconds, for [`LargeDocumentBudget`].
+pub const LARGE_DOCUMENT_BUDGET_WINDOW_SECS: u64 = 60;
+
+/// Hard cap on tracked-address map size, mirroring
+/// `did-hosting-control::rate_limit`'s per-IP and per-source limiters: past
+/// this the whole map is cleared in one pass rather than left to grow
+/// unbounded under a novel-address flood.
+const MAX_TRACKED_ADDRESSES: usize = 10_000;
+
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    /// Cost units spent in the current window.
+    spent: u64,
+    /// `now` (epoch seconds) of the window start.
+    window_start: u64,
+    /// The cost of this address's *next* charge — 1 until
+    /// [`LargeDocumentBudget::penalize`] doubles it.
+    cost: u64,
+}
+
+/// Per-address budget for documents [`check_for_known_issuer`] grants the
+/// raised limit to before their claimed issuer is verified. See the module
+/// docs.
+#[derive(Debug, Default)]
+pub struct LargeDocumentBudget {
+    buckets: std::sync::Mutex<std::collections::HashMap<String, Bucket>>,
+}
+
+impl LargeDocumentBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge `address` for one large document, at its current per-charge
+    /// cost. `Err` is the number of seconds until the window rolls over,
+    /// once spending would exceed [`LARGE_DOCUMENT_BUDGET_PER_WINDOW`] for
+    /// the current one.
+    fn try_charge(&self, address: &str, now: u64) -> Result<(), u64> {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Drastic eviction, as the per-IP/per-source limiters do: past the
+        // cap, clear the whole map rather than let it grow unbounded.
+        if buckets.len() >= MAX_TRACKED_ADDRESSES {
+            buckets.clear();
+        }
+
+        let entry = buckets.entry(address.to_string()).or_insert(Bucket {
+            spent: 0,
+            window_start: now,
+            cost: 1,
+        });
+
+        if now.saturating_sub(entry.window_start) >= LARGE_DOCUMENT_BUDGET_WINDOW_SECS {
+            entry.spent = 0;
+            entry.window_start = now;
+        }
+
+        if entry.spent.saturating_add(entry.cost) > LARGE_DOCUMENT_BUDGET_PER_WINDOW {
+            let retry_after_secs =
+                (entry.window_start + LARGE_DOCUMENT_BUDGET_WINDOW_SECS).saturating_sub(now);
+            return Err(retry_after_secs);
+        }
+        entry.spent += entry.cost;
+        Ok(())
+    }
+
+    /// Double `address`'s per-charge cost — called once a claimed issuer
+    /// this budget let through turns out to have failed verification, or
+    /// proven to be someone else. Persists across windows (a penalty is
+    /// against the address, not the minute it earned it); capped well
+    /// short of overflow, since a handful of doublings already exhausts the
+    /// window on its own.
+    fn penalize(&self, address: &str) {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = buckets.entry(address.to_string()).or_insert(Bucket {
+            spent: 0,
+            window_start: 0,
+            cost: 1,
+        });
+        entry.cost = entry.cost.saturating_mul(2).min(1 << 20);
+    }
+
+    #[cfg(test)]
+    fn cost(&self, address: &str) -> u64 {
+        self.buckets
+            .lock()
+            .unwrap()
+            .get(address)
+            .map(|b| b.cost)
+            .unwrap_or(1)
+    }
+}
+
+/// A per-address [`LargeDocumentBudget`] charge [`check_for_known_issuer`]
+/// made before this document's proof was verified. Pass it to
+/// [`settle_large_document_charge`] once the caller's own verification
+/// concludes.
+#[derive(Debug)]
+pub struct LargeDocumentCharge {
+    address: String,
+    claimed_issuer: String,
+}
+
 /// [`check`], but a raised limit is granted only to a document whose
-/// claimed `issuer` already holds an entry in `acl`.
+/// claimed `issuer` already holds an entry in `acl` — and even then, only
+/// while `address`'s [`LargeDocumentBudget`] has room for it.
 ///
 /// The limit is decided before any signature is verified, so an
 /// unauthenticated caller could otherwise claim a raised type (1 MiB for
 /// `did/register`) and make the service parse and verify that much for
 /// nothing. A caller with no ACL entry could never be authorised for a
-/// raised task anyway, so it gets the default. The lookup is one keyspace
-/// read; a claimed issuer that then fails verification is refused as usual.
+/// raised task anyway, so it gets the default, with no charge against
+/// `budget` — the ACL lookup alone already holds it to the cheap path. A
+/// known claimed issuer past its address's budget is refused `unavailable`
+/// rather than admitted, even one that would have gone on to verify
+/// correctly; that trade-off is what a budget is for.
+///
+/// Returns the charge to settle once verification concludes
+/// ([`settle_large_document_charge`]), or `None` when no charge was made.
 pub async fn check_for_known_issuer(
     body: &[u8],
     served: &[&str],
     acl: &crate::server::store::KeyspaceHandle,
-) -> Result<(), ErrorResponse> {
+    budget: &LargeDocumentBudget,
+    address: &str,
+    now: u64,
+) -> Result<Option<LargeDocumentCharge>, ErrorResponse> {
     if body.len() <= DEFAULT_MAX_DOCUMENT_BYTES {
-        return Ok(());
+        return Ok(None);
     }
-    let known = match peek_issuer(body) {
-        Some(issuer) => matches!(
-            crate::server::acl::get_acl_entry(acl, &issuer).await,
-            Ok(Some(_))
-        ),
-        None => false,
+    let claimed_issuer = match peek_issuer(body) {
+        Some(issuer)
+            if matches!(
+                crate::server::acl::get_acl_entry(acl, &issuer).await,
+                Ok(Some(_))
+            ) =>
+        {
+            Some(issuer)
+        }
+        _ => None,
     };
-    if known {
-        check(body, served)
-    } else {
-        check_with(body, |_| DEFAULT_MAX_DOCUMENT_BYTES)
+    let Some(claimed_issuer) = claimed_issuer else {
+        check_with(body, |_| DEFAULT_MAX_DOCUMENT_BYTES)?;
+        return Ok(None);
+    };
+    if let Err(retry_after_secs) = budget.try_charge(address, now) {
+        return Err(unrouted_error(
+            RejectReason::Unavailable {
+                retry_after: Some(
+                    chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
+                ),
+            }
+            .into(),
+        ));
+    }
+    check(body, served)?;
+    Ok(Some(LargeDocumentCharge {
+        address: address.to_string(),
+        claimed_issuer,
+    }))
+}
+
+/// Settle a [`LargeDocumentCharge`] once the caller's own proof verification
+/// concludes. `verified_issuer` is the proven signer on success, or `None`
+/// on any verification failure. A `verified_issuer` that is not exactly the
+/// one the charge was granted against — including a failure, which proves
+/// none at all — doubles the address's cost for its next large document
+/// ([`LargeDocumentBudget::penalize`]). A charge that verified to exactly
+/// its claimed issuer costs nothing extra.
+///
+/// A no-op when `charge` is `None` — the document never carried one.
+pub fn settle_large_document_charge(
+    budget: &LargeDocumentBudget,
+    charge: Option<&LargeDocumentCharge>,
+    verified_issuer: Option<&str>,
+) {
+    let Some(charge) = charge else {
+        return;
+    };
+    if verified_issuer != Some(charge.claimed_issuer.as_str()) {
+        budget.penalize(&charge.address);
     }
 }
 
@@ -277,14 +461,109 @@ mod tests {
     async fn a_raised_limit_is_granted_only_to_a_known_issuer() {
         let acl = acl_with("did:web:admin.example").await;
         let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
         let big = register_doc("did:web:admin.example", 200 * 1024);
-        assert!(check_for_known_issuer(&big, &served, &acl).await.is_ok());
+        assert!(
+            check_for_known_issuer(&big, &served, &acl, &budget, "ip:1.2.3.4", 0)
+                .await
+                .is_ok()
+        );
         let stranger = register_doc("did:web:stranger.example", 200 * 1024);
         assert!(
-            check_for_known_issuer(&stranger, &served, &acl)
+            check_for_known_issuer(&stranger, &served, &acl, &budget, "ip:5.6.7.8", 0)
                 .await
                 .is_err()
         );
+    }
+
+    /// Repeated large documents from one address, all naming the same known
+    /// (but not yet verified) issuer, are refused once the address's budget
+    /// is spent — the DoS amplification the module docs describe.
+    #[tokio::test]
+    async fn repeated_large_documents_from_one_address_are_refused_past_the_budget() {
+        let acl = acl_with("did:web:admin.example").await;
+        let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
+        let doc = register_doc("did:web:admin.example", 200 * 1024);
+        for _ in 0..LARGE_DOCUMENT_BUDGET_PER_WINDOW {
+            assert!(
+                check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9", 0)
+                    .await
+                    .is_ok()
+            );
+        }
+        let err = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9", 0)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal(err)["code"], "unavailable");
+        // A different address is unaffected.
+        assert!(
+            check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.1.1.1", 0)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A verified known issuer, still within its address's budget, is
+    /// granted the raised limit and settles for free — no penalty when the
+    /// verified issuer is exactly the one it claimed.
+    #[tokio::test]
+    async fn a_verified_known_issuer_within_its_budget_passes() {
+        let acl = acl_with("did:web:admin.example").await;
+        let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
+        let doc = register_doc("did:web:admin.example", 200 * 1024);
+        let charge = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.2.3.4", 0)
+            .await
+            .expect("within budget")
+            .expect("a large document charges the budget");
+        settle_large_document_charge(&budget, Some(&charge), Some("did:web:admin.example"));
+        assert_eq!(
+            budget.cost("ip:1.2.3.4"),
+            1,
+            "a verified claim is not penalised"
+        );
+    }
+
+    /// Settling a charge whose claimed issuer did not verify — a mismatch,
+    /// or an outright verification failure (`None`) — doubles the address's
+    /// next cost, so repeating the same lie exhausts its budget faster.
+    #[tokio::test]
+    async fn an_unverified_or_mismatched_issuer_penalises_the_address() {
+        let budget = LargeDocumentBudget::new();
+        let charge = LargeDocumentCharge {
+            address: "ip:1.2.3.4".to_string(),
+            claimed_issuer: "did:web:admin.example".to_string(),
+        };
+        settle_large_document_charge(&budget, Some(&charge), None);
+        assert_eq!(budget.cost("ip:1.2.3.4"), 2);
+        settle_large_document_charge(&budget, Some(&charge), Some("did:web:someone-else.example"));
+        assert_eq!(budget.cost("ip:1.2.3.4"), 4);
+        // A `None` charge (no large document was charged) never touches the
+        // budget.
+        settle_large_document_charge(&budget, None, None);
+        assert_eq!(budget.cost("ip:1.2.3.4"), 4);
+    }
+
+    /// A document at or under the default is never charged against the
+    /// budget, whatever it claims — the whole point of the default is that
+    /// every type accepts that much for free.
+    #[tokio::test]
+    async fn small_documents_are_never_charged() {
+        let acl = acl_with("did:web:admin.example").await;
+        let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
+        let small = register_doc("did:web:admin.example", 10);
+        assert!(small.len() <= DEFAULT_MAX_DOCUMENT_BYTES);
+        for _ in 0..(LARGE_DOCUMENT_BUDGET_PER_WINDOW * 3) {
+            let charge = check_for_known_issuer(&small, &served, &acl, &budget, "ip:2.2.2.2", 0)
+                .await
+                .expect("small document admitted");
+            assert!(
+                charge.is_none(),
+                "a small document never charges the budget"
+            );
+        }
     }
 
     /// `did/register` as though this deployment served it (the only

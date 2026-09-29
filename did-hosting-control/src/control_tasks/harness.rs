@@ -106,6 +106,9 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
     };
     (state, dir)
@@ -227,6 +230,7 @@ pub(crate) async fn https(state: &AppState, bearer: Option<AuthClaims>, doc: Val
     let response = crate::routes::trust_tasks::dispatch_trust_task(
         bearer,
         axum::extract::State(state.clone()),
+        None,
         axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
     )
     .await

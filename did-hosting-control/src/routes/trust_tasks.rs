@@ -57,15 +57,16 @@ pub async fn trust_tasks_endpoint(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    if let Some(axum::Extension(axum::extract::ConnectInfo(addr))) = connect
+    // The client IP, resolved the same way whether it is about to gate an
+    // invite redemption or a large document's per-address budget below —
+    // both count the one source a stranger cannot choose over HTTPS.
+    let client_ip = connect.map(|axum::Extension(axum::extract::ConnectInfo(addr))| {
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies)
+    });
+    if let Some(ip) = client_ip
         && is_redeem_start(&body)
     {
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        let ip = crate::rate_limit::resolve_client_ip(
-            addr.ip(),
-            xff,
-            &state.config.server.trusted_proxies,
-        );
         let limited = state.redeem_rate_limiter.try_consume(
             &format!("ip:{ip}"),
             did_hosting_common::server::auth::session::now_epoch(),
@@ -88,7 +89,7 @@ pub async fn trust_tasks_endpoint(
             }
         }
     }
-    dispatch_trust_task(auth, State(state), body).await
+    dispatch_trust_task(auth, State(state), client_ip, body).await
 }
 
 /// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
@@ -121,9 +122,16 @@ fn is_redeem_start(body: &[u8]) -> bool {
 /// rather than axum's text/plain default. The route mount caps body
 /// size separately (see [`crate::routes::trust_tasks_body_limit_bytes`]);
 /// the per-type narrowing below is what actually decides most requests.
+///
+/// `client_ip`, when known, is this document's address for the per-address
+/// large-document budget below (`ip:{client_ip}`) — `None` for a direct,
+/// non-HTTPS call (tests exercising this handler without a real socket),
+/// which then shares one placeholder address rather than being charged
+/// against nothing.
 pub async fn dispatch_trust_task(
     auth: Option<AuthClaims>,
     State(state): State<AppState>,
+    client_ip: Option<std::net::IpAddr>,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     // ─── 1. Service DID required. Without one configured the §7.2
@@ -142,15 +150,29 @@ pub async fn dispatch_trust_task(
     //         body at the largest limit any served type declares
     //         (`crate::routes::trust_tasks_body_limit_bytes`); this
     //         narrows further for a type whose own limit is smaller.
-    if let Err(err) = did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
-        &body,
-        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
-        &state.acl_ks,
-    )
-    .await
-    {
-        return Ok(into_response(DispatchOutcome::Rejected(err)));
-    }
+    //
+    //         A document large enough to need its claimed (not yet
+    //         verified) issuer's ACL entry for the raised limit is charged
+    //         against that address's large-document budget first — see
+    //         `size`'s module docs for why an unverified claim alone would
+    //         otherwise be a DoS amplifier.
+    let address = client_ip
+        .map(|ip| format!("ip:{ip}"))
+        .unwrap_or_else(|| "ip:unknown".to_string());
+    let large_doc_charge =
+        match did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+            &body,
+            &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+            &state.acl_ks,
+            &state.large_document_budget,
+            &address,
+            did_hosting_common::server::auth::session::now_epoch(),
+        )
+        .await
+        {
+            Ok(charge) => charge,
+            Err(err) => return Ok(into_response(DispatchOutcome::Rejected(err))),
+        };
 
     // ─── 2. Parse the body to `TrustTask<Value>`. A parse failure
     //        emits a routed `trust-task-error` document with
@@ -248,6 +270,7 @@ pub async fn dispatch_trust_task(
         &transport,
         doc,
         verifier,
+        large_doc_charge,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?

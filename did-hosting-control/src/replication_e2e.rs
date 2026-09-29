@@ -242,6 +242,7 @@ impl Fleet {
                 let _ = crate::routes::trust_tasks::dispatch_trust_task(
                     None,
                     axum::extract::State(self.control.clone()),
+                    None,
                     axum::body::Bytes::from(serde_json::to_vec(&reply).unwrap()),
                 )
                 .await
