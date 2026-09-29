@@ -33,6 +33,11 @@
 pub mod bound;
 pub mod entry;
 pub mod ext;
+// `check` returns `Result<(), ErrorResponse>` on the refusal path; see the
+// identical allow on `handlers` below for why `ErrorResponse`'s size is
+// tolerated rather than boxed at this boundary.
+#[allow(clippy::result_large_err)]
+pub mod size;
 // Every handler returns `Result<TrustTask<Resp>, ErrorResponse>`, and
 // `ErrorResponse` is `trust_tasks_rs::TrustTask<ErrorPayload>` — 752
 // bytes, over `result_large_err`'s threshold. Rust 1.98.0 started
@@ -95,6 +100,21 @@ pub enum TypedInbound {
     List(TrustTask<list::v0_1::Payload>),
     Discovery(TrustTask<discovery::v0_1::Payload>),
 }
+
+/// Every Type URI [`build_dispatcher`] routes — the ACL family this
+/// module serves. Combined with `did_hosting_control::control_tasks::TASKS`
+/// (the DID-management family), this is every type the control plane
+/// dispatches — the "served" list `size::check` and
+/// `size::largest_max_document_bytes` need to decide whether a raised
+/// per-type limit is actually in force.
+pub const ACL_TASK_URIS: &[&str] = &[
+    <grant::v0_1::Payload as Payload>::TYPE_URI,
+    <revoke::v0_1::Payload as Payload>::TYPE_URI,
+    <change_role::v0_1::Payload as Payload>::TYPE_URI,
+    <show::v0_1::Payload as Payload>::TYPE_URI,
+    <list::v0_1::Payload as Payload>::TYPE_URI,
+    <discovery::v0_1::Payload as Payload>::TYPE_URI,
+];
 
 /// Build the shared [`Dispatcher`] keyed on each registered Type URI.
 ///

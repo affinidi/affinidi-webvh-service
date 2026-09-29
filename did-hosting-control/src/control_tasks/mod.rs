@@ -46,6 +46,7 @@ pub(crate) mod enrol;
 mod enrol_tests;
 #[cfg(test)]
 pub(crate) mod harness;
+pub(crate) mod passkey;
 pub(crate) mod queries;
 pub(crate) mod registry;
 pub(crate) mod server;
@@ -56,7 +57,10 @@ mod tests;
 
 use trust_tasks_rs::specs::{
     auth::{
-        passkey::{enroll as tt_enroll, enroll::invite as tt_invite, login as tt_login},
+        passkey::{
+            admin_list as tt_pk_admin_list, enroll as tt_enroll, enroll::invite as tt_invite,
+            list as tt_pk_list, login as tt_login, revoke as tt_pk_revoke,
+        },
         revoke_session as tt_revoke_session, step_up as tt_step_up,
     },
     did_management::{
@@ -180,6 +184,14 @@ control_tasks! {
     tt_invite::list::v0_1 => Authentication, enrol::invite_list;
     tt_invite::update::v0_1 => Authentication, enrol::invite_update;
     tt_invite::revoke::v0_1 => Authentication, enrol::invite_revoke;
+    // Passkey management: a subject's own inventory, an administrator's
+    // purpose-scoped read of another's, and revoking one — a re-
+    // authentication ceremony like enrolment's own user-verification, not a
+    // bare delete.
+    tt_pk_list::v0_1 => Authentication, passkey::list;
+    tt_pk_admin_list::v0_1 => Authentication, passkey::admin_list;
+    tt_pk_revoke::start::v0_2 => Authentication, passkey::revoke_start;
+    tt_pk_revoke::finish::v0_2 => Authentication, passkey::revoke_finish;
 }
 
 /// The proof rule for `type_uri`, when this table serves it.
@@ -189,6 +201,27 @@ pub(crate) fn proof_rule(type_uri: &str) -> Option<ProofRule> {
         .find(|(uri, _)| *uri == type_uri)
         .map(|(_, rule)| *rule)
 }
+
+/// Every Type URI this control plane dispatches: this table's rows plus
+/// the ACL family `did_hosting_common::server::trust_tasks` routes.
+///
+/// The single "served" list `size::check` and
+/// `size::largest_max_document_bytes` take — a type raised above the
+/// default in `size::DECLARED` (`did/register`) is in force only while it
+/// appears here, so a type this deployment does not actually route can't
+/// buy an unauthenticated caller a larger body to canonicalise before it
+/// is refused as unrouted.
+///
+/// Computed once: `TASKS` and `ACL_TASK_URIS` are both `'static`, but they
+/// live in two different const arrays of two different shapes, and `const`
+/// arithmetic can't concatenate them into one array whose length isn't
+/// spelled out by hand.
+pub(crate) static SERVED_TRUST_TASK_URIS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut uris: Vec<&'static str> = TASKS.iter().map(|(uri, _)| *uri).collect();
+        uris.extend_from_slice(did_hosting_common::server::trust_tasks::ACL_TASK_URIS);
+        uris
+    });
 
 /// Narrow `doc` into `P`, run the framework pipeline, and hand the typed
 /// payload to `handler`.

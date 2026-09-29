@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { PasskeysCard } from "../../components/PasskeysCard";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import {
   formatBytes,
@@ -26,18 +27,17 @@ import type {
   CreateInviteResponse,
   DidRecord,
   InvitePurpose,
-  DomainScope,
   InviteListItem,
 } from "../../lib/api";
-
-type ScopeKind = "all" | "allowed" | "allowed_with_default";
-
-interface ScopeDraft {
-  kind: ScopeKind;
-  domains: string[];
-  /** Only meaningful when `kind === "allowed_with_default"`. */
-  default: string;
-}
+import {
+  DEFAULT_SCOPE_DRAFT,
+  aclEntryToDraft,
+  defaultScopeForRole,
+  draftToScope,
+  validateScopeDraft,
+  type ScopeDraft,
+  type ScopeKind,
+} from "../../lib/acl-scope";
 
 interface EditState {
   did: string;
@@ -46,63 +46,6 @@ interface EditState {
   maxTotalSize: string;
   maxDidCount: string;
   scope: ScopeDraft;
-}
-
-/** Default scope draft for new ACL entries — "All domains" unless an admin
- * narrows it. v0.7 backend ultimately defaults new Owners to
- * AllowedWithDefault, but the UI surfaces the choice explicitly so admins
- * don't accidentally grant unrestricted access. */
-const DEFAULT_SCOPE_DRAFT: ScopeDraft = {
-  kind: "all",
-  domains: [],
-  default: "",
-};
-
-function aclEntryToDraft(entry: AclEntry): ScopeDraft {
-  if (!entry.domains || entry.domains.kind === "all") {
-    return { kind: "all", domains: [], default: "" };
-  }
-  if (entry.domains.kind === "allowed") {
-    return { kind: "allowed", domains: [...entry.domains.domains], default: "" };
-  }
-  return {
-    kind: "allowed_with_default",
-    domains: [...entry.domains.domains],
-    default: entry.domains.default,
-  };
-}
-
-/** Convert the draft back to wire shape. Returns `undefined` when the
- * draft is unset/invalid so the caller can omit the field. */
-function draftToScope(draft: ScopeDraft): DomainScope | undefined {
-  if (draft.kind === "all") return { kind: "all" };
-  if (draft.kind === "allowed") {
-    if (draft.domains.length === 0) return undefined;
-    return { kind: "allowed", domains: draft.domains };
-  }
-  if (draft.domains.length === 0 || !draft.default) return undefined;
-  return {
-    kind: "allowed_with_default",
-    domains: draft.domains,
-    default: draft.default,
-  };
-}
-
-/** Validation hook used by the Save / Add buttons — returns an error
- * message when the draft is not submittable. */
-function validateScopeDraft(draft: ScopeDraft): string | null {
-  if (draft.kind === "all") return null;
-  if (draft.domains.length === 0) return "Select at least one domain";
-  if (draft.kind === "allowed_with_default" && !draft.default) {
-    return "Pick a default domain";
-  }
-  if (
-    draft.kind === "allowed_with_default" &&
-    !draft.domains.includes(draft.default)
-  ) {
-    return "Default must be one of the selected domains";
-  }
-  return null;
 }
 
 const formatDate = (ts: number) =>
@@ -324,6 +267,8 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
   onChangeScope,
+  passkeysExpanded,
+  onTogglePasskeys,
 }: {
   item: AclEntry;
   editing: EditState | null;
@@ -338,11 +283,14 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
   onChangeScope: (next: ScopeDraft) => void;
+  passkeysExpanded: boolean;
+  onTogglePasskeys: (did: string) => void;
 }) {
   const isEditing = editing?.did === item.did;
   const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
 
   return (
+    <View>
     <View style={styles.entryCard}>
       <View style={styles.entryInfo}>
         <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
@@ -481,11 +429,26 @@ const AclEntryRow = memo(function AclEntryRow({
             <Text style={styles.editText}>Edit</Text>
           </Pressable>
           <Pressable
+            style={styles.editButton}
+            onPress={() => onTogglePasskeys(item.did)}
+          >
+            <Text style={styles.editText}>
+              {passkeysExpanded ? "Hide passkeys" : "Passkeys"}
+            </Text>
+          </Pressable>
+          <Pressable
             style={styles.deleteButton}
             onPress={() => onDelete(item.did)}
           >
             <Text style={styles.deleteText}>Remove</Text>
           </Pressable>
+        </View>
+      )}
+    </View>
+      {passkeysExpanded && (
+        <View style={styles.passkeysPanel}>
+          <PasskeysCard subject={item.did} purpose="session" title="Sign-in passkeys" />
+          <PasskeysCard subject={item.did} purpose="stepUp" title="Step-up passkeys" />
         </View>
       )}
     </View>
@@ -495,7 +458,7 @@ const AclEntryRow = memo(function AclEntryRow({
 export default function AclManagement() {
   const api = useApi();
   const { isAuthenticated } = useAuth();
-  const { domains: domainCatalog } = useDomains();
+  const { domains: domainCatalog, defaultDomain } = useDomains();
 
   // Trimmed view of `domainCatalog` for ScopeEditor — name + disabled flag,
   // sorted alphabetically. Disabled domains stay visible so admins can
@@ -520,7 +483,24 @@ export default function AclManagement() {
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
   const [newScope, setNewScope] = useState<ScopeDraft>(DEFAULT_SCOPE_DRAFT);
+  // Whether the operator has touched the scope editor for the entry being
+  // built — once true, the effect below stops overwriting `newScope`.
+  const [newScopeTouched, setNewScopeTouched] = useState(false);
   const [creating, setCreating] = useState(false);
+
+  // See `defaultScopeForRole`. Runs only while the operator hasn't picked a
+  // scope themselves, and only for the "Add Entry" form — editing an
+  // existing entry's role never rewrites its scope, matching the removed
+  // route's `PUT` behaviour, which had no such default either.
+  useEffect(() => {
+    if (newScopeTouched) return;
+    setNewScope(defaultScopeForRole(newRole, defaultDomain));
+  }, [newRole, defaultDomain, newScopeTouched]);
+
+  const handleNewScopeChange = useCallback((next: ScopeDraft) => {
+    setNewScopeTouched(true);
+    setNewScope(next);
+  }, []);
 
   // Invite form
   const [inviteDid, setInviteDid] = useState("");
@@ -541,6 +521,18 @@ export default function AclManagement() {
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Which entries' passkey panel is expanded — a lost passkey is recovered
+  // here: an administrator revokes the missing credential, then re-invites.
+  const [expandedPasskeys, setExpandedPasskeys] = useState<Set<string>>(new Set());
+  const togglePasskeys = useCallback((did: string) => {
+    setExpandedPasskeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(did)) next.delete(did);
+      else next.add(did);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(() => {
     if (!isAuthenticated) {
@@ -661,7 +653,7 @@ export default function AclManagement() {
       setNewLabel("");
       setNewMaxTotalSize("");
       setNewMaxDidCount("");
-      setNewScope(DEFAULT_SCOPE_DRAFT);
+      setNewScopeTouched(false);
       refresh();
     } catch (e: unknown) {
       const msg =
@@ -829,6 +821,8 @@ export default function AclManagement() {
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
       onChangeScope={onChangeScope}
+      passkeysExpanded={expandedPasskeys.has(item.did)}
+      onTogglePasskeys={togglePasskeys}
     />
   );
 
@@ -1152,7 +1146,7 @@ export default function AclManagement() {
         <ScopeEditor
           draft={newScope}
           availableDomains={availableDomains}
-          onChange={setNewScope}
+          onChange={handleNewScopeChange}
         />
         <Pressable
           style={[
@@ -1395,6 +1389,10 @@ const styles = StyleSheet.create({
   },
   entryActions: {
     gap: spacing.xs,
+  },
+  passkeysPanel: {
+    marginTop: spacing.md,
+    gap: spacing.sm,
   },
   editButton: {
     borderColor: colors.accent,

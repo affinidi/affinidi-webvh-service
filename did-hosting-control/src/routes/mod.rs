@@ -25,12 +25,21 @@ use axum::routing::{get, post};
 
 use crate::server::AppState;
 
-/// Maximum body size accepted on `POST /api/trust-tasks` (in bytes).
-/// Sized for the largest legitimate envelope a client produces
-/// (`acl/list` response with a full page) plus headroom; an
-/// authenticated-Owner attacker can no longer drive multi-MB JSON
-/// allocations before the handler-level Admin check rejects.
-pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// Maximum body size accepted on `POST /api/trust-tasks` (in bytes) — the
+/// largest limit any type this control plane serves declares
+/// (`did_hosting_common::server::trust_tasks::size`). Every type not
+/// individually raised there still takes
+/// `size::DEFAULT_MAX_DOCUMENT_BYTES` (64 KiB); an authenticated-Owner
+/// attacker can no longer drive multi-MB JSON allocations before the
+/// handler-level Admin check rejects. `dispatch_trust_task` narrows
+/// further per the document's own `type` once it is read, so a request for
+/// a type with a smaller limit than this route's blanket cap is still
+/// refused at its own, tighter ceiling.
+pub fn trust_tasks_body_limit_bytes() -> usize {
+    did_hosting_common::server::trust_tasks::size::largest_max_document_bytes(
+        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+    )
+}
 
 /// Maximum body size accepted on the **unauthenticated** auth surface
 /// (`/auth/challenge`, `/auth/`, `/auth/refresh`) in bytes.
@@ -46,7 +55,7 @@ pub fn router_without_fallback() -> Router<AppState> {
         .route(
             "/api/trust-tasks",
             post(trust_tasks::trust_tasks_endpoint)
-                .layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
+                .layer(DefaultBodyLimit::max(trust_tasks_body_limit_bytes())),
         )
         .route(
             "/api/auth/challenge",

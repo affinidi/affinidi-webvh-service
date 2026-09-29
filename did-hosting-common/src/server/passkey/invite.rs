@@ -10,11 +10,12 @@
 //! - the claim code (60 bits, short enough to type) is kept only as a salted
 //!   Argon2id digest, and compared in constant time.
 //!
-//! Wrong claim codes are counted per invite. At [`MAX_WRONG_CODES`] the invite
-//! is deleted, so a stolen URL gives an attacker a handful of guesses at a
-//! 60-bit code and no more. An invite expires, and is consumed exactly once:
-//! [`take`] is the atomic step that lets exactly one redemption bind a
-//! credential.
+//! Wrong claim codes are counted per invite, atomically in the store (so the
+//! count is correct even when replicas share it — see [`ATTEMPT_LOCKS`]).
+//! At [`MAX_WRONG_CODES`] the invite is deleted, so a stolen URL gives an
+//! attacker a handful of guesses at a 60-bit code and no more. An invite
+//! expires, and is consumed exactly once: [`take`] is the atomic step that
+//! lets exactly one redemption bind a credential.
 //!
 //! Every read and change an administrator makes addresses an invite by its
 //! `invite_id`, which carries no authority.
@@ -184,6 +185,14 @@ fn invite_id_key(invite_id: &str) -> String {
     format!("pk_invite_id:{invite_id}")
 }
 
+/// The wrong-claim-code counter for one invite, kept apart from the `Invite`
+/// JSON blob so it can be incremented atomically (`KeyspaceHandle::incr_raw`)
+/// without a read-modify-write race between replicas sharing this store. See
+/// [`redeem`].
+fn wrong_codes_key(token_hash: &str) -> String {
+    format!("pk_wrong:{token_hash}")
+}
+
 /// The prefix every stored invite is under. The session cleanup task sweeps
 /// expired ones (`auth::session::cleanup_expired_sessions`).
 pub const INVITE_PREFIX: &str = "pk_invite:";
@@ -282,8 +291,18 @@ static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
     digest: hex::encode([0u8; 32]),
 });
 
-/// Serialises the read–verify–write of one invite's attempt counter, so
-/// concurrent wrong codes are each counted.
+/// Serialises one invite's existence check, ceremony bookkeeping and
+/// consume-on-lockout against concurrent callers **in this process**.
+///
+/// The wrong-code count itself no longer depends on this lock for
+/// correctness: [`redeem`] increments it with
+/// [`KeyspaceHandle::incr_raw`](crate::server::store::KeyspaceHandle::incr_raw),
+/// which is atomic in the store and therefore correct across replicas too.
+/// This lock still avoids duplicate work within one process — two racing
+/// wrong codes on the same invite in this process take the invite exactly
+/// once past the threshold rather than both attempting it — but a
+/// deployment with more than one replica relies on the store's atomicity,
+/// not on this lock, for the lockout to hold.
 static ATTEMPT_LOCKS: LazyLock<PathLocks> = LazyLock::new(PathLocks::new);
 
 /// Claim-code hashes run at once, service-wide. Each takes
@@ -413,6 +432,7 @@ async fn take_locked(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Inv
     let taken: Option<Invite> = ks.take(invite_key(token_hash)).await?;
     if let Some(ref invite) = taken {
         ks.remove(invite_id_key(&invite.invite_id)).await?;
+        ks.remove(wrong_codes_key(token_hash)).await?;
     }
     Ok(taken)
 }
@@ -494,15 +514,20 @@ pub async fn redeem(
     if blocking(move || verify_claim_code(&claim, &code)).await? {
         return Ok(Redemption::Valid(Box::new(invite)));
     }
-    invite.wrong_codes += 1;
-    if invite.wrong_codes >= MAX_WRONG_CODES {
+    // The lockout decision is made from the atomic counter, not from
+    // `invite.wrong_codes` — the field mirrors it for observability (an
+    // administrator reading the invite by id) but a replica racing this
+    // call cannot lose an increment the way a plain get-then-save could.
+    let wrong_codes = ks.incr_raw(wrong_codes_key(&token_hash)).await?;
+    invite.wrong_codes = wrong_codes.min(u64::from(u32::MAX)) as u32;
+    if wrong_codes >= u64::from(MAX_WRONG_CODES) {
         take_locked(ks, &token_hash).await?;
         info!(
             target: "audit",
             event = "passkey.invite.locked",
             invite_id = %invite.invite_id,
             subject = %invite.subject,
-            wrong_codes = invite.wrong_codes,
+            wrong_codes,
             "passkey enrolment invite invalidated after too many wrong claim codes"
         );
         return Ok(Redemption::TooManyAttempts);
@@ -668,6 +693,72 @@ mod tests {
         ));
         assert!(
             by_id(&ks, &issued.invite.invite_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The lockout holds even when wrong codes arrive through two
+    /// independent handles onto the same store — standing in for two
+    /// control-plane replicas, each with its own process memory (its own
+    /// `ATTEMPT_LOCKS`, its own backend mutexes) but the same backing data.
+    /// The count that matters lives in the store now, not in either
+    /// handle's process, so alternating attempts between them still lock
+    /// out at exactly [`MAX_WRONG_CODES`].
+    #[tokio::test]
+    async fn lockout_holds_across_two_app_states_sharing_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        // Two independently-obtained handles for the same keyspace name —
+        // each its own Rust object, sharing only the store's data.
+        let ks_a = store.keyspace(KS_SESSIONS).unwrap();
+        let ks_b = store.keyspace(KS_SESSIONS).unwrap();
+
+        let issued = issue(&ks_a, request(Purpose::Session)).await.unwrap();
+        for n in 1..MAX_WRONG_CODES {
+            let ks = if n % 2 == 0 { &ks_a } else { &ks_b };
+            assert!(
+                matches!(
+                    redeem(ks, &issued.token, "0000-0000-0000").await.unwrap(),
+                    Redemption::Invalid
+                ),
+                "wrong code {n}"
+            );
+            // Read back from the OTHER handle: the count is visible there
+            // too, because it lives in the store, not in `ks`'s process.
+            let other = if n % 2 == 0 { &ks_b } else { &ks_a };
+            let stored = by_id(other, &issued.invite.invite_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.wrong_codes, n,
+                "count not visible from the other handle"
+            );
+        }
+        // The last allowed wrong code, from whichever handle's turn it is,
+        // locks the invite out.
+        assert!(matches!(
+            redeem(&ks_b, &issued.token, "0000-0000-0000")
+                .await
+                .unwrap(),
+            Redemption::TooManyAttempts
+        ));
+        // Gone, seen from either handle.
+        assert!(
+            by_id(&ks_a, &issued.invite.invite_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            by_id(&ks_b, &issued.invite.invite_id)
                 .await
                 .unwrap()
                 .is_none()

@@ -8,7 +8,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api, checkReply, resetServiceInfo } from "../api";
+import {
+  ApiError,
+  api,
+  checkReply,
+  looksLikeAgentName,
+  resetServiceInfo,
+  splitAgentName,
+} from "../api";
 import { generateSessionKeypair } from "../session-key";
 import { domainFromWire, logMetadataFromEntries } from "../wire";
 import {
@@ -25,6 +32,7 @@ import {
 
 const SUBJECT = "did:webvh:QmAdmin:example.com:admin";
 const DM = "https://trusttasks.org/spec/did-management/";
+const TT = "https://trusttasks.org/spec/";
 const TOKEN = tokenFor(SUBJECT, { session_id: "sess-1" });
 
 beforeEach(() => {
@@ -360,6 +368,176 @@ describe("management calls (passkey session)", () => {
     vi.stubGlobal("window", { dispatchEvent: vi.fn() });
     installControlPlane(() => undefined);
     await expect(api.listAcl()).rejects.toThrow(/sign in again/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("looksLikeAgentName / splitAgentName", () => {
+  it.each([
+    ["did:web:example.com", false],
+    ["did:webvh:QmAdmin:example.com:admin", false],
+    ["example.com/@alice", true],
+    ["https://example.com/@alice", true],
+  ])("looksLikeAgentName(%j) is %j", (input, expected) => {
+    expect(looksLikeAgentName(input)).toBe(expected);
+  });
+
+  it("splits a bare domain/@name", () => {
+    expect(splitAgentName("example.com/@alice")).toEqual({
+      domain: "example.com",
+      name: "alice",
+    });
+  });
+
+  it("lower-cases the domain but keeps the local name's case", () => {
+    expect(splitAgentName("https://Example.COM/@Alice")).toEqual({
+      domain: "example.com",
+      name: "Alice",
+    });
+  });
+
+  it("drops a trailing slash", () => {
+    expect(splitAgentName("example.com/@alice/")).toEqual({
+      domain: "example.com",
+      name: "alice",
+    });
+  });
+
+  it("ignores a trailing context path segment — the DID identity is the local name alone", () => {
+    expect(splitAgentName("firstperson.network/@drummond/h2hsummit")).toEqual({
+      domain: "firstperson.network",
+      name: "drummond",
+    });
+  });
+
+  it("refuses the community name (empty local part) — no ACL role binds to a community", () => {
+    expect(splitAgentName("example.com/@")).toBeNull();
+  });
+
+  it("refuses a community name followed by a path", () => {
+    expect(splitAgentName("example.com/@/oops")).toBeNull();
+  });
+
+  it("refuses a marker with no domain in front of it", () => {
+    expect(splitAgentName("/@alice")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("resolveAclSubject / createAcl (agent names)", () => {
+  beforeEach(async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_auth_method: "passkey" });
+    await generateSessionKeypair();
+  });
+
+  /** A `did/list` record serving `name` (enabled) on `domain`. */
+  const record = (didId: string, domain: string, name: string) => ({
+    mnemonic: didId.split(":").pop(),
+    owner: SUBJECT,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    versionCount: 1,
+    didId,
+    didUrl: `https://${domain}/did.jsonl`,
+    disabled: false,
+    totalResolves: 0,
+    domain,
+    ext: {
+      "vnd.affinidi.webvh": { agentNames: [{ name, enabled: true, createdAt: 1 }] },
+    },
+  });
+
+  it("sends a DID straight through, unresolved — no did/list or agent-name/resolve call", async () => {
+    const sent = installControlPlane((req) =>
+      req.type === `${TT}acl/grant/0.1`
+        ? seal(req, {
+            entry: {
+              subject: "did:web:alice.example",
+              role: "admin",
+              ext: { "vnd.affinidi.webvh": { domains: { kind: "all" } } },
+            },
+          })
+        : undefined,
+    );
+
+    await api.createAcl("did:web:alice.example", "admin");
+
+    const sentTasks = tasks(sent);
+    expect(sentTasks).toHaveLength(1);
+    expect(sentTasks[0]!.doc).toMatchObject({
+      type: `${TT}acl/grant/0.1`,
+      payload: { entry: { subject: "did:web:alice.example" } },
+    });
+  });
+
+  it("resolves an agent name to the DID that currently serves it before granting", async () => {
+    const alice = "did:webvh:QmAlice:example.com:alice";
+    const sent = installControlPlane((req) => {
+      if (req.type === `${DM}did/list/0.1`) {
+        return seal(req, { records: [record(alice, "example.com", "alice")], total: 1 });
+      }
+      if (req.type === `${DM}agent-name/resolve/0.1`) {
+        return seal(req, { entries: [{ did: alice, names: ["example.com/@alice"] }] });
+      }
+      if (req.type === `${TT}acl/grant/0.1`) {
+        return seal(req, {
+          entry: {
+            subject: alice,
+            role: "owner",
+            ext: { "vnd.affinidi.webvh": { domains: { kind: "all" } } },
+          },
+        });
+      }
+      return undefined;
+    });
+
+    await api.createAcl("example.com/@alice", "owner", { domains: { kind: "all" } });
+
+    const grant = tasks(sent).find((s) => s.doc.type === `${TT}acl/grant/0.1`);
+    expect(grant!.doc.payload.entry.subject).toBe(alice);
+  });
+
+  it("refuses an agent name no hosted DID currently serves — no acl/grant is sent", async () => {
+    const sent = installControlPlane((req) =>
+      req.type === `${DM}did/list/0.1` ? seal(req, { records: [], total: 0 }) : undefined,
+    );
+
+    await expect(api.createAcl("example.com/@ghost", "owner")).rejects.toThrow(
+      /does not resolve to a DID hosted here/,
+    );
+    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.1`)).toBe(false);
+  });
+
+  it("refuses a candidate whose binding agent-name/resolve does not confirm as still served", async () => {
+    // did/list's local index has a match, but the DID is no longer served
+    // (disabled, or the document dropped it) by the time agent-name/resolve —
+    // the authoritative check — is asked.
+    const alice = "did:webvh:QmAlice:example.com:alice";
+    const sent = installControlPlane((req) => {
+      if (req.type === `${DM}did/list/0.1`) {
+        return seal(req, { records: [record(alice, "example.com", "alice")], total: 1 });
+      }
+      if (req.type === `${DM}agent-name/resolve/0.1`) {
+        return seal(req, { entries: [] });
+      }
+      return undefined;
+    });
+
+    await expect(api.createAcl("example.com/@alice", "owner")).rejects.toThrow(
+      /does not resolve to a DID hosted here/,
+    );
+    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.1`)).toBe(false);
+  });
+
+  it("refuses a malformed agent-name-like input without calling the control plane", async () => {
+    const sent = installControlPlane(() => undefined);
+
+    await expect(api.createAcl("example.com/@/oops", "owner")).rejects.toThrow(
+      /not a valid agent name/,
+    );
+    expect(tasks(sent)).toHaveLength(0);
   });
 });
 

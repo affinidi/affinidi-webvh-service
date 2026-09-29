@@ -196,6 +196,12 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
             json!({ "inviteId": "no-such-invite", "role": "owner" })
         }
         "auth/passkey/enroll/invite/revoke/0.1" => json!({ "inviteId": "no-such-invite" }),
+        "auth/passkey/list/0.1" => json!({}),
+        "auth/passkey/admin-list/0.1" => json!({ "subject": admin.did, "purpose": "session" }),
+        "auth/passkey/revoke/start/0.2" => json!({ "credentialId": "AAAA" }),
+        "auth/passkey/revoke/finish/0.2" => {
+            json!({ "revocationId": "no-such-revocation", "uvCredential": assertion() })
+        }
         other => panic!("no sample for {other}: add one when adding a row"),
     }
 }
@@ -1033,25 +1039,6 @@ const SPEC: &str = "https://trusttasks.org/spec/";
 
 fn t(slug: &str) -> String {
     format!("{SPEC}{slug}")
-}
-
-/// A live session for `caller`, as a login would leave it.
-async fn session_for(
-    state: &AppState,
-    caller: &Caller,
-) -> did_hosting_common::server::auth::session::TokenResponse {
-    did_hosting_common::server::auth::session::create_authenticated_session(
-        &state.sessions_ks,
-        state.jwt_keys.as_deref().unwrap(),
-        &caller.did,
-        &caller.role,
-        900,
-        3600,
-        None,
-        None,
-    )
-    .await
-    .unwrap()
 }
 
 /// Step-up end to end: start answers a signed approve-request 0.3 bound to the

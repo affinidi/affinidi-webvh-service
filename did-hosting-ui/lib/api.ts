@@ -47,6 +47,10 @@ import type * as RedeemFinish from "@openvtc/trust-tasks/auth/passkey/enroll/red
 import type * as InviteList from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
 import type * as InviteUpdate from "@openvtc/trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
 import type * as InviteRevoke from "@openvtc/trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
+import type * as PasskeyList from "@openvtc/trust-tasks/auth/passkey/list/0.1/payload";
+import type * as PasskeyAdminList from "@openvtc/trust-tasks/auth/passkey/admin-list/0.1/payload";
+import type * as PasskeyRevokeStart from "@openvtc/trust-tasks/auth/passkey/revoke/start/0.2/payload";
+import type * as PasskeyRevokeFinish from "@openvtc/trust-tasks/auth/passkey/revoke/finish/0.2/payload";
 import type * as AclList from "@openvtc/trust-tasks/acl/list/0.1/payload";
 import type * as AclShow from "@openvtc/trust-tasks/acl/show/0.1/payload";
 import type * as AclGrant from "@openvtc/trust-tasks/acl/grant/0.1/payload";
@@ -77,6 +81,7 @@ import {
   inviteFromWire,
   logEntriesFromWire,
   logMetadataFromEntries,
+  passkeyCredentialFromWire,
   serviceInstanceFromWire,
   statsFromWire,
   timeRangeToWire,
@@ -388,6 +393,32 @@ export interface InviteListResponse {
   invites: InviteListItem[];
 }
 
+/** A passkey already bound to a subject — the auth service's own management
+ *  view (`auth/passkey/list`, `auth/passkey/admin-list`), never a WebAuthn
+ *  dictionary. `credentialId` is opaque: echoed verbatim to
+ *  `revokePasskeyStart`, never parsed. */
+export interface PasskeyCredential {
+  credentialId: string;
+  deviceLabel: string | null;
+  registeredAt: number;
+  lastUsedAt: number | null;
+  transports: string[];
+}
+
+/** The caller's own re-authentication ceremony for `revoke/finish`. */
+export interface RevokePasskeyStartResponse {
+  revocationId: string;
+  uvOptions: PasskeyRevokeStart.Response["uvOptions"];
+}
+
+export interface RevokePasskeyFinishResponse {
+  credentialId: string;
+  subject: string;
+  purpose: InvitePurpose;
+  revokedAt: number;
+  remaining: number;
+}
+
 /** `server/config`: what an operator needs to see. No secrets, by rule. */
 export interface ControlPlaneConfig {
   controlDid: string;
@@ -494,6 +525,10 @@ const T = {
   inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
   inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
   inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
+  passkeyList: `${TT}auth/passkey/list/0.1` as const satisfies typeof PasskeyList.TYPE_URI,
+  passkeyAdminList: `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
+  passkeyRevokeStart: `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
+  passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
   aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
   revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
   aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
@@ -525,6 +560,44 @@ function webvhAclExt(
   if (typeof maxDidCount === "number") quota.maxDidCount = maxDidCount;
   if (Object.keys(quota).length > 0) ext.quota = quota;
   return { [WEBVH_EXT]: ext };
+}
+
+// ---------------------------------------------------------------------------
+// ACL subject resolution — an agent name typed where an ACL takes a DID
+// ---------------------------------------------------------------------------
+//
+// `acl/grant` stores whatever `subject` it is given verbatim — the control
+// plane resolves nothing (unlike the removed REST `POST /api/acl`, which
+// resolved a name to a DID server-side via `resolve_did_or_agent_name`
+// before it ever reached storage). A subject typed as a name the console
+// doesn't resolve first would silently create an entry keyed on a string
+// nothing can ever authenticate as.
+
+/** Cheap syntactic test — the `/@` marker — mirroring
+ *  `agent_names::AgentName::looks_like_agent_name` (Rust) used server-side
+ *  for the same purpose. No network access; just decides whether `input`
+ *  is an agent name shape before doing any resolution work. */
+export function looksLikeAgentName(input: string): boolean {
+  return input.includes("/@");
+}
+
+/** Split an agent name (`example.com/@alice`, with or without a leading
+ *  `https://`, and tolerant of trailing context path segments or a
+ *  trailing slash) into its hosting domain and bare local name. `null`
+ *  when the `/@` marker is present but the surrounding shape isn't one
+ *  this parser understands — an empty domain, the community name
+ *  (`example.com/@`, which no ACL role can be granted to), or a second
+ *  `/@` marker. Domain is lower-cased; the local name keeps its case. */
+export function splitAgentName(input: string): { domain: string; name: string } | null {
+  const noScheme = input.trim().replace(/^https?:\/\//i, "");
+  const idx = noScheme.indexOf("/@");
+  if (idx < 1) return null;
+  const domain = noScheme.slice(0, idx).toLowerCase();
+  const afterMarker = noScheme.slice(idx + 2).replace(/\/+$/, "");
+  const nextSlash = afterMarker.indexOf("/");
+  const name = nextSlash === -1 ? afterMarker : afterMarker.slice(0, nextSlash);
+  if (!domain || !name || name.includes("/@")) return null;
+  return { domain, name };
 }
 
 type Role = "admin" | "owner" | "service";
@@ -802,17 +875,78 @@ export const api = {
     return { entries: (resp.entries ?? []).map(aclEntryFromWire) };
   },
 
+  /**
+   * Turn what an operator typed into the ACL "Add Entry" field into a
+   * DID. A DID is returned verbatim — `acl/grant` stores whatever
+   * `subject` it is given, so this is the only place a name gets resolved
+   * before it lands there.
+   *
+   * An agent name is resolved once, here: every DID this deployment hosts
+   * is searched for one whose registry currently serves the name, and
+   * `agent-name/resolve` — the same task an owner's console calls to show
+   * a DID's addresses — confirms the binding is still live (enabled, and
+   * claimed by the DID's current document) before it is accepted. The ACL
+   * entry is then created against the DID, never the name: the name can
+   * be released and re-claimed by someone else later, and that must not
+   * silently move the grant (mirrors the removed REST route's
+   * `resolve_did_or_agent_name`, which resolved once at write time for
+   * the same reason).
+   *
+   * Throws when the input looks like an agent name but does not resolve
+   * to a DID hosted here. Anything that doesn't look like an agent name
+   * (including a malformed DID) is passed through unchanged — `acl/grant`
+   * is left to refuse it in whatever shape it likes.
+   */
+  resolveAclSubject: async (input: string): Promise<string> => {
+    const trimmed = input.trim();
+    if (!looksLikeAgentName(trimmed)) return trimmed;
+    const parsed = splitAgentName(trimmed);
+    if (!parsed) {
+      throw new ApiError(400, `'${trimmed}' is not a valid agent name`);
+    }
+    const served = `${parsed.domain}/@${parsed.name}`;
+    const dids = await api.listDids();
+    const hasDidId = (d: DidRecord): d is DidRecord & { didId: string } => d.didId !== null;
+    const candidates = dids.filter(
+      (d): d is DidRecord & { didId: string } =>
+        hasDidId(d) &&
+        d.domain === parsed.domain &&
+        (d.agentNames ?? []).some((e) => e.enabled && e.name === parsed.name),
+    );
+    if (candidates.length > 0) {
+      const { names } = await api.resolveAgentNames(candidates.map((d) => d.didId));
+      const match = candidates.find((d) => names[d.didId]?.includes(served));
+      if (match) return match.didId;
+    }
+    throw new ApiError(
+      404,
+      `agent name '${trimmed}' does not resolve to a DID hosted here — bind it first, or use the DID directly`,
+    );
+  },
+
+  /**
+   * `acl/grant`. `subject` is a DID, or an agent name hosted here
+   * (`example.com/@alice`) — resolved to the DID it currently serves
+   * before the grant is sent; see `resolveAclSubject`. `acl/grant`'s
+   * scopes are explicit on the wire and the maintainer no longer infers
+   * one (the removed REST route did, for a domain-less Owner) — a caller
+   * granting Owner access is expected to pass `opts.domains` itself
+   * (`Add Entry`'s default-domain-scope logic is what fills it in when
+   * the operator hasn't chosen one). Omitting it falls back to `all`
+   * here, matching the unrestricted default a bare Admin/Service grant
+   * already gets.
+   */
   createAcl: async (
-    did: string,
+    subject: string,
     role: Role,
     opts?: {
       label?: string;
       maxTotalSize?: number;
       maxDidCount?: number;
-      /** Omit to let the control plane pick the role's default scope. */
       domains?: DomainScope;
     },
   ): Promise<AclEntry> => {
+    const did = await api.resolveAclSubject(subject);
     const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
       entry: {
         subject: did,
@@ -1172,5 +1306,61 @@ export const api = {
 
   revokeInvite: async (inviteId: string): Promise<void> => {
     await trustTask<InviteRevoke.Payload, InviteRevoke.Response>(T.inviteRevoke, { inviteId });
+  },
+
+  // ---- Passkey management (Trust Tasks) ----
+
+  /** The caller's own passkeys, of every purpose — the credential-management
+   *  counterpart to the session list: this answers "what can sign me in?". */
+  listPasskeys: async (): Promise<PasskeyCredential[]> => {
+    const r = await trustTask<PasskeyList.Payload, PasskeyList.Response>(T.passkeyList, {});
+    return r.credentials.map(passkeyCredentialFromWire);
+  },
+
+  /** An administrator's purpose-scoped read of one subject's passkeys —
+   *  never the owner's own `listPasskeys`, which takes no subject. */
+  adminListPasskeys: async (
+    subject: string,
+    purpose: InvitePurpose,
+  ): Promise<PasskeyCredential[]> => {
+    const r = await trustTask<PasskeyAdminList.Payload, PasskeyAdminList.Response>(
+      T.passkeyAdminList,
+      { subject, purpose },
+    );
+    return r.credentials.map(passkeyCredentialFromWire);
+  },
+
+  /**
+   * Begin revoking a passkey — the caller's own, or, for an administrator,
+   * `subject`'s. The response carries a fresh user-verification challenge
+   * over the *caller's* own credentials: the person acting proves they are
+   * present, whoever owns the credential being revoked. Nothing is removed
+   * until `revokePasskeyFinish` presents that assertion.
+   */
+  revokePasskeyStart: async (
+    credentialId: string,
+    subject?: string,
+  ): Promise<RevokePasskeyStartResponse> =>
+    trustTask<PasskeyRevokeStart.Payload, PasskeyRevokeStart.Response>(T.passkeyRevokeStart, {
+      credentialId,
+      ...(subject ? { subject } : {}),
+    }),
+
+  /** Present the user-verification assertion `revokePasskeyStart` asked for. */
+  revokePasskeyFinish: async (
+    revocationId: string,
+    uvCredential: PasskeyRevokeFinish.Payload["uvCredential"],
+  ): Promise<RevokePasskeyFinishResponse> => {
+    const r = await trustTask<PasskeyRevokeFinish.Payload, PasskeyRevokeFinish.Response>(
+      T.passkeyRevokeFinish,
+      { revocationId, uvCredential },
+    );
+    return {
+      credentialId: r.credentialId,
+      subject: r.subject,
+      purpose: r.purpose,
+      revokedAt: Math.floor(Date.parse(r.revokedAt) / 1000),
+      remaining: r.remaining,
+    };
   },
 };
