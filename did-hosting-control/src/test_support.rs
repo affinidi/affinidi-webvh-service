@@ -209,7 +209,13 @@ impl TestServer {
     /// unmatched path instead of serving the SPA, which is what an HTTP-shape
     /// test wants.
     pub fn router(&self) -> axum::Router {
-        crate::routes::router_without_fallback().with_state(self.state.clone())
+        // A test drives the router with no real connection behind it, so it
+        // supplies the address a production server records per connection.
+        crate::routes::router_without_fallback()
+            .with_state(self.state.clone())
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            ))
     }
 
     /// Grant `did` an ACL entry with `role` and unrestricted domain scope.

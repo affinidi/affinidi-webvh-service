@@ -802,7 +802,7 @@ async fn https_redemption_is_rate_limited_per_client_ip() {
         let response = crate::routes::trust_tasks::trust_tasks_endpoint(
             None,
             axum::extract::State(state.clone()),
-            Some(axum::Extension(axum::extract::ConnectInfo(addr))),
+            Ok(axum::extract::ConnectInfo(addr)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
         )

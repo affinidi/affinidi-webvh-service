@@ -53,20 +53,38 @@ use crate::server::AppState;
 pub async fn trust_tasks_endpoint(
     auth: Option<AuthClaims>,
     State(state): State<AppState>,
-    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    connect: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        <axum::extract::ConnectInfo<std::net::SocketAddr> as axum::extract::FromRequestParts<
+            AppState,
+        >>::Rejection,
+    >,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     // The client IP, resolved the same way whether it is about to gate an
     // invite redemption or a large document's per-address budget below —
     // both count the one source a stranger cannot choose over HTTPS.
-    let client_ip = connect.map(|axum::Extension(axum::extract::ConnectInfo(addr))| {
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies)
-    });
-    if let Some(ip) = client_ip
-        && is_redeem_start(&body)
-    {
+    //
+    // A request with no connection address is refused rather than counted
+    // under a shared placeholder: every production server is built with
+    // `into_make_service_with_connect_info`, so its absence is a wiring
+    // fault, and a shared bucket would skip the redemption limit and pool
+    // every such caller's large-document budget.
+    let Ok(axum::extract::ConnectInfo(addr)) = connect else {
+        tracing::error!(
+            "trust-tasks request without a connection address; the server must be built with \
+             into_make_service_with_connect_info"
+        );
+        return Err(AppError::Internal(
+            "no connection address for this request".into(),
+        ));
+    };
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let ip =
+        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let client_ip = Some(ip);
+    if is_redeem_start(&body) {
         let limited = state.redeem_rate_limiter.try_consume(
             &format!("ip:{ip}"),
             did_hosting_common::server::auth::session::now_epoch(),
