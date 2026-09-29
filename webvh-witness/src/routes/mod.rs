@@ -3,7 +3,6 @@ pub mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::connect_info::MockConnectInfo;
 use axum::routing::post;
 
 use crate::server::AppState;
@@ -24,12 +23,13 @@ pub fn router() -> Router<AppState> {
         )
         // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
         // per real connection in production by
-        // `into_make_service_with_connect_info`. This is the fallback
-        // `ConnectInfo`'s extractor uses when a router is driven directly
-        // (`.oneshot()` in tests) with no real connection behind it; it never
-        // affects a genuine request.
-        .layer(MockConnectInfo(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            0,
-        ))))
+        // `into_make_service_with_connect_info`. There is deliberately no
+        // `MockConnectInfo` layer here: production must never silently fall
+        // back to a shared address, so a router driven directly (`.oneshot()`
+        // in tests) with no real connection behind it has to supply its own
+        // mock, or `receive`'s extractor fails the request closed with a 500.
+        // This layer only logs that case; it never masks it.
+        .layer(axum::middleware::from_fn(
+            trust_tasks::log_missing_connect_info,
+        ))
 }
