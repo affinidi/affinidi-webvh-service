@@ -93,6 +93,12 @@
             "content": {
               "application/json": {}
             }
+          },
+          "429": {
+            "description": "This address's request rate exceeds the limit",
+            "content": {
+              "application/json": {}
+            }
           }
         }
       }
