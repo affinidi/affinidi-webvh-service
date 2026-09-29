@@ -1413,6 +1413,13 @@ pub async fn upload_witness(
     witness_entry: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
+
+    // Same per-path write lock as `register_did_atomic`: merging a proof
+    // into the stored witness file is a read-modify-write, and two
+    // witnesses publishing at once would otherwise each write back only
+    // their own proof, silently dropping the other's.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
+
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     use did_hosting_common::server::error::ValidationKind;
