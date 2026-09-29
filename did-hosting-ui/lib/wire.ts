@@ -35,6 +35,7 @@ import type {
   InviteListItem,
   LogEntryInfo,
   LogMetadata,
+  PasskeyCredential,
   ServerStats,
   ServiceInstance,
   TimeRange,
@@ -314,6 +315,27 @@ export function inviteFromWire(i: InviteSummary): InviteListItem {
     createdAt: requiredEpoch(i.createdAt),
     expiresAt: requiredEpoch(i.expiresAt),
     expired: i.expired,
+  };
+}
+
+/** A wire credential summary — `auth/passkey/list`'s `RegisteredCredential`
+ *  and `auth/passkey/admin-list`'s `ListedCredential` share this shape (the
+ *  latter also carries an optional `signCount` this console doesn't show). */
+interface WireCredentialSummary {
+  credentialId: string;
+  deviceLabel?: string;
+  registeredAt: string;
+  lastUsedAt?: string;
+  transports?: string[];
+}
+
+export function passkeyCredentialFromWire(c: WireCredentialSummary): PasskeyCredential {
+  return {
+    credentialId: c.credentialId,
+    deviceLabel: c.deviceLabel ?? null,
+    registeredAt: requiredEpoch(c.registeredAt),
+    lastUsedAt: epochSeconds(c.lastUsedAt),
+    transports: c.transports ?? [],
   };
 }
 

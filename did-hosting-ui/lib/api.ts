@@ -47,6 +47,10 @@ import type * as RedeemFinish from "@openvtc/trust-tasks/auth/passkey/enroll/red
 import type * as InviteList from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
 import type * as InviteUpdate from "@openvtc/trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
 import type * as InviteRevoke from "@openvtc/trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
+import type * as PasskeyList from "@openvtc/trust-tasks/auth/passkey/list/0.1/payload";
+import type * as PasskeyAdminList from "@openvtc/trust-tasks/auth/passkey/admin-list/0.1/payload";
+import type * as PasskeyRevokeStart from "@openvtc/trust-tasks/auth/passkey/revoke/start/0.2/payload";
+import type * as PasskeyRevokeFinish from "@openvtc/trust-tasks/auth/passkey/revoke/finish/0.2/payload";
 import type * as AclList from "@openvtc/trust-tasks/acl/list/0.1/payload";
 import type * as AclShow from "@openvtc/trust-tasks/acl/show/0.1/payload";
 import type * as AclGrant from "@openvtc/trust-tasks/acl/grant/0.1/payload";
@@ -77,6 +81,7 @@ import {
   inviteFromWire,
   logEntriesFromWire,
   logMetadataFromEntries,
+  passkeyCredentialFromWire,
   serviceInstanceFromWire,
   statsFromWire,
   timeRangeToWire,
@@ -388,6 +393,32 @@ export interface InviteListResponse {
   invites: InviteListItem[];
 }
 
+/** A passkey already bound to a subject — the auth service's own management
+ *  view (`auth/passkey/list`, `auth/passkey/admin-list`), never a WebAuthn
+ *  dictionary. `credentialId` is opaque: echoed verbatim to
+ *  `revokePasskeyStart`, never parsed. */
+export interface PasskeyCredential {
+  credentialId: string;
+  deviceLabel: string | null;
+  registeredAt: number;
+  lastUsedAt: number | null;
+  transports: string[];
+}
+
+/** The caller's own re-authentication ceremony for `revoke/finish`. */
+export interface RevokePasskeyStartResponse {
+  revocationId: string;
+  uvOptions: PasskeyRevokeStart.Response["uvOptions"];
+}
+
+export interface RevokePasskeyFinishResponse {
+  credentialId: string;
+  subject: string;
+  purpose: InvitePurpose;
+  revokedAt: number;
+  remaining: number;
+}
+
 /** `server/config`: what an operator needs to see. No secrets, by rule. */
 export interface ControlPlaneConfig {
   controlDid: string;
@@ -494,6 +525,10 @@ const T = {
   inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
   inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
   inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
+  passkeyList: `${TT}auth/passkey/list/0.1` as const satisfies typeof PasskeyList.TYPE_URI,
+  passkeyAdminList: `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
+  passkeyRevokeStart: `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
+  passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
   aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
   revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
   aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
@@ -1271,5 +1306,61 @@ export const api = {
 
   revokeInvite: async (inviteId: string): Promise<void> => {
     await trustTask<InviteRevoke.Payload, InviteRevoke.Response>(T.inviteRevoke, { inviteId });
+  },
+
+  // ---- Passkey management (Trust Tasks) ----
+
+  /** The caller's own passkeys, of every purpose — the credential-management
+   *  counterpart to the session list: this answers "what can sign me in?". */
+  listPasskeys: async (): Promise<PasskeyCredential[]> => {
+    const r = await trustTask<PasskeyList.Payload, PasskeyList.Response>(T.passkeyList, {});
+    return r.credentials.map(passkeyCredentialFromWire);
+  },
+
+  /** An administrator's purpose-scoped read of one subject's passkeys —
+   *  never the owner's own `listPasskeys`, which takes no subject. */
+  adminListPasskeys: async (
+    subject: string,
+    purpose: InvitePurpose,
+  ): Promise<PasskeyCredential[]> => {
+    const r = await trustTask<PasskeyAdminList.Payload, PasskeyAdminList.Response>(
+      T.passkeyAdminList,
+      { subject, purpose },
+    );
+    return r.credentials.map(passkeyCredentialFromWire);
+  },
+
+  /**
+   * Begin revoking a passkey — the caller's own, or, for an administrator,
+   * `subject`'s. The response carries a fresh user-verification challenge
+   * over the *caller's* own credentials: the person acting proves they are
+   * present, whoever owns the credential being revoked. Nothing is removed
+   * until `revokePasskeyFinish` presents that assertion.
+   */
+  revokePasskeyStart: async (
+    credentialId: string,
+    subject?: string,
+  ): Promise<RevokePasskeyStartResponse> =>
+    trustTask<PasskeyRevokeStart.Payload, PasskeyRevokeStart.Response>(T.passkeyRevokeStart, {
+      credentialId,
+      ...(subject ? { subject } : {}),
+    }),
+
+  /** Present the user-verification assertion `revokePasskeyStart` asked for. */
+  revokePasskeyFinish: async (
+    revocationId: string,
+    uvCredential: PasskeyRevokeFinish.Payload["uvCredential"],
+  ): Promise<RevokePasskeyFinishResponse> => {
+    const r = await trustTask<PasskeyRevokeFinish.Payload, PasskeyRevokeFinish.Response>(
+      T.passkeyRevokeFinish,
+      { revocationId, uvCredential },
+    );
+    return {
+      credentialId: r.credentialId,
+      subject: r.subject,
+      purpose: r.purpose,
+      revokedAt: Math.floor(Date.parse(r.revokedAt) / 1000),
+      remaining: r.remaining,
+    };
   },
 };

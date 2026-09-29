@@ -46,6 +46,7 @@ pub(crate) mod enrol;
 mod enrol_tests;
 #[cfg(test)]
 pub(crate) mod harness;
+pub(crate) mod passkey;
 pub(crate) mod queries;
 pub(crate) mod registry;
 pub(crate) mod server;
@@ -56,7 +57,10 @@ mod tests;
 
 use trust_tasks_rs::specs::{
     auth::{
-        passkey::{enroll as tt_enroll, enroll::invite as tt_invite, login as tt_login},
+        passkey::{
+            admin_list as tt_pk_admin_list, enroll as tt_enroll, enroll::invite as tt_invite,
+            list as tt_pk_list, login as tt_login, revoke as tt_pk_revoke,
+        },
         revoke_session as tt_revoke_session, step_up as tt_step_up,
     },
     did_management::{
@@ -180,6 +184,14 @@ control_tasks! {
     tt_invite::list::v0_1 => Authentication, enrol::invite_list;
     tt_invite::update::v0_1 => Authentication, enrol::invite_update;
     tt_invite::revoke::v0_1 => Authentication, enrol::invite_revoke;
+    // Passkey management: a subject's own inventory, an administrator's
+    // purpose-scoped read of another's, and revoking one — a re-
+    // authentication ceremony like enrolment's own user-verification, not a
+    // bare delete.
+    tt_pk_list::v0_1 => Authentication, passkey::list;
+    tt_pk_admin_list::v0_1 => Authentication, passkey::admin_list;
+    tt_pk_revoke::start::v0_2 => Authentication, passkey::revoke_start;
+    tt_pk_revoke::finish::v0_2 => Authentication, passkey::revoke_finish;
 }
 
 /// The proof rule for `type_uri`, when this table serves it.

@@ -9,7 +9,9 @@ use did_hosting_common::server::acl::{Role, get_acl_entry};
 use did_hosting_common::server::passkey::{invite, store as pk};
 use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
 
-use super::harness::{Caller, VIAS, Via, code, conforms, member, ok, request, state, stranger};
+use super::harness::{
+    Caller, VIAS, Via, code, conforms, member, ok, request, session_for, state, stranger,
+};
 use super::soft_passkey::SoftPasskey;
 use crate::server::AppState;
 
@@ -46,6 +48,12 @@ const FINISH: &str = "auth/passkey/enroll/finish/0.2";
 const LOGIN_START: &str = "auth/passkey/login/start/0.2";
 const LOGIN_FINISH: &str = "auth/passkey/login/finish/0.2";
 const LIST: &str = "auth/passkey/enroll/invite/list/0.1";
+const STEP_UP_START: &str = "auth/step-up/start/0.1";
+const STEP_UP_APPROVE: &str = "auth/step-up/approve-response/0.5";
+const PK_LIST: &str = "auth/passkey/list/0.1";
+const PK_ADMIN_LIST: &str = "auth/passkey/admin-list/0.1";
+const PK_REVOKE_START: &str = "auth/passkey/revoke/start/0.2";
+const PK_REVOKE_FINISH: &str = "auth/passkey/revoke/finish/0.2";
 
 /// An issued invite's two secrets.
 struct Issued {
@@ -805,4 +813,631 @@ async fn https_redemption_is_rate_limited_per_client_ip() {
     }
     assert_eq!(code(&last), "unavailable", "{last}");
     assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
+/// A step-up approve-response's `webauthn` evidence is gated on the
+/// subject's step-up-only store: offered only once one is enrolled, bound to
+/// the ceremony's own challenge, refused without user verification, and
+/// refused for a login passkey's assertion even though it's a real,
+/// currently-valid credential for the same subject.
+#[tokio::test]
+async fn step_up_accepts_its_own_passkey_and_refuses_a_login_one() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 100, Role::Admin).await;
+    let dana = member(&state, 101, Role::Owner).await;
+    let invitee = stranger(102);
+
+    // Dana has a login passkey but, so far, no step-up passkey.
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let tokens = session_for(&state, &dana).await;
+    let session_id = tokens.session_id.clone();
+
+    // No step-up passkey yet: didSigned only, no webauthn gate offered.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["acceptableEvidence"],
+        json!(["didSigned"]),
+        "{request}"
+    );
+    assert!(request["payload"].get("webauthn").is_none(), "{request}");
+
+    // Give her a step-up passkey.
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Now the start offers a WebAuthn gate, bound to the ceremony's own
+    // challenge — the same value, not merely an equal-looking one.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["acceptableEvidence"],
+        json!(["didSigned", "webauthn"]),
+        "{request}"
+    );
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let webauthn_options = request["payload"]["webauthn"].clone();
+    assert_eq!(webauthn_options["challenge"], challenge, "{request}");
+
+    // A login passkey's assertion over the same options: refused. It's a
+    // real, currently-bound credential for this subject — just not one this
+    // ceremony was opened for (the ceremony only knows the step-up store's
+    // credentials).
+    let bad = login_key.assert(&webauthn_options);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": bad },
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+
+    // Single use: that refusal burned the challenge. A fresh start, and an
+    // assertion with no user verification: also refused.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    step_up.user_verified = false;
+    let no_uv = step_up.assert(&request["payload"]["webauthn"]);
+    step_up.user_verified = true;
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": no_uv },
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+
+    // The subject's own step-up passkey, user-verified: accepted.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let good = step_up.assert(&request["payload"]["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+    assert!(
+        body["session"]["amr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "passkey"),
+        "{body}"
+    );
+}
+
+/// `auth/passkey/list` answers only the caller's own credentials, of every
+/// purpose; `auth/passkey/admin-list` answers one subject's credentials of
+/// one purpose, and only to an administrator.
+#[tokio::test]
+async fn passkey_list_and_admin_list_answer_the_right_scope() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 110, Role::Admin).await;
+    let dana = member(&state, 111, Role::Owner).await;
+    let erin = member(&state, 112, Role::Owner).await;
+    let invitee = stranger(113);
+
+    let mut dana_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut dana_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut dana_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Dana's own list sees both of hers; Erin, who has enrolled nothing,
+    // sees none of Dana's.
+    let reply = call(&state, Via::Https, &dana, &t(PK_LIST), json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_LIST));
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 2, "{body}");
+    assert!(
+        creds
+            .iter()
+            .any(|c| c["credentialId"] == json!(dana_login.id()))
+    );
+    assert!(
+        creds
+            .iter()
+            .any(|c| c["credentialId"] == json!(dana_step_up.id()))
+    );
+
+    let reply = call(&state, Via::Https, &erin, &t(PK_LIST), json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_LIST));
+    assert!(body["credentials"].as_array().unwrap().is_empty(), "{body}");
+
+    // Erin is not an administrator: she cannot read Dana's inventory.
+    let reply = call(
+        &state,
+        Via::Https,
+        &erin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "session" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/admin-list:notAdministrator",
+        "{reply}"
+    );
+
+    // The administrator reads it, purpose by purpose.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "session" }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_ADMIN_LIST));
+    assert_eq!(body["purpose"], "session", "{body}");
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 1, "{body}");
+    assert_eq!(creds[0]["credentialId"], json!(dana_login.id()));
+
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "stepUp" }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_ADMIN_LIST));
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 1, "{body}");
+    assert_eq!(creds[0]["credentialId"], json!(dana_step_up.id()));
+
+    // An unrecognised subject is refused.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": "did:example:nobody", "purpose": "session" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/admin-list:subjectUnknown",
+        "{reply}"
+    );
+}
+
+/// Revoke authority: a subject revokes their own credential (re-authenticated
+/// with their own login passkey); an administrator revokes another subject's
+/// (re-authenticated with *their own* login passkey, never the target's); a
+/// non-administrator asking for anyone else's is refused outright; and a
+/// subject's last login passkey cannot be revoked this way.
+#[tokio::test]
+async fn revoke_authority_is_own_or_administrator_others_are_refused() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let dana = member(&state, 121, Role::Owner).await;
+    let erin = member(&state, 122, Role::Owner).await;
+    let invitee = stranger(123);
+
+    // The administrator's own login passkey, for re-verifying presence when
+    // revoking someone else's credential.
+    let mut admin_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &admin.did, "session").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut admin_login,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    let mut dana_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut dana_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut dana_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    let mut erin_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut erin_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut erin_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Erin is not an administrator: she cannot even start a revocation of
+    // Dana's credential.
+    let reply = call(
+        &state,
+        Via::Https,
+        &erin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": dana_step_up.id(), "subject": dana.did }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/revoke/start:notAuthorized",
+        "{reply}"
+    );
+
+    // Dana revokes her own step-up passkey, re-authenticating with her own
+    // login passkey.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": dana_step_up.id() }),
+    )
+    .await;
+    conforms(&reply);
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = dana_login.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_REVOKE_FINISH));
+    assert_eq!(body["credentialId"], json!(dana_step_up.id()));
+    assert_eq!(body["purpose"], "stepUp", "{body}");
+    assert_eq!(body["subject"], dana.did.as_str());
+    assert_eq!(body["remaining"], 0, "{body}");
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP).unwrap();
+    assert!(
+        pk::get_passkey_user_by_cred(&step_up_ks, &hex(&dana_step_up.cred_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The administrator revokes Erin's step-up passkey, re-authenticating
+    // with the administrator's own login passkey — not Erin's.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": erin_step_up.id(), "subject": erin.did }),
+    )
+    .await;
+    conforms(&reply);
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = admin_login.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_REVOKE_FINISH));
+    assert_eq!(body["subject"], erin.did.as_str());
+    assert_eq!(body["purpose"], "stepUp", "{body}");
+
+    // Erin's login passkey is her last: revoking it is refused, even for an
+    // administrator.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": erin_login.id(), "subject": erin.did }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/revoke/start:lastCredential",
+        "{reply}"
+    );
+}
+
+/// Open a step-up on `session_id` and return its approve-request payload.
+async fn step_up_payload(state: &AppState, subject: &Caller, session_id: &str) -> Value {
+    let reply = call(
+        state,
+        Via::Https,
+        subject,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    ok(&reply, &t(STEP_UP_START))["approveRequest"]["payload"].clone()
+}
+
+/// A step-up passkey assertion is single use, even raced: two responses
+/// carrying the same valid assertion arrive together and exactly one
+/// elevates the session. Replayed afterwards — into this session or a new
+/// step-up — it is refused.
+#[tokio::test]
+async fn a_step_up_assertion_elevates_once_even_raced_and_never_replays() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 130, Role::Admin).await;
+    let dana = member(&state, 131, Role::Owner).await;
+    let invitee = stranger(132);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    let approve = |challenge: &Value, assertion: &Value| {
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": assertion },
+        })
+    };
+
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    let good = step_up.assert(&payload["webauthn"]);
+    let body = approve(&payload["challenge"], &good);
+    let approve_type = t(STEP_UP_APPROVE);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+    );
+    let response = format!("{}#response", t(STEP_UP_APPROVE));
+    let elevated = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(elevated, 1, "exactly one racer elevates: {a} / {b}");
+
+    // Replayed into the same, now-consumed step-up: refused.
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), body).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:challengeUnknown",
+        "{reply}"
+    );
+
+    // Replayed against a fresh step-up on another session — its own
+    // challenge, the old assertion: the ceremony that assertion answers is
+    // gone, so it does not verify.
+    let other_session = session_for(&state, &dana).await.session_id;
+    let payload = step_up_payload(&state, &dana, &other_session).await;
+    let mut replay = approve(&payload["challenge"], &good);
+    replay["sessionId"] = json!(other_session);
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), replay).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+}
+
+/// Two revocations of a subject's last two login passkeys, finished at the
+/// same moment, can't both pass the last-login-passkey guard: exactly one
+/// revokes, the other is refused, and the survivor still signs in.
+#[tokio::test]
+async fn concurrent_revokes_cannot_remove_the_last_login_passkey() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 140, Role::Admin).await;
+    let dana = member(&state, 141, Role::Owner).await;
+    let invitee = stranger(142);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // A second login credential for Dana: enrolled for another subject, then
+    // rebound to Dana in the store. It is only ever a revoke target here, so
+    // its user handle doesn't matter.
+    let erin = member(&state, 143, Role::Owner).await;
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    // Two open revocations, one per credential; each passes `start`'s guard.
+    let mut finishes = Vec::new();
+    for target in [first.id(), second.id()] {
+        let reply = call(
+            &state,
+            Via::Https,
+            &dana,
+            &t(PK_REVOKE_START),
+            json!({ "credentialId": target }),
+        )
+        .await;
+        let start = ok(&reply, &t(PK_REVOKE_START));
+        let uv = first.assert(&start["uvOptions"]);
+        finishes.push(json!({ "revocationId": start["revocationId"], "uvCredential": uv }));
+    }
+    let finish_type = t(PK_REVOKE_FINISH);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &finish_type, finishes[0].clone()),
+        call(&state, Via::Https, &dana, &finish_type, finishes[1].clone()),
+    );
+    let response = format!("{}#response", t(PK_REVOKE_FINISH));
+    let revoked = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(revoked, 1, "exactly one revoke may win: {a} / {b}");
+
+    let user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.credentials.len(), 1);
+    let survivor = hex(user.credentials[0].cred_id());
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &survivor)
+            .await
+            .unwrap()
+            .is_some(),
+        "the surviving credential is still indexed"
+    );
 }
