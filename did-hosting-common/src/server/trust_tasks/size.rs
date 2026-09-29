@@ -141,10 +141,21 @@ pub const LARGE_DOCUMENT_BUDGET_PER_WINDOW: u64 = 5;
 /// Fixed-window length, in seconds, for [`LargeDocumentBudget`].
 pub const LARGE_DOCUMENT_BUDGET_WINDOW_SECS: u64 = 60;
 
-/// Hard cap on tracked-address map size, mirroring
-/// `did-hosting-control::rate_limit`'s per-IP and per-source limiters: past
-/// this the whole map is cleared in one pass rather than left to grow
-/// unbounded under a novel-address flood.
+/// Large documents admitted per window across *every* address together.
+///
+/// The per-address budget is keyed on something a caller can vary — a client
+/// IP behind a large pool, or on the messaging transports a sender VID anyone
+/// can mint — so it bounds one address, not the service. This bounds the
+/// service: however many addresses a caller spreads across, the raised-limit
+/// parse-and-verify path runs at most this many times a window. A legitimate
+/// deployment registers far fewer large DIDs than this per minute.
+pub const LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW: u64 = 60;
+
+/// Hard cap on tracked-address map size. Past it, addresses with nothing at
+/// stake — an expired window and no penalty — are evicted; if the map is
+/// still full, a new address is refused rather than tracked. Clearing the map
+/// wholesale, as the per-IP limiters do, would also wipe every penalty, which
+/// a novel-address flood could then trigger on purpose.
 const MAX_TRACKED_ADDRESSES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -163,7 +174,15 @@ struct Bucket {
 /// docs.
 #[derive(Debug, Default)]
 pub struct LargeDocumentBudget {
-    buckets: std::sync::Mutex<std::collections::HashMap<String, Bucket>>,
+    inner: std::sync::Mutex<BudgetState>,
+}
+
+#[derive(Debug, Default)]
+struct BudgetState {
+    buckets: std::collections::HashMap<String, Bucket>,
+    /// The every-address window: see [`LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW`].
+    global_spent: u64,
+    global_window_start: u64,
 }
 
 impl LargeDocumentBudget {
@@ -176,15 +195,30 @@ impl LargeDocumentBudget {
     /// once spending would exceed [`LARGE_DOCUMENT_BUDGET_PER_WINDOW`] for
     /// the current one.
     fn try_charge(&self, address: &str, now: u64) -> Result<(), u64> {
-        let mut buckets = self
-            .buckets
+        let mut state = self
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = &mut *state;
 
-        // Drastic eviction, as the per-IP/per-source limiters do: past the
-        // cap, clear the whole map rather than let it grow unbounded.
-        if buckets.len() >= MAX_TRACKED_ADDRESSES {
-            buckets.clear();
+        if now.saturating_sub(state.global_window_start) >= LARGE_DOCUMENT_BUDGET_WINDOW_SECS {
+            state.global_spent = 0;
+            state.global_window_start = now;
+        }
+        let global_retry =
+            (state.global_window_start + LARGE_DOCUMENT_BUDGET_WINDOW_SECS).saturating_sub(now);
+        if state.global_spent >= LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
+            return Err(global_retry);
+        }
+
+        let buckets = &mut state.buckets;
+        if buckets.len() >= MAX_TRACKED_ADDRESSES && !buckets.contains_key(address) {
+            buckets.retain(|_, b| {
+                b.cost > 1 || now.saturating_sub(b.window_start) < LARGE_DOCUMENT_BUDGET_WINDOW_SECS
+            });
+            if buckets.len() >= MAX_TRACKED_ADDRESSES {
+                return Err(global_retry);
+            }
         }
 
         let entry = buckets.entry(address.to_string()).or_insert(Bucket {
@@ -204,6 +238,7 @@ impl LargeDocumentBudget {
             return Err(retry_after_secs);
         }
         entry.spent += entry.cost;
+        state.global_spent += 1;
         Ok(())
     }
 
@@ -214,11 +249,11 @@ impl LargeDocumentBudget {
     /// short of overflow, since a handful of doublings already exhausts the
     /// window on its own.
     fn penalize(&self, address: &str) {
-        let mut buckets = self
-            .buckets
+        let mut state = self
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = buckets.entry(address.to_string()).or_insert(Bucket {
+        let entry = state.buckets.entry(address.to_string()).or_insert(Bucket {
             spent: 0,
             window_start: 0,
             cost: 1,
@@ -228,9 +263,10 @@ impl LargeDocumentBudget {
 
     #[cfg(test)]
     fn cost(&self, address: &str) -> u64 {
-        self.buckets
+        self.inner
             .lock()
             .unwrap()
+            .buckets
             .get(address)
             .map(|b| b.cost)
             .unwrap_or(1)
@@ -548,6 +584,69 @@ mod tests {
     /// A document at or under the default is never charged against the
     /// budget, whatever it claims — the whole point of the default is that
     /// every type accepts that much for free.
+    #[test]
+    fn many_addresses_together_are_held_to_the_global_budget() {
+        let budget = LargeDocumentBudget::new();
+        for i in 0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
+            assert!(budget.try_charge(&format!("vid:{i}"), 1_000).is_ok());
+        }
+        assert!(
+            budget.try_charge("vid:fresh", 1_000).is_err(),
+            "a fresh address does not escape the service-wide cap"
+        );
+        assert!(
+            budget
+                .try_charge("vid:fresh", 1_000 + LARGE_DOCUMENT_BUDGET_WINDOW_SECS)
+                .is_ok(),
+            "the next window has room again"
+        );
+    }
+
+    #[test]
+    fn a_full_map_keeps_its_penalties() {
+        let budget = LargeDocumentBudget::new();
+        budget.penalize("ip:abuser");
+        {
+            let mut state = budget.inner.lock().unwrap();
+            for i in 0..MAX_TRACKED_ADDRESSES {
+                state.buckets.insert(
+                    format!("ip:{i}"),
+                    Bucket {
+                        spent: 0,
+                        window_start: 0,
+                        cost: 1,
+                    },
+                );
+            }
+        }
+        // Every filler's window has expired: they are evicted, the penalty is not.
+        assert!(budget.try_charge("ip:new", 10_000).is_ok());
+        assert_eq!(budget.cost("ip:abuser"), 2);
+    }
+
+    #[test]
+    fn a_full_map_of_live_addresses_refuses_a_new_one() {
+        let budget = LargeDocumentBudget::new();
+        {
+            let mut state = budget.inner.lock().unwrap();
+            for i in 0..MAX_TRACKED_ADDRESSES {
+                state.buckets.insert(
+                    format!("ip:{i}"),
+                    Bucket {
+                        spent: 1,
+                        window_start: 10_000,
+                        cost: 1,
+                    },
+                );
+            }
+        }
+        assert!(budget.try_charge("ip:new", 10_000).is_err());
+        assert!(
+            budget.try_charge("ip:0", 10_000).is_ok(),
+            "a tracked address still charges"
+        );
+    }
+
     #[tokio::test]
     async fn small_documents_are_never_charged() {
         let acl = acl_with("did:web:admin.example").await;
