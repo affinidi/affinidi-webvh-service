@@ -332,12 +332,24 @@ async fn proxied_authenticate_body(
     sign_envelope(doc, delegate).await
 }
 
+/// `oneshot` has no real connection, so give the request the peer address a
+/// production server records per connection.
+fn with_peer(mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            12345,
+        ))));
+    req
+}
+
 fn authenticate_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/trust-tasks")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .map(with_peer)
         .unwrap()
 }
 
@@ -347,6 +359,7 @@ fn junk_authenticate_request(body: String) -> Request<Body> {
         .uri("/api/trust-tasks")
         .header("content-type", "application/json")
         .body(Body::from(body))
+        .map(with_peer)
         .unwrap()
 }
 
