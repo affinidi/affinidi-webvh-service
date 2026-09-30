@@ -46,7 +46,7 @@ use webauthn_rs::prelude::{
 };
 
 use did_hosting_common::server::acl::{self, AclEntry, Role};
-use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::server::auth::session::{self, now_epoch};
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 use did_hosting_common::server::domain::DomainScope;
 use did_hosting_common::server::passkey::invite::{self, InviteRequest, Purpose, Redemption};
@@ -704,6 +704,24 @@ pub(crate) async fn redeem_finish(
         acl_entry,
     )
     .await?;
+    // A step-up passkey just landed: any session of this subject still
+    // carrying an aal2 elevation reached without one (a wallet/VTA-signed
+    // `didSigned` step-up) stops counting from here — decisions from now on
+    // are made by `approve_response`'s own fresh check, but a session
+    // elevated *before* this enrolment would otherwise keep that elevation
+    // until it happened to refresh.
+    if ceremony.purpose == Purpose::StepUp {
+        let demoted =
+            session::demote_non_passkey_step_up_sessions(&state.sessions_ks, &ceremony.subject)
+                .await?;
+        if demoted > 0 {
+            info!(
+                subject = %ceremony.subject,
+                demoted,
+                "step-up passkey enrolled: prior non-passkey elevation revoked"
+            );
+        }
+    }
     let cred_id = wire_cred_id(&passkey)?;
     info!(
         target: "audit",

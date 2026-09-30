@@ -26,10 +26,33 @@ fn refresh_key(token: &str) -> String {
     format!("refresh:{token}")
 }
 
+/// Per-DID reverse index: `session-did:{did}:{session_id}` → `session_id`.
+///
+/// Lets [`demote_non_passkey_step_up_sessions`] find one subject's sessions
+/// without a full `session:` table scan. Written by [`store_session`],
+/// removed by [`delete_session`] and [`cleanup_expired_sessions`] — every
+/// path that writes or removes a `session:` row keeps this in lockstep.
+fn session_did_key(did: &str, session_id: &str) -> String {
+    format!("session-did:{did}:{session_id}")
+}
+
+/// Prefix over `session_did_key` entries for `did` — every one of its
+/// sessions. The trailing colon disambiguates DIDs that are a prefix of one
+/// another (e.g. `did:example:ali` vs. `did:example:alice`).
+fn session_did_prefix(did: &str) -> String {
+    format!("session-did:{did}:")
+}
+
 /// Store a new session in the `sessions` keyspace.
 pub async fn store_session(sessions: &KeyspaceHandle, session: &Session) -> Result<(), AppError> {
     sessions
         .insert(session_key(&session.session_id), session)
+        .await?;
+    sessions
+        .insert_raw(
+            session_did_key(&session.did, &session.session_id),
+            session.session_id.as_bytes().to_vec(),
+        )
         .await?;
     debug!(session_id = %session.session_id, did = %session.did, "session stored");
     Ok(())
@@ -163,9 +186,62 @@ pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Resu
             sessions.remove(refresh_key(token)).await?;
         }
         sessions.remove(session_key(session_id)).await?;
+        sessions
+            .remove(session_did_key(&session.did, session_id))
+            .await?;
         debug!(session_id, "session deleted");
     }
     Ok(())
+}
+
+/// Demote every live session of `subject` that is currently elevated
+/// (`acr == "aal2"`) without a passkey factor in `amr` — the wallet/VTA-signed
+/// `didSigned` step-up route this relying party no longer honours for a
+/// subject holding a step-up passkey (once enrolled, only that subject's own
+/// step-up passkeys may satisfy step-up; any elevation reached another way
+/// stops counting, SPEC step-up rule).
+///
+/// Call this once a step-up passkey is enrolled for `subject`. A session
+/// already elevated *with* a passkey (`amr` contains `"passkey"`) is left
+/// untouched — it satisfies the rule that now applies. The demoted row falls
+/// back to the base `aal1`/`["did"]` shape; a live access token already
+/// carrying the higher claims is unaffected until it is next refreshed or
+/// expires, the same bound every other mid-session permission change in this
+/// store is subject to (see `AuthClaims`, which reads `acr`/`amr`/`role` from
+/// the JWT, not the session row, between refreshes).
+///
+/// Returns the number of sessions demoted.
+///
+/// Walks only `subject`'s own sessions, via the `session-did:{subject}:`
+/// index (see [`session_did_key`]) — not a full `session:` table scan.
+pub async fn demote_non_passkey_step_up_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+) -> Result<u64, AppError> {
+    let entries = sessions
+        .prefix_iter_raw(session_did_prefix(subject))
+        .await?;
+    let mut demoted = 0u64;
+    for (_key, value) in entries {
+        let Ok(session_id) = String::from_utf8(value) else {
+            continue;
+        };
+        let Some(mut session) = get_session(sessions, &session_id).await? else {
+            continue;
+        };
+        if session.did != subject
+            || session.acr != "aal2"
+            || session.amr.iter().any(|m| m == "passkey")
+        {
+            continue;
+        }
+        session.amr = vec!["did".to_string()];
+        session.acr = "aal1".to_string();
+        session.acr_expires_at = None;
+        store_session(sessions, &session).await?;
+        demoted += 1;
+    }
+    Ok(demoted)
 }
 
 /// Remove expired sessions from the store.
@@ -201,6 +277,9 @@ pub async fn cleanup_expired_sessions(
             if let Some(ref token) = session.refresh_token {
                 sessions.remove(refresh_key(token)).await?;
             }
+            sessions
+                .remove(session_did_key(&session.did, &session.session_id))
+                .await?;
             removed += 1;
         }
     }
@@ -720,6 +799,129 @@ mod refresh_token_invariant {
                 .is_none(),
             "a refresh-less Authenticated session is reaped on the next sweep, however recently \
              it was seen — teach cleanup_expired_sessions about last_seen before creating one"
+        );
+    }
+}
+
+/// #191: `demote_non_passkey_step_up_sessions` walks the `session-did:`
+/// index rather than the whole `session:` table, and that index stays in
+/// lockstep with every writer/remover of a session row.
+#[cfg(all(test, feature = "store-fjall"))]
+mod demotion_index_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        (ks, dir)
+    }
+
+    fn session(did: &str, session_id: &str, acr: &str, amr: Vec<String>) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: None,
+            refresh_expires_at: Some(now_epoch() + 3600),
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr,
+            acr: acr.to_string(),
+            acr_expires_at: None,
+        }
+    }
+
+    /// Demotion touches only the subject's own sessions — reached via the
+    /// `session-did:{subject}:` index — never another subject's, and never
+    /// one of the subject's own sessions that already carries a passkey
+    /// factor.
+    #[tokio::test]
+    async fn demotion_touches_only_the_subjects_own_sessions_via_the_index() {
+        let (ks, _dir) = make_ks().await;
+
+        let alice_elevated = session("did:example:alice", "s-alice-1", "aal2", vec!["did".into()]);
+        let alice_passkey = session(
+            "did:example:alice",
+            "s-alice-2",
+            "aal2",
+            vec!["did".into(), "passkey".into()],
+        );
+        let bob_elevated = session("did:example:bob", "s-bob-1", "aal2", vec!["did".into()]);
+        for s in [&alice_elevated, &alice_passkey, &bob_elevated] {
+            store_session(&ks, s).await.unwrap();
+        }
+
+        let demoted = demote_non_passkey_step_up_sessions(&ks, "did:example:alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            demoted, 1,
+            "only alice's non-passkey aal2 session is demoted"
+        );
+
+        let alice1 = get_session(&ks, "s-alice-1").await.unwrap().unwrap();
+        assert_eq!(alice1.acr, "aal1");
+
+        let alice2 = get_session(&ks, "s-alice-2").await.unwrap().unwrap();
+        assert_eq!(alice2.acr, "aal2", "a passkey-factor session is left alone");
+
+        let bob1 = get_session(&ks, "s-bob-1").await.unwrap().unwrap();
+        assert_eq!(
+            bob1.acr, "aal2",
+            "another subject's session is never touched"
+        );
+    }
+
+    /// The `session-did:` index entry is removed exactly when the session
+    /// row it points to is — on delete, and on the expiry sweep — so it
+    /// never grows stale pointers to sessions that no longer exist.
+    #[tokio::test]
+    async fn the_did_index_is_removed_on_delete_and_on_cleanup() {
+        let (ks, _dir) = make_ks().await;
+
+        let deleted = session("did:example:carol", "s-carol-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &deleted).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "store_session must write the index"
+        );
+        delete_session(&ks, &deleted.session_id).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "delete_session must remove the did-index entry too"
+        );
+
+        let mut expired = session("did:example:dana", "s-dana-1", "aal1", vec!["did".into()]);
+        expired.refresh_expires_at = Some(0); // already in the past
+        store_session(&ks, &expired).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap()
+        );
+        cleanup_expired_sessions(&ks, 300).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap(),
+            "cleanup_expired_sessions must remove the did-index entry too"
         );
     }
 }
