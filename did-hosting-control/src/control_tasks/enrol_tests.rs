@@ -877,7 +877,7 @@ async fn step_up_accepts_its_own_passkey_and_refuses_a_login_one() {
     let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
     assert_eq!(
         request["payload"]["acceptableEvidence"],
-        json!(["didSigned", "webauthn"]),
+        json!(["webauthn"]),
         "{request}"
     );
     let challenge = request["payload"]["challenge"]
@@ -1440,4 +1440,188 @@ async fn concurrent_revokes_cannot_remove_the_last_login_passkey() {
             .is_some(),
         "the surviving credential is still indexed"
     );
+}
+
+/// Once a subject holds a step-up passkey, a decision with no `webauthn`
+/// evidence — a plain framework-proof (`didSigned`) approval, exactly as a
+/// wallet or VTA-signed approve-response would send, and exactly what
+/// satisfied step-up before this subject enrolled one — no longer grants it,
+/// however validly it is signed. Only the passkey does.
+#[tokio::test]
+async fn step_up_with_a_passkey_refuses_a_no_passkey_decision() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 150, Role::Admin).await;
+    let dana = member(&state, 151, Role::Owner).await;
+    let invitee = stranger(152);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    assert_eq!(
+        payload["acceptableEvidence"],
+        json!(["webauthn"]),
+        "{payload}"
+    );
+
+    // A framework-proof-only decision, no evidence at all: refused. The
+    // subject's own step-up passkey is the only route left.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:noGate",
+        "{reply}"
+    );
+
+    // The refusal consumed that challenge (single use, whatever the
+    // decision) — re-open, and the passkey still completes it.
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    let good = step_up.assert(&payload["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+}
+
+/// A subject with no step-up passkey keeps today's route: a plain
+/// framework-proof (`didSigned`) approve-response elevates the session.
+/// Enrolling a step-up passkey afterwards drops that elevation — a fresh
+/// step-up start no longer answers `notNeeded`, and now only the new
+/// passkey satisfies it.
+#[tokio::test]
+async fn enrolling_a_step_up_passkey_revokes_a_prior_non_passkey_elevation() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 160, Role::Admin).await;
+    let dana = member(&state, 161, Role::Owner).await;
+    let invitee = stranger(162);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    // No step-up passkey yet: the old didSigned route elevates the session.
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    assert_eq!(
+        payload["acceptableEvidence"],
+        json!(["didSigned"]),
+        "{payload}"
+    );
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+        }),
+    )
+    .await;
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+
+    // Confirmed elevated: a further step-up start answers notNeeded.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    assert_eq!(code(&reply), "auth/step-up/start:notNeeded", "{reply}");
+
+    // Dana enrols a step-up passkey.
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    // The old elevation is gone: the session needs a step-up again, and now
+    // only its own passkey may satisfy it.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["acceptableEvidence"],
+        json!(["webauthn"]),
+        "{request}"
+    );
+
+    // And it can be completed with the new passkey.
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let good = step_up.assert(&request["payload"]["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
 }

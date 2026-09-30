@@ -230,7 +230,11 @@ pub(crate) async fn step_up_start(
                 .and_then(Value::as_str)
                 .ok_or_else(|| AppError::Internal("webauthn options missing challenge".into()))?
                 .to_string();
-            (challenge, json!(["didSigned", "webauthn"]), Some(options))
+            // Once the subject holds a step-up passkey, only a webauthn
+            // assertion from it may satisfy step-up — `didSigned` (a
+            // self- or wallet/VTA-signed decision made without touching
+            // the passkey) is no longer offered.
+            (challenge, json!(["webauthn"]), Some(options))
         }
         None => (random_hex(32), json!(["didSigned"]), None),
     };
@@ -305,6 +309,14 @@ pub(crate) async fn step_up_start(
 /// ceremony `step_up_start` opened for exactly this challenge — a login
 /// passkey can't answer it (it's a different store) and a step-up passkey
 /// can't sign anyone in (this is the only place that verifies one).
+///
+/// **Once the subject holds any step-up passkey, that is the only route.** A
+/// `didSigned` decision (no evidence, or `evidence.kind: didSigned` — a
+/// self- or wallet/VTA-signed approval) is refused with `noGate` for a
+/// subject with at least one `KS_PASSKEY_STEP_UP` credential, checked fresh
+/// here rather than against what `step_up_start` advertised, so enrolling a
+/// passkey between start and this decision still closes the route. A
+/// subject with none keeps `didSigned`.
 pub(crate) async fn approve_response(
     cx: &Cx<'_>,
     p: approve_response::v0_5::Payload,
@@ -378,6 +390,11 @@ pub(crate) async fn approve_response(
     // replacement for it: the browser signs with the did:key its session is
     // already bound to (the same key every other request in the session
     // uses), and the human-facing action is touching the step-up passkey.
+    // Looked up once, fresh, and reused by both the webauthn-evidence branch
+    // below and the passkey-only gate after it — decided at the subject's
+    // *current* enrolment, not at what `step_up_start` offered, since a
+    // step-up passkey can land between start and this decision.
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
     if let Some(Evidence::Webauthn(assertion)) = &p.evidence {
         let webauthn_state = pending.webauthn.as_ref().ok_or_else(|| {
             TaskError::Declared(
@@ -418,7 +435,6 @@ pub(crate) async fn approve_response(
         // already everything `webauthn_state` could answer, since it was
         // built from exactly that subject's `KS_PASSKEY_STEP_UP` passkeys,
         // never the login store.
-        let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
         let _guard = super::passkey::credentials_guard(
             state,
             did_hosting_common::server::passkey::invite::Purpose::StepUp,
@@ -448,6 +464,22 @@ pub(crate) async fn approve_response(
         }
         PayloadDecision::Approved => {}
         _ => return Err(AppError::Validation("unsupported decision".into()).into()),
+    }
+    // Once this subject holds a step-up passkey, only a webauthn assertion
+    // from it may grant step-up: a wallet/VTA-signed `didSigned` decision
+    // (or one carrying no evidence at all) no longer counts, however
+    // properly it is signed. Evaluated fresh, at this decision, not against
+    // what `step_up_start` offered.
+    if !matches!(p.evidence, Some(Evidence::Webauthn(_)))
+        && passkey_store::get_passkey_user_by_did(&step_up_ks, &pending.subject)
+            .await?
+            .is_some_and(|u| !u.credentials.is_empty())
+    {
+        return Err(TaskError::Declared(
+            error_codes::NO_GATE,
+            "the subject has a step-up passkey; only a webauthn assertion from it may grant step-up"
+                .into(),
+        ));
     }
     if let Some(granted) = p.granted_acr.as_deref()
         && granted != STEP_UP_ACR

@@ -168,6 +168,48 @@ pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Resu
     Ok(())
 }
 
+/// Demote every live session of `subject` that is currently elevated
+/// (`acr == "aal2"`) without a passkey factor in `amr` — the wallet/VTA-signed
+/// `didSigned` step-up route this relying party no longer honours for a
+/// subject holding a step-up passkey (once enrolled, only that subject's own
+/// step-up passkeys may satisfy step-up; any elevation reached another way
+/// stops counting, SPEC step-up rule).
+///
+/// Call this once a step-up passkey is enrolled for `subject`. A session
+/// already elevated *with* a passkey (`amr` contains `"passkey"`) is left
+/// untouched — it satisfies the rule that now applies. The demoted row falls
+/// back to the base `aal1`/`["did"]` shape; a live access token already
+/// carrying the higher claims is unaffected until it is next refreshed or
+/// expires, the same bound every other mid-session permission change in this
+/// store is subject to (see `AuthClaims`, which reads `acr`/`amr`/`role` from
+/// the JWT, not the session row, between refreshes).
+///
+/// Returns the number of sessions demoted.
+pub async fn demote_non_passkey_step_up_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+) -> Result<u64, AppError> {
+    let entries = sessions.prefix_iter_raw("session:").await?;
+    let mut demoted = 0u64;
+    for (_key, value) in entries {
+        let Ok(mut session) = serde_json::from_slice::<Session>(&value) else {
+            continue;
+        };
+        if session.did != subject
+            || session.acr != "aal2"
+            || session.amr.iter().any(|m| m == "passkey")
+        {
+            continue;
+        }
+        session.amr = vec!["did".to_string()];
+        session.acr = "aal1".to_string();
+        session.acr_expires_at = None;
+        store_session(sessions, &session).await?;
+        demoted += 1;
+    }
+    Ok(demoted)
+}
+
 /// Remove expired sessions from the store.
 ///
 /// - `ChallengeSent` sessions expire after `challenge_ttl` seconds from `created_at`.
