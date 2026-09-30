@@ -196,6 +196,27 @@ impl AuthState for AppState {
     fn sessions_ks(&self) -> &KeyspaceHandle {
         &self.sessions_ks
     }
+
+    /// Whether `did` holds at least one step-up-only passkey credential —
+    /// backs the extractor's TOCTOU close (#190): an `aal2` session whose
+    /// `amr` lacks `"passkey"` is only ever downgraded back to `aal1` when
+    /// this returns `true`, so the store read only happens on that rare
+    /// path, never on every request.
+    fn has_step_up_passkey(&self, did: &str) -> impl std::future::Future<Output = bool> + Send {
+        let store = self.store.clone();
+        let did = did.to_string();
+        async move {
+            let Ok(ks) = store.keyspace(did_hosting_common::server::store::KS_PASSKEY_STEP_UP)
+            else {
+                return false;
+            };
+            did_hosting_common::server::passkey::store::get_passkey_user_by_did(&ks, &did)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|user| !user.credentials.is_empty())
+        }
+    }
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
