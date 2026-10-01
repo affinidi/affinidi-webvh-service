@@ -12,6 +12,7 @@
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
+use didwebvh_rs::host_policy::HostPolicy;
 use serde_json::{Value, json};
 use trust_tasks_rs::Payload;
 use trust_tasks_rs::specs::webvh::witness::{
@@ -20,7 +21,8 @@ use trust_tasks_rs::specs::webvh::witness::{
 };
 
 use crate::error::{Result, WebVHError};
-use crate::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
+use crate::server::trust_tasks::TransportBoundVerifier;
+use crate::server::trust_tasks::send::{build_signed_request, post_trust_task_https_verified};
 
 /// A client for one webvh-witness service, acting as one requester.
 pub struct WitnessClient {
@@ -29,6 +31,7 @@ pub struct WitnessClient {
     requester_did: String,
     signer: Secret,
     did_resolver: DIDCacheClient,
+    host_policy: HostPolicy,
 }
 
 impl WitnessClient {
@@ -49,7 +52,18 @@ impl WitnessClient {
             requester_did: requester_did.to_string(),
             signer,
             did_resolver,
+            host_policy: HostPolicy::PublicOnly,
         }
+    }
+
+    /// The host policy `did_resolver` was built with, when it is not the
+    /// default `PublicOnly`. Reply verification reads a `did:webvh` witness's
+    /// log to check it is not deactivated, and must be allowed to reach the
+    /// same hosts the resolver can — a witness on `localhost` needs
+    /// `AllowPrivate` here as well as on the resolver.
+    pub fn with_host_policy(mut self, host_policy: HostPolicy) -> Self {
+        self.host_policy = host_policy;
+        self
     }
 
     /// `webvh/witness/sign/0.1`: ask witness identity `witness_id` to witness
@@ -117,12 +131,16 @@ impl WitnessClient {
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;
-        let reply = post_trust_task_https(
+        let verifier = TransportBoundVerifier::with_did_cache_and_host_policy(
+            self.did_resolver.clone(),
+            self.host_policy,
+        );
+        let reply = post_trust_task_https_verified(
             &self.requester_did,
             &self.witness_did,
             &self.url,
             &doc,
-            Some(&self.did_resolver),
+            &verifier,
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;

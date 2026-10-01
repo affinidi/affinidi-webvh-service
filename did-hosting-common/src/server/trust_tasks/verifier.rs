@@ -95,6 +95,8 @@ use std::time::{Duration, Instant};
 use affinidi_data_integrity::{DataIntegrityError, ResolvedKey, SignatureFailure, VerifyOptions};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use async_trait::async_trait;
+use didwebvh_rs::host_policy::HostPolicy;
+use didwebvh_rs::resolve::ResolveOptions;
 use serde::Serialize;
 use trust_tasks_proof::affinidi::{
     CachedDidResolver, ProofPurpose, ProofPurposeResolver, PurposeBound,
@@ -196,9 +198,15 @@ impl StaleKeyRefresh for CacheRefresher {
 /// same document and younger than the cache TTL, and re-read when the cache
 /// resolved the document afresh (or the verdict aged out). The map is bounded
 /// ([`DEACTIVATION_CACHE_CAPACITY`]); expired verdicts are dropped first.
+///
+/// The log is fetched under `host_policy`, which must be the policy the DID
+/// cache resolves with: a signer whose document the cache may fetch has to
+/// have a log this check may fetch too, or every proof from it is refused as
+/// unreachable.
 #[derive(Default)]
 struct DeactivationCache {
     verdicts: Mutex<HashMap<String, (Instant, bool)>>,
+    host_policy: HostPolicy,
 }
 
 impl DeactivationCache {
@@ -253,8 +261,9 @@ impl DeactivationCache {
             return Ok(verdict);
         }
         let mut state = didwebvh_rs::DIDWebVHState::default();
+        let options = ResolveOptions::default().with_host_policy(self.host_policy);
         let deactivated = state
-            .resolve(did, Default::default())
+            .resolve(did, options)
             .await
             .map(|(_, meta)| meta.deactivated)
             .map_err(|e| {
@@ -367,9 +376,22 @@ impl TransportBoundVerifier {
     /// Construct a verifier over a configured DID cache client: operational
     /// proofs must use an `authentication` key, and a proof failing against a
     /// cached document is retried once against a fresh one.
+    ///
+    /// A `did:webvh` signer's log is read under [`HostPolicy::PublicOnly`], the
+    /// DID cache's own default; a client built with another policy needs
+    /// [`Self::with_did_cache_and_host_policy`].
     pub fn with_did_cache(client: DIDCacheClient) -> Self {
+        Self::with_did_cache_and_host_policy(client, HostPolicy::PublicOnly)
+    }
+
+    /// [`Self::with_did_cache`] for a client built with `host_policy` — pass
+    /// the same policy given to its `DIDCacheConfigBuilder::with_host_policy`.
+    pub fn with_did_cache_and_host_policy(client: DIDCacheClient, host_policy: HostPolicy) -> Self {
         let decode = CachedDidResolver::new(Arc::new(client.clone()));
-        let deactivation = Arc::new(DeactivationCache::default());
+        let deactivation = Arc::new(DeactivationCache {
+            host_policy,
+            ..DeactivationCache::default()
+        });
         Self {
             resolver: Arc::new(decode.clone()),
             signer_resolver: Arc::new(SignerKeyResolver {
